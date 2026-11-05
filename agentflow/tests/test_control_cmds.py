@@ -177,6 +177,23 @@ def test_cancel_never_signals_a_process_it_cannot_verify(pipe):
             proc.wait()
 
 
+@pytest.mark.parametrize("patch", [{"version": 1}, {"engine": ">=3"}], ids=["format-1", "engine-excluded"])
+def test_cancel_with_a_trusted_recorded_config_that_no_longer_loads_still_cancels(pipe, tmp_path, patch):
+    import yaml
+
+    from agentflow.config_trust import config_sha256
+
+    old = tmp_path / "old-config.yaml"  # unchanged since the run started, so trusted, but this engine refuses it
+    old.write_text(yaml.safe_dump({**yaml.safe_load(Path(pipe.cfg.path).read_text(encoding="utf-8")), **patch}),
+                   encoding="utf-8")
+    run = pipe.new_run()
+    run.emit("run_options", config=str(old.resolve()), config_sha256=config_sha256(old))
+    assert cancel(run, by="me") == []
+    run.refresh()
+    assert run.state["status"] == "cancelled"
+    assert [e["by"] for e in pipe.events(run, "run_cancelled")] == ["me"]
+
+
 def test_cancelled_run_stays_cancelled(pipe):
     run = pipe.new_run()
     cancel(run, by="me", cfg=pipe.cfg)

@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 
 from agentflow.config import Config, ConfigError, load_config
-from agentflow.config_trust import ConfigUntrusted, run_config_path
+from agentflow.config_trust import run_config_path
 from agentflow import pack, safeio
 from agentflow.events import lock_state, parse_iso
 from agentflow.gitops import GitError, commits_between, dirty_paths
@@ -228,11 +228,12 @@ def _verify(run: Run, commands: dict[str, list[str]], skip: set[int], settle_s: 
 
 def _agent_commands(run: Run, cfg: Config | None) -> dict[str, list[str]]:
     """The agent commands `cancel` matches live processes against. They only name processes, never run, so an
-    untrusted recorded config gives way to the repository's pack, and with neither no process matches."""
+    untrusted or unloadable recorded config gives way to the repository's pack, and with neither no process
+    matches."""
     if cfg is None:
         try:
             cfg = run_config(run)
-        except (ConfigUntrusted, pack.PackError):
+        except (ConfigError, pack.PackError):  # ConfigUntrusted is a ConfigError
             try:
                 cfg = load_config(pack.pack_config(run.repo))
             except (ConfigError, pack.PackError):
