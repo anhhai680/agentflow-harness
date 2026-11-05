@@ -19,7 +19,7 @@ from agentflow.agents import (
     parse_codex_line,
 )
 from agentflow.config import load_config
-from agentflow.flow import default_config_path
+from conftest import PYTHON_CONFIG
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 STEP = "build/build/task-3/implement"
@@ -27,7 +27,7 @@ STEP = "build/build/task-3/implement"
 
 @pytest.fixture
 def cfg():
-    return load_config(default_config_path())
+    return load_config(PYTHON_CONFIG)
 
 
 @pytest.fixture

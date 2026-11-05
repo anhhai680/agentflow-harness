@@ -150,5 +150,6 @@ def test_new_module_flag_must_be_exactly_the_expected_shape(nm, capsys, value):
 
 
 def test_new_module_flag_is_accepted_when_well_formed(nm, capsys):
+    nm.install_pack()
     value = json.dumps({"module": "x", "responsibility": "r", "deps": ["platform"]})
     assert main(["run", "feature", "--module=x", f"--new-module={value}", "--dry-run"]) == 0

@@ -21,7 +21,7 @@ from conftest import ENGINE, run_git
 
 FIXTURE = ENGINE / "tests" / "fixtures" / "idea.md"
 GH_BIN = ENGINE / "tests" / "bin"
-IDEA = "docs/ideas/agentic-rag-customer-support.md"
+IDEA = "docs/idea.md"
 DECISIONS = "docs/decisions"
 TOPIC = "Ngưỡng làm rõ"
 CHECKS = ["decisions_log_row", "open_question_removed", "adr_index_updated"]

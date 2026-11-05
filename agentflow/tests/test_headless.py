@@ -10,7 +10,8 @@ import pytest
 
 from agentflow.agents import RUNNER_ONLY_DENY
 from agentflow.config import ConfigError, Gate, Phase, Step, load_config, resolve_model
-from agentflow.flow import default_config_path
+from agentflow.pack import ENGINE_PROMPTS
+from conftest import PYTHON_CONFIG
 from agentflow.gates import resolve, run_gates
 from agentflow.hitl import NotWaiting, approve, raise_hitl
 from agentflow.run_control import retry
@@ -39,7 +40,7 @@ def raised(flow_repo, run) -> list[str]:
 
 @pytest.fixture
 def shipped():
-    return load_config(default_config_path())
+    return load_config(PYTHON_CONFIG)
 
 
 def phase_named(cfg, name: str) -> Phase:
@@ -55,7 +56,7 @@ def test_verify_runs_integration_between_unit_and_the_coverage_check(shipped):
 
 
 def test_the_python_test_gates_write_the_coverage_the_check_reads(shipped):
-    assert "--cov-report=xml" in shipped.gates["py_unit"].run
+    assert shipped.gates["py_unit"].run == "python3 -m unittest -q"  # the toy's unit tests write no coverage
     integration = shipped.gates["py_integration"].run
     assert "tests/integration" in integration
     assert "--cov-append" in integration and "--cov-report=xml" in integration
@@ -89,8 +90,8 @@ def test_only_the_verify_step_runs_the_e2e_suite_through_the_runner_owned_stack(
     verify = next(s for s in phase_named(shipped, "verify").steps if s.id == "verify")
     assert [g.name for g in resolve(shipped, verify.gates)][-1] == "web_e2e"  # last: slowest, needs the port lock
     e2e = shipped.gates["web_e2e"]
-    assert e2e.run == "python3 devtools/e2e_stack.py"  # the runner configures the stack; agents never touch .env
-    assert e2e.when_exists == "webadmin/e2e"
+    assert e2e.run == "true"  # the toy has no e2e stack
+    assert e2e.when_exists == "web/e2e"
     # not in the shared sets: fix loops, sync and the CI fix would rebuild the stack on every attempt
     assert "web_e2e" not in {g.name for g in resolve(shipped, "build")}
     assert "web_e2e" not in {g.name for g in resolve(shipped, "verify")}
@@ -111,7 +112,7 @@ def test_recording_a_decision_runs_on_sonnet_and_planning_stays_on_opus(shipped)
 
 
 def test_gates_get_the_configured_env(tmp_git, tmp_path):
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     cfg = dataclasses.replace(
         cfg,
         gates={"probe": Gate(name="probe", run='test "$AGENTFLOW_PROBE" = yes')},
@@ -145,17 +146,19 @@ def test_forbidden_paths_are_denied_before_the_edit(flow_repo):
     argv = flow_repo.calls()[0]["argv"]
     settings = json.loads(argv[argv.index("--settings") + 1])
     # `./`, not `/`: real `claude` ignored `Edit(/CONSTRAINTS.md)` from --settings and let the write through
-    assert settings == {"permissions": {"deny": ["Edit(./CONSTRAINTS.md)", "Edit(./.claude/**)", *RUNNER_ONLY_DENY]}}
+    assert settings == {"permissions": {"deny": ["Edit(./CONSTRAINTS.md)", "Edit(./.claude/**)", "Edit(./.agentflow/**)",
+                                                 *RUNNER_ONLY_DENY]}}
 
 
-def test_settings_hold_only_the_runner_only_denies_when_nothing_is_forbidden(flow_repo):
+def test_settings_hold_only_the_engine_floor_and_the_runner_only_denies_when_the_pack_forbids_nothing(flow_repo):
     cfg = flow_repo.configure({"guardrails": {"forbidden_paths": []}})
     run = flow_repo.new_run()
     flow_repo.script({KEY: [{"result": {"status": "done", "summary": "ok"}}]})
     run_impl(flow_repo, run)
-    assert cfg.guardrails.forbidden_paths == []
+    assert cfg.guardrails.forbidden_paths == [".agentflow/**"]  # the engine's floor: the pack itself
     argv = flow_repo.calls()[0]["argv"]
-    assert json.loads(argv[argv.index("--settings") + 1]) == {"permissions": {"deny": list(RUNNER_ONLY_DENY)}}
+    assert json.loads(argv[argv.index("--settings") + 1]) == {"permissions": {"deny": ["Edit(./.agentflow/**)",
+                                                                                      *RUNNER_ONLY_DENY]}}
 
 
 def test_the_settings_come_before_the_prompt(flow_repo):
@@ -300,18 +303,18 @@ def test_a_first_block_is_never_a_repeat(flow_repo):
 
 @pytest.mark.parametrize("line", ["never `cd`", "One command per Bash call", "pyright"])
 def test_the_preamble_gives_the_shell_rules(shipped, line):
-    text = (default_config_path().parent / "prompts" / "_preamble.md").read_text(encoding="utf-8")
+    text = (ENGINE_PROMPTS / "_preamble.md").read_text(encoding="utf-8")
     assert line in text
 
 
 @pytest.mark.parametrize("line", ["uv run ruff format", "the runner's build gates run them", "`blocked`"])
 def test_the_task_prompt_names_what_to_run(shipped, line):
-    text = (default_config_path().parent / "prompts" / "task.md").read_text(encoding="utf-8")
+    text = (ENGINE_PROMPTS / "task.md").read_text(encoding="utf-8")
     assert line in text
 
 
 @pytest.mark.parametrize("prompt", ["task.md", "task_next.md"])
 def test_implementers_format_and_leave_lint_types_and_the_floor_to_the_build_gates(shipped, prompt):
-    text = (default_config_path().parent / "prompts" / prompt).read_text(encoding="utf-8")
+    text = (ENGINE_PROMPTS / prompt).read_text(encoding="utf-8")
     assert "uv run ruff format" in text and "the runner's build gates run them" in text
-    assert "python3 devtools/floor_guard.py`" not in text  # the gates run it ~20 s after the session
+    assert "floor_guard" not in text  # the floor is a pack's gate, run ~20 s after the session; no prompt names it

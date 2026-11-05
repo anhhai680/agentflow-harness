@@ -9,16 +9,17 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agentflow import config_edit, pipeline
+from agentflow import config_edit, pack, pipeline
 from agentflow.config import load_config
 from agentflow.config_edit import Conflict, EditError, Refused
 from agentflow.pipeline import RunOptions
 
+from conftest import PYTHON_CONFIG
 from test_dashboard import dash as dash, payload  # `dash` is a fixture these tests share
 
 AGENTFLOW = Path(__file__).resolve().parents[1]
 REPO = AGENTFLOW.parent
-SHIPPED = (AGENTFLOW / "config.yaml").read_text(encoding="utf-8")
+SHIPPED = PYTHON_CONFIG.read_text(encoding="utf-8")
 
 
 @pytest.fixture
@@ -137,7 +138,7 @@ def test_an_anchored_value_used_elsewhere_is_not_edited_through_the_text():
 
 
 def test_a_symlinked_config_is_refused(shipped, tmp_path):
-    link = tmp_path / "agentflow" / "linked.yaml"
+    link = tmp_path / ".agentflow" / "linked.yaml"
     link.symlink_to(shipped)
     with pytest.raises(EditError, match="symlink"):
         config_edit.read(link)
@@ -152,7 +153,7 @@ def test_yaml_text_may_change_anything_but_the_protected_settings(shipped):
     proposal = config_edit.propose(shipped, sha, text=edited, repo=REPO)
     assert proposal.changed and not proposal.errors
     for old, new in [
-        ('floor:        {run: "python3 devtools/floor_guard.py --base origin/main"}', 'floor:        {run: "true"}'),
+        ('floor:        {run: "true"}', 'floor:        {run: "false"}'),
         ("    - CONSTRAINTS.md\n", ""),                                                  # guardrails
         ("    command: [claude]", "    command: [sh, -c, claude]"),                     # an agent's command line
         ('    POSTGRES_HOST_PORT: "55432"', '    POSTGRES_HOST_PORT: "55432"\n    BASH_ENV: /tmp/x'),  # defaults.env
@@ -162,6 +163,8 @@ def test_yaml_text_may_change_anything_but_the_protected_settings(shipped):
         ("  refine_prompt: refine.md", "  refine_prompt: ../../../CONSTRAINTS.md"),       # a file read into prompts
         ("  fork_from: main", "  fork_from: --upload-pack=x"),                          # reaches git
         ('  progress_file: "runs/{run}/progress.md"', '  progress_file: "../../x.md"'),  # a path the runner writes
+        ("version: 2\n", "version: 3\n"),                                          # the pack's format
+        ('engine: ">=2,<3"', 'engine: ">=2"'),                                      # the engines it runs on
     ]:
         assert old in SHIPPED, old
         with pytest.raises(Refused, match="protected"):
@@ -251,7 +254,7 @@ def test_the_yaml_tab_may_send_the_whole_file(dash):
 
 
 def _loop(flow_repo, monkeypatch):
-    monkeypatch.setattr(pipeline, "SHIPPED_CONFIG", Path(flow_repo.cfg.path))
+    monkeypatch.setattr(pack, "pack_config", lambda repo: Path(flow_repo.cfg.path))  # the run's repo's own pack
     run = flow_repo.new_run()
     return pipeline._Loop(run, flow_repo.cfg, RunOptions()), run
 
@@ -289,7 +292,7 @@ def test_a_live_runner_keeps_its_config_when_the_new_one_is_not_usable(flow_repo
 
 
 def test_a_runner_on_another_config_never_reloads_it(flow_repo, monkeypatch):
-    monkeypatch.setattr(pipeline, "SHIPPED_CONFIG", AGENTFLOW / "config.yaml")
+    monkeypatch.setattr(pack, "pack_config", lambda repo: PYTHON_CONFIG)
     run = flow_repo.new_run()
     loop = pipeline._Loop(run, flow_repo.cfg, RunOptions())
     _rewrite(Path(flow_repo.cfg.path), lambda d: d["defaults"].update(step_timeout_min=7))

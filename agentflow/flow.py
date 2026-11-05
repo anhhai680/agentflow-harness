@@ -27,46 +27,45 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
-def default_config_path() -> Path:
-    """The `config.yaml` that ships next to this file."""
-    return Path(__file__).resolve().parent / "config.yaml"
-
-
 def repo_root(start: Path) -> Path:
     """The main checkout containing `start`, even when `start` is inside a linked worktree."""
-    start = Path(start).resolve()
-    out = subprocess.run(
-        ["git", "rev-parse", "--git-common-dir"],
-        cwd=start,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    return (start / out).resolve().parent
+    from agentflow.pack import main_checkout
+
+    return main_checkout(start)
 
 
 def _find_repo() -> Path:
+    """The main checkout holding the working directory: the one place the CLI looks for the pack."""
     from agentflow.config import ConfigError
 
-    for start in (Path.cwd(), Path(__file__).resolve().parent):
-        try:
-            return repo_root(start)
-        except (subprocess.CalledProcessError, OSError):
-            continue
-    raise ConfigError("", "not inside a git checkout")
+    try:
+        return repo_root(Path.cwd())
+    except (subprocess.CalledProcessError, OSError):
+        raise ConfigError("", "not inside a git checkout") from None
+
+
+def _pack_config() -> Path:
+    """The repository's pack: `<main checkout>/.agentflow/config.yaml` (`PackError` when there is none)."""
+    from agentflow.pack import pack_config
+
+    return pack_config(_find_repo())
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
     from agentflow.config import ConfigError, load_config, validate
     from agentflow.guards import settings_coverage
+    from agentflow.pack import PackError
 
-    config_path = Path(args.config) if args.config else default_config_path()
     try:
         repo = _find_repo()
+        config_path = Path(args.config) if args.config else _pack_config()
         cfg = load_config(config_path)
     except ConfigError as exc:
         where = f"{exc.path}: " if exc.path else ""
         print(f"error {where}{exc.message}")
+        return 1
+    except PackError as exc:
+        print(f"error {exc}")
         return 1
     issues = validate(cfg, repo) + settings_coverage(cfg, repo)
     for issue in issues:
@@ -81,7 +80,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 def _load_cfg(args: argparse.Namespace):
     from agentflow.config import load_config
 
-    return load_config(Path(args.config) if getattr(args, "config", None) else default_config_path())
+    return load_config(Path(args.config) if getattr(args, "config", None) else _pack_config())
 
 
 def _by(args: argparse.Namespace) -> str:
@@ -93,11 +92,13 @@ def _human_errors() -> tuple[type[Exception], ...]:
     from agentflow.events import EventError
     from agentflow.gitops import GhError, GitError
     from agentflow.hitl import NotWaiting
+    from agentflow.pack import PackError
     from agentflow.pipeline import RunLocked
     from agentflow.run_control import ControlError
     from agentflow.state import RunNotFound
 
-    return (RunNotFound, NotWaiting, EventError, ConfigError, ValueError, GitError, GhError, RunLocked, ControlError)
+    return (RunNotFound, NotWaiting, EventError, ConfigError, PackError, ValueError, GitError, GhError, RunLocked,
+            ControlError)
 
 
 def _money(value: float | None) -> str:
@@ -344,11 +345,11 @@ PARAM_FLAGS = ("module", "topic", "issue", "log", "task", "slice")
 
 def _run_cfg(run, args: argparse.Namespace):
     """The config a run continues with: `--config`, else the one it was started with when that is still
-    trusted (`config_trust`), else the shipped one."""
+    trusted (`config_trust`), else the repository's pack."""
     from agentflow.config import load_config
-    from agentflow.config_trust import trusted_config_path
+    from agentflow.config_trust import run_config_path
 
-    return load_config(trusted_config_path(run, getattr(args, "config", None), default_config_path()))
+    return load_config(run_config_path(run, getattr(args, "config", None)))
 
 
 def _preflight(cfg) -> str | None:
@@ -747,18 +748,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentflow", description="Run the repo's agent workflow, from idea to ship.")
     sub = parser.add_subparsers(dest="command", required=True)
     check = sub.add_parser("validate", help="check config.yaml: skills, prompts, conditions, references")
-    check.add_argument("--config", help="path to a config.yaml (default: the shipped one)")
+    check.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     check.set_defaults(func=cmd_validate)
 
     status = sub.add_parser("status", help="list runs with phase, step, status and spend, or show one run")
     status.add_argument("run", nargs="?", help="a run id (or a part of it that matches one run)")
     status.add_argument("--watch", action="store_true", help="a live board in the terminal (Ctrl-C ends it)")
-    status.add_argument("--config", help="path to a config.yaml (default: the shipped one)")
+    status.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     status.set_defaults(func=cmd_status)
 
     agents = sub.add_parser("agents", help="every agent process running now, across runs")
     agents.add_argument("--watch", action="store_true", help="refresh on every new event (Ctrl-C ends it)")
-    agents.add_argument("--config", help="path to a config.yaml (default: the shipped one)")
+    agents.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     agents.set_defaults(func=cmd_agents)
 
     inbox = sub.add_parser("inbox", help="every run waiting on a human, with its questions")
@@ -802,7 +803,7 @@ def build_parser() -> argparse.ArgumentParser:
                      '{"module": ..., "responsibility": ..., "deps": [...]}: the run adds its row first')
     run.add_argument("--dry-run", action="store_true", help="print the agent and gate commands; create and call nothing")
     run.add_argument("--detach", action="store_true", help="run in the background after starting")
-    run.add_argument("--config", help="path to a config.yaml (default: the shipped one)")
+    run.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     run.set_defaults(func=cmd_run)
 
     res = sub.add_parser("resume", help="continue a run from where it stopped")
@@ -820,18 +821,18 @@ def build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--topic", help="a design topic")
     exp.add_argument("--issue", help="a bug or issue reference")
     exp.add_argument("--model", action="append", default=[], metavar="PHASE=MODEL", help="override one phase's model")
-    exp.add_argument("--config", help="path to a config.yaml (default: the shipped one)")
+    exp.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     exp.set_defaults(func=cmd_explain)
 
     nxt = sub.add_parser("next", help="the lane, stage and next skill for the repo as it stands now")
-    nxt.add_argument("--config", help="path to a config.yaml (default: the shipped one)")
+    nxt.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     nxt.set_defaults(func=cmd_next)
 
     que = sub.add_parser("queue", help="start modules in capability-map order as their dependencies merge")
     que.add_argument("--max-parallel", type=int, default=2, help="runs live at once (default 2)")
     que.add_argument("--once", action="store_true", help="tick one time and exit (for cron and tests)")
     que.add_argument("--interval", type=float, default=30.0, help="seconds between ticks (default 30)")
-    que.add_argument("--config", help="path to a config.yaml (default: the shipped one)")
+    que.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     que.set_defaults(func=cmd_queue)
 
     met = sub.add_parser("metrics", help="where runs spent time and money: by phase, wait, model and effort")
@@ -843,7 +844,7 @@ def build_parser() -> argparse.ArgumentParser:
     shape = met.add_mutually_exclusive_group()
     shape.add_argument("--json", action="store_true", help="the full data as JSON")
     shape.add_argument("--csv", action="store_true", help="one row per run, phase, model and effort")
-    met.add_argument("--config", help="path to a config.yaml (default: the shipped one)")
+    met.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     met.set_defaults(func=cmd_metrics)
 
     pau = sub.add_parser("pause", help="stop a run before its next step (a live agent finishes its step)")
@@ -876,7 +877,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     das = sub.add_parser("dashboard", help="the local Kanban board and Agents view (127.0.0.1, token-protected)")
     das.add_argument("--port", type=int, help="the port (default: dashboard.port; 0 picks a free one)")
-    das.add_argument("--config", help="path to a config.yaml (default: the shipped one)")
+    das.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     das.set_defaults(func=cmd_dashboard)
     return parser
 

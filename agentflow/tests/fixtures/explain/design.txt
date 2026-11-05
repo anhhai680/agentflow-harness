@@ -1,0 +1,15 @@
+explain design {"module": "greet", "topic": "x", "issue": "1"}
+define: ✓ run
+  ✓ run  decide
+  ✓ run  decide/grill_topic  [opus]
+  ✓ run  decide/topic_answers
+  ✓ run  decide/apply_topic  [opus]
+  ⏸ define_approved
+plan: – skip (no steps for lane design)
+build: – skip (no steps for lane design)
+verify: – skip (no steps for lane design)
+review: – skip (no steps for lane design)
+ship: ✓ run
+  ✓ run  commit
+  ✓ run  finish
+  ✓ run  ci

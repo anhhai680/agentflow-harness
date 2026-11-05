@@ -1,0 +1,25 @@
+explain bug {"module": "greet", "topic": "x", "issue": "1"}
+define: ✓ run
+  ✓ run  debug  [opus]
+  ⏸ define_approved
+plan: – skip (no steps for lane bug)
+build: ✓ run (build_done = false: all: this run's lane is bug, not feature)
+  ✓ run  setup
+  ✓ run  regression_test  [sonnet]
+  ✓ run  fix  [sonnet]
+verify: ✓ run
+  ✓ run  setup
+  – skip  plan_fixes  [opus] (refine_round = false: not in a refine round)
+  – skip  fix_findings  [sonnet] (refine_round = false: not in a refine round)
+  ✓ run  verify  [sonnet]
+  ? ask  eval_gate (eval_required = unknown: any: this run's lane is bug, not eval; eval_paths_touched = unknown: cannot diff against origin/main)
+review: ✓ run
+  – skip  setup (refine_round = false: not in a refine round)
+  – skip  plan_fixes  [opus] (refine_round = false: not in a refine round)
+  – skip  fix_findings  [sonnet] (refine_round = false: not in a refine round)
+  – skip  eval_gate (all: refine_round = false: not in a refine round)
+  ✓ run  branch_review  [sonnet]
+  ? ask  security_review  [sonnet] (security_path = unknown: any: cannot diff against origin/main; no file)
+ship: ✓ run
+  ✓ run  finish
+  ✓ run  ci

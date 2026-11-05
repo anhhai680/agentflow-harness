@@ -6,9 +6,11 @@ import pytest
 import yaml
 
 from agentflow.config import ConfigError, Issue, load_config, validate
-from agentflow.flow import default_config_path, main, repo_root
+from agentflow.flow import main, repo_root
+from agentflow.pack import ENGINE_PROMPTS
+from conftest import PYTHON_CONFIG
 
-CFG = default_config_path()
+CFG = PYTHON_CONFIG
 
 
 def issues_for(tmp_cfg, patch) -> list[Issue]:
@@ -36,7 +38,7 @@ def test_package_design_belongs_to_the_plan_not_the_spec():
             yield from skills(step.steps)
 
     assert "codebase-design" not in set(skills(load_config(CFG).phases["define"].steps))
-    assert "`codebase-design` skill" in (CFG.parent / "prompts" / "plan.md").read_text(encoding="utf-8")
+    assert "`codebase-design` skill" in (ENGINE_PROMPTS / "plan.md").read_text(encoding="utf-8")
 
 
 def test_eval_steps_map_to_a_verify_skill_and_lanes_hold_no_repo_paths():
@@ -403,10 +405,11 @@ def test_a_repository_may_have_no_backlog_block(tmp_cfg):
     assert errors(issues_for(tmp_cfg, lambda data: data["dashboard"].pop("backlog"))) == []
 
 
-def test_validate_cli_exit_codes(tmp_cfg, capsys):
+def test_validate_cli_exit_codes(tmp_cfg, capsys, pack_repo_python, monkeypatch):
     bad = tmp_cfg({"effort": {"allowed": ["low", "turbo"]}})
     assert main(["validate", "--config", str(bad)]) == 1
     assert "error effort.allowed:" in capsys.readouterr().out
+    monkeypatch.chdir(pack_repo_python)
     assert main(["validate"]) == 0
 
 
@@ -416,9 +419,10 @@ def test_validate_cli_reports_load_errors(tmp_cfg, capsys):
     assert "error phases.plan.steps:" in capsys.readouterr().out
 
 
-def test_validate_cli_works_outside_a_git_checkout(tmp_cfg, tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    assert main(["validate"]) == 0
+def test_validate_cli_outside_a_git_checkout_says_so(tmp_cfg, tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)  # no checkout, so no pack: the engine's own checkout is not one
+    assert main(["validate"]) == 1
+    assert "not inside a git checkout" in capsys.readouterr().out
 
 
 def test_repo_root_from_a_subdirectory():
@@ -462,7 +466,7 @@ def test_unknown_placeholder_in_a_template(tmp_cfg):
     issues = validate(load_config(path), path.parent.parent)
     assert ("error", "prompts/bogus.md") in errors(issues)
     assert any("{bogus}" in i.message for i in issues)
-    assert not any(i.path.startswith("prompts/") and i.path != "prompts/bogus.md" for i in issues)
+    assert not any(i.path.startswith(("prompts/", "engine:prompts/")) and i.path != "prompts/bogus.md" for i in issues)
 
 
 def test_a_brief_file_must_exist(tmp_cfg):

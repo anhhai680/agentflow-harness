@@ -583,6 +583,21 @@ def _build_gates(data: dict) -> dict[str, Gate]:
     return out
 
 
+def _check_format(raw: dict) -> None:
+    """A pack says which format it is written in (`version`) and which engines may run it (`engine`)."""
+    version = _require(raw, "version", "", int)
+    if isinstance(version, bool) or version != pack.PACK_VERSION:
+        raise ConfigError("version", f"pack format {version}; this engine reads format {pack.PACK_VERSION}")
+    spec = _require(raw, "engine", "", str)
+    try:
+        ok = pack.engine_satisfies(spec)
+    except pack.PackError as exc:
+        raise ConfigError("engine", str(exc)) from exc
+    if not ok:
+        raise ConfigError("engine",
+                          f"engine: '{spec}' does not include this engine; this engine is {pack.ENGINE_VERSION}")
+
+
 def load_config(path: Path) -> Config:
     """Parse `path`, resolve `@` references and build the dataclasses."""
     path = Path(path)
@@ -592,6 +607,7 @@ def load_config(path: Path) -> Config:
         raise ConfigError("", f"cannot read {path}: {exc}") from exc
     if not isinstance(loaded, dict):
         raise ConfigError("", f"{path} must hold a mapping at the top level")
+    _check_format(loaded)
 
     origins: dict[str, str] = {}
     raw = _resolve(loaded, "", loaded, (), origins)
@@ -643,7 +659,10 @@ def load_config(path: Path) -> Config:
         gates=_build_gates(_require(raw, "gates", "", dict)),
         gate_sets={name: _string_list(members, f"gate_sets.{name}") for name, members in gate_sets.items()},
         guardrails=Guardrails(
-            forbidden_paths=_string_list(guardrails.get("forbidden_paths", []), "guardrails.forbidden_paths"),
+            forbidden_paths=list(dict.fromkeys([  # the pack's own first; the engine's floor always holds
+                *_string_list(guardrails.get("forbidden_paths", []), "guardrails.forbidden_paths"),
+                *pack.ENGINE_FORBIDDEN,
+            ])),
             reject_trailers=_string_list(guardrails.get("reject_trailers", []), "guardrails.reject_trailers"),
             user_only_skills=_string_list(guardrails.get("user_only_skills", []), "guardrails.user_only_skills"),
         ),
@@ -966,6 +985,8 @@ class _Validator:
                            f"unknown permission_mode '{agent.permission_mode}': use one of {', '.join(PERMISSION_MODES)}")
 
     def gate_definitions(self) -> None:
+        if not self.cfg.gate_sets.get("verify"):
+            self.error("gate_sets.verify", "every pack declares the gates a diff must pass: gate_sets.verify")
         for name, members in self.cfg.gate_sets.items():
             for i, member in enumerate(members):
                 if member not in self.cfg.gates:

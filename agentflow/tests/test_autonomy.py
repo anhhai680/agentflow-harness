@@ -14,6 +14,7 @@ from agentflow.config import load_config, validate
 from agentflow.hitl import approve, reject
 from agentflow.pipeline import RunOptions, advance, approval_text, start
 from agentflow.state import Run
+from conftest import PYTHON_CONFIG
 
 AGENTFLOW = Path(__file__).resolve().parents[1]
 REPO = AGENTFLOW.parent
@@ -77,7 +78,7 @@ def called(flow) -> list[str]:
 
 
 def test_shipped_config_says_who_approves_on_every_phase():
-    raw = load_config(AGENTFLOW / "config.yaml")
+    raw = load_config(PYTHON_CONFIG)
     assert {name: phase.needs_approval for name, phase in raw.phases.items()} == {
         "define": True, "plan": True, "build": False, "verify": False, "review": False, "ship": False}
     assert {name for name, phase in raw.phases.items() if phase.resolve} == {"build", "verify", "review"}
@@ -92,7 +93,7 @@ def test_the_runner_never_names_a_phase(path):
 
 def test_nothing_in_agentflow_can_merge():
     merge = re.compile(r"""["']merge["']|pr\s+merge|--auto\b|--admin\b""")
-    for path in [*AGENTFLOW.glob("*.py"), *AGENTFLOW.glob("prompts/*.md"), AGENTFLOW / "config.yaml"]:
+    for path in [*AGENTFLOW.glob("*.py"), *AGENTFLOW.glob("prompts/*.md"), PYTHON_CONFIG]:
         assert not merge.search(path.read_text(encoding="utf-8")), path
 
 

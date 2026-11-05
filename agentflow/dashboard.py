@@ -24,7 +24,7 @@ Routes:
   `POST /api/config/save` with `base_sha256` and either `changes` (the form) or `text` (the YAML tab); see
   `config_edit`. A save is refused unless the new config validates, leaves the protected settings as they are and
   starts from the file's current hash (409 otherwise). After a save the dashboard serves the new config at once,
-  and a live runner on the shipped config picks it up when its next phase starts.
+  and a live runner on the pack config picks it up when its next phase starts.
 
 It can approve checkpoints and start agents, so it is locked down:
 - it binds `127.0.0.1` only, and every request but the data-free shell needs the random token printed at

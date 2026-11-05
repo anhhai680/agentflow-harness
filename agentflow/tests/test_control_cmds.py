@@ -470,6 +470,7 @@ def test_watch_rerenders_on_change_and_reminds(pipe):
 
 def test_cli_agents_once(pipe, capsys):
     fixture_runs(pipe)
+    pipe.install_pack()
     assert main(["agents"]) == 0
     assert "Agents running: 1" in capsys.readouterr().out
 

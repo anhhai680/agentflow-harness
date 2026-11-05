@@ -7,7 +7,7 @@ import pytest
 
 from agentflow import flow
 from agentflow.config import Gate, load_config
-from agentflow.flow import default_config_path
+from conftest import PYTHON_CONFIG
 from agentflow.guards import (
     Violation,
     _covered,
@@ -23,7 +23,7 @@ from test_gates import cfg_with
 
 @pytest.fixture
 def cfg():
-    return load_config(default_config_path())
+    return load_config(PYTHON_CONFIG)
 
 
 def head(git, wt):
@@ -187,7 +187,7 @@ def with_mode(cfg, mode):
 
 
 def test_settings_cover_shipped_gates(repo_root):
-    assert settings_coverage(load_config(default_config_path()), repo_root) == []
+    assert settings_coverage(load_config(PYTHON_CONFIG), repo_root) == []
 
 
 def test_shipped_settings_file_alone_covers_shipped_gates(repo_root, tmp_path):
@@ -195,7 +195,7 @@ def test_shipped_settings_file_alone_covers_shipped_gates(repo_root, tmp_path):
     (tmp_path / ".claude" / "settings.json").write_text(
         (repo_root / ".claude" / "settings.json").read_text(encoding="utf-8"), encoding="utf-8"
     )
-    assert settings_coverage(load_config(default_config_path()), tmp_path) == []
+    assert settings_coverage(load_config(PYTHON_CONFIG), tmp_path) == []
 
 
 def test_settings_coverage_warns_on_uncovered_gate(repo_root):
@@ -212,7 +212,7 @@ def test_settings_coverage_checks_each_part(repo_root):
 
 
 def test_settings_coverage_without_settings_files_warns_for_every_gate(tmp_path):
-    cfg = with_mode(load_config(default_config_path()), "acceptEdits")
+    cfg = with_mode(load_config(PYTHON_CONFIG), "acceptEdits")
     issues = settings_coverage(cfg, tmp_path)
     assert {i.path for i in issues} == {f"gates.{n}.run" for n in cfg.gates}
     assert all(i.level == "warning" for i in issues)
@@ -246,7 +246,7 @@ def test_settings_coverage_in_bypass_mode_warns_only_on_ask_or_deny(tmp_path):
 
 
 def test_shipped_config_runs_in_bypass_mode_with_no_coverage_warnings(tmp_path):
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     assert cfg.agents[cfg.defaults.agent].permission_mode == "bypassPermissions"
     assert settings_coverage(cfg, tmp_path) == []  # no settings files: allow rules are moot
 
@@ -282,7 +282,8 @@ def test_validate_command_reports_coverage_warnings(tmp_cfg, monkeypatch, repo_r
     assert "warning gates.make.run" in out
 
 
-def test_validate_command_shipped_config_has_no_coverage_warnings(capsys):
+def test_validate_command_shipped_config_has_no_coverage_warnings(capsys, pack_repo_python, monkeypatch):
+    monkeypatch.chdir(pack_repo_python)
     assert flow.main(["validate"]) == 0
     out = capsys.readouterr().out
     assert "gates." not in out
@@ -324,7 +325,6 @@ def test_shipped_settings_do_not_cover_escapes(repo_root, command):
     "pnpm exec vitest run --coverage",
     "git status",
     "git diff HEAD~1",
-    "python3 devtools/floor_guard.py --base origin/main",
 ])
 def test_shipped_settings_cover_the_gate_commands(repo_root, command):
     assert shipped_allows(repo_root, command)

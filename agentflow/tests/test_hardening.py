@@ -22,7 +22,8 @@ import yaml
 from agentflow import gitops
 from agentflow.config import Gate, Phase, Step, load_config, validate
 from agentflow.config_trust import ConfigUntrusted, trusted_config_path
-from agentflow.flow import default_config_path, main
+from agentflow.flow import main
+from conftest import PYTHON_CONFIG
 from agentflow.gates import run_gates
 from agentflow.hitl import approve
 from agentflow.pipeline import RunOptions, advance, start
@@ -68,7 +69,7 @@ def test_start_records_the_config_path_and_hash(pipe):
     options = pipe.events(run, "run_options")[0]
     assert options["config"] == str(Path(pipe.cfg.path).resolve())
     assert len(options["config_sha256"]) == 64
-    assert trusted_config_path(run, None, default_config_path()) == Path(pipe.cfg.path).resolve()
+    assert trusted_config_path(run, None, PYTHON_CONFIG) == Path(pipe.cfg.path).resolve()
 
 
 def test_a_later_run_options_naming_another_config_is_refused(pipe, tmp_path, capsys):
@@ -77,7 +78,7 @@ def test_a_later_run_options_naming_another_config_is_refused(pipe, tmp_path, ca
     evil.write_text(Path(pipe.cfg.path).read_text(encoding="utf-8"), encoding="utf-8")
     run.emit("run_options", config=str(evil), config_sha256="0" * 64)
     with pytest.raises(ConfigUntrusted):
-        trusted_config_path(run, None, default_config_path())
+        trusted_config_path(run, None, PYTHON_CONFIG)
     assert main(["resume", run.id]) == 1
     assert "not started with" in capsys.readouterr().out
     assert pipe.calls() == []  # nothing ran
@@ -90,16 +91,16 @@ def test_a_config_changed_since_start_is_refused_unless_named(pipe, capsys):
     data["gates"]["ok"] = {"run": "touch pwned"}
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     with pytest.raises(ConfigUntrusted, match="changed since"):
-        trusted_config_path(run, None, default_config_path())
+        trusted_config_path(run, None, PYTHON_CONFIG)
     assert main(["resume", run.id]) == 1
     assert "changed since" in capsys.readouterr().out
-    assert trusted_config_path(run, str(path), default_config_path()) == path  # an explicit --config wins
+    assert trusted_config_path(run, str(path), PYTHON_CONFIG) == path  # an explicit --config wins
 
 
 def test_the_shipped_config_is_trusted_whatever_its_hash(repo, cfg):
     run = Run.create(cfg, repo, "feature", {"module": "crm"})
-    run.emit("run_options", config=str(default_config_path()), config_sha256="0" * 64)
-    assert trusted_config_path(run, None, default_config_path()) == default_config_path().resolve()
+    run.emit("run_options", config=str(PYTHON_CONFIG), config_sha256="0" * 64)
+    assert trusted_config_path(run, None, PYTHON_CONFIG) == PYTHON_CONFIG.resolve()
 
 
 # --------------------------------------------------------------------------- symlinked runner files (Critical 1)
@@ -274,7 +275,7 @@ def test_gate_with_a_missing_cwd_fails_with_the_path(tmp_git, tmp_path):
 
 
 def test_gate_timeout_is_configured_and_validated(tmp_cfg):
-    assert load_config(default_config_path()).defaults.gate_timeout_min == 30
+    assert load_config(PYTHON_CONFIG).defaults.gate_timeout_min == 30
     path = tmp_cfg({"defaults": {"gate_timeout_min": 0}})
     assert any(i.path == "defaults.gate_timeout_min" for i in validate(load_config(path), path.parent.parent))
 

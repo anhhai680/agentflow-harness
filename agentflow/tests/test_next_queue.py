@@ -143,16 +143,16 @@ def test_next_mixed_changes_are_not_doc_only(fr):
 
 
 def test_next_eval_paths(fr):
-    write(fr.root, "src/tivacare/knowledge/retrieval/x.py", "x = 1\n")
+    write(fr.root, "toy/knowledge/retrieval/x.py", "x = 1\n")
     answer = next_step(fr.cfg, fr.root)
     assert answer.lane == "eval"
     assert answer.stage == "Verify"
-    assert any("src/tivacare/knowledge/retrieval/x.py" in line for line in answer.evidence)
+    assert any("toy/knowledge/retrieval/x.py" in line for line in answer.evidence)
 
 
 def test_next_eval_beats_open_plan(fr):
     write(fr.root, "docs/plans/2026-10-28-crm.md", PLAN_OPEN)
-    write(fr.root, "src/tivacare/agent/policy.py", "x = 1\n")
+    write(fr.root, "toy/agent/policy.py", "x = 1\n")
     assert next_step(fr.cfg, fr.root).lane == "eval"
 
 
@@ -164,7 +164,7 @@ def test_next_nothing_in_flight(fr):
 
 def test_next_security_line_when_overlay_matches(fr):
     write(fr.root, "docs/plans/2026-10-28-crm.md", PLAN_OPEN)
-    write(fr.root, "src/tivacare/staff_auth/guard.py", "x = 1\n")
+    write(fr.root, "toy/staff_auth/guard.py", "x = 1\n")
     answer = next_step(fr.cfg, fr.root)
     assert answer.security
     text = module_queue.format_answer(answer)
@@ -173,7 +173,7 @@ def test_next_security_line_when_overlay_matches(fr):
 
 
 def test_next_security_line_from_plan_keywords(fr):
-    write(fr.root, "docs/plans/2026-10-28-crm.md", PLAN_OPEN + "\nThe customer_code claim is injected.\n")
+    write(fr.root, "docs/plans/2026-10-28-crm.md", PLAN_OPEN + "\nThe session token is checked.\n")
     assert next_step(fr.cfg, fr.root).security
 
 
@@ -194,6 +194,7 @@ def test_format_answer_is_three_lines():
 
 
 def test_cmd_next_prints_the_answer(fr, capsys):
+    fr.install_pack()
     write(fr.root, "docs/ideas/x.md", "# idea\n")
     assert main(["next"]) == 0
     out = capsys.readouterr().out.splitlines()
@@ -425,6 +426,7 @@ def test_second_queue_is_refused(qrepo):
 
 
 def test_cmd_queue_once_wires_the_spawner(qrepo, monkeypatch, capsys):
+    qrepo.install_pack()
     spawned: list[tuple] = []
     monkeypatch.setattr("agentflow.flow._preflight", lambda cfg: None)
     monkeypatch.setattr(module_queue, "spawn_feature_run",
@@ -435,6 +437,7 @@ def test_cmd_queue_once_wires_the_spawner(qrepo, monkeypatch, capsys):
 
 
 def test_cmd_queue_refused_while_another_queue_runs(qrepo, monkeypatch, capsys):
+    qrepo.install_pack()
     monkeypatch.setattr("agentflow.flow._preflight", lambda cfg: None)
     with module_queue.queue_lock(qrepo.root):
         assert main(["queue", "--once"]) == 1

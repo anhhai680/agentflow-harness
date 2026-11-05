@@ -1,0 +1,30 @@
+explain feature {"module": "greet", "topic": "x", "issue": "1"}
+define: ✓ run
+  – skip  idea (spec_exists = true: docs/specs/SPEC-greet.md exists)
+  – skip  draft  [opus] (spec_exists = true: docs/specs/SPEC-greet.md exists)
+  – skip  contracts  [opus] (spec_needs_api_design = false: all: spec_defines_contracts = true: pattern found in docs/specs/SPEC-greet.md at line 7; not (spec_api_reviewed = true: pattern found in docs/specs/SPEC-greet.md at line 18))
+  – skip  grill_open_questions (spec_has_open_questions = false: 0 open items, 1 resolved)
+  – skip  spec_approval (spec_awaits_approval = false: not (spec_is_approved = true: docs/specs/SPEC-greet.md status line says approved))
+plan: ✓ run (plan_exists_unchecked = false: no plan file)
+  ✓ run  plan  [opus]
+  ⏸ plan_approved
+build: ✓ run (build_done = false: all: this run's lane is feature; plan_done = false: all: no path)
+  ✓ run  setup
+  ✓ run  build  [sonnet]
+  ✓ run  build/review  [sonnet] (per-task review)
+verify: ✓ run
+  ✓ run  setup
+  – skip  plan_fixes  [opus] (refine_round = false: not in a refine round)
+  – skip  fix_findings  [sonnet] (refine_round = false: not in a refine round)
+  ✓ run  verify  [sonnet]
+  ? ask  eval_gate (eval_required = unknown: any: this run's lane is feature, not eval; eval_paths_touched = unknown: cannot diff against origin/main)
+review: ✓ run
+  – skip  setup (refine_round = false: not in a refine round)
+  – skip  plan_fixes  [opus] (refine_round = false: not in a refine round)
+  – skip  fix_findings  [sonnet] (refine_round = false: not in a refine round)
+  – skip  eval_gate (all: refine_round = false: not in a refine round)
+  ✓ run  branch_review  [sonnet]
+  ? ask  security_review  [sonnet] (security_path = unknown: any: cannot diff against origin/main; no file)
+ship: ✓ run
+  ✓ run  finish
+  ✓ run  ci

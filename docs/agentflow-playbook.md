@@ -52,7 +52,7 @@ uv run --with pyyaml --with pytest pytest agentflow/tests --import-mode=prepend 
 
 Then check the three files that decide what agents may do:
 
-- `agentflow/config.yaml` is the one file with all behaviour: models per phase, gates, conditions, budget, push and PR. **Agents cannot edit it during a run.** Run `agentflow validate` after every edit.
+- `.agentflow/config.yaml` is the one file with all behaviour: models per phase, gates, conditions, budget, push and PR. **Agents cannot edit it during a run.** Run `agentflow validate` after every edit. It is the repository's pack (section 14), read from the main checkout even when you run `agentflow` inside a run's worktree.
 - `.claude/settings.json` (shared) and `.claude/settings.local.json` (yours, git-ignored) hold the tool rules for Claude. The runner passes no allow or deny flags, and headless agents run with `--permission-prompts none`, so any command that would prompt is denied. If a step needs a command, add an `allow` rule for exactly that command.
 - `CONSTRAINTS.md` is the quality bar. The gates are copied from it. Never weaken a gate in `config.yaml` to get a run through.
 
@@ -176,7 +176,7 @@ Codex support is an **adapter only, disabled by default, and not yet exercised a
    approval_policy = "never"
    ```
 
-2. **Enable the agent:** set `agents.codex.enabled: true` in `agentflow/config.yaml`. The rest of the block is ready (`profile: agentflow`, the models, the effort argument). From then on every `agentflow run` needs `codex` on your PATH, even a run that stays on Claude.
+2. **Enable the agent:** set `agents.codex.enabled: true` in `.agentflow/config.yaml`. The rest of the block is ready (`profile: agentflow`, the models, the effort argument). From then on every `agentflow run` needs `codex` on your PATH, even a run that stays on Claude.
 
 3. **Move one phase to Codex.** Start with a phase that is easy to review, such as `review` or `build` on a small module. Add `agent` and replace the phase's `model`, and leave its `steps` as they are:
 
@@ -319,7 +319,7 @@ agentflow queue --max-parallel 2
 ## 11. Safety model in five lines
 
 1. Agents get one writable folder besides the work tree: `agentflow/workspaces/<run>/`. The run's events, state, inbox and lock live in `agentflow/runs/`, outside it.
-2. The runner refuses a step that touches `CONSTRAINTS.md`, `devtools/floor_guard.py`, `eval/baseline.json`, the agentflow config or `.claude/**`, that moves `HEAD`, or that uses a user-only skill. It re-checks before every commit and before the push.
+2. The runner refuses a step that touches a path in the pack's `guardrails.forbidden_paths` (such as `CONSTRAINTS.md`, `eval/baseline.json` or `.claude/**`) or the pack itself (`.agentflow/**`, always), that moves `HEAD`, or that uses a user-only skill. It re-checks before every commit and before the push.
 3. Only the runner pushes, only commits it made, never with `--force`. It never writes `Constraints-Approved-By`.
 4. The dashboard listens on `127.0.0.1` only and every request needs the token. Do not paste the dashboard URL into chat or tickets.
 5. **Residual risk:** gates such as `uv run pytest` execute code from the work tree, which the agent wrote, with your permissions. The guards catch what that code changes in git, not everything it could do on your machine. Review the diff at every approval, and for risky work run agentflow in a disposable environment.
@@ -354,3 +354,30 @@ agentflow queue --max-parallel 2
 - run `agentflow validate` until it prints 0 warnings, then `agentflow explain` and `agentflow run … --dry-run` before the first real run.
 
 Add `agentflow/runs/` and `agentflow/workspaces/` to `.gitignore` (they are ignored here).
+
+## 14. Pack reference
+
+The pack is the repository's `.agentflow/` directory in the main checkout: `config.yaml`, and `prompts/` for any prompt that replaces the engine's file of the same name. `agentflow` never reads a linked worktree's copy. The engine adds `.agentflow/**` to every pack's forbidden paths and refuses a pack without a non-empty `gate_sets.verify`. One line per key: name, meaning, and whether the Settings page may change it.
+
+- `version`: the pack format, `2`. The engine reads format 2 only and refuses any other. Protected.
+- `engine`: the engine versions that may run the pack, comma-separated clauses of `>=`, `>`, `<=`, `<`, `==` on dotted numbers, such as `">=2,<3"`. A range that leaves this engine out is refused. Protected.
+- `project`: branches (`base_branch`, `fork_from`, `branch`), `worktrees_dir`, the `docs` paths and the `commit_trailer`. Protected.
+- `agents.<name>`: the command line and arguments of an agent CLI, its models, `max_turns` and prices. Protected, except `enabled`, `models`, `max_turns` and `prices`.
+- `defaults`: the default agent, timeouts, `fix_attempts` and budgets. Not protected, except `defaults.env`.
+- `recovery`: how long an outage may last and how many failed attempts a step gets. Not protected.
+- `effort`: the level a session starts at and the levels an agent may pick. Not protected.
+- `context`: auto-compact, rollover and the context window. Not protected, except `context.autocompact_env` and `context.progress_file`.
+- `gates`: names to shell commands, with `cwd` and `when_exists`. Protected.
+- `gate_sets`: named lists of gates; `verify` is required. Protected.
+- `guardrails`: `forbidden_paths`, `reject_trailers` and `user_only_skills`. Protected.
+- `overlays`: the `security` and `eval` paths, keywords and added skills. Protected.
+- `conditions`: named checks the runner evaluates from files and git. Protected.
+- `lanes`: the kinds of work. Not protected.
+- `record_step`, `resolve_step`: the steps that file a spec-gap answer and resolve a stop. Protected.
+- `autonomy`: what the runner decides by itself. Not protected.
+- `ci`: polling and fix rounds of the `ci` step. Not protected.
+- `phases.<name>`: the workflow. Protected, except `needs_approval`, `resolve`, `model` and `agent`.
+- `phase_approval`: the refine prompt and what an approval page shows. Protected.
+- `checkpoints`: who answers each inner checkpoint. Not protected.
+- `hitl`: notifications, reminders and where decisions are recorded. Not protected, except `hitl.notify`.
+- `dashboard`: host, port and the Backlog. Not protected, except `dashboard.host`.

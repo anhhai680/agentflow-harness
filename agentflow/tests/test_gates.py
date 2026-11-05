@@ -6,12 +6,12 @@ from pathlib import Path
 import pytest
 
 from agentflow.config import Gate, load_config
-from agentflow.flow import default_config_path
 from agentflow.gates import GateResult, gates_ok, run_gates, summarize
+from conftest import PYTHON_CONFIG
 
 
 def cfg_with(gates: dict[str, str | Gate], sets: dict[str, list[str]] | None = None, lines: int | None = None):
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     built = {n: g if isinstance(g, Gate) else Gate(name=n, run=g) for n, g in gates.items()}
     context = cfg.context if lines is None else dataclasses.replace(cfg.context, gate_output_lines=lines)
     return dataclasses.replace(cfg, gates=built, gate_sets=sets or {}, context=context)
@@ -56,7 +56,7 @@ def test_gate_when_exists_missing_is_skipped(tmp_git, tmp_path):
 
 
 def test_shipped_web_gate_skipped_without_webadmin(tmp_git, tmp_path):
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     (g,) = run_gates(cfg, ["web_types"], tmp_git, tmp_path / "logs")
     assert g.skipped and gates_ok([g])
 

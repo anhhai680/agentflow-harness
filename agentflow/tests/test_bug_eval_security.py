@@ -296,10 +296,10 @@ def test_red_checked_again_in_a_refine_round(flow_repo):
 
 def test_security_overlay(flow_repo):
     flow_repo.configure(GREEN_GATES)
-    commit_file(flow_repo, "src/tivacare/staff_auth/__init__.py", "", "Start staff_auth")
+    commit_file(flow_repo, "toy/staff_auth/__init__.py", "", "Start staff_auth")
     run = flow_repo.new_run({"module": "staff-auth"})
     target = make_ctx(flow_repo.cfg, flow_repo.root, "feature", run.state["params"], run).values["plan_target"]
-    plan = plan_text("staff-auth", "Validate Entra tokens in src/tivacare/staff_auth/tokens.py")
+    plan = plan_text("staff-auth", "Validate Entra tokens in toy/staff_auth/tokens.py")
     flow_repo.script({"plan/plan": [{"write": {target: plan}, **done("planned")}]})
 
     assert run_phase(flow_repo, run, "plan") == ("done", True)
@@ -324,7 +324,7 @@ def test_no_overlay_off_security_paths(flow_repo):
     flow_repo.configure(GREEN_GATES)
     run = flow_repo.new_run({"module": "crm"})
     target = make_ctx(flow_repo.cfg, flow_repo.root, "feature", run.state["params"], run).values["plan_target"]
-    plan = plan_text("crm", "Cache the MISA token in src/tivacare/crm/client.py")
+    plan = plan_text("crm", "Cache the product list in toy/crm/client.py")
     flow_repo.script({"plan/plan": [{"write": {target: plan}, **done("planned")}]})
 
     assert run_phase(flow_repo, run, "plan") == ("done", True)
@@ -419,10 +419,10 @@ def test_eval_gate_fix_that_changes_nothing_commits_nothing(flow_repo, git, tmp_
 def test_feature_test_phase_ends_clean(flow_repo, git):
     gate = {"run": "grep -q good src/state.txt || { echo 'recall dropped'; exit 1; }", "when_exists": None}
     flow_repo.configure({**GREEN_GATES, "gates": {"floor": {"run": "true"}, "eval": gate}})
-    commit_file(flow_repo, "src/tivacare/agent/policy.py", "THRESHOLD = 0.5\n", "Tune policy")
+    commit_file(flow_repo, "toy/agent/policy.py", "THRESHOLD = 0.5\n", "Tune policy")
     run = flow_repo.new_run({"module": "agent"})
     flow_repo.script({
-        "verify/verify": [{"write": {"src/tivacare/agent/fixup.py": "x = 1\n"}, **done("fixed a lint finding")}],
+        "verify/verify": [{"write": {"toy/agent/fixup.py": "x = 1\n"}, **done("fixed a lint finding")}],
         "verify/eval_gate": [{"write": {"src/state.txt": "good\n"}, **done("restored recall")}],
     })
     assert run_phase(flow_repo, run, "verify") == ("done", True)
@@ -437,7 +437,7 @@ def test_eval_lane_ends_clean_through_finish(flow_repo, git, tmp_path, monkeypat
     gate = {"run": "grep -q good src/state.txt || { echo 'recall dropped'; exit 1; }", "when_exists": None}
     flow_repo.configure({"gates": {"floor": {"run": "true"}, "eval": gate}})
     flow_repo.script({
-        "build/change": [{"write": {"src/tivacare/agent/policy.py": "THRESHOLD = 0.6\n"}, **done("raised it")}],
+        "build/change": [{"write": {"toy/agent/policy.py": "THRESHOLD = 0.6\n"}, **done("raised it")}],
         EVAL: [{"write": {"src/state.txt": "good\n"}, **done("restored recall")}],
     })
     from agentflow.pipeline import advance

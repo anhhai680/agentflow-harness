@@ -12,11 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from conftest import run_git
 from agentflow.config import load_config, validate
 from agentflow.gitops import merge_in_progress
 from agentflow.hitl import approve
 from agentflow.pipeline import RunOptions, advance, start
+from conftest import PYTHON_CONFIG, run_git
 
 AGENTFLOW = Path(__file__).resolve().parents[1]
 BIN = AGENTFLOW / "tests" / "bin"
@@ -189,7 +189,7 @@ def test_a_human_finishes_the_merge_and_the_run_goes_on(flow_repo, gh, git):
     assert on_origin(git, flow_repo, run, "README.md") == "settled by a person\n"
 
 
-@pytest.mark.parametrize("path", ["CONSTRAINTS.md", "uv.lock", "src/tivacare/staff_auth/tokens.py"])
+@pytest.mark.parametrize("path", ["CONSTRAINTS.md", "uv.lock", "toy/staff_auth/tokens.py"])
 def test_conflicts_in_protected_paths_are_a_humans_without_calling_the_agent(flow_repo, gh, git, path):
     run = begin(flow_repo)
     own_work(flow_repo, run, {path: "branch\n"})
@@ -270,7 +270,7 @@ def issues(tmp_cfg, patch):
 
 
 def test_the_shipped_config_has_a_sync_session():
-    cfg = load_config(AGENTFLOW / "config.yaml")
+    cfg = load_config(PYTHON_CONFIG)
     finish = next(step for step in cfg.phases["ship"].steps if step.type == "finish")
     assert finish.sync is not None and finish.sync.gates == "verify" and finish.sync.commit is False
     assert not [i for i in validate(cfg, REPO) if i.level == "error"]

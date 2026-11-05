@@ -20,7 +20,7 @@ live agent finishes its step first; `advance` on a paused run records `run_resum
 An approved phase can rest as ready (`hitl.approve(hold=True)`): nothing runs until a human goes on, which
 also lifts `--to`, or marks the run done, which skips every phase but the last, so a run stopped early
 still ends with a pull request.
-A runner on the shipped config re-reads it before each phase (`_Loop.reload`), so a change saved from the
+A runner on the repository's pack re-reads it before each phase (`_Loop.reload`), so a change saved from the
 dashboard's Settings page, or by hand, reaches a live run at its next phase: `config_reloaded`. A config that
 does not load or validate, or that changes the phases' names or order, is not taken (`config_reload_skipped`,
 with the reason); the run goes on with the one it has, and the next `resume` loads the file as it is then.
@@ -46,7 +46,7 @@ from agentflow.autonomy import (
     findings_note,
     phase_findings,
 )
-from agentflow import sources
+from agentflow import pack, sources
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.config_trust import config_sha256, start_options
@@ -217,9 +217,6 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
         lock.release()
 
 
-SHIPPED_CONFIG = Path(__file__).resolve().with_name("config.yaml")
-
-
 class _Loop:
     def __init__(self, run: Run, cfg: Config, opts: RunOptions) -> None:
         self.run = run
@@ -229,9 +226,12 @@ class _Loop:
         self.config_sha = self._config_sha()
 
     def _config_sha(self) -> str | None:
-        """The hash of the config file when it is the shipped one (the only one reloaded), else None."""
+        """The hash of the config file when it is the repository's pack (the only one reloaded), else None."""
         path = Path(self.cfg.path).resolve()
-        if path != SHIPPED_CONFIG.resolve():
+        try:
+            if path != Path(pack.pack_config(self.run.repo)).resolve():
+                return None
+        except (pack.PackError, subprocess.CalledProcessError, OSError):
             return None
         try:
             return config_sha256(path)
@@ -239,7 +239,7 @@ class _Loop:
             return None
 
     def reload(self) -> None:
-        """Take a changed shipped config before a phase starts, when it loads, validates and keeps the phases."""
+        """Take a changed pack config before a phase starts, when it loads, validates and keeps the phases."""
         if self.config_sha is None:
             return
         sha = self._config_sha()

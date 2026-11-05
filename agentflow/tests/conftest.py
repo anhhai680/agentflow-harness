@@ -1,9 +1,10 @@
-"""Shared fixtures: the repo root on sys.path, this checkout's root, and a config builder."""
+"""Shared fixtures: the repo root on sys.path, this checkout's root, the fixture packs and a config builder."""
 
 from __future__ import annotations
 
 import copy
 import json
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -16,9 +17,15 @@ import yaml
 ENGINE = Path(__file__).resolve().parents[1]
 ROOT = Path(__file__).resolve().parents[2]
 REPO = ROOT
+PACKS = ENGINE / "tests" / "fixtures" / "packs"
+PYTHON_PACK = PACKS / "python"
+PYTHON_CONFIG = PYTHON_PACK / ".agentflow" / "config.yaml"  # the suite's pack: the shipped config's shape, a toy's values
+PYTHON_SKILLS = PYTHON_PACK / ".claude" / "skills"
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+collect_ignore_glob = ["fixtures/*"]  # the fixture packs' own tests belong to their toy repositories, not this suite
 
 
 def deep_merge(base: Any, patch: Any) -> Any:
@@ -43,27 +50,27 @@ def repo_root() -> Path:
 
 @pytest.fixture
 def tmp_cfg(tmp_path: Path) -> Callable[..., Path]:
-    """Return `make(patch)`: write the shipped config with `patch` applied, return its path.
+    """Return `make(patch)`: write the `python` pack's config with `patch` applied, return its path.
 
-    `patch` is a dict (deep-merged, `None` deletes a key) or a callable that mutates the
-    parsed YAML in place (needed to edit list items). The config lands in
-    `<tmp>/agentflow/config.yaml` beside an empty `prompts/` (a test adds an override) and a symlinked `.claude/skills/`, so
-    `<tmp>` works as the repo root for existence checks.
+    `patch` is a dict (deep-merged, `None` deletes a key) or a callable that mutates the parsed YAML in place
+    (needed to edit list items). The config lands in `<tmp>/.agentflow/config.yaml` beside an empty `prompts/` (a
+    test adds an override), with `<tmp>/.claude/skills/` linked to the pack's skill stubs, so `<tmp>` works as the
+    repo root for existence checks.
     """
 
     def make(patch: dict | Callable[[dict], None] | None = None, name: str = "config.yaml") -> Path:
-        data = yaml.safe_load((ENGINE / "config.yaml").read_text(encoding="utf-8"))
+        data = yaml.safe_load(PYTHON_CONFIG.read_text(encoding="utf-8"))
         if callable(patch):
             patch(data)
         elif patch:
             data = deep_merge(data, patch)
-        pkg = tmp_path / "agentflow"
+        pkg = tmp_path / ".agentflow"
         pkg.mkdir(exist_ok=True)
         (pkg / "prompts").mkdir(exist_ok=True)  # the pack's own prompts: empty, so the engine's defaults resolve
         claude = tmp_path / ".claude"
         claude.mkdir(exist_ok=True)
         if not (claude / "skills").exists():
-            (claude / "skills").symlink_to(REPO / ".claude" / "skills", target_is_directory=True)
+            (claude / "skills").symlink_to(PYTHON_SKILLS, target_is_directory=True)
         target = pkg / name
         target.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
         return target
@@ -131,10 +138,24 @@ def tmp_git(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def cfg():
-    """The shipped config, loaded."""
+    """The `python` pack's config, loaded."""
     from agentflow.config import load_config
 
-    return load_config(ENGINE / "config.yaml")
+    return load_config(PYTHON_CONFIG)
+
+
+@pytest.fixture
+def pack_repo_python(tmp_path: Path) -> Path:
+    """The `python` fixture pack copied into a fresh git repo of its own (one commit on `main`)."""
+    root = tmp_path / "python"
+    shutil.copytree(PYTHON_PACK, root, ignore=shutil.ignore_patterns("__pycache__"))
+    run_git(root, "init", "-q", "-b", "main")
+    run_git(root, "config", "user.name", "Test")
+    run_git(root, "config", "user.email", "test@example.com")
+    run_git(root, "config", "commit.gpgsign", "false")
+    run_git(root, "add", "-A")
+    run_git(root, "commit", "-q", "-m", "initial")
+    return root
 
 
 @pytest.fixture
@@ -167,7 +188,7 @@ FLOW_SETTINGS = {"permissions": {"allow": ["Bash(true)", "Bash(false)", "Bash(te
 class FlowRepo:
     """A tmp git repo (branches `main`, `next`, bare `origin`) wired to the fake agent.
 
-    `configure(patch)` reloads the shipped config with the fake agent as `claude`, no notifiers,
+    `configure(patch)` reloads the `python` pack's config with the fake agent as `claude`, no notifiers,
     the `TEST_GATES` added, and `patch` deep-merged on top. `new_run()` starts a `feature` run for
     module `crm`; `executor()` builds an `Executor` for it. The repo ignores the runs root and the agent
     workspaces, as the real one does, so run files never show up in a step's diff.
@@ -213,6 +234,18 @@ class FlowRepo:
         self.cfg = load_config(self._make_cfg(build))
         return self.cfg
 
+    def install_pack(self) -> Path:
+        """Copy the configured config to `<root>/.agentflow/config.yaml` (git-excluded), so a CLI call or a
+        dashboard action that names no `--config` finds a pack. A copy: `self.cfg.path` stays the run's own file."""
+        target = self.root / ".agentflow" / "config.yaml"
+        (target.parent / "prompts").mkdir(parents=True, exist_ok=True)
+        target.write_text(Path(self.cfg.path).read_text(encoding="utf-8"), encoding="utf-8")
+        exclude = self.root / ".git" / "info" / "exclude"
+        if "/.agentflow/" not in exclude.read_text(encoding="utf-8"):
+            with exclude.open("a", encoding="utf-8") as handle:
+                handle.write("/.agentflow/\n")
+        return target
+
     def script(self, acts: dict[str, list[dict]]) -> None:
         self.fake.script(acts)
 
@@ -256,7 +289,7 @@ def flow_repo(tmp_path: Path, fake: FakeAgent, tmp_cfg: Callable[..., Path], mon
     (root / "CONSTRAINTS.md").write_text("rules\n", encoding="utf-8")
     (root / ".claude").mkdir()
     (root / ".claude" / "settings.json").write_text(json.dumps(FLOW_SETTINGS, indent=2) + "\n", encoding="utf-8")
-    (root / ".claude" / "skills").symlink_to(REPO / ".claude" / "skills", target_is_directory=True)
+    (root / ".claude" / "skills").symlink_to(PYTHON_SKILLS, target_is_directory=True)
     (root / "README.md").write_text("hello\n", encoding="utf-8")
     run_git(root, "add", "-A")
     run_git(root, "commit", "-q", "-m", "initial")
