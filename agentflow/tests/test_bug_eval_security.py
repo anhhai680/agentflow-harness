@@ -218,7 +218,7 @@ def test_eval_regression_blocks(flow_repo):
     assert len(calls) == 2
     assert [e["attempt"] for e in flow_repo.events(run, "fix_attempt")] == [1, 2]
     first = calls[0]["argv"][-1]
-    assert REGRESSION in first and "eval/baseline.json" in first
+    assert REGRESSION in first and "Never edit the eval baseline" in first  # the generic rule, not a path
     assert "verification-before-completion" in first  # the fix session verifies with the skill
     session = flow_repo.events(run, "agent_session")[0]["session_id"]
     assert "--resume" not in calls[0]["argv"] and ("--resume", session) in pairs(calls[1]["argv"])

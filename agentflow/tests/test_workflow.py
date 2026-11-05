@@ -280,7 +280,7 @@ def test_a_larger_plan_gives_each_task_the_implementer_brief(pipe):
     step = _build_step(pipe)
     assert step.skill == "subagent-driven-development"
     text = _prompt(pipe, step)
-    assert "subagent-driven-development/implementer-prompt.md" in text
+    assert "`subagent-driven-development` skill's `implementer-prompt.md`" in text
     assert "Use the `subagent-driven-development` skill" not in text  # that would load the controller process
     assert "**do not commit**" in text and "Use the `test-driven-development` skill" in text
 

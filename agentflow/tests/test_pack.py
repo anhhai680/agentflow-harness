@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 import yaml
 
 from agentflow import pack
-from agentflow.config import ConfigError, load_config, validate
+from agentflow.config import PROMPT_PLACEHOLDERS, ConfigError, load_config, validate
 from agentflow.config_trust import ConfigUntrusted, trusted_config_path
 from agentflow.state import Run
 from conftest import PYTHON_CONFIG, deep_merge, run_git
@@ -168,3 +169,24 @@ def test_cli_without_a_pack_says_so(tmp_git, monkeypatch, capsys):
     assert "no .agentflow/config.yaml in " in capsys.readouterr().out
     assert flow.main(["explain", "feature", "--module", "greet"]) == 1
     assert "this repository has no agentflow pack" in capsys.readouterr().out
+
+
+PROMPT_DENYLIST = re.compile(
+    r"(?i:tivacare)|CONSTRAINTS\.md|src/|docs/specs|docs/ideas|CAPABILITY-MAP|SPEC-|floor_guard|webadmin|next-step"
+)
+
+
+def test_engine_prompts_name_no_project():
+    hits = [
+        f"{f.name}:{n}"
+        for f in sorted(pack.ENGINE_PROMPTS.glob("*.md"))
+        for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1)
+        if PROMPT_DENYLIST.search(line)
+    ]
+    assert hits == []
+
+
+def test_engine_default_prompts_use_only_known_placeholders():
+    for file in pack.ENGINE_PROMPTS.glob("*.md"):
+        names = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", file.read_text(encoding="utf-8")))
+        assert names <= PROMPT_PLACEHOLDERS, file.name

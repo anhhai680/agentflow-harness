@@ -1,6 +1,6 @@
 Use the `domain-modeling` skill.
 
-Goal: record the decision "{topic}" in `docs/specs/SPEC-{module}.md`.
+Goal: record the decision "{topic}" in the spec of module `{module}` (`{spec}`).
 
 A human answered a question that the spec did not settle while the run was building:
 

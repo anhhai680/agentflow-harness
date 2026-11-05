@@ -12,7 +12,7 @@ Investigate before you change anything, in this work tree. The step's own sessio
 
 - If a command was denied, it stays denied in every form. Find the allowed way to get the same result, such as a gate command or the runner's `setup` gates. Do not rephrase it.
 - If the step needs something only a human can give, stop as `blocked` and name it exactly. That is a good result: a human then reads your diagnosis.
-- Never weaken `CONSTRAINTS.md`, edit `eval/baseline.json`, lower a threshold, skip a test or add a suppression.
+- Never weaken the repository's quality rules, edit the eval baseline, lower a threshold, skip a test or add a suppression.
 
 Say in your summary what the cause was and what you changed. Do not commit: the runner commits.
 

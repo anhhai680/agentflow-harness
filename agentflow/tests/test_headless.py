@@ -301,13 +301,13 @@ def test_a_first_block_is_never_a_repeat(flow_repo):
 # --------------------------------------------------------------------------- the prompts
 
 
-@pytest.mark.parametrize("line", ["never `cd`", "One command per Bash call", "pyright"])
+@pytest.mark.parametrize("line", ["never `cd`", "One command per Bash call", "Run only the tests you wrote or changed"])
 def test_the_preamble_gives_the_shell_rules(shipped, line):
     text = (ENGINE_PROMPTS / "_preamble.md").read_text(encoding="utf-8")
     assert line in text
 
 
-@pytest.mark.parametrize("line", ["uv run ruff format", "the runner's build gates run them", "`blocked`"])
+@pytest.mark.parametrize("line", ["format what you changed", "the runner's build gates run them", "`blocked`"])
 def test_the_task_prompt_names_what_to_run(shipped, line):
     text = (ENGINE_PROMPTS / "task.md").read_text(encoding="utf-8")
     assert line in text
@@ -316,5 +316,5 @@ def test_the_task_prompt_names_what_to_run(shipped, line):
 @pytest.mark.parametrize("prompt", ["task.md", "task_next.md"])
 def test_implementers_format_and_leave_lint_types_and_the_floor_to_the_build_gates(shipped, prompt):
     text = (ENGINE_PROMPTS / prompt).read_text(encoding="utf-8")
-    assert "uv run ruff format" in text and "the runner's build gates run them" in text
-    assert "floor_guard" not in text  # the floor is a pack's gate, run ~20 s after the session; no prompt names it
+    assert "format what you changed" in text and "the runner's build gates run them" in text
+    assert "floor_guard" not in text  # the floor is a pack's gate, run after the session; no prompt names it
