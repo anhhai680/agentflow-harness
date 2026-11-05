@@ -458,10 +458,6 @@ def test_same_id_in_different_phases_is_fine():
 def test_unknown_placeholder_in_a_template(tmp_cfg):
     path = tmp_cfg()
     prompts = path.parent / "prompts"
-    prompts.unlink()  # swap the symlink for a real copy so the shipped templates stay untouched
-    prompts.mkdir()
-    for file in (CFG.parent / "prompts").glob("*.md"):
-        (prompts / file.name).write_text(file.read_text(encoding="utf-8"), encoding="utf-8")
     (prompts / "bogus.md").write_text("Use {module} and {bogus}.\n", encoding="utf-8")
     issues = validate(load_config(path), path.parent.parent)
     assert ("error", "prompts/bogus.md") in errors(issues)

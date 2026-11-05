@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, TextIO
 
-from agentflow import overlays, workspace
+from agentflow import overlays, pack, workspace
 from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
 from agentflow.autonomy import AUTO_BY, eligible
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
@@ -82,7 +82,10 @@ def footer_next(text: str) -> str | None:
 
 
 def _template(cfg: Config, name: str) -> str:
-    return (cfg.path.parent / "prompts" / name).read_text(encoding="utf-8")
+    file = pack.prompt_path(cfg.path, name)
+    if file is None:
+        raise FileNotFoundError(f"prompt '{name}' is not in the pack's prompts/ or the engine's")
+    return file.read_text(encoding="utf-8")
 
 
 def _values(cfg: Config, step: Step, ctx: Ctx, extra: dict) -> dict[str, str]:

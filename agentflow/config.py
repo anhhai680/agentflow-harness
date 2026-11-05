@@ -15,6 +15,8 @@ from typing import Any, Literal
 
 import yaml
 
+from agentflow import pack
+
 KNOWN_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 BUILTIN_CHECKS = (
     "file_exists",
@@ -701,7 +703,6 @@ class _Validator:
     def __init__(self, cfg: Config, repo: Path) -> None:
         self.cfg = cfg
         self.repo = repo
-        self.prompts = cfg.path.parent / "prompts"
         self.issues: list[Issue] = []
         self.roles = {role for agent in cfg.agents.values() for role in agent.models}
 
@@ -764,8 +765,8 @@ class _Validator:
             self.error(path, f"skill '{skill}' has no .claude/skills/{skill}/SKILL.md")
 
     def prompt(self, prompt: Any, path: str) -> None:
-        if not isinstance(prompt, str) or not (self.prompts / prompt).is_file():
-            self.error(path, f"prompt template '{prompt}' is not in {self.prompts.name}/")
+        if not isinstance(prompt, str) or pack.prompt_path(self.cfg.path, prompt) is None:
+            self.error(path, f"prompt template '{prompt}' is not in the pack's prompts/ or the engine's")
 
     def steps(self, steps: list[Step]) -> None:
         """Validate one step list (a phase) and everything nested in it."""
@@ -789,13 +790,11 @@ class _Validator:
 
     def templates(self) -> None:
         """Every `{placeholder}` in every prompt template must be a known key."""
-        if not self.prompts.is_dir():
-            return
-        for file in sorted(self.prompts.glob("*.md")):
+        for file in pack.prompt_files(self.cfg.path).values():
             text = file.read_text(encoding="utf-8")
             for name in dict.fromkeys(_PLACEHOLDER.findall(text)):
                 if name not in PROMPT_PLACEHOLDERS:
-                    self.error(f"prompts/{file.name}", f"unknown placeholder '{{{name}}}'")
+                    self.error(pack.prompt_label(self.cfg.path, file), f"unknown placeholder '{{{name}}}'")
 
     def brief(self, files: list[str], prompt: str | None, path: str) -> None:
         """A brief goes in the prompt at `{brief}`: a missing file, a `{brief}` with no file, or a file with no
@@ -803,16 +802,17 @@ class _Validator:
         for name in files:
             if not (self.repo / name).is_file():
                 self.error(path, f"brief '{name}' is not a file in this repository")
-        template = self.prompts / prompt if prompt else None
-        if template is None or not template.is_file():
+        template = pack.prompt_path(self.cfg.path, prompt) if prompt else None
+        if template is None:
             if files:
                 self.error(path, "a brief needs a prompt template with a {brief} placeholder")
             return
         used = "{brief}" in template.read_text(encoding="utf-8")
+        label = pack.prompt_label(self.cfg.path, template)
         if used and not files:
-            self.error(path, f"prompts/{prompt} has a {{brief}} placeholder, so this step must name the file")
+            self.error(path, f"{label} has a {{brief}} placeholder, so this step must name the file")
         elif files and not used:
-            self.error(path, f"prompts/{prompt} has no {{brief}} placeholder, so this brief would never be sent")
+            self.error(path, f"{label} has no {{brief}} placeholder, so this brief would never be sent")
 
     def step(self, step: Step, phase_ids: set[str]) -> None:
         p = step.path

@@ -47,7 +47,7 @@ def tmp_cfg(tmp_path: Path) -> Callable[..., Path]:
 
     `patch` is a dict (deep-merged, `None` deletes a key) or a callable that mutates the
     parsed YAML in place (needed to edit list items). The config lands in
-    `<tmp>/agentflow/config.yaml` with `prompts/` and `.claude/skills/` symlinked in, so
+    `<tmp>/agentflow/config.yaml` beside an empty `prompts/` (a test adds an override) and a symlinked `.claude/skills/`, so
     `<tmp>` works as the repo root for existence checks.
     """
 
@@ -59,8 +59,7 @@ def tmp_cfg(tmp_path: Path) -> Callable[..., Path]:
             data = deep_merge(data, patch)
         pkg = tmp_path / "agentflow"
         pkg.mkdir(exist_ok=True)
-        if not (pkg / "prompts").exists():
-            (pkg / "prompts").symlink_to(ENGINE / "prompts", target_is_directory=True)
+        (pkg / "prompts").mkdir(exist_ok=True)  # the pack's own prompts: empty, so the engine's defaults resolve
         claude = tmp_path / ".claude"
         claude.mkdir(exist_ok=True)
         if not (claude / "skills").exists():
