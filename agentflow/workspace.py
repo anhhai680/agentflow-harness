@@ -1,6 +1,6 @@
 """The per-run agent workspace: the one directory an agent may write outside its working tree.
 
-Agents get `devtools/agentflow/workspaces/<run>/` (`Run.agent_dir`) as their only `--add-dir`. The run
+Agents get `agentflow/workspaces/<run>/` (`Run.agent_dir`) as their only `--add-dir`. The run
 directory (`runs/<run>/`: `events.jsonl`, `state.json`, `inbox/`, `runner.lock`, the runner's result
 copies, gate logs), the other runs, the queue files and the config are outside every directory an agent
 may write, so nothing an agent writes can change a run's state.

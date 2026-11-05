@@ -17,7 +17,7 @@ from agentflow.pipeline import RunOptions
 from test_dashboard import dash as dash, payload  # `dash` is a fixture these tests share
 
 AGENTFLOW = Path(__file__).resolve().parents[1]
-REPO = AGENTFLOW.parents[1]
+REPO = AGENTFLOW.parent
 SHIPPED = (AGENTFLOW / "config.yaml").read_text(encoding="utf-8")
 
 

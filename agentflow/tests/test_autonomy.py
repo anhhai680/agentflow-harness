@@ -16,7 +16,7 @@ from agentflow.pipeline import RunOptions, advance, approval_text, start
 from agentflow.state import Run
 
 AGENTFLOW = Path(__file__).resolve().parents[1]
-REPO = AGENTFLOW.parents[1]
+REPO = AGENTFLOW.parent
 PIPE = {"gate_sets": {"build": ["ok"], "verify": ["ok"], "setup": []}}
 SPEC = "docs/specs/SPEC-demo.md"
 SPEC_TEXT = "# Spec: `demo`\n\n**Status: approved** 2026-10-01\n\n## Objective\n\nMẫu.\n\n## Open Questions\n\nNone for this module.\n"

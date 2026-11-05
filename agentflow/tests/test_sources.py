@@ -17,7 +17,7 @@ from agentflow.sources import (
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[2]
 APPROVED = r"\*\*Status: approved"
 PENDING = "pending approval"
 

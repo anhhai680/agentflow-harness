@@ -12,9 +12,9 @@ from agentflow.commit_checks import foreign_commits, runner_commits
 from agentflow.flow import main
 from agentflow.pipeline import RunOptions, start
 
-from conftest import AGENTFLOW, run_git
+from conftest import ENGINE, run_git
 
-GH_BIN = AGENTFLOW / "tests" / "bin"
+GH_BIN = ENGINE / "tests" / "bin"
 ROW = {"Module id": "`{module}`", "Responsibility": "{responsibility}", "Depends on": "{deps}",
        "Spec": "[SPEC-{module}](SPEC-{module}.md)"}
 MAP = """# Capability map

@@ -27,7 +27,7 @@ PLAN_TEXT = "# Plan: demo\n\n### Task 1: First thing\n\n**Depends on:** none\n\n
 QUESTION = {"id": "q1", "question": "Lưu trong bao lâu?", "options": [{"key": "A", "label": "1 giờ", "recommended": True}],
             "evidence": [], "kind": "other"}
 AGENTFLOW_DIR = Path(__file__).resolve().parents[1]
-REPO_ROOT = AGENTFLOW_DIR.parents[1]
+REPO_ROOT = AGENTFLOW_DIR.parent
 NOTE = "Sửa lỗi kiểm tra quyền"
 BLOCKING = {"severity": "blocking", "file": "src/one.py", "line": 3, "text": "Thiếu kiểm tra quyền"}
 MINOR_FINDING = {"severity": "minor", "file": "src/one.py", "line": 9, "text": "đổi tên biến"}

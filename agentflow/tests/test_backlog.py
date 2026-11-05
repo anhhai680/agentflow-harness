@@ -11,9 +11,9 @@ from agentflow import backlog, module_queue
 from agentflow.backlog import Invalid, Refused
 from agentflow.state import Run
 
-from conftest import AGENTFLOW, run_git
+from conftest import ENGINE, run_git
 
-GH_BIN = AGENTFLOW / "tests" / "bin"
+GH_BIN = ENGINE / "tests" / "bin"
 # A is merged, B and C depend on A, D depends on B (the plan's example).
 MAP = """# Capability map
 

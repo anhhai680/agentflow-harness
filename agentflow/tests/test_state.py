@@ -547,10 +547,10 @@ def test_threads_racing_for_the_lock_have_one_winner(run):
 
 
 def test_processes_racing_for_the_lock_have_one_winner(run):
-    devtools = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[2]
     code = (
         "import sys, time\n"
-        f"sys.path.insert(0, {str(devtools)!r})\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
         "from pathlib import Path\n"
         "from agentflow.events import RunLock\n"
         "while time.time() < float(sys.argv[2]):\n"

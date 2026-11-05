@@ -16,7 +16,7 @@ from agentflow.config import resolve_model
 from agentflow.gitops import GhError, gh_json
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[2]
 
 T = {"check": "command", "run": "true"}
 F = {"check": "command", "run": "false"}

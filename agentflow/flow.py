@@ -5,7 +5,7 @@
 # ///
 """agentflow: run the repo's CLAUDE.md workflow lanes headlessly.
 
-Usage: agentflow <command>   (see `--help`; `devtools/bin/agentflow` runs this file)
+Usage: agentflow <command>   (see `--help`; `bin/agentflow` runs this file)
 """
 
 from __future__ import annotations
@@ -21,10 +21,10 @@ import sys
 import traceback
 from pathlib import Path
 
-# `devtools/` goes on sys.path so `agentflow.*` imports work when this file runs as a script.
-_DEVTOOLS = Path(__file__).resolve().parents[1]
-if str(_DEVTOOLS) not in sys.path:
-    sys.path.insert(0, str(_DEVTOOLS))
+# The repo root goes on sys.path so `agentflow.*` imports work when this file runs as a script.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 
 def default_config_path() -> Path:

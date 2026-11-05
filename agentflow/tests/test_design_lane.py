@@ -17,10 +17,10 @@ from agentflow.gates import GateResult, run_doc_checks
 from agentflow.hitl import approve, parse_answers
 from agentflow.pipeline import RunOptions, advance, start
 from agentflow.state import Run
-from conftest import AGENTFLOW, run_git
+from conftest import ENGINE, run_git
 
-FIXTURE = AGENTFLOW / "tests" / "fixtures" / "idea.md"
-GH_BIN = AGENTFLOW / "tests" / "bin"
+FIXTURE = ENGINE / "tests" / "fixtures" / "idea.md"
+GH_BIN = ENGINE / "tests" / "bin"
 IDEA = "docs/ideas/agentic-rag-customer-support.md"
 DECISIONS = "docs/decisions"
 TOPIC = "Ngưỡng làm rõ"

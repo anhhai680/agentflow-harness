@@ -20,7 +20,7 @@ from agentflow.pipeline import RunOptions, advance, start
 
 AGENTFLOW = Path(__file__).resolve().parents[1]
 BIN = AGENTFLOW / "tests" / "bin"
-REPO = AGENTFLOW.parents[1]
+REPO = AGENTFLOW.parent
 URL = "https://github.com/acme/repo/pull/42"
 SYNC = "ship/finish/sync-{n}"
 BASE = {"gate_sets": {"build": ["ok"], "verify": ["ok"]}}

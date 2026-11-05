@@ -1,4 +1,4 @@
-"""Shared fixtures: `devtools/` on sys.path, the real repo root, and a config builder."""
+"""Shared fixtures: the repo root on sys.path, this checkout's root, and a config builder."""
 
 from __future__ import annotations
 
@@ -13,12 +13,12 @@ from typing import Any
 import pytest
 import yaml
 
-DEVTOOLS = Path(__file__).resolve().parents[2]
-AGENTFLOW = DEVTOOLS / "agentflow"
-REPO = DEVTOOLS.parent
+ENGINE = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
+REPO = ROOT
 
-if str(DEVTOOLS) not in sys.path:
-    sys.path.insert(0, str(DEVTOOLS))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def deep_merge(base: Any, patch: Any) -> Any:
@@ -52,7 +52,7 @@ def tmp_cfg(tmp_path: Path) -> Callable[..., Path]:
     """
 
     def make(patch: dict | Callable[[dict], None] | None = None, name: str = "config.yaml") -> Path:
-        data = yaml.safe_load((AGENTFLOW / "config.yaml").read_text(encoding="utf-8"))
+        data = yaml.safe_load((ENGINE / "config.yaml").read_text(encoding="utf-8"))
         if callable(patch):
             patch(data)
         elif patch:
@@ -60,7 +60,7 @@ def tmp_cfg(tmp_path: Path) -> Callable[..., Path]:
         pkg = tmp_path / "agentflow"
         pkg.mkdir(exist_ok=True)
         if not (pkg / "prompts").exists():
-            (pkg / "prompts").symlink_to(AGENTFLOW / "prompts", target_is_directory=True)
+            (pkg / "prompts").symlink_to(ENGINE / "prompts", target_is_directory=True)
         claude = tmp_path / ".claude"
         claude.mkdir(exist_ok=True)
         if not (claude / "skills").exists():
@@ -78,7 +78,7 @@ class FakeAgent:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self.script_path = tmp_path / "fake_script.json"
         self.calls_path = tmp_path / "fake_calls.jsonl"
-        self.command = [sys.executable, str(AGENTFLOW / "tests" / "fake_agent.py")]
+        self.command = [sys.executable, str(ENGINE / "tests" / "fake_agent.py")]
         self.script_path.write_text("{}", encoding="utf-8")
         monkeypatch.setenv("AGENTFLOW_FAKE_SCRIPT", str(self.script_path))
         monkeypatch.setenv("AGENTFLOW_FAKE_CALLS", str(self.calls_path))
@@ -135,7 +135,7 @@ def cfg():
     """The shipped config, loaded."""
     from agentflow.config import load_config
 
-    return load_config(AGENTFLOW / "config.yaml")
+    return load_config(ENGINE / "config.yaml")
 
 
 @pytest.fixture

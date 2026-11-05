@@ -14,9 +14,9 @@ from agentflow import hitl, module_queue
 from agentflow.flow import main
 from agentflow.module_queue import NextAnswer, QueueBusy, QueueState, StartFailed, next_step, queue_tick
 
-from conftest import AGENTFLOW, run_git
+from conftest import ENGINE, run_git
 
-GH_BIN = AGENTFLOW / "tests" / "bin"
+GH_BIN = ENGINE / "tests" / "bin"
 APPROVED_SPEC = "# Spec: {m}\n\n**Status: approved** 2026-10-28\n"
 MAP = """# Capability map
 
@@ -449,16 +449,16 @@ def test_cmd_queue_rejects_bad_max_parallel(qrepo, capsys):
 def test_no_module_is_named_like_a_stdlib_module():
     """A file named like a stdlib module shadows it for any process with this folder on `sys.path`
     (`cd devtools/agentflow && python3 -m pytest` died on `from queue import Queue`)."""
-    names = {p.stem for p in AGENTFLOW.glob("*.py")} | {p.name for p in AGENTFLOW.iterdir() if p.is_dir()}
+    names = {p.stem for p in ENGINE.glob("*.py")} | {p.name for p in ENGINE.iterdir() if p.is_dir()}
     assert sorted(names & set(sys.stdlib_module_names)) == []
 
 
 def test_stdlib_queue_resolves_from_the_agentflow_folder():
     out = subprocess.run(
-        [sys.executable, "-c", "import queue; print(queue.__file__)"], cwd=AGENTFLOW,
+        [sys.executable, "-c", "import queue; print(queue.__file__)"], cwd=ENGINE,
         capture_output=True, text=True, check=True,
     ).stdout.strip()
-    assert Path(out).parent != AGENTFLOW
+    assert Path(out).parent != ENGINE
 
 
 # --------------------------------------------------------------------------- blocked modules are reported

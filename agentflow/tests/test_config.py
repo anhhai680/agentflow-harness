@@ -423,7 +423,7 @@ def test_validate_cli_works_outside_a_git_checkout(tmp_cfg, tmp_path, monkeypatc
 
 def test_repo_root_from_a_subdirectory():
     # In a linked worktree repo_root names the main checkout, so compare with the checkout's own root.
-    checkout = Path(__file__).resolve().parents[3]
+    checkout = Path(__file__).resolve().parents[2]
     assert repo_root(CFG.parent) == repo_root(checkout)
     assert (repo_root(CFG.parent) / ".git").is_dir()
 
