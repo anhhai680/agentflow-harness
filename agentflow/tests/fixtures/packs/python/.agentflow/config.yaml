@@ -11,12 +11,27 @@ project:
   worktrees_dir: ../toy-worktrees
   docs:
     idea: docs/idea.md
-    capability_map: docs/specs/CAPABILITY-MAP.md
     specs: docs/specs
     spec_file: "SPEC-{module}.md"   # a module's spec is <specs>/<spec_file>
     plans: docs/plans
     decisions: docs/decisions
+    glossary: GLOSSARY.md
   commit_trailer: "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+
+work_source:                    # the modules `agentflow queue`, the Backlog and `modules_done` walk, in build order
+  kind: capability_map          # a table with `Module id` and `Depends on` columns
+  path: docs/specs/CAPABILITY-MAP.md
+
+skills:
+  map:                          # the skill `agentflow next` names for each kind of next step
+    decide: grilling
+    define: spec-driven-development
+    design_doc: domain-modeling
+    plan: writing-plans
+    build: subagent-driven-development
+    build_small: executing-plans
+    verify: verification-before-completion
+    ship: finishing-a-development-branch
 
 agents:
   claude:
@@ -153,7 +168,7 @@ conditions:                     # evaluated by the runner from files and git, ne
   refine_round:           {check: refine_round}                    # a human rejected this phase
   plan_is_small:          {check: plan_tasks, file: "{plan}", max: 3}      # executing-plans instead of per-task sessions
   idea_doc_question_open: {check: section_items, file: "{idea}", section: '^## Open Questions', match: "{topic}"}
-  deps_merged:            {check: modules_done, from: capability_map}
+  deps_merged:            {check: modules_done}
   plan_exists_unchecked:  {check: plan_unchecked, file: "{plan}"}
   plan_done:                                  # a plan exists and every task is ticked; no plan is not "done"
     all:

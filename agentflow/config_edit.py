@@ -46,7 +46,7 @@ PHASE_FREE_KEYS = ("needs_approval", "resolve", "model", "agent")  # the rest of
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
     "version", "engine", "gates", "gate_sets", "guardrails", "conditions", "overlays", "project", "phase_approval",
     "record_step", "resolve_step", "paths", "defaults.env", "context.autocompact_env", "context.progress_file",
-    "hitl.notify", "dashboard.host",
+    "hitl.notify", "dashboard.host", "work_source", "skills",
 )
 PROTECTED = (
     *_PROTECTED_KEYS,

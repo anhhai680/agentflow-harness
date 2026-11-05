@@ -3,7 +3,7 @@ Use the `spec-driven-development` skill.
 Goal: draft `{spec}` for module `{module}`.
 
 Read, by path:
-- The `{module}` row in `{capability_map}` (scope, dependencies, build order).
+- The work source, if one is configured (`{capability_map}`): the `{module}` row (scope, dependencies, build order).
 - The idea doc, if one is configured (`{idea}`): `grep -n '^## '` first, then only the sections the module touches. Never read it whole.
 - The decision records that the module touches, and one finished spec of another module for the format, if there is one.
 

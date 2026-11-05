@@ -176,6 +176,8 @@ def test_yaml_text_may_change_anything_but_the_protected_settings(shipped):
     ('    spec_file: "SPEC-{module}.md"', '    spec_file: "{module}-spec.md"'),             # changed
     ('    spec_file: "SPEC-{module}.md"   # a module\'s spec is <specs>/<spec_file>\n', ""),  # removed
     ("version: 2\n", "version: 2\npaths:\n  state_dir: ../elsewhere\n"),              # paths.state_dir
+    ("  path: docs/specs/CAPABILITY-MAP.md", "  path: docs/other.md"),                  # work_source
+    ("    ship: finishing-a-development-branch", "    ship: executing-plans"),           # skills.map
 ])
 def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
     _, sha = config_edit.read(shipped)
@@ -188,6 +190,8 @@ def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
     (["project", "skills_dir"], "skills"),
     (["project", "docs", "spec_file"], "{module}-spec.md"),
     (["paths", "state_dir"], "../elsewhere"),
+    (["work_source", "path"], "docs/other.md"),
+    (["skills", "map", "ship"], "executing-plans"),
 ])
 def test_the_form_refuses_the_paths_the_runner_reads(shipped, key, value):
     with pytest.raises(Refused):

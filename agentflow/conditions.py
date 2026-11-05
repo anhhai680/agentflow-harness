@@ -16,7 +16,7 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agentflow import sources
+from agentflow import sources, work_source
 from agentflow.config import ON_UNKNOWN_VALUES, Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.gitops import GhError, changed_files, gh_json
 from agentflow.guards import path_matches
@@ -73,7 +73,7 @@ def make_ctx(cfg: Config, repo: Path, pipeline: str, params: dict, run: Run | No
         "plan": plan.relative_to(repo).as_posix() if plan else "",
         "plan_target": f"{docs['plans']}/{today}-{module}-{slug}.md" if module else "",
         "idea": docs.get("idea") or "",
-        "capability_map": docs["capability_map"],
+        "capability_map": cfg.work_source.path if cfg.work_source is not None else "",
         "topic": str(params.get("topic") or ""),
         "issue": str(params.get("issue") or ""),
         "run": run.id if run else "",
@@ -245,11 +245,9 @@ def _merged_heads(ctx: Ctx) -> set[str]:
 
 
 def _modules_done(spec: dict, ctx: Ctx) -> tuple[bool | None, str]:
-    source = str(spec.get("from", "capability_map"))
-    if source != "capability_map":
-        raise ValueError(f"modules_done: unsupported source {source!r}")
+    """Whether every module the run's module depends on (in the pack's work source) has a merged pull request."""
     module = ctx.values.get("module", "")
-    nodes = sources.capability_map(ctx.repo / ctx.values["capability_map"]) if ctx.values.get("capability_map") else []
+    nodes = work_source.items(ctx.cfg, ctx.repo)
     node = next((n for n in nodes if n.id == module), None)
     if node is None:
         return None, f"module '{module}' is not in the capability map"

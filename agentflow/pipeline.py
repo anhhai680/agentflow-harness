@@ -46,7 +46,7 @@ from agentflow.autonomy import (
     findings_note,
     phase_findings,
 )
-from agentflow import pack, sources
+from agentflow import pack, work_source
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.config_trust import config_sha256, start_options
@@ -158,6 +158,8 @@ def _check_new_module(cfg: Config, params: dict, new_module: dict | None) -> dic
     cannot be added, before any run exists."""
     if new_module is None:
         return None
+    if cfg.work_source is None:
+        raise ValueError("a new module needs a work_source in config.yaml: this pack has no table to add it to")
     template = (cfg.dashboard.get("backlog") or {}).get("module_row")
     if not isinstance(template, dict) or not template:
         raise ValueError("a new module needs dashboard.backlog.module_row in config.yaml")
@@ -168,10 +170,10 @@ def _check_new_module(cfg: Config, params: dict, new_module: dict | None) -> dic
 
 
 def _add_module_row(cfg: Config, run: Run, worktree: Path, template: dict, new_module: dict) -> None:
-    """Write a new module's row into the capability map of the run's worktree and commit it as the branch's
+    """Write a new module's row into the work source of the run's worktree and commit it as the branch's
     first commit, so every step that reads the map finds it. The runner does this, not an agent."""
-    relative = cfg.project.docs["capability_map"]
-    sources.add_module_row(worktree / relative, template, new_module)
+    work_source.add_item(cfg, worktree, template, new_module)
+    relative = cfg.work_source.path if cfg.work_source is not None else ""
     module = str(new_module["module"])
     sha = commit(worktree, f"Add module {module} to the capability map", cfg, paths=[relative],
                  expected_head=runner_head(run))

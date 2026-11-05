@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agentflow import intake, module_queue, sources
+from agentflow import intake, module_queue, sources, work_source
 from agentflow.conditions import first_phase_with_work, make_ctx
 from agentflow.config import check_lane
 from agentflow.events import EventLog, nfc
@@ -160,10 +160,9 @@ def lane_labels(cfg: Config) -> dict[str, str]:
 
 
 def _map_nodes(cfg: Config, repo: Path) -> list[sources.ModuleNode]:
-    path = repo / cfg.project.docs["capability_map"]
-    if module_queue.module_lane(cfg) is None or not path.is_file():
+    if module_queue.module_lane(cfg) is None:
         return []
-    return sources.capability_map(path)
+    return work_source.items(cfg, repo)
 
 
 # --------------------------------------------------------------------------- validation
@@ -361,8 +360,10 @@ def _picture(cfg: Config, repo: Path) -> dict:
     """Everything the board and the start rules need, read from files (no `gh`, no git)."""
     runs = list_runs(repo)
     nodes = _map_nodes(cfg, repo)
-    if not nodes and module_queue.module_lane(cfg) and not (repo / cfg.project.docs["capability_map"]).is_file():
-        # no map file here: show what an earlier `agentflow queue` recorded, if anything
+    source = work_source.file(cfg, repo)
+    if not nodes and module_queue.module_lane(cfg) and source is not None and not source.is_file():
+        # no map file here: show what an earlier `agentflow queue` recorded, if anything (a pack with no work
+        # source has no modules at all, so the board holds only the cards added on the page)
         nodes = [sources.ModuleNode(m["id"], list(m.get("deps") or [])) for m in module_queue.QueueState.load(repo).modules]
     mod_runs = module_queue.feature_runs(cfg, repo, runs)
     entries = module_queue.cached_entries(repo, nodes, mod_runs)

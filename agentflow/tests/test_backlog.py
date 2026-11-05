@@ -180,7 +180,7 @@ def test_nothing_depends_on_this_repositorys_lane_branch_or_map_names(flow_repo,
         rename(data)
         data["lanes"] = [renames.get(v, v) for v in data["lanes"]]
         data["conditions"]["build_done"] = {"all": [{"check": "lane", "is": "build"}, "plan_done"]}
-        data["project"]["docs"]["capability_map"] = "map/modules.md"
+        data["work_source"] = {"kind": "capability_map", "path": "map/modules.md"}
         data["project"]["fork_from"] = "next"
         data["project"]["base_branch"] = "trunk"
         data["project"]["branch"] = "wip/{lane}/{slug}"

@@ -1,10 +1,11 @@
 """`agentflow next` and `agentflow queue`.
 
-`next_step` is the deterministic port of `.claude/skills/next-step/SKILL.md` section 2, rules 2 to 7
-in order (rule 1 needs a conversation, so it is skipped): each rule is a small function that
-returns a `NextAnswer` or None, and the first answer wins.
+`next_step` is a deterministic check of the next step: rules 2 to 7 in order (rule 1, reading the
+conversation, needs a person, so it is skipped). Each rule is a small function that returns a `NextAnswer`
+or None, and the first answer wins. The skill each answer names comes from the pack's `skills.map`; with
+no entry, the answer names the stage (`Build stage`).
 
-`queue_tick` walks the capability map in row order and starts every module whose dependencies are
+`queue_tick` walks the pack's work source (`work_source`) in row order and starts every module whose dependencies are
 done, up to `max_parallel` runs at once. A module is done when its newest plan is fully checked (deferred tasks
 aside) and its branch has a merged pull request. Module ids come from a repo file, so they only ever travel as
 argv items, never through a shell.
@@ -29,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agentflow import gitops, sources
+from agentflow import gitops, sources, work_source
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.gitops import uncommitted_paths
 from agentflow.guards import path_matches
@@ -41,11 +42,7 @@ if TYPE_CHECKING:
 
 INTERVAL_S = 30.0
 SPAWN_TIMEOUT_S = 180
-DESIGN_DOC_PATHS = ("docs/ideas/", "docs/decisions/", "GLOSSARY.md")
-SECURITY_LINE = (
-    "a security path is involved: add `security-and-hardening` at Plan and Review "
-    "and offer `/doubt-driven-development` before Build"
-)
+DESIGN_DOC_KEYS = ("idea", "decisions", "glossary")  # the `project.docs` paths a design-doc change touches
 _PLAN_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}-(.+)\.md$")
 _MODULE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _STARTED = re.compile(r"^Started (\S+) in ", re.MULTILINE)
@@ -150,8 +147,33 @@ def branch_is_merged(cfg: Config, repo: Path, branch: str) -> tuple[bool | None,
 
 
 def _module_ids(cfg: Config, repo: Path) -> list[str]:
-    path = repo / cfg.project.docs["capability_map"]
-    return [n.id for n in sources.capability_map(path)] if path.is_file() else []
+    return [n.id for n in work_source.items(cfg, repo)]
+
+
+def _skill(cfg: Config, key: str, stage: str) -> str:
+    """The skill `skills.map` names for `key`, else the stage's name (`Build stage`)."""
+    return cfg.skills_map.get(key) or f"{stage} stage"
+
+
+def design_doc_paths(cfg: Config) -> list[str]:
+    """The `project.docs` `idea`, `decisions` and `glossary` paths the pack sets."""
+    docs = cfg.project.docs
+    return [str(docs[k]).strip().rstrip("/") for k in DESIGN_DOC_KEYS if isinstance(docs.get(k), str) and docs[k].strip()]
+
+
+def security_line(cfg: Config) -> str:
+    """What `next` says when a security path is involved, from `overlays.security.add_skills` (stage -> skill) and
+    `phases.plan.approval_note.human_skill`; `""` when either is missing."""
+    security = cfg.overlays.get("security")
+    added = security.get("add_skills") if isinstance(security, dict) else None
+    plan = cfg.phases.get("plan")
+    note = plan.approval_note if plan is not None else None
+    human = note.get("human_skill") if isinstance(note, dict) else None
+    if not isinstance(added, dict) or not added or not human:
+        return ""
+    skills = " and ".join(f"`{s}`" for s in dict.fromkeys(str(v) for v in added.values()))
+    stages = " and ".join(str(stage).title() for stage in added)
+    return f"a security path is involved: add {skills} at {stages} and offer `/{human}` before Build"
 
 
 def _ctx(cfg: Config, repo: Path, plan: Path | None) -> Ctx:
@@ -176,8 +198,8 @@ def rule_eval(cfg: Config, dirty: list[str]) -> NextAnswer | None:
     return NextAnswer(
         "eval", "Verify",
         [f"{len(hits)} uncommitted path(s) under overlays.eval.when_paths: {_some(hits)}"],
-        "verification-before-completion",
-        "re-run the eval suite with retrieval scored separately; a regression blocks the change",
+        _skill(cfg, "verify", "Verify"),
+        "run the eval gate; a regression blocks the change",
     )
 
 
@@ -190,7 +212,7 @@ def rule_unchecked_plan(cfg: Config, repo: Path, plan: Path | None, ctx: Ctx) ->
     if not open_tasks:
         return None
     small = "plan_is_small" in cfg.conditions and evaluate(cfg, "plan_is_small", ctx).value is True
-    skill = "executing-plans" if small else "subagent-driven-development"
+    skill = _skill(cfg, "build_small", "Build") if small else _skill(cfg, "build", "Build")
     return NextAnswer(
         "feature", "Build",
         [f"{plan.relative_to(repo).as_posix()}: {len(open_tasks)} of {len(tasks)} tasks unchecked "
@@ -210,18 +232,18 @@ def rule_checked_plan(cfg: Config, repo: Path, plan: Path | None) -> NextAnswer 
         return None
     evidence = [f"{plan.relative_to(repo).as_posix()} is fully checked",
                 f"{branch} has no merged pull request" if merged is False else f"could not check {branch}: {why}"]
-    return NextAnswer("feature", "Verify", evidence, "verification-before-completion",
-                      "then finishing-a-development-branch")
+    return NextAnswer("feature", "Verify", evidence, _skill(cfg, "verify", "Verify"),
+                      f"then {_skill(cfg, 'ship', 'Ship')}")
 
 
 def rule_spec_without_plan(cfg: Config, repo: Path) -> NextAnswer | None:
-    """Rule 5: an approved spec has no plan yet (capability-map order first)."""
+    """Rule 5: an approved spec has no plan yet (work-source order first)."""
     docs = cfg.project.docs
     specs_dir = repo / docs["specs"]
     cond = cfg.conditions.get("spec_is_approved") or {}
     if not specs_dir.is_dir() or not cond.get("approved") or not cond.get("pending"):
         return None
-    by_module = {p.name[len("SPEC-"):-len(".md")]: p for p in specs_dir.glob("SPEC-*.md")}
+    by_module = sources.spec_modules(specs_dir, cfg.project.spec_file)
     order = [m for m in _module_ids(cfg, repo) if m in by_module]
     order += sorted(m for m in by_module if m not in order)
     for module in order:
@@ -231,28 +253,31 @@ def rule_spec_without_plan(cfg: Config, repo: Path) -> NextAnswer | None:
         if sources.find_plan(repo / docs["plans"], module) is None:
             return NextAnswer(
                 "feature", "Plan", [f"{spec.relative_to(repo).as_posix()} is approved and {module} has no plan"],
-                "writing-plans", f"plan {module} from its approved spec",
+                _skill(cfg, "plan", "Plan"), f"plan {module} from its approved spec",
             )
     return None
 
 
-def rule_design_doc(dirty: list[str]) -> NextAnswer | None:
-    """Rule 6: uncommitted changes only under the idea doc, the ADRs or the glossary."""
-    if not dirty or not all(any(p == d or (d.endswith("/") and p.startswith(d)) for d in DESIGN_DOC_PATHS) for p in dirty):
+def rule_design_doc(cfg: Config, dirty: list[str]) -> NextAnswer | None:
+    """Rule 6: uncommitted changes only under the pack's `project.docs` `idea`, `decisions` or `glossary` (a
+    directory matches every path under it)."""
+    docs = design_doc_paths(cfg)
+    if not dirty or not docs or not all(any(p == d or p.startswith(f"{d}/") for d in docs) for p in dirty):
         return None
     return NextAnswer(
         "design-doc", "Define", [f"{len(dirty)} uncommitted path(s), all design docs: {_some(dirty)}"],
-        "domain-modeling",
-        "finish the idea-doc edits (CLAUDE.md, Editing the idea doc), then commit when the user asks",
+        _skill(cfg, "design_doc", "Define"),
+        "finish the design-doc edits, then commit when the user asks",
     )
 
 
-def rule_idle(dirty: list[str]) -> NextAnswer:
+def rule_idle(cfg: Config, dirty: list[str]) -> NextAnswer:
     """Rule 7: nothing in flight."""
     evidence = (f"{len(dirty)} uncommitted path(s) fit no lane: {_some(dirty)}" if dirty
                 else "no uncommitted changes, no open plan, no approved spec waiting for a plan")
-    return NextAnswer("none", "-", [evidence], "grilling or spec-driven-development",
-                      "nothing is in flight: ask what to do; grilling for a decision, spec-driven-development for something to build")
+    decide, define = _skill(cfg, "decide", "Define"), _skill(cfg, "define", "Define")
+    return NextAnswer("none", "-", [evidence], decide if decide == define else f"{decide} or {define}",
+                      f"nothing is in flight: ask what to do; {decide} for a decision, {define} for something to build")
 
 
 def next_step(cfg: Config, repo: Path) -> NextAnswer:
@@ -266,13 +291,14 @@ def next_step(cfg: Config, repo: Path) -> NextAnswer:
         or rule_unchecked_plan(cfg, repo, plan, ctx)
         or rule_checked_plan(cfg, repo, plan)
         or rule_spec_without_plan(cfg, repo)
-        or rule_design_doc(dirty)
-        or rule_idle(dirty)
+        or rule_design_doc(cfg, dirty)
+        or rule_idle(cfg, dirty)
     )
-    if "security_path" in cfg.conditions:
+    line = security_line(cfg)
+    if line and "security_path" in cfg.conditions:
         security = evaluate(cfg, "security_path", ctx)
         if security.value is True:  # unknown does not count: `next` must not guess
-            answer.security = SECURITY_LINE
+            answer.security = line
     return answer
 
 
@@ -281,7 +307,7 @@ def next_step(cfg: Config, repo: Path) -> NextAnswer:
 
 @dataclass
 class QueueState:
-    """`runs/queue.json`: one entry per capability-map module."""
+    """`runs/queue.json`: one entry per work-source module."""
 
     modules: list[dict] = field(default_factory=list)
 
@@ -456,7 +482,7 @@ def _report(entry: dict, reason: str, prior: dict[str, dict], say: Callable[[str
 
 
 def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = None) -> Assessment:
-    """Read the capability map and every module's run, write `runs/queue.json`, and start nothing.
+    """Read the work source and every module's run, write `runs/queue.json`, and start nothing.
 
     A module that cannot move without a person is reported through `log` as `queue: <id> blocked - <reason>`,
     once per change of reason; the reason is kept in `queue.json`, so a later tick or process stays quiet
@@ -464,7 +490,7 @@ def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = 
     """
     repo = Path(repo)
     say = log or (lambda _message: None)
-    nodes = sources.capability_map(repo / cfg.project.docs["capability_map"])
+    nodes = work_source.items(cfg, repo)
     prior = {m["id"]: m for m in QueueState.load(repo).modules}
     runs = feature_runs(cfg, repo)
     graph = {n.id: list(n.deps) for n in nodes}
@@ -685,9 +711,13 @@ def run_queue(
     once: bool = False, interval: float = INTERVAL_S, sleep: Callable[[float], None] = time.sleep,
     log: Callable[[str], None] | None = None,
 ) -> int:
-    """Tick every `interval` seconds until interrupted (Ctrl-C ends it cleanly); `once` ticks one time."""
+    """Tick every `interval` seconds until interrupted (Ctrl-C ends it cleanly); `once` ticks one time.
+
+    A pack with no `work_source` has no modules to start, so the queue refuses to run."""
     from agentflow import hitl
 
+    if cfg.work_source is None:
+        raise ValueError("this pack has no work_source: the queue has no modules to start")
     say = log or print
     with queue_lock(repo):
         try:

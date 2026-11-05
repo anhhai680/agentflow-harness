@@ -3,7 +3,7 @@ Use the `grilling` skill.
 Goal: turn the new module `{module}` into a short list of product questions for a human, each with your recommended option.
 
 Read, by path, and only what you need:
-- The `{module}` row and its dependencies in `{capability_map}`.
+- The work source, if one is configured (`{capability_map}`): the `{module}` row and its dependencies.
 - The idea doc, if one is configured (`{idea}`): run `grep -n '^## '` on it, then read only the sections this module touches (MVP Scope, Decisions Log, Open Questions). Never read it whole.
 - The decision records' index, then only the decision records the module touches.
 

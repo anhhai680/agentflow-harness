@@ -235,7 +235,7 @@ class FlowRepo:
                     for step in phase["steps"]:
                         if isinstance(step, dict):
                             step.pop("batch", None)
-            merged = deep_merge(data, deep_merge(base, patch or {}))
+            merged = deep_merge(deep_merge(data, base), patch or {})  # so `None` in `patch` deletes any key
             data.clear()
             data.update(merged)
 

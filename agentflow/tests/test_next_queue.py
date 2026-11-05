@@ -130,15 +130,15 @@ def test_next_spec_with_plan_or_pending_is_skipped(fr, monkeypatch):
 
 
 def test_next_doc_only_changes(fr):
-    write(fr.root, "docs/ideas/x.md", "# idea\n")
+    write(fr.root, "docs/idea.md", "# idea\n")
     write(fr.root, "GLOSSARY.md", "# terms\n")
     answer = next_step(fr.cfg, fr.root)
     assert answer.lane == "design-doc"
-    assert any("docs/ideas/x.md" in line for line in answer.evidence)
+    assert any("docs/idea.md" in line for line in answer.evidence)
 
 
 def test_next_mixed_changes_are_not_doc_only(fr):
-    write(fr.root, "docs/ideas/x.md", "# idea\n")
+    write(fr.root, "docs/idea.md", "# idea\n")
     write(fr.root, "src/other.py", "x = 1\n")
     assert next_step(fr.cfg, fr.root).lane == "none"
 
@@ -196,7 +196,7 @@ def test_format_answer_is_three_lines():
 
 def test_cmd_next_prints_the_answer(fr, capsys):
     fr.install_pack()
-    write(fr.root, "docs/ideas/x.md", "# idea\n")
+    write(fr.root, "docs/idea.md", "# idea\n")
     assert main(["next"]) == 0
     out = capsys.readouterr().out.splitlines()
     assert out[0] == "Lane: design-doc · Stage: Define"

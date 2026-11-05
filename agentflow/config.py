@@ -173,6 +173,8 @@ class Issue:
 DEFAULT_SKILLS_DIR = ".claude/skills"
 DEFAULT_SPEC_FILE = "{module}.md"  # a module's spec is `<docs.specs>/<spec_file>`
 REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea`, `decisions`, `glossary` are optional
+WORK_SOURCE_KINDS = ("capability_map",)  # a Markdown table with `Module id` and `Depends on` columns (`sources`)
+SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "verify", "ship")
 
 
 @dataclass
@@ -185,6 +187,14 @@ class Project:
     commit_trailer: str
     skills_dir: str = DEFAULT_SKILLS_DIR
     spec_file: str = DEFAULT_SPEC_FILE
+
+
+@dataclass
+class WorkSource:
+    """Where the modules `agentflow queue`, the Backlog and `modules_done` walk come from (`work_source:`)."""
+
+    kind: Literal["capability_map"]
+    path: str  # relative to the repository root
 
 
 @dataclass
@@ -333,6 +343,8 @@ class Config:
     autonomy: dict = field(default_factory=dict)
     resolve_step: Step | None = None
     ci: dict = field(default_factory=dict)
+    work_source: WorkSource | None = None  # None: no modules to queue; `next` and the Backlog go on without them
+    skills_map: dict[str, str] = field(default_factory=dict)  # the skill `next` names per kind of step (`skills.map`)
 
 
 def for_lane(steps: list[Step], lane: str) -> list[Step]:
@@ -614,6 +626,18 @@ def _skills_dir(value: str) -> str:
     return posixpath.normpath(value) if value else ""
 
 
+def _work_source(raw: dict) -> WorkSource | None:
+    block = _optional(raw, "work_source", "", dict, None)
+    if block is None:
+        return None
+    return WorkSource(kind=_require(block, "kind", "work_source", str), path=_require(block, "path", "work_source", str))
+
+
+def _skills_map(raw: dict) -> dict[str, str]:
+    block = _optional(raw, "skills", "", dict, {})
+    return {str(k): str(v) for k, v in _optional(block, "map", "skills", dict, {}).items()}
+
+
 def load_config(path: Path) -> Config:
     """Parse `path`, resolve `@` references and build the dataclasses."""
     path = Path(path)
@@ -703,6 +727,8 @@ def load_config(path: Path) -> Config:
         autonomy=_optional(raw, "autonomy", "", dict, {}),
         resolve_step=builder.step(raw["resolve_step"], "resolve_step") if raw.get("resolve_step") else None,
         ci=_optional(raw, "ci", "", dict, {}),
+        work_source=_work_source(raw),
+        skills_map=_skills_map(raw),
     )
 
 
@@ -766,6 +792,8 @@ class _Validator:
         if "check" in value:
             if value["check"] not in BUILTIN_CHECKS:
                 self.error(_join(path, "check"), f"unknown check '{value['check']}'")
+            if value["check"] == "modules_done" and "from" in value:
+                self.error(_join(path, "from"), "modules_done reads work_source")
         elif "all" in value or "any" in value:
             key = "all" if "all" in value else "any"
             members = value[key]
@@ -988,9 +1016,18 @@ class _Validator:
         for key in ("idea", "decisions", "glossary"):
             if key in docs and not isinstance(docs[key], str):
                 self.error(f"project.docs.{key}", "must be a path")
+        if "capability_map" in docs:
+            self.error("project.docs.capability_map", "the module list moved to `work_source: {kind: capability_map, "
+                       "path: ...}`; nothing reads project.docs.capability_map")
         spec_file = self.cfg.project.spec_file
         if "{module}" not in spec_file or "/" in spec_file:
             self.error("project.docs.spec_file", "spec_file is a file name holding {module}, such as '{module}.md'")
+        else:
+            try:
+                spec_file.format(module="m")
+            except (KeyError, IndexError, ValueError, AttributeError) as exc:
+                self.error("project.docs.spec_file", f"spec_file cannot be filled in ({type(exc).__name__}: {exc}): "
+                           "{module} is its only placeholder; write a literal brace as {{ or }}")
         skills_dir = self.cfg.project.skills_dir
         if skills_dir in ("", ".") or posixpath.isabs(skills_dir) or ".." in skills_dir.split("/"):
             self.error("project.skills_dir", "skills_dir is a directory inside the repository holding "
@@ -1016,11 +1053,39 @@ class _Validator:
         if not target.is_relative_to(root):
             return
         relative = target.relative_to(root).as_posix()
-        ignored = subprocess.run(["git", "check-ignore", "-q", f"{relative}/"], cwd=root, capture_output=True)
+        try:
+            ignored = subprocess.run(["git", "check-ignore", "-q", f"{relative}/"], cwd=root, capture_output=True)
+        except OSError:  # no git to ask: cannot tell whether it is ignored, so say nothing
+            return
         if ignored.returncode != 0:
             self.add("warning", "paths.state_dir",
                      f"the state dir {relative}/ is inside the repository and git does not ignore it: "
                      "add it to .gitignore, or leave paths.state_dir unset for a state dir outside the repository")
+
+    def work_source(self) -> None:
+        """`work_source:`: one kind, `capability_map`, at a path inside the repository."""
+        ws = self.cfg.work_source
+        if ws is None:
+            return
+        if ws.kind not in WORK_SOURCE_KINDS:
+            self.error("work_source.kind", "the only work source this engine reads is capability_map")
+        path = ws.path.strip()
+        if not path or posixpath.isabs(path) or ".." in posixpath.normpath(path).split("/"):
+            self.error("work_source.path", "path is a file inside the repository, relative to its root and without '..'")
+
+    def skills_map(self) -> None:
+        """`skills.map`: the skill `agentflow next` names for each kind of step; each one is in `skills_dir`."""
+        block = self.cfg.raw.get("skills")
+        if block is None:
+            return
+        for key in block:
+            if key != "map":
+                self.error(f"skills.{key}", "unknown key; known: map")
+        for key, skill in ((block.get("map") or {}) if isinstance(block.get("map"), dict) else {}).items():
+            if key not in SKILLS_MAP_KEYS:
+                self.error(f"skills.map.{key}", f"unknown key; known: {', '.join(SKILLS_MAP_KEYS)}")
+            else:
+                self.skill(skill, f"skills.map.{key}")
 
     def removed_defaults(self) -> None:
         for key, why in REMOVED_DEFAULTS.items():
@@ -1273,6 +1338,8 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.removed_defaults()
     v.project()
     v.paths()
+    v.work_source()
+    v.skills_map()
     v.agents()
     v.gate_definitions()
     v.conditions()

@@ -363,9 +363,11 @@ The pack is the repository's `.agentflow/` directory in the main checkout: `conf
 - `engine`: the engine versions that may run the pack, comma-separated clauses of `>=`, `>`, `<=`, `<`, `==` on dotted numbers, such as `">=2,<3"`. A range that leaves this engine out is refused. Protected.
 - `project`: branches (`base_branch`, `fork_from`, `branch`), `worktrees_dir`, the `docs` paths and the `commit_trailer`. Protected.
 - `project.skills_dir`: the directory holding `<skill>/SKILL.md` for every skill a step names, relative to the repository root; default `.claude/skills`. Protected.
-- `project.docs`: `specs` and `plans` (directories) are required; `idea`, `decisions` and `glossary` are optional, and a step with `checks:` needs `idea` and `decisions`. `{idea}` is empty when `idea` is unset. Protected.
-- `project.docs.spec_file`: a module's spec file name inside `docs.specs`, with `{module}` in it; default `{module}.md`. Protected.
+- `project.docs`: `specs` and `plans` (directories) are required; `idea`, `decisions` and `glossary` are optional, and a step with `checks:` needs `idea` and `decisions`. `{idea}` is empty when `idea` is unset. `agentflow next` reads uncommitted changes under only these three as a design-doc change. The module list is not here: see `work_source`. Protected.
+- `project.docs.spec_file`: a module's spec file name inside `docs.specs`, with `{module}` in it and no other placeholder (write a literal brace as `{{` or `}}`); default `{module}.md`. `agentflow next` reads every file in `docs.specs` that fits it as a module's spec. Protected.
 - `paths.state_dir`: where runs (`runs/`) and agent workspaces (`workspaces/`) live; `~` is expanded and a relative path is relative to the main checkout. Default `${XDG_STATE_HOME:-~/.local/state}/agentflow/<repo-id>`, outside the repository (`<repo-id>` is the checkout's name and a hash of its path). A state dir inside the repository that git does not ignore is a `validate` warning. Protected.
+- `work_source`: where the modules `agentflow queue`, the Backlog and the `modules_done` check walk come from: `kind` and `path` (relative to the repository root). The only kind is `capability_map`, a Markdown table with `Module id` and `Depends on` columns, one row per module in build order; `{capability_map}` is its path. Optional: without it `{capability_map}` is empty, `agentflow next` skips the module order, the Backlog shows only the cards added on the page, and `agentflow queue` refuses to run. Protected.
+- `skills`: `skills.map` names the skill `agentflow next` suggests for each kind of next step: `decide`, `define`, `design_doc`, `plan`, `build`, `build_small`, `verify` and `ship`. Each must be a skill in `project.skills_dir`, and another key is an error. Optional: a step with no entry is named by its stage (`Build stage`). Protected.
 - `agents.<name>`: the command line and arguments of an agent CLI, its models, `max_turns` and prices. Protected, except `enabled`, `models`, `max_turns` and `prices`.
 - `defaults`: the default agent, timeouts, `fix_attempts` and budgets. Not protected, except `defaults.env`.
 - `recovery`: how long an outage may last and how many failed attempts a step gets. Not protected.
@@ -375,7 +377,7 @@ The pack is the repository's `.agentflow/` directory in the main checkout: `conf
 - `gate_sets`: named lists of gates; `verify` is required. Protected.
 - `guardrails`: `forbidden_paths`, `reject_trailers` and `user_only_skills`. Protected.
 - `overlays`: the `security` and `eval` paths, keywords and added skills. Protected.
-- `conditions`: named checks the runner evaluates from files and git. Protected.
+- `conditions`: named checks the runner evaluates from files and git; `modules_done` reads `work_source` and takes no `from`. Protected.
 - `lanes`: the kinds of work. Not protected.
 - `record_step`, `resolve_step`: the steps that file a spec-gap answer and resolve a stop. Protected.
 - `autonomy`: what the runner decides by itself. Not protected.
