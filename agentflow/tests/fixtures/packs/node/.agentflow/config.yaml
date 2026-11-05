@@ -1,0 +1,100 @@
+# agentflow's minimum pack: a Node project with one lane, no prompt overrides (no prompts/ dir), no work source,
+# no idea doc, skills in skills/ and the default spec file name. `agentflow validate` checks it.
+version: 2
+engine: ">=2,<3"
+
+project:
+  base_branch: main
+  fork_from: main
+  branch: "flow/{lane}/{slug}"
+  worktrees_dir: ../greet-worktrees
+  skills_dir: skills
+  docs:
+    specs: docs
+    plans: docs/plans
+  commit_trailer: "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+
+agents:
+  claude:
+    enabled: true
+    command: [claude]
+    base_args: [-p, --output-format, stream-json, --verbose]
+    permission_mode: bypassPermissions   # allow rules are moot; deny rules, hooks and the guards still bind
+    models: {plan: opus, build: sonnet, mechanical: haiku, review: sonnet, debug: opus}
+    effort_arg: [--effort, "{effort}"]
+    max_turns: 80
+
+defaults:
+  agent: claude
+
+effort:
+  default: medium
+  allowed: [low, medium, high]
+
+context:
+  autocompact_pct: 60
+  rollover_pct: 80
+  max_rollovers: 2
+  progress_file: "runs/{run}/progress.md"
+  gate_output_lines: 200
+
+gates:
+  unit: {run: "node --test"}
+gate_sets:
+  verify: [unit]
+
+guardrails:
+  forbidden_paths: []
+
+conditions:
+  spec_exists:           {check: file_exists, path: "{spec}"}
+  plan_exists_unchecked: {check: plan_unchecked, file: "{plan}"}
+  plan_done:
+    all:
+      - {check: file_exists, path: "{plan}"}
+      - {not: plan_exists_unchecked}
+
+lanes: [feature]
+
+phases:
+  define:
+    needs_approval: true
+    model: opus
+    steps:
+      - {id: draft, skill: spec-driven-development, role: plan, prompt: spec.md, output: "{spec}",
+         unless: spec_exists, commit: true, message: "Draft the {module} spec"}
+  plan:
+    needs_approval: true
+    model: opus
+    skip_if: plan_exists_unchecked
+    steps:
+      - {id: plan, skill: writing-plans, role: plan, prompt: plan.md, output: "{plan_target}",
+         commit: true, message: "Plan {module}"}
+  build:
+    needs_approval: false
+    model: sonnet
+    skip_if: plan_done
+    steps:
+      - {id: build, foreach: plan_task, skill: subagent-driven-development, role: build, prompt: task.md,
+         brief: skills/subagent-driven-development/SKILL.md, gates: verify, fix_loop: true, commit: per_task}
+  verify:
+    needs_approval: false
+    model: sonnet
+    steps:
+      - {id: verify, skill: verification-before-completion, role: build, prompt: verify.md,
+         brief: skills/verification-before-completion/SKILL.md, gates: verify, fix_loop: true,
+         commit: true, message: "Fix issues found in verification"}
+  review:
+    needs_approval: false
+    model: sonnet
+    steps:
+      - {id: branch_review, skill: requesting-code-review, role: review, prompt: branch_review.md,
+         brief: skills/requesting-code-review/SKILL.md, blocks_on_findings: true}
+  ship:
+    needs_approval: false
+    steps:
+      - {id: finish, type: finish}
+
+dashboard:
+  host: 127.0.0.1
+  port: 7788

@@ -235,6 +235,16 @@ def test_a_merge_the_gates_never_accept_is_not_committed_or_pushed(flow_repo, gh
     assert not pushed(git, flow_repo, run) and not verbs(gh, "create") and not flow_repo.events(run, "base_synced")
 
 
+def test_a_pack_without_an_eval_condition_checks_the_merge_without_the_eval_gate(flow_repo, gh, git):
+    """`eval_required` is a pack's condition, not the engine's: a pack that defines none never runs the eval gate."""
+    run = begin(flow_repo, {"conditions": {"eval_required": None}})
+    own_work(flow_repo, run, {"mine.txt": "mine\n"})
+    target_moves(flow_repo, git, {"upstream.txt": "theirs\n"})
+    assert go(flow_repo, run) == "done"
+    (synced,) = flow_repo.events(run, "base_synced")
+    assert "eval" not in synced["gates"] and on_origin(git, flow_repo, run, "upstream.txt") == "theirs\n"
+
+
 # --------------------------------------------------------------------------- after the pull request exists
 
 

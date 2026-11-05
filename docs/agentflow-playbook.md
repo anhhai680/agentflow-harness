@@ -343,15 +343,11 @@ agentflow queue --max-parallel 2
 
 ## 13. Using agentflow in another repository
 
-`agentflow/` has no dependency on the TivaCare code, but `config.yaml` and the prompts are written for this repo's lanes, skills, docs layout and gates. To use it elsewhere (not yet tried), copy `agentflow/`, `AGENTS.md` and `.claude/skills/`, then in `config.yaml`:
+The engine (`agentflow/`) names no project: everything a repository decides is in its pack, the `.agentflow/` directory at the root of its main checkout (section 14). To use agentflow in another repository:
 
-- set `project.*` (`base_branch`, `fork_from`, `worktrees_dir`, `docs`, `commit_trailer`);
-- replace the `gates:` and `gate_sets:` with your quality bar's real commands, each with a `when_exists`;
-- rewrite the `conditions:` that read repo paths (spec status, the module package), the `overlays.security` and `overlays.eval` paths, and the `guardrails.forbidden_paths`;
-- keep only the lanes, phases and steps you use, and make every named skill exist under `.claude/skills/`;
-- rewrite the files in `agentflow/prompts/` that name this repo's docs and `src/tivacare`;
-- write `.claude/settings.json` `allow` rules for exactly your gate commands, and keep the `ask` and `deny` rules;
-- run `agentflow validate` until it prints 0 warnings, then `agentflow explain` and `agentflow run … --dry-run` before the first real run.
+1. Write `.agentflow/config.yaml`. Start from the `python` fixture pack (`agentflow/tests/fixtures/packs/python/.agentflow/config.yaml`), or from this repository's own `.agentflow/config.yaml`, and set its values: `project.*`, the `gates:` and `gate_sets:` (your quality bar's real commands; `gate_sets.verify` is required), the `conditions:` that read your docs, `overlays`, `guardrails`, and the lanes and steps you use. Every skill a step names must exist under `project.skills_dir`. `agentflow/tests/fixtures/packs/node` is the smallest pack that works.
+2. Put any prompt you want worded differently in `.agentflow/prompts/<name>.md`; it replaces the engine's file of the same name, and every other prompt comes from the engine.
+3. Run `agentflow validate` until it prints 0 warnings, then `agentflow explain <lane> --module <id>` and `agentflow run … --dry-run` before the first real run.
 
 Runs and workspaces live in the state dir, outside the repository unless `paths.state_dir` puts them inside it; then add that directory to `.gitignore` (`agentflow validate` warns until you do).
 
@@ -377,7 +373,7 @@ The pack is the repository's `.agentflow/` directory in the main checkout: `conf
 - `gate_sets`: named lists of gates; `verify` is required. Protected.
 - `guardrails`: `forbidden_paths`, `reject_trailers` and `user_only_skills`. Protected.
 - `overlays`: the `security` and `eval` paths, keywords and added skills. Protected.
-- `conditions`: named checks the runner evaluates from files and git; `modules_done` reads `work_source` and takes no `from`. Protected.
+- `conditions`: named checks the runner evaluates from files and git; `modules_done` reads `work_source` and takes no `from`. `finish` also runs the `eval` gate on a merged tree when the pack defines `eval_required` and it holds. Protected.
 - `lanes`: the kinds of work. Not protected.
 - `record_step`, `resolve_step`: the steps that file a spec-gap answer and resolve a stop. Protected.
 - `autonomy`: what the runner decides by itself. Not protected.

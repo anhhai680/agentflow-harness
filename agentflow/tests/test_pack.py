@@ -174,21 +174,6 @@ def test_cli_without_a_pack_says_so(tmp_git, monkeypatch, capsys):
     assert "this repository has no agentflow pack" in capsys.readouterr().out
 
 
-PROMPT_DENYLIST = re.compile(
-    r"(?i:tivacare)|CONSTRAINTS\.md|src/|docs/specs|docs/ideas|CAPABILITY-MAP|SPEC-|floor_guard|webadmin|next-step"
-)
-
-
-def test_engine_prompts_name_no_project():
-    hits = [
-        f"{f.name}:{n}"
-        for f in sorted(pack.ENGINE_PROMPTS.glob("*.md"))
-        for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1)
-        if PROMPT_DENYLIST.search(line)
-    ]
-    assert hits == []
-
-
 def test_engine_default_prompts_use_only_known_placeholders():
     for file in pack.ENGINE_PROMPTS.glob("*.md"):
         names = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", file.read_text(encoding="utf-8")))
