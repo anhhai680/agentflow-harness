@@ -1,0 +1,56 @@
+{
+  "enabledPlugins": {},
+  "permissions": {
+    "allow": [
+      "Bash(python3 devtools/floor_guard.py *)",
+      "Bash(uv run ruff check *)",
+      "Bash(uv run ruff format --check *)",
+      "Bash(uv run ruff format *)",
+      "Bash(uv run pyright)",
+      "Bash(uv run pyright *)",
+      "Bash(uv run pytest *)",
+      "Bash(uv run diff-cover *)",
+      "Bash(uv run python -m tivacare.eval.cli *)",
+      "Bash(uv run python -m tivacare.entrypoints.export_schemas)",
+      "Bash(uv sync)",
+      "Bash(uv lock)",
+      "Bash(pnpm exec tsc *)",
+      "Bash(pnpm biome check *)",
+      "Bash(pnpm exec vitest *)",
+      "Bash(pnpm install --frozen-lockfile --ignore-scripts --config.strictDepBuilds=false)",
+      "Bash(pnpm --dir webadmin exec tsc *)",
+      "Bash(pnpm --dir webadmin exec biome *)",
+      "Bash(pnpm --dir webadmin exec vitest *)",
+      "Bash(pnpm --dir webadmin generate)",
+      "Bash(pnpm --dir webadmin build)",
+      "Bash(pnpm --dir webadmin run check:no-dev-auth)",
+      "Bash(docker compose -p tivacare-test up -d postgres --wait)",
+      "Bash(python3 devtools/e2e_stack.py)",
+      "Bash(python3 devtools/e2e_stack.py *)",
+      "Bash(git diff *)",
+      "Bash(git status *)",
+      "Bash(git log *)",
+      "Bash(git show *)"
+    ],
+    "ask": [
+      "Bash(git push*)",
+      "Bash(gh pr *)"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)",
+      "Bash(git *--output*)",
+      "Bash(uv run git *)",
+      "Bash(pnpm exec git *)",
+      "Bash(pnpm dlx *)",
+      "Edit(/devtools/agentflow/runs/**)",
+      "Read(./.env)",
+      "Read(./.env.local)",
+      "Read(./.env.*.local)",
+      "Read(./.env.development)",
+      "Read(./.env.staging)",
+      "Read(./.env.production)",
+      "Read(./.env.test)"
+    ]
+  }
+}

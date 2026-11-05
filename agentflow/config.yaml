@@ -1,0 +1,386 @@
+# agentflow: the one file that decides what the workflow does.
+# Edit behaviour here, not in code. `agentflow validate` checks it.
+# A string value that starts with "@" is a reference to another key ("@overlays.eval.when_paths").
+version: 1
+
+project:
+  base_branch: main            # the base the changed-path conditions compare against (`origin/<base_branch>`)
+  fork_from: main              # the branch a run is cut from and its pull request goes to; `finish` brings it in first
+  branch: "flow/{lane}/{slug}"
+  worktrees_dir: ../tivacare-worktrees
+  docs:
+    idea: docs/ideas/agentic-rag-customer-support.md
+    capability_map: docs/specs/CAPABILITY-MAP.md
+    specs: docs/specs
+    plans: docs/plans
+    decisions: docs/decisions
+  commit_trailer: "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+
+agents:
+  claude:
+    enabled: true
+    command: [claude]
+    base_args: [-p, --output-format, stream-json, --verbose]
+    # bypassPermissions: allow rules are moot, so an agent never stops on an unlisted command. Still binding:
+    # deny and ask rules in .claude/settings*.json (ask = denied headless), the runner's --settings denies
+    # (forbidden paths, `gh`), PreToolUse hooks, and the guards. Set acceptEdits for a run held to allow rules.
+    permission_mode: bypassPermissions
+    models: {plan: opus, build: sonnet, mechanical: haiku, review: sonnet, debug: opus}  # fallback when a phase sets no model
+    effort_arg: [--effort, "{effort}"]   # the level is the agent's choice (see `effort:`), never set per step
+    max_turns: 80
+    prices:                      # USD per 1M tokens; prices a session Claude never reported a cost for (rollover, timeout)
+      claude-opus-5-5:   {input: 4.00, output: 20.00, cache_read: 0.20, cache_write_5m: 5.00,  cache_write_1h: 8.00}
+      claude-sonnet-5-5: {input: 2.00, output: 10.00, cache_read: 0.10, cache_write_5m: 2.50,  cache_write_1h: 4.00}
+      claude-haiku-5-5:  {input: 0.10, output: 0.50,  cache_read: 0.01, cache_write_5m: 0.125, cache_write_1h: 0.20}
+      # checked against `claude -p` costUSD on 2026-10-30 (1h cache writes); the 5m write rate is 1.25x input, not probed.
+      # Haiku 5.5 costs more above 100K-token prompts. Verify current pricing before changing a figure.
+  codex:
+    enabled: false
+    command: [codex]
+    base_args: [exec, --json]
+    profile: agentflow          # sandbox/approval policy lives in Codex's own config.toml profile
+    models: {plan: gpt-5-codex, build: gpt-5-codex, review: gpt-5-codex}
+    effort_arg: [-c, "model_reasoning_effort={effort}"]
+    skill_loading: read_file   # the prompt tells it to read .claude/skills/<skill>/SKILL.md
+
+defaults:
+  agent: claude
+  step_timeout_min: 45
+  gate_timeout_min: 30         # each gate command; past it the gate's process group is killed and it fails
+  fix_attempts: 3              # gate failure: the same session is resumed with the gate output
+  run_budget_usd: 25           # stop + checkpoint when the run's summed cost crosses it
+  task_budget_usd: 1.0         # a feature run's budget grows to spend + this x unticked tasks + 25% of run_budget_usd
+                               # (measured: $0.73 mean, $1.71 max per task; 20 tasks after a $4.4 plan -> ~$31)
+  env:                         # for every agent session and gate of a run; values are strings
+    FORCE_PROMPT_CACHING_5M: "1"   # 5-minute cache writes cost 37.5% less than the 1-hour default; sessions rarely idle
+    POSTGRES_HOST_PORT: "55432"    # compose and tests/integration/conftest.py both read it, so a local Postgres can't clash
+
+recovery:                       # a usage limit just waits for its reset; these bound everything else
+  give_up_h: 24                 # an outage longer than this stops for a human
+  failed_attempts: 3            # calls that reached the model and still died: that costs money, an outage does not
+
+effort:
+  default: medium               # every step's sizing session starts here
+  allowed: [low, medium, high]  # the only levels an agent may pick; resumes reuse the step's level
+
+context:
+  autocompact_pct: 60            # Claude Code auto-compact override on every `claude -p`
+  autocompact_env: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+  rollover_pct: 80               # runner safety net
+  max_rollovers: 2               # then HITL: split the task
+  context_window_tokens: auto    # from stream-json model info; set a number to override
+  default_window_tokens: 1000000 # used until a result event reports the model's window. opus-5-5, sonnet-5-5 and
+                                 # haiku-5-5 all report 1M; a wrong value here makes the runner roll sessions over early
+  progress_file: "runs/{run}/progress.md"
+  gate_output_lines: 200
+
+gates:                          # names to commands; copied from CONSTRAINTS.md, never weakened here
+  floor:        {run: "python3 devtools/floor_guard.py --base origin/main"}
+  py_lint:      {run: "uv run ruff check . && uv run ruff format --check .", when_exists: pyproject.toml}
+  py_types:     {run: "uv run pyright", when_exists: pyproject.toml}
+  # -n: pytest-xdist; 4 workers at most keeps the shared test Postgres under its 100 connections
+  py_unit:      {run: "uv run pytest tests/unit --cov=src/tivacare --cov-report=xml -n auto --maxprocesses 4 --dist loadfile",
+                 when_exists: tests/unit}
+  py_integration: {run: "uv run pytest tests/integration --cov=src/tivacare --cov-append --cov-report=xml -n auto --maxprocesses 4 --dist loadfile",
+                   when_exists: tests/integration}   # needs Postgres: the `setup` step starts it; can't connect = fails
+  py_cov_diff:  {run: "uv run diff-cover coverage.xml --fail-under=80", when_exists: coverage.xml}
+  web_types:    {run: "pnpm exec tsc --noEmit", cwd: webadmin, when_exists: webadmin/package.json}
+  web_lint:     {run: "pnpm biome check .", cwd: webadmin, when_exists: webadmin/package.json}
+  web_unit:     {run: "pnpm exec vitest run --coverage", cwd: webadmin, when_exists: webadmin/package.json}
+  eval:         {run: "uv run python -m tivacare.eval.cli gate", when_exists: src/tivacare/eval}
+  setup_py:     {run: "uv sync", when_exists: pyproject.toml}
+  setup_web:    {run: "pnpm install --frozen-lockfile --ignore-scripts --config.strictDepBuilds=false", cwd: webadmin,
+                 when_exists: webadmin/package.json}   # no install scripts; pnpm 12 fails on skipped ones unless told it's on purpose
+  setup_db:     {run: "docker compose -p tivacare-test up -d postgres --wait", when_exists: compose.yaml}  # one server for all runs: tests make their own databases
+  web_e2e:      {run: "python3 devtools/e2e_stack.py", when_exists: webadmin/e2e}  # SPEC-platform R10 / CI's e2e job, not a
+                                                   # CONSTRAINTS row: one locked stack per machine, configured from .env.example;
+                                                   # named by verify/verify only, never in `gate_sets.verify`
+gate_sets:
+  setup:  [setup_py, setup_web, setup_db]                          # the environment, before an agent needs it
+  build:  [floor, py_lint, py_types, web_types, web_lint]          # CONSTRAINTS Lifecycle: Build
+  verify: [floor, py_lint, py_types, py_unit, py_integration, py_cov_diff, web_types, web_lint, web_unit]
+
+guardrails:
+  forbidden_paths:              # any diff here fails the step (an agent may not touch them in a run)
+    - CONSTRAINTS.md
+    - devtools/floor_guard.py
+    - eval/baseline.json
+    - devtools/agentflow/config.yaml
+    - devtools/agentflow/tests/**    # outside the floor's removed-assertions check, so no agent edits it in a run
+    - .claude/**
+  reject_trailers: ["Constraints-Approved-By"]
+  user_only_skills: [improve-codebase-architecture, constraint-driven-development,
+                     doubt-driven-development, using-git-worktrees, writing-for-agents]
+
+overlays:
+  security:
+    when_paths: ["src/tivacare/staff_auth/**", "**/identity/**", "**/attachments/**",
+                 "**/redaction/**", "**/widget/**", "src/tivacare/knowledge/retrieval/**"]
+    when_keywords: [IS4, Entra, customer_code, "visibility = public", attachment, redaction]
+    add_skills: {plan: security-and-hardening, review: security-and-hardening}
+    review_agent: security-auditor
+  eval:                         # the repo's eval-gate inputs (CLAUDE.md "Eval gate"); lanes carry no repo paths
+    when_paths: [src/tivacare/knowledge/retrieval/**, src/tivacare/knowledge/tables/**,
+                 src/tivacare/crm/model_fields.py, src/tivacare/llm_gateway/models.toml,
+                 src/tivacare/agent/policy.py, src/tivacare/agent/prompts/**]
+
+conditions:                     # evaluated by the runner from files and git, never by a model
+  spec_exists:            {check: file_exists, path: "docs/specs/SPEC-{module}.md"}
+  spec_has_open_questions:
+    check: section_items                      # counts open items in one section
+    file: "docs/specs/SPEC-{module}.md"
+    section: '^## Open Questions'
+    stop_at: ['^\*\*Resolved', '^\*\*For the AWS stage']   # deferred/resolved lists don't count
+    none_patterns: ['^(- )?None\b', '^None for this module']
+    min: 1
+  spec_is_approved:
+    check: status_line
+    file: "docs/specs/SPEC-{module}.md"
+    approved: '\*\*Status: approved'
+    pending: 'pending approval'               # a later "Amended ..., pending approval" wins
+    on_unknown: ask_human                     # no status line: the human says
+  spec_awaits_approval: {not: spec_is_approved, on_unknown: false}  # only a spec that says "pending approval": no status line passes
+  spec_defines_contracts:                     # a public surface: routes, WebSocket messages, or interfaces other modules call
+    check: grep
+    file: "docs/specs/SPEC-{module}.md"
+    pattern: '\b(GET|POST|PUT|PATCH|DELETE) /|WebSocket|^#{2,3} .*(Contracts this module provides|What other modules get from this one)'
+  spec_api_reviewed:                          # the spec's own review is recorded as "**Resolved (<date>, API review...)**"
+    check: grep
+    file: "docs/specs/SPEC-{module}.md"
+    pattern: '^\*\*Resolved \(\d{4}-\d{2}-\d{2}, API review'
+  spec_needs_api_design:                      # api-and-interface-design runs once per spec, before writing-plans
+    all: [spec_defines_contracts, {not: spec_api_reviewed}]
+  security_path:
+    any:
+      - {check: changed_paths, globs: "@overlays.security.when_paths"}
+      - {check: grep, file: "{plan}", pattern: "@overlays.security.when_keywords"}
+  eval_paths_touched:     {check: changed_paths, globs: "@overlays.eval.when_paths"}
+  eval_required:          {any: [{check: lane, is: eval}, eval_paths_touched]}
+  refine_round:           {check: refine_round}                    # a human rejected this phase
+  plan_is_small:          {check: plan_tasks, file: "{plan}", max: 3}      # executing-plans instead of per-task sessions
+  idea_doc_question_open: {check: section_items, file: "{idea}", section: '^## Open Questions', match: "{topic}"}
+  deps_merged:            {check: modules_done, from: capability_map}
+  plan_exists_unchecked:  {check: plan_unchecked, file: "{plan}"}
+  plan_done:                                  # a plan exists and every task is ticked; no plan is not "done"
+    all:
+      - {check: file_exists, path: "{plan}"}
+      - {not: plan_exists_unchecked}
+  build_done:             {all: [{check: lane, is: feature}, plan_done]}   # only a feature run has a plan to finish
+
+lanes: [feature, bug, eval, design]   # kinds of work: a lane selects steps of the workflow below, it is not a workflow
+
+record_step:                    # a spec gap settled during a run (hitl.record_decisions.spec_gap); it files an answer
+  {id: record_decision, skill: domain-modeling, role: build, prompt: record_decision.md,
+   brief: .claude/skills/domain-modeling/SKILL.md, commit: true, message: "Decide {topic} in SPEC-{module}"}
+
+resolve_step:                   # a stop in a `resolve: true` phase, run as <key>/resolve-<n> on opus; see `autonomy.resolve_kinds`
+  {id: resolve, skill: systematic-debugging, role: plan, prompt: resolve.md,
+   brief: .claude/skills/systematic-debugging/SKILL.md}
+
+autonomy:                       # what the runner does on its own; which phases it applies to is on each phase
+  non_blocking_severities: [minor, low, info, nit]   # any other severity, or none, blocks: findings fail closed
+  finding_rounds: 2             # refine rounds the runner opens on blocking findings, then the phase goes to a human
+  answer_recommended: true      # a `needs_human` whose questions all have a recommended option takes it
+  revert_forbidden: 1           # put a forbidden path back and tell the step, this often per step
+  resolve_kinds:                # stop kind: resolver sessions per step. Any kind not here stops for a human
+    blocked: 2
+    blocked_repeat: 2
+    step_timeout: 2
+    gate_failed: 2
+    fix_attempts_exhausted: 2
+    eval_regression: 2
+    red_test_passes: 2
+    review_unresolved: 1
+
+ci:                             # the `ci` step in `ship`
+  poll_s: 60
+  appear_min: 5                 # no checks at all for this long is a stop
+  timeout_min: 45               # still pending after this is a stop
+  fix_rounds: 3
+  rerun_rounds: 1               # a fix session that changes nothing runs the failed jobs again, this often
+  sync_rounds: 2                # `finish`: resolver sessions for the target branch's conflicts, and re-syncs if GitHub still reports one
+
+phases:                         # the main workflow, in order; --from/--to on the CLI override the ends
+  # needs_approval: every phase says whether a human approves it once it ran. false moves on by itself.
+  # resolve: true sends this phase's stops to the resolver before a human hears of them.
+  # Each step maps to one skill. `lanes:` limits a step to some lanes; with no tag it runs for all of them. A phase
+  # with no step for a run's lane is skipped with no approval, so every lane walks this one list.
+  # model: a string, or a role map with `default`; skip_if: a condition
+  # brief: repo files the runner puts in the prompt at `{brief}`. Sonnet sessions never load a skill by name (0 of 96
+  # in the real runs), so a step on Sonnet that names a skill must name a brief; tests/test_workflow.py holds this.
+  # task_briefs: the same for one plan task, when its text names the key (a `webadmin/` task gets the frontend skill).
+  # role: review is read-only and always a fresh session, also in a refine round
+  # blocks_on_findings: true: the step's blocking `findings` hold back a phase with needs_approval: false
+  define:                                    # the deciding steps on opus; `apply` files answers a human already gave
+    needs_approval: true
+    model: {default: opus, build: sonnet}
+    steps:
+      - id: idea
+        lanes: [feature]
+        unless: spec_exists
+        steps:
+          - {id: idea_questions, skill: grilling, role: plan, prompt: idea.md, output: "runs/{run}/questions.md"}
+          - {id: idea_answers, type: checkpoint, name: idea_answers, wait_for: answered_file}
+      - {id: debug, lanes: [bug], skill: systematic-debugging, role: debug, prompt: debug.md}
+      - id: decide
+        lanes: [design]
+        steps:
+          - {id: grill_topic, skill: grilling, role: plan, prompt: grill_questions.md,
+             output: "runs/{run}/questions.md"}                       # questions + recommended answers
+          - {id: topic_answers, type: checkpoint, wait_for: answered_file}
+          - {id: apply_topic, skill: domain-modeling, role: plan, prompt: design_apply.md,
+             checks: [decisions_log_row, open_question_removed, adr_index_updated]}
+      - {id: draft, lanes: [feature], skill: spec-driven-development, role: plan, prompt: spec.md,
+         output: "docs/specs/SPEC-{module}.md", unless: spec_exists,
+         commit: true, message: "Draft SPEC-{module}"}
+      - {id: contracts, lanes: [feature], skill: api-and-interface-design, role: plan, prompt: contracts.md,
+         when: spec_needs_api_design, commit: true, message: "Add contracts to SPEC-{module}"}
+      - id: grill_open_questions
+        lanes: [feature]
+        when: spec_has_open_questions
+        repeat: {until: {not: spec_has_open_questions}, max_rounds: 2}  # then HITL
+        steps:
+          - {id: grill, skill: grilling, role: plan, prompt: grill_spec_questions.md,
+             output: "runs/{run}/questions.md"}
+          - {id: answers, type: checkpoint, wait_for: answered_file}
+          - {id: apply, skill: domain-modeling, role: build, prompt: spec_apply.md,
+             brief: [.claude/skills/domain-modeling/SKILL.md, .claude/skills/domain-modeling/ADR-FORMAT.md],
+             commit: true, message: "Resolve open questions in SPEC-{module}"}
+      - {id: spec_approval, lanes: [feature], gates: [], when: spec_awaits_approval}  # no agent: it only keeps `define`
+                                                                     # from being skipped, so its approval is the human's
+  plan:                                      # the plan on opus; `record_step` files a human's answer on sonnet
+    needs_approval: true
+    approval_note: {when: security_path, human_skill: doubt-driven-development}  # a human runs it, never the runner
+    model: {default: opus, build: sonnet}
+    skip_if: plan_exists_unchecked
+    steps:
+      - {id: plan, lanes: [feature], skill: writing-plans, role: plan, prompt: plan.md,
+         output: "docs/plans/{date}-{module}-{slug}.md", commit: true, message: "Plan {module}"}
+  build:                                     # implementer and per-task reviewer on sonnet, `change` on opus
+    needs_approval: false
+    resolve: true
+    model: {default: sonnet, review: sonnet, plan: opus}
+    skip_if: build_done
+    steps:
+      - &setup                                                        # no agent: a failure stops for a human, at no cost
+        {id: setup, lanes: [feature, bug], type: gate, gates: setup}
+      - id: build
+        lanes: [feature]
+        foreach: plan_task
+        skill: subagent-driven-development   # the runner is the controller; each task's session is one implementer
+        role: build
+        prompt: task.md
+        brief: [.claude/skills/subagent-driven-development/implementer-prompt.md, .claude/skills/test-driven-development/SKILL.md,
+                .claude/skills/test-driven-development/writing-good-tests.md]
+        task_briefs:
+          "webadmin/": .claude/skills/frontend-ui-engineering/SKILL.md
+          "web/": .claude/skills/frontend-ui-engineering/SKILL.md
+        gates: build
+        fix_loop: true
+        review: {skill: requesting-code-review, role: review, prompt: task_review.md,
+                 brief: .claude/skills/requesting-code-review/code-reviewer.md}
+        commit: per_task                                              # ticks the plan's - [ ] boxes
+        batch: {max_tasks: 3, max_files: 3, prompt: task_next.md}     # neighbouring small tasks: one session, one review
+        small_plan: {when: plan_is_small, skill: executing-plans, prompt: task_inline.md,
+                     brief: &tdd_brief [.claude/skills/test-driven-development/SKILL.md,
+                                        .claude/skills/test-driven-development/writing-good-tests.md],
+                     shared_session: true, review: false}
+      - {id: regression_test, lanes: [bug], skill: test-driven-development, role: build, prompt: regression_test.md,
+         brief: *tdd_brief, expect: red}                              # the new test must FAIL
+      - {id: fix, lanes: [bug], skill: test-driven-development, role: build, prompt: fix.md, brief: *tdd_brief,
+         gates: verify, expect: green, fix_loop: true, commit: true, message: "Fix {slug}"}  # the regression test must PASS too
+      - {id: change, lanes: [eval], role: plan, prompt: eval_change.md, tdd: false, commit: true,
+         message: "Change {slug}"}                                    # prompt, model, chunking or retrieval; no TDD
+  verify:
+    needs_approval: false
+    resolve: true
+    model: sonnet
+    steps:
+      - *setup                                                        # Docker may have stopped during an approval wait
+      - &plan_fixes                                                   # a refine round: decide what each finding needs
+        {id: plan_fixes, lanes: [feature, bug, eval], skill: receiving-code-review, role: plan, model: opus,
+         prompt: plan_fixes.md, brief: .claude/skills/receiving-code-review/SKILL.md, when: refine_round}
+      - &fix_findings                                                 # then carry that plan out; the runner commits
+        {id: fix_findings, lanes: [feature, bug, eval], skill: receiving-code-review, role: build,
+         prompt: fix_findings.md, brief: .claude/skills/receiving-code-review/SKILL.md,
+         when: refine_round, gates: verify, fix_loop: true, commit: true, message: "Fix findings"}
+      - {id: verify, lanes: [feature, bug], skill: verification-before-completion, role: build, prompt: verify.md,
+         brief: .claude/skills/verification-before-completion/SKILL.md, blocks_on_findings: true, gates_first: true,
+         gates: [verify, web_e2e], fix_loop: true, commit: true,              # e2e here only: not in every fix loop,
+         message: "Fix issues found in verification"}                         # sync or CI fix (CI's e2e job checks the PR)
+      - &eval_gate                                                    # a pass calls no agent; never lowers the baseline
+        {id: eval_gate, lanes: [feature, bug, eval], type: gate, skill: verification-before-completion, role: build,
+         prompt: eval_verify.md, brief: .claude/skills/verification-before-completion/SKILL.md,
+         gates: [floor, eval], when: eval_required, fix_loop: true, on_fail: block}
+  review:                                    # the reviewers and the fix on sonnet, `plan_fixes` on opus
+    needs_approval: false
+    resolve: true
+    model: {default: sonnet, build: sonnet}
+    steps:
+      - {<<: *setup, lanes: [feature, bug, eval], when: refine_round}  # the fix below runs the verify gates
+      - *plan_fixes
+      - *fix_findings                        # the reviews are read-only: their findings are fixed here, then re-checked
+      - {<<: *eval_gate, when: {all: [refine_round, eval_required]}}  # a review fix never bypasses the eval gate
+      - {id: branch_review, lanes: [feature, bug, eval], skill: requesting-code-review, role: review,
+         prompt: branch_review.md, brief: .claude/skills/requesting-code-review/code-reviewer.md,
+         blocks_on_findings: true}
+      - {id: security_review, lanes: [feature, bug, eval], skill: security-and-hardening, when: security_path,
+         role: review, prompt: security_review.md, brief: .claude/skills/security-and-hardening/SKILL.md,
+         blocks_on_findings: true}
+  ship:                                      # `ci` fixes on opus through its own session; stops here are a human's
+    needs_approval: false
+    steps:
+      - {id: commit, lanes: [design], type: commit, message: "Decide {topic} in agentic RAG idea doc"}
+      - id: finish                           # every lane: bring origin/<fork_from> in, then push the run's own branch + gh pr create --draft
+        type: finish
+        gates: setup                         # the environment, before the merged tree is checked
+        sync: {id: sync, skill: systematic-debugging, role: plan, prompt: sync_conflicts.md,
+               brief: .claude/skills/systematic-debugging/SKILL.md, gates: verify, fix_loop: true,
+               human_paths: ["**/uv.lock", "**/pnpm-lock.yaml"]}   # conflicts here (and in security paths) are a human's
+      - id: ci                               # every lane: wait for CI, fix what fails, gh pr ready. Never merges
+        type: ci
+        gates: setup                         # the environment, before a fix session runs the verify gates
+        fix: {id: fix, skill: systematic-debugging, role: plan, prompt: ci_fix.md,
+              brief: .claude/skills/systematic-debugging/SKILL.md, gates: verify, fix_loop: true,
+              forbid: [".github/workflows/**"], commit: true, message: "Fix CI failures"}
+  # a phase can also move to another agent: {agent: codex, model: gpt-5-codex, steps: ...}
+
+phase_approval:                  # raised after a phase with needs_approval: true, and on findings nothing could fix
+  refine_prompt: refine.md       # template for each step of a refine round
+  show: [handoff, diff, step_results, skipped_steps, gates, review_findings]
+
+checkpoints:                     # inner checkpoints, inside a phase
+  idea_answers:       human      # always: product questions
+
+hitl:
+  notify:
+    - {type: terminal_bell}
+    - {type: macos, title: "agentflow: {run} needs you"}       # osascript display notification
+    - {type: webhook, url_env: AGENTFLOW_WEBHOOK_URL, enabled: false}  # Slack/Teams/ntfy later
+  remind_after_h: 4
+  record_decisions: {spec_gap: record_step, ambiguity: commit_body, review_dispute: commit_body}
+  park_independent: true          # honour can_continue_without
+
+dashboard:
+  host: 127.0.0.1
+  port: 7788
+  show_done_days: 0               # days a Done card stays on the Board; 0 keeps every one (history stays until you delete runs/)
+  agents: {show_exited_min: 10, idle_warn_min: 5}
+  backlog:
+    sync_base: true
+    module_lane: feature            # the lane that runs a map module; without it, map modules can't be started here
+    lane_labels:                    # the page's words for a lane; a lane left out shows its own name
+      feature: New module
+      bug: Bug fix
+      eval: Prompt or retrieval change
+      design: Design decision
+    new_task:                       # lane: its form fields; a lane left out can't be added from the page
+      feature: [new_module]
+      bug:     [issue, task, after]
+      eval:    [task, after]
+      design:  [topic, after]
+    module_row:                     # column header: cell template for a new module's row
+      "Module id": "`{module}`"
+      "Responsibility": "{responsibility}"
+      "Depends on": "{deps}"
+      "Spec": "[SPEC-{module}](SPEC-{module}.md)"

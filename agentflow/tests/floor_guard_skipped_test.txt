@@ -1,0 +1,8 @@
+def test_it():
+    assert 1 == 1
+    assert 2 == 2
+
+
+@pytest.mark.skip
+def test_later():
+    assert True

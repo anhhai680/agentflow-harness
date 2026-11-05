@@ -1,0 +1,1198 @@
+"""Load and validate `config.yaml`: typed dataclasses, `@a.b.c` references, clear errors.
+
+`load_config` fails fast with a `ConfigError` (carrying the dotted YAML path) for anything
+that cannot be turned into the dataclasses. `validate` then reports every semantic problem
+it can find as a list of `Issue`s, so one run shows them all.
+"""
+
+from __future__ import annotations
+
+import re
+import shlex
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+
+import yaml
+
+KNOWN_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+BUILTIN_CHECKS = (
+    "file_exists",
+    "grep",
+    "section_items",
+    "status_line",
+    "changed_paths",
+    "plan_tasks",
+    "plan_unchecked",
+    "modules_done",
+    "gate_passed",
+    "branch_merged",
+    "result_signal",
+    "command",
+    "lane",
+    "refine_round",
+)
+ON_UNKNOWN_VALUES = ("ask_human", "agent", True, False)
+BACKLOG_KEYS = ("sync_base", "module_lane", "new_task", "module_row", "lane_labels")
+BACKLOG_FIELDS = ("issue", "task", "topic", "new_module", "after")  # the form fields agentflow knows
+STEP_TYPES = ("agent", "gate", "group", "checkpoint", "finish", "commit", "ci")
+EXPLICIT_STEP_TYPES = ("checkpoint", "finish", "commit", "ci")
+PHASE_KEYS = ("agent", "model", "skip_if", "steps", "needs_approval", "resolve", "approval_note")
+APPROVAL_PHASE_KEYS = ("approval", "auto_approve")
+PHASE_APPROVAL_KEYS = ("refine_prompt", "show")
+REMOVED_DEFAULTS = {  # keys that were read but never acted on: a value here would look like it does something
+    "commit": "a step's own `commit:` decides when the runner commits",
+    "push": "`finish` always pushes the run's own branch",
+    "pr": "`finish` always opens a draft pull request, and the `ci` step marks it ready",
+}
+AUTONOMY_KEYS = ("non_blocking_severities", "finding_rounds", "resolve_kinds", "answer_recommended", "revert_forbidden")
+CI_KEYS = ("poll_s", "appear_min", "timeout_min", "fix_rounds", "rerun_rounds", "sync_rounds")
+STEP_KEYS = (
+    "id",
+    "type",
+    "skill",
+    "role",
+    "prompt",
+    "output",
+    "when",
+    "unless",
+    "repeat",
+    "next",
+    "gates",
+    "fix_loop",
+    "gates_first",
+    "review",
+    "commit",
+    "message",
+    "foreach",
+    "expect",
+    "model",
+    "wait_for",
+    "checks",
+    "on_fail",
+    "steps",
+    "lanes",
+    "tdd",
+    "small_plan",
+    "batch",
+    "brief",
+    "task_briefs",
+    "name",
+    "blocks_on_findings",
+    "forbid",
+    "fix",
+    "sync",
+    "human_paths",
+)
+
+
+# The design lane's built-in doc checks a step may name in `checks:` (`gates.run_doc_checks`).
+DOC_CHECK_NAMES = ("decisions_log_row", "open_question_removed", "adr_index_updated")
+
+
+# Placeholders a prompt template may use, as `{name}`. The first group is Task 5's `make_ctx`
+# keys; the second is the per-step extras the runner adds. Later tasks extend this set when
+# they add a placeholder, so a typo in a template fails `validate` instead of reaching an agent.
+PROMPT_PLACEHOLDERS = frozenset(
+    {
+        # make_ctx
+        "module",
+        "module_pkg",
+        "lane",
+        "spec",
+        "plan",
+        "plan_target",
+        "idea",
+        "capability_map",
+        "topic",
+        "issue",
+        "run",
+        "date",
+        "slug",
+        # per-step extras
+        "task_n",
+        "task_title",
+        "task_text",
+        "refine_note",
+        "refine_round",
+        "previous_summary",
+        "refine_artifacts",
+        "question",
+        "answer",
+        "evidence",
+        "step_id",
+        "progress",
+        "handoff",
+        "questions",
+        "run_dir",
+        "result_file",
+        "effort_reason",
+        "diff_range",
+        "task_start_sha",
+        "earlier_findings",
+        "gate_evidence",
+        "brief",
+        "phase",
+        "stop_kind",
+        "stop_key",
+        "stop_summary",
+        "stop_report",
+        "ci_report",
+        "sync_report",
+    }
+)
+PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
+                    "--dangerously-skip-permissions", "--permission-mode")
+PERMISSION_MODES = ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions")
+EXPECT_VALUES = ("red", "green")
+ON_FAIL_VALUES = ("block",)
+NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable")
+_PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+class ConfigError(Exception):
+    """A config problem too big to continue; `path` is the dotted YAML path (`steps[2]`)."""
+
+    def __init__(self, path: str, message: str) -> None:
+        super().__init__(f"{path}: {message}" if path else message)
+        self.path = path
+        self.message = message
+
+
+@dataclass
+class Issue:
+    level: Literal["error", "warning"]
+    path: str
+    message: str
+
+
+@dataclass
+class Project:
+    base_branch: str
+    fork_from: str
+    branch: str
+    worktrees_dir: str
+    docs: dict[str, str]
+    commit_trailer: str
+
+
+@dataclass
+class AgentSpec:
+    name: str
+    enabled: bool
+    command: list[str]
+    base_args: list[str]
+    permission_mode: str | None
+    models: dict[str, str]
+    effort_arg: list[str]
+    max_turns: int | None
+    profile: str | None
+    skill_loading: str
+    prices: dict[str, dict[str, float]] = field(default_factory=dict)  # USD per 1M tokens, by model id
+
+
+PRICE_KEYS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
+
+
+@dataclass
+class Defaults:
+    agent: str
+    step_timeout_min: int
+    fix_attempts: int
+    run_budget_usd: float
+    gate_timeout_min: float = 30
+    env: dict[str, str] = field(default_factory=dict)  # for every agent session and gate of a run
+    task_budget_usd: float = 0  # a feature run's budget grows to fit its plan (`feature_lane._scale_budget`); 0 = off
+
+
+@dataclass
+class Recovery:
+    give_up_h: float = 24
+    failed_attempts: int = 3
+
+
+@dataclass
+class EffortPolicy:
+    default: str
+    allowed: list[str]
+
+
+@dataclass
+class ContextPolicy:
+    autocompact_pct: int
+    autocompact_env: str
+    rollover_pct: int
+    max_rollovers: int
+    context_window_tokens: int | str
+    default_window_tokens: int
+    progress_file: str
+    gate_output_lines: int
+
+
+@dataclass
+class Gate:
+    name: str
+    run: str
+    cwd: str | None = None
+    when_exists: str | None = None
+
+
+@dataclass
+class Guardrails:
+    forbidden_paths: list[str]
+    reject_trailers: list[str]
+    user_only_skills: list[str]
+
+
+@dataclass
+class Step:
+    id: str
+    type: str
+    skill: str | None = None
+    role: str | None = None
+    prompt: str | None = None
+    output: str | None = None
+    when: Any = None
+    unless: Any = None
+    repeat: dict | None = None
+    next: list[dict] | None = None
+    gates: str | list[str] | None = None
+    fix_loop: bool = False
+    gates_first: bool = False  # run `gates` before the session and hand it their output (`{gate_evidence}`)
+    review: Step | None = None
+    commit: bool | str = False
+    message: str | None = None
+    foreach: str | None = None
+    expect: str | None = None
+    model: str | None = None
+    wait_for: str | None = None
+    checks: list[str] = field(default_factory=list)
+    on_fail: str | None = None
+    steps: list[Step] = field(default_factory=list)
+    lanes: list[str] = field(default_factory=list)
+    tdd: bool = True
+    small_plan: dict | None = None
+    batch: dict | None = None  # a `foreach: plan_task` step: neighbouring small tasks share a session and a review
+    brief: list[str] = field(default_factory=list)
+    task_briefs: dict[str, str] = field(default_factory=dict)
+    name: str | None = None
+    blocks_on_findings: bool = False  # its `findings` hold the phase back (`autonomy.phase_findings`)
+    forbid: list[str] = field(default_factory=list)  # guardrails.forbidden_paths for this step only
+    fix: Step | None = None  # a `ci` step: the session that fixes a failed check
+    sync: Step | None = None  # a `finish` step: the session that resolves the target branch's conflicts
+    human_paths: list[str] = field(default_factory=list)  # a `sync` step: conflicts in these paths are a human's
+    path: str = ""
+
+
+@dataclass
+class Phase:
+    name: str
+    agent: str | None
+    model: str | dict[str, str] | None
+    skip_if: Any
+    steps: list[Step]
+    needs_approval: bool = True  # a phase that does not say keeps its human
+    resolve: bool = False  # stops in this phase go to the resolver first (`autonomy.Resolver`)
+    approval_note: dict | None = None  # a line on this phase's approval page, when its condition holds
+
+
+@dataclass
+class Config:
+    version: int
+    project: Project
+    agents: dict[str, AgentSpec]
+    defaults: Defaults
+    effort: EffortPolicy
+    context: ContextPolicy
+    gates: dict[str, Gate]
+    gate_sets: dict[str, list[str]]
+    guardrails: Guardrails
+    overlays: dict[str, dict]
+    conditions: dict[str, dict]
+    lanes: list[str]
+    phases: dict[str, Phase]
+    record_step: Step | None
+    phase_approval: dict
+    checkpoints: dict[str, str]
+    hitl: dict
+    dashboard: dict
+    raw: dict
+    path: Path
+    recovery: Recovery = field(default_factory=Recovery)
+    autonomy: dict = field(default_factory=dict)
+    resolve_step: Step | None = None
+    ci: dict = field(default_factory=dict)
+
+
+def for_lane(steps: list[Step], lane: str) -> list[Step]:
+    """The steps a run of `lane` walks: those with no `lanes:` tag, and those tagged with `lane`."""
+    return [step for step in steps if not step.lanes or lane in step.lanes]
+
+
+def check_lane(cfg: Config, lane: str) -> None:
+    """Raise `ValueError` for a lane the workflow does not know."""
+    if lane == "spec":
+        raise ValueError("there is no spec lane: use `agentflow run feature --module <module> --to define`")
+    if lane not in cfg.lanes:
+        raise ValueError(f"unknown lane {lane!r}; known: {', '.join(cfg.lanes)}")
+
+
+# --------------------------------------------------------------------------- references
+
+
+def _join(path: str, key: str) -> str:
+    return f"{path}.{key}" if path else key
+
+
+def _lookup(root: dict, dotted: str, at: str) -> Any:
+    node: Any = root
+    for segment in dotted.split("."):
+        if isinstance(node, dict) and segment in node:
+            node = node[segment]
+        elif isinstance(node, list) and segment.isdigit() and int(segment) < len(node):
+            node = node[int(segment)]
+        else:
+            raise ConfigError(at, f"unresolved reference @{dotted}")
+    return node
+
+
+def _resolve(node: Any, path: str, root: dict, stack: tuple[str, ...], origins: dict[str, str]) -> Any:
+    """Return `node` with every `"@a.b.c"` string replaced by a copy of what it names.
+
+    `origins` maps the path of each reference to the path it finally points at, so steps
+    pulled in through a reference keep the YAML path of where they are defined.
+    """
+    if isinstance(node, str) and node.startswith("@"):
+        target = node[1:]
+        if target in stack:
+            chain = " -> ".join((*stack, target))
+            raise ConfigError(path, f"reference cycle: {chain}")
+        value = _lookup(root, target, path)
+        resolved = _resolve(value, target, root, (*stack, target), origins)
+        origins[path] = origins.get(target, target)
+        return resolved
+    if isinstance(node, dict):
+        return {k: _resolve(v, _join(path, str(k)), root, stack, origins) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_resolve(v, f"{path}[{i}]", root, stack, origins) for i, v in enumerate(node)]
+    return node
+
+
+# --------------------------------------------------------------------------- builders
+
+
+def _require(data: dict, key: str, path: str, kind: type | tuple[type, ...]) -> Any:
+    here = _join(path, key)
+    if key not in data:
+        raise ConfigError(here, "missing")
+    value = data[key]
+    if not isinstance(value, kind):
+        raise ConfigError(here, f"expected {_kind_name(kind)}, got {type(value).__name__}")
+    return value
+
+
+def _optional(data: dict, key: str, path: str, kind: type | tuple[type, ...], default: Any) -> Any:
+    if key not in data or data[key] is None:
+        return default
+    return _require(data, key, path, kind)
+
+
+def _kind_name(kind: type | tuple[type, ...]) -> str:
+    kinds = kind if isinstance(kind, tuple) else (kind,)
+    return " or ".join(k.__name__ for k in kinds)
+
+
+def _string_map(value: Any, path: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+        raise ConfigError(path, "must map names to strings (quote numbers)")
+    return dict(value)
+
+
+def _string_list(value: Any, path: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ConfigError(path, "expected a list of strings")
+    return list(value)
+
+
+def brief_files(value: Any, path: str) -> list[str]:
+    """`brief:` is one repo path or a list of them."""
+    if value is None:
+        return []
+    return [value] if isinstance(value, str) else _string_list(value, path)
+
+
+def _build_agent(name: str, data: Any, path: str) -> AgentSpec:
+    if not isinstance(data, dict):
+        raise ConfigError(path, "expected a mapping")
+    command = data.get("command")
+    if isinstance(command, str):
+        command = shlex.split(command)
+    if not command:
+        raise ConfigError(_join(path, "command"), "missing")
+    return AgentSpec(
+        name=name,
+        enabled=bool(_optional(data, "enabled", path, bool, True)),
+        command=_string_list(command, _join(path, "command")),
+        base_args=_string_list(data.get("base_args", []), _join(path, "base_args")),
+        permission_mode=_optional(data, "permission_mode", path, str, None),
+        models=dict(_optional(data, "models", path, dict, {})),
+        effort_arg=_string_list(data.get("effort_arg", []), _join(path, "effort_arg")),
+        max_turns=_optional(data, "max_turns", path, int, None),
+        profile=_optional(data, "profile", path, str, None),
+        skill_loading=_optional(data, "skill_loading", path, str, "native"),
+        prices=_build_prices(data.get("prices"), _join(path, "prices")),
+    )
+
+
+def _build_prices(raw: Any, path: str) -> dict[str, dict[str, float]]:
+    """`{model id: {input, output, cache_read, cache_write_5m, cache_write_1h}}` in USD per 1M tokens."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(path, "expected a mapping of model id to prices")
+    out: dict[str, dict[str, float]] = {}
+    for model, row in raw.items():
+        here = _join(path, str(model))
+        if not isinstance(row, dict):
+            raise ConfigError(here, "expected a mapping of price names to numbers")
+        for key, value in row.items():
+            if key not in PRICE_KEYS:
+                raise ConfigError(_join(here, str(key)), f"unknown price; known: {', '.join(PRICE_KEYS)}")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise ConfigError(_join(here, str(key)), "expected a number of USD per 1M tokens, 0 or more")
+        out[str(model)] = {str(k): float(v) for k, v in row.items()}
+    return out
+
+
+def _step_type(raw: dict, path: str) -> str:
+    """D4: explicit `type`, else `steps` -> group, else skill/prompt/role -> agent, else gates."""
+    explicit = raw.get("type")
+    if explicit is not None:
+        return str(explicit)
+    if "steps" in raw:
+        return "group"
+    if any(raw.get(k) for k in ("skill", "prompt", "role")):
+        return "agent"
+    if "gates" in raw:
+        return "gate"
+    raise ConfigError(path, "cannot tell the step type: give it `type`, `steps`, `skill`/`prompt`/`role`, or `gates`")
+
+
+class _Builder:
+    def __init__(self, origins: dict[str, str]) -> None:
+        self.origins = origins
+
+    def steps(self, value: Any, path: str) -> list[Step]:
+        """Build a step list found at `path`; steps pulled in by reference keep their source path."""
+        if not isinstance(value, list):
+            raise ConfigError(path, "expected a list of steps")
+        base = self.origins.get(path, path)
+        return [self.step(raw, f"{base}[{i}]") for i, raw in enumerate(value)]
+
+    def step(self, raw: Any, path: str, default_id: str | None = None) -> Step:
+        if not isinstance(raw, dict):
+            raise ConfigError(path, "a step must be a mapping")
+        for key in raw:
+            if key not in STEP_KEYS:
+                raise ConfigError(_join(path, str(key)), "unknown step key")
+        step_type = _step_type(raw, path)
+        review = None
+        if raw.get("review") not in (None, False):
+            review = self.step(raw["review"], _join(path, "review"), default_id="review")
+        nested = self.steps(raw["steps"], _join(path, "steps")) if "steps" in raw else []
+        fix = self.step(raw["fix"], _join(path, "fix"), default_id="fix") if raw.get("fix") else None
+        sync = self.step(raw["sync"], _join(path, "sync"), default_id="sync") if raw.get("sync") else None
+        step_id = raw.get("id") or raw.get("skill") or default_id or step_type
+        return Step(
+            id=str(step_id),
+            type=step_type,
+            skill=raw.get("skill"),
+            role=raw.get("role"),
+            prompt=raw.get("prompt"),
+            output=raw.get("output"),
+            when=raw.get("when"),
+            unless=raw.get("unless"),
+            repeat=raw.get("repeat"),
+            next=raw.get("next"),
+            gates=raw.get("gates"),
+            fix_loop=bool(raw.get("fix_loop", False)),
+            gates_first=bool(raw.get("gates_first", False)),
+            review=review,
+            commit=raw.get("commit", False),
+            message=raw.get("message"),
+            foreach=raw.get("foreach"),
+            expect=raw.get("expect"),
+            model=raw.get("model"),
+            wait_for=raw.get("wait_for"),
+            checks=list(raw.get("checks") or []),
+            on_fail=raw.get("on_fail"),
+            steps=nested,
+            lanes=_string_list(raw.get("lanes", []), _join(path, "lanes")),
+            tdd=bool(raw.get("tdd", True)),
+            small_plan=raw.get("small_plan"),
+            batch=raw.get("batch"),
+            brief=brief_files(raw.get("brief"), _join(path, "brief")),
+            task_briefs=dict(raw.get("task_briefs") or {}),
+            name=raw.get("name"),
+            blocks_on_findings=bool(raw.get("blocks_on_findings", False)),
+            forbid=_string_list(raw.get("forbid", []), _join(path, "forbid")),
+            fix=fix,
+            sync=sync,
+            human_paths=_string_list(raw.get("human_paths", []), _join(path, "human_paths")),
+            path=path,
+        )
+
+    def phases(self, data: dict) -> dict[str, Phase]:
+        out: dict[str, Phase] = {}
+        for name, raw in data.items():
+            path = f"phases.{name}"
+            if not isinstance(raw, dict):
+                raise ConfigError(path, "expected a mapping")
+            model = raw.get("model")
+            if model is not None and not isinstance(model, (str, dict)):
+                raise ConfigError(_join(path, "model"), "expected a model name or a role map")
+            out[name] = Phase(
+                name=name,
+                agent=raw.get("agent"),
+                model=model,
+                skip_if=raw.get("skip_if"),
+                steps=self.steps(raw.get("steps", []), _join(path, "steps")),
+                needs_approval=raw.get("needs_approval", True) is not False,  # anything but an explicit false keeps the human
+                resolve=raw.get("resolve") is True,
+                approval_note=raw.get("approval_note"),
+            )
+        return out
+
+
+def _build_gates(data: dict) -> dict[str, Gate]:
+    out: dict[str, Gate] = {}
+    for name, raw in data.items():
+        path = f"gates.{name}"
+        if not isinstance(raw, dict):
+            raise ConfigError(path, "expected a mapping")
+        out[name] = Gate(
+            name=name,
+            run=_require(raw, "run", path, str),
+            cwd=_optional(raw, "cwd", path, str, None),
+            when_exists=_optional(raw, "when_exists", path, str, None),
+        )
+    return out
+
+
+def load_config(path: Path) -> Config:
+    """Parse `path`, resolve `@` references and build the dataclasses."""
+    path = Path(path)
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigError("", f"cannot read {path}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise ConfigError("", f"{path} must hold a mapping at the top level")
+
+    origins: dict[str, str] = {}
+    raw = _resolve(loaded, "", loaded, (), origins)
+
+    project = _require(raw, "project", "", dict)
+    defaults = _require(raw, "defaults", "", dict)
+    effort = _require(raw, "effort", "", dict)
+    context = _require(raw, "context", "", dict)
+    guardrails = _require(raw, "guardrails", "", dict)
+    recovery = _optional(raw, "recovery", "", dict, {})
+    agents = _require(raw, "agents", "", dict)
+    gate_sets = _require(raw, "gate_sets", "", dict)
+    builder = _Builder(origins)
+
+    return Config(
+        version=_require(raw, "version", "", int),
+        project=Project(
+            base_branch=_require(project, "base_branch", "project", str),
+            fork_from=_require(project, "fork_from", "project", str),
+            branch=_require(project, "branch", "project", str),
+            worktrees_dir=_require(project, "worktrees_dir", "project", str),
+            docs=dict(_optional(project, "docs", "project", dict, {})),
+            commit_trailer=_require(project, "commit_trailer", "project", str),
+        ),
+        agents={name: _build_agent(name, spec, f"agents.{name}") for name, spec in agents.items()},
+        defaults=Defaults(
+            agent=_require(defaults, "agent", "defaults", str),
+            step_timeout_min=_optional(defaults, "step_timeout_min", "defaults", int, 45),
+            fix_attempts=_optional(defaults, "fix_attempts", "defaults", int, 3),
+            run_budget_usd=_optional(defaults, "run_budget_usd", "defaults", (int, float), 25),
+            gate_timeout_min=_optional(defaults, "gate_timeout_min", "defaults", (int, float), 30),
+            env=_string_map(defaults.get("env"), "defaults.env"),
+            task_budget_usd=_optional(defaults, "task_budget_usd", "defaults", (int, float), 0),
+        ),
+        effort=EffortPolicy(
+            default=_require(effort, "default", "effort", str),
+            allowed=_string_list(effort.get("allowed"), "effort.allowed"),
+        ),
+        context=ContextPolicy(
+            autocompact_pct=_require(context, "autocompact_pct", "context", int),
+            autocompact_env=_optional(context, "autocompact_env", "context", str, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
+            rollover_pct=_require(context, "rollover_pct", "context", int),
+            max_rollovers=_require(context, "max_rollovers", "context", int),
+            context_window_tokens=_optional(context, "context_window_tokens", "context", (int, str), "auto"),
+            default_window_tokens=_optional(context, "default_window_tokens", "context", int, 200000),
+            progress_file=_require(context, "progress_file", "context", str),
+            gate_output_lines=_require(context, "gate_output_lines", "context", int),
+        ),
+        gates=_build_gates(_require(raw, "gates", "", dict)),
+        gate_sets={name: _string_list(members, f"gate_sets.{name}") for name, members in gate_sets.items()},
+        guardrails=Guardrails(
+            forbidden_paths=_string_list(guardrails.get("forbidden_paths", []), "guardrails.forbidden_paths"),
+            reject_trailers=_string_list(guardrails.get("reject_trailers", []), "guardrails.reject_trailers"),
+            user_only_skills=_string_list(guardrails.get("user_only_skills", []), "guardrails.user_only_skills"),
+        ),
+        overlays=_optional(raw, "overlays", "", dict, {}),
+        conditions=_optional(raw, "conditions", "", dict, {}),
+        lanes=_string_list(_require(raw, "lanes", "", list), "lanes"),
+        phases=builder.phases(_require(raw, "phases", "", dict)),
+        record_step=builder.step(raw["record_step"], "record_step") if raw.get("record_step") else None,
+        phase_approval=_optional(raw, "phase_approval", "", dict, {}),
+        checkpoints=_optional(raw, "checkpoints", "", dict, {}),
+        hitl=_optional(raw, "hitl", "", dict, {}),
+        dashboard=_optional(raw, "dashboard", "", dict, {}),
+        raw=raw,
+        path=path,
+        recovery=Recovery(
+            give_up_h=_optional(recovery, "give_up_h", "recovery", (int, float), 24),
+            failed_attempts=_optional(recovery, "failed_attempts", "recovery", int, 3),
+        ),
+        autonomy=_optional(raw, "autonomy", "", dict, {}),
+        resolve_step=builder.step(raw["resolve_step"], "resolve_step") if raw.get("resolve_step") else None,
+        ci=_optional(raw, "ci", "", dict, {}),
+    )
+
+
+# --------------------------------------------------------------------------- models
+
+
+def resolve_model(cfg: Config, phase: Phase, step: Step, role: str, overrides: dict[str, str]) -> tuple[str, str]:
+    """`(model, source)` for one agent call, first hit wins.
+
+    `cli` (`--model <phase>=<model>`), `step` (`model:` on the step), `phase` (a string) or
+    `phase_role` (the role's entry in a map, else its `default`), then `agent_role`
+    (`agents.<agent>.models[<role>]`, the phase's agent or `defaults.agent`).
+    """
+    if phase.name in overrides:
+        return overrides[phase.name], "cli"
+    if step.model:
+        return step.model, "step"
+    if isinstance(phase.model, str):
+        return phase.model, "phase"
+    if isinstance(phase.model, dict):
+        if role in phase.model:
+            return phase.model[role], "phase_role"
+        if "default" in phase.model:
+            return phase.model["default"], "phase_role"
+    agent_name = phase.agent or cfg.defaults.agent
+    agent = cfg.agents.get(agent_name)
+    if agent is not None and role in agent.models:
+        return agent.models[role], "agent_role"
+    raise ValueError(f"no model for role {role!r}: phase '{phase.name}' sets none and agent '{agent_name}' has no entry")
+
+
+# --------------------------------------------------------------------------- validation
+
+
+class _Validator:
+    def __init__(self, cfg: Config, repo: Path) -> None:
+        self.cfg = cfg
+        self.repo = repo
+        self.prompts = cfg.path.parent / "prompts"
+        self.issues: list[Issue] = []
+        self.roles = {role for agent in cfg.agents.values() for role in agent.models}
+
+    def add(self, level: Literal["error", "warning"], path: str, message: str) -> None:
+        issue = Issue(level, path, message)
+        if issue not in self.issues:
+            self.issues.append(issue)
+
+    def error(self, path: str, message: str) -> None:
+        self.add("error", path, message)
+
+    # ---- conditions
+
+    def condition(self, value: Any, path: str, named: bool = False) -> None:
+        """Check a condition reference: a defined name, or an inline check/all/any/not."""
+        if isinstance(value, str):
+            if value not in self.cfg.conditions:
+                self.error(path, f"undefined condition '{value}'")
+            return
+        if not isinstance(value, dict):
+            self.error(path, "a condition is a name or a mapping with check, all, any or not")
+            return
+        if "check" in value:
+            if value["check"] not in BUILTIN_CHECKS:
+                self.error(_join(path, "check"), f"unknown check '{value['check']}'")
+        elif "all" in value or "any" in value:
+            key = "all" if "all" in value else "any"
+            members = value[key]
+            if not isinstance(members, list) or not members:
+                self.error(_join(path, key), f"`{key}` needs a non-empty list of conditions")
+            else:
+                for i, member in enumerate(members):
+                    self.condition(member, f"{path}.{key}[{i}]")
+        elif "not" in value:
+            self.condition(value["not"], _join(path, "not"))
+        else:
+            self.error(path, "a condition needs one of check, all, any or not")
+        if named and "on_unknown" in value and value["on_unknown"] not in ON_UNKNOWN_VALUES:
+            self.error(_join(path, "on_unknown"), "on_unknown must be ask_human, agent, true or false")
+
+    def conditions(self) -> None:
+        for name, value in self.cfg.conditions.items():
+            self.condition(value, f"conditions.{name}", named=True)
+        graph = {name: sorted(_condition_names(value)) for name, value in self.cfg.conditions.items()}
+        reported: set[str] = set()
+        for name in graph:
+            cycle = _find_cycle(graph, name)
+            if cycle and cycle[0] not in reported:
+                reported.update(cycle)
+                self.error(f"conditions.{cycle[0]}", f"condition cycle: {' -> '.join(cycle)}")
+
+    # ---- steps
+
+    def skill(self, skill: Any, path: str) -> None:
+        if not isinstance(skill, str):
+            self.error(path, "skill must be a name")
+        elif skill in self.cfg.guardrails.user_only_skills:
+            self.error(path, f"'{skill}' is a user-only skill: only the human runs it")
+        elif not (self.repo / ".claude" / "skills" / skill / "SKILL.md").is_file():
+            self.error(path, f"skill '{skill}' has no .claude/skills/{skill}/SKILL.md")
+
+    def prompt(self, prompt: Any, path: str) -> None:
+        if not isinstance(prompt, str) or not (self.prompts / prompt).is_file():
+            self.error(path, f"prompt template '{prompt}' is not in {self.prompts.name}/")
+
+    def steps(self, steps: list[Step]) -> None:
+        """Validate one step list (a phase) and everything nested in it."""
+        self.unique_ids(steps, set())
+        ids = _all_step_ids(steps)
+        self._walk(steps, ids)
+
+    def unique_ids(self, steps: list[Step], seen: set[str]) -> None:
+        """Step ids are unique across the whole phase: nested `steps:` and `review` included."""
+        for step in steps:
+            if step.id in seen:
+                self.error(_join(step.path, "id"), f"duplicate step id '{step.id}'")
+            seen.add(step.id)
+            if step.review is not None:
+                self.unique_ids([step.review], seen)
+            self.unique_ids(step.steps, seen)
+
+    def _walk(self, steps: list[Step], phase_ids: set[str]) -> None:
+        for step in steps:
+            self.step(step, phase_ids)
+
+    def templates(self) -> None:
+        """Every `{placeholder}` in every prompt template must be a known key."""
+        if not self.prompts.is_dir():
+            return
+        for file in sorted(self.prompts.glob("*.md")):
+            text = file.read_text(encoding="utf-8")
+            for name in dict.fromkeys(_PLACEHOLDER.findall(text)):
+                if name not in PROMPT_PLACEHOLDERS:
+                    self.error(f"prompts/{file.name}", f"unknown placeholder '{{{name}}}'")
+
+    def brief(self, files: list[str], prompt: str | None, path: str) -> None:
+        """A brief goes in the prompt at `{brief}`: a missing file, a `{brief}` with no file, or a file with no
+        `{brief}` would each lose it silently."""
+        for name in files:
+            if not (self.repo / name).is_file():
+                self.error(path, f"brief '{name}' is not a file in this repository")
+        template = self.prompts / prompt if prompt else None
+        if template is None or not template.is_file():
+            if files:
+                self.error(path, "a brief needs a prompt template with a {brief} placeholder")
+            return
+        used = "{brief}" in template.read_text(encoding="utf-8")
+        if used and not files:
+            self.error(path, f"prompts/{prompt} has a {{brief}} placeholder, so this step must name the file")
+        elif files and not used:
+            self.error(path, f"prompts/{prompt} has no {{brief}} placeholder, so this brief would never be sent")
+
+    def step(self, step: Step, phase_ids: set[str]) -> None:
+        p = step.path
+        self.brief(step.brief, step.prompt, _join(p, "brief"))
+        for name in step.task_briefs.values():
+            if not (self.repo / name).is_file():
+                self.error(_join(p, "task_briefs"), f"brief '{name}' is not a file in this repository")
+        if step.type not in STEP_TYPES:
+            self.error(_join(p, "type"), f"unknown step type '{step.type}'")
+        if step.skill is not None:
+            self.skill(step.skill, _join(p, "skill"))
+        elif step.type == "agent" and step.tdd:
+            self.error(p, "an agent step maps to one skill: name it, or set `tdd: false` for a step no skill owns")
+        if step.prompt is not None:
+            self.prompt(step.prompt, _join(p, "prompt"))
+        if step.role is not None and step.role not in self.roles:
+            self.error(_join(p, "role"), f"role '{step.role}' is in no agent's models map")
+        for key in ("when", "unless"):
+            value = getattr(step, key)
+            if value is not None:
+                self.condition(value, _join(p, key))
+        if step.repeat is not None:
+            self.repeat(step.repeat, _join(p, "repeat"))
+        for i, branch in enumerate(step.next or []):
+            self.branch(branch, f"{p}.next[{i}]", phase_ids)
+        if step.gates is not None:
+            self.gates(step.gates, _join(p, "gates"))
+        for name in step.checks:
+            if name not in DOC_CHECK_NAMES:
+                self.error(_join(p, "checks"), f"'{name}' is not a doc check ({', '.join(DOC_CHECK_NAMES)})")
+        if step.expect is not None and step.expect not in EXPECT_VALUES:
+            self.error(_join(p, "expect"), f"expect must be one of {', '.join(EXPECT_VALUES)}")
+        if step.on_fail is not None and step.on_fail not in ON_FAIL_VALUES:
+            self.error(_join(p, "on_fail"), f"on_fail must be one of {', '.join(ON_FAIL_VALUES)}")
+        if step.gates_first and (step.type != "agent" or not step.gates):
+            self.error(_join(p, "gates_first"), "gates_first needs an agent step with `gates`")
+        if step.commit not in (True, False, "per_task"):
+            self.error(_join(p, "commit"), "commit must be true, false or per_task")
+        for lane in step.lanes:
+            if lane not in self.cfg.lanes:
+                self.error(_join(p, "lanes"), f"lane '{lane}' is not in `lanes`")
+        if step.type == "group" and not step.steps:
+            self.error(_join(p, "steps"), "a group needs at least one step")
+        if step.type == "checkpoint":
+            for label in (step.id, step.name):
+                if isinstance(label, str) and label.endswith("_approved"):
+                    self.error(p, f"'{label}' looks like a phase approval; a phase approval cannot be configured")
+        if step.small_plan is not None:
+            self.small_plan(step.small_plan, _join(p, "small_plan"))
+        if step.batch is not None:
+            self.batch(step.batch, _join(p, "batch"), step)
+        if step.review is not None:
+            self.step(step.review, phase_ids)
+        if step.type == "ci" and step.fix is None:
+            self.error(_join(p, "fix"), "a ci step needs `fix`, the session that fixes a failed check")
+        if step.fix is not None:
+            if step.type != "ci":
+                self.error(_join(p, "fix"), "only a ci step has `fix`")
+            self.step(step.fix, phase_ids)
+        if step.sync is not None:
+            if step.type != "finish":
+                self.error(_join(p, "sync"), "only a finish step has `sync`")
+            self.step(step.sync, phase_ids)
+        if step.human_paths and step.type == "finish":
+            self.error(_join(p, "human_paths"), "`human_paths` belongs on the `sync` session, not on `finish`")
+        self._walk(step.steps, phase_ids)
+
+    def repeat(self, repeat: Any, path: str) -> None:
+        if not isinstance(repeat, dict):
+            self.error(path, "repeat must be a mapping with until and max_rounds")
+            return
+        rounds = repeat.get("max_rounds")
+        if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 1:
+            self.error(_join(path, "max_rounds"), "repeat needs max_rounds, a whole number of at least 1")
+        if "until" not in repeat:
+            self.error(_join(path, "until"), "repeat needs `until`, a condition")
+        else:
+            self.condition(repeat["until"], _join(path, "until"))
+
+    def branch(self, branch: Any, path: str, phase_ids: set[str]) -> None:
+        if not isinstance(branch, dict):
+            self.error(path, "a branch is a mapping with when and goto")
+            return
+        if "when" in branch:
+            self.condition(branch["when"], _join(path, "when"))
+        goto = branch.get("goto")
+        if goto not in phase_ids:
+            self.error(_join(path, "goto"), f"goto '{goto}' is not a step of this phase")
+
+    def gates(self, gates: Any, path: str) -> None:
+        names = [gates] if isinstance(gates, str) else gates
+        if not isinstance(names, list):
+            self.error(path, "gates is a gate-set name or a list of gate names")
+            return
+        for name in names:
+            if name not in self.cfg.gates and name not in self.cfg.gate_sets:
+                self.error(path, f"'{name}' is neither a gate nor a gate set")
+
+    def small_plan(self, small: Any, path: str) -> None:
+        if not isinstance(small, dict):
+            self.error(path, "small_plan must be a mapping")
+            return
+        if "when" in small:
+            self.condition(small["when"], _join(path, "when"))
+        if "skill" in small:
+            self.skill(small["skill"], _join(path, "skill"))
+        if "prompt" in small:
+            self.prompt(small["prompt"], _join(path, "prompt"))
+            self.brief(brief_files(small.get("brief"), _join(path, "brief")), small["prompt"], _join(path, "brief"))
+
+    def batch(self, batch: Any, path: str, step: Step) -> None:
+        if not isinstance(batch, dict):
+            self.error(path, "batch must be a mapping")
+            return
+        if step.foreach != "plan_task":
+            self.error(path, "only a `foreach: plan_task` step has `batch`")
+        for key, low in (("max_tasks", 2), ("max_files", 0)):
+            value = batch.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < low):
+                self.error(_join(path, key), f"{key} must be a whole number of at least {low}")
+        if "prompt" in batch:
+            self.prompt(batch["prompt"], _join(path, "prompt"))
+
+    # ---- sections
+
+    def removed_defaults(self) -> None:
+        for key, why in REMOVED_DEFAULTS.items():
+            if key in (self.cfg.raw.get("defaults") or {}):
+                self.error(f"defaults.{key}", f"defaults.{key} was removed: {why}. Delete the key")
+
+    def agents(self) -> None:
+        defaults = self.cfg.defaults.agent
+        spec = self.cfg.agents.get(defaults)
+        if spec is None:
+            self.error("defaults.agent", f"agent '{defaults}' is not defined")
+        elif not spec.enabled:
+            self.error("defaults.agent", f"agent '{defaults}' is disabled")
+        if not self.cfg.defaults.task_budget_usd >= 0:
+            self.error("defaults.task_budget_usd", "task_budget_usd must be 0 (off) or a positive number of USD")
+        if not self.cfg.defaults.gate_timeout_min > 0:
+            self.error("defaults.gate_timeout_min", "gate_timeout_min must be a positive number of minutes")
+        for name, agent in self.cfg.agents.items():
+            path = f"agents.{name}"
+            if agent.effort_arg and not any("{effort}" in arg for arg in agent.effort_arg):
+                self.error(_join(path, "effort_arg"), "effort_arg must contain {effort}: every call passes its level")
+            for arg in agent.base_args:
+                if arg.split("=", 1)[0] in PERMISSION_FLAGS:
+                    self.error(_join(path, "base_args"), f"'{arg}' is not allowed: tool rules come from .claude/settings*.json")
+            if agent.permission_mode is not None and agent.permission_mode not in PERMISSION_MODES:
+                self.error(_join(path, "permission_mode"),
+                           f"unknown permission_mode '{agent.permission_mode}': use one of {', '.join(PERMISSION_MODES)}")
+
+    def gate_definitions(self) -> None:
+        for name, members in self.cfg.gate_sets.items():
+            for i, member in enumerate(members):
+                if member not in self.cfg.gates:
+                    self.error(f"gate_sets.{name}[{i}]", f"'{member}' is not a defined gate")
+
+    def phases(self) -> None:
+        cfg = self.cfg
+        for name, phase in cfg.phases.items():
+            path = f"phases.{name}"
+            raw = cfg.raw["phases"][name]
+            for key in raw:
+                if key in APPROVAL_PHASE_KEYS:
+                    self.error(_join(path, key), "use `needs_approval: true|false` to say whether a human approves this phase")
+                elif key not in PHASE_KEYS:
+                    self.error(_join(path, key), "unknown phase key")
+            if not isinstance(raw.get("needs_approval"), bool):
+                self.error(_join(path, "needs_approval"), "every phase says `needs_approval: true` or `false`")
+            if "resolve" in raw and not isinstance(raw["resolve"], bool):
+                self.error(_join(path, "resolve"), "resolve must be true or false")
+            if phase.resolve and cfg.resolve_step is None:
+                self.error(_join(path, "resolve"), "`resolve: true` needs a top-level `resolve_step`")
+            if phase.approval_note is not None:
+                self.approval_note(phase, _join(path, "approval_note"))
+            self.phase_model(phase, path)
+            if phase.skip_if is not None:
+                self.condition(phase.skip_if, _join(path, "skip_if"))
+            self.steps(phase.steps)
+        if cfg.record_step is not None:
+            self.step(cfg.record_step, {cfg.record_step.id})
+        if cfg.resolve_step is not None:
+            self.step(cfg.resolve_step, {cfg.resolve_step.id})
+
+    def approval_note(self, phase: Phase, path: str) -> None:
+        note = phase.approval_note
+        if not isinstance(note, dict) or "when" not in note or "human_skill" not in note:
+            self.error(path, "approval_note needs `when` (a condition) and `human_skill`")
+            return
+        self.condition(note["when"], _join(path, "when"))
+        if note["human_skill"] not in self.cfg.guardrails.user_only_skills:
+            self.error(_join(path, "human_skill"), f"'{note['human_skill']}' is not in guardrails.user_only_skills")
+
+    def phase_model(self, phase: Phase, path: str) -> None:
+        agent_name = phase.agent or self.cfg.defaults.agent
+        agent = self.cfg.agents.get(agent_name)
+        if agent is None:
+            self.error(_join(path, "agent"), f"agent '{agent_name}' is not defined")
+        elif not agent.enabled:
+            where = "model" if phase.model is not None else "agent"
+            self.error(_join(path, where), f"agent '{agent_name}' is disabled, so this phase cannot run on it")
+        if isinstance(phase.model, dict) and "default" not in phase.model:
+            self.error(_join(path, "model"), "a model map by role needs a `default`")
+
+    def effort(self) -> None:
+        effort = self.cfg.effort
+        for i, level in enumerate(effort.allowed):
+            if level not in KNOWN_EFFORT_LEVELS:
+                self.error(f"effort.allowed[{i}]", f"unknown effort level '{level}'")
+        if any(level not in KNOWN_EFFORT_LEVELS for level in effort.allowed):
+            self.error("effort.allowed", f"allowed levels must be within {', '.join(KNOWN_EFFORT_LEVELS)}")
+        if effort.default not in effort.allowed:
+            self.error("effort.default", f"default '{effort.default}' is not in effort.allowed")
+
+    def approval(self) -> None:
+        cfg = self.cfg
+        for key in cfg.phase_approval:
+            if key not in PHASE_APPROVAL_KEYS:
+                self.error(f"phase_approval.{key}", "phase approval cannot be skipped or changed: only refine_prompt and show are configurable")
+        refine = cfg.phase_approval.get("refine_prompt")
+        if refine is not None:
+            self.prompt(refine, "phase_approval.refine_prompt")
+        for name in cfg.checkpoints:
+            if str(name).endswith("_approved"):
+                self.error(f"checkpoints.{name}", "a phase approval cannot be configured as a checkpoint")
+        for path in _find_keys(cfg.raw, "auto_if"):
+            self.error(path, "auto_if is not allowed: a phase's `needs_approval` says whether a human approves it")
+
+    def autonomy(self) -> None:
+        cfg = self.cfg
+        for key in cfg.autonomy:
+            if key not in AUTONOMY_KEYS:
+                self.error(f"autonomy.{key}", "unknown autonomy key")
+        rounds = cfg.autonomy.get("finding_rounds", 0)
+        if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 0:
+            self.error("autonomy.finding_rounds", "finding_rounds must be a whole number, 0 or more")
+        kinds = cfg.autonomy.get("resolve_kinds", {})
+        if not isinstance(kinds, dict):
+            self.error("autonomy.resolve_kinds", "resolve_kinds maps a stop kind to its attempts per step")
+            kinds = {}
+        for kind, attempts in kinds.items():
+            if kind in NEVER_RESOLVED:
+                self.error(f"autonomy.resolve_kinds.{kind}", f"a {kind} stop is always a human's")
+            if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
+                self.error(f"autonomy.resolve_kinds.{kind}", "attempts must be a whole number of at least 1")
+        for key in CI_KEYS:
+            value = cfg.ci.get(key)
+            if value is None and any(step.type == "ci" for phase in cfg.phases.values() for step in phase.steps):
+                self.error(f"ci.{key}", "a ci step needs this setting")
+            elif value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0):
+                self.error(f"ci.{key}", "must be a number, 0 or more")
+        for key in cfg.ci:
+            if key not in CI_KEYS:
+                self.error(f"ci.{key}", "unknown ci key")
+
+    def overlays(self) -> None:
+        for name, overlay in self.cfg.overlays.items():
+            skills = overlay.get("add_skills", {}) if isinstance(overlay, dict) else {}
+            for stage, skill in skills.items():
+                self.skill(skill, f"overlays.{name}.add_skills.{stage}")
+
+    def dashboard(self) -> None:
+        if self.cfg.dashboard.get("host") != "127.0.0.1":
+            self.error("dashboard.host", "the dashboard binds 127.0.0.1 only")
+        if "backlog" in self.cfg.dashboard:
+            self.backlog(self.cfg.dashboard["backlog"])
+
+    def backlog(self, block: Any) -> None:
+        """`dashboard.backlog`: which lane runs a map module, each lane's New task fields, a new module's row."""
+        path = "dashboard.backlog"
+        if not isinstance(block, dict):
+            self.error(path, "must be a mapping")
+            return
+        for key in block:
+            if key not in BACKLOG_KEYS:
+                self.error(f"{path}.{key}", f"unknown key; known: {', '.join(BACKLOG_KEYS)}")
+        lanes = self.cfg.lanes
+        if "sync_base" in block and not isinstance(block["sync_base"], bool):
+            self.error(f"{path}.sync_base", "must be true or false")
+        module_lane = block.get("module_lane")
+        if module_lane is not None and module_lane not in lanes:
+            self.error(f"{path}.module_lane", f"{module_lane!r} is not a lane; known: {', '.join(lanes)}")
+        row = block.get("module_row")
+        if row is not None:
+            headers = {str(k).strip().lower() for k in row} if isinstance(row, dict) else set()
+            if (not isinstance(row, dict) or not all(isinstance(v, str) for v in row.values())
+                    or not {"module id", "depends on"} <= headers):
+                self.error(f"{path}.module_row", "must map column headers to cell templates (text), "
+                           "including the `Module id` and `Depends on` columns")
+        labels = block.get("lane_labels")
+        if labels is not None and not isinstance(labels, dict):
+            self.error(f"{path}.lane_labels", "must map a lane to the words the dashboard shows for it")
+        elif labels:
+            for lane, label in labels.items():
+                where = f"{path}.lane_labels.{lane}"
+                if lane not in lanes:
+                    self.error(where, f"{lane!r} is not a lane; known: {', '.join(lanes)}")
+                elif not isinstance(label, str) or not label.strip():
+                    self.error(where, "must be text")
+        tasks = block.get("new_task")
+        if tasks is None:
+            return
+        if not isinstance(tasks, dict):
+            self.error(f"{path}.new_task", "must map a lane to its form fields")
+            return
+        for lane, fields in tasks.items():
+            where = f"{path}.new_task.{lane}"
+            if lane not in lanes:
+                self.error(where, f"{lane!r} is not a lane; known: {', '.join(lanes)}")
+            elif not isinstance(fields, list) or not all(isinstance(f, str) for f in fields):
+                self.error(where, "must be a list of form fields")
+            elif unknown := [f for f in fields if f not in BACKLOG_FIELDS]:
+                self.error(where, f"unknown field {', '.join(unknown)}; known: {', '.join(BACKLOG_FIELDS)}")
+            elif not [f for f in fields if f != "after"]:
+                self.error(where, "needs a field to fill in besides `after`")
+            elif "new_module" in fields and (lane != module_lane or not isinstance(row, dict)):
+                self.error(where, "`new_module` belongs to the module_lane and needs dashboard.backlog.module_row")
+
+
+def _all_step_ids(steps: list[Step]) -> set[str]:
+    ids: set[str] = set()
+    for step in steps:
+        ids.add(step.id)
+        ids |= _all_step_ids(step.steps)
+    return ids
+
+
+def _condition_names(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {value}
+    names: set[str] = set()
+    if isinstance(value, dict):
+        for key in ("all", "any"):
+            for member in value.get(key) or []:
+                names |= _condition_names(member)
+        if "not" in value:
+            names |= _condition_names(value["not"])
+    return names
+
+
+def _find_cycle(graph: dict[str, list[str]], start: str) -> list[str] | None:
+    def visit(node: str, trail: list[str]) -> list[str] | None:
+        if node in trail:
+            return [*trail[trail.index(node) :], node]
+        for nxt in graph.get(node, []):
+            found = visit(nxt, [*trail, node])
+            if found:
+                return found
+        return None
+
+    return visit(start, [])
+
+
+def _find_keys(node: Any, key: str, path: str = "") -> list[str]:
+    found: list[str] = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            here = _join(path, str(k))
+            if k == key:
+                found.append(here)
+            found += _find_keys(v, key, here)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            found += _find_keys(v, key, f"{path}[{i}]")
+    return found
+
+
+def validate(cfg: Config, repo: Path) -> list[Issue]:
+    """Return every problem found in `cfg`, checked against the checkout at `repo`."""
+    v = _Validator(cfg, Path(repo))
+    v.removed_defaults()
+    v.agents()
+    v.gate_definitions()
+    v.conditions()
+    v.phases()
+    v.effort()
+    v.approval()
+    v.autonomy()
+    v.overlays()
+    v.dashboard()
+    v.templates()
+    return v.issues

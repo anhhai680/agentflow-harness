@@ -1,0 +1,1349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>agentflow</title>
+<link rel="icon" href="data:,">
+<style nonce="{{NONCE}}">
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #5f6b7a; --line: #dde2e8;
+  --accent: #2f6fd6; --ok: #1f8a4c; --bad: #c23b3b; --warn: #b7791f; --wait: #7a4fd0;
+  --chip: #eef1f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1b2029; --ink: #e6e9ef; --muted: #9aa5b4; --line: #2c3340;
+    --accent: #6ea0ff; --ok: #4cc584; --bad: #ff7676; --warn: #f0b44c; --wait: #b294ff;
+    --chip: #262d39;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+header h1 { font-size: 16px; margin: 0 8px 0 0; }
+#summary { flex: 1; color: var(--muted); }
+button, select { font: inherit; color: inherit; background: var(--chip); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.danger { color: var(--bad); }
+.pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+.pill.live { color: var(--ok); }
+main { padding: 12px 16px 40px; }
+.columns { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(150px, 1fr); gap: 10px; overflow-x: auto; padding-bottom: 8px; }
+.col { background: var(--chip); border-radius: 8px; padding: 8px; min-height: 120px; }
+.col h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; display: flex; flex-wrap: wrap; gap: 2px 8px; justify-content: space-between; }
+.card { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 6px; padding: 8px; margin-bottom: 8px; cursor: pointer; overflow-wrap: anywhere; }
+.card:focus { outline: 2px solid var(--accent); }
+.card.waiting_human, .card.awaiting_approval { border-left-color: var(--wait); }
+.card.failed, .card.cancelled, .card.stalled { border-left-color: var(--bad); }
+.card.paused, .card.refining, .card.held { border-left-color: var(--warn); }
+.card.done, .card.ready { border-left-color: var(--ok); }
+.card[draggable="true"] { cursor: grab; }
+.card.backlog { cursor: default; }
+.card.backlog.parallel { border-left-color: var(--ok); }  /* the green of .gate-ok */
+.card.backlog.blocked { border-left-color: var(--muted); }
+.card.backlog.starting { border-left-color: var(--warn); }
+.card.backlog.failed-start { border-left-color: var(--bad); }
+.badge.p { color: var(--ok); border: 1px solid var(--ok); font-weight: 700; }
+.badge.lock { color: var(--muted); border: 1px solid var(--line); }
+.badge.ready-mark { border: 1px solid var(--line); }
+#sync-note { margin-bottom: 8px; }
+.card a { color: var(--accent); font-size: 12px; }
+.moves { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.moves button { font-size: 12px; padding: 2px 8px; }
+.col.drop { outline: 2px dashed var(--ok); outline-offset: -2px; }
+.card .title { font-weight: 600; }
+.card .sub, .muted { color: var(--muted); font-size: 12px; }
+.badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--chip); margin: 4px 4px 0 0; }
+.gate-ok { color: var(--ok); } .gate-bad { color: var(--bad); } .gate-skip { color: var(--muted); }
+h2.lane { font-size: 13px; margin: 18px 0 8px; border-top: 1px solid var(--line); padding-top: 10px; }
+.need { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-bottom: 6px; }
+.need .what { flex: 1 1 320px; }
+.need ul { margin: 4px 0 0 18px; padding: 0; }
+table { border-collapse: collapse; width: 100%; background: var(--panel); }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; }
+tr.idle td { color: var(--warn); }
+tr.sub td { color: var(--muted); }
+tr.row-link { cursor: pointer; }
+#drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 100%); background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 14px 16px; z-index: 3; box-shadow: -4px 0 18px rgba(0,0,0,.18); }
+#drawer h2 { margin: 0 0 4px; font-size: 16px; word-break: break-all; }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+pre { background: var(--chip); padding: 8px; border-radius: 6px; overflow: auto; max-height: 360px; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 ui-monospace, Menlo, monospace; }
+details { margin: 8px 0; } summary { cursor: pointer; font-weight: 600; }
+.timeline li { font-size: 12px; margin-bottom: 2px; }
+dialog { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); width: min(620px, 92vw); }
+dialog::backdrop { background: rgba(0,0,0,.35); }
+dialog label { display: block; margin: 10px 0 4px; font-weight: 600; }
+dialog textarea, dialog input[type=text] { width: 100%; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px; }
+dialog textarea { min-height: 120px; }
+dialog textarea.short { min-height: 60px; }
+dialog fieldset { border: 0; margin: 10px 0 0; padding: 0; }
+dialog legend { font-weight: 600; margin-bottom: 4px; padding: 0; }
+dialog label.kind { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-weight: 400; }
+dialog select { width: 100%; }
+dialog select[multiple] { min-height: 90px; }
+dialog .row { display: flex; gap: 8px; }
+dialog .row > * { flex: 1; }
+.opts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.dlg-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+#toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 6px 12px; border-radius: 6px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 4; }
+#toast.show { opacity: .95; }
+.attach { display: flex; gap: 6px; align-items: center; }
+.attach input { flex: 1; font: 12px ui-monospace, Menlo, monospace; color: inherit; background: var(--chip); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
+#agents-live, #agents-exited { overflow-x: auto; }
+.wf-step { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-bottom: 8px; overflow-wrap: anywhere; }
+.wf-step .wf-step { margin: 8px 0 0; background: var(--chip); }
+.wf-step .title { font-weight: 600; }
+.wf-step .sub { color: var(--muted); font-size: 12px; }
+.wf-title { margin: 14px 0 6px; font-size: 14px; }
+.wf-phase { margin-bottom: 8px; }
+.wf-run { list-style: none; margin: 2px 0 0; padding-left: 14px; }
+.st-ok { color: var(--ok); } .st-bad { color: var(--bad); } .st-wait { color: var(--wait); } .st-run { color: var(--accent); }
+.set-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.set-bar .grow { flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere; }
+.set-note { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; }
+.set-note code { font-size: 12px; }
+.set-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr)); gap: 10px; align-items: start; }
+.set-section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 0; }
+.set-section h3 { margin: 0 0 2px; font-size: 14px; }
+.set-section > p { margin: 0 0 6px; }
+.set-field { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2px 10px; align-items: center; padding: 7px 0; border-top: 1px solid var(--line); }
+.set-field > label { font-weight: 600; font-size: 13px; }
+.set-field > .full { grid-column: 1 / -1; }
+.set-field.changed > label::after { content: " (changed)"; color: var(--warn); font-weight: 400; }
+.set-field input[type=text], .set-field input[type=number], .set-field select { width: 100%; min-width: 0; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
+.set-field input[type=checkbox] { justify-self: start; width: 18px; height: 18px; }
+.set-key { font: 11px ui-monospace, Menlo, monospace; color: var(--muted); overflow-wrap: anywhere; }
+.map-rows { display: flex; flex-direction: column; gap: 4px; }
+.map-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 4px; }
+.map-row input { width: 100%; min-width: 0; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
+.checks { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.checks label { display: flex; gap: 4px; align-items: center; font-weight: 400; }
+#settings-yaml { width: 100%; min-height: 70vh; font: 12px/1.45 ui-monospace, Menlo, monospace; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; tab-size: 2; white-space: pre; overflow: auto; }
+.diff .d-add { color: var(--ok); } .diff .d-del { color: var(--bad); } .diff .d-hunk { color: var(--accent); }
+dialog.wide { width: min(980px, 96vw); }
+/* time and cost: one fixed colour per bucket (validated categorical slots 1-6, runner a neutral grey) */
+:root { --b-agent: #2a78d6; --b-gates: #eb6834; --b-human: #1baf7a; --b-ci: #eda100; --b-hold: #e87ba4; --b-down: #008300; --b-runner: #a3a3a0; }
+@media (prefers-color-scheme: dark) {
+  :root { --b-agent: #3987e5; --b-gates: #d95926; --b-human: #199e70; --b-ci: #c98500; --b-hold: #d55181; --b-down: #008300; --b-runner: #6b6b68; }
+}
+.b-agent { background: var(--b-agent); } .b-gates { background: var(--b-gates); } .b-human { background: var(--b-human); }
+.b-ci { background: var(--b-ci); } .b-hold { background: var(--b-hold); } .b-down { background: var(--b-down); } .b-runner { background: var(--b-runner); }
+.stack-cell { min-width: 140px; width: 32%; }
+.stack { display: flex; gap: 2px; height: 12px; margin-top: 3px; }
+.stack span { display: block; height: 100%; min-width: 2px; }
+.stack span:last-child { border-radius: 0 4px 4px 0; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 10px; font-size: 12px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.met-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.met-bar input[type=date] { font: inherit; color: inherit; background: var(--chip); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+.kpi .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.kpi .k { font-size: 12px; color: var(--muted); }
+.scroll { overflow-x: auto; margin-bottom: 14px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.wrap { white-space: normal; min-width: 200px; }
+.chip { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--chip); margin: 2px 4px 2px 0; white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>agentflow</h1>
+  <div id="summary">loading…</div>
+  <button id="new-task" type="button" class="primary" hidden>+ New task</button>
+  <button id="tab-board" type="button" aria-pressed="true">Board</button>
+  <button id="tab-workflow" type="button" aria-pressed="false">Workflow</button>
+  <button id="tab-agents" type="button" aria-pressed="false">Agents</button>
+  <button id="tab-metrics" type="button" aria-pressed="false">Metrics</button>
+  <button id="tab-settings" type="button" aria-pressed="false">Settings</button>
+  <span id="live" class="pill">connecting…</span>
+</header>
+<main>
+  <section id="board-view">
+    <div id="sync-note" class="muted" role="status" hidden></div>
+    <div id="columns" class="columns"></div>
+    <h2 class="lane">Needs human</h2>
+    <div id="needs"></div>
+  </section>
+  <section id="workflow-view" hidden>
+    <div id="workflow-phases" class="columns"></div>
+    <h2 class="lane">Human-run skills</h2>
+    <p class="muted">The runner never loads these. You run <code>doubt-driven-development</code> when the plan's approval page offers it, and the others when you choose. The gates in build and verify enforce the rules <code>constraint-driven-development</code> wrote to <code>CONSTRAINTS.md</code>.</p>
+    <div id="workflow-human"></div>
+  </section>
+  <section id="agents-view" hidden>
+    <p id="agents-summary"></p>
+    <div id="agents-live"></div>
+    <h2 class="lane" id="exited-title"></h2>
+    <div id="agents-exited"></div>
+  </section>
+  <section id="metrics-view" hidden>
+    <div class="met-bar">
+      <label for="met-lane" class="muted">Work</label>
+      <select id="met-lane"></select>
+      <label for="met-range" class="muted">Started</label>
+      <select id="met-range">
+        <option value="month">This month</option>
+        <option value="last_month">Last month</option>
+        <option value="d7">Last 7 days</option>
+        <option value="d30">Last 30 days</option>
+        <option value="all">All time</option>
+        <option value="custom">Custom range</option>
+      </select>
+      <span id="met-custom" hidden>
+        <input id="met-from" type="date" aria-label="from">
+        <span class="muted">to</span>
+        <input id="met-to" type="date" aria-label="to">
+      </span>
+      <span id="met-status" class="muted" role="status"></span>
+    </div>
+    <div id="met-body"></div>
+  </section>
+  <section id="settings-view" hidden>
+    <div class="set-bar">
+      <button id="set-mode-form" type="button" aria-pressed="true">Form</button>
+      <button id="set-mode-yaml" type="button" aria-pressed="false">YAML</button>
+      <span id="settings-status" class="muted grow" role="status">loading…</span>
+      <button id="set-reload" type="button">Reload</button>
+      <button id="set-discard" type="button" disabled>Discard</button>
+      <button id="set-review" type="button" class="primary" disabled>Review and save</button>
+    </div>
+    <div class="set-note muted">
+      Saving writes <code id="settings-path"></code> after <code>agentflow validate</code>'s checks pass. Comments and layout stay as they are.
+      The dashboard uses the new config at once. A running run picks it up when its next phase starts, and new runs start with it.
+      Commit the change like any other edit.
+      <span id="settings-protected"></span>
+    </div>
+    <div id="settings-form" class="set-grid"></div>
+    <div id="settings-text" hidden><textarea id="settings-yaml" spellcheck="false" aria-label="config.yaml"></textarea></div>
+  </section>
+</main>
+<aside id="drawer" hidden aria-label="Run detail"></aside>
+<dialog id="dlg">
+  <h3 id="dlg-title"></h3>
+  <div id="dlg-body"></div>
+  <div class="dlg-buttons">
+    <button type="button" id="dlg-cancel">Cancel</button>
+    <button type="button" id="dlg-ok" class="primary">OK</button>
+  </div>
+</dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+<script nonce="{{NONCE}}">
+"use strict";
+// Every string from a run (agent output, notes, issue text) is set with textContent: never as markup.
+
+const TOKEN = (function () {
+  // `agentflow dashboard` prints /#token=...: a fragment is never sent to the server, its log or a Referer.
+  // The token is kept in sessionStorage for this tab, so a reload or a restored tab still works.
+  const match = /^#token=([A-Za-z0-9_-]+)$/.exec(location.hash);
+  let token = match ? match[1] : "";
+  try {
+    if (token) { sessionStorage.setItem("agentflow-token", token); } else { token = sessionStorage.getItem("agentflow-token") || ""; }
+  } catch (err) {
+    console.warn("agentflow: session storage unavailable", err);
+  }
+  if (location.hash) { history.replaceState(null, "", location.pathname); }  // keep the token out of the address bar
+  return token;
+})();
+
+const ui = { view: "board", drawer: null, board: null, agents: null, workflow: null, dragging: null };
+const $ = (id) => document.getElementById(id);
+const workLabel = (lane) => (ui.board && ui.board.lane_labels[lane]) || lane;  // a lane with no label, or an old run's, shows its name
+
+function el(tag, props, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props || {})) {
+    if (value === null || value === undefined || value === false) continue;
+    if (key === "class") node.className = value;
+    else if (key === "text") node.textContent = String(value);
+    else if (key === "title") node.title = String(value);
+    else if (key === "onclick") node.addEventListener("click", value);
+    else if (/^(type|value|name|for|id|role|tabindex|aria-[a-z]+|readonly|checked|placeholder|open|draggable|href|target|rel|disabled|maxlength|multiple|min|max|step|spellcheck)$/.test(key)) node.setAttribute(key, String(value));
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function toast(text) {
+  const box = $("toast");
+  box.textContent = text;
+  box.classList.add("show");
+  setTimeout(() => box.classList.remove("show"), 2600);
+}
+
+async function api(path, body) {
+  const options = { headers: { "X-Agentflow-Token": TOKEN }, cache: "no-store" };
+  if (body !== undefined) {
+    options.method = "POST";
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  const text = await response.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (err) { data = { error: "unreadable response" }; }
+  if (!response.ok) {
+    throw new Error(data.error || (response.status === 403 ? "forbidden: open the URL with the token printed by `agentflow dashboard`" : "HTTP " + response.status));
+  }
+  return data;
+}
+
+const runPath = (id) => "/api/runs/" + encodeURIComponent(id);
+
+function actionToast(action, result) {
+  if (action === "answer" && result.complete === false) return "Recorded; still waiting on " + result.pending.join(", ");
+  if (action === "approve" && !result.resumed) return "Approved: the card is ready";
+  if (action === "done" && result.resumed) return "Marked done: the draft PR opens in the background";
+  return action + " recorded" + (result.resumed ? "; the run resumes in the background" : "");
+}
+
+async function act(runId, action, body) {
+  try {
+    toast(actionToast(action, await api(runPath(runId) + "/" + action, body || {})));
+    scheduleRefresh();
+    return true;
+  } catch (err) {
+    toast(action + " failed: " + err.message);
+    return false;
+  }
+}
+
+function ago(seconds) {
+  if (seconds === null || seconds === undefined) return "-";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return minutes + " min";
+  return Math.floor(minutes / 60) + " h " + (minutes % 60) + " min";
+}
+
+const money = (value) => (typeof value === "number" ? "$" + value.toFixed(2) : "-");
+const arrow = (direction) => (direction === "up" ? " ↑" : direction === "down" ? " ↓" : "");
+
+// ------------------------------------------------------------------ board
+
+// A ready card moves one phase on, or to Done. The buttons and drag and drop are two ways to the same two actions.
+
+const continueCard = (card) => act(card.run_id, "resume");
+
+function markDone(card) {
+  const skips = card.ready.skips;
+  const warning = skips.length ? "\n\nThese phases will not run: " + skips.join(", ") + ". The PR says so." : "";
+  if (confirm("Mark " + card.module + " done and open a draft PR?" + warning)) act(card.run_id, "done");
+}
+
+function canDrop(name) {
+  const drag = ui.dragging;
+  if (!drag) return false;
+  if (drag.start) return name === drag.start.first_phase;  // the first phase with work for it (a finished spec: plan), never Done
+  return name === "Done" || name === drag.ready.next;
+}
+
+function showDropTargets() {
+  for (const col of document.querySelectorAll(".col")) col.classList.toggle("drop", canDrop(col.dataset.column));
+}
+
+function dropOn(col, name) {
+  col.dataset.column = name;
+  col.addEventListener("dragover", (ev) => {
+    if (!canDrop(name)) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = "move";
+  });
+  col.addEventListener("drop", (ev) => {
+    if (!canDrop(name)) return;
+    ev.preventDefault();
+    const drag = ui.dragging;
+    setTimeout(() => {  // confirm() must not block the drag's end
+      if (drag.start) startItem(drag.start);
+      else if (name === "Done") markDone(drag);
+      else continueCard(drag);
+    }, 0);
+  });
+}
+
+function dragFrom(node, dragged, id) {
+  node.addEventListener("dragstart", (ev) => {
+    ui.dragging = dragged;
+    ev.dataTransfer.effectAllowed = "move";
+    ev.dataTransfer.setData("text/plain", id);
+    showDropTargets();
+  });
+  node.addEventListener("dragend", () => {
+    ui.dragging = null;
+    showDropTargets();
+    if (ui.board) renderBoard(ui.board);  // what arrived during the drag
+  });
+}
+
+function movesNode(card) {
+  const button = (text, primary, onclick) => el("button", { type: "button", class: primary ? "primary" : null, text: text,
+    onclick: (ev) => { ev.stopPropagation(); onclick(card); } });
+  const next = card.ready.next;
+  const moves = el("div", { class: "moves" },
+    next ? button("Continue → " + next, true, continueCard) : null,
+    button("Mark done", !next, markDone));
+  moves.addEventListener("keydown", (ev) => ev.stopPropagation());  // Enter on a button must not open the drawer too
+  return moves;
+}
+
+function prNode(card) {
+  const link = el("a", { href: card.pr_link, target: "_blank", rel: "noopener noreferrer", text: "PR ↗",
+    onclick: (ev) => ev.stopPropagation() });
+  link.addEventListener("keydown", (ev) => ev.stopPropagation());
+  return el("div", {}, link);
+}
+
+function cardNode(card) {
+  const agent = card.agent
+    ? el("div", { class: "sub", title: card.agent.reason ? "effort: " + card.agent.reason : null },
+        (card.agent.model || "?") + " · " + (card.agent.effort || "?") + arrow(card.agent.arrow))
+    : el("div", { class: "sub", text: "no agent" });
+  const where = card.task ? "Task " + card.task + " ▸ " + (card.step || "").split("/").pop() : (card.step || "not started");
+  const gates = el("div", { class: "sub" }, card.gates.map((g) =>
+    el("span", { class: g.skipped ? "gate-skip" : g.passed ? "gate-ok" : "gate-bad", text: (g.skipped ? "– " : g.passed ? "✓ " : "✗ ") + g.gate + " " })));
+  const node = el("article", { class: "card " + card.status, tabindex: "0", role: "button", draggable: card.ready ? "true" : null, onclick: () => openDrawer(card.run_id) },
+    el("div", { class: "title", text: card.module }),
+    el("div", { class: "sub", text: where }),
+    el("span", { class: "badge", text: card.badge }),
+    card.refine_round ? el("span", { class: "badge", text: "refine " + card.refine_round }) : null,
+    agent,
+    el("div", { class: "sub", text: "ctx " + (typeof card.context_pct === "number" ? Math.round(card.context_pct) + "%" : "-") + " · " + money(card.spend) + (card.budget ? " / " + money(card.budget) : "") }),
+    card.gates.length ? gates : null,
+    el("div", { class: "sub", text: "in phase " + ago(card.time_in_phase_s) + " · total " + dur(card.wall_s) }),
+    card.pr_link ? prNode(card) : null,
+    card.ready ? movesNode(card) : null);
+  node.addEventListener("keydown", (ev) => { if (ev.key === "Enter") openDrawer(card.run_id); });
+  if (card.ready) dragFrom(node, card, card.run_id);
+  return node;
+}
+
+// ------------------------------------------------------------------ backlog
+
+// Nothing starts by itself: a developer drags a card to its first phase or presses Start. A blocked card is locked.
+
+async function startItem(item) {
+  try {
+    await api("/api/backlog/start", item.kind === "module" ? { module: item.id } : { item: item.key });
+    toast("Starting " + item.label + "…");
+  } catch (err) {
+    toast("Could not start " + item.label + ": " + err.message);
+  }
+  scheduleRefresh();
+}
+
+async function removeItem(item) {
+  if (!confirm("Remove " + item.label + " from Backlog?")) return;
+  try {
+    await api("/api/backlog/remove", { item: item.key });
+    toast("Removed " + item.label);
+  } catch (err) {
+    toast("Could not remove: " + err.message);
+  }
+  scheduleRefresh();
+}
+
+function backlogMark(item) {
+  if (item.status === "parallel") return el("span", { class: "badge p", text: "P", title: "Can run in parallel", "aria-label": "Can run in parallel", role: "img" });
+  if (item.status === "blocked") return el("span", { class: "badge lock", text: "Blocked" });
+  if (item.status === "starting") return el("span", { class: "badge", text: "Starting…" });
+  return el("span", { class: "badge ready-mark", text: "Ready" });
+}
+
+function backlogNode(item) {
+  const canStart = item.status === "parallel" || item.status === "ready";
+  const names = (list) => list.map((p) => p.label).join(", ");
+  const buttons = [];
+  if (canStart) buttons.push(el("button", { type: "button", class: "primary", text: "Start", onclick: (ev) => { ev.stopPropagation(); startItem(item); } }));
+  if (item.removable) buttons.push(el("button", { type: "button", class: "danger", text: "Remove", onclick: (ev) => { ev.stopPropagation(); removeItem(item); } }));
+  const node = el("article", { class: "card backlog " + item.status + (item.failure ? " failed-start" : ""), draggable: canStart ? "true" : null },
+    el("div", { class: "title", text: item.label }),
+    backlogMark(item),
+    item.blocked_by.length ? el("div", { class: "sub", text: "Runs after: " + item.blocked_by.map((b) => b.text).join(", ") }) : null,
+    item.parallel_with.length ? el("div", { class: "sub", text: "Parallel with: " + names(item.parallel_with) }) : null,
+    item.note ? el("div", { class: "sub", text: item.note }) : null,
+    item.failure ? el("div", { class: "sub gate-bad", text: "Could not start: " + item.failure + (canStart ? " — Start tries again" : "") }) : null,
+    buttons.length ? el("div", { class: "moves" }, buttons) : null);
+  if (canStart) dragFrom(node, { start: item }, item.key);
+  return node;
+}
+
+function newTaskDialog() {
+  const data = ui.board;
+  const kinds = Object.keys(data.new_task);
+  if (!kinds.length) return;
+  const radios = kinds.map((name, index) => el("input", { type: "radio", name: "nt-kind", value: name, checked: index === 0 ? "checked" : null }));
+  const kind = () => radios.find((radio) => radio.checked).value;
+  const fields = el("div", {});
+  const inputs = {};
+  const pick = (id, label, multi, choices, hint) => {
+    const select = el("select", { id: id, multiple: multi ? "multiple" : null }, choices.map((c) => el("option", { value: c.key, text: c.label })));
+    inputs[id] = select;
+    return [el("label", { for: id, text: label }), hint ? el("div", { class: "sub", text: hint }) : null, select];
+  };
+  const text = (id, label, area, max) => {
+    const input = area ? el("textarea", { id: id, maxlength: max, class: area === "short" ? "short" : null }) : el("input", { type: "text", id: id, maxlength: max });
+    inputs[id] = input;
+    return [el("label", { for: id, text: label }), input];
+  };
+  const build = () => {
+    const wanted = data.new_task[kind()];
+    const parts = [];
+    if (wanted.includes("issue")) parts.push(...text("nt-issue", "Issue number", false, 12));
+    if (wanted.includes("task")) parts.push(...text("nt-task", "Task (paste a log here if it helps)", true, 16000));
+    if (wanted.includes("topic")) parts.push(...text("nt-topic", "Topic", false, 400));
+    if (wanted.includes("new_module")) {
+      parts.push(...text("nt-module", "Module id (lowercase, - or _)", false, 60));
+      parts.push(...text("nt-resp", "What it does", "short", 400));
+      parts.push(...pick("nt-deps", "Depends on", true, data.modules.map((m) => ({ key: m, label: m })), "Only modules already in the map."));
+    }
+    const phases = data.lane_phases[kind()] || [];
+    parts.push(...pick("nt-stop", "Stop after", false, [{ key: "", label: "(run to the end)" }, ...phases.map((p) => ({ key: p, label: p }))]));
+    if (wanted.includes("after")) parts.push(...pick("nt-after", "Runs after (optional)", true, data.after_choices, "The card stays locked until each one is merged."));
+    fields.replaceChildren(...parts.filter(Boolean));
+  };
+  for (const radio of radios) radio.addEventListener("change", build);
+  build();
+  const chosen = (id) => Array.from(inputs[id].selectedOptions).map((o) => o.value);
+  const picker = el("fieldset", {}, el("legend", { text: "What kind of work?" }),
+    kinds.map((name, index) => el("label", { class: "kind" }, radios[index], workLabel(name))));
+  dialog("New task", [picker, fields], async () => {
+    const wanted = data.new_task[kind()];
+    const body = { lane: kind(), fields: {}, after: wanted.includes("after") ? chosen("nt-after") : [], to_phase: inputs["nt-stop"].value || null };
+    if (wanted.includes("issue")) body.fields.issue = inputs["nt-issue"].value.trim();
+    if (wanted.includes("task")) body.fields.task = inputs["nt-task"].value;
+    if (wanted.includes("topic")) body.fields.topic = inputs["nt-topic"].value.trim();
+    if (wanted.includes("new_module")) body.fields.new_module = { module: inputs["nt-module"].value.trim(), responsibility: inputs["nt-resp"].value, deps: chosen("nt-deps") };
+    for (const name of Object.keys(body.fields)) if (body.fields[name] === "" || (typeof body.fields[name] === "string" && !body.fields[name].trim())) delete body.fields[name];
+    try {
+      await api("/api/backlog", body);
+      toast("Added to Backlog: press Start or drag it to " + ((data.lane_phases[kind()] || [])[0] || "its first phase"));
+      scheduleRefresh();
+      return true;
+    } catch (err) {
+      toast("Could not add: " + err.message);
+      return false;
+    }
+  });
+}
+
+function renderBoard(data) {
+  ui.board = data;
+  const counts = Object.entries(data.counts).map(([k, v]) => k.replace("_", " ") + " " + v).join(" · ") || "no runs";
+  const byModel = Object.entries(data.agents_running.by_model).map(([k, v]) => k + " " + v).join(" · ");
+  $("summary").textContent = counts + " | agents running " + data.agents_running.total + (byModel ? " (" + byModel + ")" : "") +
+    " | today " + money(data.spend_today) + " (budget per run " + money(data.run_budget_usd) + ")";
+  const columns = data.columns.map((name) => {
+    const cards = name === "Backlog" ? [] : data.cards.filter((c) => c.column === name);
+    const col = el("div", { class: "col" }, el("h2", {}, el("span", { text: name }), el("span", { text: String(name === "Backlog" ? data.backlog.length : cards.length) })));
+    dropOn(col, name);
+    if (name === "Backlog") col.append(...data.backlog.map(backlogNode));
+    for (const card of cards) col.append(cardNode(card));
+    return col;
+  });
+  $("new-task").hidden = !Object.keys(data.new_task).length;
+  $("sync-note").hidden = !data.sync_note;
+  $("sync-note").textContent = data.sync_note ? "Base branch not updated: " + data.sync_note : "";
+  if (!ui.dragging) $("columns").replaceChildren(...columns);  // new columns would lose the drop highlights mid-drag
+  $("needs").replaceChildren(...(data.needs_human.length ? data.needs_human.map(needNode) : [el("p", { class: "muted", text: "Nothing is waiting on you." })]));
+}
+
+function needNode(item) {
+  const questions = item.questions || [];
+  const what = el("div", { class: "what" },
+    el("strong", { text: item.run_id }), " · ", item.key, " · ", item.kind, " · ", ago(item.age_s) + " ago",
+    item.summary ? el("div", { class: "sub", text: item.summary }) : null,
+    questions.length ? el("ul", {}, questions.map((q) => el("li", { text: q.id + ": " + q.question }))) : null);
+  const buttons = [];
+  const target = item.kind === "phase_approval" ? item.phase : item.key;
+  if (questions.length) {
+    buttons.push(el("button", { type: "button", class: "primary", text: "Answer…", onclick: () => answerDialog(item) }));
+  } else {
+    buttons.push(el("button", { type: "button", class: "primary", text: "Approve", onclick: () => {
+      if (item.kind === "blocked" || item.kind === "blocked_repeat") {
+        const required = item.kind === "blocked_repeat";
+        const note = prompt("Tell the agent what changed or what to do" + (required ? " (required: it blocked again with nothing changed)" : " (optional)") + ":", "");
+        if (note !== null) act(item.run_id, "approve", note.trim() ? { target: target, note: note.trim() } : { target: target });
+      } else if (confirm("Approve " + item.key + " for " + item.run_id + "?")) {
+        act(item.run_id, "approve", { target: target });
+      }
+    } }));
+  }
+  if (item.kind !== "parked") {
+    buttons.push(el("button", { type: "button", text: "Reject…", onclick: () => rejectDialog(item.run_id, target) }));
+  }
+  buttons.push(el("button", { type: "button", text: "Open", onclick: () => openDrawer(item.run_id) }));
+  return el("div", { class: "need" }, what, ...buttons);
+}
+
+// ------------------------------------------------------------------ dialogs
+
+function dialog(title, body, onOk, okText, wide) {
+  const dlg = $("dlg");
+  dlg.classList.toggle("wide", !!wide);
+  $("dlg-title").textContent = title;
+  $("dlg-body").replaceChildren(...body);
+  const ok = $("dlg-ok").cloneNode(true);
+  const cancel = $("dlg-cancel").cloneNode(true);
+  $("dlg-ok").replaceWith(ok);
+  $("dlg-cancel").replaceWith(cancel);
+  ok.textContent = okText || "OK";
+  ok.addEventListener("click", async () => { if (await onOk()) dlg.close(); });
+  cancel.addEventListener("click", () => dlg.close());
+  dlg.showModal();
+}
+
+function rejectDialog(runId, target) {
+  const note = el("textarea", { id: "reject-note", placeholder: "What should change? The phase runs again with this note." });
+  dialog("Reject " + target + " (" + runId + ")", [el("label", { for: "reject-note", text: "Note" }), note], () => {
+    if (!note.value.trim()) { toast("A rejection needs a note"); return false; }
+    return act(runId, "reject", { target: target, note: note.value });
+  });
+}
+
+function answerDialog(item) {
+  const inputs = {};
+  const body = [];
+  for (const q of item.questions) {
+    const id = "answer-" + q.id;
+    const input = el("input", { type: "text", id: id, placeholder: "an option key or your answer" });
+    inputs[q.id] = input;
+    body.push(el("label", { for: id, text: q.id + ": " + q.question }));
+    if (q.evidence && q.evidence.length) body.push(el("div", { class: "sub", text: "see " + q.evidence.join(", ") }));
+    if (q.options && q.options.length) {
+      body.push(el("div", { class: "opts" }, q.options.map((o) => el("button", {
+        type: "button", text: o.key + ": " + o.label + (o.recommended ? " (recommended)" : ""),
+        onclick: () => { input.value = o.key; },
+      }))));
+    }
+    body.push(input);
+  }
+  dialog("Answer " + item.key + " (" + item.run_id + ")", body, () => {
+    const answers = {};
+    for (const [qid, input] of Object.entries(inputs)) if (input.value.trim()) answers[qid] = input.value;
+    if (!Object.keys(answers).length) { toast("Fill in at least one answer"); return false; }
+    return act(item.run_id, "answer", { key: item.key, answers: answers });
+  });
+}
+
+// ------------------------------------------------------------------ run detail drawer
+
+function section(title, text, open) {
+  return el("details", { open: open }, el("summary", { text: title }), el("pre", { text: text || "(empty)" }));
+}
+
+function describe(event) {
+  const bits = [event.ts ? event.ts.slice(11, 19) : "", event.type];
+  for (const key of ["phase", "key", "kind", "status", "gate", "reason", "summary", "note"]) {
+    if (event[key] !== undefined && event[key] !== null && event[key] !== "") bits.push(key + "=" + (typeof event[key] === "string" ? event[key] : JSON.stringify(event[key])));
+  }
+  if (event.by && event.by !== "runner") bits.push("by " + event.by);
+  return bits.join("  ");
+}
+
+async function openDrawer(runId) {
+  ui.drawer = runId;
+  const drawer = $("drawer");
+  drawer.hidden = false;
+  let detail;
+  try {
+    detail = await api(runPath(runId));
+  } catch (err) {
+    drawer.replaceChildren(el("p", { text: "Could not load " + runId + ": " + err.message }), el("button", { type: "button", text: "Close", onclick: closeDrawer }));
+    return;
+  }
+  if (ui.drawer !== runId) return;
+  const st = detail.state;
+  const attach = el("input", { type: "text", value: detail.attach, readonly: "readonly", "aria-label": "attach command" });
+  const copy = el("button", { type: "button", text: "Copy", onclick: () => {
+    navigator.clipboard.writeText(detail.attach).then(() => toast("Copied: run it in your terminal"), () => { attach.select(); toast("Press Ctrl-C / ⌘C to copy"); });
+  } });
+  const actions = el("div", { class: "actions" },
+    el("button", { type: "button", text: "Pause", onclick: () => act(runId, "pause") }),
+    el("button", { type: "button", text: "Resume", onclick: () => act(runId, "resume") }),
+    el("button", { type: "button", text: "Retry failed step", onclick: () => act(runId, "retry") }),
+    el("button", { type: "button", class: "danger", text: "Cancel run", onclick: () => { if (confirm("Cancel " + runId + "? Live agents are stopped.")) act(runId, "cancel"); } }),
+    el("button", { type: "button", text: "Close", onclick: closeDrawer }));
+  const records = Object.entries(st.steps || {}).map(([key, row]) => key + "  " + row.status + (row.skip_reason ? "  (" + row.skip_reason + ")" : "") + (row.result ? "  — " + row.result : ""));
+  const gates = detail.gates.map((g) => (g.skipped ? "– " : g.passed ? "✓ " : "✗ ") + g.key + " " + g.gate + (g.log_tail ? "\n" + g.log_tail : "")).join("\n\n");
+  const facts = [["status", detail.status], ["work", workLabel(st.pipeline)], ["phase", st.phase], ["step", st.step],
+    ["branch", st.branch], ["worktree", st.worktree], ["pull request", st.pr_url], ["spend", money(st.spend_usd) + (st.budget_usd ? " / " + money(st.budget_usd) : "")],
+    ["refine", st.refine ? "round " + st.refine.round + ": " + st.refine.note : null], ["failure", st.failure]]
+    .filter(([, v]) => v).map(([k, v]) => el("div", {}, el("span", { class: "muted", text: k + ": " }), String(v)));
+  drawer.replaceChildren(
+    el("h2", { text: runId }), ...facts,
+    el("div", { class: "attach" }, attach, copy), actions,
+    metricsSection(detail.metrics),
+    ...(st.waiting ? [section("Waiting on " + st.waiting.key + " (" + st.waiting.kind + ")", detail.inbox || st.waiting.summary, true)] : []),
+    runWorkflow(detail.workflow),
+    section("Step records", records.join("\n"), false),
+    el("details", {}, el("summary", { text: "Timeline (" + detail.timeline.length + " events)" }),
+      el("ol", { class: "timeline" }, detail.timeline.slice().reverse().map((e) => el("li", { text: describe(e) })))),
+    section("Gates", gates, false),
+    section("Review findings", Object.keys(detail.reviews).length ? JSON.stringify(detail.reviews, null, 2) : "", false),
+    section("progress.md", detail.progress, false),
+    section("handoff.md", detail.handoff, false),
+    section("Transcript tail" + (detail.transcript_file ? " (" + detail.transcript_file + ")" : ""), detail.transcript, false));
+}
+
+function closeDrawer() {
+  ui.drawer = null;
+  $("drawer").hidden = true;
+}
+
+// ------------------------------------------------------------------ workflow view
+
+const STATUS_CLASS = { done: "st-ok", approved: "st-ok", failed: "st-bad", waiting: "st-wait", awaiting_approval: "st-wait", running: "st-run", refining: "st-run" };
+
+function stepSkills(step) {
+  const skills = [];
+  if (step.skill) skills.push(step.skill);
+  if (step.small_plan_skill) skills.push(step.small_plan_skill + " (small plan)");
+  if (skills.length) return skills.join(" · ");
+  if (step.type === "agent" && !step.tdd) return "no skill (no TDD for prompt text)";  // an agent step no skill owns
+  return { gate: "no agent", finish: "runner action", commit: "runner action", ci: "runner action", group: "", checkpoint: "human checkpoint" }[step.type] ?? "no skill";
+}
+
+// One workflow for all work: a badge marks only a step one kind of work runs, and a nested step doesn't repeat its parent's.
+function onlyFor(step, parent) {
+  if (step.lanes.length !== 1 || ui.workflow.lanes.length < 2 || (parent && parent.lanes.length === 1)) return null;
+  return el("div", {}, el("span", { class: "badge", text: workLabel(step.lanes[0]) + " only" }));
+}
+
+function workflowStep(step, parent) {
+  const facts = [step.model, step.gates.length ? "gates: " + step.gates.join(", ") : null, step.runs_when ? "when: " + step.runs_when : null].filter(Boolean).join(" · ");
+  const children = [...step.steps, ...(step.review ? [step.review] : [])];
+  return el("div", { class: "wf-step" },
+    el("div", { class: "title", text: step.id }),
+    el("div", { class: "sub", text: stepSkills(step) }),
+    onlyFor(step, parent),
+    facts ? el("div", { class: "sub", text: facts }) : null,
+    children.map((child) => workflowStep(child, step)));
+}
+
+function renderWorkflow() {
+  const view = ui.workflow;
+  if (!view) return;
+  $("workflow-phases").replaceChildren(...view.phases.map((phase) => el("div", { class: "col" },
+    el("h2", {}, el("span", { text: phase.name }), el("span", { text: phase.approval ? "you approve" + (phase.human_skill ? ", offers " + phase.human_skill : "") : "moves on by itself" })),
+    phase.steps.map((step) => workflowStep(step)))));
+  $("workflow-human").replaceChildren(...view.human_skills.map((skill) => el("span", { class: "badge", text: skill })));
+}
+
+function runStepNode(step) {
+  const detail = [step.count, step.reason].filter(Boolean).join(" · ");
+  return el("li", {},
+    el("span", { class: STATUS_CLASS[step.status] || "muted", text: step.status }), " ",
+    el("strong", { text: step.id }),
+    step.skill ? el("span", { class: "muted", text: " " + step.skill }) : null,
+    detail ? el("div", { class: "muted", text: detail }) : null,
+    step.steps.length ? el("ul", { class: "wf-run" }, step.steps.map(runStepNode)) : null);
+}
+
+function runWorkflow(phases) {
+  return el("div", {}, el("h3", { class: "wf-title", text: "Workflow" }), phases.map((phase) => el("div", { class: "wf-phase" },
+    el("div", {}, el("strong", { text: phase.name }), " ", el("span", { class: STATUS_CLASS[phase.status] || "muted", text: phase.status.replace("_", " ") }),
+      phase.reason ? el("span", { class: "muted", text: " · " + phase.reason }) : null),
+    el("ul", { class: "wf-run" }, phase.steps.map(runStepNode)))));
+}
+
+// ------------------------------------------------------------------ agents view
+
+function agentTable(rows, withSubs) {
+  const head = ["Run", "Phase › step", "Role", "Agent", "Model", "Effort", "Status", "Ctx", "Spend", "For", "Last activity"];
+  const body = [];
+  for (const r of rows) {
+    const effort = el("td", { title: r.effort_reason ? "chose " + r.effort + ": " + r.effort_reason : r.effort_refused ? "refused: " + JSON.stringify(r.effort_refused) : null }, (r.effort || "-") + arrow(r.effort_arrow));
+    body.push(el("tr", { class: "row-link" + (r.idle ? " idle" : ""), title: "open " + r.run_id, onclick: () => openDrawer(r.run_id) },
+      el("td", { text: r.module }), el("td", { text: r.place }), el("td", { text: r.role || "—" }), el("td", { text: r.agent || "-" }),
+      el("td", { text: r.model || "-", title: r.model_source ? "from " + r.model_source : null }), effort,
+      el("td", { text: r.status || "-" }), el("td", { text: typeof r.context_pct === "number" ? Math.round(r.context_pct) + "%" : "-" }),
+      el("td", { text: money(r.spend) }), el("td", { text: ago(r.age_s) }),
+      el("td", { text: (r.last_tool || "") + (r.idle ? " (idle)" : "") })));
+    if (withSubs) {
+      for (const s of r.subagents) {
+        body.push(el("tr", { class: "sub" }, el("td", { text: "  └ sub" }), el("td", { text: (s.subagent_type || "subagent") + " (spawned by the session above)" }),
+          el("td", { text: "—" }), el("td", { text: r.agent || "-" }), el("td", { text: s.model }), el("td", { text: "inherit" }),
+          el("td", { text: s.done ? "done" : "running" }), el("td", { text: "—" }), el("td", { text: "—" }), el("td", { text: "" }), el("td", { text: "" })));
+      }
+    }
+  }
+  return el("table", {}, el("thead", {}, el("tr", {}, head.map((h) => el("th", { text: h })))), el("tbody", {}, body));
+}
+
+function renderAgents(view) {
+  ui.agents = view;
+  const byAgent = Object.entries(view.counts.by_agent).map(([k, v]) => k + " " + v).join(" · ");
+  const byModel = Object.entries(view.counts.by_model).map(([k, v]) => k + " " + v).join(" · ");
+  $("agents-summary").textContent = "Agents running: " + view.live.length + (view.live.length ? "  (" + byAgent + " | " + byModel + ")" : "");
+  $("agents-live").replaceChildren(view.live.length ? agentTable(view.live, true) : el("p", { class: "muted", text: "No agent is running." }));
+  $("exited-title").textContent = "Exited in the last " + view.show_exited_min + " min";
+  $("agents-exited").replaceChildren(view.exited.length ? agentTable(view.exited, false) : el("p", { class: "muted", text: "None." }));
+}
+
+// ------------------------------------------------------------------ time and cost
+
+// Every figure comes from the runs' event logs, so a finished or archived run keeps its numbers. A run's time is split
+// into buckets: what it was doing (an agent call, gates, waiting on a person, CI, a usage-limit hold, no runner going).
+
+const BUCKET_LABEL = { agent: "agent", gates: "gates", human: "waiting on a human", ci: "CI", hold: "usage-limit hold", down: "runner down", runner: "runner" };
+const shortModel = (model) => String(model || "?").replace(/^claude-/, "");
+const modelLabel = (m) => shortModel(m.model) + "·" + (m.effort || "?");
+
+function dur(seconds) {
+  if (typeof seconds !== "number" || !isFinite(seconds) || seconds <= 0) return "0m";
+  if (seconds < 60) return Math.round(seconds) + "s";
+  const minutes = Math.round(seconds / 60);
+  return minutes < 60 ? minutes + "m" : Math.floor(minutes / 60) + "h " + String(minutes % 60).padStart(2, "0") + "m";
+}
+
+const pct = (part, whole) => (whole ? Math.round((part / whole) * 100) : 0);
+const cost = (value, estimated) => (estimated ? "~" : "") + money(value);
+
+function bucketOrder() {
+  return (metricsUi.data && metricsUi.data.buckets) || Object.keys(BUCKET_LABEL);
+}
+
+// A horizontal stacked bar: one segment per bucket, the whole bar `scale` (0..1) of the widest bar it is compared with.
+function stackNode(buckets, scale) {
+  const total = Object.values(buckets || {}).reduce((a, b) => a + b, 0);
+  const bar = el("div", { class: "stack", role: "img", "aria-label": bucketOrder().filter((b) => buckets[b]).map((b) => BUCKET_LABEL[b] + " " + dur(buckets[b])).join(", ") });
+  bar.style.width = Math.max(2, Math.round((scale === undefined ? 1 : scale) * 100)) + "%";
+  for (const name of bucketOrder()) {
+    const value = (buckets || {})[name] || 0;
+    if (!value || !total) continue;
+    const seg = el("span", { class: "b-" + name, title: BUCKET_LABEL[name] + ": " + dur(value) + " (" + pct(value, total) + "%)" });
+    seg.style.flexGrow = String(value);
+    bar.append(seg);
+  }
+  return bar;
+}
+
+function legendNode(used) {
+  return el("div", { class: "legend" }, bucketOrder().filter((b) => !used || used[b]).map((b) =>
+    el("span", {}, el("span", { class: "swatch b-" + b }), BUCKET_LABEL[b])));
+}
+
+function modelChips(models) {
+  return (models || []).map((m) => el("span", { class: "chip", title: (m.agent || "?") + " · " + m.sessions + " session(s) · " + dur(m.agent_s) + " · " + money(m.cost_usd) },
+    modelLabel(m) + " ×" + m.sessions));
+}
+
+function table(head, rows, numeric) {
+  return el("div", { class: "scroll" }, el("table", {},
+    el("thead", {}, el("tr", {}, head.map((h, i) => el("th", { class: numeric && numeric.includes(i) ? "num" : null, text: h })))),
+    el("tbody", {}, rows)));
+}
+
+const metricsUi = { data: null, request: 0, range: "month", from: "", to: "", work: "", shown: "" };
+
+function isoDay(day) {
+  return day.getFullYear() + "-" + String(day.getMonth() + 1).padStart(2, "0") + "-" + String(day.getDate()).padStart(2, "0");
+}
+
+function metricsQuery() {
+  const today = new Date();
+  const back = (days) => new Date(today.getFullYear(), today.getMonth(), today.getDate() - days);
+  const params = new URLSearchParams();
+  const range = metricsUi.range;
+  if (range === "all") params.set("all", "1");
+  else if (range === "last_month") {
+    params.set("from", isoDay(new Date(today.getFullYear(), today.getMonth() - 1, 1)));
+    params.set("to", isoDay(new Date(today.getFullYear(), today.getMonth(), 0)));
+  } else if (range === "d7") params.set("from", isoDay(back(6)));
+  else if (range === "d30") params.set("from", isoDay(back(29)));
+  else if (range === "custom") {
+    if (metricsUi.from) params.set("from", metricsUi.from);
+    if (metricsUi.to) params.set("to", metricsUi.to);
+    if (!metricsUi.from && !metricsUi.to) params.set("all", "1");
+  } else params.set("from", isoDay(new Date(today.getFullYear(), today.getMonth(), 1)));
+  if (metricsUi.work) params.set("lane", metricsUi.work);
+  return params.toString();
+}
+
+function saveMetricsChoice() {
+  try { localStorage.setItem("agentflow-metrics", JSON.stringify({ range: metricsUi.range, from: metricsUi.from, to: metricsUi.to, work: metricsUi.work })); } catch (err) { console.warn("agentflow: local storage unavailable", err); }
+}
+
+function restoreMetricsChoice() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("agentflow-metrics") || "{}");
+    for (const key of ["range", "from", "to", "work"]) if (typeof saved[key] === "string") metricsUi[key] = saved[key];
+  } catch (err) { console.warn("agentflow: local storage unavailable", err); }
+  $("met-range").value = metricsUi.range;
+  $("met-from").value = metricsUi.from;
+  $("met-to").value = metricsUi.to;
+  $("met-custom").hidden = metricsUi.range !== "custom";
+}
+
+async function loadMetrics() {
+  if (!TOKEN) return;
+  const request = ++metricsUi.request;  // the latest request wins: a filter change is never lost behind a refresh
+  try {
+    const data = await api("/api/metrics?" + metricsQuery());
+    if (request !== metricsUi.request) return;
+    const shown = JSON.stringify({ ...data, generated_at: null });
+    metricsUi.data = data;
+    if (shown !== metricsUi.shown) {  // a live refresh with nothing new keeps the tables (and a click on them) as they are
+      metricsUi.shown = shown;
+      renderMetrics();
+    } else {
+      $("met-status").textContent = $("met-status").textContent.replace(/updated \S+$/, "updated " + data.generated_at.slice(11, 19));
+    }
+  } catch (err) {
+    if (request === metricsUi.request) $("met-status").textContent = "Could not load: " + err.message;
+  }
+}
+
+function kpi(value, label, title) {
+  return el("div", { class: "kpi", title: title }, el("div", { class: "v", text: value }), el("div", { class: "k", text: label }));
+}
+
+function laneSelect(data) {
+  const select = $("met-lane");
+  const options = [el("option", { value: "", text: "All work" }), ...data.lanes.map((lane) => el("option", { value: lane, text: workLabel(lane) }))];
+  select.replaceChildren(...options);
+  select.value = metricsUi.work;
+}
+
+function phaseRows(phases, order) {
+  const names = order.filter((name) => phases[name] && (phases[name].wall_s.total >= 1 || phases[name].cost_usd.total > 0));
+  const widest = Math.max(1, ...names.map((name) => phases[name].wall_s.total));
+  return names.map((name) => {
+    const p = phases[name];
+    return el("tr", {},
+      el("td", { text: name }), el("td", { class: "num", text: p.runs }),
+      el("td", { class: "stack-cell" }, stackNode(p.buckets, p.wall_s.total / widest)),
+      el("td", { class: "num", text: dur(p.wall_s.total) }), el("td", { class: "num", text: dur(p.wall_s.median) }), el("td", { class: "num", text: dur(p.wall_s.p90) }),
+      el("td", { class: "num", text: money(p.cost_usd.total) }), el("td", { class: "num", text: money(p.cost_usd.median) }), el("td", { class: "num", text: money(p.cost_usd.p90) }),
+      el("td", { class: "num", text: money(p.rework_cost_usd) }), el("td", { class: "num", text: p.attempts }),
+      el("td", { class: "muted", text: bucketOrder().filter((b) => p.buckets[b]).map((b) => BUCKET_LABEL[b] + " " + pct(p.buckets[b], p.wall_s.total) + "%").join(" · ") }));
+  });
+}
+
+function runPhaseChips(metrics) {
+  return metrics.phases.filter((p) => p.wall_s >= 1 || p.cost_usd > 0).map((p) => el("span", {
+    class: "chip", title: p.models.map((m) => modelLabel(m) + " ×" + m.sessions + " " + money(m.cost_usd)).join(", ") || "no agent call",
+  }, p.phase + " " + dur(p.wall_s) + " · " + money(p.cost_usd) + (p.models.length ? " · " + p.models.map(modelLabel).join(", ") : "")));
+}
+
+function stepRows(steps) {
+  return steps.map((s) => el("tr", { class: "row-link", title: "open " + s.run_id, onclick: () => openDrawer(s.run_id) },
+    el("td", { text: s.module }), el("td", { text: s.key }), el("td", { class: "num", text: dur(s.wall_s) }), el("td", { class: "num", text: money(s.cost_usd) }),
+    el("td", { class: "num", text: s.attempts + (s.rework_attempts ? " (" + s.rework_attempts + " rework)" : "") }),
+    el("td", { class: "num", text: s.review_rounds || "-" }), el("td", { class: "num", text: s.fixes || "-" }),
+    el("td", {}, s.models.map((m) => el("span", { class: "chip", text: shortModel(m) })))));
+}
+
+function renderMetrics() {
+  const data = metricsUi.data;
+  if (!data) return;
+  laneSelect(data);
+  const t = data.totals;
+  const span = data.all_time ? "all time" : (data.from || "…") + " to " + (data.to || "today");
+  $("met-status").textContent = t.runs + " run" + (t.runs === 1 ? "" : "s") + " started " + span + " · updated " + data.generated_at.slice(11, 19);
+  const body = [];
+  const wall = Object.values(t.buckets).reduce((a, b) => a + b, 0);
+  body.push(el("div", { class: "kpis" },
+    kpi(String(t.runs), "runs"),
+    kpi(money(t.cost_usd), "total cost"),
+    kpi(dur(t.wall_s.median), "median run time", "p90 " + dur(t.wall_s.p90)),
+    kpi(dur(t.wall_s.p90), "p90 run time"),
+    kpi(t.rework_pct + "%", "of cost spent on rework", money(t.rework_cost_usd) + " on fix, re-review and refine rounds"),
+    kpi(pct(t.buckets.human || 0, wall) + "%", "of time waiting on a human", dur(t.buckets.human)),
+    kpi(pct(t.buckets.down || 0, wall) + "%", "of time with no runner going", dur(t.buckets.down))));
+  if (!t.runs) {
+    body.push(el("p", { class: "muted", text: "No run started in this range." }));
+    $("met-body").replaceChildren(...body);
+    return;
+  }
+  body.push(el("h2", { class: "lane", text: "Where the time goes, by phase" }), legendNode(t.buckets));
+  for (const [lane, row] of Object.entries(t.lanes)) {
+    body.push(el("h3", { class: "wf-title", text: workLabel(lane) + " · " + row.runs + " run" + (row.runs === 1 ? "" : "s") + " · median " + dur(row.wall_s.median) + " / " + money(row.cost_usd.median) + " · p90 " + dur(row.wall_s.p90) + " / " + money(row.cost_usd.p90) }));
+    body.push(table(["Phase", "Runs", "Time by bucket", "Time", "Median", "p90", "Cost", "Median", "p90", "Rework", "Calls", "Share"],
+      phaseRows(row.phases, data.phases), [1, 3, 4, 5, 6, 7, 8, 9, 10]));
+  }
+  body.push(el("h2", { class: "lane", text: "Model and effort by phase" }));
+  const phaseCost = {};
+  for (const m of t.models) phaseCost[m.phase] = (phaseCost[m.phase] || 0) + m.cost_usd;
+  const models = t.models.slice().sort((a, b) => data.phases.indexOf(a.phase) - data.phases.indexOf(b.phase) || b.cost_usd - a.cost_usd);
+  body.push(table(["Phase", "Model · effort", "Sessions", "Agent time", "Cost", "Share of phase cost"], models.map((m) => el("tr", {},
+    el("td", { text: m.phase }), el("td", { text: shortModel(m.model) }), el("td", { class: "num", text: m.sessions }),
+    el("td", { class: "num", text: dur(m.agent_s) }), el("td", { class: "num", text: money(m.cost_usd) }),
+    el("td", { class: "num", text: pct(m.cost_usd, phaseCost[m.phase]) + "%" }))), [2, 3, 4, 5]));
+  body.push(el("h2", { class: "lane", text: "Runs" }));
+  const widest = Math.max(1, ...data.runs.map((r) => r.metrics.wall_s));
+  body.push(table(["Started", "Run", "Work", "Status", "Time", "Time by bucket", "Cost", "Phases (time · cost · model·effort)"], data.runs.map((r) => {
+    const m = r.metrics;
+    const flags = [m.live ? "live" : "", m.stalled ? "stalled" : "", m.approx ? "gate time estimated" : ""].filter(Boolean).join(", ");
+    return el("tr", { class: "row-link", title: "open " + r.run_id + (flags ? " (" + flags + ")" : ""), onclick: () => openDrawer(r.run_id) },
+      el("td", { text: r.started_on || "-" }), el("td", { text: r.module }), el("td", { text: workLabel(r.lane) }),
+      el("td", { text: r.status + (r.archived ? " (archived)" : "") + (m.stalled ? " · stalled" : "") }),
+      el("td", { class: "num", text: dur(m.wall_s) }), el("td", { class: "stack-cell" }, stackNode(m.buckets, m.wall_s / widest)),
+      el("td", { class: "num", text: cost(m.cost_usd, m.cost_estimated) + (r.budget ? " / " + money(r.budget) : "") }),
+      el("td", { class: "wrap" }, runPhaseChips(m)));
+  }), [4, 6]));
+  const stepHead = ["Run", "Step", "Time", "Cost", "Calls", "Review rounds", "Fixes", "Model · effort"];
+  body.push(el("h2", { class: "lane", text: "Costliest steps" }), table(stepHead, stepRows(t.costliest_steps), [2, 3, 4, 5, 6]));
+  body.push(el("h2", { class: "lane", text: "Slowest steps" }), table(stepHead, stepRows(t.slowest_steps), [2, 3, 4, 5, 6]));
+  $("met-body").replaceChildren(...body);
+}
+
+$("met-range").addEventListener("change", () => {
+  metricsUi.range = $("met-range").value;
+  $("met-custom").hidden = metricsUi.range !== "custom";
+  saveMetricsChoice();
+  loadMetrics();
+});
+for (const id of ["met-from", "met-to"]) {
+  $(id).addEventListener("change", () => {
+    metricsUi.from = $("met-from").value;
+    metricsUi.to = $("met-to").value;
+    saveMetricsChoice();
+    loadMetrics();
+  });
+}
+$("met-lane").addEventListener("change", () => { metricsUi.work = $("met-lane").value; saveMetricsChoice(); loadMetrics(); });
+
+// The drawer's view of one run: a row per phase, and its steps with every agent call (model, effort, role, cost).
+function metricsSection(m) {
+  if (!m) return el("p", { class: "muted", text: "No time and cost yet." });
+  const flags = [m.live ? "still running: figures up to now" : "", m.stalled ? "stalled: no event for longer than a step may run" : "",
+    m.approx ? "gate time estimated for runs older than gate timing" : "", m.cost_estimated ? "~ cost partly estimated" : ""].filter(Boolean);
+  const phases = m.phases.filter((p) => p.wall_s >= 1 || p.cost_usd > 0);
+  const widest = Math.max(1, ...phases.map((p) => p.wall_s));
+  const order = bucketOrder().filter((b) => m.buckets[b]);  // only the buckets this run used: the drawer is narrow
+  const phaseTable = table(["Phase", "Time", "By bucket", ...order.map((b) => BUCKET_LABEL[b]), "Cost", "Rework", "Calls", "Model · effort"],
+    phases.map((p) => el("tr", {},
+      el("td", { text: p.phase }), el("td", { class: "num", text: dur(p.wall_s) }),
+      el("td", { class: "stack-cell" }, stackNode(p.buckets, p.wall_s / widest)),
+      ...order.map((b) => el("td", { class: "num", text: p.buckets[b] ? dur(p.buckets[b]) : "-" })),
+      el("td", { class: "num", text: money(p.cost_usd) }), el("td", { class: "num", text: p.rework_cost_usd ? money(p.rework_cost_usd) : "-" }),
+      el("td", { class: "num", text: p.attempts + (p.rework_attempts ? " (" + p.rework_attempts + " rework)" : "") }),
+      el("td", { class: "wrap" }, modelChips(p.models)))), [1, ...order.map((_, i) => i + 3), order.length + 3, order.length + 4, order.length + 5]);
+  const stepBody = [];
+  for (const p of phases) {
+    for (const s of p.steps) {
+      if (!s.wall_s && !s.cost_usd && !s.sessions.length) continue;
+      const changes = s.effort_changes.map((c) => (c.from || "?") + " → " + (c.to || "?") + (c.reason ? ": " + c.reason : "")).join("; ");
+      stepBody.push(el("tr", { title: changes ? "effort changed " + changes : null },
+        el("td", { text: s.key + (s.approx ? " (gate time estimated)" : "") }), el("td", { class: "num", text: dur(s.wall_s) }),
+        el("td", { class: "stack-cell" }, stackNode(s.buckets, 1)), el("td", { class: "num", text: money(s.cost_usd) }),
+        el("td", { class: "num", text: s.attempts + (s.rework_attempts ? " (" + s.rework_attempts + " rework)" : "") }),
+        el("td", { text: [s.review_rounds ? "review rounds " + s.review_rounds : "", s.fixes ? "fixes " + s.fixes : "", s.retries ? "retries " + s.retries : "", changes ? "effort " + changes : ""].filter(Boolean).join(" · ") || "-" })));
+      s.sessions.forEach((c, i) => stepBody.push(el("tr", { class: "sub" },
+        el("td", { text: "  └ call " + (i + 1) + ": " + (c.agent || "?") + " " + shortModel(c.model) + " · " + (c.effort || "?") + (c.role ? " · " + c.role : "") + (c.sizing ? " · sizing" : "") + (c.rework ? " · rework" : "") + (c.live ? " · live" : "") }),
+        el("td", { class: "num", text: dur(c.agent_s) }), el("td", { text: "" }), el("td", { class: "num", text: cost(c.cost_usd, c.cost_estimated) }),
+        el("td", { text: "" }), el("td", { class: "muted", text: (c.started_at || "").slice(11, 19) + (c.exit_code !== undefined && c.exit_code !== null ? " · exit " + c.exit_code : "") }))));
+    }
+  }
+  return el("details", { open: "open" },
+    el("summary", { text: "Time & cost · " + dur(m.wall_s) + " · " + cost(m.cost_usd, m.cost_estimated) + (m.rework_cost_usd ? " (" + money(m.rework_cost_usd) + " rework)" : "") }),
+    flags.length ? el("p", { class: "muted", text: flags.join(" · ") }) : "",
+    legendNode(m.buckets), phaseTable,
+    el("details", {}, el("summary", { text: "Steps and agent calls" }),
+      table(["Step / call", "Time", "By bucket", "Cost", "Calls", "Notes"], stepBody, [1, 3, 4])));
+}
+
+// ------------------------------------------------------------------ settings
+
+// The form sends only the fields that changed ({key, value}); the YAML tab sends the whole text. Either way the
+// server checks the result as `agentflow validate` does and refuses protected settings, and the dialog shows the diff.
+
+const settings = { data: null, mode: "form", edits: new Map(), rows: new Map(), yamlDirty: false };
+const keyId = (key) => JSON.stringify(key);
+const same = (a, b) => JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+
+function pendingCount() {
+  return settings.mode === "form" ? settings.edits.size : (settings.yamlDirty ? 1 : 0);
+}
+
+function updateSettingsBar() {
+  const n = pendingCount();
+  const d = settings.data;
+  $("set-review").disabled = n === 0;
+  $("set-discard").disabled = settings.edits.size === 0 && !settings.yamlDirty;
+  if (!d) return;
+  const pending = settings.mode === "form" ? (n ? n + " unsaved change" + (n === 1 ? "" : "s") : "no unsaved changes")
+    : (n ? "unsaved edits in the YAML" : "no unsaved edits");
+  $("settings-status").textContent = pending + " · sha256 " + d.sha256.slice(0, 12);
+}
+
+function setEdit(field, value) {
+  const id = keyId(field.key);
+  if (same(value, field.value)) settings.edits.delete(id); else settings.edits.set(id, { key: field.key, value: value });
+  const row = settings.rows.get(id);
+  if (row) row.classList.toggle("changed", settings.edits.has(id));
+  updateSettingsBar();
+}
+
+function numberOf(input, kind) {
+  if (input.value.trim() === "") return null;
+  const value = Number(input.value);
+  return kind === "int" && Number.isInteger(value) ? value : (kind === "int" ? input.value : value);
+}
+
+function mapInput(field, id) {
+  const rows = el("div", { class: "map-rows" });
+  const pairs = Object.entries(field.value || {});
+  const isInt = field.value_kind === "int";
+  const collect = () => {
+    const out = {};
+    for (const row of rows.children) {
+      const [k, v] = row.querySelectorAll("input");
+      if (!k.value.trim()) continue;
+      out[k.value.trim()] = isInt ? numberOf(v, "int") : v.value;
+    }
+    setEdit(field, out);
+  };
+  const addRow = (key, value) => {
+    const k = el("input", { type: "text", value: key, "aria-label": field.label + ": name", placeholder: "name", disabled: !!field.readonly });
+    const v = el("input", { type: isInt ? "number" : "text", value: value === null || value === undefined ? "" : value,
+      "aria-label": field.label + ": value", placeholder: "value", step: isInt ? "1" : null, min: field.min, disabled: !!field.readonly });
+    const remove = el("button", { type: "button", text: "×", title: "Remove", "aria-label": "Remove " + (key || "row"), disabled: !!field.readonly,
+      onclick: () => { row.remove(); collect(); } });
+    const row = el("div", { class: "map-row" }, k, v, remove);
+    k.addEventListener("input", collect);
+    v.addEventListener("input", collect);
+    rows.append(row);
+    return k;
+  };
+  for (const [k, v] of pairs) addRow(k, v);
+  const add = el("button", { type: "button", text: "+ Add", disabled: !!field.readonly, onclick: () => addRow("", "").focus() });
+  return el("div", { class: "full", id: id }, rows, el("div", { class: "opts" }, add));
+}
+
+function fieldInput(field, id) {
+  const ro = !!field.readonly;
+  const kind = field.kind;
+  if (kind === "bool") {
+    const box = el("input", { type: "checkbox", id: id, disabled: ro });
+    box.checked = field.value === true;
+    box.addEventListener("change", () => setEdit(field, box.checked || field.present ? box.checked : null));  // unset stays unset
+    return box;
+  }
+  if (kind === "int" || kind === "number") {
+    const input = el("input", { type: "number", id: id, min: field.min, max: field.max, step: kind === "int" ? "1" : "any",
+      value: field.value === null || field.value === undefined ? "" : field.value, disabled: ro });
+    input.addEventListener("input", () => setEdit(field, numberOf(input, kind)));
+    return input;
+  }
+  if (kind === "enum") {
+    const options = [...field.options];
+    if (field.value !== null && !options.includes(field.value)) options.unshift(field.value);
+    const select = el("select", { id: id, disabled: ro }, options.map((o) => el("option", { value: o, text: o })));
+    select.value = field.value === null ? "" : field.value;
+    select.addEventListener("change", () => setEdit(field, select.value));
+    return select;
+  }
+  if (kind === "list" && field.options) {
+    const chosen = new Set(field.value || []);
+    const boxes = field.options.map((o) => {
+      const box = el("input", { type: "checkbox", disabled: ro });
+      box.checked = chosen.has(o);
+      box.dataset.option = o;
+      return el("label", {}, box, o);
+    });
+    const group = el("div", { class: "checks", id: id, role: "group", "aria-label": field.label }, boxes);
+    group.addEventListener("change", () => setEdit(field, [...group.querySelectorAll("input")].filter((b) => b.checked).map((b) => b.dataset.option)));
+    return group;
+  }
+  if (kind === "list") {
+    const input = el("input", { type: "text", id: id, value: (field.value || []).join(", "), placeholder: "comma-separated", disabled: ro });
+    input.addEventListener("input", () => setEdit(field, input.value.split(",").map((v) => v.trim()).filter(Boolean)));
+    return input;
+  }
+  if (kind === "map") return mapInput(field, id);
+  const input = el("input", { type: "text", id: id, value: field.value === null || field.value === undefined ? "" : field.value,
+    placeholder: field.optional ? "not set" : "", disabled: ro });
+  input.addEventListener("input", () => setEdit(field, field.optional && !input.value.trim() ? null : input.value));
+  return input;
+}
+
+function fieldRow(field) {
+  const id = "cfg-" + field.key.join("-").replace(/[^A-Za-z0-9_-]/g, "_");
+  const input = fieldInput(field, id);
+  const label = field.kind === "map" || (field.kind === "list" && field.options)
+    ? el("label", { text: field.label }) : el("label", { for: id, text: field.label });
+  const row = el("div", { class: "set-field" }, label,
+    field.kind === "map" ? el("span", { class: "set-key", text: field.key.join(".") }) : input,
+    field.kind === "map" ? input : el("span", { class: "set-key full", text: field.key.join(".") }),
+    field.help ? el("div", { class: "sub full", text: field.help }) : null,
+    field.readonly ? el("div", { class: "sub full", text: field.readonly }) : null);
+  settings.rows.set(keyId(field.key), row);
+  return row;
+}
+
+function renderSettings() {
+  const d = settings.data;
+  if (!d) return;
+  settings.rows.clear();
+  $("settings-path").textContent = d.path;
+  $("settings-protected").textContent = "Protected, so only the file can change them: " + d.protected.join("; ") + ".";
+  $("settings-form").replaceChildren(...d.sections.map((section) => el("div", { class: "set-section" },
+    el("h3", { text: section.title }), el("p", { class: "muted", text: section.note }), section.fields.map(fieldRow))));
+  $("settings-yaml").value = d.text;
+  updateSettingsBar();
+}
+
+function settingsMode(mode) {
+  settings.mode = mode;
+  $("settings-form").hidden = mode !== "form";
+  $("settings-text").hidden = mode !== "yaml";
+  $("set-mode-form").setAttribute("aria-pressed", String(mode === "form"));
+  $("set-mode-yaml").setAttribute("aria-pressed", String(mode === "yaml"));
+  updateSettingsBar();
+}
+
+async function loadSettings() {
+  try {
+    settings.data = await api("/api/config");
+    settings.edits.clear();
+    settings.yamlDirty = false;
+    renderSettings();
+  } catch (err) {
+    $("settings-status").textContent = "Could not load the config: " + err.message;
+  }
+}
+
+function diffNode(text) {
+  const lines = text.replace(/\n$/, "").split("\n").map((line) => el("span", {
+    class: line.startsWith("@@") ? "d-hunk" : line.startsWith("+") && !line.startsWith("+++") ? "d-add"
+      : line.startsWith("-") && !line.startsWith("---") ? "d-del" : null, text: line + "\n" }));
+  return el("pre", { class: "diff" }, lines);
+}
+
+async function reviewSettings() {
+  const d = settings.data;
+  if (!d) return;
+  const body = settings.mode === "form"
+    ? { base_sha256: d.sha256, changes: [...settings.edits.values()] }
+    : { base_sha256: d.sha256, text: $("settings-yaml").value };
+  let result;
+  try {
+    result = await api("/api/config/preview", body);
+  } catch (err) {
+    toast("Not saved: " + err.message);
+    return;
+  }
+  if (!result.changed) { toast("Nothing in the file changes"); return; }
+  const issues = result.issues.map((i) => el("li", { class: i.level === "error" ? "st-bad" : "muted",
+    text: i.level + " " + (i.path ? i.path + ": " : "") + i.message }));
+  const verdict = result.ok ? "It validates." : "It does not validate: fix the errors below first.";
+  dialog("Save config.yaml?", [
+    el("p", { text: verdict, class: result.ok ? "st-ok" : "st-bad" }),
+    diffNode(result.diff),
+    issues.length ? el("ul", {}, issues) : null,
+  ], async () => {
+    if (!result.ok) { toast("Fix the errors first"); return false; }
+    try {
+      await api("/api/config/save", body);
+    } catch (err) {
+      toast("Save failed: " + err.message);
+      return false;
+    }
+    toast("Saved: a running run takes it at its next phase");
+    ui.workflow = null;  // the Workflow tab is built from the config
+    await loadSettings();
+    scheduleRefresh();
+    return true;
+  }, result.ok ? "Save" : "Close", true);
+}
+
+function discardSettings() {
+  if (!confirm("Discard your unsaved changes?")) return;
+  settings.edits.clear();
+  settings.yamlDirty = false;
+  renderSettings();
+}
+
+$("set-mode-form").addEventListener("click", () => settingsMode("form"));
+$("set-mode-yaml").addEventListener("click", () => settingsMode("yaml"));
+$("set-review").addEventListener("click", reviewSettings);
+$("set-discard").addEventListener("click", discardSettings);
+$("set-reload").addEventListener("click", () => {
+  if ((settings.edits.size || settings.yamlDirty) && !confirm("Reload from the file and drop your unsaved changes?")) return;
+  loadSettings();
+});
+$("settings-yaml").addEventListener("input", () => { settings.yamlDirty = $("settings-yaml").value !== (settings.data || {}).text; updateSettingsBar(); });
+$("settings-yaml").addEventListener("keydown", (ev) => {
+  if (ev.key !== "Tab" || ev.shiftKey) return;  // two spaces, as YAML indents; Shift+Tab still leaves the box
+  ev.preventDefault();
+  ev.target.setRangeText("  ", ev.target.selectionStart, ev.target.selectionEnd, "end");
+  ev.target.dispatchEvent(new Event("input"));
+});
+
+// ------------------------------------------------------------------ refresh and live updates
+
+let refreshTimer = null;
+function scheduleRefresh() {
+  if (refreshTimer) return;
+  refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, 250);
+}
+
+async function refresh() {
+  try {
+    const [boardData, agentsData, workflow] = await Promise.all([api("/api/board"), api("/api/agents"), ui.workflow || api("/api/workflow")]);
+    renderBoard(boardData);
+    renderAgents(agentsData);
+    ui.workflow = workflow;
+    renderWorkflow();
+    if (ui.drawer && !$("dlg").open) openDrawer(ui.drawer);
+    if (ui.view === "metrics") loadMetrics();
+  } catch (err) {
+    $("summary").textContent = "Could not load: " + err.message;
+  }
+}
+
+let backoff = 1000;
+let stream = null;
+function connect() {
+  stream = new EventSource("/api/events?token=" + encodeURIComponent(TOKEN));
+  stream.onopen = () => { backoff = 1000; $("live").textContent = "live"; $("live").classList.add("live"); scheduleRefresh(); };
+  stream.onmessage = () => scheduleRefresh();
+  stream.onerror = () => {
+    $("live").textContent = "reconnecting…";
+    $("live").classList.remove("live");
+    stream.close();
+    setTimeout(connect, backoff);
+    backoff = Math.min(backoff * 2, 15000);
+  };
+}
+
+const VIEWS = ["board", "workflow", "agents", "metrics", "settings"];
+
+function show(view) {
+  ui.view = view;
+  for (const name of VIEWS) {
+    $(name + "-view").hidden = view !== name;
+    $("tab-" + name).setAttribute("aria-pressed", String(view === name));
+  }
+  try { localStorage.setItem("agentflow-view", view); } catch (err) { console.warn("agentflow: local storage unavailable", err); }
+  if (view === "settings" && TOKEN && !settings.edits.size && !settings.yamlDirty) loadSettings();  // unsaved edits stay
+  if (view === "metrics") loadMetrics();
+}
+
+restoreMetricsChoice();
+for (const name of VIEWS) $("tab-" + name).addEventListener("click", () => show(name));
+$("new-task").addEventListener("click", newTaskDialog);
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("dlg").open) closeDrawer(); });
+try { const saved = localStorage.getItem("agentflow-view"); show(VIEWS.includes(saved) ? saved : "board"); } catch (err) { show("board"); }
+if (TOKEN) {
+  refresh();
+  connect();
+  setInterval(refresh, 30000);  // ages and idle markers move on even without new events
+} else {
+  $("summary").textContent = "No token: open the URL printed by `agentflow dashboard` (it ends in #token=...).";
+  $("live").textContent = "offline";
+}
+</script>
+</body>
+</html>

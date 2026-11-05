@@ -1,0 +1,5 @@
+#!/bin/sh
+# agentflow: the workflow CLI. Put it on your PATH once, from the repo root:
+#   ln -s "$PWD/devtools/bin/agentflow" ~/.local/bin/agentflow
+self=$(readlink -f "$0")
+exec uv run --quiet --script "$(dirname "$self")/../agentflow/flow.py" "$@"

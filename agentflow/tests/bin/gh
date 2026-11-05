@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""A stand-in for `gh` in agentflow tests (tests put this directory first on PATH).
+
+Every call appends its argv as one JSON list to `$FAKE_GH_LOG` (when set). `pr create` prints a PR
+URL (`$FAKE_GH_URL`, default https://github.com/example/repo/pull/1); `pr view ... --json state`
+prints `{"state": "$FAKE_GH_STATE"}` (default OPEN); `pr view ... --json mergeable,...` plays the next entry of the
+comma-separated `$FAKE_GH_MERGEABLE` (the last one repeating; default MERGEABLE; the place is kept in
+`$FAKE_GH_LOG.mergeable`); `issue view N ...` prints `$FAKE_GH_ISSUE` (default
+an issue titled `Issue N`); `pr checks` plays the next entry of the JSON list in the file `$FAKE_GH_CHECKS`
+(`{"checks": [...], "exit": 8, "stderr": "..."}`, the last one repeating; the place is kept in `<file>.cursor`);
+anything else prints `$FAKE_GH_JSON` (default `[]`). `$FAKE_GH_FAIL` makes every call fail with exit 1.
+"""
+
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+log = os.environ.get("FAKE_GH_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(args, ensure_ascii=False) + "\n")
+if os.environ.get("FAKE_GH_FAIL"):
+    sys.stderr.write("fake gh: failing as asked\n")
+    sys.exit(1)
+if args[:2] == ["pr", "create"]:
+    print(os.environ.get("FAKE_GH_URL", "https://github.com/example/repo/pull/1"))
+elif args[:2] == ["pr", "checks"] and os.environ.get("FAKE_GH_CHECKS"):
+    path = os.environ["FAKE_GH_CHECKS"]
+    with open(path, encoding="utf-8") as handle:
+        entries = json.load(handle)
+    cursor = path + ".cursor"
+    place = int(open(cursor, encoding="utf-8").read()) if os.path.exists(cursor) else 0
+    with open(cursor, "w", encoding="utf-8") as handle:
+        handle.write(str(place + 1))
+    entry = entries[min(place, len(entries) - 1)]
+    if "checks" in entry:
+        print(json.dumps(entry["checks"]))
+    if entry.get("stderr"):
+        sys.stderr.write(entry["stderr"] + "\n")
+    sys.exit(entry.get("exit", 0))
+elif args[:2] == ["pr", "view"] and "--json" in args and args[args.index("--json") + 1].startswith("mergeable"):
+    verdicts = os.environ.get("FAKE_GH_MERGEABLE", "MERGEABLE").split(",")
+    cursor = (log or "/tmp/fake_gh") + ".mergeable"
+    place = int(open(cursor, encoding="utf-8").read()) if os.path.exists(cursor) else 0
+    with open(cursor, "w", encoding="utf-8") as handle:
+        handle.write(str(place + 1))
+    print(json.dumps({"mergeable": verdicts[min(place, len(verdicts) - 1)], "mergeStateStatus": "CLEAN"}))
+elif args[:2] == ["pr", "view"] and "--json" in args and "state" in args[args.index("--json") + 1:][:1]:
+    print(json.dumps({"state": os.environ.get("FAKE_GH_STATE", "OPEN")}))
+elif args[:2] == ["issue", "view"] and len(args) > 2:
+    default = {"title": f"Issue {args[2]}", "body": "", "url": f"https://github.com/example/repo/issues/{args[2]}"}
+    print(os.environ.get("FAKE_GH_ISSUE") or json.dumps(default))
+else:
+    print(os.environ.get("FAKE_GH_JSON", "[]"))
