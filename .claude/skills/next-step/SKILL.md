@@ -5,7 +5,7 @@ description: Use when unsure which workflow skill comes next, when resuming work
 
 # Next Step
 
-<!-- Tiva Care skill (not vendored). Canonical copy of the handoff map; each skill's "## Next step" footer repeats only its own row. -->
+<!-- Local skill (not vendored). Canonical copy of the handoff map; each skill's "## Next step" footer repeats only its own row. -->
 
 Work out where the work stands and name **one** next skill. Don't run it: say it and let the developer (or your next turn) decide.
 
@@ -17,20 +17,19 @@ Run these and read nothing else unless one points somewhere:
 git status --short
 git branch --show-current
 ls -t docs/plans/*.md 2>/dev/null | head -1
-ls -t docs/specs/*.md 2>/dev/null | head -3
+ls -t docs/agentflow-*-proposal.md 2>/dev/null | head -3
 ```
 
 ## 2. Pick the lane and stage (first match wins)
 
 1. An error or failing test is in the conversation → **bug** lane → `systematic-debugging`.
-2. The change touches prompts, model choice, chunking or embeddings → **eval** lane → Verify by re-running the eval suite.
-3. The newest plan in `docs/plans/` has unchecked `- [ ]` tasks → **feature** lane, Build → continue with the plan's execution method (`executing-plans` or `subagent-driven-development`).
-4. The newest plan is fully checked and its branch isn't merged → **feature** lane, Verify → `verification-before-completion`, then Ship with `finishing-a-development-branch`.
-5. A spec in `docs/specs/` was approved but has no plan in `docs/plans/` → **feature** lane → `writing-plans`.
-6. Uncommitted changes only under `docs/ideas/`, `docs/decisions/` or `GLOSSARY.md` → **design-doc** lane → finish the idea-doc edits (`CLAUDE.md` → "Editing the idea doc"), then commit when the user asks.
-7. Nothing in flight → ask what the user wants to do. Use `grilling` for a decision and `spec-driven-development` for something to build (both are Define).
+2. The newest plan in `docs/plans/` has unchecked `- [ ]` tasks → **feature** lane, Build → continue with the plan's execution method (`executing-plans` or `subagent-driven-development`).
+3. The newest plan is fully checked and its branch isn't merged → **feature** lane, Verify → `verification-before-completion`, then Ship with `finishing-a-development-branch`.
+4. A proposal (`docs/agentflow-<module>-proposal.md`) says `Status: approved` but has no plan in `docs/plans/` → **feature** lane → `writing-plans`.
+5. Uncommitted changes only in `docs/*.md` → **design-doc** lane → finish the proposal edits (resolve its Open Questions, keep its sections consistent), then commit when the user asks.
+6. Nothing in flight → ask what the user wants to do. Use `grilling` for a decision and `spec-driven-development` for something to build (both are Define).
 
-If a security path is involved (Entra/IS4 token validation, `customer_code` injection, `visibility = public` filtering, staff-only data on widget routes, attachments, redaction), add the **security** lane: `security-and-hardening`, and offer `/doubt-driven-development` before Build.
+If the work touches a security path (the pack's `overlays.security.when_paths` in `.agentflow/config.yaml`: guards, agent adapters, config trust, safe I/O, workspaces, the pack loader), add the **security** lane: `security-and-hardening`, and offer `/doubt-driven-development` before Build.
 
 ## 3. Answer in this shape
 
@@ -55,7 +54,7 @@ Next: <skill or /command> — <reason>
 | `test-driven-development` | the next task · `verification-before-completion` (all done) |
 | `systematic-debugging` | `test-driven-development` (regression test) → `verification-before-completion` |
 | `frontend-ui-engineering` | `verification-before-completion` |
-| `verification-before-completion` | eval delta (eval lane) · the next task · `finishing-a-development-branch` (from a plan) · `requesting-code-review` (outside a plan) |
+| `verification-before-completion` | the next task · `finishing-a-development-branch` (from a plan) · `requesting-code-review` (outside a plan) |
 | `security-and-hardening` / `/doubt-driven-development` | back to the calling stage · `security-auditor` agent at Review |
 | `requesting-code-review` | `receiving-code-review` |
 | `receiving-code-review` | `test-driven-development` → `verification-before-completion` → `finishing-a-development-branch` |

@@ -47,15 +47,15 @@ def test_unknown_gate_raises(tmp_git, tmp_path):
 
 
 def test_gate_when_exists_missing_is_skipped(tmp_git, tmp_path):
-    cfg = cfg_with({"web_types": Gate("web_types", "exit 1", cwd="webadmin", when_exists="webadmin/package.json")})
+    cfg = cfg_with({"web_types": Gate("web_types", "exit 1", cwd="console", when_exists="console/package.json")})
     (g,) = run_gates(cfg, ["web_types"], tmp_git, tmp_path / "logs")
     assert g.skipped and not g.passed and gates_ok([g])
-    assert g.reason == "webadmin/package.json missing"
+    assert g.reason == "console/package.json missing"
     assert g.log_path is None
-    assert summarize([g]) == "– web_types (skipped: webadmin/package.json missing)"
+    assert summarize([g]) == "– web_types (skipped: console/package.json missing)"
 
 
-def test_shipped_web_gate_skipped_without_webadmin(tmp_git, tmp_path):
+def test_shipped_web_gate_skipped_without_console(tmp_git, tmp_path):
     cfg = load_config(PYTHON_CONFIG)
     (g,) = run_gates(cfg, ["web_types"], tmp_git, tmp_path / "logs")
     assert g.skipped and gates_ok([g])
@@ -71,12 +71,12 @@ def test_gate_tail_capped(tmp_git, tmp_path):
 
 
 def test_gate_cwd(tmp_git, tmp_path):
-    (tmp_git / "webadmin").mkdir()
-    (tmp_git / "webadmin" / "package.json").write_text("{}", encoding="utf-8")
-    cfg = cfg_with({"where": Gate("where", "pwd", cwd="webadmin", when_exists="webadmin/package.json")})
+    (tmp_git / "console").mkdir()
+    (tmp_git / "console" / "package.json").write_text("{}", encoding="utf-8")
+    cfg = cfg_with({"where": Gate("where", "pwd", cwd="console", when_exists="console/package.json")})
     (g,) = run_gates(cfg, ["where"], tmp_git, tmp_path / "logs")
     assert g.passed
-    assert Path(g.tail.strip()).resolve() == (tmp_git / "webadmin").resolve()
+    assert Path(g.tail.strip()).resolve() == (tmp_git / "console").resolve()
 
 
 def test_gate_without_cwd_runs_at_root(tmp_git, tmp_path):
@@ -93,12 +93,12 @@ def test_summarize_lines():
     results = [
         GateResult("floor", True, False, "", None, ""),
         GateResult("py_lint", False, False, "exit 1", None, ""),
-        GateResult("web_types", False, True, "webadmin/package.json missing", None, ""),
+        GateResult("web_types", False, True, "console/package.json missing", None, ""),
     ]
     assert summarize(results).splitlines() == [
         "✓ floor",
         "✗ py_lint",
-        "– web_types (skipped: webadmin/package.json missing)",
+        "– web_types (skipped: console/package.json missing)",
     ]
 
 

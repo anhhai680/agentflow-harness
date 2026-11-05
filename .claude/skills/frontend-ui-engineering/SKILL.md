@@ -341,7 +341,7 @@ After building UI:
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
-- → `verification-before-completion`, checking the screen against `docs/designs/tivacare_admin_ui_ux_design_specification.md` (lane: feature)
+- → `verification-before-completion`, checking the screen against its design spec (lane: feature)

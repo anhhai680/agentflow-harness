@@ -183,7 +183,7 @@ With the validated spec, generate a technical implementation plan:
 4. Identify what can be built in parallel vs. what must be sequential
 5. Define verification checkpoints between phases
 
-> **Tiva Care:** Phases 2–3 are done by `writing-plans`, which is the canonical source; the bullets above only say what the plan must cover. The plan is saved to `docs/plans/YYYY-MM-DD-<feature>.md`. There is no `tasks/` folder.
+> **This repo:** Phases 2–3 are done by `writing-plans`, which is the canonical source; the bullets above only say what the plan must cover. The plan is saved to `docs/plans/YYYY-MM-DD-<feature>.md`. There is no `tasks/` folder.
 
 The plan should be reviewable: the human should be able to read it and say "yes, that's the right approach" or "no, change X."
 
@@ -258,7 +258,7 @@ Before proceeding to implementation, confirm:
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
 - The approved spec defines REST/WebSocket routes or module contracts → `api-and-interface-design` (lane: feature)

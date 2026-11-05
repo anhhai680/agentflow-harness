@@ -50,7 +50,7 @@ plan, the conversation, or the branch's upstream. If it is not already
 known, ask: "This branch split from <your best guess> - is that correct?"
 Confirm before merging: merging into the wrong base is expensive to undo.
 
-**Tiva Care:** day-to-day work has been on `next`, and `main` is the PR target; confirm which applies. Commits follow `CLAUDE.md` (one decision or refinement each), and nothing is committed, merged or pushed until the user picks an option. Before step 1's green suite counts, run `python3 devtools/floor_guard.py --base origin/main` on the committed branch: CI fails a new PR on any floor violation, and `devtools/hooks/floor_before_push.py` blocks the push and `gh pr create` while it fails.
+**This repo:** `main` is the base branch and the PR target. Commits follow `CLAUDE.md` (one imperative sentence plus the co-author trailer), and nothing is committed, merged or pushed until the user picks an option. Step 1's green suite is the pack's `gate_sets.verify` (the full `agentflow/tests` suite).
 
 ## Step 4: Present Options
 
@@ -228,7 +228,7 @@ place. If your platform provides a workspace-exit tool, use it.
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
-- Done. At an MVP milestone → `/improve-codebase-architecture`
+- Done. At a milestone → `/improve-codebase-architecture`

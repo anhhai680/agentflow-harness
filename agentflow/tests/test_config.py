@@ -485,7 +485,7 @@ def test_a_brief_needs_a_template_that_uses_it(tmp_cfg):
 
 
 def test_a_task_brief_file_must_exist(tmp_cfg):
-    path = tmp_cfg(lambda data: phase_step(data, "build", "build").update(task_briefs={"webadmin/": "none.md"}))
+    path = tmp_cfg(lambda data: phase_step(data, "build", "build").update(task_briefs={"console/": "none.md"}))
     assert ("error", "phases.build.steps[1].task_briefs") in errors(validate(load_config(path), path.parent.parent))
 
 

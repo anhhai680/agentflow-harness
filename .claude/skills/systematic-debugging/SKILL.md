@@ -284,7 +284,7 @@ These techniques are part of systematic debugging and available in this director
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
 - Root cause found → `test-driven-development` (a failing regression test first), then `verification-before-completion` (lane: bug)

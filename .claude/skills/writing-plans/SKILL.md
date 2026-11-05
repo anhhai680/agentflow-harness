@@ -28,7 +28,7 @@ Before defining tasks, map out which files will be created or modified and what 
 - You reason best about code you can hold in context at once, and your edits are more reliable when files are focused. Prefer smaller, focused files over large ones that do too much.
 - Files that change together should live together. Split by responsibility, not by technical layer.
 - In existing codebases, follow established patterns. If the codebase uses large files, don't unilaterally restructure - but if a file you're modifying has grown unwieldy, including a split in the plan is reasonable.
-- **Tiva Care:** for a new package, call the Skill tool with "codebase-design" and design it here: each file's responsibility, its interface, and what imports it. This design stays in the plan. A public interface, route or table the approved spec doesn't have, or a change to one, goes back to the spec first.
+- For a new package, call the Skill tool with "codebase-design" and design it here: each file's responsibility, its interface, and what imports it. This design stays in the plan. A public interface, route or table the approved spec doesn't have, or a change to one, goes back to the spec first.
 
 This structure informs the task decomposition. Each task should produce self-contained changes that make sense independently.
 
@@ -43,7 +43,7 @@ independently testable deliverable.
 
 ## Step Granularity
 
-**Each task is one testable slice that ends in one commit** (Tiva Care). Don't split a slice into several tasks just to keep tasks small: every task costs a fresh implementer and reviewer under subagent-driven-development.
+**Each task is one testable slice that ends in one commit.** Don't split a slice into several tasks just to keep tasks small: every task costs a fresh implementer and reviewer under subagent-driven-development.
 
 **Each step is one action with a checkable result:**
 - "Write the failing test" - step
@@ -194,7 +194,7 @@ them to review the plan and choose an execution method before implementation.
 - **Subagent-driven** - A fresh subagent implements each task and a fresh reviewer checks it before the next one starts, then a whole-branch review at the end. Most thorough; costs a fresh context per task and per review.
 - **Native** - I implement every task myself in this session, the way this harness runs work, then one fresh reviewer on the most capable model checks the whole branch. Cheapest and fastest; no independent review until the end. Runs well with a mid-tier session model, since the plan carries the design.
 
-(Tiva Care: recommend Native when the plan has 3 tasks or fewer.)
+(Recommend Native when the plan has 3 tasks or fewer.)
 
 **For this plan I recommend <one of the two>, because <one sentence from the plan: how much the tasks depend on each other's interfaces, how many there are, what a shipped mistake would cost>. Does the plan capture what you want, and which approach should we use?"**
 
@@ -210,7 +210,7 @@ them to review the plan and choose an execution method before implementation.
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
 - The plan touches a security path → `/doubt-driven-development` on the plan before Build (lane: security)

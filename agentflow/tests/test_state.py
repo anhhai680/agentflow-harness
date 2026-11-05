@@ -397,7 +397,7 @@ def test_run_create_rejects_unknown_pipeline_and_avoids_id_clashes(repo, cfg):
 
 
 def test_slugify():
-    assert slugify("Hỏi Mayai: đăng nhập!") == "hoi-mayai-dang-nhap"
+    assert slugify("Hỏi trợ lý: đăng nhập!") == "hoi-tro-ly-dang-nhap"
     assert slugify("Đơn hàng") == "don-hang"
     assert len(slugify("x" * 100)) == 40
     assert slugify("???") == ""

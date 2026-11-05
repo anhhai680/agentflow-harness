@@ -27,7 +27,7 @@ This means: every public behavior — including undocumented quirks, error messa
 
 - **Be intentional about what you expose.** Every observable behavior is a potential commitment.
 - **Don't leak implementation details.** If users can observe it, they will depend on it.
-- **Plan for deprecation at design time.** In Tiva Care, schema changes are forward-only migrations (ADR-015), so removals go expand-then-contract across releases.
+- **Plan for deprecation at design time.** A removal goes expand-then-contract across releases: add the replacement, move the callers, then remove the old surface.
 - **Tests are not enough.** Even with perfect contract tests, Hyrum's Law means "safe" changes can break real users who depend on undocumented behavior.
 
 ### The One-Version Rule
@@ -368,7 +368,7 @@ After designing an API:
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
 - The contract changes a decision an ADR covers → `domain-modeling` (lane: design-doc)

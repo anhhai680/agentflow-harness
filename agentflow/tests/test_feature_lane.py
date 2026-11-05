@@ -28,7 +28,7 @@ DONE_RESULT = {"status": "done", "summary": "did it"}
 MINOR = {"severity": "minor", "file": "src/one.py", "line": 9, "text": "rename x"}
 
 
-def question(kind: str, qid: str = "q1", text: str = "Lưu bộ nhớ đệm token MISA?") -> dict:
+def question(kind: str, qid: str = "q1", text: str = "Lưu bộ nhớ đệm token CRM?") -> dict:
     return {"id": qid, "question": text, "options": [{"key": "A", "label": "Theo tiến trình", "recommended": True}],
             "evidence": ["docs/specs/SPEC-demo.md#M5"], "kind": kind}
 
@@ -300,7 +300,7 @@ def test_parking_runs_independent_task(lane, git):
     assert parked["seq"] < lane.events(run, "agent_started")[1]["seq"]  # parked before task 2 started
     assert run.state["status"] == "waiting_human"
     assert run.state["waiting"]["key"] == impl1 and run.state["waiting"]["kind"] == "needs_human"
-    assert run.state["waiting"]["questions"][0]["question"] == "Lưu bộ nhớ đệm token MISA?"
+    assert run.state["waiting"]["questions"][0]["question"] == "Lưu bộ nhớ đệm token CRM?"
     assert run.inbox_path(impl1).exists()
     assert build(lane, run) == ("stopped", True)  # still waiting: nothing runs, nothing is raised again
     assert len(lane.calls()) == 3 and len(lane.events(run, "hitl_raised")) == 1
@@ -369,9 +369,9 @@ def test_spec_gap_answer_records_decision_first(lane, git):
     assert steps(calls)[:3] == [impl, record, impl]
     rec_call = calls[1]
     assert ("--model", "sonnet") in pairs(rec_call["argv"]) and "domain-modeling" in rec_call["argv"][-1]
-    assert "Lưu bộ nhớ đệm token MISA?" in rec_call["argv"][-1] and "Answer: A" in rec_call["argv"][-1]
+    assert "Lưu bộ nhớ đệm token CRM?" in rec_call["argv"][-1] and "Answer: A" in rec_call["argv"][-1]
     assert ("--resume", session_of(lane, run, impl)) in pairs(calls[2]["argv"])
-    decide = "Decide Lưu bộ nhớ đệm token MISA in SPEC-demo"
+    decide = "Decide Lưu bộ nhớ đệm token CRM in SPEC-demo"
     assert subjects(git, lane.root)[:2] == ["Task 1: First thing", decide]
     sha = commit_of(git, lane.root, decide)
     assert git(lane.root, "show", sha, "--name-only", "--format=").split() == ["docs/specs/SPEC-demo.md"]
@@ -391,7 +391,7 @@ def test_record_flag_records_any_kind(lane, git):
     build(lane, run)
     assert answer(run, impl, {"q1": "A"}, by="me", record=True)
     assert build(lane, run) == ("done", True)
-    assert "Decide Lưu bộ nhớ đệm token MISA in SPEC-demo" in subjects(git, lane.root)
+    assert "Decide Lưu bộ nhớ đệm token CRM in SPEC-demo" in subjects(git, lane.root)
 
 
 def test_spec_gap_without_a_spec_records_nothing(lane, git):
@@ -427,7 +427,7 @@ def test_grill_answers_all_reach_apply_with_no_record_sessions(lane, git):
         return lane.executor(run).run_steps(phase, [step], "define")[0]
 
     assert define() == "stopped"
-    assert "Lưu bộ nhớ đệm token MISA?" in run.questions_path().read_text(encoding="utf-8")
+    assert "Lưu bộ nhớ đệm token CRM?" in run.questions_path().read_text(encoding="utf-8")
     assert answer(run, f"{group}/answers", {"q1": "A"}, by="me")
     assert define() == "done"
     assert steps(lane.calls()) == [grill, apply]

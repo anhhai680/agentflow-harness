@@ -373,7 +373,7 @@ Using finishing-a-development-branch.
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
 - All tasks done and the final review handled → `verification-before-completion`, then `finishing-a-development-branch`. The final review here replaces a separate `requesting-code-review`

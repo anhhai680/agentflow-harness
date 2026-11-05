@@ -30,7 +30,7 @@ QUESTION = {"id": "q1", "question": "Bao nhiêu vòng làm rõ trước khi chuy
             "options": [{"key": "A", "label": "Tối đa 2 vòng", "recommended": True}, {"key": "B", "label": "1 vòng"}],
             "evidence": [], "kind": "spec_gap"}
 QUESTION_LINE = "- Ngưỡng làm rõ: how many clarifying rounds before the agent escalates?\n"
-LAST_ROW = "| MISA sandbox / rate limit | Sandbox AppID available; defensive caching |\n"
+LAST_ROW = "| CRM sandbox / rate limit | Sandbox API key available; defensive caching |\n"
 NEW_ROW = "| Ngưỡng làm rõ: how many clarifying rounds? | Tối đa 2 vòng, rồi chuyển người |\n"
 README = "# ADRs\n\n| ADR | Decision | Status |\n|---|---|---|\n| [ADR-001](ADR-001-langgraph.md) | LangGraph | Accepted |\n"
 

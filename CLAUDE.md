@@ -2,78 +2,94 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Repository state
+## What this repository is
 
-This repo is in the **design phase — there is no application code yet**, so there are no build, lint, or test commands. It holds:
+**agentflow**, a headless runner that drives Claude Code (or Codex) through a config-driven SDLC workflow (`define → plan → build → verify → review → ship`), one step per `claude -p` call, ending in a PR that is ready for review. It was cut out of the product repository it was built in, and it is being turned into a project-agnostic **agent harness**.
 
-- `CONSTRAINTS.md` — the quality bar, with a command for each rule. Read CONSTRAINTS.md before writing code. Do not weaken it to make a change pass. The floor is enforced now by `python3 devtools/floor_guard.py`, and the other rows start running when the platform skeleton lands. CI runs it on the whole PR diff, so a Claude Code session also runs it before every `git push` and `gh pr create` (the `PreToolUse` hook `devtools/hooks/floor_before_push.py`, wired in `.claude/settings.json`) and the push is blocked until it is clean; run `python3 devtools/floor_guard.py --base origin/main` yourself after committing.
-- `docs/ideas/agentic-rag-customer-support.md` — **the source of truth**: the design doc for the "Deflection Engine" (problem, scope, architecture, decisions log, open questions). Most work here is refining this doc. It's ~80k tokens: never read it whole. Grep for the section (`^## `) and read only those lines.
-- `docs/decisions/` — ADRs for the decisions that would be expensive to reverse (ADR-001 to ADR-015), extracted from the idea doc, which still wins any conflict. `docs/decisions/README.md` is the index and sets the conventions.
-- `docs/refs/customers-support-agentic-rag-notes.md` — a third-party web clipping kept for background. It is not authoritative, and the idea doc deliberately goes against it in places (e.g. no AI write actions, no LLM self-confidence for escalation, pgvector instead of Pinecone/Weaviate).
-- `docs/designs/tivacare_admin_ui_ux_design_specification.md` — the console's UI/UX spec (layout, tokens, components, and every screen), based on the HTML mock-up `docs/tivacare_mockup_html_20261025_7d0642.html`, which replaced the outdated `docs/assets/chatbot-staff.png`. Its values come from the mock-up's CSS. Where it conflicts with the idea doc, the idea doc's Console section records the decision, and the spec's section 9 lists the known conflicts.
-- `docs/designs/tivacare_widget_ui_ux_design_specification.md` — the chat widget's UI/UX spec (panel, thread, composer, launcher), based on `docs/assets/chatbot-user.png`. Also estimated from a screenshot; the idea doc's Widget section records where we deviate.
-- `docs/assets/` — images referenced by the docs.
-- `docs/specs/` — module specs (`SPEC-<module>.md`) and `CAPABILITY-MAP.md`. `docs/plans/` (implementation plans) and a root `GLOSSARY.md` are created when first needed.
-- `.claude/skills/` — the project's workflow skills, vendored from three skill packs (see "Agent workflow" and `.claude/skills/VENDORED.md`).
+- `agentflow/` is the **engine**: a stdlib + `pyyaml` Python package, with `flow.py` as its CLI. It must name no project.
+- `.agentflow/` is this repository's **pack**: `config.yaml`, plus `prompts/` for any prompt that overrides the engine's file of the same name. A pack is config only, never code. Here it is agentflow working on itself, with the `feature` and `bug` lanes only.
 
-## Editing the idea doc
+Design docs (read by section, using `grep -n '^## '`):
+- `docs/agentflow-harness-proposal.md`: **the current design**, status `proposed`. §1b covers the engine/pack split and §5 the rollout slices. Slice P (engine/pack separation) has shipped. Slice PnP (plug and play) comes next.
+- `docs/agentflow-playbook.md`: how to operate runs. §10 is the cheat sheet and §14 the pack reference, one line per config key.
+- `docs/plans/`: implementation plans (`YYYY-MM-DD-agentflow-harness-<slice>.md`). Completed plans are records and aren't edited afterwards.
 
-- When a question gets resolved, update **every** section it touches: the relevant MVP Scope subsection, add a row to **Decisions Log**, remove it from **Open Questions**, and if an alternative was rejected, record why under **Not Doing (and Why)**. The sections cross-reference each other ("see Upgrade path", "see Conversation lifecycle"), so keep those links consistent.
-- If the change affects a decision an ADR in `docs/decisions/` covers, add a new ADR that supersedes it, and set the old one's status to `Superseded by ADR-NNN`. Never edit an old ADR's decision in place.
-- Commits are one decision or refinement each, with messages like `Decide <topic> in agentic RAG idea doc`.
-- Budget and pricing figures are dated estimates (marked "verify current pricing"). Check current prices before changing them.
+There is no `pyproject.toml`: packaging belongs to slice PnP. There is no `CONSTRAINTS.md` either, so the quality bar is the pack's `gate_sets` plus the invariants below. There is no `docs/ideas/`, `docs/decisions/` or `docs/specs/`. A module's spec is its proposal, `docs/agentflow-<module>-proposal.md`.
 
-## Agent workflow (unified SDLC)
+## Commands
 
-The skills in `.claude/skills/` are the only workflow skills. They're vendored from superpowers, agent-skills and mattpocock-skills, whose plugins are off for this repo (see `.claude/skills/VENDORED.md`). Each stage has one owner skill. Never load a second skill for the same stage.
+The runtime needs Python 3.12+ and `uv`. `bin/agentflow` runs `agentflow/flow.py` as a `uv` script, and PyYAML comes from the script header. To put it on your PATH: `ln -s "$PWD/bin/agentflow" ~/.local/bin/agentflow`.
 
-| Stage | Skill | Output |
-|---|---|---|
-| Define | `grilling`; `domain-modeling` for terms and ADRs; `spec-driven-development` (+ `api-and-interface-design` for routes and contracts) | idea doc, `GLOSSARY.md`, `docs/decisions/`, `docs/specs/SPEC-<module>.md` |
-| Plan | `writing-plans` (with `codebase-design` as its vocabulary for a new package) | `docs/plans/YYYY-MM-DD-<feature>.md` |
-| Build | `executing-plans` (≤ 3 tasks) or `subagent-driven-development`; `test-driven-development` inside both | code + tests |
-| Verify | `verification-before-completion`; the eval gate for prompt/model/chunking/embedding/retrieval/model-CRM-field changes | command output |
-| Review | The plan executor's final review is the branch review. Use `requesting-code-review` only for work done outside a plan, and `receiving-code-review` for feedback | review notes |
-| Ship | `finishing-a-development-branch` | PR or merge, only when asked |
+```bash
+# Tests. --no-project keeps uv from picking up any project file, and --import-mode=prepend is required
+uv run --no-project --with pyyaml --with pytest pytest agentflow/tests --import-mode=prepend -q       # full suite: 25-60 min
+uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_pack.py --import-mode=prepend -q
+uv run --no-project --with pyyaml --with pytest pytest "agentflow/tests/test_pack.py::test_name" --import-mode=prepend -q
 
-Every skill ends by printing `Next: <skill> — <reason> (lane: <lane>)`. When unsure where the work stands, use `next-step` (the developer can type `/next-step`).
+# The pack's gates (.agentflow/config.yaml): `portability` gates build, and `engine_tests` (the full suite) gates verify
+uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_portability.py --import-mode=prepend -q
 
-Pick a lane by task, and skip stages it doesn't list:
-- **Design-doc change:** Define only, following "Editing the idea doc".
-- **New module or feature:** Define → Plan → Build → Verify → Review → Ship.
-- **Bug:** `systematic-debugging` → a failing regression test → fix → Verify → Review.
-- **Prompt, model, chunking, embedding, retrieval, or model CRM-field change** (`crm/model_fields.py`, `knowledge/retrieval/`, `knowledge/tables/`): no TDD for prompt text. Verify means re-running the eval suite with retrieval scored separately, and a regression blocks the change.
-- **Security paths** (Entra/IS4 token validation, `customer_code` injection, `visibility = public` filtering, staff-only data on widget routes, attachments, redaction): add `security-and-hardening` at Plan and Review (with the `security-auditor` agent), and offer `/doubt-driven-development` before Build.
-- **Console UI:** `frontend-ui-engineering`, with the TivaCare admin spec as the visual source.
+bin/agentflow validate                         # after every config edit; it must print "0 warnings"
+bin/agentflow explain <lane> --module <id>     # what a lane would run, with no agent calls
+bin/agentflow run <lane> ... --dry-run         # prints the commands and creates nothing
+bin/agentflow next | status | inbox | dashboard
+```
 
-When instructions conflict:
-- This file and the idea doc beat any skill on paths, ADR format and commit style.
-- One review per task (inside `subagent-driven-development`) and one per branch. Add no persona or extra reviews unless asked.
-- Library and API facts come from context7, not memory.
-- Run these only when the user asks: `/improve-codebase-architecture` (milestones), `/constraint-driven-development` (first run 2026-10-19; rerun to add a dimension or change `CONSTRAINTS.md`), `/using-git-worktrees`, `/doubt-driven-development`, `/writing-for-agents`.
-- Changing a stage's owner skill means updating this table, `VENDORED.md` and `next-step` together.
+The full suite is slow, so run the test files you touched while you work and the full suite before you finish.
 
-### Automated runs
+## Engine architecture
 
-`devtools/agentflow/config.yaml` is the durable permission for commits, pushes, draft PRs and marking a PR ready for review, and it applies inside `agentflow` runs only (`agentflow run`, `agentflow resume`, `agentflow queue`, and a run started from the dashboard's Backlog, which is the same `agentflow run` started by a developer's click). Interactive sessions keep "commit only when asked". The stages above are one main workflow there (`define → plan → build → verify → review → ship`), and each step maps to one skill. A lane (`feature`, `bug`, `eval`, `design`) selects which steps run, and a phase with no step for the lane is skipped. The runner takes one step per `claude -p` call. Each phase's `needs_approval` says whether a human approves it: `define` and `plan` do, and `build`, `verify`, `review` and `ship` move on by themselves. After `plan`, the agent resolves its own stops, blocking findings and CI failures, and a human hears only when those run out (`autonomy:` and `ci:` in the config). `ship` ends with a PR ready for review. Before it opens the PR, `finish` merges the latest `origin/<fork_from>` into the run's branch (the PR's target), resolving conflicts in a `sync` session and checking the merged tree with the verify gates before the runner commits it. A run never merges the PR. Agent sessions in a run use `bypassPermissions` (`agents.claude.permission_mode`), so they need no `allow` rules, though deny and ask rules, the runner's denies (forbidden paths, `gh`), hooks and the guards still bind them. Interactive sessions keep the `.claude/settings.json` rules. Run `agentflow validate` after editing the config. `docs/agent-orchestration-guide-v3.md` section 11 covers how to run and read it.
+**Core rule:** the model never decides the next phase. The runner walks the pack's `phases:`. A lane (`feature | bug`, with `eval | design` in other packs) picks which steps run, and `conditions:` decide what gets skipped. Conditions are evaluated from files and git, never by a model. The harness proposal relaxes this to "the model proposes, the harness disposes", but that work isn't built yet.
 
-## Planned architecture (for when code is written)
+How a run flows:
+- `flow.py` is the argparse CLI and runs on top of `pipeline.py` (the phase loop: start a run, then advance phase by phase until a human is needed or the run ends).
+- `flow_control.py` decides which step of a phase runs next and what each kind of step does (agent, gate, checkpoint, `finish`, `ci`).
+- `lanes.py` runs one agent step through its lifecycle: prompt → `agents.py` (argv/env for `claude -p` / `codex exec`, stream parsing) → result file → gates and the fix loop → guards → commit. It also handles context rollover.
+- Lane-specific behaviour lives in its own module: `feature_lane.py` (plan tasks, per-task review, commits that tick `- [ ]` boxes), `bug_eval.py` (the bug lane's red/green test expectations), `sync_lane.py` (`finish` merges `origin/<fork_from>` in) and `ci_lane.py` (waits for CI, fixes failures, marks the PR ready, never merges).
+- `autonomy.py` holds what the runner resolves by itself after `plan`: resolver sessions for stops, and refine rounds on blocking findings. `hitl.py` holds the `result.json` schema, the inbox, notifications, and `answer`/`approve`/`reject`.
 
-These constraints come from the idea doc. Code should follow them, and changes to them belong in the doc first.
+State and the pack:
+- `events.py` keeps the append-only `events.jsonl` and the run lock. `state.py` reduces it into `state.json`, and `Run` is the only writer of both. `metrics.py` and `views.py` are read-only passes over them.
+- Runs and workspaces live in the state dir (`paths.state_dir`), which defaults to `~/.local/state/agentflow/<repo-id>/`, outside the repo. `workspace.py` gives each run the one directory an agent may write to outside its worktree.
+- `pack.py` finds the pack (always the **main checkout's** `.agentflow/`, never a linked worktree's copy), checks `version`/`engine`, and resolves prompts with the pack first and the engine's defaults second. `config.py` loads it into typed dataclasses, resolves `@a.b.c` references and implements `validate`. `config_trust.py` decides which config a resumed run may use.
+- `conditions.py` holds the named condition checks (`file_exists`, `grep`, `section_items`, `status_line`, `changed_paths`, `plan_tasks`, …), prompt placeholders, and `agentflow explain`. `sources.py` reads plans and specs. `work_source.py` and `module_queue.py` handle `next` and `queue`.
 
-- **Phasing:** the **MVP** (15 weeks, hard deadline, delivered in full) is internal: the project structure, the full TivaCare console, the agentic RAG agent, and a **customer simulator** (Mô phỏng khách hàng, a console page for all staff) where staff chat as **real MISA customers from an admin-kept allow-list** (ADR-021). Simulator messages run the same customer graph a widget turn will, escalations go through the Shared Inbox, and its endpoints return only the customer-side response models. It accepts only allow-listed customer codes, checks the code on every message, injects it server-side like the IS4 claim, and tags conversations with channel `simulator`. The MVP reads real MISA data (`MISA_MODE=live` in dev/staging with the sandbox AppID, and in production only after legal sign-off); there is no fake MISA client and there are no mock customers. **Phase 2:** the widget, the IS4 handshake, and Hỏi Mayai. Tiva Care never collects phone, Zalo, or remote-desktop contacts (out of scope); every metric comes from conversations inside Tiva Care.
-- **Stack:** Python. **LangGraph** runs **one graph per customer turn** (load context → routing → pre-answer rules → clarify | answer with tools → grounding check → outcome `send | clarify | escalate`). `langchain-core` is used **only** for chat models and tool schemas (no LangChain retrievers, vector stores, or loaders). **FastAPI** serves the API and WebSockets.
-- **Repository layout:** three top-level code roots, each built and tested on its own: the backend (Tiva Care Agentic RAG) in `src/tivacare/` (one package per module, `platform` included; `entrypoints/` is the only code that imports every module), the **Console Web Admin** in `webadmin/`, and the **Chat Widget** in `web/` (Phase 2). The frontends are standalone pnpm projects with no shared workspace or package, and code roots never import each other. `docs/specs/SPEC-platform.md` has the full tree.
-- **Frontend:** TypeScript + Vite. The **console** (`webadmin/`) is a React SPA using Mantine, TanStack Query (no Redux/Zustand), React Router, and MSAL React. Its UI strings are Vietnamese, kept in one module with no i18n library. Its layout and look follow the TivaCare spec (light theme, with the spec's tokens on one Mantine theme), and the AI persona is "Mayai (AI)". The **widget** (Phase 2, `web/`) is a tiny plain-TS loader (`SupportChat.init({ getToken, getContext })`) on TivaCloud's pages plus a **Preact** app in an iframe on our origin, styled after the TivaCare widget spec with hand-written CSS (tokens as CSS custom properties). AI messages keep the "Mayai (AI)" label, and the widget has no upload button. The token and page context (screen, last error code, app version — allow-listed, length-capped, untrusted, never used for authorisation) go over postMessage with exact origin checks on both sides, never in a URL, and the widget page sets `frame-ancestors` to TivaCloud's origins. Render model output as sanitised Markdown (`marked` + `DOMPurify`), never as raw HTML. REST and WebSocket types are generated from FastAPI's OpenAPI and the Pydantic models, not hand-written, separately for each frontend and filtered to its own routes. Caddy serves the built static files from the same origin as the API. No Node in production and no Next.js.
-- **State lives in our Postgres tables, not LangGraph checkpoints.** The conversation lifecycle (`bot → waiting → assigned → closed`), claims, timers, and memory are rows, so they survive deploys; the graph never pauses with `interrupt()`. `ai_mode` per topic category is `auto | off` — there is no draft mode. In `off` (categories not yet passed, the kill switch, a failed weekly audit) the AI makes no factual claims: it gathers details and escalates at once. Once a human claims a conversation it never returns to the AI. From then on the AI produces staff-only output (the AI summary; no reply suggestions in the MVP, ADR-027) and never messages the customer. Transitions are enforced server-side.
-- **LLM access goes through a `ModelRegistry`/provider interface** (`init_chat_model`), with the model configured per role: `routing`, `answer`, `grounding`, `summary`. Nodes never import a provider SDK. Embeddings are separate and fixed: OpenAI `text-embedding-3-small`.
-- **Retrieval is hand-written SQL in one Postgres:** pgvector + `simple`-config `tsvector` over accented and `unaccent()`-ed text + `pg_trgm`, fused with reciprocal rank fusion, filtered to `visibility = public` for every AI-written answer (customer turns and staff Hỏi Mayai answers alike; Hỏi Mayai lists `internal` documents separately as staff-only references). Apply Unicode NFC at ingest and at query time. Spreadsheets go to structured tables queried via `lookup_table` with a fixed query shape, never model-written SQL.
-- **Tool security:** all tools are read-only. The customer code is injected from the validated IdentityServer4 token (`customer_code` claim, checked via JWKS) — in the MVP's simulator, from the selected allow-listed customer, checked server-side — never taken as a model argument. `get_order_by_code` checks that the order belongs to the customer. `get_product_by_code` takes the product code as a model argument (the catalogue isn't customer data) and never returns a price. Only allow-listed CRM fields reach the model. Retrieved/CRM text is data, never instructions.
-- **Staff-only data stays off widget routes:** CRM profile fields, internal notes (`audience = staff`, with `@mentions`), the handoff summary, and AI traces. Internal notes feed the summary, but never a customer-facing agent turn. **Attachments are staff-only uploads:** allow-listed types, ≤ 10 MB, stored through the storage interface, and served via a route that checks the viewer belongs to the conversation. The AI never reads attachments, and customers can't upload.
-- **Staff sign-in (console):** Microsoft Entra ID from the company's Microsoft 365 tenant, using a single-tenant SPA app registration with auth code + PKCE (no client secret). Validate tokens against Entra's JWKS and check `iss`, `aud`, `exp`, and that `tid` matches the company tenant. Staff tokens are accepted only on console routes, and customer (IS4) tokens only on widget routes. Roles and groups come from our `staff` table (keyed by `tid` + `oid`, checked for `active` on every request), never from Entra app roles or groups.
-- **MISA CRM client:** GET-only, against the developer-portal gateway (`https://developer.misa.vn/apis/amiscrm/v1`), with five calls and no others (ADR-022): `POST /Account` (the token, always first), `GET /Customers/code`, `GET /SaleOrders/code`, `GET /Products/code`, and `GET /Products` (only from the recording CLI). Send `api-key` on every call, and `Authorization: Bearer` and `Clientid` (the AppID) on data calls. The host, AppID, secret, and API key are env config only (ADR-019). Treat `success: false` in an HTTP 200 as an error. Fetch at most once per conversation, cache it, and wrap it in a circuit breaker (the rate limit is unknown).
-- **Escalation is rule-based on observable signals**, never LLM self-reported confidence. Up to 2 clarifying rounds first, except for an explicit human request, denylisted topics, frustration, or degraded mode.
-- **Language split:** Vietnamese for the KB and everything customer-facing. English for code, schema, system prompts, and logs.
-- **Infra:** one Docker Compose stack (`api`, `worker`, `postgres` with pgvector/unaccent/pg_trgm, `caddy`) that runs the same locally and on a single EC2 instance. Only EC2 + S3 on AWS. The job queue is a Postgres table using `FOR UPDATE SKIP LOCKED`, with `LISTEN/NOTIFY` for signals. Deployment config comes only from env vars; model ids per role and the agent's tuned thresholds are committed files (`llm_gateway/models.toml`, `agent/policy.py`) so a change runs the eval gate. Storage, queue, and secrets sit behind small interfaces. Local dev runs MISA `off` (no calls, CRM unavailable) or `live` against the sandbox, tests stub MISA's transport with invented payloads in the recorded shape, and a dev-only token issuer serves JWKS.
-- **Observability:** per-turn traces and every tool call go to the `conversation_events` table, which also feeds the SQL dashboard. Mask PII in logs and eval exports.
-- **Eval gate:** re-run the eval suite on any change to prompts, models, chunking, embeddings, retrieval and table lookup (`knowledge/retrieval/`, `knowledge/tables/`, ADR-023), or the CRM fields the model sees (`crm/model_fields.py`, ADR-020). It runs in CI against a committed snapshot of the `public` KB (`eval/corpus/`) and curated cases (`eval/cases/`), and blocks on fixed drops against `eval/baseline.json`. Score retrieval separately from answers.
+Safety and the UI:
+- `guards.py` refuses a step that touches `guardrails.forbidden_paths` or `.agentflow/**` (always), moves `HEAD`, or uses a user-only skill. Only the runner commits and pushes (`gitops.py`, `commit_checks.py`), and it never merges. `safeio.py` writes files without following symlinks.
+- `dashboard.py` + `dashboard.html` + `backlog.py` make up the local Kanban board: a stdlib HTTP server on 127.0.0.1 that needs a token, with SSE updates. `config_edit.py` backs its Settings page, which edits `config.yaml` while keeping comments and anchors, and its `_PROTECTED_KEYS` lists what the page may not change.
+- `prompts/*.md` are the engine's default prompt templates. `_preamble.md` and `_result.md` are shared by all of them.
+
+Tests (`agentflow/tests/`):
+- `fake_agent.py` is a scripted stand-in for `claude -p` (`AGENTFLOW_FAKE_SCRIPT`), and `tests/bin/gh` is a fake `gh`. No test calls a real model or GitHub.
+- `conftest.py` sets `XDG_STATE_HOME` to a tmp dir for every test.
+- The suite runs on two toy fixture packs, `fixtures/packs/python` (the suite's main pack) and `fixtures/packs/node`, each copied into its own temp git repo.
+
+## Invariants that changes must keep
+
+- **Engine dependencies stay stdlib + `pyyaml>=6`.** Don't add a third-party import.
+- **No project strings in the engine.** `test_portability.py` has a denylist (`tivacare`, `CONSTRAINTS.md`, `src/`, `docs/specs`, `docs/ideas`, `CAPABILITY-MAP`, `SPEC-`, `floor_guard`, `webadmin`, `next-step`) that fails on any engine `.py`, `dashboard.html` or default prompt containing one of them. Project wording belongs in `.agentflow/prompts/`. `agentflow/tests/` is exempt.
+- **The golden files `agentflow/tests/fixtures/explain/*.txt` never change.** They pin `agentflow explain` for every lane of the `python` pack, so a refactor must leave them byte-identical. They are also a forbidden path in runs.
+- **Every new or changed config key** ships in the same change with all four of: a Settings Form field or a `_PROTECTED_KEYS` entry (`config_edit.py`), the matching `validate` checks, a `tests/test_config_edit.py` case, and a line in playbook §14 "Pack reference".
+- **Engine floor:** a pack without a non-empty `gate_sets.verify` is refused, `.agentflow/**` is always forbidden in a run, and user-only skills are refused. A pack can add obligations but can't remove these.
+- Changes to `guards.py`, `agents.py`, `config_trust.py`, `safeio.py`, `workspace.py` or `pack.py` trigger the pack's security overlay. Plan and review that work with `security-and-hardening` and the `security-auditor` agent.
+
+## Agent workflow
+
+The workflow skills are vendored in `.claude/skills/` (see `.claude/skills/VENDORED.md`), and each stage has one owner skill. The pack's `skills.map` records the same mapping:
+
+| Stage | Skill |
+|---|---|
+| Define | `grilling` (decisions), `spec-driven-development` (a proposal in `docs/agentflow-<module>-proposal.md`), `api-and-interface-design` (contracts), `domain-modeling` (recording decisions) |
+| Plan | `writing-plans` → `docs/plans/YYYY-MM-DD-<feature>.md` |
+| Build | `subagent-driven-development`, or `executing-plans` for ≤ 3 tasks, with `test-driven-development` inside both |
+| Verify | `verification-before-completion` |
+| Review | the plan executor's final review; `receiving-code-review` for feedback |
+| Ship | `finishing-a-development-branch` (only when asked) |
+
+Lanes: **feature** (the whole table), **bug** (`systematic-debugging` → a failing regression test → fix → verify), **design-doc** (Define only: edit a proposal, resolving its Open Questions and keeping its sections consistent), and a **security** overlay on the pack's `overlays.security.when_paths` (see Invariants). `next-step` (or `/next-step`) reads the repo state and names the lane and next skill. A proposal is approved by editing its status line (`Status: proposed` → `approved`), and the pack's `spec_is_approved` condition reads that line. Use `improve-codebase-architecture`, `constraint-driven-development`, `doubt-driven-development`, `using-git-worktrees` and `writing-for-agents` only when the user asks for them.
+
+### Automated runs vs interactive sessions
+
+`.agentflow/config.yaml` is the durable permission for commits, pushes, draft PRs and marking a PR ready, but **only inside agentflow runs** (`agentflow run | resume | queue`, or a run started from the dashboard Backlog). Those runs use `bypassPermissions`, and the deny rules, the runner's `--settings` denies, hooks and guards still bind them. Agents in a run never commit, push, amend or rebase, because the runner does that (see `AGENTS.md`). Interactive sessions keep "commit only when asked".
+
+Commit messages are one imperative sentence, ending with the `Co-Authored-By` trailer from `project.commit_trailer`. Never add a `Constraints-Approved-By` trailer: only a human does that.

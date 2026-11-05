@@ -81,10 +81,10 @@ def test_snapshot_ignores_gitignored_files(tmp_git):
         ("src/b.py", "src/*.py", True),
         ("src/a/b.py", "src/**/*.py", True),
         ("src/b.py", "src/**/*.py", True),
-        ("src/tivacare/x/identity/y.py", "**/identity/**", True),
+        ("src/toy/x/identity/y.py", "**/identity/**", True),
         ("identity/y.py", "**/identity/**", True),
-        ("src/tivacare/staff_auth/a/b.py", "src/tivacare/staff_auth/**", True),
-        ("src/tivacare/staff_authx/a.py", "src/tivacare/staff_auth/**", False),
+        ("src/toy/staff_auth/a/b.py", "src/toy/staff_auth/**", True),
+        ("src/toy/staff_authx/a.py", "src/toy/staff_auth/**", False),
         ("a.b", "a.b", True),
         ("axb", "a.b", False),
     ],
@@ -222,7 +222,7 @@ def test_settings_coverage_warns_on_uncovered_gate(repo_root):
 
 
 def test_settings_coverage_checks_each_part(repo_root):
-    cfg = with_mode(cfg_with({"mixed": "uv run ruff check . && make lint; pnpm exec tsc --noEmit"}), "acceptEdits")
+    cfg = with_mode(cfg_with({"mixed": "uv run --no-project --with pyyaml --with pytest pytest agentflow/tests -q && make lint; git status --short"}), "acceptEdits")
     issues = settings_coverage(cfg, repo_root)
     assert len(issues) == 1 and "make lint" in issues[0].message
 
@@ -325,7 +325,7 @@ def shipped_allows(repo_root, command: str) -> bool:
     "pnpm install",
     "pnpm run anything",
     "git difftool -x evil",
-    "git log --output=devtools/agentflow/runs/x/events.jsonl",
+    "git log --output=runs/x/events.jsonl",
     "git diff --output=/tmp/x",
     "git push origin main",
     "git push --force origin main",
@@ -335,10 +335,10 @@ def test_shipped_settings_do_not_cover_escapes(repo_root, command):
 
 
 @pytest.mark.parametrize("command", [
-    "uv run pytest tests/unit/test_x.py::test_y",
-    "uv run ruff check .",
-    "uv run pyright",
-    "pnpm exec vitest run --coverage",
+    "uv run --no-project --with pyyaml --with pytest pytest agentflow/tests --import-mode=prepend -q",
+    "uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_x.py::test_y --import-mode=prepend -q",
+    "bin/agentflow validate",
+    "bin/agentflow explain feature --module demo",
     "git status",
     "git diff HEAD~1",
 ])
