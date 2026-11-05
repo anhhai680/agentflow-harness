@@ -352,9 +352,9 @@ def test_a_console_task_also_gets_the_frontend_skill(pipe):
     step = _build_step(pipe)
     executor = pipe.executor(pipe.new_run({"module": "demo"}))
     skill = (PYTHON_SKILLS / "frontend-ui-engineering/SKILL.md").read_text(encoding="utf-8").strip()
-    assert skill in _prompt(pipe, executor._impl_step(step, {}, "Add `webadmin/src/pages/inbox.tsx`"))
+    assert skill in _prompt(pipe, executor._impl_step(step, {}, "Add `console/src/pages/inbox.tsx`"))
     assert skill in _prompt(pipe, executor._impl_step(step, {}, "Add `web/src/thread.ts`"))
-    assert skill not in _prompt(pipe, executor._impl_step(step, {}, "Add `src/tivacare/crm/client.py`"))
+    assert skill not in _prompt(pipe, executor._impl_step(step, {}, "Add `src/toy/crm/client.py`"))
 
 
 def test_a_reviewer_is_told_not_to_dispatch_another_reviewer(pipe):

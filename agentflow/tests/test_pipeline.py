@@ -95,7 +95,7 @@ def test_feature_stops_after_every_phase(pipe):
 
 
 def test_skipped_phase_raises_no_approval(pipe):
-    commit_files(pipe, {"docs/specs/SPEC-demo.md": APPROVED_SPEC, "src/tivacare/demo/__init__.py": "", PLAN_PATH: PLAN})
+    commit_files(pipe, {"docs/specs/SPEC-demo.md": APPROVED_SPEC, "src/toy/demo/__init__.py": "", PLAN_PATH: PLAN})
     run = begin(pipe)
     assert go(pipe, run) == "awaiting_approval"
     skipped = {e["phase"]: e["reason"] for e in pipe.events(run, "phase_skipped")}
@@ -106,7 +106,7 @@ def test_skipped_phase_raises_no_approval(pipe):
 
 
 def test_phase_with_all_steps_skipped_is_skipped(pipe):
-    commit_files(pipe, {"docs/specs/SPEC-demo.md": APPROVED_SPEC, "src/tivacare/demo/__init__.py": ""})
+    commit_files(pipe, {"docs/specs/SPEC-demo.md": APPROVED_SPEC, "src/toy/demo/__init__.py": ""})
     run = begin(pipe)
     assert go(pipe, run) == "awaiting_approval"
     reasons = {e["phase"]: e["reason"] for e in pipe.events(run, "phase_skipped")}
@@ -119,7 +119,7 @@ def test_the_first_phase_with_work_is_the_phase_a_real_run_stops_in(pipe):
     """The dashboard offers this phase as a card's drop target, so it must never disagree with the runner."""
     from agentflow.conditions import first_phase_with_work, make_ctx
 
-    commit_files(pipe, {"docs/specs/SPEC-demo.md": APPROVED_SPEC, "src/tivacare/demo/__init__.py": ""})
+    commit_files(pipe, {"docs/specs/SPEC-demo.md": APPROVED_SPEC, "src/toy/demo/__init__.py": ""})
     ctx = make_ctx(pipe.cfg, pipe.root, "feature", {"module": "demo"})
     predicted = first_phase_with_work(pipe.cfg, "feature", ctx)
     run = begin(pipe)
@@ -130,7 +130,7 @@ def test_the_first_phase_with_work_is_the_phase_a_real_run_stops_in(pipe):
 
 def test_a_spec_pending_approval_needs_one_human_approval_before_plan(pipe):
     spec = APPROVED_SPEC.replace("2026-10-01", "2026-10-01. **Amended 2026-10-25, pending approval.**")
-    commit_files(pipe, {"docs/specs/SPEC-demo.md": spec, "src/tivacare/demo/__init__.py": ""})
+    commit_files(pipe, {"docs/specs/SPEC-demo.md": spec, "src/toy/demo/__init__.py": ""})
     run = begin(pipe)
     assert go(pipe, run) == "awaiting_approval"
     assert run.state["waiting"]["phase"] == "define"
@@ -144,7 +144,7 @@ def test_a_spec_pending_approval_needs_one_human_approval_before_plan(pipe):
 def test_a_spec_with_no_status_line_goes_straight_to_plan(pipe):
     """Only a spec that says it is waiting stops: the older specs never had a status line to keep up to date."""
     spec = APPROVED_SPEC.replace("**Status: approved** 2026-10-01\n\n", "")
-    commit_files(pipe, {"docs/specs/SPEC-demo.md": spec, "src/tivacare/demo/__init__.py": ""})
+    commit_files(pipe, {"docs/specs/SPEC-demo.md": spec, "src/toy/demo/__init__.py": ""})
     run = begin(pipe)
     assert go(pipe, run) == "awaiting_approval"
     assert types(pipe, run, "phase_approval_raised") == ["plan"]
@@ -175,7 +175,7 @@ def test_new_session_per_phase_and_handoff(pipe):
 
 
 def test_unchecked_plan_goes_straight_to_build(pipe):
-    commit_files(pipe, {"docs/specs/SPEC-demo.md": APPROVED_SPEC, "src/tivacare/demo/__init__.py": "",
+    commit_files(pipe, {"docs/specs/SPEC-demo.md": APPROVED_SPEC, "src/toy/demo/__init__.py": "",
                         PLAN_PATH: PLAN})
     run = begin(pipe)
     assert go(pipe, run) == "awaiting_approval"
@@ -236,8 +236,8 @@ def test_last_phase_no_approval(pipe, git, monkeypatch):
     idea = Path(__file__).parent / "fixtures" / "idea.md"
     text = idea.read_text(encoding="utf-8")
     commit_files(pipe, {IDEA: text})
-    decided = text.replace("| MISA sandbox / rate limit | Sandbox AppID available; defensive caching |\n",
-                           "| MISA sandbox / rate limit | Sandbox AppID available; defensive caching |\n| Cache TTL | 1 giờ |\n")
+    decided = text.replace("| CRM sandbox / rate limit | Sandbox API key available; defensive caching |\n",
+                           "| CRM sandbox / rate limit | Sandbox API key available; defensive caching |\n| Cache TTL | 1 giờ |\n")
     decided = decided.replace("- Is zero data retention available with each LLM provider we shortlist?\n", "")
     assert decided.count("\n") == text.count("\n")  # one row in, one open question out (the doc checks pass)
     pipe.script({"define/decide/apply_topic": [{"write": {IDEA: decided}, "result": DONE}]})
@@ -416,7 +416,7 @@ def test_dry_run_feature(pipe, capsys):
     assert "gh pr create --draft" in out
     assert pipe.calls() == []
     assert not runs_root(pipe.root).exists()
-    assert not (pipe.root.parent / "tivacare-worktrees").exists()
+    assert not (pipe.root.parent / "toy-worktrees").exists()
 
 
 def test_run_cli_detach_starts_a_background_resume(pipe, monkeypatch):

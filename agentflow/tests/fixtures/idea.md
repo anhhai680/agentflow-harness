@@ -1,6 +1,6 @@
-# Idea: Deflection Engine (agentflow test fixture)
+# Idea: Support Assistant (agentflow test fixture)
 
-A small stand-in for `docs/ideas/agentic-rag-customer-support.md`, with the same sections the doc checks read.
+A small stand-in for a product's idea doc, with the same sections the doc checks read.
 
 ## Problem Statement
 
@@ -18,14 +18,14 @@ Customers ask the same questions again and again.
 
 ## Not Doing (and Why)
 
-- **Phone support:** out of scope, every metric comes from conversations inside Tiva Care.
+- **Phone support:** out of scope, every metric comes from conversations inside the product.
 
 ## Decisions Log
 
 | Question | Decision |
 |---|---|
-| Which customer identifier does the web app provide? | MISA **customer code** |
-| MISA sandbox / rate limit | Sandbox AppID available; defensive caching |
+| Which customer identifier does the web app provide? | CRM **customer code** |
+| CRM sandbox / rate limit | Sandbox API key available; defensive caching |
 
 ## Open Questions
 

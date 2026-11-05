@@ -4,13 +4,13 @@ Status: proposed (2026-11-04)
 
 ## Context
 
-agentflow can already take a feature from spec to a PR that is ready for review. It does this by walking one fixed, config-driven workflow: `define → plan → build → verify → review → ship`. A lane (`feature | bug | eval | design`) selects steps, and `conditions:` (file and git checks, never a model) decide what to skip. The design says so outright (`docs/agentflow-proposal.md` §"Phase chaining"): **"The agent never decides the next phase."**
+agentflow can already take a feature from spec to a PR that is ready for review. It does this by walking one fixed, config-driven workflow: `define → plan → build → verify → review → ship`. A lane (`feature | bug | eval | design`) selects steps, and `conditions:` (file and git checks, never a model) decide what to skip. The original design said so outright: **"The agent never decides the next phase."**
 
 That rule is the reason quality holds today. It is also the reason agentflow isn't a harness. The model can't choose a workflow that fits the task: it can't skip grilling for a one-line change, split a big task, add a spike, pick Opus for a hard task, re-plan after a failed approach, or handle work that fits no lane (refactor, dependency bump, docs, a cross-module epic).
 
 The goal is to let the model decide **how** the work gets done while the harness keeps deciding **what "done" means**. Then the output can't fall below today's bar, whatever route the model picks.
 
-Evidence from the 10 runs in `devtools/agentflow/runs/` (`agentflow metrics --all`, events.jsonl):
+Evidence from the first 10 real runs, made before slice P (`agentflow metrics --all`, events.jsonl):
 - Cost runs $5–32 per feature, and build is 70–85% of it. Rework is $0.3–3 per run.
 - Humans wait 0–64 min per phase. Most of that is approvals and stops.
 - Compliance noise already shows up: 265 `permission_denied`, 154 `progress_not_updated`, 4 `footer_mismatch`, 18 `step_reopened`. Those signals already exist; nobody has turned them into a scorecard yet.
@@ -43,7 +43,7 @@ Split the work into three layers. Only the middle one is new freedom for the mod
 
 ## 1b. Portability: a project-agnostic engine plus a per-project pack
 
-agentflow will be cut out of this repository and run on many projects. So the harness is split in two, and **nothing project-specific lives in the engine**.
+agentflow has been cut out of the project it was built in, and it will run on many projects. So the harness is split in two, and **nothing project-specific lives in the engine**.
 
 ```
 agentflow (own repo, installed as a tool: `uv tool install agentflow`)     <project repo>/.agentflow/  (the "pack")
@@ -59,13 +59,13 @@ agentflow (own repo, installed as a tool: `uv tool install agentflow`)     <proj
 
 **What belongs where:**
 
-| Concern | Engine (generic) | Pack (this repo's values) |
+| Concern | Engine (generic) | Pack (a project's values) |
 |---|---|---|
 | Workflow | Route schema, action catalog *mechanics* (`requires`/`provides`), lanes as data | Which actions exist, their skills and prompts, reference routes per lane |
-| Quality bar | Obligation *engine*, conformance audit, evidence-by-tree-SHA | The obligations themselves (here: `CONSTRAINTS.md` gates, security/eval overlays, spec/plan approvals) |
-| Conditions | Generic checks (`file_exists`, `grep`, `section_items`, `status_line`, `changed_paths`, `plan_tasks`, `lane`, `gate_passed`, `command`) | Named conditions with this repo's paths and patterns |
+| Quality bar | Obligation *engine*, conformance audit, evidence-by-tree-SHA | The obligations themselves (e.g. a `CONSTRAINTS.md`'s gates, security/eval overlays, spec/plan approvals) |
+| Conditions | Generic checks (`file_exists`, `grep`, `section_items`, `status_line`, `changed_paths`, `plan_tasks`, `lane`, `gate_passed`, `command`) | Named conditions with the project's paths and patterns |
 | Skills | `project.skills_dir` (default `.claude/skills`), resolution, brief injection | The skills, and which step uses which |
-| Work intake | A **work-source interface**: `capability_map` (a markdown table), `github_issues`, `backlog_file` | Which source and its path (here: `docs/specs/CAPABILITY-MAP.md`) |
+| Work intake | A **work-source interface**: `capability_map` (a markdown table), `github_issues`, `backlog_file` | Which source and its path (e.g. `docs/specs/CAPABILITY-MAP.md`) |
 | Guardrails | Universal floor (below), deny-rule generation, guard checks | `forbidden_paths`, `reject_trailers`, `user_only_skills`, `human_paths` |
 | Memory | Tiers, digest builder, caps, retro step, engine lessons | Project lessons, stats, ledger (per repo) |
 | Metrics | KPI definitions from generic events, scorecard, autonomy ladder | SLO thresholds and baseline **per project** (projects aren't compared with each other) |
@@ -82,21 +82,21 @@ agentflow (own repo, installed as a tool: `uv tool install agentflow`)     <proj
 
 A pack can add obligations but can't remove these. `agentflow validate` refuses a pack with no `verify` gate set.
 
-**Hard-coding to remove from today's code** (found in this review):
+**Hard-coding removed in slice P** (found in this review; the paths are the source project's layout at the time):
 - `.claude/skills` in `config.py:764`, `guards.py:120` and `lanes.py:138` → `project.skills_dir`.
 - `devtools/agentflow/runs` and `workspaces` in `state.py:809-814` → `paths.state_dir`, default `~/.local/state/agentflow/<repo-id>/` (outside the repo; see 1c).
 - The shipped-config path in `config_trust.py` → the pack's path.
 - `devtools/bin/agentflow` → a console-script entry point.
-- `module_queue.py`'s port of this repo's `next-step` skill and the capability-map parsing → the `capability_map` work source.
-- The prompts that name `src/tivacare`, this repo's docs, `CONSTRAINTS.md` and `floor_guard.py` (about 28 files in `prompts/`). Engine defaults become generic; this repo's wording moves to `.agentflow/prompts/` overrides.
-- `floor_before_push.py` stays in this repo. The engine ships a generic `agentflow hook install` that runs the pack's `gate_sets.floor` (or a named gate) before push.
+- `module_queue.py`'s port of the source project's `next-step` skill and the capability-map parsing → the `capability_map` work source.
+- The prompts that name the source project's code root, its docs, `CONSTRAINTS.md` and `floor_guard.py` (about 28 files in `prompts/`). Engine defaults become generic; a project's wording moves to `.agentflow/prompts/` overrides.
+- The source project's `floor_before_push.py` stays there. The engine ships a generic `agentflow hook install` that runs the pack's `gate_sets.floor` (or a named gate) before push.
 
 **Portability is enforced, not hoped for:**
 - The engine's own test suite runs every feature against **two fixture packs** (a toy Python repo and a toy Node repo).
 - A CI test fails if any engine file (code *or* default prompt) contains a pack-specific string (a denylist that includes `tivacare`, `CONSTRAINTS.md`, `src/`, `docs/specs`).
 - The pack format is versioned (`version: 2`, `engine: ">=2,<3"`), and `agentflow migrate` upgrades a pack.
 
-Everywhere below, a YAML example with this repo's paths or skills is **this repo's pack**, not engine code.
+Everywhere below, a YAML example with a product repo's paths or skills (specs, ADRs, an eval suite) is **an example pack**, not engine code.
 
 ---
 
@@ -169,7 +169,7 @@ One `agentflow dashboard` serves every repo registered on the machine (`agentflo
 ## 3. Design of each piece
 
 ### 3.1 Action catalog (`config.yaml: catalog:`), from G1
-Recast the existing steps as named actions without changing what they do. The engine defines the action *schema* and ships a generic starter catalog. Each pack lists its own actions, skills and prompts. Example (this repo's pack):
+Recast the existing steps as named actions without changing what they do. The engine defines the action *schema* and ships a generic starter catalog. Each pack lists its own actions, skills and prompts. Example (an example pack):
 ```yaml
 catalog:
   grill_spec:   {skill: grilling, role: plan, prompt: grill_spec_questions.md, provides: [spec_questions_resolved], human: answers}
@@ -185,7 +185,7 @@ catalog:
 The current lanes become **reference routes**, the exact sequences that run today. They are the fallback, and the baseline everything is compared against.
 
 ### 3.2 Policy and obligations (`config.yaml: policy:`), from G3
-The engine evaluates obligations generically. The list below is **this repo's pack**: another project declares its own, on top of the engine floor (1b). Evidence kinds are generic (`gates:<set>`, `review:<action>`, `approval:<phase>`, `ci_green`, `expect:<red|green>`). They are built from the pack's named `conditions:` (reuse `conditions.evaluate`, `devtools/agentflow/conditions.py:385`):
+The engine evaluates obligations generically. The list below is **an example pack**: another project declares its own, on top of the engine floor (1b). Evidence kinds are generic (`gates:<set>`, `review:<action>`, `approval:<phase>`, `ci_green`, `expect:<red|green>`). They are built from the pack's named `conditions:` (reuse `conditions.evaluate` in `agentflow/conditions.py`):
 ```yaml
 policy:
   obligations:
@@ -222,7 +222,7 @@ This needs one small change to existing code: put `tree_sha` (from `guards.snaps
 ### 3.6 Long-running goal runs, from G7
 
 #### Where a goal comes from: the harness never invents one
-**A human gives the goal, and the project's own documents ground it. Memory never does.** This mirrors the product's own rule ("escalation is rule-based on observable signals, never LLM self-reported confidence"): the harness doesn't ask the model whether it's confident. It checks citations.
+**A human gives the goal, and the project's own documents ground it. Memory never does.** It follows the same rule as good escalation logic (act on observable signals, never on a model's self-reported confidence): the harness doesn't ask the model whether it's confident. It checks citations.
 
 | Input | Role in a goal | Can it *define* the goal? |
 |---|---|---|
@@ -231,11 +231,11 @@ This needs one small change to existing code: put `tree_sha` (from `guards.snaps
 | **Memory**: digest, ledger, lessons, stats (3.10) | **How**: route, cost, model choice | **No.** Memory is episodic and procedural, never a source of scope or acceptance |
 | **The model** | Drafts the Goal Brief and the decomposition | **No.** It proposes; citations and a human decide |
 
-**`knowledge.sources`** (pack, protected) declares where truth lives and its authority order. A higher source wins a conflict. This repo's pack:
+**`knowledge.sources`** (pack, protected) declares where truth lives and its authority order. A higher source wins a conflict. An example pack:
 ```yaml
 knowledge:
   sources:                                   # highest authority first
-    - {id: idea,   path: docs/ideas/agentic-rag-customer-support.md, cite: section}   # "the source of truth"
+    - {id: idea,   path: docs/idea.md,                               cite: section}   # "the source of truth"
     - {id: adr,    path: "docs/decisions/ADR-*.md",                  cite: file}
     - {id: spec,   path: "docs/specs/SPEC-*.md",                     cite: section, ready_when: spec_is_approved}
     - {id: map,    path: docs/specs/CAPABILITY-MAP.md,               cite: row}
@@ -318,7 +318,7 @@ The principle: **the model's compliance is never trusted, only verified.** Every
 \*An action that an obligation covers is never optional. Promotion is a human's decision (`autonomy.level.<lane>` in config). **Demotion is automatic** when a scorecard SLO breaks.
 
 ### 3.9 Dashboard Settings stay in step with config.yaml
-Every slice that adds or changes a `config.yaml` key also updates the dashboard Settings tab **in the same PR**. To stay project-agnostic, the Form sections and the engine's protected keys move from hand-written lists in `config_edit.py` (`_SECTIONS`, `_PROTECTED_KEYS`) into the engine's **config schema**. The form, `agentflow validate` and the protected-key check are all generated from it, so they can't drift apart. A pack can mark more keys protected (`pack.protected_keys`) but can't un-protect an engine key. The Settings tab is `devtools/agentflow/config_edit.py`, served by `dashboard.py` (`GET /api/config`, `POST /api/config/preview`/save) and rendered in `dashboard.html`. That means two things. First, a key is either a Form field in `_SECTIONS`/`_catalog()` or listed in `_PROTECTED_KEYS`, never neither. Second, `agentflow validate` and the page's **Review and save** apply the same rules.
+Every slice that adds or changes a `config.yaml` key also updates the dashboard Settings tab **in the same PR**. To stay project-agnostic, the Form sections and the engine's protected keys move from hand-written lists in `config_edit.py` (`_SECTIONS`, `_PROTECTED_KEYS`) into the engine's **config schema**. The form, `agentflow validate` and the protected-key check are all generated from it, so they can't drift apart. A pack can mark more keys protected (`pack.protected_keys`) but can't un-protect an engine key. The Settings tab is `agentflow/config_edit.py`, served by `dashboard.py` (`GET /api/config`, `POST /api/config/preview`/save) and rendered in `dashboard.html`. That means two things. First, a key is either a Form field in `_SECTIONS`/`_catalog()` or listed in `_PROTECTED_KEYS`, never neither. Second, `agentflow validate` and the page's **Review and save** apply the same rules.
 
 | New key | Settings page | Why |
 |---|---|---|
@@ -492,15 +492,15 @@ All of it comes from `events.jsonl`, the existing single source of truth, throug
 - Route agreement with reference (shadow), and "regret": a decision later reversed by a re-plan or a resolver
 
 ### 4.3 Harness eval suite (gates changes to the conductor itself)
-- **Route eval (cheap, runs in CI):** about 30 frozen task snapshots (task text, `explain` output, diff summary) with expected obligations and acceptable routes. It scores obligation coverage (must be 100%), validity, and cost estimate. It blocks any change to `conductor.md`, the catalog or the policy on a regression, against `devtools/agentflow/harness_eval/baseline.json`. This mirrors the product's eval gate.
+- **Route eval (cheap, runs in CI):** about 30 frozen task snapshots (task text, `explain` output, diff summary) with expected obligations and acceptable routes. It scores obligation coverage (must be 100%), validity, and cost estimate. It blocks any change to `conductor.md`, the catalog or the policy on a regression, against `.agentflow/harness_eval/baseline.json`. This mirrors the product's eval gate.
 - **Replay benchmark (expensive, run on demand):** 5–8 past tasks replayed from their fork SHA in throwaway worktrees, reference route against conductor route, compared on the KPIs. It runs before each autonomy promotion.
 
 ---
 
 ## 5. Rollout (each slice is one testable PR; feature lane on agentflow itself)
 
-**Slice P (first, before any harness feature): separate the engine from the pack inside this repo.**
-- Move this repo's config, prompt wording and lessons into `.agentflow/`, and keep `devtools/agentflow/` as the engine.
+**Slice P (done, 2026-11-05; `docs/plans/2026-11-05-agentflow-harness-slice-p.md`): separate the engine from the pack.**
+- Move a project's config, prompt wording and lessons into `.agentflow/`, and keep `agentflow/` as the engine.
 - Remove the hard-coding listed in 1b.
 - Add the two fixture packs and the denylist test.
 - `agentflow explain` output for every lane must be identical before and after.
@@ -512,13 +512,13 @@ All of it comes from `events.jsonl`, the existing single source of truth, throug
 - `init` (detect, starter, sparse pack, gate baseline) and `doctor`
 - the bundled generic skills plus `skills.map`
 
-Every later slice then lands in the engine already generic, and the cutover becomes moving `devtools/agentflow/` to its own repo and installing it as a tool, with `.agentflow/` staying here. After the cutover, CLAUDE.md "Automated runs" and the guide/playbook point at `.agentflow/config.yaml` and the engine's own docs. Playbook §13 "Using agentflow in another repository" is replaced by `agentflow init --starter <python-uv|node-pnpm|docs-only>`.
+Every later slice then lands in the engine already generic. The engine already lives in its own repository (this one, with its own `.agentflow/` pack); what remains of the cutover is installing it as a tool. Playbook §13 "Using agentflow in another repository" is replaced by `agentflow init --starter <python-uv|node-pnpm|docs-only>`.
 
 **Rule for every slice:** any `config.yaml` key it adds or changes ships with the matching Settings change (3.9): a Form field or a `_PROTECTED_KEYS` entry, validate cross-checks, `tests/test_config_edit.py` cases, and the field list in guide §11 "Changing behaviour".
 
 0. **Baseline and scorecard.** Add `tree_sha` to gate/review events, KPIs in `metrics.py`, the `agentflow scorecard` CLI and dashboard tab. No behaviour change.
 1. **Policy and conformance audit** (G3, G5), running on the *current fixed workflow*. It should pass at 100% straight away, which proves the obligations match today's bar. Switch it from report-only to blocking.
-2. **Catalog and reference routes** (G1). Re-express the lanes as routes. A pure refactor: the existing `devtools/agentflow/tests/` must pass unchanged.
+2. **Catalog and reference routes** (G1). Re-express the lanes as routes. A pure refactor: the existing `agentflow/tests/` must pass unchanged.
 3. **Route validator, run digest and conductor in shadow mode** (G2, G4, L0, 3.10 tier 3). Log routes and agreement, build the route-eval suite, and start writing `stats.json`.
 3a. **Cost governance** (3.11): the budget hierarchy, per-turn metering, the action cap, the no-progress breaker, failure signatures, the stop report and the Budget panel. This lands **before** L1 (step 4), so no conductor decision ever runs without these caps.
 3b. **Lessons and retro** (3.10 tier 5): the `lessons.md` seed (written by hand from the existing config comments) and the weekly retro step that proposes PRs.
@@ -527,19 +527,19 @@ Every later slice then lands in the engine already generic, and the cutover beco
 6. **L4 goal runs** (G7) on top of `module_queue.py`.
 
 ### Critical files
-(Paths are today's. After slice P, engine files stay in `devtools/agentflow/` until the cutover, and pack files move to `.agentflow/`.)
-- New: `devtools/agentflow/{route.py, policy.py, conductor.py, conformance.py, scorecard.py, digest.py, goal.py}`, `prompts/conductor.md`, `prompts/retro.md`, `lessons.md`, `harness_eval/`
+(Engine files are in `agentflow/`, and pack files in `.agentflow/`.)
+- New: `agentflow/{route.py, policy.py, conductor.py, conformance.py, scorecard.py, digest.py, goal.py}`, `prompts/conductor.md`, `prompts/retro.md`, `lessons.md`, `harness_eval/`
 - Change: `config.yaml` (`catalog`, `policy`, `conductor`, `autonomy.level`), `config.py` (schema plus validate), `pipeline.py` (`_Loop`: next action from the route; decision points), `events.py`/`state.py` (new event types), `gitops.py` (conformance before `finish`), `metrics.py`, `dashboard.py`/`views.py`/`dashboard.html` (Route and Scorecard views), `config_edit.py` (new Form sections "Conductor" and "Scorecard", per-lane `autonomy.level` fields, and the new `_PROTECTED_KEYS` entries; see 3.9), `tests/test_config_edit.py`
 - Reuse: `conditions.evaluate`/`explain`, `guards.check_step`/`snapshot`, `autonomy.Resolver`, `module_queue.py`, `metrics.run_metrics`/`aggregate`
-- Docs: new `docs/agentflow-harness-proposal.md` (this proposal), then §11 of `docs/agent-orchestration-guide-v3.md` and the CLAUDE.md "Automated runs" paragraph once each slice ships
+- Docs: new `docs/agentflow-harness-proposal.md` (this proposal), then `docs/agentflow-playbook.md` and the CLAUDE.md engine sections once each slice ships
 
 ## Next step
-This proposal is the companion to `docs/agentflow-proposal.md`. Each slice is planned with `writing-plans` (`docs/plans/YYYY-MM-DD-agentflow-harness-<slice>.md`), starting with slice P (engine/pack separation).
+Each slice is planned with `writing-plans` (`docs/plans/YYYY-MM-DD-agentflow-harness-<slice>.md`), starting with slice P (engine/pack separation).
 
 ## Verification
 - Slice 1: run `agentflow run feature --module <m> --dry-run` and a real past-shaped run. The conformance audit must report 100% on the reference route. Then deliberately skip `branch_review` in a test config and check that the audit blocks `finish` and queues the review.
-- Slice 2: `uv run pytest devtools/agentflow/tests` is green with no test edits, and `agentflow explain` output is identical before and after for every lane.
-- Settings (every slice): `uv run pytest devtools/agentflow/tests/test_config_edit.py` covers three cases. Each new Form field round-trips through `propose`/`save` and keeps comments and anchors. Each new protected key is refused from the page with the "protected" message. A `needs_approval: false` on `plan`, or an autonomy promotion with a red scorecard, is refused by validate. Then a manual check: `agentflow dashboard` → Settings shows the new sections with help text, and Review and save shows the diff.
+- Slice 2: `uv run --no-project --with pyyaml --with pytest pytest agentflow/tests --import-mode=prepend -q` is green with no test edits, and `agentflow explain` output is identical before and after for every lane.
+- Settings (every slice): `agentflow/tests/test_config_edit.py` covers three cases. Each new Form field round-trips through `propose`/`save` and keeps comments and anchors. Each new protected key is refused from the page with the "protected" message. A `needs_approval: false` on `plan`, or an autonomy promotion with a red scorecard, is refused by validate. Then a manual check: `agentflow dashboard` → Settings shows the new sections with help text, and Review and save shows the diff.
 - Plug and play (engine CI, every release): an e2e test clones three fixture repos (Python/uv with a GitHub Actions workflow, Node/pnpm, docs-only with no skills dir). It runs `init` → `doctor` → `validate` (0 warnings after `gates_confirmed`) → `explain` → `run --dry-run`. Pass criteria:
   - the gates are detected from CI
   - nothing is written in the repo except `.agentflow/`

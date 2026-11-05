@@ -206,7 +206,7 @@ When replying to inline review comments on GitHub, reply in the comment thread (
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
 - Fix each accepted item with `test-driven-development` → `verification-before-completion` → `finishing-a-development-branch`

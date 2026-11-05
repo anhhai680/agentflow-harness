@@ -282,7 +282,7 @@ phases:                         # the main workflow, in order; --from/--to on th
         brief: [.claude/skills/subagent-driven-development/implementer-prompt.md, .claude/skills/test-driven-development/SKILL.md,
                 .claude/skills/test-driven-development/writing-good-tests.md]
         task_briefs:
-          "webadmin/": .claude/skills/frontend-ui-engineering/SKILL.md
+          "console/": .claude/skills/frontend-ui-engineering/SKILL.md
           "web/": .claude/skills/frontend-ui-engineering/SKILL.md
         gates: build
         fix_loop: true

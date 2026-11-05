@@ -121,10 +121,9 @@ Skip any step = lying, not verifying
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
-- Prompt, model, chunking or embedding change → report the eval delta against the baseline; a regression goes back to Build (lane: eval)
 - More plan tasks remain → the next task
 - The branch came from a plan → `finishing-a-development-branch` (the plan executor already ran the branch review)
 - Work done outside a plan (bug fix, small change) → `requesting-code-review`

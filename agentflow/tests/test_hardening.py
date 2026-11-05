@@ -269,9 +269,9 @@ def test_gate_times_out_and_its_group_is_killed(tmp_git, tmp_path):
 
 
 def test_gate_with_a_missing_cwd_fails_with_the_path(tmp_git, tmp_path):
-    cfg = cfg_with({"web": Gate(name="web", run="true", cwd="webadmin")})
+    cfg = cfg_with({"web": Gate(name="web", run="true", cwd="console")})
     (result,) = run_gates(cfg, ["web"], tmp_git, tmp_path / "logs")
-    assert not result.passed and not result.skipped and "webadmin" in result.reason
+    assert not result.passed and not result.skipped and "console" in result.reason
 
 
 def test_gate_timeout_is_configured_and_validated(tmp_cfg):

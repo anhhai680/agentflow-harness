@@ -26,7 +26,7 @@ from agentflow.hitl import (
 )
 from agentflow.state import Run
 
-QUESTION = "Có lưu token MISA giữa các hội thoại không?"
+QUESTION = "Có lưu token CRM giữa các hội thoại không?"
 ANSWER = "Không, mỗi hội thoại xác thực lại"
 
 

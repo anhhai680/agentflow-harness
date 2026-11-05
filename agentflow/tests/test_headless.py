@@ -17,7 +17,7 @@ from agentflow.hitl import NotWaiting, approve, raise_hitl
 from agentflow.run_control import retry
 
 KEY = "build/impl"
-DENIED = {"tool_name": "Bash", "tool_input": {"command": "uv lock --project devtools/token-issuer"}}
+DENIED = {"tool_name": "Bash", "tool_input": {"command": "uv lock --project tools/token-issuer"}}
 
 
 def blocked(summary: str = "uv is denied", **act) -> dict:
@@ -207,7 +207,7 @@ def test_a_blocked_inbox_lists_each_denied_command_once(flow_repo):
     flow_repo.script({KEY: [blocked(permission_denials=[DENIED, DENIED])]})
     run_impl(flow_repo, run)
     inbox = run.inbox_path(KEY).read_text(encoding="utf-8")
-    assert inbox.count("uv lock --project devtools/token-issuer") == 1
+    assert inbox.count("uv lock --project tools/token-issuer") == 1
     # the session reads the worktree's settings, where `settings.json` is a forbidden path
     assert ".claude/settings.local.json" in inbox
 

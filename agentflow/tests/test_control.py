@@ -18,7 +18,7 @@ CONDS = {
 }
 QUESTION = {
     "id": "q1",
-    "question": "Lưu bộ nhớ đệm token MISA?",
+    "question": "Lưu bộ nhớ đệm token CRM?",
     "options": [{"key": "A", "label": "Theo tiến trình", "recommended": True}, {"key": "B", "label": "Mỗi lượt"}],
     "evidence": ["docs/specs/SPEC-crm.md#M5"],
     "kind": "spec_gap",

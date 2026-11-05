@@ -331,7 +331,7 @@ No exceptions without your human partner's permission.
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
 - More plan tasks remain → the next task

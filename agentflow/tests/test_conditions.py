@@ -172,11 +172,11 @@ def test_section_items_match_filter(cfg, tmp_path):
     idea = tmp_path / "docs" / "ideas" / "idea.md"
     idea.parent.mkdir(parents=True)
     idea.write_text(
-        "# Idea\n\n## Open Questions\n**MVP**\n- Can MISA issue a read-only AppID?\n- Is zero retention on?\n\n"
+        "# Idea\n\n## Open Questions\n**MVP**\n- Can CRM issue a read-only API key?\n- Is zero retention on?\n\n"
         "**Phase 2**\n- Which origins host the widget?\n\n## Next\n- not counted\n",
         encoding="utf-8",
     )
-    ctx = make_ctx(cfg, tmp_path, "design", {"topic": "MISA"})
+    ctx = make_ctx(cfg, tmp_path, "design", {"topic": "CRM"})
     ctx.values["idea"] = "docs/ideas/idea.md"
     assert evaluate(cfg, "idea_doc_question_open", ctx).value is True
     ctx.values["topic"] = "nothing like it"
@@ -286,10 +286,10 @@ def test_changed_paths_committed_uncommitted_and_untracked(cfg, tmp_path):
     repo = git_repo(tmp_path / "r")
     ctx = make_ctx(cfg, repo, "feature", {"module": "crm"})
     ctx.base_ref = "base"
-    cond = {"check": "changed_paths", "globs": ["src/tivacare/crm/**", "**/identity/**"]}
+    cond = {"check": "changed_paths", "globs": ["src/toy/crm/**", "**/identity/**"]}
     assert evaluate(cfg, cond, ctx).value is False
-    (repo / "src" / "tivacare" / "crm").mkdir(parents=True)
-    (repo / "src" / "tivacare" / "crm" / "x.py").write_text("x\n", encoding="utf-8")
+    (repo / "src" / "toy" / "crm").mkdir(parents=True)
+    (repo / "src" / "toy" / "crm" / "x.py").write_text("x\n", encoding="utf-8")
     assert evaluate(cfg, cond, ctx).value is True  # untracked counts
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "add"], cwd=repo, check=True)
@@ -696,7 +696,7 @@ def test_cli_explain_design_by_topic(capsys, monkeypatch, pack_repo_python):
     from agentflow import flow
 
     monkeypatch.chdir(pack_repo_python)
-    assert flow.main(["explain", "design", "--topic", "MISA"]) == 0
+    assert flow.main(["explain", "design", "--topic", "CRM"]) == 0
     out = capsys.readouterr().out
     assert "⏸ define_approved" in out
     assert "ship_approved" not in out

@@ -82,7 +82,7 @@ You win twice: fewer tokens, and a sharper hook for the agent to hang its thinki
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
 - None. If you changed CLAUDE.md → "Agent workflow" or a stage's owner skill, update `.claude/skills/VENDORED.md` and `next-step` too

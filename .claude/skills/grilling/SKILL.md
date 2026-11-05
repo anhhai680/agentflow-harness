@@ -31,7 +31,7 @@ The session is done when the frontier is empty: every branch of the design tree 
 
 ## Next step
 
-<!-- Tiva Care local edit; see .claude/skills/VENDORED.md -->
+<!-- Local edit; see .claude/skills/VENDORED.md -->
 When this skill's work is done, end your message with one line for the developer: `Next: <skill> — <reason> (lane: <lane>)`. Pick the first case that fits; suggest user-only skills as `/name`. Not sure where you are? Use `next-step`.
 
 - A term was sharpened or a hard-to-reverse decision was made → `domain-modeling` (lane: design-doc)
