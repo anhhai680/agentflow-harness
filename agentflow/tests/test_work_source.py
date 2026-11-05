@@ -96,6 +96,27 @@ def test_add_item_appends_a_row(tmp_cfg, tmp_path):
     assert work_source.items(cfg, tmp_path)[-1] == sources.ModuleNode("c", ["a"])
 
 
+def _unsafe_paths(tmp_path: Path) -> list[str]:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    write(outside, "modules.md", MAP)
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "repo" / "link").symlink_to(outside, target_is_directory=True)
+    return [str(outside / "modules.md"), "../outside/modules.md", "link/modules.md"]
+
+
+@pytest.mark.parametrize("which", [0, 1, 2], ids=["absolute", "dotdot", "symlink"])
+def test_a_work_source_path_outside_the_repository_is_refused(tmp_cfg, tmp_path, which):
+    path = _unsafe_paths(tmp_path)[which]
+    repo = tmp_path / "repo"
+    cfg = load_config(tmp_cfg({"work_source": {"path": path}}))
+    with pytest.raises(ValueError, match="work_source.path must stay inside the repository"):
+        work_source.add_item(cfg, repo, {"Module id": "{module}"}, {"module": "c", "responsibility": "x", "deps": []})
+    assert (tmp_path / "outside" / "modules.md").read_text(encoding="utf-8") == MAP  # nothing written
+    assert work_source.items(cfg, repo) == []  # a bad path never breaks the Backlog render, it reads nothing
+    assert work_source.file(cfg, repo) is None
+
+
 def test_add_item_without_a_work_source_is_refused(tmp_cfg, tmp_path):
     cfg = load_config(tmp_cfg({"work_source": None}))
     with pytest.raises(ValueError, match="this pack has no work_source"):

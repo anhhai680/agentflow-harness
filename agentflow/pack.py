@@ -117,7 +117,7 @@ def state_dir(repo: Path) -> Path:
         return resolve_state_dir(value, root)
     home = os.environ.get("XDG_STATE_HOME", "")
     base = Path(home) if home and Path(home).is_absolute() else Path(STATE_HOME).expanduser()
-    return base / "agentflow" / repo_id(root)
+    return (base / "agentflow" / repo_id(root)).resolve()
 
 
 def _version(text: str) -> tuple[int, ...]:

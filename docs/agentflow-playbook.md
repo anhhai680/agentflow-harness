@@ -26,14 +26,14 @@ You stay in charge of three things: answering the questions in `define` and `pla
 | Need | Check |
 |---|---|
 | Python 3.12+ and `uv` | `uv --version` (`bin/agentflow` runs the script with `uv`, and PyYAML comes from the script header) |
-| `git` with an `origin` remote and the fork branch (`next` here) | `git remote -v`, `git branch --list next` |
+| `git` with an `origin` remote and the fork branch (`main` here) | `git remote -v`, `git branch --list main` |
 | GitHub CLI, signed in (needed by `ship`, `--issue`, and `queue`) | `gh auth status` |
 | Claude Code (the default agent) | `claude --version`, and run `claude` once interactively so it is signed in |
 | Codex CLI (optional second agent) | `codex --version`, and `codex login` once |
 | The repo's skills at `.claude/skills/<name>/SKILL.md` | `ls .claude/skills` |
 | A clean working tree on the fork branch (design runs require it) | `git status`, `git branch --show-current` |
 
-Agent runs spend real money. `defaults.run_budget_usd` (20 here) stops a run when its summed cost crosses it. The runner checks before each agent call, so a call already running can go past the budget. Claude's cost is what Claude reports, or an estimate from `agents.claude.prices` for a session that ended without a report (a context rollover, a timeout). Codex steps are recorded as 0, so the budget does not count them.
+Agent runs spend real money. `defaults.run_budget_usd` (25 here) stops a run when its summed cost crosses it. The runner checks before each agent call, so a call already running can go past the budget. Claude's cost is what Claude reports, or an estimate from `agents.claude.prices` for a session that ended without a report (a context rollover, a timeout). Codex steps are recorded as 0, so the budget does not count them.
 
 ## 3. One-time setup
 
@@ -46,15 +46,16 @@ agentflow validate
 # 2. Fast sanity check of everything the runner can see, with no agent calls.
 agentflow next
 
-# 3. Optional but recommended: run the tests once (about 8 minutes).
-uv run --with pyyaml --with pytest pytest agentflow/tests --import-mode=prepend -q
+# 3. Optional but recommended: run the tests once (25-60 minutes; a loaded machine is slower).
+#    --no-project is required here: pyproject.toml belongs to the source project, not to agentflow.
+uv run --no-project --with pyyaml --with pytest pytest agentflow/tests --import-mode=prepend -q
 ```
 
 Then check the three files that decide what agents may do:
 
 - `.agentflow/config.yaml` is the one file with all behaviour: models per phase, gates, conditions, budget, push and PR. **Agents cannot edit it during a run.** Run `agentflow validate` after every edit. It is the repository's pack (section 14), read from the main checkout even when you run `agentflow` inside a run's worktree.
-- `.claude/settings.json` (shared) and `.claude/settings.local.json` (yours, git-ignored) hold the tool rules for Claude. The runner passes no allow or deny flags, and headless agents run with `--permission-prompts none`, so any command that would prompt is denied. If a step needs a command, add an `allow` rule for exactly that command.
-- `CONSTRAINTS.md` is the quality bar. The gates are copied from it. Never weaken a gate in `config.yaml` to get a run through.
+- `.claude/settings.json` (shared) and `.claude/settings.local.json` (yours, git-ignored) hold the tool rules for Claude. The runner passes no `allow` rules. It passes `--settings` deny rules of its own (the pack's forbidden paths, including `.agentflow/**`, and the state dir's runs root), and headless agents run with `--permission-prompts none`, so any command that would prompt is denied. If a step needs a command, add an `allow` rule for exactly that command.
+- The `gates:` and `gate_sets:` in `config.yaml` are the repository's quality bar. Never weaken a gate to get a run through.
 
 A denied command does not stop a run by itself. The runner records a `permission_denied` event on the step, and the agent carries on without the command, usually ending the step as `blocked`. That is the system working. Decide, add the narrow rule, then `agentflow approve <run> <step-key>` to resume the step's session, or `agentflow retry <run> <step-key>` to start it fresh.
 
@@ -102,7 +103,7 @@ It prints the agent command per phase and the gate commands, and creates nothing
 agentflow run feature --module crm
 ```
 
-It creates a worktree under `../tivacare-worktrees/<run>` on `flow/feature/<slug>`, forked from `next`, and starts at the first phase that is not skipped. It stops at the first question or approval. The run id looks like `20261030-0915-feature-crm`.
+It creates a worktree under `../agentflow-harness-worktrees/<run>` on `flow/feature/<slug>`, forked from `main`, and starts at the first phase that is not skipped. It stops at the first question or approval. The run id looks like `20261030-0915-feature-crm`.
 
 Useful options: `--from plan --to build` (start and stop at chosen phases; the `--to` phase still raises its approval), `--model plan=sonnet` (one phase's model, this run only; it replaces that phase's whole role map), `--detach` (run in the background, logging to `<state dir>/runs/<run>/runner.log`).
 

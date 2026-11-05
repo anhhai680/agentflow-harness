@@ -207,6 +207,15 @@ def test_state_dir_default_is_outside_the_repo(tmp_git, monkeypatch, tmp_path):
     assert got.parent == tmp_path / "xdg/agentflow" and got.name.startswith(tmp_git.name + "-")
 
 
+def test_state_dir_default_is_resolved_through_a_symlinked_xdg_home(tmp_git, monkeypatch, tmp_path):
+    real = tmp_path / "real-xdg"
+    real.mkdir()
+    (tmp_path / "xdg-link").symlink_to(real, target_is_directory=True)
+    write_pack(tmp_git, {}); monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-link"))
+    got = pack.state_dir(tmp_git)
+    assert got == got.resolve() and got.parent == real.resolve() / "agentflow"
+
+
 def test_state_dir_default_is_the_same_from_a_worktree_and_without_a_pack(tmp_git, git):
     wt = make_worktree(tmp_git, git)
     assert pack.state_dir(wt) == pack.state_dir(tmp_git)

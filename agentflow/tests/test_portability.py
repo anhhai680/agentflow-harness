@@ -74,3 +74,10 @@ def test_engine_names_no_pack_strings():
     hits = [f"{f.name}:{n}: {line.strip()}" for f in files
             for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1) if DENYLIST.search(line)]
     assert hits == []
+
+
+@pytest.mark.parametrize("name", ["eval_change.md", "eval_verify.md"])
+def test_the_eval_prompts_ask_for_the_gate_and_its_scores_not_a_domain(name):
+    text = (ENGINE / "prompts" / name).read_text(encoding="utf-8")
+    assert "eval gate" in text and "baseline" in text
+    assert not re.search(r"(?i)retrieval|chunking|embedding|CRM-field|scored separately", text)

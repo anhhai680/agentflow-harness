@@ -1,4 +1,4 @@
-"""The engine runs from this repository's layout: `agentflow/`, `bin/` and `hooks/` at the root."""
+"""The engine runs from this repository's layout: `agentflow/` and `bin/` at the root."""
 
 import subprocess
 import sys

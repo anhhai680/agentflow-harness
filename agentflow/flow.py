@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["pyyaml>=6"]
 # ///
-"""agentflow: run the repo's CLAUDE.md workflow lanes headlessly.
+"""agentflow: run the lanes of the repository's pack (.agentflow/config.yaml) headlessly.
 
 Usage: agentflow <command>   (see `--help`; `bin/agentflow` runs this file)
 """
@@ -675,7 +675,22 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         return 1
     stopped = f"; stopped agent PID(s) {', '.join(map(str, killed))}" if killed else ""
     print(f"{run.id} cancelled{stopped}.")
+    skipped = _cancel_skipped(run)
+    for item in skipped:
+        print(f"not signalled: PID {item.get('pid')} ({item.get('reason')})")
+    if any("has no configured command" in str(item.get("reason")) for item in skipped):
+        print("warning: no config could be loaded to match agent processes, so live agents were not signalled; "
+              "stop them yourself or pass --config <path>.")
     return 0
+
+
+def _cancel_skipped(run) -> list[dict]:
+    """The `{pid, reason}` rows of the run's `run_cancelled` event: agent PIDs `cancel` would not signal."""
+    run.refresh()
+    for event in reversed(list(run.events.read())):
+        if event.get("type") == "run_cancelled":
+            return [i for i in event.get("skipped") or [] if isinstance(i, dict)]
+    return []
 
 
 def cmd_archive(args: argparse.Namespace) -> int:

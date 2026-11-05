@@ -288,6 +288,39 @@ def test_cli_pause_cancel_and_retry(pipe, capsys):
     assert [e["by"] for e in pipe.events(run, "run_cancelled")] == ["tester"]
 
 
+def test_cli_cancel_names_each_skipped_pid_and_its_reason(pipe, capsys):
+    run = pipe.new_run()
+    stranger = subprocess.Popen(["sleep", "30"], start_new_session=True)  # not an agent command
+    try:
+        run.emit("agent_started", pid=stranger.pid, step="define/idea/idea_questions", agent="claude")
+        assert main(["cancel", run.id, "--by", "tester", "--config", str(pipe.cfg.path)]) == 0
+        out = capsys.readouterr().out
+        assert "cancelled" in out
+        assert f"not signalled: PID {stranger.pid}" in out and "its command does not run" in out
+        assert stranger.poll() is None
+    finally:
+        stranger.send_signal(signal.SIGKILL)
+        stranger.wait()
+
+
+def test_cli_cancel_warns_when_no_config_could_match_the_agents(pipe, capsys, monkeypatch):
+    from agentflow import run_control
+
+    run = pipe.new_run()
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    monkeypatch.setattr(run_control, "_agent_commands", lambda run, cfg: {})  # neither recorded nor pack config loads
+    try:
+        run.emit("agent_started", pid=proc.pid, step="define/idea/idea_questions", agent="claude")
+        assert main(["cancel", run.id, "--by", "tester"]) == 0
+        out = capsys.readouterr().out
+        assert "live agents were not signalled" in out and "--config" in out
+        assert f"PID {proc.pid}" in out
+        assert proc.poll() is None
+    finally:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait()
+
+
 def test_cli_attach_resumes_the_session_interactively(pipe, monkeypatch, capsys):
     from agentflow import run_control
 

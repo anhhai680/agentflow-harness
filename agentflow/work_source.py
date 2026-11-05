@@ -16,13 +16,29 @@ if TYPE_CHECKING:
     from agentflow.config import Config
 
 
+def _unsafe(cfg: Config, repo: Path) -> str | None:
+    """The work source's `path` when it is absolute or resolves (`..`, symlinks) outside `repo`, else None."""
+    if cfg.work_source is None:
+        return None
+    raw = cfg.work_source.path
+    if Path(raw).is_absolute():
+        return raw
+    root = Path(repo).resolve()
+    if not (root / raw).resolve().is_relative_to(root):
+        return raw
+    return None
+
+
 def file(cfg: Config, repo: Path) -> Path | None:
-    """The work source's file inside `repo`, or None when the pack has no work source."""
-    return Path(repo) / cfg.work_source.path if cfg.work_source is not None else None
+    """The work source's file inside `repo`, or None when the pack has no work source or its path leaves `repo`."""
+    if cfg.work_source is None or _unsafe(cfg, repo) is not None:
+        return None
+    return Path(repo) / cfg.work_source.path
 
 
 def items(cfg: Config, repo: Path) -> list[sources.ModuleNode]:
-    """The modules in the work source, in order; `[]` when the pack has none or its file is missing."""
+    """The modules in the work source, in order; `[]` when the pack has none, its file is missing or its path
+    leaves `repo` (not an error here: the Backlog and the queue read this on every render; `add_item` refuses)."""
     path = file(cfg, repo)
     if cfg.work_source is None or path is None or not path.is_file():
         return []
@@ -33,8 +49,13 @@ def items(cfg: Config, repo: Path) -> list[sources.ModuleNode]:
 
 def add_item(cfg: Config, repo: Path, template: dict[str, str], values: dict) -> None:
     """Add one module to the work source (`values`: `module`, `responsibility`, `deps`), filled from `template`."""
+    if cfg.work_source is None:
+        raise ValueError("this pack has no work_source")
+    bad = _unsafe(cfg, repo)
+    if bad is not None:
+        raise ValueError(f"work_source.path must stay inside the repository: {bad}")
     path = file(cfg, repo)
-    if cfg.work_source is None or path is None:
+    if path is None:
         raise ValueError("this pack has no work_source")
     if cfg.work_source.kind == "capability_map":
         sources.add_module_row(path, template, values)
