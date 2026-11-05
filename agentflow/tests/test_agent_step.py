@@ -366,7 +366,7 @@ def test_rollover_with_a_done_result_is_done(flow_repo):
     run = flow_repo.new_run()
     # The fake writes `result` after its usage turns (too late), so write the file first to model
     # the over-threshold turn being followed directly by the result event.
-    early = run.agent_result_path(KEY).relative_to(flow_repo.root).as_posix()  # where the agent writes it
+    early = str(run.agent_result_path(KEY))  # where the agent writes it: its workspace, in the state dir
     flow_repo.script({KEY: [{"write": {early: '{"status": "done", "summary": "early"}'}, "usage_pct": [81]}]})
     assert run_step(flow_repo) == "done"
     assert len(flow_repo.calls()) == 1
@@ -668,8 +668,7 @@ def test_progress_updated_no_event(flow_repo):
     progress.write_text("start\n", encoding="utf-8")
     old = time.time() - 60
     os.utime(progress, (old, old))
-    rel = progress.relative_to(flow_repo.root).as_posix()
-    flow_repo.script({KEY: [{"write": {rel: "start\n- did a thing\n"}, "result": DONE}]})
+    flow_repo.script({KEY: [{"write": {str(progress): "start\n- did a thing\n"}, "result": DONE}]})
     assert run_step(flow_repo) == "done"
     assert flow_repo.events(run, "progress_not_updated") == []
 

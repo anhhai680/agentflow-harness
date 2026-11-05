@@ -12,15 +12,15 @@ from pathlib import Path
 
 import pytest
 
-from conftest import run_git
 from agentflow.config import load_config, validate
 from agentflow.gitops import merge_in_progress
 from agentflow.hitl import approve
 from agentflow.pipeline import RunOptions, advance, start
+from conftest import PYTHON_CONFIG, run_git
 
 AGENTFLOW = Path(__file__).resolve().parents[1]
 BIN = AGENTFLOW / "tests" / "bin"
-REPO = AGENTFLOW.parents[1]
+REPO = AGENTFLOW.parent
 URL = "https://github.com/acme/repo/pull/42"
 SYNC = "ship/finish/sync-{n}"
 BASE = {"gate_sets": {"build": ["ok"], "verify": ["ok"]}}
@@ -189,7 +189,7 @@ def test_a_human_finishes_the_merge_and_the_run_goes_on(flow_repo, gh, git):
     assert on_origin(git, flow_repo, run, "README.md") == "settled by a person\n"
 
 
-@pytest.mark.parametrize("path", ["CONSTRAINTS.md", "uv.lock", "src/tivacare/staff_auth/tokens.py"])
+@pytest.mark.parametrize("path", ["CONSTRAINTS.md", "uv.lock", "toy/staff_auth/tokens.py"])
 def test_conflicts_in_protected_paths_are_a_humans_without_calling_the_agent(flow_repo, gh, git, path):
     run = begin(flow_repo)
     own_work(flow_repo, run, {path: "branch\n"})
@@ -235,6 +235,16 @@ def test_a_merge_the_gates_never_accept_is_not_committed_or_pushed(flow_repo, gh
     assert not pushed(git, flow_repo, run) and not verbs(gh, "create") and not flow_repo.events(run, "base_synced")
 
 
+def test_a_pack_without_an_eval_condition_checks_the_merge_without_the_eval_gate(flow_repo, gh, git):
+    """`eval_required` is a pack's condition, not the engine's: a pack that defines none never runs the eval gate."""
+    run = begin(flow_repo, {"conditions": {"eval_required": None}})
+    own_work(flow_repo, run, {"mine.txt": "mine\n"})
+    target_moves(flow_repo, git, {"upstream.txt": "theirs\n"})
+    assert go(flow_repo, run) == "done"
+    (synced,) = flow_repo.events(run, "base_synced")
+    assert "eval" not in synced["gates"] and on_origin(git, flow_repo, run, "upstream.txt") == "theirs\n"
+
+
 # --------------------------------------------------------------------------- after the pull request exists
 
 
@@ -270,7 +280,7 @@ def issues(tmp_cfg, patch):
 
 
 def test_the_shipped_config_has_a_sync_session():
-    cfg = load_config(AGENTFLOW / "config.yaml")
+    cfg = load_config(PYTHON_CONFIG)
     finish = next(step for step in cfg.phases["ship"].steps if step.type == "finish")
     assert finish.sync is not None and finish.sync.gates == "verify" and finish.sync.commit is False
     assert not [i for i in validate(cfg, REPO) if i.level == "error"]

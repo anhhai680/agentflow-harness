@@ -1,4 +1,4 @@
-"""Conditions, `fmt`, model resolution and `explain`: real specs read-only, fixtures for the rest."""
+"""Conditions, `fmt`, model resolution and `explain`: the `python` pack's specs read-only, fixtures for the rest."""
 
 from __future__ import annotations
 
@@ -14,9 +14,25 @@ import pytest
 from agentflow.conditions import CondResult, Ctx, evaluate, explain, fmt, make_ctx, plan_warnings
 from agentflow.config import resolve_model
 from agentflow.gitops import GhError, gh_json
+from conftest import PYTHON_PACK
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-REPO = Path(__file__).resolve().parents[3]
+PACK = PYTHON_PACK  # the toy repository: `greet` has an approved, API-reviewed spec with nothing open
+# An approved spec with contracts but no review of its own: it only mentions greet's.
+FAREWELL = """# Spec: `farewell`
+
+**Status: approved** (2026-11-02)
+
+Builds on greet, whose **Resolved (2026-11-01, API review)** settled the route; this spec has had no review of its own.
+
+## Contracts this module provides
+
+- `toy.farewell(name: str) -> str`, called by greet.
+
+## Open Questions
+
+None.
+"""
 
 T = {"check": "command", "run": "true"}
 F = {"check": "command", "run": "false"}
@@ -30,7 +46,7 @@ def unknown_repo(tmp_path):
 
 
 def real_ctx(cfg, module, **extra):
-    ctx = make_ctx(cfg, REPO, "feature", {"module": module})
+    ctx = make_ctx(cfg, PACK, "feature", {"module": module})
     ctx.values.update(extra)
     return ctx
 
@@ -48,18 +64,25 @@ def fixture_ctx(cfg, tmp_path, module, *names):
     return make_ctx(cfg, repo, "spec", {"module": module})
 
 
-# ------------------------------------------------------------------ spec conditions (real specs)
+def farewell_repo(root):
+    """`root` with the farewell spec: approved, with contracts, never API-reviewed."""
+    specs = root / "docs" / "specs"
+    specs.mkdir(parents=True, exist_ok=True)
+    (specs / "SPEC-farewell.md").write_text(FAREWELL, encoding="utf-8")
+    return root
 
 
-@pytest.mark.parametrize("m", ["settings", "staff-auth", "platform"])
-def test_no_open_questions_in_real_specs(cfg, m):
-    r = evaluate(cfg, "spec_has_open_questions", real_ctx(cfg, m))
+# ------------------------------------------------------------------ spec conditions (the pack's specs)
+
+
+def test_no_open_questions_in_the_packs_spec(cfg):
+    r = evaluate(cfg, "spec_has_open_questions", real_ctx(cfg, "greet"))
     assert r.value is False
     assert "0 open" in r.reason
 
 
-def test_platform_resolved_items_are_counted_not_open(cfg):
-    r = evaluate(cfg, "spec_has_open_questions", real_ctx(cfg, "platform"))
+def test_resolved_items_are_counted_not_open(cfg):
+    r = evaluate(cfg, "spec_has_open_questions", real_ctx(cfg, "greet"))
     assert "resolved" in r.reason
     assert not r.reason.startswith("spec_has_open_questions = true")
 
@@ -70,8 +93,8 @@ def test_open_questions_fixture(cfg, tmp_path):
     assert "2 open items, 2 resolved" in r.reason
 
 
-def test_spec_approved_real(cfg):
-    assert evaluate(cfg, "spec_is_approved", real_ctx(cfg, "crm")).value is True
+def test_spec_approved_in_the_pack(cfg):
+    assert evaluate(cfg, "spec_is_approved", real_ctx(cfg, "greet")).value is True
 
 
 def test_pending_amendment_wins(cfg, tmp_path):
@@ -81,8 +104,8 @@ def test_pending_amendment_wins(cfg, tmp_path):
     assert "pending" in r.reason
 
 
-def test_missing_status_line_unknown(cfg):
-    r = evaluate(cfg, "spec_is_approved", real_ctx(cfg, "settings"))
+def test_missing_status_line_unknown(cfg, tmp_path):
+    r = evaluate(cfg, "spec_is_approved", fixture_ctx(cfg, tmp_path, "nostatus", "SPEC-nostatus.md"))
     assert r.value is None
     assert r.on_unknown == "ask_human"
     assert "spec_is_approved = unknown" in r.reason
@@ -97,28 +120,26 @@ def test_spec_missing_means_not_approved_and_not_exists(cfg, tmp_path):
 
 
 def test_routes_detected(cfg):
-    assert evaluate(cfg, "spec_defines_contracts", real_ctx(cfg, "settings")).value is True
+    assert evaluate(cfg, "spec_defines_contracts", real_ctx(cfg, "greet")).value is True
 
 
-def test_api_review_marker_is_the_modules_own(cfg):
-    reviewed = {"settings", "staff-auth", "llm-gateway", "simulator", "inbox", "conversations"}
-    for module in reviewed:
-        assert evaluate(cfg, "spec_api_reviewed", real_ctx(cfg, module)).value is True, module
-        assert evaluate(cfg, "spec_needs_api_design", real_ctx(cfg, module)).value is False, module
-    # specs that only mention another module's API review are not reviewed themselves
-    for module in ("knowledge", "agent", "gap-loop"):
-        assert evaluate(cfg, "spec_api_reviewed", real_ctx(cfg, module)).value is False, module
+def test_api_review_marker_is_the_modules_own(cfg, tmp_path):
+    assert evaluate(cfg, "spec_api_reviewed", real_ctx(cfg, "greet")).value is True
+    assert evaluate(cfg, "spec_needs_api_design", real_ctx(cfg, "greet")).value is False
+    # a spec that only mentions another module's API review is not reviewed itself
+    ctx = make_ctx(cfg, farewell_repo(tmp_path), "feature", {"module": "farewell"})
+    assert evaluate(cfg, "spec_api_reviewed", ctx).value is False
 
 
-def test_eval_has_contracts_but_no_routes(cfg):
-    # eval has no HTTP routes (T25) but provides add_candidate (R9), so it still needs an API review
-    ctx = real_ctx(cfg, "eval")
+def test_contracts_without_routes_still_need_an_api_review(cfg, tmp_path):
+    # farewell has no HTTP routes but provides a function other modules call, so it still needs an API review
+    ctx = make_ctx(cfg, farewell_repo(tmp_path), "feature", {"module": "farewell"})
     assert evaluate(cfg, "spec_defines_contracts", ctx).value is True
     assert evaluate(cfg, "spec_needs_api_design", ctx).value is True
 
 
-def test_explain_unreviewed_approved_spec_runs_api_design_in_define(cfg):
-    ctx = make_ctx(cfg, REPO, "feature", {"module": "knowledge"})
+def test_explain_unreviewed_approved_spec_runs_api_design_in_define(cfg, tmp_path):
+    ctx = make_ctx(cfg, farewell_repo(tmp_path), "feature", {"module": "farewell"})
     by_key = lines_by_key(explain(cfg, "feature", ctx))
     assert by_key["define"].verdict == "run"
     assert by_key["define/contracts"].verdict == "run"
@@ -129,7 +150,7 @@ def test_explain_unreviewed_approved_spec_runs_api_design_in_define(cfg):
 
 
 def test_explain_reviewed_spec_skips_api_design(cfg):
-    ctx = make_ctx(cfg, REPO, "feature", {"module": "simulator"})
+    ctx = make_ctx(cfg, PACK, "feature", {"module": "greet"})
     by_key = lines_by_key(explain(cfg, "feature", ctx))
     assert by_key["define/contracts"].verdict == "skip"
     assert "spec_api_reviewed = true" in by_key["define/contracts"].reason
@@ -196,7 +217,7 @@ def test_on_unknown_true_and_false_decide(cfg, unknown_repo):
 
 
 def test_named_condition_inside_composition(cfg):
-    ctx = real_ctx(cfg, "settings")
+    ctx = real_ctx(cfg, "greet")
     r = evaluate(cfg, {"all": ["spec_exists", "spec_defines_contracts"]}, ctx)
     assert r.value is True
     assert evaluate(cfg, "plan_done", real_ctx(cfg, "no-such-module")).value is False  # no plan, so not done
@@ -217,7 +238,7 @@ def test_unknown_check_raises(cfg):
 
 def test_command_check(cfg):
     ctx = real_ctx(cfg, "settings")
-    r = evaluate(cfg, {"check": "command", "run": "test -d devtools"}, ctx)
+    r = evaluate(cfg, {"check": "command", "run": "test -d toy"}, ctx)
     assert r.value is True
     assert evaluate(cfg, {"check": "command", "run": "test -d no-such-dir"}, ctx).value is False
     assert evaluate(cfg, {"check": "command", "run": "exit 3"}, ctx).reason.endswith("exit 3")
@@ -411,26 +432,28 @@ def test_branch_merged(cfg, fake_gh, monkeypatch):
     assert r.value is None and "boom" in r.reason
 
 
-def test_modules_done_uses_merged_pull_requests(cfg, fake_gh, monkeypatch):
-    ctx = make_ctx(cfg, REPO, "feature", {"module": "settings"})  # depends on staff-auth
-    monkeypatch.setenv("FAKE_GH_JSON", json.dumps([{"headRefName": "flow/feature/staff-auth"}]))
+def test_modules_done_uses_merged_pull_requests(cfg, fake_gh, monkeypatch, tmp_path):
+    (tmp_path / "docs" / "specs").mkdir(parents=True)
+    shutil.copy(FIXTURES / "capability-sample.md", tmp_path / "docs" / "specs" / "CAPABILITY-MAP.md")
+    ctx = make_ctx(cfg, tmp_path, "feature", {"module": "beta"})  # depends on alpha
+    monkeypatch.setenv("FAKE_GH_JSON", json.dumps([{"headRefName": "flow/feature/alpha"}]))
     assert evaluate(cfg, "deps_merged", ctx).value is True
-    monkeypatch.setenv("FAKE_GH_JSON", json.dumps([{"headRefName": "flow/feature/crm"}]))
+    monkeypatch.setenv("FAKE_GH_JSON", json.dumps([{"headRefName": "flow/feature/gamma"}]))
     r = evaluate(cfg, "deps_merged", ctx)
-    assert r.value is False and "staff-auth" in r.reason
+    assert r.value is False and "alpha" in r.reason
     monkeypatch.setenv("FAKE_GH_FAIL", "1")
     assert evaluate(cfg, "deps_merged", ctx).value is None
 
 
 def test_modules_done_with_no_dependencies_needs_no_gh(cfg, monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", str(tmp_path))  # no gh at all
-    ctx = make_ctx(cfg, REPO, "feature", {"module": "platform"})
+    ctx = make_ctx(cfg, PACK, "feature", {"module": "greet"})
     r = evaluate(cfg, "deps_merged", ctx)
     assert r.value is True and "no dependencies" in r.reason
 
 
 def test_modules_done_unknown_module_is_unknown(cfg):
-    ctx = make_ctx(cfg, REPO, "feature", {"module": "ghost"})
+    ctx = make_ctx(cfg, PACK, "feature", {"module": "ghost"})
     assert evaluate(cfg, "deps_merged", ctx).value is None
 
 
@@ -448,7 +471,7 @@ def test_make_ctx_values(cfg, tmp_path):
     assert v["module_pkg"] == "staff_auth"
     assert v["spec"] == "docs/specs/SPEC-staff-auth.md"
     assert v["plan"] == "docs/plans/2026-10-01-staff-auth.md"
-    assert v["idea"] == "docs/ideas/agentic-rag-customer-support.md"
+    assert v["idea"] == "docs/idea.md"
     assert v["capability_map"] == "docs/specs/CAPABILITY-MAP.md"
     assert v["topic"] == "Khách hàng"
     assert v["issue"] == "12"
@@ -555,7 +578,7 @@ def lines_by_key(lines):
 
 
 def test_explain_reviewed_spec_skips_its_review(cfg):
-    ctx = make_ctx(cfg, REPO, "feature", {"module": "settings"})
+    ctx = make_ctx(cfg, PACK, "feature", {"module": "greet"})
     by_key = lines_by_key(explain(cfg, "feature", ctx))
     assert by_key["define/draft"].verdict == "skip" and "spec_exists = true" in by_key["define/draft"].reason
     assert by_key["define/contracts"].verdict == "skip" and "spec_api_reviewed = true" in by_key["define/contracts"].reason
@@ -563,8 +586,8 @@ def test_explain_reviewed_spec_skips_its_review(cfg):
     assert grill.verdict == "skip" and "spec_has_open_questions = false" in grill.reason and "0 open items" in grill.reason
 
 
-def test_explain_unreviewed_spec_runs_api_design_then_asks_approval(cfg):
-    ctx = make_ctx(cfg, REPO, "feature", {"module": "knowledge"})
+def test_explain_unreviewed_spec_runs_api_design_then_asks_approval(cfg, tmp_path):
+    ctx = make_ctx(cfg, farewell_repo(tmp_path), "feature", {"module": "farewell"})
     lines = explain(cfg, "feature", ctx)
     by_key = lines_by_key(lines)
     assert by_key["define/contracts"].verdict == "run" and by_key["define/contracts"].model == "opus"
@@ -573,7 +596,7 @@ def test_explain_unreviewed_spec_runs_api_design_then_asks_approval(cfg):
 
 
 def test_explain_feature_with_define_work(cfg):
-    ctx = make_ctx(cfg, REPO, "feature", {"module": "knowledge"})
+    ctx = make_ctx(cfg, PACK, "feature", {"module": "knowledge"})  # no spec yet: define drafts one
     lines = explain(cfg, "feature", ctx)
     phases = {line.key: line for line in lines if line.key == line.phase}
     assert list(phases) == list(cfg.phases)
@@ -583,8 +606,8 @@ def test_explain_feature_with_define_work(cfg):
 
 
 def test_explain_finished_spec_raises_no_define_approval(cfg):
-    # crm's spec is reviewed with nothing open, so no define step runs and no human is stopped for it
-    by_key = lines_by_key(explain(cfg, "feature", make_ctx(cfg, REPO, "feature", {"module": "crm"})))
+    # greet's spec is reviewed with nothing open, so no define step runs and no human is stopped for it
+    by_key = lines_by_key(explain(cfg, "feature", make_ctx(cfg, PACK, "feature", {"module": "greet"})))
     assert "define_approved" not in by_key
 
 
@@ -605,7 +628,7 @@ def test_explain_applies_cli_model_overrides(cfg, tmp_path):
 
 
 def test_explain_skipped_phase_lists_no_steps(cfg):
-    ctx = make_ctx(cfg, REPO, "feature", {"module": "crm"})
+    ctx = make_ctx(cfg, PACK, "feature", {"module": "greet"})
     keys = [line.key for line in explain(cfg, "feature", ctx)]
     assert not any(k.startswith("define/debug") for k in keys)  # another lane's step is not listed
 
@@ -622,7 +645,7 @@ def test_explain_runs_nested_group_steps_when_the_group_runs(cfg, tmp_path):
 
 
 def test_explain_unknown_pipeline_raises(cfg):
-    ctx = make_ctx(cfg, REPO, "feature", {"module": "crm"})
+    ctx = make_ctx(cfg, PACK, "feature", {"module": "greet"})
     with pytest.raises(ValueError, match="unknown lane 'nope'"):
         explain(cfg, "nope", ctx)
 
@@ -646,42 +669,43 @@ def test_cond_result_defaults():
 # ------------------------------------------------------------------ CLI
 
 
-def test_cli_explain_spec_settings(capsys, monkeypatch):
+def test_cli_explain_spec_greet(capsys, monkeypatch, pack_repo_python):
     from agentflow import flow
 
-    monkeypatch.chdir(REPO)
-    assert flow.main(["explain", "feature", "--module", "settings"]) == 0
+    monkeypatch.chdir(pack_repo_python)
+    assert flow.main(["explain", "feature", "--module", "greet"]) == 0
     out = capsys.readouterr().out
     assert "– skip" in out and "contracts" in out and "spec_api_reviewed = true" in out
     assert "spec_has_open_questions = false" in out
-    assert flow.main(["explain", "feature", "--module", "knowledge"]) == 0
+    farewell_repo(pack_repo_python)
+    assert flow.main(["explain", "feature", "--module", "farewell"]) == 0
     out = capsys.readouterr().out
     assert "✓ run" in out and "contracts" in out
     assert "⏸ define_approved" in out
 
 
-def test_cli_explain_needs_module_or_topic(capsys, monkeypatch):
+def test_cli_explain_needs_module_or_topic(capsys, monkeypatch, pack_repo_python):
     from agentflow import flow
 
-    monkeypatch.chdir(REPO)
+    monkeypatch.chdir(pack_repo_python)
     assert flow.main(["explain", "feature"]) == 1
     assert "--module" in capsys.readouterr().out
 
 
-def test_cli_explain_design_by_topic(capsys, monkeypatch):
+def test_cli_explain_design_by_topic(capsys, monkeypatch, pack_repo_python):
     from agentflow import flow
 
-    monkeypatch.chdir(REPO)
+    monkeypatch.chdir(pack_repo_python)
     assert flow.main(["explain", "design", "--topic", "MISA"]) == 0
     out = capsys.readouterr().out
     assert "⏸ define_approved" in out
     assert "ship_approved" not in out
 
 
-def test_cli_explain_model_override(capsys, monkeypatch):
+def test_cli_explain_model_override(capsys, monkeypatch, pack_repo_python):
     from agentflow import flow
 
-    monkeypatch.chdir(REPO)
-    assert flow.main(["explain", "feature", "--module", "crm", "--model", "plan=fable"]) == 0
+    monkeypatch.chdir(pack_repo_python)
+    assert flow.main(["explain", "feature", "--module", "greet", "--model", "plan=fable"]) == 0
     assert "fable" in capsys.readouterr().out
-    assert flow.main(["explain", "feature", "--module", "crm", "--model", "nonsense"]) == 1
+    assert flow.main(["explain", "feature", "--module", "greet", "--model", "nonsense"]) == 1

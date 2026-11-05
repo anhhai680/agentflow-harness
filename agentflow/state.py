@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import pack
 from .config import KNOWN_EFFORT_LEVELS, Config, check_lane
 from .events import EventError, EventLog, RunLock, lock_state, nfc, now_iso
 
@@ -806,13 +807,13 @@ def replay(events: Iterable[dict]) -> dict:
 
 
 def runs_root(repo: Path) -> Path:
-    """Where runs live: always the main checkout's `devtools/agentflow/runs/`."""
-    return Path(repo).resolve() / "devtools" / "agentflow" / "runs"
+    """Where runs live: `runs/` in the state dir of the main checkout holding `repo` (`pack.state_dir`)."""
+    return pack.state_dir(repo) / "runs"
 
 
 def workspaces_root(repo: Path) -> Path:
-    """Where the agent workspaces live: `devtools/agentflow/workspaces/`, beside the runs root, never in it."""
-    return Path(repo).resolve() / "devtools" / "agentflow" / "workspaces"
+    """Where the agent workspaces live: `workspaces/` in the state dir, beside the runs root, never in it."""
+    return pack.state_dir(repo) / "workspaces"
 
 
 def slugify(text: str, limit: int = SLUG_MAX) -> str:

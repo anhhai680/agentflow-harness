@@ -9,11 +9,11 @@ from pathlib import Path
 import pytest
 from agentflow import backlog, module_queue
 from agentflow.backlog import Invalid, Refused
-from agentflow.state import Run
+from agentflow.state import Run, runs_root
 
-from conftest import AGENTFLOW, run_git
+from conftest import ENGINE, run_git
 
-GH_BIN = AGENTFLOW / "tests" / "bin"
+GH_BIN = ENGINE / "tests" / "bin"
 # A is merged, B and C depend on A, D depends on B (the plan's example).
 MAP = """# Capability map
 
@@ -180,7 +180,7 @@ def test_nothing_depends_on_this_repositorys_lane_branch_or_map_names(flow_repo,
         rename(data)
         data["lanes"] = [renames.get(v, v) for v in data["lanes"]]
         data["conditions"]["build_done"] = {"all": [{"check": "lane", "is": "build"}, "plan_done"]}
-        data["project"]["docs"]["capability_map"] = "map/modules.md"
+        data["work_source"] = {"kind": "capability_map", "path": "map/modules.md"}
         data["project"]["fork_from"] = "next"
         data["project"]["base_branch"] = "trunk"
         data["project"]["branch"] = "wip/{lane}/{slug}"
@@ -508,7 +508,7 @@ def test_a_new_module_card_starts_with_its_row_and_the_stop_phase(bk):
 def test_cards_survive_a_restart_of_the_dashboard(bk):
     item = backlog.add(bk.cfg, bk.root, "bug", {"issue": "3"}, to_phase=None)
     assert f"card:{item.id}" in bk.cards()
-    log = bk.root / "devtools/agentflow/runs/backlog.jsonl"
+    log = runs_root(bk.root) / "backlog.jsonl"
     assert log.is_file() and json.loads(log.read_text().splitlines()[0])["type"] == "item_added"
     reloaded = backlog.Backlog.load(bk.root)
     assert reloaded.items[item.id].params == {"issue": "3"}

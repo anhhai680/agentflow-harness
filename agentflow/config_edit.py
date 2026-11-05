@@ -44,8 +44,9 @@ MERGE_TAG = "tag:yaml.org,2002:merge"
 AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices")  # what a page may change in an `agents.<name>` block
 PHASE_FREE_KEYS = ("needs_approval", "resolve", "model", "agent")  # the rest of a phase is the workflow itself
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
-    "gates", "gate_sets", "guardrails", "conditions", "overlays", "project", "phase_approval", "record_step",
-    "resolve_step", "defaults.env", "context.autocompact_env", "context.progress_file", "hitl.notify", "dashboard.host",
+    "version", "engine", "gates", "gate_sets", "guardrails", "conditions", "overlays", "project", "phase_approval",
+    "record_step", "resolve_step", "paths", "defaults.env", "context.autocompact_env", "context.progress_file",
+    "hitl.notify", "dashboard.host", "work_source", "skills",
 )
 PROTECTED = (
     *_PROTECTED_KEYS,
@@ -368,6 +369,7 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
         try:
             new_cfg = load_config(Path(temp))
         except ConfigError as exc:
+            _hold_unloadable(path, parsed)  # a pack format or engine change does not load: it is still refused
             return [Issue("error", exc.path, exc.message)]
         from agentflow.guards import settings_coverage
 
@@ -384,6 +386,19 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
             raise Refused("these settings are protected and can only be changed in the file, in git: "
                           + ", ".join(changed))
     return issues
+
+
+def _hold_unloadable(path: Path, parsed: dict) -> None:
+    """Refuse a text that changes a protected setting even when it no longer loads, comparing it as written with
+    the file as written (a loaded config's `@` references are resolved, the new text's are not)."""
+    try:
+        load_config(path)
+        old = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (ConfigError, OSError, yaml.YAMLError):  # the file on disk is broken already: there is nothing to hold
+        return
+    changed = _protected_changes(old, parsed)
+    if changed:
+        raise Refused("these settings are protected and can only be changed in the file, in git: " + ", ".join(changed))
 
 
 def _protected_view(raw: dict) -> dict[str, Any]:

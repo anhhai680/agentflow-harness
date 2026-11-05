@@ -10,7 +10,7 @@ The local gates passed before this ran, so look for what differs in CI first: a 
 
 - You may not edit `.github/workflows/`. CI passing because CI changed proves nothing.
 - If the failure has nothing to do with the code (a network error, a runner problem, a flaky service), change nothing and say so in your summary: the runner then runs the failed jobs again.
-- Never weaken `CONSTRAINTS.md`, skip a test or add a suppression.
+- Never weaken the repository's quality rules, skip a test or add a suppression.
 
 Run the verify gates before you finish. Do not commit: the runner commits and pushes.
 

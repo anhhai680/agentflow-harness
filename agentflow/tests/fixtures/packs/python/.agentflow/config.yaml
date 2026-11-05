@@ -1,20 +1,37 @@
 # agentflow: the one file that decides what the workflow does.
 # Edit behaviour here, not in code. `agentflow validate` checks it.
 # A string value that starts with "@" is a reference to another key ("@overlays.eval.when_paths").
-version: 1
+version: 2
+engine: ">=2,<3"               # the engine versions that may run this pack
 
 project:
   base_branch: main            # the base the changed-path conditions compare against (`origin/<base_branch>`)
   fork_from: main              # the branch a run is cut from and its pull request goes to; `finish` brings it in first
   branch: "flow/{lane}/{slug}"
-  worktrees_dir: ../tivacare-worktrees
+  worktrees_dir: ../toy-worktrees
   docs:
-    idea: docs/ideas/agentic-rag-customer-support.md
-    capability_map: docs/specs/CAPABILITY-MAP.md
+    idea: docs/idea.md
     specs: docs/specs
+    spec_file: "SPEC-{module}.md"   # a module's spec is <specs>/<spec_file>
     plans: docs/plans
     decisions: docs/decisions
+    glossary: GLOSSARY.md
   commit_trailer: "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+
+work_source:                    # the modules `agentflow queue`, the Backlog and `modules_done` walk, in build order
+  kind: capability_map          # a table with `Module id` and `Depends on` columns
+  path: docs/specs/CAPABILITY-MAP.md
+
+skills:
+  map:                          # the skill `agentflow next` names for each kind of next step
+    decide: grilling
+    define: spec-driven-development
+    design_doc: domain-modeling
+    plan: writing-plans
+    build: subagent-driven-development
+    build_small: executing-plans
+    verify: verification-before-completion
+    ship: finishing-a-development-branch
 
 agents:
   claude:
@@ -53,7 +70,7 @@ defaults:
                                # (measured: $0.73 mean, $1.71 max per task; 20 tasks after a $4.4 plan -> ~$31)
   env:                         # for every agent session and gate of a run; values are strings
     FORCE_PROMPT_CACHING_5M: "1"   # 5-minute cache writes cost 37.5% less than the 1-hour default; sessions rarely idle
-    POSTGRES_HOST_PORT: "55432"    # compose and tests/integration/conftest.py both read it, so a local Postgres can't clash
+    POSTGRES_HOST_PORT: "55432"
 
 recovery:                       # a usage limit just waits for its reset; these bound everything else
   give_up_h: 24                 # an outage longer than this stops for a human
@@ -74,39 +91,31 @@ context:
   progress_file: "runs/{run}/progress.md"
   gate_output_lines: 200
 
-gates:                          # names to commands; copied from CONSTRAINTS.md, never weakened here
-  floor:        {run: "python3 devtools/floor_guard.py --base origin/main"}
-  py_lint:      {run: "uv run ruff check . && uv run ruff format --check .", when_exists: pyproject.toml}
-  py_types:     {run: "uv run pyright", when_exists: pyproject.toml}
-  # -n: pytest-xdist; 4 workers at most keeps the shared test Postgres under its 100 connections
-  py_unit:      {run: "uv run pytest tests/unit --cov=src/tivacare --cov-report=xml -n auto --maxprocesses 4 --dist loadfile",
-                 when_exists: tests/unit}
-  py_integration: {run: "uv run pytest tests/integration --cov=src/tivacare --cov-append --cov-report=xml -n auto --maxprocesses 4 --dist loadfile",
-                   when_exists: tests/integration}   # needs Postgres: the `setup` step starts it; can't connect = fails
-  py_cov_diff:  {run: "uv run diff-cover coverage.xml --fail-under=80", when_exists: coverage.xml}
-  web_types:    {run: "pnpm exec tsc --noEmit", cwd: webadmin, when_exists: webadmin/package.json}
-  web_lint:     {run: "pnpm biome check .", cwd: webadmin, when_exists: webadmin/package.json}
-  web_unit:     {run: "pnpm exec vitest run --coverage", cwd: webadmin, when_exists: webadmin/package.json}
-  eval:         {run: "uv run python -m tivacare.eval.cli gate", when_exists: src/tivacare/eval}
+gates:                          # names to commands
+  floor:        {run: "true"}
+  py_lint:      {run: "true", when_exists: pyproject.toml}
+  py_types:     {run: "true", when_exists: pyproject.toml}
+  py_unit:      {run: "python3 -m unittest -q", when_exists: tests/unit}
+  py_integration: {run: "uv run pytest tests/integration --cov=toy --cov-append --cov-report=xml -n auto --maxprocesses 4 --dist loadfile",
+                   when_exists: tests/integration}
+  py_cov_diff:  {run: "true", when_exists: coverage.xml}
+  web_types:    {run: "true", cwd: web, when_exists: web/package.json}
+  web_lint:     {run: "true", cwd: web, when_exists: web/package.json}
+  web_unit:     {run: "true", cwd: web, when_exists: web/package.json}
+  eval:         {run: "python3 -m toy.eval", when_exists: toy/eval}
   setup_py:     {run: "uv sync", when_exists: pyproject.toml}
-  setup_web:    {run: "pnpm install --frozen-lockfile --ignore-scripts --config.strictDepBuilds=false", cwd: webadmin,
-                 when_exists: webadmin/package.json}   # no install scripts; pnpm 12 fails on skipped ones unless told it's on purpose
-  setup_db:     {run: "docker compose -p tivacare-test up -d postgres --wait", when_exists: compose.yaml}  # one server for all runs: tests make their own databases
-  web_e2e:      {run: "python3 devtools/e2e_stack.py", when_exists: webadmin/e2e}  # SPEC-platform R10 / CI's e2e job, not a
-                                                   # CONSTRAINTS row: one locked stack per machine, configured from .env.example;
-                                                   # named by verify/verify only, never in `gate_sets.verify`
+  setup_web:    {run: "true", cwd: web, when_exists: web/package.json}
+  setup_db:     {run: "true", when_exists: compose.yaml}
+  web_e2e:      {run: "true", when_exists: web/e2e}  # named by verify/verify only, never in `gate_sets.verify`
 gate_sets:
   setup:  [setup_py, setup_web, setup_db]                          # the environment, before an agent needs it
-  build:  [floor, py_lint, py_types, web_types, web_lint]          # CONSTRAINTS Lifecycle: Build
+  build:  [floor, py_lint, py_types, web_types, web_lint]
   verify: [floor, py_lint, py_types, py_unit, py_integration, py_cov_diff, web_types, web_lint, web_unit]
 
 guardrails:
   forbidden_paths:              # any diff here fails the step (an agent may not touch them in a run)
     - CONSTRAINTS.md
-    - devtools/floor_guard.py
     - eval/baseline.json
-    - devtools/agentflow/config.yaml
-    - devtools/agentflow/tests/**    # outside the floor's removed-assertions check, so no agent edits it in a run
     - .claude/**
   reject_trailers: ["Constraints-Approved-By"]
   user_only_skills: [improve-codebase-architecture, constraint-driven-development,
@@ -114,15 +123,15 @@ guardrails:
 
 overlays:
   security:
-    when_paths: ["src/tivacare/staff_auth/**", "**/identity/**", "**/attachments/**",
-                 "**/redaction/**", "**/widget/**", "src/tivacare/knowledge/retrieval/**"]
-    when_keywords: [IS4, Entra, customer_code, "visibility = public", attachment, redaction]
+    when_paths: ["toy/staff_auth/**", "**/identity/**", "**/attachments/**",
+                 "**/redaction/**", "**/widget/**", "toy/knowledge/retrieval/**"]
+    when_keywords: [token, password, secret, attachment, redaction]
     add_skills: {plan: security-and-hardening, review: security-and-hardening}
     review_agent: security-auditor
-  eval:                         # the repo's eval-gate inputs (CLAUDE.md "Eval gate"); lanes carry no repo paths
-    when_paths: [src/tivacare/knowledge/retrieval/**, src/tivacare/knowledge/tables/**,
-                 src/tivacare/crm/model_fields.py, src/tivacare/llm_gateway/models.toml,
-                 src/tivacare/agent/policy.py, src/tivacare/agent/prompts/**]
+  eval:                         # the eval gate's inputs; lanes carry no repo paths
+    when_paths: [toy/knowledge/retrieval/**, toy/knowledge/tables/**,
+                 toy/crm/model_fields.py, toy/llm_gateway/models.toml,
+                 toy/agent/policy.py, toy/agent/prompts/**]
 
 conditions:                     # evaluated by the runner from files and git, never by a model
   spec_exists:            {check: file_exists, path: "docs/specs/SPEC-{module}.md"}
@@ -159,7 +168,7 @@ conditions:                     # evaluated by the runner from files and git, ne
   refine_round:           {check: refine_round}                    # a human rejected this phase
   plan_is_small:          {check: plan_tasks, file: "{plan}", max: 3}      # executing-plans instead of per-task sessions
   idea_doc_question_open: {check: section_items, file: "{idea}", section: '^## Open Questions', match: "{topic}"}
-  deps_merged:            {check: modules_done, from: capability_map}
+  deps_merged:            {check: modules_done}
   plan_exists_unchecked:  {check: plan_unchecked, file: "{plan}"}
   plan_done:                                  # a plan exists and every task is ticked; no plan is not "done"
     all:
@@ -208,7 +217,7 @@ phases:                         # the main workflow, in order; --from/--to on th
   # model: a string, or a role map with `default`; skip_if: a condition
   # brief: repo files the runner puts in the prompt at `{brief}`. Sonnet sessions never load a skill by name (0 of 96
   # in the real runs), so a step on Sonnet that names a skill must name a brief; tests/test_workflow.py holds this.
-  # task_briefs: the same for one plan task, when its text names the key (a `webadmin/` task gets the frontend skill).
+  # task_briefs: the same for one plan task, when its text names the key.
   # role: review is read-only and always a fresh session, also in a refine round
   # blocks_on_findings: true: the step's blocking `findings` hold back a phase with needs_approval: false
   define:                                    # the deciding steps on opus; `apply` files answers a human already gave
@@ -296,7 +305,7 @@ phases:                         # the main workflow, in order; --from/--to on th
     resolve: true
     model: sonnet
     steps:
-      - *setup                                                        # Docker may have stopped during an approval wait
+      - *setup
       - &plan_fixes                                                   # a refine round: decide what each finding needs
         {id: plan_fixes, lanes: [feature, bug, eval], skill: receiving-code-review, role: plan, model: opus,
          prompt: plan_fixes.md, brief: .claude/skills/receiving-code-review/SKILL.md, when: refine_round}
@@ -307,7 +316,7 @@ phases:                         # the main workflow, in order; --from/--to on th
       - {id: verify, lanes: [feature, bug], skill: verification-before-completion, role: build, prompt: verify.md,
          brief: .claude/skills/verification-before-completion/SKILL.md, blocks_on_findings: true, gates_first: true,
          gates: [verify, web_e2e], fix_loop: true, commit: true,              # e2e here only: not in every fix loop,
-         message: "Fix issues found in verification"}                         # sync or CI fix (CI's e2e job checks the PR)
+         message: "Fix issues found in verification"}                         # sync or CI fix
       - &eval_gate                                                    # a pass calls no agent; never lowers the baseline
         {id: eval_gate, lanes: [feature, bug, eval], type: gate, skill: verification-before-completion, role: build,
          prompt: eval_verify.md, brief: .claude/skills/verification-before-completion/SKILL.md,

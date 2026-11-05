@@ -5,9 +5,10 @@ import json
 
 import pytest
 
-from agentflow import flow
+from agentflow import flow, guards
 from agentflow.config import Gate, load_config
-from agentflow.flow import default_config_path
+from agentflow.state import runs_root
+from conftest import PYTHON_CONFIG
 from agentflow.guards import (
     Violation,
     _covered,
@@ -23,7 +24,7 @@ from test_gates import cfg_with
 
 @pytest.fixture
 def cfg():
-    return load_config(default_config_path())
+    return load_config(PYTHON_CONFIG)
 
 
 def head(git, wt):
@@ -166,6 +167,21 @@ def test_user_only_skill_read_by_path(cfg, tmp_git, git):
     assert [x.kind for x in v] == ["user_only_skill"]
 
 
+def test_user_only_skill_read_from_a_custom_skills_dir_trips(tmp_cfg):
+    cfg = load_config(tmp_cfg({"project": {"skills_dir": "skills"}}))
+    calls = [{"name": "Read", "input": {"file_path": "skills/doubt-driven-development/SKILL.md"}}]
+    assert [v.kind for v in guards._user_only_violations(cfg, calls)] == ["user_only_skill"]
+
+
+@pytest.mark.parametrize("skills_dir", ["skills", "./skills", "skills/", "./skills/"])
+@pytest.mark.parametrize("read", ["skills/{s}/SKILL.md", "./skills/{s}/SKILL.md", "{root}/skills/{s}/SKILL.md"])
+def test_user_only_skill_trips_however_the_skills_dir_and_the_read_are_spelled(tmp_cfg, tmp_path, skills_dir, read):
+    cfg = load_config(tmp_cfg({"project": {"skills_dir": skills_dir}}))
+    path = read.format(s="doubt-driven-development", root=tmp_path)
+    calls = [{"name": "Read", "input": {"file_path": path}}]
+    assert [v.kind for v in guards._user_only_violations(cfg, calls)] == ["user_only_skill"]
+
+
 def test_user_only_skill_read_via_bash(cfg, tmp_git, git):
     calls = [{"name": "Bash", "input": {"command": "cat .claude/skills/doubt-driven-development/SKILL.md"}}]
     assert [x.kind for x in run_step(cfg, git, tmp_git, lambda: None, calls)] == ["user_only_skill"]
@@ -187,7 +203,7 @@ def with_mode(cfg, mode):
 
 
 def test_settings_cover_shipped_gates(repo_root):
-    assert settings_coverage(load_config(default_config_path()), repo_root) == []
+    assert settings_coverage(load_config(PYTHON_CONFIG), repo_root) == []
 
 
 def test_shipped_settings_file_alone_covers_shipped_gates(repo_root, tmp_path):
@@ -195,7 +211,7 @@ def test_shipped_settings_file_alone_covers_shipped_gates(repo_root, tmp_path):
     (tmp_path / ".claude" / "settings.json").write_text(
         (repo_root / ".claude" / "settings.json").read_text(encoding="utf-8"), encoding="utf-8"
     )
-    assert settings_coverage(load_config(default_config_path()), tmp_path) == []
+    assert settings_coverage(load_config(PYTHON_CONFIG), tmp_path) == []
 
 
 def test_settings_coverage_warns_on_uncovered_gate(repo_root):
@@ -212,7 +228,7 @@ def test_settings_coverage_checks_each_part(repo_root):
 
 
 def test_settings_coverage_without_settings_files_warns_for_every_gate(tmp_path):
-    cfg = with_mode(load_config(default_config_path()), "acceptEdits")
+    cfg = with_mode(load_config(PYTHON_CONFIG), "acceptEdits")
     issues = settings_coverage(cfg, tmp_path)
     assert {i.path for i in issues} == {f"gates.{n}.run" for n in cfg.gates}
     assert all(i.level == "warning" for i in issues)
@@ -246,7 +262,7 @@ def test_settings_coverage_in_bypass_mode_warns_only_on_ask_or_deny(tmp_path):
 
 
 def test_shipped_config_runs_in_bypass_mode_with_no_coverage_warnings(tmp_path):
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     assert cfg.agents[cfg.defaults.agent].permission_mode == "bypassPermissions"
     assert settings_coverage(cfg, tmp_path) == []  # no settings files: allow rules are moot
 
@@ -282,7 +298,8 @@ def test_validate_command_reports_coverage_warnings(tmp_cfg, monkeypatch, repo_r
     assert "warning gates.make.run" in out
 
 
-def test_validate_command_shipped_config_has_no_coverage_warnings(capsys):
+def test_validate_command_shipped_config_has_no_coverage_warnings(capsys, pack_repo_python, monkeypatch):
+    monkeypatch.chdir(pack_repo_python)
     assert flow.main(["validate"]) == 0
     out = capsys.readouterr().out
     assert "gates." not in out
@@ -324,12 +341,19 @@ def test_shipped_settings_do_not_cover_escapes(repo_root, command):
     "pnpm exec vitest run --coverage",
     "git status",
     "git diff HEAD~1",
-    "python3 devtools/floor_guard.py --base origin/main",
 ])
 def test_shipped_settings_cover_the_gate_commands(repo_root, command):
     assert shipped_allows(repo_root, command)
 
 
-def test_shipped_settings_deny_agent_edits_to_the_runs_root(repo_root):
-    deny = json.loads((repo_root / ".claude" / "settings.json").read_text(encoding="utf-8"))["permissions"]["deny"]
-    assert "Edit(/devtools/agentflow/runs/**)" in deny
+def test_the_runner_denies_agent_edits_to_its_runs_root(flow_repo):
+    # The runs root is in the state dir, outside the repo by default, so no project settings file can name it:
+    # the runner's own `--settings` deny rule does, as an absolute (`//`) path.
+    from test_agent_step import run_step
+
+    flow_repo.new_run()
+    assert run_step(flow_repo) == "done"
+    argv = flow_repo.calls()[0]["argv"]
+    deny = json.loads(argv[argv.index("--settings") + 1])["permissions"]["deny"]
+    assert f"Edit(/{runs_root(flow_repo.root)}/**)" in deny
+    assert runs_root(flow_repo.root).is_absolute()

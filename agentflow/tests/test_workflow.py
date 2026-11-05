@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from agentflow.config import for_lane, load_config, resolve_model
-from agentflow.flow import default_config_path, main
+from agentflow.flow import main
+from conftest import PYTHON_CONFIG, PYTHON_SKILLS
 from agentflow.hitl import answer, approve, reject
 from agentflow.lanes import build_prompt
 from agentflow.module_queue import feature_runs
@@ -27,7 +28,6 @@ PLAN_TEXT = "# Plan: demo\n\n### Task 1: First thing\n\n**Depends on:** none\n\n
 QUESTION = {"id": "q1", "question": "Lưu trong bao lâu?", "options": [{"key": "A", "label": "1 giờ", "recommended": True}],
             "evidence": [], "kind": "other"}
 AGENTFLOW_DIR = Path(__file__).resolve().parents[1]
-REPO_ROOT = AGENTFLOW_DIR.parents[1]
 NOTE = "Sửa lỗi kiểm tra quyền"
 BLOCKING = {"severity": "blocking", "file": "src/one.py", "line": 3, "text": "Thiếu kiểm tra quyền"}
 MINOR_FINDING = {"severity": "minor", "file": "src/one.py", "line": 9, "text": "đổi tên biến"}
@@ -156,11 +156,12 @@ def test_a_step_not_in_the_lane_leaves_no_record(pipe):
     ("design", ["define", "ship"]),
 ])
 def test_each_lane_has_steps_in_exactly_its_phases(lane, phases):
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     assert [name for name, phase in cfg.phases.items() if for_lane(phase.steps, lane)] == phases
 
 
 def test_spec_is_not_a_lane(flow_repo, capsys):
+    flow_repo.install_pack()
     assert main(["run", "spec", "--module", "demo", "--dry-run"]) == 1
     assert "agentflow run feature --module <module> --to define" in capsys.readouterr().out
 
@@ -279,7 +280,7 @@ def test_a_larger_plan_gives_each_task_the_implementer_brief(pipe):
     step = _build_step(pipe)
     assert step.skill == "subagent-driven-development"
     text = _prompt(pipe, step)
-    assert "subagent-driven-development/implementer-prompt.md" in text
+    assert "`subagent-driven-development` skill's `implementer-prompt.md`" in text
     assert "Use the `subagent-driven-development` skill" not in text  # that would load the controller process
     assert "**do not commit**" in text and "Use the `test-driven-development` skill" in text
 
@@ -291,7 +292,7 @@ def _review_prompts(flow_repo) -> list[str]:
 
 
 def test_each_reviewer_gets_the_code_reviewer_brief_in_its_prompt(pipe):
-    brief = (REPO_ROOT / ".claude/skills/requesting-code-review/code-reviewer.md").read_text(encoding="utf-8")
+    brief = (PYTHON_SKILLS / "requesting-code-review/code-reviewer.md").read_text(encoding="utf-8")
     for text in _review_prompts(pipe):
         assert brief.strip() in text  # in the prompt itself: a Sonnet session never opened it on its own
         assert "{brief}" not in text
@@ -307,7 +308,7 @@ def _agent_steps(steps):
 
 def test_every_sonnet_step_with_a_skill_gets_it_in_its_prompt():
     """Sonnet sessions never loaded a skill by name (0 of 96 in the real runs), so its text must be in the prompt."""
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     bare = []
     for phase in cfg.phases.values():
         steps = list(_agent_steps(phase.steps))
@@ -331,12 +332,12 @@ def test_every_sonnet_step_with_a_skill_gets_it_in_its_prompt():
 ])
 def test_a_skill_step_gets_that_skills_text(pipe, phase, step_id, needle):
     step = next(s for s in _agent_steps(pipe.cfg.phases[phase].steps) if s.id == step_id)
-    skill = (REPO_ROOT / ".claude/skills" / needle).read_text(encoding="utf-8")
+    skill = (PYTHON_SKILLS / needle).read_text(encoding="utf-8")
     assert skill.strip() in _prompt(pipe, step)
 
 
 def test_record_step_gets_the_skills_text(pipe):
-    skill = (REPO_ROOT / ".claude/skills/domain-modeling/SKILL.md").read_text(encoding="utf-8")
+    skill = (PYTHON_SKILLS / "domain-modeling/SKILL.md").read_text(encoding="utf-8")
     assert skill.strip() in _prompt(pipe, pipe.cfg.record_step)
 
 
@@ -344,13 +345,13 @@ def test_an_implementer_gets_its_brief_and_the_tdd_skill_in_its_prompt(pipe):
     text = _prompt(pipe, _build_step(pipe))
     for name in ("subagent-driven-development/implementer-prompt.md", "test-driven-development/SKILL.md",
                  "test-driven-development/writing-good-tests.md"):
-        assert (REPO_ROOT / ".claude/skills" / name).read_text(encoding="utf-8").strip() in text
+        assert (PYTHON_SKILLS / name).read_text(encoding="utf-8").strip() in text
 
 
 def test_a_console_task_also_gets_the_frontend_skill(pipe):
     step = _build_step(pipe)
     executor = pipe.executor(pipe.new_run({"module": "demo"}))
-    skill = (REPO_ROOT / ".claude/skills/frontend-ui-engineering/SKILL.md").read_text(encoding="utf-8").strip()
+    skill = (PYTHON_SKILLS / "frontend-ui-engineering/SKILL.md").read_text(encoding="utf-8").strip()
     assert skill in _prompt(pipe, executor._impl_step(step, {}, "Add `webadmin/src/pages/inbox.tsx`"))
     assert skill in _prompt(pipe, executor._impl_step(step, {}, "Add `web/src/thread.ts`"))
     assert skill not in _prompt(pipe, executor._impl_step(step, {}, "Add `src/tivacare/crm/client.py`"))
@@ -381,7 +382,7 @@ def test_a_small_plan_uses_executing_plans(pipe):
     assert small.skill == "executing-plans" and small.prompt == "task_inline.md"
     text = _prompt(pipe, small)
     assert "Use the `executing-plans` skill" in text and "implementer-prompt.md" not in text
-    tdd = (REPO_ROOT / ".claude/skills/test-driven-development/SKILL.md").read_text(encoding="utf-8")
+    tdd = (PYTHON_SKILLS / "test-driven-development/SKILL.md").read_text(encoding="utf-8")
     assert tdd.strip() in text
 
 
@@ -389,7 +390,7 @@ def test_a_small_plan_uses_executing_plans(pipe):
 
 
 def test_workflow_view_comes_from_the_config():
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     view = workflow_view(cfg)
     assert [p["name"] for p in view["phases"]] == ["define", "plan", "build", "verify", "review", "ship"]
     assert [p["approval"] for p in view["phases"]] == [True, True, False, False, False, False]
@@ -412,7 +413,7 @@ def _step(cfg, phase: str, step_id: str):
 
 
 def test_a_per_task_step_rolls_up_with_a_count():
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     state = {"task": {"n": 2, "of": 5}, "steps": {
         "build/build/task-1/implement": {"status": "done"}, "build/build/task-1/review": {"status": "done"},
         "build/build/task-2/implement": {"status": "running"},
@@ -422,7 +423,7 @@ def test_a_per_task_step_rolls_up_with_a_count():
 
 
 def test_the_task_count_total_does_not_grow_with_the_started_tasks():
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     step = _step(cfg, "build", "build")
     steps = {"build/build/task-1/implement": {"status": "done"}}
     state = {"task": None, "task_total": 5, "steps": steps}  # between tasks: no live task, the total stays 5
@@ -432,7 +433,7 @@ def test_the_task_count_total_does_not_grow_with_the_started_tasks():
 
 
 def test_a_repeat_shows_its_latest_round():
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     key = "define/grill_open_questions"
     state = {"waiting": {"key": f"{key}/r2/answers"}, "steps": {
         f"{key}/r1/grill": {"status": "done"}, f"{key}/r1/answers": {"status": "done"},
@@ -444,14 +445,14 @@ def test_a_repeat_shows_its_latest_round():
 
 
 def test_a_skipped_step_gives_its_reason():
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     state = {"steps": {"define/contracts": {"status": "skipped", "skip_reason": "the package exists"}}}
     row = _run_step(state, "feature", _step(cfg, "define", "contracts"), "define/contracts")
     assert row["status"] == "skipped" and row["reason"] == "the package exists"
 
 
 def test_run_workflow_shows_only_the_runs_lane():
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     run = SimpleNamespace(state={"pipeline": "eval", "status": "running", "steps": {}, "phases": {}})
     assert [p["name"] for p in run_workflow(run, cfg)] == ["build", "verify", "review", "ship"]
     build = run_workflow(run, cfg)[0]
@@ -459,7 +460,7 @@ def test_run_workflow_shows_only_the_runs_lane():
 
 
 def test_a_run_from_before_the_one_workflow_shows_its_own_records():
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     run = SimpleNamespace(state={"pipeline": "spec", "status": "done", "phases": {"spec": {"status": "approved"}}, "steps": {
         "spec/draft": {"phase": "spec", "status": "skipped", "skip_reason": "exists"},
         "spec/contracts": {"phase": "spec", "status": "done"},
@@ -471,6 +472,6 @@ def test_a_run_from_before_the_one_workflow_shows_its_own_records():
 
 
 def test_for_lane_keeps_untagged_steps():
-    cfg = load_config(default_config_path())
+    cfg = load_config(PYTHON_CONFIG)
     step = replace(_step(cfg, "plan", "plan"), lanes=[])
     assert for_lane([step], "bug") == [step]

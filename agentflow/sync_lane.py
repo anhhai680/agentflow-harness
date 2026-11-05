@@ -9,8 +9,9 @@ the latest `origin/<fork_from>` first, and never lets the merge break the system
 2. Conflicts are the `sync` session's to resolve (a human's when a path is a security path, a `human_paths` match,
    a forbidden path, or has no conflict markers to work with). The session edits files only; it never commits.
 3. Nothing is committed until the merged tree has passed the `sync` session's gates (and the eval gate when
-   `eval_required` holds). A clean merge is checked too: a textually clean merge can still break behaviour. A
-   failing gate goes back to the `sync` session as a fix attempt; none left, or no session, and a human gets it.
+   the pack defines `eval_required` and it holds). A clean merge is checked too: a textually clean merge can
+   still break behaviour. A failing gate goes back to the `sync` session as a fix attempt; none left, or no
+   session, and a human gets it.
 4. The runner commits the merge (`gitops.commit_sync`) and records `base_synced`, so `foreign_commits` knows
    the merge is its own and the target's commits are not.
 
@@ -171,9 +172,11 @@ class SyncLane:
                 raise_hitl(self.cfg, self.run, "blocked", key, f"The environment for checking the merge did not come up: {names}.")
                 return "stopped"
         names = sync.gates if isinstance(sync.gates, list) else [sync.gates]
-        eval_needed, _ = self.decide(phase, "eval_required", f"{key}.eval_required")
-        if eval_needed is None:
-            return "stopped"
+        eval_needed = False  # a pack that defines no `eval_required` has no eval gate to run
+        if "eval_required" in self.cfg.conditions:
+            eval_needed, _ = self.decide(phase, "eval_required", f"{key}.eval_required")
+            if eval_needed is None:
+                return "stopped"
         results = self._run_merge_gates(key, names, with_eval=bool(eval_needed))
         if gates_ok(results):
             return "done"

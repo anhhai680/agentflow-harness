@@ -174,7 +174,7 @@ td.wrap { white-space: normal; min-width: 200px; }
   <section id="workflow-view" hidden>
     <div id="workflow-phases" class="columns"></div>
     <h2 class="lane">Human-run skills</h2>
-    <p class="muted">The runner never loads these. You run <code>doubt-driven-development</code> when the plan's approval page offers it, and the others when you choose. The gates in build and verify enforce the rules <code>constraint-driven-development</code> wrote to <code>CONSTRAINTS.md</code>.</p>
+    <p class="muted" id="workflow-human-note"></p>
     <div id="workflow-human"></div>
   </section>
   <section id="agents-view" hidden>
@@ -736,6 +736,16 @@ function renderWorkflow() {
     el("h2", {}, el("span", { text: phase.name }), el("span", { text: phase.approval ? "you approve" + (phase.human_skill ? ", offers " + phase.human_skill : "") : "moves on by itself" })),
     phase.steps.map((step) => workflowStep(step)))));
   $("workflow-human").replaceChildren(...view.human_skills.map((skill) => el("span", { class: "badge", text: skill })));
+  $("workflow-human-note").textContent = humanSkillsNote(view);
+}
+
+// The pack's user-only skills (`guardrails.user_only_skills`) and the approval pages that offer one.
+function humanSkillsNote(view) {
+  if (!view.human_skills.length) return "This pack names no human-run skills (guardrails.user_only_skills).";
+  const offered = view.phases.filter((phase) => phase.human_skill)
+    .map((phase) => phase.human_skill + " when the " + phase.name + " approval page offers it");
+  return "The runner never loads these (guardrails.user_only_skills). You run "
+    + (offered.length ? offered.join(", ") + ", and the others when you choose." : "them when you choose.");
 }
 
 function runStepNode(step) {

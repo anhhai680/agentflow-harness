@@ -31,15 +31,14 @@ import sys
 import time
 from pathlib import Path
 
-from agentflow.config import Config, load_config
-from agentflow.config_trust import ConfigUntrusted, trusted_config_path
-from agentflow import safeio
+from agentflow.config import Config, ConfigError, load_config
+from agentflow.config_trust import run_config_path
+from agentflow import pack, safeio
 from agentflow.events import lock_state, parse_iso
 from agentflow.gitops import GitError, commits_between, dirty_paths
 from agentflow.state import TERMINAL, Run
 
 FLOW = Path(__file__).resolve().parent / "flow.py"
-DEFAULT_CONFIG = Path(__file__).resolve().parent / "config.yaml"
 KILL_GRACE_S = 5.0
 SETTLE_S = 1.0  # a just-forked agent may not have exec'd its command yet
 POLL_S = 0.05
@@ -55,9 +54,9 @@ class ControlError(Exception):
 
 
 def run_config(run: Run) -> Config:
-    """The config the run was started with when it is still trusted (`config_trust`), else the shipped one
-    when none is recorded; `ConfigUntrusted` otherwise."""
-    return load_config(trusted_config_path(run, None, DEFAULT_CONFIG))
+    """The config the run was started with when it is still trusted (`config_trust`), else the repository's
+    pack when none is recorded; `ConfigUntrusted` otherwise."""
+    return load_config(run_config_path(run))
 
 
 def _refuse_terminal(run: Run, action: str) -> None:
@@ -227,6 +226,21 @@ def _verify(run: Run, commands: dict[str, list[str]], skip: set[int], settle_s: 
     return verified, [{"pid": pid, "reason": why} for pid, why in refused.items()]
 
 
+def _agent_commands(run: Run, cfg: Config | None) -> dict[str, list[str]]:
+    """The agent commands `cancel` matches live processes against. They only name processes, never run, so an
+    untrusted or unloadable recorded config gives way to the repository's pack, and with neither no process
+    matches."""
+    if cfg is None:
+        try:
+            cfg = run_config(run)
+        except (ConfigError, pack.PackError):  # ConfigUntrusted is a ConfigError
+            try:
+                cfg = load_config(pack.pack_config(run.repo))
+            except (ConfigError, pack.PackError):
+                return {}
+    return {name: list(spec.command) for name, spec in cfg.agents.items()}
+
+
 def _signal(pid: int, sig: int) -> bool:
     try:
         os.killpg(pid, sig)
@@ -239,12 +253,7 @@ def cancel(run: Run, by: str, cfg: Config | None = None, grace_s: float = KILL_G
     """End the run (`run_cancelled`) and stop its live agents; returns the PIDs signalled."""
     run.refresh()
     _refuse_terminal(run, "cancel")
-    if cfg is None:
-        try:
-            cfg = run_config(run)
-        except ConfigUntrusted:  # the commands only name processes to match, never run: the shipped ones do
-            cfg = load_config(DEFAULT_CONFIG)
-    commands = {name: list(spec.command) for name, spec in cfg.agents.items()}
+    commands = _agent_commands(run, cfg)
     verified, skipped = _verify(run, commands, set(), SETTLE_S)
     with run.locked():
         _refuse_terminal(run, "cancel")

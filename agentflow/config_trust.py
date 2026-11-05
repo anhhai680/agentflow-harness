@@ -4,7 +4,7 @@ A config decides which shell commands the runner runs (gates, `test_command` che
 taken from a run's own record is loaded only when one of these holds; otherwise the run is refused with
 a message that says how to go on (`--config <path>`):
 
-1. it is this checkout's shipped config (`devtools/agentflow/config.yaml`), or
+1. it is the repository's pack (`<main checkout>/.agentflow/config.yaml`, the `default` below), or
 2. it is the config the run was started with (the run's first `run_options` event, written by `start`),
    and the file's SHA-256 still equals the hash recorded then.
 
@@ -17,10 +17,11 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from agentflow import pack
 from agentflow.config import ConfigError
 from agentflow.state import Run
 
-__all__ = ["ConfigUntrusted", "config_sha256", "start_options", "trusted_config_path"]
+__all__ = ["ConfigUntrusted", "config_sha256", "run_config_path", "start_options", "trusted_config_path"]
 
 
 class ConfigUntrusted(ConfigError):
@@ -39,7 +40,7 @@ def start_options(path: Path) -> dict[str, str]:
 
 def trusted_config_path(run: Run, explicit: str | Path | None, default: Path) -> Path:
     """The config `run` continues with: `explicit`, else the recorded one if trusted (see the module
-    docstring), else the shipped `default` when nothing is recorded. Raises `ConfigUntrusted`."""
+    docstring), else `default` (the repository's pack) when nothing is recorded. Raises `ConfigUntrusted`."""
     if explicit:
         return Path(explicit)
     default = Path(default).resolve()
@@ -59,8 +60,21 @@ def trusted_config_path(run: Run, explicit: str | Path | None, default: Path) ->
         current = config_sha256(path)
     except OSError as exc:
         raise ConfigUntrusted(started, f"{run.id} was started with {started}, which cannot be read ({exc}). "
-                              "Pass `--config <path>` to choose one.") from exc
+                              "Pass `--config <path>` to choose one. "
+                              f"Pass --config {pack.PACK_DIR}/config.yaml to use the repository's pack.") from exc
     if not recorded or current != recorded:
         raise ConfigUntrusted(started, f"{started} changed since {run.id} started (its SHA-256 is not the one "
                               f"recorded then); refusing to load it. Pass `--config {started}` to use it as it is now.")
+    return path
+
+
+def run_config_path(run: Run, explicit: str | Path | None = None) -> Path:
+    """`trusted_config_path` with the repository's pack as the default. A repository without a pack still
+    continues a run on the trusted config it records; `PackError` only when the pack is the one it would load."""
+    if explicit:
+        return Path(explicit)
+    default = pack.pack_config_path(run.repo)
+    path = trusted_config_path(run, None, default)
+    if path == default.resolve():
+        return pack.pack_config(run.repo)  # `PackError` when the repository has no pack
     return path

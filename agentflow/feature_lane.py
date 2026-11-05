@@ -34,8 +34,8 @@ run goes on lets its task (and its dependents) run in another walk of the plan. 
 so a resumed run picks every task up where it stopped.
 
 `record_decisions` runs before an answered step resumes: an answer to a `spec_gap` question (or one
-given with `--record`) runs `record_step` and commits `Decide <question> in SPEC-<module>`
-with only the files that step changed. `ambiguity`/`review_dispute` answers go in the task's commit body.
+given with `--record`) runs `record_step` and commits its `message` (default `Decide <question> in the
+<module> spec`) with only the files that step changed. `ambiguity`/`review_dispute` answers go in the task's commit body.
 
 `run_finish` first brings the latest `origin/<fork_from>` into the branch (`sync_lane`), then refuses
 uncommitted changes, pushes the branch (never forced) and opens a draft pull request against `fork_from` whose
@@ -643,7 +643,7 @@ class FeatureLane:
         since = self._since_step_started(rkey)
         start_tree = str(since[0].get("start_tree") or "") if since else ""
         paths = changed_paths(self.worktree, start_tree, snapshot(self.worktree)) if start_tree else []
-        subject = fmt(rstep.message or "Decide {topic} in SPEC-{module}", {**self.ctx.values, **extra})
+        subject = fmt(rstep.message or "Decide {topic} in the {module} spec", {**self.ctx.values, **extra})
         message = f"{subject}\n\nQuestion: {extra['question']}\nAnswer: {text}"
         try:
             sha = commit(self.worktree, message, self.cfg, paths=paths, expected_head=runner_head(self.run))

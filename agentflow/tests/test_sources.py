@@ -1,4 +1,4 @@
-"""Plan, capability-map and spec-status parsing, against fixtures and the real capability map."""
+"""Plan, capability-map and spec-status parsing, against fixtures and the `python` pack's capability map."""
 
 from __future__ import annotations
 
@@ -16,8 +16,9 @@ from agentflow.sources import (
     tick_task,
 )
 
+from conftest import PYTHON_PACK
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-REPO = Path(__file__).resolve().parents[3]
 APPROVED = r"\*\*Status: approved"
 PENDING = "pending approval"
 
@@ -164,14 +165,8 @@ def test_capability_map_fixture():
     ]
 
 
-def test_capability_map_real():
-    nodes = capability_map(REPO / "docs" / "specs" / "CAPABILITY-MAP.md")
-    assert nodes[0] == ModuleNode("platform", [])
-    by_id = {n.id: n for n in nodes}
-    assert by_id["settings"].deps == ["staff-auth"]
-    assert by_id["staff-auth"].deps == ["platform"]
-    assert [n.id for n in nodes[:3]] == ["platform", "staff-auth", "settings"]
-    assert len(nodes) == 13
+def test_capability_map_of_the_python_pack():
+    assert capability_map(PYTHON_PACK / "docs" / "specs" / "CAPABILITY-MAP.md") == [ModuleNode("greet", [])]
 
 
 @pytest.mark.parametrize(
@@ -187,11 +182,13 @@ def test_spec_status_last_match_wins(name, expected):
     assert spec_status(FIXTURES / "specs" / name, APPROVED, PENDING) == expected
 
 
-def test_spec_status_pending_later_on_the_same_line():
-    # SPEC-agent and SPEC-conversations say "Status: approved ... Amended ..., pending approval" on one line
-    assert spec_status(REPO / "docs" / "specs" / "SPEC-agent.md", APPROVED, PENDING) == "pending"
-    assert spec_status(REPO / "docs" / "specs" / "SPEC-crm.md", APPROVED, PENDING) == "approved"
-    assert spec_status(REPO / "docs" / "specs" / "SPEC-settings.md", APPROVED, PENDING) == "unknown"
+def test_spec_status_pending_later_on_the_same_line(tmp_path):
+    amended = tmp_path / "SPEC-amended-inline.md"
+    amended.write_text("# Spec\n\n**Status: approved** (2026-10-01). Amended 2026-10-20, pending approval.\n",
+                       encoding="utf-8")
+    assert spec_status(amended, APPROVED, PENDING) == "pending"
+    assert spec_status(PYTHON_PACK / "docs" / "specs" / "SPEC-greet.md", APPROVED, PENDING) == "approved"
+    assert spec_status(FIXTURES / "specs" / "SPEC-nostatus.md", APPROVED, PENDING) == "unknown"
 
 
 # --------------------------------------------------------------------------- batches of small tasks

@@ -16,9 +16,9 @@ import pytest
 
 from agentflow import hitl
 from agentflow.dashboard import make_server
-from agentflow.state import Run
+from agentflow.state import Run, runs_root
 from agentflow.views import _badge
-from conftest import run_git
+from conftest import PYTHON_CONFIG, run_git
 
 TOKEN = "k3y-" + "x" * 40
 AGENTFLOW = Path(__file__).resolve().parents[1]
@@ -890,7 +890,7 @@ def test_the_refresh_round_updates_the_cards_and_starts_nothing(bdash):
     from agentflow.dashboard import refresh_once
 
     refresh_once(bdash.server)
-    assert (bdash.flow.root / "devtools/agentflow/runs/queue.json").is_file()
+    assert (runs_root(bdash.flow.root) / "queue.json").is_file()
     assert bdash.fake.calls == []
 
 
@@ -960,7 +960,7 @@ def test_the_new_task_form_asks_the_kind_of_work_with_radios():
 def test_every_lane_label_is_shown_in_the_real_config():
     from agentflow.config import load_config
 
-    cfg = load_config(AGENTFLOW / "config.yaml")
+    cfg = load_config(PYTHON_CONFIG)
     labels = cfg.raw["dashboard"]["backlog"]["lane_labels"]
     assert sorted(labels) == sorted(cfg.lanes)
 

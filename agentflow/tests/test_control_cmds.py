@@ -21,7 +21,7 @@ from agentflow.flow import main
 from agentflow.lanes import Executor
 from agentflow.pipeline import RunOptions, advance, start
 from agentflow.run_control import ControlError, cancel, pause, retry
-from agentflow.state import Run
+from agentflow.state import Run, runs_root
 from agentflow.views import agents_table, agents_view, board, board_table, watch
 
 DONE = {"status": "done", "summary": "did it"}
@@ -177,6 +177,23 @@ def test_cancel_never_signals_a_process_it_cannot_verify(pipe):
             proc.wait()
 
 
+@pytest.mark.parametrize("patch", [{"version": 1}, {"engine": ">=3"}], ids=["format-1", "engine-excluded"])
+def test_cancel_with_a_trusted_recorded_config_that_no_longer_loads_still_cancels(pipe, tmp_path, patch):
+    import yaml
+
+    from agentflow.config_trust import config_sha256
+
+    old = tmp_path / "old-config.yaml"  # unchanged since the run started, so trusted, but this engine refuses it
+    old.write_text(yaml.safe_dump({**yaml.safe_load(Path(pipe.cfg.path).read_text(encoding="utf-8")), **patch}),
+                   encoding="utf-8")
+    run = pipe.new_run()
+    run.emit("run_options", config=str(old.resolve()), config_sha256=config_sha256(old))
+    assert cancel(run, by="me") == []
+    run.refresh()
+    assert run.state["status"] == "cancelled"
+    assert [e["by"] for e in pipe.events(run, "run_cancelled")] == ["me"]
+
+
 def test_cancelled_run_stays_cancelled(pipe):
     run = pipe.new_run()
     cancel(run, by="me", cfg=pipe.cfg)
@@ -271,6 +288,39 @@ def test_cli_pause_cancel_and_retry(pipe, capsys):
     assert [e["by"] for e in pipe.events(run, "run_cancelled")] == ["tester"]
 
 
+def test_cli_cancel_names_each_skipped_pid_and_its_reason(pipe, capsys):
+    run = pipe.new_run()
+    stranger = subprocess.Popen(["sleep", "30"], start_new_session=True)  # not an agent command
+    try:
+        run.emit("agent_started", pid=stranger.pid, step="define/idea/idea_questions", agent="claude")
+        assert main(["cancel", run.id, "--by", "tester", "--config", str(pipe.cfg.path)]) == 0
+        out = capsys.readouterr().out
+        assert "cancelled" in out
+        assert f"not signalled: PID {stranger.pid}" in out and "its command does not run" in out
+        assert stranger.poll() is None
+    finally:
+        stranger.send_signal(signal.SIGKILL)
+        stranger.wait()
+
+
+def test_cli_cancel_warns_when_no_config_could_match_the_agents(pipe, capsys, monkeypatch):
+    from agentflow import run_control
+
+    run = pipe.new_run()
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    monkeypatch.setattr(run_control, "_agent_commands", lambda run, cfg: {})  # neither recorded nor pack config loads
+    try:
+        run.emit("agent_started", pid=proc.pid, step="define/idea/idea_questions", agent="claude")
+        assert main(["cancel", run.id, "--by", "tester"]) == 0
+        out = capsys.readouterr().out
+        assert "live agents were not signalled" in out and "--config" in out
+        assert f"PID {proc.pid}" in out
+        assert proc.poll() is None
+    finally:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait()
+
+
 def test_cli_attach_resumes_the_session_interactively(pipe, monkeypatch, capsys):
     from agentflow import run_control
 
@@ -346,7 +396,7 @@ def fixture_runs(flow_repo) -> tuple[Run, Run]:
 
 def test_board_cards_for_fixture_runs(pipe):
     planning, building = fixture_runs(pipe)
-    queue = pipe.root / "devtools" / "agentflow" / "runs" / "queue.json"
+    queue = runs_root(pipe.root) / "queue.json"
     queue.write_text(json.dumps({"modules": [
         {"id": "settings", "deps": ["platform"], "status": "backlog", "run_id": None, "blocked": "waiting on platform"},
         {"id": "crm", "deps": [], "status": "running", "run_id": building.id},
@@ -470,6 +520,7 @@ def test_watch_rerenders_on_change_and_reminds(pipe):
 
 def test_cli_agents_once(pipe, capsys):
     fixture_runs(pipe)
+    pipe.install_pack()
     assert main(["agents"]) == 0
     assert "Agents running: 1" in capsys.readouterr().out
 

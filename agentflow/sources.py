@@ -1,4 +1,4 @@
-"""Read the documents the workflow reasons about: plans, the capability map and spec status.
+"""Read the documents the workflow reasons about: plans, the capability map, spec files and spec status.
 
 Plans follow the `writing-plans` shape: `### Task N: Title` headings, `- [ ]` / `- [x]` step
 boxes and an optional `**Depends on:**` line (plan decision D12). Lines inside code fences
@@ -300,6 +300,22 @@ def add_module_row(path: Path, template: dict[str, str], values: dict) -> None:
         lines.insert(last + 1, row)
     with open(path, "w", encoding="utf-8", newline="") as handle:
         handle.write("".join(lines))
+
+
+def spec_modules(specs_dir: Path, spec_file: str) -> dict[str, Path]:
+    """Module id -> spec file for every file in `specs_dir` whose name fits `spec_file` (`{module}` is the
+    wildcard, `{{` and `}}` are literal braces, as `str.format` reads them)."""
+    specs_dir = Path(specs_dir)
+    if not specs_dir.is_dir():
+        return {}
+    parts = [re.escape(p.replace("{{", "{").replace("}}", "}")) for p in spec_file.split("{module}")]
+    pattern = re.compile(parts[0] + "(?P<module>.+)" + "(?P=module)".join(parts[1:]))
+    found = {}
+    for path in sorted(specs_dir.iterdir()):
+        match = pattern.fullmatch(path.name)
+        if match and path.is_file():
+            found[match.group("module")] = path
+    return found
 
 
 def spec_status(path: Path, approved_re: str, pending_re: str) -> Literal["approved", "pending", "unknown"]:

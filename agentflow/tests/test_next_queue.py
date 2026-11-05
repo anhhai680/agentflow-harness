@@ -13,10 +13,11 @@ import pytest
 from agentflow import hitl, module_queue
 from agentflow.flow import main
 from agentflow.module_queue import NextAnswer, QueueBusy, QueueState, StartFailed, next_step, queue_tick
+from agentflow.state import runs_root
 
-from conftest import AGENTFLOW, run_git
+from conftest import ENGINE, run_git
 
-GH_BIN = AGENTFLOW / "tests" / "bin"
+GH_BIN = ENGINE / "tests" / "bin"
 APPROVED_SPEC = "# Spec: {m}\n\n**Status: approved** 2026-10-28\n"
 MAP = """# Capability map
 
@@ -129,30 +130,30 @@ def test_next_spec_with_plan_or_pending_is_skipped(fr, monkeypatch):
 
 
 def test_next_doc_only_changes(fr):
-    write(fr.root, "docs/ideas/x.md", "# idea\n")
+    write(fr.root, "docs/idea.md", "# idea\n")
     write(fr.root, "GLOSSARY.md", "# terms\n")
     answer = next_step(fr.cfg, fr.root)
     assert answer.lane == "design-doc"
-    assert any("docs/ideas/x.md" in line for line in answer.evidence)
+    assert any("docs/idea.md" in line for line in answer.evidence)
 
 
 def test_next_mixed_changes_are_not_doc_only(fr):
-    write(fr.root, "docs/ideas/x.md", "# idea\n")
+    write(fr.root, "docs/idea.md", "# idea\n")
     write(fr.root, "src/other.py", "x = 1\n")
     assert next_step(fr.cfg, fr.root).lane == "none"
 
 
 def test_next_eval_paths(fr):
-    write(fr.root, "src/tivacare/knowledge/retrieval/x.py", "x = 1\n")
+    write(fr.root, "toy/knowledge/retrieval/x.py", "x = 1\n")
     answer = next_step(fr.cfg, fr.root)
     assert answer.lane == "eval"
     assert answer.stage == "Verify"
-    assert any("src/tivacare/knowledge/retrieval/x.py" in line for line in answer.evidence)
+    assert any("toy/knowledge/retrieval/x.py" in line for line in answer.evidence)
 
 
 def test_next_eval_beats_open_plan(fr):
     write(fr.root, "docs/plans/2026-10-28-crm.md", PLAN_OPEN)
-    write(fr.root, "src/tivacare/agent/policy.py", "x = 1\n")
+    write(fr.root, "toy/agent/policy.py", "x = 1\n")
     assert next_step(fr.cfg, fr.root).lane == "eval"
 
 
@@ -164,7 +165,7 @@ def test_next_nothing_in_flight(fr):
 
 def test_next_security_line_when_overlay_matches(fr):
     write(fr.root, "docs/plans/2026-10-28-crm.md", PLAN_OPEN)
-    write(fr.root, "src/tivacare/staff_auth/guard.py", "x = 1\n")
+    write(fr.root, "toy/staff_auth/guard.py", "x = 1\n")
     answer = next_step(fr.cfg, fr.root)
     assert answer.security
     text = module_queue.format_answer(answer)
@@ -173,7 +174,7 @@ def test_next_security_line_when_overlay_matches(fr):
 
 
 def test_next_security_line_from_plan_keywords(fr):
-    write(fr.root, "docs/plans/2026-10-28-crm.md", PLAN_OPEN + "\nThe customer_code claim is injected.\n")
+    write(fr.root, "docs/plans/2026-10-28-crm.md", PLAN_OPEN + "\nThe session token is checked.\n")
     assert next_step(fr.cfg, fr.root).security
 
 
@@ -194,7 +195,8 @@ def test_format_answer_is_three_lines():
 
 
 def test_cmd_next_prints_the_answer(fr, capsys):
-    write(fr.root, "docs/ideas/x.md", "# idea\n")
+    fr.install_pack()
+    write(fr.root, "docs/idea.md", "# idea\n")
     assert main(["next"]) == 0
     out = capsys.readouterr().out.splitlines()
     assert out[0] == "Lane: design-doc · Stage: Define"
@@ -379,7 +381,7 @@ def test_queue_rejects_bad_max_parallel(qrepo):
 
 def test_queue_state_roundtrip_is_atomic_json(qrepo):
     queue_tick(qrepo.cfg, qrepo.root, 1, Starter(qrepo))
-    path = qrepo.root / "devtools" / "agentflow" / "runs" / "queue.json"
+    path = runs_root(qrepo.root) / "queue.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     assert [m["id"] for m in data["modules"]] == ["platform", "staff-auth", "crm", "settings"]
     assert not list(path.parent.glob("queue.json.*"))
@@ -425,6 +427,7 @@ def test_second_queue_is_refused(qrepo):
 
 
 def test_cmd_queue_once_wires_the_spawner(qrepo, monkeypatch, capsys):
+    qrepo.install_pack()
     spawned: list[tuple] = []
     monkeypatch.setattr("agentflow.flow._preflight", lambda cfg: None)
     monkeypatch.setattr(module_queue, "spawn_feature_run",
@@ -435,6 +438,7 @@ def test_cmd_queue_once_wires_the_spawner(qrepo, monkeypatch, capsys):
 
 
 def test_cmd_queue_refused_while_another_queue_runs(qrepo, monkeypatch, capsys):
+    qrepo.install_pack()
     monkeypatch.setattr("agentflow.flow._preflight", lambda cfg: None)
     with module_queue.queue_lock(qrepo.root):
         assert main(["queue", "--once"]) == 1
@@ -448,17 +452,17 @@ def test_cmd_queue_rejects_bad_max_parallel(qrepo, capsys):
 
 def test_no_module_is_named_like_a_stdlib_module():
     """A file named like a stdlib module shadows it for any process with this folder on `sys.path`
-    (`cd devtools/agentflow && python3 -m pytest` died on `from queue import Queue`)."""
-    names = {p.stem for p in AGENTFLOW.glob("*.py")} | {p.name for p in AGENTFLOW.iterdir() if p.is_dir()}
+    (`cd agentflow && python3 -m pytest` died on `from queue import Queue`)."""
+    names = {p.stem for p in ENGINE.glob("*.py")} | {p.name for p in ENGINE.iterdir() if p.is_dir()}
     assert sorted(names & set(sys.stdlib_module_names)) == []
 
 
 def test_stdlib_queue_resolves_from_the_agentflow_folder():
     out = subprocess.run(
-        [sys.executable, "-c", "import queue; print(queue.__file__)"], cwd=AGENTFLOW,
+        [sys.executable, "-c", "import queue; print(queue.__file__)"], cwd=ENGINE,
         capture_output=True, text=True, check=True,
     ).stdout.strip()
-    assert Path(out).parent != AGENTFLOW
+    assert Path(out).parent != ENGINE
 
 
 # --------------------------------------------------------------------------- blocked modules are reported
@@ -573,7 +577,7 @@ def test_spawn_feature_run_returns_run_id(qrepo, tmp_path):
     argv, _, stdin_text = json.loads(argv_log.read_text(encoding="utf-8"))
     assert argv == ["run", "feature", "--module=crm", "--detach"]
     assert stdin_text == ""  # stdin is closed
-    assert "Started 20261030-1000-feature-crm" in (qrepo.root / "devtools/agentflow/runs/queue.log").read_text()
+    assert "Started 20261030-1000-feature-crm" in (runs_root(qrepo.root) / "queue.log").read_text()
 
 
 def test_spawn_feature_run_passes_config_as_argv_items(qrepo, tmp_path):

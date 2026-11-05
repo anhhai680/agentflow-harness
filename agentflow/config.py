@@ -7,13 +7,17 @@ it can find as a list of `Issue`s, so one run shows them all.
 
 from __future__ import annotations
 
+import posixpath
 import re
 import shlex
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+
+from agentflow import pack
 
 KNOWN_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 BUILTIN_CHECKS = (
@@ -166,6 +170,13 @@ class Issue:
     message: str
 
 
+DEFAULT_SKILLS_DIR = ".claude/skills"
+DEFAULT_SPEC_FILE = "{module}.md"  # a module's spec is `<docs.specs>/<spec_file>`
+REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea`, `decisions`, `glossary` are optional
+WORK_SOURCE_KINDS = ("capability_map",)  # a Markdown table with `Module id` and `Depends on` columns (`sources`)
+SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "verify", "ship")
+
+
 @dataclass
 class Project:
     base_branch: str
@@ -174,6 +185,16 @@ class Project:
     worktrees_dir: str
     docs: dict[str, str]
     commit_trailer: str
+    skills_dir: str = DEFAULT_SKILLS_DIR
+    spec_file: str = DEFAULT_SPEC_FILE
+
+
+@dataclass
+class WorkSource:
+    """Where the modules `agentflow queue`, the Backlog and `modules_done` walk come from (`work_source:`)."""
+
+    kind: Literal["capability_map"]
+    path: str  # relative to the repository root
 
 
 @dataclass
@@ -322,6 +343,8 @@ class Config:
     autonomy: dict = field(default_factory=dict)
     resolve_step: Step | None = None
     ci: dict = field(default_factory=dict)
+    work_source: WorkSource | None = None  # None: no modules to queue; `next` and the Backlog go on without them
+    skills_map: dict[str, str] = field(default_factory=dict)  # the skill `next` names per kind of step (`skills.map`)
 
 
 def for_lane(steps: list[Step], lane: str) -> list[Step]:
@@ -581,6 +604,40 @@ def _build_gates(data: dict) -> dict[str, Gate]:
     return out
 
 
+def _check_format(raw: dict) -> None:
+    """A pack says which format it is written in (`version`) and which engines may run it (`engine`)."""
+    version = _require(raw, "version", "", int)
+    if isinstance(version, bool) or version != pack.PACK_VERSION:
+        raise ConfigError("version", f"pack format {version}; this engine reads format {pack.PACK_VERSION}")
+    spec = _require(raw, "engine", "", str)
+    try:
+        ok = pack.engine_satisfies(spec)
+    except pack.PackError as exc:
+        raise ConfigError("engine", str(exc)) from exc
+    if not ok:
+        raise ConfigError("engine",
+                          f"engine: '{spec}' does not include this engine; this engine is {pack.ENGINE_VERSION}")
+
+
+def _skills_dir(value: str) -> str:
+    """`project.skills_dir` in one spelling (`./skills/` is `skills`), so the user-only-skill guard matches every
+    read of it; empty stays empty for the validator to refuse."""
+    value = value.strip()
+    return posixpath.normpath(value) if value else ""
+
+
+def _work_source(raw: dict) -> WorkSource | None:
+    block = _optional(raw, "work_source", "", dict, None)
+    if block is None:
+        return None
+    return WorkSource(kind=_require(block, "kind", "work_source", str), path=_require(block, "path", "work_source", str))
+
+
+def _skills_map(raw: dict) -> dict[str, str]:
+    block = _optional(raw, "skills", "", dict, {})
+    return {str(k): str(v) for k, v in _optional(block, "map", "skills", dict, {}).items()}
+
+
 def load_config(path: Path) -> Config:
     """Parse `path`, resolve `@` references and build the dataclasses."""
     path = Path(path)
@@ -590,6 +647,7 @@ def load_config(path: Path) -> Config:
         raise ConfigError("", f"cannot read {path}: {exc}") from exc
     if not isinstance(loaded, dict):
         raise ConfigError("", f"{path} must hold a mapping at the top level")
+    _check_format(loaded)
 
     origins: dict[str, str] = {}
     raw = _resolve(loaded, "", loaded, (), origins)
@@ -602,6 +660,7 @@ def load_config(path: Path) -> Config:
     recovery = _optional(raw, "recovery", "", dict, {})
     agents = _require(raw, "agents", "", dict)
     gate_sets = _require(raw, "gate_sets", "", dict)
+    docs = dict(_optional(project, "docs", "project", dict, {}))
     builder = _Builder(origins)
 
     return Config(
@@ -611,8 +670,10 @@ def load_config(path: Path) -> Config:
             fork_from=_require(project, "fork_from", "project", str),
             branch=_require(project, "branch", "project", str),
             worktrees_dir=_require(project, "worktrees_dir", "project", str),
-            docs=dict(_optional(project, "docs", "project", dict, {})),
+            docs=docs,
             commit_trailer=_require(project, "commit_trailer", "project", str),
+            skills_dir=_skills_dir(_optional(project, "skills_dir", "project", str, DEFAULT_SKILLS_DIR)),
+            spec_file=_optional(docs, "spec_file", "project.docs", str, DEFAULT_SPEC_FILE),
         ),
         agents={name: _build_agent(name, spec, f"agents.{name}") for name, spec in agents.items()},
         defaults=Defaults(
@@ -641,7 +702,10 @@ def load_config(path: Path) -> Config:
         gates=_build_gates(_require(raw, "gates", "", dict)),
         gate_sets={name: _string_list(members, f"gate_sets.{name}") for name, members in gate_sets.items()},
         guardrails=Guardrails(
-            forbidden_paths=_string_list(guardrails.get("forbidden_paths", []), "guardrails.forbidden_paths"),
+            forbidden_paths=list(dict.fromkeys([  # the pack's own first; the engine's floor always holds
+                *_string_list(guardrails.get("forbidden_paths", []), "guardrails.forbidden_paths"),
+                *pack.ENGINE_FORBIDDEN,
+            ])),
             reject_trailers=_string_list(guardrails.get("reject_trailers", []), "guardrails.reject_trailers"),
             user_only_skills=_string_list(guardrails.get("user_only_skills", []), "guardrails.user_only_skills"),
         ),
@@ -663,6 +727,8 @@ def load_config(path: Path) -> Config:
         autonomy=_optional(raw, "autonomy", "", dict, {}),
         resolve_step=builder.step(raw["resolve_step"], "resolve_step") if raw.get("resolve_step") else None,
         ci=_optional(raw, "ci", "", dict, {}),
+        work_source=_work_source(raw),
+        skills_map=_skills_map(raw),
     )
 
 
@@ -701,7 +767,6 @@ class _Validator:
     def __init__(self, cfg: Config, repo: Path) -> None:
         self.cfg = cfg
         self.repo = repo
-        self.prompts = cfg.path.parent / "prompts"
         self.issues: list[Issue] = []
         self.roles = {role for agent in cfg.agents.values() for role in agent.models}
 
@@ -727,6 +792,8 @@ class _Validator:
         if "check" in value:
             if value["check"] not in BUILTIN_CHECKS:
                 self.error(_join(path, "check"), f"unknown check '{value['check']}'")
+            if value["check"] == "modules_done" and "from" in value:
+                self.error(_join(path, "from"), "modules_done reads work_source")
         elif "all" in value or "any" in value:
             key = "all" if "all" in value else "any"
             members = value[key]
@@ -760,12 +827,12 @@ class _Validator:
             self.error(path, "skill must be a name")
         elif skill in self.cfg.guardrails.user_only_skills:
             self.error(path, f"'{skill}' is a user-only skill: only the human runs it")
-        elif not (self.repo / ".claude" / "skills" / skill / "SKILL.md").is_file():
-            self.error(path, f"skill '{skill}' has no .claude/skills/{skill}/SKILL.md")
+        elif not (self.repo / self.cfg.project.skills_dir / skill / "SKILL.md").is_file():
+            self.error(path, f"skill '{skill}' has no {self.cfg.project.skills_dir}/{skill}/SKILL.md")
 
     def prompt(self, prompt: Any, path: str) -> None:
-        if not isinstance(prompt, str) or not (self.prompts / prompt).is_file():
-            self.error(path, f"prompt template '{prompt}' is not in {self.prompts.name}/")
+        if not isinstance(prompt, str) or pack.prompt_path(self.cfg.path, prompt) is None:
+            self.error(path, f"prompt template '{prompt}' is not in the pack's prompts/ or the engine's")
 
     def steps(self, steps: list[Step]) -> None:
         """Validate one step list (a phase) and everything nested in it."""
@@ -789,13 +856,11 @@ class _Validator:
 
     def templates(self) -> None:
         """Every `{placeholder}` in every prompt template must be a known key."""
-        if not self.prompts.is_dir():
-            return
-        for file in sorted(self.prompts.glob("*.md")):
+        for file in pack.prompt_files(self.cfg.path).values():
             text = file.read_text(encoding="utf-8")
             for name in dict.fromkeys(_PLACEHOLDER.findall(text)):
                 if name not in PROMPT_PLACEHOLDERS:
-                    self.error(f"prompts/{file.name}", f"unknown placeholder '{{{name}}}'")
+                    self.error(pack.prompt_label(self.cfg.path, file), f"unknown placeholder '{{{name}}}'")
 
     def brief(self, files: list[str], prompt: str | None, path: str) -> None:
         """A brief goes in the prompt at `{brief}`: a missing file, a `{brief}` with no file, or a file with no
@@ -803,16 +868,17 @@ class _Validator:
         for name in files:
             if not (self.repo / name).is_file():
                 self.error(path, f"brief '{name}' is not a file in this repository")
-        template = self.prompts / prompt if prompt else None
-        if template is None or not template.is_file():
+        template = pack.prompt_path(self.cfg.path, prompt) if prompt else None
+        if template is None:
             if files:
                 self.error(path, "a brief needs a prompt template with a {brief} placeholder")
             return
         used = "{brief}" in template.read_text(encoding="utf-8")
+        label = pack.prompt_label(self.cfg.path, template)
         if used and not files:
-            self.error(path, f"prompts/{prompt} has a {{brief}} placeholder, so this step must name the file")
+            self.error(path, f"{label} has a {{brief}} placeholder, so this step must name the file")
         elif files and not used:
-            self.error(path, f"prompts/{prompt} has no {{brief}} placeholder, so this brief would never be sent")
+            self.error(path, f"{label} has no {{brief}} placeholder, so this brief would never be sent")
 
     def step(self, step: Step, phase_ids: set[str]) -> None:
         p = step.path
@@ -843,6 +909,10 @@ class _Validator:
         for name in step.checks:
             if name not in DOC_CHECK_NAMES:
                 self.error(_join(p, "checks"), f"'{name}' is not a doc check ({', '.join(DOC_CHECK_NAMES)})")
+        if step.checks:
+            for key in ("idea", "decisions"):
+                if not self.cfg.project.docs.get(key):
+                    self.error(_join(p, "checks"), f"doc checks read project.docs.{key}, which this pack does not set")
         if step.expect is not None and step.expect not in EXPECT_VALUES:
             self.error(_join(p, "expect"), f"expect must be one of {', '.join(EXPECT_VALUES)}")
         if step.on_fail is not None and step.on_fail not in ON_FAIL_VALUES:
@@ -938,6 +1008,85 @@ class _Validator:
 
     # ---- sections
 
+    def project(self) -> None:
+        docs = self.cfg.project.docs
+        for key in REQUIRED_DOCS:
+            if not isinstance(docs.get(key), str) or not docs[key].strip():
+                self.error(f"project.docs.{key}", f"project.docs.{key} is required: the directory of the {key}")
+        for key in ("idea", "decisions", "glossary"):
+            if key in docs and not isinstance(docs[key], str):
+                self.error(f"project.docs.{key}", "must be a path")
+        if "capability_map" in docs:
+            self.error("project.docs.capability_map", "the module list moved to `work_source: {kind: capability_map, "
+                       "path: ...}`; nothing reads project.docs.capability_map")
+        spec_file = self.cfg.project.spec_file
+        if "{module}" not in spec_file or "/" in spec_file:
+            self.error("project.docs.spec_file", "spec_file is a file name holding {module}, such as '{module}.md'")
+        else:
+            try:
+                spec_file.format(module="m")
+            except (KeyError, IndexError, ValueError, AttributeError) as exc:
+                self.error("project.docs.spec_file", f"spec_file cannot be filled in ({type(exc).__name__}: {exc}): "
+                           "{module} is its only placeholder; write a literal brace as {{ or }}")
+        skills_dir = self.cfg.project.skills_dir
+        if skills_dir in ("", ".") or posixpath.isabs(skills_dir) or ".." in skills_dir.split("/"):
+            self.error("project.skills_dir", "skills_dir is a directory inside the repository holding "
+                       "<skill>/SKILL.md, relative to its root and without '..'")
+
+    def paths(self) -> None:
+        """`paths.state_dir`: a path; a state dir inside the checkout that git doesn't ignore is a warning, since
+        every run would then show up in `git status` and could be committed."""
+        block = self.cfg.raw.get("paths")
+        if block is None:
+            return
+        if not isinstance(block, dict):
+            self.error("paths", "must be a mapping")
+            return
+        value = block.get("state_dir")
+        if value is None:
+            return
+        if not isinstance(value, str) or not value.strip():
+            self.error("paths.state_dir", "state_dir must be a path")
+            return
+        root = pack.checkout_root(self.repo)
+        target = pack.resolve_state_dir(value, root)
+        if not target.is_relative_to(root):
+            return
+        relative = target.relative_to(root).as_posix()
+        try:
+            ignored = subprocess.run(["git", "check-ignore", "-q", f"{relative}/"], cwd=root, capture_output=True)
+        except OSError:  # no git to ask: cannot tell whether it is ignored, so say nothing
+            return
+        if ignored.returncode != 0:
+            self.add("warning", "paths.state_dir",
+                     f"the state dir {relative}/ is inside the repository and git does not ignore it: "
+                     "add it to .gitignore, or leave paths.state_dir unset for a state dir outside the repository")
+
+    def work_source(self) -> None:
+        """`work_source:`: one kind, `capability_map`, at a path inside the repository."""
+        ws = self.cfg.work_source
+        if ws is None:
+            return
+        if ws.kind not in WORK_SOURCE_KINDS:
+            self.error("work_source.kind", "the only work source this engine reads is capability_map")
+        path = ws.path.strip()
+        if not path or posixpath.isabs(path) or ".." in posixpath.normpath(path).split("/"):
+            self.error("work_source.path", "path is a file inside the repository, relative to its root and without '..'")
+
+    def skills_map(self) -> None:
+        """`skills.map`: the skill `agentflow next` names for each kind of step; each one is in `skills_dir`."""
+        block = self.cfg.raw.get("skills")
+        if block is None:
+            return
+        for key in block:
+            if key != "map":
+                self.error(f"skills.{key}", "unknown key; known: map")
+        for key, skill in ((block.get("map") or {}) if isinstance(block.get("map"), dict) else {}).items():
+            if key not in SKILLS_MAP_KEYS:
+                self.error(f"skills.map.{key}", f"unknown key; known: {', '.join(SKILLS_MAP_KEYS)}")
+            else:
+                self.skill(skill, f"skills.map.{key}")
+
     def removed_defaults(self) -> None:
         for key, why in REMOVED_DEFAULTS.items():
             if key in (self.cfg.raw.get("defaults") or {}):
@@ -966,6 +1115,8 @@ class _Validator:
                            f"unknown permission_mode '{agent.permission_mode}': use one of {', '.join(PERMISSION_MODES)}")
 
     def gate_definitions(self) -> None:
+        if not self.cfg.gate_sets.get("verify"):
+            self.error("gate_sets.verify", "every pack declares the gates a diff must pass: gate_sets.verify")
         for name, members in self.cfg.gate_sets.items():
             for i, member in enumerate(members):
                 if member not in self.cfg.gates:
@@ -1185,6 +1336,10 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     """Return every problem found in `cfg`, checked against the checkout at `repo`."""
     v = _Validator(cfg, Path(repo))
     v.removed_defaults()
+    v.project()
+    v.paths()
+    v.work_source()
+    v.skills_map()
     v.agents()
     v.gate_definitions()
     v.conditions()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -108,6 +109,7 @@ def _strings(value: Any) -> list[str]:
 
 def _user_only_violations(cfg: Config, tool_calls: list[dict]) -> list[Violation]:
     user_only = cfg.guardrails.user_only_skills
+    skills_dir = re.escape(posixpath.normpath(cfg.project.skills_dir))  # matches `x`, `./x` and `/repo/x` reads
     found: list[Violation] = []
     for call in tool_calls:
         args = call.get("input") or {}
@@ -117,7 +119,7 @@ def _user_only_violations(cfg: Config, tool_calls: list[dict]) -> list[Violation
                 found.append(Violation("user_only_skill", f"{invoked}: loaded with the Skill tool"))
                 continue
         for skill in user_only:
-            hit = re.compile(rf"\.claude/skills/{re.escape(skill)}(?![\w.-])")
+            hit = re.compile(rf"{skills_dir}/{re.escape(skill)}(?![\w.-])")
             for text in _strings(args):
                 if hit.search(text):
                     found.append(Violation("user_only_skill", f"{skill}: {call.get('name')} {text}"))

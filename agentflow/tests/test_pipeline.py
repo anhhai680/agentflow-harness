@@ -22,7 +22,7 @@ APPROVED_SPEC = (
 )
 PLAN = "# Plan: demo\n\n### Task 1: First thing\n\n**Depends on:** none\n\n- [ ] **Step 1: Do it**\n"
 PLAN_PATH = "docs/plans/2026-10-29-demo.md"
-IDEA = "docs/ideas/agentic-rag-customer-support.md"
+IDEA = "docs/idea.md"
 ENDS_AT_ANSWERS = {"phases": {"define": {"steps": [
     {"id": "ask", "skill": "grilling", "role": "plan", "prompt": "idea.md", "output": "runs/{run}/questions.md"},
     {"id": "asked", "type": "checkpoint", "wait_for": "answered_file"},

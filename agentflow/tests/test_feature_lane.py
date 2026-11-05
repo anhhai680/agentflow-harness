@@ -182,7 +182,7 @@ def test_review_findings_back_once_then_hitl(lane, git):
     assert ("--resume", impl_session) in pairs(fix) and ("--effort", "medium") in pairs(fix)
     assert "receiving-code-review" in fix[-1] and FINDING["text"] in fix[-1] and "src/one.py:3" in fix[-1]
     assert MINOR["text"] not in fix[-1]  # only blocking findings go back
-    assert "Verify before implementing" in fix[-1]  # the skill's own text, since a resumed session will not load it
+    assert "Stub: the receiving-code-review skill." in fix[-1]  # the skill's own text, since a resumed session will not load it
     assert "--resume" not in calls[3]["argv"]  # every round is a new session
     assert "--resume" not in calls[1]["argv"]
     assert FINDING["text"] in calls[3]["argv"][-1] and "src/one.py:3" in calls[3]["argv"][-1]

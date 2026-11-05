@@ -12,9 +12,9 @@ from agentflow.commit_checks import foreign_commits, runner_commits
 from agentflow.flow import main
 from agentflow.pipeline import RunOptions, start
 
-from conftest import AGENTFLOW, run_git
+from conftest import ENGINE, run_git
 
-GH_BIN = AGENTFLOW / "tests" / "bin"
+GH_BIN = ENGINE / "tests" / "bin"
 ROW = {"Module id": "`{module}`", "Responsibility": "{responsibility}", "Depends on": "{deps}",
        "Spec": "[SPEC-{module}](SPEC-{module}.md)"}
 MAP = """# Capability map
@@ -150,5 +150,6 @@ def test_new_module_flag_must_be_exactly_the_expected_shape(nm, capsys, value):
 
 
 def test_new_module_flag_is_accepted_when_well_formed(nm, capsys):
+    nm.install_pack()
     value = json.dumps({"module": "x", "responsibility": "r", "deps": ["platform"]})
     assert main(["run", "feature", "--module=x", f"--new-module={value}", "--dry-run"]) == 0
