@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from agentflow import backlog, module_queue
 from agentflow.backlog import Invalid, Refused
-from agentflow.state import Run
+from agentflow.state import Run, runs_root
 
 from conftest import ENGINE, run_git
 
@@ -508,7 +508,7 @@ def test_a_new_module_card_starts_with_its_row_and_the_stop_phase(bk):
 def test_cards_survive_a_restart_of_the_dashboard(bk):
     item = backlog.add(bk.cfg, bk.root, "bug", {"issue": "3"}, to_phase=None)
     assert f"card:{item.id}" in bk.cards()
-    log = bk.root / "devtools/agentflow/runs/backlog.jsonl"
+    log = runs_root(bk.root) / "backlog.jsonl"
     assert log.is_file() and json.loads(log.read_text().splitlines()[0])["type"] == "item_added"
     reloaded = backlog.Backlog.load(bk.root)
     assert reloaded.items[item.id].params == {"issue": "3"}

@@ -28,7 +28,7 @@ from agentflow.gates import run_gates
 from agentflow.hitl import approve
 from agentflow.pipeline import RunOptions, advance, start
 from agentflow.run_control import ControlError, retry, spawn_resume
-from agentflow.state import Run, display_status
+from agentflow.state import Run, display_status, runs_root
 from test_gates import cfg_with
 
 DONE = {"status": "done", "summary": "did it"}
@@ -326,7 +326,7 @@ def test_start_records_a_failure_after_the_run_exists(pipe, monkeypatch):
     monkeypatch.setattr(pipeline, "add_worktree", broken)
     with pytest.raises(RuntimeError):
         begin(pipe)
-    (run,) = [Run.load(pipe.root, p.name) for p in (pipe.root / "devtools" / "agentflow" / "runs").iterdir()]
+    (run,) = [Run.load(pipe.root, p.name) for p in runs_root(pipe.root).iterdir()]
     assert run.state["status"] == "failed" and "read-only" in run.state["failure"]
 
 

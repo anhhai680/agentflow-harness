@@ -133,12 +133,12 @@ def _phase_artifacts(ctx: Ctx, phase: str | None) -> str:
     return "\n".join(f"- `{path}`" for path in paths) or "(none yet)"
 
 
-def _read_file_skills(text: str) -> str:
-    """For agents that cannot load skills by name: point them at the skill file instead."""
+def _read_file_skills(text: str, skills_dir: str) -> str:
+    """For agents that cannot load skills by name: point them at the skill file in `skills_dir` instead."""
 
     def replace(match: re.Match[str]) -> str:
         read = "Read" if match.group(1) == "U" else "read"
-        return f"{read} `.claude/skills/{match.group(2)}/SKILL.md` and follow it"
+        return f"{read} `{skills_dir}/{match.group(2)}/SKILL.md` and follow it"
 
     return SKILL_LINE.sub(replace, text)
 
@@ -173,7 +173,7 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     text = "\n\n".join(part.strip() for part in (preamble, body, _template(cfg, RESULT)))
     agent = cfg.agents.get(rec.get("agent") or cfg.defaults.agent)
     if agent is not None and agent.skill_loading == "read_file":
-        text = _read_file_skills(text)
+        text = _read_file_skills(text, cfg.project.skills_dir)
     return fmt(text, values) + "\n"
 
 
@@ -551,6 +551,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             result_path=self.run.agent_result_path(sr.key),
             transcript_path=self.run.transcript_path(sr.key, attempt),
             add_dirs=[self.run.agent_dir],  # the workspace only: never the runs root (events, state, inbox)
+            runs_root=self.run.dir.parent,  # denied to the agent's edits, wherever the pack puts the state dir
             timeout_s=self._timeout_s(),
             resume_session=turn.resume,
             agent_profile=sr.agent_profile,

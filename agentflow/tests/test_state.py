@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from agentflow import pack
 from agentflow.events import EventError, EventLog, RunLock, lock_state
 from agentflow.flow import _human_errors, main
 from agentflow.state import (
@@ -24,6 +25,7 @@ from agentflow.state import (
     replay,
     runs_root,
     slugify,
+    workspaces_root,
 )
 
 
@@ -367,7 +369,7 @@ def test_load_unknown_run(repo):
 def test_run_create_and_paths(run, repo, cfg):
     assert run.id.endswith("-feature-crm")
     assert run.dir == runs_root(repo) / run.id
-    assert runs_root(repo) == repo.resolve() / "devtools" / "agentflow" / "runs"
+    assert runs_root(repo) == pack.state_dir(repo) / "runs" and not runs_root(repo).is_relative_to(repo.resolve())
     started = run.events.read()[0]
     assert started["type"] == "run_started" and started["params"] == {"module": "crm"}
     assert run.state["run_id"] == run.id and run.state["budget_usd"] == cfg.defaults.run_budget_usd
@@ -380,7 +382,7 @@ def test_run_create_and_paths(run, repo, cfg):
     assert run.refine_note_path("plan", 1) == run.dir / "refine" / "plan-1.md"
     assert run.questions_path() == run.dir / "questions.md"
     assert run.progress_path() == run.agent_dir / "progress.md"  # the agent's notes live in its workspace
-    assert run.agent_dir == repo.resolve() / "devtools" / "agentflow" / "workspaces" / run.id
+    assert run.agent_dir == workspaces_root(repo) / run.id == pack.state_dir(repo) / "workspaces" / run.id
     assert run.agent_result_path(key) == run.agent_dir / "out" / "build__implement__task-3__implement.json"
     assert run.handoff_path() == run.dir / "handoff.md"
     assert run.dir.is_absolute()
@@ -412,7 +414,7 @@ def test_list_runs_and_find_run(repo, cfg):
     assert list_runs(repo) == []
     first = Run.create(cfg, repo, "feature", {"module": "crm"})
     second = Run.create(cfg, repo, "bug", {"issue": 7})
-    (repo / "devtools" / "agentflow" / "runs" / "stray").mkdir()
+    (runs_root(repo) / "stray").mkdir()
     assert {r.id for r in list_runs(repo)} == {first.id, second.id}
     assert find_run(repo, first.id).id == first.id
     assert find_run(repo, "-bug-7").id == second.id

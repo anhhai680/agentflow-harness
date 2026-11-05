@@ -43,6 +43,14 @@ def deep_merge(base: Any, patch: Any) -> Any:
     return out
 
 
+@pytest.fixture(autouse=True)
+def _state_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Every test's default state dir (`pack.state_dir`) is under its own tmp dir, never `~/.local/state`."""
+    home = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_STATE_HOME", str(home))
+    return home
+
+
 @pytest.fixture
 def repo_root() -> Path:
     return REPO
@@ -190,8 +198,8 @@ class FlowRepo:
 
     `configure(patch)` reloads the `python` pack's config with the fake agent as `claude`, no notifiers,
     the `TEST_GATES` added, and `patch` deep-merged on top. `new_run()` starts a `feature` run for
-    module `crm`; `executor()` builds an `Executor` for it. The repo ignores the runs root and the agent
-    workspaces, as the real one does, so run files never show up in a step's diff.
+    module `crm`; `executor()` builds an `Executor` for it. The runs root and the agent workspaces are in
+    the state dir, outside the repo (`pack.state_dir`), so run files never show up in a step's diff.
     """
 
     def __init__(self, root: Path, origin: Path, fake: FakeAgent, make_cfg: Callable[..., Path]) -> None:
@@ -284,8 +292,7 @@ def flow_repo(tmp_path: Path, fake: FakeAgent, tmp_cfg: Callable[..., Path], mon
     run_git(root, "config", "user.name", "Test")
     run_git(root, "config", "user.email", "test@example.com")
     run_git(root, "config", "commit.gpgsign", "false")
-    (root / ".gitignore").write_text("devtools/agentflow/runs/\ndevtools/agentflow/workspaces/\n__pycache__/\n",
-                                    encoding="utf-8")
+    (root / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
     (root / "CONSTRAINTS.md").write_text("rules\n", encoding="utf-8")
     (root / ".claude").mkdir()
     (root / ".claude" / "settings.json").write_text(json.dumps(FLOW_SETTINGS, indent=2) + "\n", encoding="utf-8")

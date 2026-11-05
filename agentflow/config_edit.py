@@ -45,8 +45,8 @@ AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices")  # what a page ma
 PHASE_FREE_KEYS = ("needs_approval", "resolve", "model", "agent")  # the rest of a phase is the workflow itself
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
     "version", "engine", "gates", "gate_sets", "guardrails", "conditions", "overlays", "project", "phase_approval",
-    "record_step", "resolve_step", "defaults.env", "context.autocompact_env", "context.progress_file", "hitl.notify",
-    "dashboard.host",
+    "record_step", "resolve_step", "paths", "defaults.env", "context.autocompact_env", "context.progress_file",
+    "hitl.notify", "dashboard.host",
 )
 PROTECTED = (
     *_PROTECTED_KEYS,

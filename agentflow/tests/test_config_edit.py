@@ -171,6 +171,29 @@ def test_yaml_text_may_change_anything_but_the_protected_settings(shipped):
             config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
 
 
+@pytest.mark.parametrize("old, new", [
+    ("  commit_trailer:", "  skills_dir: skills\n  commit_trailer:"),                  # project.skills_dir added
+    ('    spec_file: "SPEC-{module}.md"', '    spec_file: "{module}-spec.md"'),             # changed
+    ('    spec_file: "SPEC-{module}.md"   # a module\'s spec is <specs>/<spec_file>\n', ""),  # removed
+    ("version: 2\n", "version: 2\npaths:\n  state_dir: ../elsewhere\n"),              # paths.state_dir
+])
+def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
+    _, sha = config_edit.read(shipped)
+    assert old in SHIPPED, old
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
+
+
+@pytest.mark.parametrize("key, value", [
+    (["project", "skills_dir"], "skills"),
+    (["project", "docs", "spec_file"], "{module}-spec.md"),
+    (["paths", "state_dir"], "../elsewhere"),
+])
+def test_the_form_refuses_the_paths_the_runner_reads(shipped, key, value):
+    with pytest.raises(Refused):
+        form(shipped, (key, value))
+
+
 def test_yaml_text_that_does_not_load_or_validate_reports_why(shipped):
     _, sha = config_edit.read(shipped)
     broken = config_edit.propose(shipped, sha, text="version: [", repo=REPO)

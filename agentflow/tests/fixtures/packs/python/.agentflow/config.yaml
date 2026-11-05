@@ -13,6 +13,7 @@ project:
     idea: docs/idea.md
     capability_map: docs/specs/CAPABILITY-MAP.md
     specs: docs/specs
+    spec_file: "SPEC-{module}.md"   # a module's spec is <specs>/<spec_file>
     plans: docs/plans
     decisions: docs/decisions
   commit_trailer: "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"

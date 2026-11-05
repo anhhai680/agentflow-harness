@@ -3,19 +3,26 @@ range it runs on, and its prompts, which resolve from the pack first, then from 
 
 A leaf module: it imports nothing from `agentflow`. The pack is the directory holding the config file; its
 `prompts/` directory overrides the engine's `prompts/` file by file. The CLI reads the pack of the main checkout
-only, never a linked worktree's copy, which is on another branch."""
+only, never a linked worktree's copy, which is on another branch. The state dir (`state_dir`) holds the runs and
+the agent workspaces, outside the repository unless the pack says otherwise."""
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import subprocess
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 ENGINE_PROMPTS: Path = Path(__file__).parent / "prompts"
 PACK_DIR = ".agentflow"
 PACK_VERSION = 2  # the pack format this engine reads (`version:`)
 ENGINE_VERSION = "2.0"  # what a pack's `engine:` range is checked against
 ENGINE_FORBIDDEN = (".agentflow/**",)  # forbidden paths every pack gets, whatever it lists itself
+STATE_HOME = "~/.local/state"  # where the default state dir goes when `XDG_STATE_HOME` is unset
 
 _CLAUSE = re.compile(r"(>=|<=|==|>|<)\s*(\d+(?:\.\d+)*)")
 
@@ -48,6 +55,69 @@ def pack_config(repo: Path) -> Path:
     if not path.is_file():
         raise PackError(f"no {PACK_DIR}/config.yaml in {path.parent.parent}: this repository has no agentflow pack")
     return path
+
+
+_CHECKOUTS: dict[str, Path] = {}  # a directory's main checkout, once git has named one: it does not move
+
+
+def checkout_root(repo: Path) -> Path:
+    """The main checkout holding `repo`, or `repo` itself when it is in no git repository (or doesn't exist).
+
+    Every run path goes through here (`state.runs_root`), so a found checkout is cached by the resolved path;
+    a miss is not, so a directory that becomes a repository later is looked up again."""
+    key = str(Path(repo).resolve())
+    if key not in _CHECKOUTS:
+        try:
+            _CHECKOUTS[key] = main_checkout(Path(key))
+        except (subprocess.CalledProcessError, OSError):
+            return Path(key)
+    return _CHECKOUTS[key]
+
+
+_STATE_DIR_CACHE: dict[tuple[str, int, int], Any] = {}
+
+
+def _raw_state_dir(config: Path) -> Any:
+    """The pack's `paths.state_dir` as written (None when unset, unreadable or no pack), cached by the file's
+    path, modification time and size, so a rewritten pack is read again."""
+    try:
+        st = config.stat()
+    except OSError:
+        return None
+    key = (str(config), st.st_mtime_ns, st.st_size)
+    if key not in _STATE_DIR_CACHE:
+        try:
+            data = yaml.safe_load(config.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            data = None
+        paths = data.get("paths") if isinstance(data, dict) else None
+        _STATE_DIR_CACHE[key] = paths.get("state_dir") if isinstance(paths, dict) else None
+    return _STATE_DIR_CACHE[key]
+
+
+def repo_id(root: Path) -> str:
+    """The default state dir's name for the main checkout `root`: its name and a hash of its path."""
+    root = Path(root).resolve()
+    return f"{root.name}-{hashlib.sha256(str(root).encode('utf-8')).hexdigest()[:8]}"
+
+
+def resolve_state_dir(value: str, root: Path) -> Path:
+    """A `paths.state_dir` value as a directory: `~` expanded, a relative value relative to the main checkout."""
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else Path(root) / path).resolve()
+
+
+def state_dir(repo: Path) -> Path:
+    """Where the runs and the agent workspaces of the repository holding `repo` live: the pack's `paths.state_dir`,
+    else `${XDG_STATE_HOME:-~/.local/state}/agentflow/<repo-id>`. It reads the pack's YAML itself (no config load)
+    and uses the default when the repository has no pack or the value is not a non-empty string."""
+    root = checkout_root(repo)
+    value = _raw_state_dir(root / PACK_DIR / "config.yaml")
+    if isinstance(value, str) and value.strip():
+        return resolve_state_dir(value, root)
+    home = os.environ.get("XDG_STATE_HOME", "")
+    base = Path(home) if home and Path(home).is_absolute() else Path(STATE_HOME).expanduser()
+    return base / "agentflow" / repo_id(root)
 
 
 def _version(text: str) -> tuple[int, ...]:

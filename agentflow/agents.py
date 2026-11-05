@@ -44,6 +44,7 @@ class AgentCall:
     context_window: int | None = None  # the model's window when the runner knows it (else the default)
     env: dict[str, str] = field(default_factory=dict)  # `defaults.env`
     forbidden_paths: list[str] = field(default_factory=list)  # `guardrails.forbidden_paths`
+    runs_root: Path | None = None  # the runner's own state (`state.runs_root`): no agent edits it
 
 
 @dataclass
@@ -511,6 +512,8 @@ class ClaudeAgent(_CliAgent):
         argv += ["--permission-prompts", "none"]
         # `./`: `claude` ignores the project-root form `Edit(/path)` in --settings. The guards stay the backstop.
         deny = [*(f"Edit(./{path})" for path in call.forbidden_paths), *RUNNER_ONLY_DENY]
+        if call.runs_root is not None:  # `//` + an absolute path is an absolute path in a permission rule
+            deny.append(f"Edit(/{call.runs_root}/**)")
         argv += ["--settings", json.dumps({"permissions": {"deny": deny}})]
         if spec.max_turns is not None:
             argv += ["--max-turns", str(spec.max_turns)]

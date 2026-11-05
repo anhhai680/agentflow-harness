@@ -21,7 +21,7 @@ from agentflow.flow import main
 from agentflow.lanes import Executor
 from agentflow.pipeline import RunOptions, advance, start
 from agentflow.run_control import ControlError, cancel, pause, retry
-from agentflow.state import Run
+from agentflow.state import Run, runs_root
 from agentflow.views import agents_table, agents_view, board, board_table, watch
 
 DONE = {"status": "done", "summary": "did it"}
@@ -363,7 +363,7 @@ def fixture_runs(flow_repo) -> tuple[Run, Run]:
 
 def test_board_cards_for_fixture_runs(pipe):
     planning, building = fixture_runs(pipe)
-    queue = pipe.root / "devtools" / "agentflow" / "runs" / "queue.json"
+    queue = runs_root(pipe.root) / "queue.json"
     queue.write_text(json.dumps({"modules": [
         {"id": "settings", "deps": ["platform"], "status": "backlog", "run_id": None, "blocked": "waiting on platform"},
         {"id": "crm", "deps": [], "status": "running", "run_id": building.id},

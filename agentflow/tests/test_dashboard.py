@@ -16,7 +16,7 @@ import pytest
 
 from agentflow import hitl
 from agentflow.dashboard import make_server
-from agentflow.state import Run
+from agentflow.state import Run, runs_root
 from agentflow.views import _badge
 from conftest import PYTHON_CONFIG, run_git
 
@@ -890,7 +890,7 @@ def test_the_refresh_round_updates_the_cards_and_starts_nothing(bdash):
     from agentflow.dashboard import refresh_once
 
     refresh_once(bdash.server)
-    assert (bdash.flow.root / "devtools/agentflow/runs/queue.json").is_file()
+    assert (runs_root(bdash.flow.root) / "queue.json").is_file()
     assert bdash.fake.calls == []
 
 

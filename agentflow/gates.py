@@ -167,7 +167,7 @@ OPEN_QUESTIONS = "## Open Questions"
 HUNK = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 TABLE_SEPARATOR = re.compile(r"^\|[\s|:-]*$")
 ADR_FILE = "ADR-*.md"
-EDITING_RULES = 'CLAUDE.md "Editing the idea doc"'
+EDITING_RULES = "the design doc's editing rules"
 WORK_TREE = "the work tree"
 
 

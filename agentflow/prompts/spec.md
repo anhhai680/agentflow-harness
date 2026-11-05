@@ -4,7 +4,7 @@ Goal: draft `{spec}` for module `{module}`.
 
 Read, by path:
 - The `{module}` row in `{capability_map}` (scope, dependencies, build order).
-- The idea doc `{idea}`: `grep -n '^## '` first, then only the sections the module touches. Never read it whole.
+- The idea doc, if one is configured (`{idea}`): `grep -n '^## '` first, then only the sections the module touches. Never read it whole.
 - The decision records that the module touches, and one finished spec of another module for the format, if there is one.
 
 If `{questions}` exists, it holds a human's answers to the idea questions for this module: treat them as settled and build the spec on them. Record any product-level answer as the repository's agent instructions say to edit the design docs.

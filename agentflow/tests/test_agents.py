@@ -19,6 +19,7 @@ from agentflow.agents import (
     parse_codex_line,
 )
 from agentflow.config import load_config
+from agentflow.state import runs_root
 from conftest import PYTHON_CONFIG
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -42,7 +43,7 @@ def codex(cfg) -> CodexAgent:
 
 @pytest.fixture
 def runs(tmp_path: Path) -> Path:
-    path = tmp_path / "main" / "devtools" / "agentflow" / "runs"
+    path = runs_root(tmp_path / "main")
     path.mkdir(parents=True)
     return path
 
@@ -119,6 +120,30 @@ def test_claude_argv_denies_runner_only_commands(claude, call):
         deny = json.loads(a[a.index("--settings") + 1])["permissions"]["deny"]
         assert set(RUNNER_ONLY_DENY) <= set(deny)
         assert all(f"Edit(./{p})" in deny for p in c.forbidden_paths)
+
+
+def claude_argv_for(repo: Path) -> list[str]:
+    """The argv a run in `repo` gives `claude`: the call names the run's runs root, as the runner's does."""
+    claude = ClaudeAgent(load_config(PYTHON_CONFIG).agents["claude"], load_config(PYTHON_CONFIG).context)
+    root = runs_root(repo)
+    return claude.argv(AgentCall(
+        prompt="p", model="sonnet", effort="medium", cwd=repo, run_id="r", step_key=STEP,
+        result_path=root / "r" / "result.json", transcript_path=root / "r" / "t.jsonl",
+        add_dirs=[], timeout_s=60, runs_root=root,
+    ))
+
+
+def deny_rules(argv: list[str]) -> list[str]:
+    return json.loads(argv[argv.index("--settings") + 1])["permissions"]["deny"]
+
+
+def test_runner_denies_edits_to_the_runs_root(repo_root):
+    assert f"Edit(/{runs_root(repo_root)}/**)" in deny_rules(claude_argv_for(repo_root))
+    assert f"Edit(/{runs_root(repo_root)}/**)".startswith("Edit(//")  # `//` is an absolute path in a rule
+
+
+def test_claude_argv_without_a_runs_root_adds_no_rule_for_it(claude, call):
+    assert not [rule for rule in deny_rules(claude.argv(call)) if rule.startswith("Edit(//")]
 
 
 def test_claude_argv_add_dir_never_directly_before_prompt(claude, call, runs):

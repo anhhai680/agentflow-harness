@@ -17,7 +17,7 @@ This repo is the reference setup. The design is in `docs/agentflow-proposal.md`,
 - **The agent handles its own problems after `plan`.** A stop goes to a fresh resolver session first, blocking review or verify findings get an automatic fix plan and fix round, and a CI failure gets a fix and a push. You hear about it only when those run out.
 - **A usage limit or an outage is a hold, not a stop.** The run shows as `held`, waits, and carries on by itself (section 8).
 - The **runner is the only thing that commits and pushes**. Agents never do. `feature`, `bug` and `eval` runs end with a PR marked ready for review once CI passes. Nothing merges it but you.
-- All state is an event log under `agentflow/runs/<run>/`. The CLI, the dashboard and the PR body read the same events.
+- All state is an event log under `<state dir>/runs/<run>/` (the state dir is outside the repository by default; see `paths.state_dir` in section 14). The CLI, the dashboard and the PR body read the same events.
 
 You stay in charge of three things: answering the questions in `define` and `plan`, approving those two phases, and merging the PR.
 
@@ -104,7 +104,7 @@ agentflow run feature --module crm
 
 It creates a worktree under `../tivacare-worktrees/<run>` on `flow/feature/<slug>`, forked from `next`, and starts at the first phase that is not skipped. It stops at the first question or approval. The run id looks like `20261030-0915-feature-crm`.
 
-Useful options: `--from plan --to build` (start and stop at chosen phases; the `--to` phase still raises its approval), `--model plan=sonnet` (one phase's model, this run only; it replaces that phase's whole role map), `--detach` (run in the background, logging to `agentflow/runs/<run>/runner.log`).
+Useful options: `--from plan --to build` (start and stop at chosen phases; the `--to` phase still raises its approval), `--model plan=sonnet` (one phase's model, this run only; it replaces that phase's whole role map), `--detach` (run in the background, logging to `<state dir>/runs/<run>/runner.log`).
 
 A foreground run outlives its terminal: if the window closes, the runner carries on and writes to the same `runner.log`.
 
@@ -295,7 +295,7 @@ agentflow queue --max-parallel 2          # loop, every --interval seconds (30):
 agentflow queue --once                    # one tick, for cron
 ```
 
-A module is done when its plan is fully checked and its PR is merged. The queue starts ready modules in `docs/specs/CAPABILITY-MAP.md` order, never above `--max-parallel`. A run that is waiting for you, paused or held keeps its slot but does not block the others. It prints `queue: <module> blocked — <reason>` once per change: an unauthenticated `gh`, a failed, cancelled or crashed run, a start that failed, an unknown dependency, a dependency cycle. Failed and crashed runs are never restarted automatically. Only one `agentflow queue` runs at a time, and its start output goes to `agentflow/runs/queue.log`.
+A module is done when its plan is fully checked and its PR is merged. The queue starts ready modules in `docs/specs/CAPABILITY-MAP.md` order, never above `--max-parallel`. A run that is waiting for you, paused or held keeps its slot but does not block the others. It prints `queue: <module> blocked — <reason>` once per change: an unauthenticated `gh`, a failed, cancelled or crashed run, a start that failed, an unknown dependency, a dependency cycle. Failed and crashed runs are never restarted automatically. Only one `agentflow queue` runs at a time, and its start output goes to `<state dir>/runs/queue.log`.
 
 ## 10. Cheat sheet
 
@@ -318,7 +318,7 @@ agentflow queue --max-parallel 2
 
 ## 11. Safety model in five lines
 
-1. Agents get one writable folder besides the work tree: `agentflow/workspaces/<run>/`. The run's events, state, inbox and lock live in `agentflow/runs/`, outside it.
+1. Agents get one writable folder besides the work tree: `<state dir>/workspaces/<run>/`. The run's events, state, inbox and lock live in `<state dir>/runs/`, outside it, and the runner denies agents any edit there.
 2. The runner refuses a step that touches a path in the pack's `guardrails.forbidden_paths` (such as `CONSTRAINTS.md`, `eval/baseline.json` or `.claude/**`) or the pack itself (`.agentflow/**`, always), that moves `HEAD`, or that uses a user-only skill. It re-checks before every commit and before the push.
 3. Only the runner pushes, only commits it made, never with `--force`. It never writes `Constraints-Approved-By`.
 4. The dashboard listens on `127.0.0.1` only and every request needs the token. Do not paste the dashboard URL into chat or tickets.
@@ -353,7 +353,7 @@ agentflow queue --max-parallel 2
 - write `.claude/settings.json` `allow` rules for exactly your gate commands, and keep the `ask` and `deny` rules;
 - run `agentflow validate` until it prints 0 warnings, then `agentflow explain` and `agentflow run … --dry-run` before the first real run.
 
-Add `agentflow/runs/` and `agentflow/workspaces/` to `.gitignore` (they are ignored here).
+Runs and workspaces live in the state dir, outside the repository unless `paths.state_dir` puts them inside it; then add that directory to `.gitignore` (`agentflow validate` warns until you do).
 
 ## 14. Pack reference
 
@@ -362,6 +362,10 @@ The pack is the repository's `.agentflow/` directory in the main checkout: `conf
 - `version`: the pack format, `2`. The engine reads format 2 only and refuses any other. Protected.
 - `engine`: the engine versions that may run the pack, comma-separated clauses of `>=`, `>`, `<=`, `<`, `==` on dotted numbers, such as `">=2,<3"`. A range that leaves this engine out is refused. Protected.
 - `project`: branches (`base_branch`, `fork_from`, `branch`), `worktrees_dir`, the `docs` paths and the `commit_trailer`. Protected.
+- `project.skills_dir`: the directory holding `<skill>/SKILL.md` for every skill a step names, relative to the repository root; default `.claude/skills`. Protected.
+- `project.docs`: `specs` and `plans` (directories) are required; `idea`, `decisions` and `glossary` are optional, and a step with `checks:` needs `idea` and `decisions`. `{idea}` is empty when `idea` is unset. Protected.
+- `project.docs.spec_file`: a module's spec file name inside `docs.specs`, with `{module}` in it; default `{module}.md`. Protected.
+- `paths.state_dir`: where runs (`runs/`) and agent workspaces (`workspaces/`) live; `~` is expanded and a relative path is relative to the main checkout. Default `${XDG_STATE_HOME:-~/.local/state}/agentflow/<repo-id>`, outside the repository (`<repo-id>` is the checkout's name and a hash of its path). A state dir inside the repository that git does not ignore is a `validate` warning. Protected.
 - `agents.<name>`: the command line and arguments of an agent CLI, its models, `max_turns` and prices. Protected, except `enabled`, `models`, `max_turns` and `prices`.
 - `defaults`: the default agent, timeouts, `fix_attempts` and budgets. Not protected, except `defaults.env`.
 - `recovery`: how long an outage may last and how many failed attempts a step gets. Not protected.

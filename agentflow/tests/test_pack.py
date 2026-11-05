@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -9,8 +11,9 @@ import yaml
 from agentflow import pack
 from agentflow.config import PROMPT_PLACEHOLDERS, ConfigError, load_config, validate
 from agentflow.config_trust import ConfigUntrusted, trusted_config_path
-from agentflow.state import Run
-from conftest import PYTHON_CONFIG, deep_merge, run_git
+from agentflow.conditions import make_ctx
+from agentflow.state import Run, runs_root, workspaces_root
+from conftest import PYTHON_CONFIG, PYTHON_SKILLS, deep_merge, run_git
 
 
 def write_pack(root: Path, patch: dict) -> Path:
@@ -190,3 +193,127 @@ def test_engine_default_prompts_use_only_known_placeholders():
     for file in pack.ENGINE_PROMPTS.glob("*.md"):
         names = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", file.read_text(encoding="utf-8")))
         assert names <= PROMPT_PLACEHOLDERS, file.name
+
+
+# --------------------------------------------------------------------------- paths from the pack
+
+
+def copy_skills(root: Path, into: str) -> Path:
+    """The `python` pack's skill stubs copied to `<root>/<into>/`; returns `root`."""
+    shutil.copytree(PYTHON_SKILLS, root / into)
+    return root
+
+
+def test_state_dir_relative_value_is_relative_to_the_main_checkout(tmp_git, git):
+    write_pack(tmp_git, {"paths": {"state_dir": "var/af"}})
+    wt = make_worktree(tmp_git, git)
+    assert pack.state_dir(wt) == (tmp_git / "var/af").resolve()
+
+
+def test_state_dir_expands_the_home_dir(tmp_git, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    write_pack(tmp_git, {"paths": {"state_dir": "~/af"}})
+    assert pack.state_dir(tmp_git) == (tmp_path / "home" / "af").resolve()
+
+
+def test_state_dir_default_is_outside_the_repo(tmp_git, monkeypatch, tmp_path):
+    write_pack(tmp_git, {}); monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    got = pack.state_dir(tmp_git)
+    assert got.parent == tmp_path / "xdg/agentflow" and got.name.startswith(tmp_git.name + "-")
+
+
+def test_state_dir_default_is_the_same_from_a_worktree_and_without_a_pack(tmp_git, git):
+    wt = make_worktree(tmp_git, git)
+    assert pack.state_dir(wt) == pack.state_dir(tmp_git)
+    digest = hashlib.sha256(str(tmp_git.resolve()).encode()).hexdigest()[:8]
+    assert pack.state_dir(tmp_git).name == f"{tmp_git.name}-{digest}"
+
+
+def test_state_dir_follows_a_rewritten_pack(tmp_git):
+    write_pack(tmp_git, {"paths": {"state_dir": "one"}})
+    assert pack.state_dir(tmp_git) == (tmp_git / "one").resolve()
+    write_pack(tmp_git, {"paths": {"state_dir": "second"}})  # another size too: the cache keys on mtime and size
+    assert pack.state_dir(tmp_git) == (tmp_git / "second").resolve()
+
+
+def test_state_dir_of_a_directory_outside_git_is_its_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert pack.state_dir(plain).parent == tmp_path / "xdg/agentflow"
+
+
+def test_runs_and_workspaces_live_in_the_state_dir(tmp_git):
+    write_pack(tmp_git, {"paths": {"state_dir": "var/af"}})
+    assert runs_root(tmp_git) == (tmp_git / "var/af/runs").resolve()
+    assert workspaces_root(tmp_git) == (tmp_git / "var/af/workspaces").resolve()
+
+
+def test_state_dir_inside_the_repo_and_not_ignored_warns(tmp_git):
+    cfg_with_state_dir = load_config(write_pack(tmp_git, {"paths": {"state_dir": "state"}}))
+    assert any(i.level == "warning" and i.path == "paths.state_dir" for i in validate(cfg_with_state_dir, tmp_git))
+
+
+def test_state_dir_inside_the_repo_and_ignored_does_not_warn(tmp_git):
+    (tmp_git / ".gitignore").write_text("/state/\n", encoding="utf-8")
+    cfg = load_config(write_pack(tmp_git, {"paths": {"state_dir": "state"}}))
+    assert not [i for i in validate(cfg, tmp_git) if i.path == "paths.state_dir"]
+
+
+def test_state_dir_outside_the_repo_does_not_warn(tmp_git, tmp_path):
+    cfg = load_config(write_pack(tmp_git, {"paths": {"state_dir": str(tmp_path / "elsewhere")}}))
+    assert not [i for i in validate(cfg, tmp_git) if i.path == "paths.state_dir"]
+
+
+def test_state_dir_that_is_not_a_string_is_an_error(tmp_cfg, repo_root):
+    cfg = load_config(tmp_cfg({"paths": {"state_dir": 3}}))
+    assert any(i.level == "error" and i.path == "paths.state_dir" for i in validate(cfg, repo_root))
+
+
+def test_skills_dir_defaults_to_claude_skills(tmp_cfg):
+    assert load_config(tmp_cfg()).project.skills_dir == ".claude/skills"
+
+
+def test_skills_dir_is_read_from_the_pack(tmp_cfg, tmp_path):
+    repo = copy_skills(tmp_path, into="skills")                     # the python pack's stubs copied to skills/
+    cfg = load_config(tmp_cfg({"project": {"skills_dir": "skills"}}))
+    (tmp_path / ".claude" / "skills").unlink()                      # only the pack's own skills dir holds them
+    assert not [i for i in validate(cfg, repo) if i.message.startswith("skill ")]  # (briefs name .claude/skills)
+    missing = load_config(tmp_cfg({"project": {"skills_dir": "nowhere"}}))
+    assert any("nowhere/test-driven-development/SKILL.md" in i.message for i in validate(missing, repo))
+
+
+def test_read_file_skill_lines_name_the_skills_dir():
+    from agentflow.lanes import _read_file_skills
+
+    text = _read_file_skills("Use the `writing-plans` skill.", "skills")
+    assert "`skills/writing-plans/SKILL.md`" in text
+
+
+def test_spec_placeholder_uses_spec_file(tmp_cfg, repo_root):
+    cfg = load_config(tmp_cfg({"project": {"docs": {"spec_file": "{module}-spec.md"}}}))
+    assert make_ctx(cfg, repo_root, "feature", {"module": "crm"}).values["spec"] == "docs/specs/crm-spec.md"
+
+
+def test_spec_file_defaults_to_the_module_name(tmp_cfg, repo_root):
+    cfg = load_config(tmp_cfg({"project": {"docs": {"spec_file": None}}}))
+    assert cfg.project.spec_file == "{module}.md"
+    assert make_ctx(cfg, repo_root, "feature", {"module": "crm"}).values["spec"] == "docs/specs/crm.md"
+
+
+def test_idea_placeholder_is_empty_without_an_idea_doc(tmp_cfg, repo_root):
+    cfg = load_config(tmp_cfg({"project": {"docs": {"idea": None}}}))
+    assert make_ctx(cfg, repo_root, "feature", {"module": "crm"}).values["idea"] == ""
+
+
+@pytest.mark.parametrize("key", ["specs", "plans"])
+def test_docs_specs_and_plans_are_required(tmp_cfg, repo_root, key):
+    cfg = load_config(tmp_cfg({"project": {"docs": {key: None}}}))
+    assert any(i.level == "error" and i.path == f"project.docs.{key}" for i in validate(cfg, repo_root))
+
+
+@pytest.mark.parametrize("key", ["idea", "decisions"])
+def test_doc_checks_need_the_idea_doc_and_the_decisions_dir(tmp_cfg, repo_root, key):
+    cfg = load_config(tmp_cfg({"project": {"docs": {key: None}}}))
+    errors = [i for i in validate(cfg, repo_root) if i.level == "error"]
+    assert errors and all(i.path.endswith(".checks") and f"project.docs.{key}" in i.message for i in errors)

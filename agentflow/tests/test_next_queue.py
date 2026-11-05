@@ -13,6 +13,7 @@ import pytest
 from agentflow import hitl, module_queue
 from agentflow.flow import main
 from agentflow.module_queue import NextAnswer, QueueBusy, QueueState, StartFailed, next_step, queue_tick
+from agentflow.state import runs_root
 
 from conftest import ENGINE, run_git
 
@@ -380,7 +381,7 @@ def test_queue_rejects_bad_max_parallel(qrepo):
 
 def test_queue_state_roundtrip_is_atomic_json(qrepo):
     queue_tick(qrepo.cfg, qrepo.root, 1, Starter(qrepo))
-    path = qrepo.root / "devtools" / "agentflow" / "runs" / "queue.json"
+    path = runs_root(qrepo.root) / "queue.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     assert [m["id"] for m in data["modules"]] == ["platform", "staff-auth", "crm", "settings"]
     assert not list(path.parent.glob("queue.json.*"))
@@ -451,7 +452,7 @@ def test_cmd_queue_rejects_bad_max_parallel(qrepo, capsys):
 
 def test_no_module_is_named_like_a_stdlib_module():
     """A file named like a stdlib module shadows it for any process with this folder on `sys.path`
-    (`cd devtools/agentflow && python3 -m pytest` died on `from queue import Queue`)."""
+    (`cd agentflow && python3 -m pytest` died on `from queue import Queue`)."""
     names = {p.stem for p in ENGINE.glob("*.py")} | {p.name for p in ENGINE.iterdir() if p.is_dir()}
     assert sorted(names & set(sys.stdlib_module_names)) == []
 
@@ -576,7 +577,7 @@ def test_spawn_feature_run_returns_run_id(qrepo, tmp_path):
     argv, _, stdin_text = json.loads(argv_log.read_text(encoding="utf-8"))
     assert argv == ["run", "feature", "--module=crm", "--detach"]
     assert stdin_text == ""  # stdin is closed
-    assert "Started 20261030-1000-feature-crm" in (qrepo.root / "devtools/agentflow/runs/queue.log").read_text()
+    assert "Started 20261030-1000-feature-crm" in (runs_root(qrepo.root) / "queue.log").read_text()
 
 
 def test_spawn_feature_run_passes_config_as_argv_items(qrepo, tmp_path):

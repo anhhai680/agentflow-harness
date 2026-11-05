@@ -147,7 +147,7 @@ def test_forbidden_paths_are_denied_before_the_edit(flow_repo):
     settings = json.loads(argv[argv.index("--settings") + 1])
     # `./`, not `/`: real `claude` ignored `Edit(/CONSTRAINTS.md)` from --settings and let the write through
     assert settings == {"permissions": {"deny": ["Edit(./CONSTRAINTS.md)", "Edit(./.claude/**)", "Edit(./.agentflow/**)",
-                                                 *RUNNER_ONLY_DENY]}}
+                                                 *RUNNER_ONLY_DENY, f"Edit(/{run.dir.parent}/**)"]}}
 
 
 def test_settings_hold_only_the_engine_floor_and_the_runner_only_denies_when_the_pack_forbids_nothing(flow_repo):
@@ -157,8 +157,9 @@ def test_settings_hold_only_the_engine_floor_and_the_runner_only_denies_when_the
     run_impl(flow_repo, run)
     assert cfg.guardrails.forbidden_paths == [".agentflow/**"]  # the engine's floor: the pack itself
     argv = flow_repo.calls()[0]["argv"]
-    assert json.loads(argv[argv.index("--settings") + 1]) == {"permissions": {"deny": ["Edit(./.agentflow/**)",
-                                                                                      *RUNNER_ONLY_DENY]}}
+    assert json.loads(argv[argv.index("--settings") + 1]) == {"permissions": {"deny": [
+        "Edit(./.agentflow/**)", *RUNNER_ONLY_DENY, f"Edit(/{run.dir.parent}/**)",  # and the runner's own state
+    ]}}
 
 
 def test_the_settings_come_before_the_prompt(flow_repo):

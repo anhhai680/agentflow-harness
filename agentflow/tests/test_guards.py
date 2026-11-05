@@ -5,8 +5,9 @@ import json
 
 import pytest
 
-from agentflow import flow
+from agentflow import flow, guards
 from agentflow.config import Gate, load_config
+from agentflow.state import runs_root
 from conftest import PYTHON_CONFIG
 from agentflow.guards import (
     Violation,
@@ -164,6 +165,12 @@ def test_user_only_skill_read_by_path(cfg, tmp_git, git):
     calls = [{"name": "Read", "input": {"file_path": path}}]
     v = run_step(cfg, git, tmp_git, lambda: None, calls)
     assert [x.kind for x in v] == ["user_only_skill"]
+
+
+def test_user_only_skill_read_from_a_custom_skills_dir_trips(tmp_cfg):
+    cfg = load_config(tmp_cfg({"project": {"skills_dir": "skills"}}))
+    calls = [{"name": "Read", "input": {"file_path": "skills/doubt-driven-development/SKILL.md"}}]
+    assert [v.kind for v in guards._user_only_violations(cfg, calls)] == ["user_only_skill"]
 
 
 def test_user_only_skill_read_via_bash(cfg, tmp_git, git):
@@ -330,6 +337,14 @@ def test_shipped_settings_cover_the_gate_commands(repo_root, command):
     assert shipped_allows(repo_root, command)
 
 
-def test_shipped_settings_deny_agent_edits_to_the_runs_root(repo_root):
-    deny = json.loads((repo_root / ".claude" / "settings.json").read_text(encoding="utf-8"))["permissions"]["deny"]
-    assert "Edit(/devtools/agentflow/runs/**)" in deny
+def test_the_runner_denies_agent_edits_to_its_runs_root(flow_repo):
+    # The runs root is in the state dir, outside the repo by default, so no project settings file can name it:
+    # the runner's own `--settings` deny rule does, as an absolute (`//`) path.
+    from test_agent_step import run_step
+
+    flow_repo.new_run()
+    assert run_step(flow_repo) == "done"
+    argv = flow_repo.calls()[0]["argv"]
+    deny = json.loads(argv[argv.index("--settings") + 1])["permissions"]["deny"]
+    assert f"Edit(/{runs_root(flow_repo.root)}/**)" in deny
+    assert runs_root(flow_repo.root).is_absolute()

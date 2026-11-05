@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -168,6 +169,11 @@ class Issue:
     message: str
 
 
+DEFAULT_SKILLS_DIR = ".claude/skills"
+DEFAULT_SPEC_FILE = "{module}.md"  # a module's spec is `<docs.specs>/<spec_file>`
+REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea`, `decisions`, `glossary` are optional
+
+
 @dataclass
 class Project:
     base_branch: str
@@ -176,6 +182,8 @@ class Project:
     worktrees_dir: str
     docs: dict[str, str]
     commit_trailer: str
+    skills_dir: str = DEFAULT_SKILLS_DIR
+    spec_file: str = DEFAULT_SPEC_FILE
 
 
 @dataclass
@@ -620,6 +628,7 @@ def load_config(path: Path) -> Config:
     recovery = _optional(raw, "recovery", "", dict, {})
     agents = _require(raw, "agents", "", dict)
     gate_sets = _require(raw, "gate_sets", "", dict)
+    docs = dict(_optional(project, "docs", "project", dict, {}))
     builder = _Builder(origins)
 
     return Config(
@@ -629,8 +638,10 @@ def load_config(path: Path) -> Config:
             fork_from=_require(project, "fork_from", "project", str),
             branch=_require(project, "branch", "project", str),
             worktrees_dir=_require(project, "worktrees_dir", "project", str),
-            docs=dict(_optional(project, "docs", "project", dict, {})),
+            docs=docs,
             commit_trailer=_require(project, "commit_trailer", "project", str),
+            skills_dir=_optional(project, "skills_dir", "project", str, DEFAULT_SKILLS_DIR).strip().rstrip("/"),
+            spec_file=_optional(docs, "spec_file", "project.docs", str, DEFAULT_SPEC_FILE),
         ),
         agents={name: _build_agent(name, spec, f"agents.{name}") for name, spec in agents.items()},
         defaults=Defaults(
@@ -780,8 +791,8 @@ class _Validator:
             self.error(path, "skill must be a name")
         elif skill in self.cfg.guardrails.user_only_skills:
             self.error(path, f"'{skill}' is a user-only skill: only the human runs it")
-        elif not (self.repo / ".claude" / "skills" / skill / "SKILL.md").is_file():
-            self.error(path, f"skill '{skill}' has no .claude/skills/{skill}/SKILL.md")
+        elif not (self.repo / self.cfg.project.skills_dir / skill / "SKILL.md").is_file():
+            self.error(path, f"skill '{skill}' has no {self.cfg.project.skills_dir}/{skill}/SKILL.md")
 
     def prompt(self, prompt: Any, path: str) -> None:
         if not isinstance(prompt, str) or pack.prompt_path(self.cfg.path, prompt) is None:
@@ -862,6 +873,10 @@ class _Validator:
         for name in step.checks:
             if name not in DOC_CHECK_NAMES:
                 self.error(_join(p, "checks"), f"'{name}' is not a doc check ({', '.join(DOC_CHECK_NAMES)})")
+        if step.checks:
+            for key in ("idea", "decisions"):
+                if not self.cfg.project.docs.get(key):
+                    self.error(_join(p, "checks"), f"doc checks read project.docs.{key}, which this pack does not set")
         if step.expect is not None and step.expect not in EXPECT_VALUES:
             self.error(_join(p, "expect"), f"expect must be one of {', '.join(EXPECT_VALUES)}")
         if step.on_fail is not None and step.on_fail not in ON_FAIL_VALUES:
@@ -956,6 +971,46 @@ class _Validator:
             self.prompt(batch["prompt"], _join(path, "prompt"))
 
     # ---- sections
+
+    def project(self) -> None:
+        docs = self.cfg.project.docs
+        for key in REQUIRED_DOCS:
+            if not isinstance(docs.get(key), str) or not docs[key].strip():
+                self.error(f"project.docs.{key}", f"project.docs.{key} is required: the directory of the {key}")
+        for key in ("idea", "decisions", "glossary"):
+            if key in docs and not isinstance(docs[key], str):
+                self.error(f"project.docs.{key}", "must be a path")
+        spec_file = self.cfg.project.spec_file
+        if "{module}" not in spec_file or "/" in spec_file:
+            self.error("project.docs.spec_file", "spec_file is a file name holding {module}, such as '{module}.md'")
+        if not self.cfg.project.skills_dir:
+            self.error("project.skills_dir", "skills_dir is the directory holding <skill>/SKILL.md")
+
+    def paths(self) -> None:
+        """`paths.state_dir`: a path; a state dir inside the checkout that git doesn't ignore is a warning, since
+        every run would then show up in `git status` and could be committed."""
+        block = self.cfg.raw.get("paths")
+        if block is None:
+            return
+        if not isinstance(block, dict):
+            self.error("paths", "must be a mapping")
+            return
+        value = block.get("state_dir")
+        if value is None:
+            return
+        if not isinstance(value, str) or not value.strip():
+            self.error("paths.state_dir", "state_dir must be a path")
+            return
+        root = pack.checkout_root(self.repo)
+        target = pack.resolve_state_dir(value, root)
+        if not target.is_relative_to(root):
+            return
+        relative = target.relative_to(root).as_posix()
+        ignored = subprocess.run(["git", "check-ignore", "-q", f"{relative}/"], cwd=root, capture_output=True)
+        if ignored.returncode != 0:
+            self.add("warning", "paths.state_dir",
+                     f"the state dir {relative}/ is inside the repository and git does not ignore it: "
+                     "add it to .gitignore, or leave paths.state_dir unset for a state dir outside the repository")
 
     def removed_defaults(self) -> None:
         for key, why in REMOVED_DEFAULTS.items():
@@ -1206,6 +1261,8 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     """Return every problem found in `cfg`, checked against the checkout at `repo`."""
     v = _Validator(cfg, Path(repo))
     v.removed_defaults()
+    v.project()
+    v.paths()
     v.agents()
     v.gate_definitions()
     v.conditions()
