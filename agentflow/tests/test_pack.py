@@ -283,6 +283,17 @@ def test_skills_dir_is_read_from_the_pack(tmp_cfg, tmp_path):
     assert any("nowhere/test-driven-development/SKILL.md" in i.message for i in validate(missing, repo))
 
 
+def test_skills_dir_is_normalized(tmp_cfg):
+    assert load_config(tmp_cfg({"project": {"skills_dir": "./skills/"}})).project.skills_dir == "skills"
+    assert load_config(tmp_cfg({"project": {"skills_dir": "a/./b//"}})).project.skills_dir == "a/b"
+
+
+@pytest.mark.parametrize("skills_dir", ["/abs/skills", "../skills", "skills/../../x", ".", ""])
+def test_skills_dir_outside_the_repo_or_not_a_subdir_is_an_error(tmp_cfg, repo_root, skills_dir):
+    cfg = load_config(tmp_cfg({"project": {"skills_dir": skills_dir}}))
+    assert any(i.level == "error" and i.path == "project.skills_dir" for i in validate(cfg, repo_root))
+
+
 def test_read_file_skill_lines_name_the_skills_dir():
     from agentflow.lanes import _read_file_skills
 

@@ -173,6 +173,15 @@ def test_user_only_skill_read_from_a_custom_skills_dir_trips(tmp_cfg):
     assert [v.kind for v in guards._user_only_violations(cfg, calls)] == ["user_only_skill"]
 
 
+@pytest.mark.parametrize("skills_dir", ["skills", "./skills", "skills/", "./skills/"])
+@pytest.mark.parametrize("read", ["skills/{s}/SKILL.md", "./skills/{s}/SKILL.md", "{root}/skills/{s}/SKILL.md"])
+def test_user_only_skill_trips_however_the_skills_dir_and_the_read_are_spelled(tmp_cfg, tmp_path, skills_dir, read):
+    cfg = load_config(tmp_cfg({"project": {"skills_dir": skills_dir}}))
+    path = read.format(s="doubt-driven-development", root=tmp_path)
+    calls = [{"name": "Read", "input": {"file_path": path}}]
+    assert [v.kind for v in guards._user_only_violations(cfg, calls)] == ["user_only_skill"]
+
+
 def test_user_only_skill_read_via_bash(cfg, tmp_git, git):
     calls = [{"name": "Bash", "input": {"command": "cat .claude/skills/doubt-driven-development/SKILL.md"}}]
     assert [x.kind for x in run_step(cfg, git, tmp_git, lambda: None, calls)] == ["user_only_skill"]

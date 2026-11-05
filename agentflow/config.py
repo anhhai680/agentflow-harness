@@ -7,6 +7,7 @@ it can find as a list of `Issue`s, so one run shows them all.
 
 from __future__ import annotations
 
+import posixpath
 import re
 import shlex
 import subprocess
@@ -606,6 +607,13 @@ def _check_format(raw: dict) -> None:
                           f"engine: '{spec}' does not include this engine; this engine is {pack.ENGINE_VERSION}")
 
 
+def _skills_dir(value: str) -> str:
+    """`project.skills_dir` in one spelling (`./skills/` is `skills`), so the user-only-skill guard matches every
+    read of it; empty stays empty for the validator to refuse."""
+    value = value.strip()
+    return posixpath.normpath(value) if value else ""
+
+
 def load_config(path: Path) -> Config:
     """Parse `path`, resolve `@` references and build the dataclasses."""
     path = Path(path)
@@ -640,7 +648,7 @@ def load_config(path: Path) -> Config:
             worktrees_dir=_require(project, "worktrees_dir", "project", str),
             docs=docs,
             commit_trailer=_require(project, "commit_trailer", "project", str),
-            skills_dir=_optional(project, "skills_dir", "project", str, DEFAULT_SKILLS_DIR).strip().rstrip("/"),
+            skills_dir=_skills_dir(_optional(project, "skills_dir", "project", str, DEFAULT_SKILLS_DIR)),
             spec_file=_optional(docs, "spec_file", "project.docs", str, DEFAULT_SPEC_FILE),
         ),
         agents={name: _build_agent(name, spec, f"agents.{name}") for name, spec in agents.items()},
@@ -983,8 +991,10 @@ class _Validator:
         spec_file = self.cfg.project.spec_file
         if "{module}" not in spec_file or "/" in spec_file:
             self.error("project.docs.spec_file", "spec_file is a file name holding {module}, such as '{module}.md'")
-        if not self.cfg.project.skills_dir:
-            self.error("project.skills_dir", "skills_dir is the directory holding <skill>/SKILL.md")
+        skills_dir = self.cfg.project.skills_dir
+        if skills_dir in ("", ".") or posixpath.isabs(skills_dir) or ".." in skills_dir.split("/"):
+            self.error("project.skills_dir", "skills_dir is a directory inside the repository holding "
+                       "<skill>/SKILL.md, relative to its root and without '..'")
 
     def paths(self) -> None:
         """`paths.state_dir`: a path; a state dir inside the checkout that git doesn't ignore is a warning, since
