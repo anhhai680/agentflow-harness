@@ -310,6 +310,7 @@ A module is done when its plan is fully checked and its PR is merged. The queue 
 ## 10. Cheat sheet
 
 ```bash
+agentflow doctor                                    # agent CLIs and logins, gh, origin, Docker, state dir, gate tools
 agentflow validate                                  # after every config edit; 0 warnings
 agentflow config show                               # the pack file as written
 agentflow config show --effective [PREFIX]          # every value after the layers merge, with its layer
@@ -341,6 +342,7 @@ agentflow queue --max-parallel 2
 
 | Symptom | Cause and fix |
 |---|---|
+| A run fails on a missing tool or a login, or you are setting up a new machine | `agentflow doctor` checks, in order, each enabled agent's CLI and login (`claude auth status`, `codex login status`), `gh auth status` (needs the network), the `origin` remote, Docker (only when a gate runs `docker`), that the state dir is writable, and that each gate's programs are on `PATH` (`defaults.env.PATH` when set). It prints `ok`, `warn` or `fail` with a fix for each, and exits 1 on any `fail`. A gate program that `gate_sets.setup` may install is a warning, not a failure. A broken user file is reported as a `user config` failure and the checks go on without it |
 | `agentflow validate` prints warnings or errors | the message names the YAML path (`phases.build.model`, `phases.define.steps[4].when`). Fix that line and re-run |
 | `run` says the agent command is not found | the preflight checks the `command` of each enabled agent. Install it or fix `agents.<name>.command` |
 | A run shows `held` | a usage limit or an outage. It carries on by itself (section 8); `pause` or `cancel` if you don't want it to |

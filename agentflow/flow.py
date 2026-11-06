@@ -104,6 +104,38 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Check the tools and logins a run needs; exit 1 when any check fails."""
+    from agentflow import doctor
+    from agentflow.config import ConfigError, load_config
+    from agentflow.layers import user_config_path
+    from agentflow.pack import PackError
+
+    try:
+        repo = _find_repo()
+        config_path = Path(args.config) if args.config else _pack_config()
+        extra: list[doctor.Check] = []
+        try:
+            cfg = load_config(config_path)
+        except ConfigError as exc:
+            user_file = str(user_config_path())
+            if user_file not in str(exc):
+                raise
+            extra.append(doctor.Check("user config", "fail", str(exc),
+                                      f"fix or delete {user_file} (`agentflow validate` shows the same error)"))
+            cfg = load_config(config_path, user=False)
+    except ConfigError as exc:
+        where = f"{exc.path}: " if exc.path else ""
+        print(f"error {where}{exc.message}")
+        return 1
+    except (PackError, RuntimeError) as exc:
+        print(f"error {exc}")
+        return 1
+    checks = [*extra, *doctor.run_checks(cfg, repo)]
+    print(doctor.render(checks))
+    return 1 if any(c.status == "fail" for c in checks) else 0
+
+
 def _load_cfg(args: argparse.Namespace):
     from agentflow.config import load_config
 
@@ -801,6 +833,11 @@ def _continue_flags(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentflow", description="Run the repo's agent workflow, from idea to ship.")
     sub = parser.add_subparsers(dest="command", required=True)
+    doc = sub.add_parser("doctor", help="check this machine can run the pack: agent CLIs and logins, gh, the remote, "
+                                        "Docker, the state dir and each gate's programs")
+    doc.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+    doc.set_defaults(func=cmd_doctor)
+
     check = sub.add_parser("validate", help="check config.yaml: skills, prompts, conditions, references")
     check.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     check.set_defaults(func=cmd_validate)
