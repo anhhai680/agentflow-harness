@@ -707,6 +707,23 @@ def test_starter_is_protected_on_the_page(sparse_repo):
         config_edit.propose(path, sha, text=text.replace("starter: go\n", ""), repo=sparse_repo)
 
 
+@pytest.mark.parametrize("change", ["gates_confirmed: false", "gates.unit.baseline: red", "gates.unit.cwd: x"])
+def test_gate_confirmation_and_gate_fields_are_protected(sparse_repo, change):
+    path = _sparse(sparse_repo)
+    assert "gates_confirmed" in config_edit._PROTECTED_KEYS and "gates_confirmed" in config_edit.form_fields(path)["protected"]
+    path.write_text(path.read_text(encoding="utf-8") + "gates_confirmed: true\n", encoding="utf-8")  # a human confirmed
+    text, sha = config_edit.read(path)
+    raw = yaml.safe_load(text)
+    key, value = change.split(": ")
+    if key == "gates_confirmed":
+        raw[key] = False
+    else:
+        _, name, field = key.split(".")
+        raw["gates"][name][field] = value
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+
+
 def _custom_starter(monkeypatch, tmp_path: Path, body: str) -> None:
     from agentflow import layers
 

@@ -37,6 +37,7 @@ BUILTIN_CHECKS = (
     "lane",
     "refine_round",
 )
+BASELINES = ("red", "green")  # what a gate's `baseline` may say about it on the base branch when the pack was set up
 ON_UNKNOWN_VALUES = ("ask_human", "agent", True, False)
 BACKLOG_KEYS = ("sync_base", "module_lane", "new_task", "module_row", "lane_labels")
 BACKLOG_FIELDS = ("issue", "task", "topic", "new_module", "after")  # the form fields agentflow knows
@@ -260,6 +261,7 @@ class Gate:
     run: str
     cwd: str | None = None
     when_exists: str | None = None
+    baseline: str | None = None  # `red`: it failed on the base branch when the pack was set up (a human fixes or deletes it)
 
 
 @dataclass
@@ -636,6 +638,7 @@ def _build_gates(data: dict) -> dict[str, Gate]:
             run=_require(raw, "run", path, str),
             cwd=_optional(raw, "cwd", path, str, None),
             when_exists=_optional(raw, "when_exists", path, str, None),
+            baseline=raw.get("baseline"),  # kept as written: `validate` refuses anything but red or green
         )
     return out
 
@@ -1248,6 +1251,24 @@ class _Validator:
                            f"unknown permission_mode '{agent.permission_mode}': use one of {', '.join(PERMISSION_MODES)}")
 
     def gate_definitions(self) -> None:
+        confirmed = self.cfg.raw.get("gates_confirmed")
+        if confirmed is not None and not isinstance(confirmed, bool):
+            self.error("gates_confirmed", "gates_confirmed must be true or false")
+        elif confirmed is not True:
+            self.add("warning", "gates_confirmed", "detected or inherited gates are a proposal: check `gates` and "
+                     "`gate_sets`, then set `gates_confirmed: true`")
+        for name, gate in self.cfg.gates.items():
+            path = f"gates.{name}"
+            if gate.cwd is not None and (posixpath.isabs(gate.cwd) or ".." in gate.cwd.split("/")):
+                self.error(_join(path, "cwd"), "cwd must be a path inside the repository: relative, with no `..` part")
+            if gate.baseline is None:
+                continue
+            if gate.baseline not in BASELINES:
+                self.error(_join(path, "baseline"), f"baseline must be one of {', '.join(BASELINES)}")
+            elif gate.baseline == "red":
+                self.add("warning", _join(path, "baseline"),
+                         f"`{name}` failed on `{self.cfg.project.base_branch}` when the pack was set up: "
+                         "fix it and remove `baseline`, or delete the gate")
         if not self.cfg.gate_sets.get("verify"):
             self.error("gate_sets.verify", "every pack declares the gates a diff must pass: state them under "
                        "`gates:` and list them in `gate_sets.verify` (a `starter:` can supply them)")
@@ -1255,6 +1276,22 @@ class _Validator:
             for i, member in enumerate(members):
                 if member not in self.cfg.gates:
                     self.error(f"gate_sets.{name}[{i}]", f"'{member}' is not a defined gate")
+
+    def bug_lane(self) -> None:
+        """The bug lane's red/green check runs the regression test only when a Bash allow rule covers it."""
+        from agentflow.guards import has_bash_allow_rule  # guards imports this module, so the import waits for the call
+
+        if "bug" not in self.cfg.lanes or has_bash_allow_rule(self.repo):
+            return
+        program = "<test runner>"
+        for member in self.cfg.gate_sets.get("verify") or []:
+            gate = self.cfg.gates.get(member)
+            words = gate.run.split() if gate else []
+            if words:
+                program = words[0]
+                break
+        self.add("warning", "lanes", "the bug lane's red/green check runs the regression test only when a Bash allow "
+                 f"rule in .claude/settings.json covers it: add a narrow rule such as `Bash({program} *)`")
 
     def phases(self) -> None:
         cfg = self.cfg
@@ -1476,6 +1513,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.skills_map()
     v.agents()
     v.gate_definitions()
+    v.bug_lane()
     v.conditions()
     v.phases()
     v.effort()

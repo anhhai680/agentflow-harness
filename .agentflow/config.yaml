@@ -82,6 +82,7 @@ context:
   progress_file: "runs/{run}/progress.md"
   gate_output_lines: 200
 
+gates_confirmed: true         # a human has checked `gates` and `gate_sets` (the page cannot change this)
 gates:                          # names to commands
   engine_tests: {run: "uv run --no-project --with pyyaml --with pytest pytest agentflow/tests --import-mode=prepend -q"}
   portability:  {run: "uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_portability.py --import-mode=prepend -q"}

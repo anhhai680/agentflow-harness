@@ -91,6 +91,7 @@ context:
   progress_file: "runs/{run}/progress.md"
   gate_output_lines: 200
 
+gates_confirmed: true         # a human has checked `gates` and `gate_sets` (the page cannot change this)
 gates:                          # names to commands
   floor:        {run: "true"}
   py_lint:      {run: "true", when_exists: pyproject.toml}

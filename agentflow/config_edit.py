@@ -45,8 +45,8 @@ MAX_TEXT = 512 * 1024
 MERGE_TAG = "tag:yaml.org,2002:merge"
 AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices")  # what a page may change in an `agents.<name>` block
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
-    "version", "engine", "gates", "gate_sets", "guardrails", "conditions", "overlays", "project", "phase_approval",
-    "record_step", "resolve_step", "paths", "defaults.env", "context.autocompact_env", "context.progress_file",
+    "version", "engine", "gates", "gates_confirmed", "gate_sets", "guardrails", "conditions", "overlays", "project",
+    "phase_approval", "record_step", "resolve_step", "paths", "defaults.env", "context.autocompact_env", "context.progress_file",
     "hitl.notify", "dashboard.host", "work_source", "skills", "starter",
 )
 PROTECTED = (

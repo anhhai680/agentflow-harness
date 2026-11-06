@@ -226,6 +226,17 @@ def command_allowed(repo: Path, command: str) -> bool:
     return _covered(rules, command.strip())
 
 
+def has_bash_allow_rule(repo: Path) -> bool:
+    """Whether `.claude/settings*.json` in the MAIN checkout of `repo` holds any `Bash(...)` allow rule at all
+    (a bare `Bash` counts). A directory that is no checkout is read as it is."""
+    try:
+        root = main_checkout(repo)
+    except (OSError, subprocess.CalledProcessError):
+        root = Path(repo)
+    rules, _issues = _load_rules(root)
+    return bool(_bash_patterns(rules["allow"]))
+
+
 def settings_coverage(cfg: Config, repo: Path) -> list[Issue]:
     """Warn for each gate command part a headless agent would be denied.
 

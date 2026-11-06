@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 import yaml
 
+from agentflow import pack
 from agentflow.config import ConfigError, Issue, load_config, validate
 from agentflow.flow import main, repo_root
 from conftest import PYTHON_CONFIG
@@ -1022,3 +1024,90 @@ def test_editing_a_starter_file_changes_the_layers_digest(sparse_repo, monkeypat
     target.write_text(target.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8")
     assert layers_sha256(layer_files(cfg)) != before
 
+
+# --------------------------------------------------------------------------- gates_confirmed, baseline, cwd, the bug lane
+
+
+def _warnings(issues: list[Issue]) -> list[tuple[str, str]]:
+    return [(i.path, i.message) for i in issues if i.level == "warning"]
+
+
+def test_unconfirmed_gates_warn(tmp_cfg):
+    issues = issues_for(tmp_cfg, {"gates_confirmed": None})
+    assert [w for w in _warnings(issues) if w[0] == "gates_confirmed"] == [
+        ("gates_confirmed", "detected or inherited gates are a proposal: check `gates` and `gate_sets`, "
+                            "then set `gates_confirmed: true`")]
+    assert [w for w in _warnings(issues_for(tmp_cfg, {"gates_confirmed": False})) if w[0] == "gates_confirmed"]
+    assert not [w for w in _warnings(issues_for(tmp_cfg, {"gates_confirmed": True})) if w[0] == "gates_confirmed"]
+
+
+@pytest.mark.parametrize("value", ["true", 1, [True]])
+def test_gates_confirmed_must_be_a_bool(tmp_cfg, value):
+    assert ("error", "gates_confirmed") in errors(issues_for(tmp_cfg, {"gates_confirmed": value}))
+
+
+def test_a_red_baseline_warns_naming_the_base_branch(tmp_cfg):
+    issues = issues_for(tmp_cfg, {"gates": {"floor": {"baseline": "red"}}})
+    base = load_config(tmp_cfg()).project.base_branch
+    assert ("gates.floor.baseline",
+            f"`floor` failed on `{base}` when the pack was set up: fix it and remove `baseline`, "
+            "or delete the gate") in _warnings(issues)
+    assert errors(issues) == []
+    green = issues_for(tmp_cfg, {"gates": {"floor": {"baseline": "green"}}})
+    assert errors(green) == [] and not [w for w in _warnings(green) if w[0] == "gates.floor.baseline"]
+
+
+@pytest.mark.parametrize("value", ["amber", True, 3])
+def test_a_baseline_other_than_red_or_green_is_an_error(tmp_cfg, value):
+    assert ("error", "gates.floor.baseline") in errors(issues_for(tmp_cfg, {"gates": {"floor": {"baseline": value}}}))
+
+
+@pytest.mark.parametrize("cwd", ["/abs", "../up", "a/../../b"])
+def test_a_gate_cwd_outside_the_repo_is_an_error(tmp_cfg, cwd):
+    assert ("error", "gates.floor.cwd") in errors(issues_for(tmp_cfg, {"gates": {"floor": {"cwd": cwd}}}))
+
+
+def test_a_relative_gate_cwd_is_fine(tmp_cfg):
+    assert ("error", "gates.floor.cwd") not in errors(issues_for(tmp_cfg, {"gates": {"floor": {"cwd": "web/app"}}}))
+
+
+def _bug_lane_warnings(issues: list[Issue]) -> list[str]:
+    return [i.message for i in issues if i.level == "warning" and i.path == "lanes"]
+
+
+def test_the_bug_lane_without_any_bash_allow_rule_warns(sparse_repo):
+    cfg = load_config(pack.pack_config(sparse_repo))
+    assert "bug" in cfg.lanes
+    messages = _bug_lane_warnings(validate(cfg, sparse_repo))
+    assert len(messages) == 1
+    assert messages[0].startswith("the bug lane's red/green check runs the regression test only when a Bash allow rule "
+                                  "in .claude/settings.json covers it: add a narrow rule such as `Bash(")
+
+
+def test_the_bug_lane_with_a_bash_allow_rule_does_not_warn(sparse_repo):
+    (sparse_repo / ".claude").mkdir()
+    (sparse_repo / ".claude" / "settings.local.json").write_text(
+        json.dumps({"permissions": {"allow": ["Bash(true)"]}}), encoding="utf-8")
+    cfg = load_config(pack.pack_config(sparse_repo))
+    assert _bug_lane_warnings(validate(cfg, sparse_repo)) == []
+
+
+def test_the_bug_lane_warning_reads_the_main_checkout_not_a_worktree(sparse_repo, git, tmp_path):
+    (sparse_repo / ".claude").mkdir()
+    (sparse_repo / ".claude" / "settings.json").write_text(
+        json.dumps({"permissions": {"allow": ["Bash(true)"]}}), encoding="utf-8")
+    git(sparse_repo, "add", "-A")
+    git(sparse_repo, "commit", "-q", "-m", "settings")
+    linked = tmp_path / "linked"
+    git(sparse_repo, "worktree", "add", "-q", str(linked), "-b", "side")
+    (linked / ".claude" / "settings.json").write_text("{}\n", encoding="utf-8")  # a worktree's own copy is not read
+    cfg = load_config(pack.pack_config(sparse_repo))
+    assert _bug_lane_warnings(validate(cfg, linked)) == []
+
+
+def test_a_pack_without_the_bug_lane_needs_no_allow_rule(sparse_repo):
+    path = pack.pack_config(sparse_repo)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["lanes"] = ["feature"]
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    assert _bug_lane_warnings(validate(load_config(path), sparse_repo)) == []
