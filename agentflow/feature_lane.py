@@ -9,7 +9,7 @@ never touched is passed over, and so is a task this run already committed. Each 
    task's session, with the `small_plan` skill), with the gates and the fix loop of `run_agent_step`;
 2. the reviewer, `<step>/task-<n>/review`, in a fresh session on the `review.role` model, given the
    diff range `<task start sha>..worktree`; blocking findings go back to the implementer's session
-   once (`receiving-code-review`, the gates again), then one re-review in a fresh session that gets
+   once (with the pack's review-feedback skill, the gates again), then one re-review in a fresh session that gets
    those findings as text; still blocking: a `review_unresolved` stop (an unreadable review result is
    a `blocked` stop, never a clean review). Approving it gives a fresh reviewer one last look, with
    the human's note, and the task is committed, with any finding still open listed in its commit body.
@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Literal
 from agentflow import sources
 from agentflow.autonomy import AUTO_BY, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
-from agentflow.conditions import Ctx, fmt
+from agentflow.conditions import Ctx, fmt, skill_text
 from agentflow.config import Config, Phase, Step, brief_files
 from agentflow.flow_control import current_refine, refine_note_block, refine_subject
 from agentflow.gates import gates_ok, run_gates
@@ -78,7 +78,6 @@ PR_FOOTER = "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
 TASK_KEY = re.compile(r"/task-\d+/(implement|review)$")
 TASK_N = re.compile(r"/task-(\d+)/")
 DONE_STATUSES = ("done", "unchanged")
-REVIEW_SKILL = "receiving-code-review"
 SUMMARY_MAX = 60
 DEFAULT_RECORD = {"spec_gap": "record_step", "ambiguity": "commit_body", "review_dispute": "commit_body"}
 
@@ -313,7 +312,7 @@ class FeatureLane:
             step = dataclasses.replace(step, skill=str(small["skill"]), prompt=small.get("prompt", step.prompt),
                                        brief=brief_files(small.get("brief"), "small_plan.brief"))
         named = [name for needle, name in step.task_briefs.items() if needle in task_text]
-        return dataclasses.replace(step, brief=list(dict.fromkeys([*step.brief, *named])))
+        return dataclasses.replace(step, task_brief=list(dict.fromkeys(named)))
 
     def _task_agent(self, phase: Phase, step: Step, key: str, extra: dict[str, str],
                     share: str | None = None, review: bool = False) -> Outcome:
@@ -338,7 +337,7 @@ class FeatureLane:
         impl_step = self._impl_step(step, small, task.text)
         continues = bool((self.run.state["steps"].get(share) or {}).get("session_id")) if share else False
         if batch and continues and step.batch and step.batch.get("prompt"):
-            impl_step = dataclasses.replace(impl_step, prompt=str(step.batch["prompt"]))
+            impl_step = dataclasses.replace(impl_step, prompt=str(step.batch["prompt"]), continuation=True)
         extra = self._task_extra(task, rel)
         if self._task_agent(phase, impl_step, f"{tkey}/implement", extra, share) != "done":
             return "stopped"
@@ -477,11 +476,14 @@ class FeatureLane:
             return "done"
         if not reopened:
             findings = "\n".join(finding_line(f) for f in blocking)
-            skill = (self.ctx.repo / ".claude" / "skills" / REVIEW_SKILL / "SKILL.md").read_text(encoding="utf-8")
-            note = (f"Use the `{REVIEW_SKILL}` skill: its full text is below, so do not load it.\n\n"
-                    f"A reviewer found blocking problems in your change:\n\n"
-                    f"{findings}\n\nCheck each one against the code; fix the ones that hold (with a test where it "
-                    f"fits), say in your summary why any does not, then run the gates.\n\n{skill}")
+            name = self.cfg.skills_map.get("review_feedback")  # read from the main checkout, never the worktree
+            skill = skill_text(self.cfg, self.ctx.repo, name) if name else None
+            note = (f"Use the `{name}` skill: its full text is below, so do not load it.\n\n" if skill is not None else "")
+            note += (f"A reviewer found blocking problems in your change:\n\n"
+                     f"{findings}\n\nCheck each one against the code; fix the ones that hold (with a test where it "
+                     f"fits), say in your summary why any does not, then run the gates.")
+            if skill is not None:
+                note += f"\n\n{skill}"
             self.run.emit("step_reopened", key=impl_key, reason="review", round=1, note=note)
         return self._task_agent(phase, impl_step, impl_key, extra)
 

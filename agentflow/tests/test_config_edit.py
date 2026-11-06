@@ -203,8 +203,10 @@ def test_new_skills_map_keys_are_refused_by_the_page(shipped, key):
     with pytest.raises(Refused):
         form(shipped, (["skills", "map", key], "agentflow-review"))
     _, sha = config_edit.read(shipped)
-    text = SHIPPED.replace("    ship: finishing-a-development-branch",
-                           f"    {key}: agentflow-review\n    ship: finishing-a-development-branch", 1)
+    line = f"    {key}: "  # the shipped config may already map the key: change its value, else add the key
+    text = (SHIPPED.replace(line + "receiving-code-review", line + "agentflow-review", 1) if line + "receiving-code-review" in SHIPPED
+            else SHIPPED.replace("    ship: finishing-a-development-branch",
+                                 f"{line}agentflow-review\n    ship: finishing-a-development-branch", 1))
     with pytest.raises(Refused, match="protected"):
         config_edit.propose(shipped, sha, text=text, repo=REPO)
 

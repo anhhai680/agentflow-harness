@@ -26,6 +26,7 @@ skills:
     build_small: executing-plans
     verify: verification-before-completion
     ship: finishing-a-development-branch
+    review_feedback: receiving-code-review   # sent with a task review's blocking findings, in the implementer's resumed session
 
 agents:
   claude:

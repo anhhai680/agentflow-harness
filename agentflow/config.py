@@ -299,6 +299,8 @@ class Step:
     batch: dict | None = None  # a `foreach: plan_task` step: neighbouring small tasks share a session and a review
     brief: list[str] = field(default_factory=list)
     task_briefs: dict[str, str] = field(default_factory=dict)
+    task_brief: list[str] = field(default_factory=list)  # run time only, never configured: the `task_briefs` a plan task matched
+    continuation: bool = False  # run time only: a batch's later member, whose session already holds the first one's prompt
     name: str | None = None
     blocks_on_findings: bool = False  # its `findings` hold the phase back (`autonomy.phase_findings`)
     forbid: list[str] = field(default_factory=list)  # guardrails.forbidden_paths for this step only
@@ -868,9 +870,10 @@ class _Validator:
                 if name not in PROMPT_PLACEHOLDERS:
                     self.error(pack.prompt_label(self.cfg.path, file), f"unknown placeholder '{{{name}}}'")
 
-    def brief(self, files: list[str], prompt: str | None, path: str) -> None:
+    def brief(self, files: list[str], prompt: str | None, path: str, skill: Any = None) -> None:
         """A brief goes in the prompt at `{brief}`: a missing file, a `{brief}` with no file, or a file with no
-        `{brief}` would each lose it silently."""
+        `{brief}` would each lose it silently. A step with no `brief:` whose skill resolves (`pack.skill_file`)
+        has the skill's text as its brief, so a `{brief}` is used then."""
         for name in files:
             if not (self.repo / name).is_file():
                 self.error(path, f"brief '{name}' is not a file in this repository")
@@ -882,13 +885,14 @@ class _Validator:
         used = "{brief}" in template.read_text(encoding="utf-8")
         label = pack.prompt_label(self.cfg.path, template)
         if used and not files:
-            self.error(path, f"{label} has a {{brief}} placeholder, so this step must name the file")
+            if pack.skill_file(self.repo, self.cfg.project.skills_dir, skill) is None:
+                self.error(path, f"{label} has a {{brief}} placeholder, so this step must name the file")
         elif files and not used:
             self.error(path, f"{label} has no {{brief}} placeholder, so this brief would never be sent")
 
     def step(self, step: Step, phase_ids: set[str]) -> None:
         p = step.path
-        self.brief(step.brief, step.prompt, _join(p, "brief"))
+        self.brief(step.brief, step.prompt, _join(p, "brief"), step.skill)
         for name in step.task_briefs.values():
             if not (self.repo / name).is_file():
                 self.error(_join(p, "task_briefs"), f"brief '{name}' is not a file in this repository")
@@ -997,7 +1001,8 @@ class _Validator:
             self.skill(small["skill"], _join(path, "skill"))
         if "prompt" in small:
             self.prompt(small["prompt"], _join(path, "prompt"))
-            self.brief(brief_files(small.get("brief"), _join(path, "brief")), small["prompt"], _join(path, "brief"))
+            self.brief(brief_files(small.get("brief"), _join(path, "brief")), small["prompt"], _join(path, "brief"),
+                       small.get("skill"))
 
     def batch(self, batch: Any, path: str, step: Step) -> None:
         if not isinstance(batch, dict):

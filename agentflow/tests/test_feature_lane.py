@@ -795,3 +795,40 @@ def test_a_refine_round_does_not_batch(batched):
     step = next(s for s in batched.cfg.phases["build"].steps if s.id == "build")
     run.emit("phase_rejected", by="me", phase="build", note="redo")
     assert executor._batches(batched.cfg.phases["build"], step, batched.root / PLAN_PATH, "build/build", {}) == {}
+
+
+# --------------------------------------------------------------------------- the review-feedback skill comes from the pack
+
+
+def test_blocking_findings_carry_the_review_feedback_skill_text(lane):
+    assert lane.cfg.skills_map["review_feedback"] == "receiving-code-review"
+    run = begin_build(lane, plan_text(count=1))
+    lane.script({REVIEW.format(n=1): [review(FINDING), review()]})
+    assert build(lane, run) == ("done", True)
+    fix = lane.calls()[2]["argv"][-1]
+    assert "Use the `receiving-code-review` skill: its full text is below, so do not load it." in fix
+    assert "Stub: the receiving-code-review skill." in fix and FINDING["text"] in fix
+    assert "name: receiving-code-review" not in fix  # the body only
+
+
+def test_blocking_findings_without_a_review_feedback_skill_do_not_crash(lane):
+    lane.configure({**BIG, "skills": {"map": {"review_feedback": None}}, "project": {"skills_dir": "no-skills-here"}})
+    assert "review_feedback" not in lane.cfg.skills_map and not (lane.root / "no-skills-here").exists()
+    run = begin_build(lane, plan_text(count=1))
+    lane.script({REVIEW.format(n=1): [review(FINDING), review()]})
+    assert build(lane, run) == ("done", True)
+    fix = lane.calls()[2]["argv"][-1]
+    assert FINDING["text"] in fix and "A reviewer found blocking problems" in fix
+    assert "its full text is below" not in fix and "Stub:" not in fix
+
+
+def test_only_a_batch_continuation_is_marked_as_one(batched, monkeypatch):
+    from agentflow import lanes
+
+    seen = []
+    real = lanes.build_prompt
+    monkeypatch.setattr(lanes, "build_prompt", lambda cfg, step, *rest: seen.append((step.id, step.continuation)) or real(cfg, step, *rest))
+    run = begin_build(batched, plan_text(count=3))
+    assert build(batched, run) == ("done", True)
+    flags = [continuation for step_id, continuation in seen if step_id == "build"]
+    assert flags == [False, True, True]  # the first member's prompt carries the skill; the later ones' sessions have it

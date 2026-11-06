@@ -474,7 +474,12 @@ def test_a_brief_file_must_exist(tmp_cfg):
 
 
 def test_a_template_with_a_brief_needs_a_step_that_names_one(tmp_cfg):
-    path = tmp_cfg(lambda data: phase_step(data, "review", "branch_review").pop("brief"))
+    def patch(data):
+        step = phase_step(data, "review", "branch_review")
+        step.pop("brief")
+        step["skill"] = "no-such-skill-anywhere"  # a skill that resolves would be the brief
+
+    path = tmp_cfg(patch)
     assert ("error", "phases.review.steps[4].brief") in errors(validate(load_config(path), path.parent.parent))
 
 
@@ -550,3 +555,21 @@ def test_skills_map_accepts_review_debug_and_review_feedback(tmp_cfg):
     assert not [i for i in issues_for(tmp_cfg, patch) if i.path.startswith("skills")]
     bad = issues_for(tmp_cfg, {"skills": {"map": {"review_feedback": "../x", "reviews": "agentflow-review"}}})
     assert ("error", "skills.map.review_feedback") in errors(bad) and ("error", "skills.map.reviews") in errors(bad)
+
+
+def test_a_brief_template_with_no_brief_is_valid_when_the_skill_resolves(tmp_cfg):
+    path = tmp_cfg(lambda data: phase_step(data, "review", "branch_review").pop("brief"))
+    # branch_review's skill (requesting-code-review) has a SKILL.md in the repository: it is the step's brief
+    assert ("error", "phases.review.steps[4].brief") not in errors(validate(load_config(path), path.parent.parent))
+
+
+def test_a_brief_template_with_no_brief_and_no_skill_is_still_an_error(tmp_cfg):
+    def patch(data):
+        step = phase_step(data, "review", "branch_review")
+        step.pop("brief")
+        step["skill"] = "no-such-skill-anywhere"
+
+    path = tmp_cfg(patch)
+    issues = validate(load_config(path), path.parent.parent)
+    assert ("error", "phases.review.steps[4].brief") in errors(issues)
+    assert any("must name the file" in i.message for i in issues if i.path == "phases.review.steps[4].brief")

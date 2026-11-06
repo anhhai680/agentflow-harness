@@ -145,7 +145,7 @@ def test_design_flow(design, monkeypatch, git):
 
     (apply_call,) = calls_for(design, "define/decide/apply_topic")
     prompt = apply_call["argv"][-1]
-    assert "Use the `domain-modeling` skill." in prompt
+    assert "Use the `domain-modeling` skill: its full text is in this prompt, so do not load it." in prompt  # no brief: the skill is it
     copy = run.agent_dir / "questions.md"  # the apply step is given the workspace copy of the answered file
     assert str(copy) in prompt and copy.read_bytes() == questions.read_bytes()
     assert TOPIC in prompt

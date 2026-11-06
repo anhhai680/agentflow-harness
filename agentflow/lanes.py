@@ -32,7 +32,7 @@ from agentflow.autonomy import AUTO_BY, eligible
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
 from agentflow.commit_checks import RUNNER_COMMITS, runner_head
-from agentflow.conditions import Ctx, fmt
+from agentflow.conditions import Ctx, fmt, skill_text
 from agentflow.config import Config, Phase, Step, resolve_model
 from agentflow.feature_lane import FeatureLane
 from agentflow.flow_control import (
@@ -66,6 +66,8 @@ DEFAULT_REFINE = "refine.md"
 DEFAULT_ROLE = "build"
 EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n?", re.DOTALL)
 SKILL_LINE = re.compile(r"\b([Uu])se the `([\w.:-]+)` skill")
+SKILL_HEADING = re.compile(r"#{1,6}[ \t]+.*`\{skill\}`")
+SKILL_BLOCK = ("## The `{skill}` skill\n\nIts full text follows, so you already have it: do not load it.\n\n{brief}")
 RESUMABLE = ("running", "waiting_human")
 UNSTARTED_STEP = (None, "pending")
 FOOTER = re.compile(r"^\s*Next:\s*`?([\w.:/-]+)`?\s+(?:—|–|--?)\s", re.MULTILINE)
@@ -133,14 +135,29 @@ def _phase_artifacts(ctx: Ctx, phase: str | None) -> str:
     return "\n".join(f"- `{path}`" for path in paths) or "(none yet)"
 
 
-def _read_file_skills(text: str, skills_dir: str) -> str:
-    """For agents that cannot load skills by name: point them at the skill file in `skills_dir` instead."""
+def _read_file_skills(text: str, skills_dir: str, inlined: frozenset[str] = frozenset()) -> str:
+    """For agents that cannot load skills by name: point them at the skill file in `skills_dir` instead.
+    A skill in `inlined` has its text in the prompt already, so its line stays as it is."""
 
     def replace(match: re.Match[str]) -> str:
+        if match.group(2) in inlined:
+            return match.group(0)
         read = "Read" if match.group(1) == "U" else "read"
         return f"{read} `{skills_dir}/{match.group(2)}/SKILL.md` and follow it"
 
     return SKILL_LINE.sub(replace, text)
+
+
+def _drop_skill_section(body: str) -> str:
+    """`body` without the sections headed by the step's skill (`## The `{skill}` skill`), for a step that has none."""
+    kept: list[str] = []
+    skipping = False
+    for line in body.split("\n"):
+        if line.startswith("#"):
+            skipping = SKILL_HEADING.match(line) is not None
+        if not skipping:
+            kept.append(line)
+    return "\n".join(kept).rstrip()
 
 
 def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode: Mode) -> str:
@@ -151,15 +168,31 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     """
     preamble = EFFORT_BLOCK.sub("" if rec.get("sized") else r"\1", _template(cfg, PREAMBLE))
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
+    files = list(dict.fromkeys([*step.brief, *step.task_brief]))
+    # A step with no configured `brief:` whose skill resolves has the skill's text as its brief, and its first
+    # prompt carries it. Not a continuation (its session has the text) and not a template that names the skill
+    # itself without a `{brief}` slot (a pack's own wording, which tells the agent to load it).
+    skill_brief = None
+    if step.skill and not step.brief and not step.continuation \
+            and ("{brief}" in body or f"`{step.skill}` skill" not in body):
+        skill_brief = skill_text(cfg, ctx.repo, step.skill)
+    briefs = [skill_brief] if skill_brief is not None else []
+    briefs.extend((ctx.repo / name).read_text(encoding="utf-8") for name in files)
+    if skill_brief is not None and "{brief}" not in body:
+        body = f"{body}\n\n{SKILL_BLOCK}"
+    if not step.skill and not briefs:
+        body = _drop_skill_section(body)
     if step.skill and f"`{step.skill}` skill" not in body:
-        body = f"Use the `{step.skill}` skill.\n\n{body}"
+        line = (f"Use the `{step.skill}` skill: its full text is in this prompt, so do not load it."
+                if skill_brief is not None else f"Use the `{step.skill}` skill.")
+        body = f"{line}\n\n{body}"
     extra_skills = overlays.skill_lines(cfg, ctx, str(rec.get("role") or step.role or DEFAULT_ROLE), body)
     if extra_skills:
         body = f"{body}\n\n{extra_skills}"
     if extra.get("gate_evidence") and "{gate_evidence}" not in body:  # a `gates_first` template that has no slot
         body = f"{body}\n\n{{gate_evidence}}"
     values = _values(cfg, step, ctx, {})
-    values["brief"] = "\n\n".join((ctx.repo / name).read_text(encoding="utf-8") for name in step.brief)
+    values["brief"] = "\n\n".join(briefs)
     values["skill"] = step.skill or ""
     values["base_ref"] = ctx.base_ref
     values["earlier_findings"] = ""
@@ -175,7 +208,8 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     text = "\n\n".join(part.strip() for part in (preamble, body, _template(cfg, RESULT)))
     agent = cfg.agents.get(rec.get("agent") or cfg.defaults.agent)
     if agent is not None and agent.skill_loading == "read_file":
-        text = _read_file_skills(text, cfg.project.skills_dir)
+        text = _read_file_skills(text, cfg.project.skills_dir,
+                                 frozenset({step.skill}) if skill_brief is not None and step.skill else frozenset())
     return fmt(text, values) + "\n"
 
 
