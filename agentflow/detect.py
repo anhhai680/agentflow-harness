@@ -217,6 +217,17 @@ def _pick_starter(src: _Source, notes: list[str]) -> str:
     return starter
 
 
+def _setup_names(starter: str) -> set[str]:
+    """The names of the gates the starter runs as `gate_sets.setup`: a detected gate must not take one."""
+    names: set[str] = set()
+    for layer in layers.base_layers(starter):
+        sets = layer.data.get("gate_sets")
+        setup = sets.get("setup") if isinstance(sets, dict) else None
+        if isinstance(setup, list):
+            names.update(n for n in setup if isinstance(n, str))
+    return names
+
+
 def _starter_gates(starter: str) -> dict[str, dict]:
     gates: dict[str, dict] = {}
     for layer in layers.base_layers(starter):
@@ -296,6 +307,8 @@ def _env_of(owner: dict, what: str) -> dict[str, str]:
             value = "true" if value else "false"
         if value is None:
             value = ""
+        if isinstance(value, str) and "\0" in value:
+            raise _Skip(f"`{what}.{key}` holds a NUL byte")
         if not isinstance(key, str) or not _ENV_KEY.fullmatch(key):
             raise _Skip(f"`{what}` has a name that isn't a shell variable: {key!r}")
         if not isinstance(value, (str, int, float)):
@@ -367,8 +380,18 @@ def _segments(line: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+_OPENERS = re.compile(r"^(\{|do\b|then\b|else\b)\s*")  # what a command can follow on inside a compound command
+_SYNTAX_WORDS = frozenset("{ } for while until if case do then else elif done fi esac".split())
+
+
 def _installs(segment: str) -> bool:
-    return bool(_INSTALL.match(segment) or _PIPED_INTO_SHELL.search(segment))
+    return bool(_INSTALL.match(_OPENERS.sub("", segment)) or _PIPED_INTO_SHELL.search(segment))
+
+
+def _is_syntax(segment: str) -> bool:
+    """True when the segment is a piece of a compound command (a block, a loop, a conditional)."""
+    words = segment.split(None, 1)
+    return bool(words) and words[0] in _SYNTAX_WORDS
 
 
 def _without_installs(run: str) -> str | None:
@@ -379,7 +402,12 @@ def _without_installs(run: str) -> str | None:
         if any(_installs(seg) for ln in lines for seg in _segments(ln)):
             return None
         return run.strip("\n").rstrip()
-    return " && ".join(seg for seg in _segments(run.strip()) if not _installs(seg))
+    segments = _segments(run.strip())
+    if not any(_installs(seg) for seg in segments):
+        return run.strip()  # nothing to remove: the run stays as written
+    if any(_is_syntax(seg) for seg in segments):
+        return None  # an install inside a block, loop or conditional can't be cut out safely
+    return " && ".join(seg for seg in segments if not _installs(seg))
 
 
 def _command(remaining: str, shell: str | None, env: dict[str, str]) -> str:
@@ -526,10 +554,10 @@ def _script_gates(src: _Source, notes: list[str], propose) -> None:
                 continue
             propose(script, {"pnpm": f"pnpm run {script}", "yarn": f"yarn {script}"}.get(manager, f"npm run {script}"))
     text = src.read("pyproject.toml")
-    if text is not None or src.exists("tests"):
+    if text is not None:
         tool: dict = {}
         try:
-            parsed = tomllib.loads(text or "").get("tool", {})
+            parsed = tomllib.loads(text).get("tool", {})
             tool = parsed if isinstance(parsed, dict) else {}
         except (tomllib.TOMLDecodeError, RecursionError, ValueError):
             notes.append("pyproject.toml: not valid TOML, so its tool sections are not read")
@@ -578,7 +606,7 @@ def detect(repo: Path, starter: str | None = None) -> Detected:
     src = _Source(repo, ref, notes)
     picked = starter if starter is not None else _pick_starter(src, notes)
     overrides = _setup_overrides(src, picked, notes)
-    found = _Gates(set(overrides))
+    found = _Gates(set(overrides) | _setup_names(picked))
     source = "starter"
     standing: list[str] = []
     _ci_gates(src, notes, found)

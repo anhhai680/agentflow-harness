@@ -245,6 +245,49 @@ def test_ci_wins_over_package_scripts(make):
     assert found.gate_sets["verify"] == ["lint"]
 
 
+def _script_of(run: str) -> str:
+    """The script inside a gate command (`bash -e -c <script>`), or the command itself when it is bare."""
+    import shlex
+    parts = shlex.split(run)
+    return parts[-1].removeprefix("export CI=true\n") if parts[0] in ("bash", "sh") else run
+
+
+@pytest.mark.parametrize("run", ["for f in a b; do pytest $f; done", "if [ -f x ]; then pytest; fi",
+                                 "pytest -k 'a;b' && ruff check ."])
+def test_a_one_line_run_with_nothing_to_remove_is_kept_as_written(make, run):
+    found = detect.detect(make(ci(f"- name: Test\n  run: \"{run}\"")))
+    assert _script_of(found.gates["test"]["run"]) == run
+
+
+@pytest.mark.parametrize("run", ["{ npm ci; npm test; }", "npm ci; if [ -f x ]; then npm test; fi",
+                                 "for f in a b; do npm ci; npm test; done", "npm ci && for f in a; do npm test; done"])
+def test_an_install_mixed_into_shell_syntax_is_a_note(make, run):
+    found = detect.detect(make(ci(f"- name: Test\n  run: \"{run}\"")))
+    assert found.gates == {}
+    assert "mixes install and test commands: add it by hand" in notes_text(found)
+
+
+def test_a_ci_step_cannot_replace_the_starters_setup_gate(make):
+    repo = make({**ci("- name: Install\n  run: pnpm install && pnpm test"), "package.json": "{}",
+                 "pnpm-lock.yaml": ""})
+    found = detect.detect(repo)
+    assert found.gates == {"install_2": {"run": "pnpm test"}}  # `install` stays the starter's
+    assert found.gate_sets["verify"] == ["install_2"]
+    repo = make({**ci("- name: Sync\n  run: uv sync && uv run pytest"), "pyproject.toml": "", "uv.lock": ""})
+    assert detect.detect(repo).gates == {"sync_2": {"run": "uv run pytest"}}
+
+
+def test_a_ci_step_cannot_replace_the_setup_override(make):
+    repo = make({**ci("- name: Install\n  run: npm ci && npm test"), "package.json": "{}", "package-lock.json": ""})
+    assert detect.detect(repo).gates == {"install": {"run": "npm ci"}, "install_2": {"run": "npm test"}}
+
+
+def test_a_nul_byte_in_an_env_value_is_a_note(make):
+    found = detect.detect(make(ci('- name: Test\n  env: {A: "x\\0y"}\n  run: pytest')))
+    assert found.gates == {}
+    assert "ci.yml/test/Test" in notes_text(found)
+
+
 # --- scripts --------------------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("lock,cmd,install", [("pnpm-lock.yaml", "pnpm run test", None),
@@ -277,6 +320,12 @@ def test_the_npm_placeholder_test_script_is_skipped(make):
     found = detect.detect(make({"package.json": json.dumps({"scripts": {"test": placeholder}})}))
     assert "test" not in found.gates and found.gate_source == "starter"
     assert "no test specified" in notes_text(found) or "placeholder" in notes_text(found)
+
+
+def test_a_tests_directory_without_a_pyproject_is_no_pytest_gate(make):
+    assert detect.detect(make({"package.json": "{}", "tests/a.js": ""})).gates == {"install": {"run": "npm install"}}
+    found = detect.detect(make({"package.json": json.dumps({"scripts": {"build": "tsc -b"}}), "tests/a.js": ""}))
+    assert "pytest" not in found.gates and found.gate_source == "starter"
 
 
 def test_malformed_package_json_and_pyproject_are_notes(make):
