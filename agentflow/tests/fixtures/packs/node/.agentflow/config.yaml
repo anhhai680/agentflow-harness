@@ -7,7 +7,6 @@ project:
   base_branch: main
   fork_from: main
   branch: "flow/{lane}/{slug}"
-  worktrees_dir: ../greet-worktrees
   skills_dir: skills
   docs:
     specs: docs

@@ -186,6 +186,16 @@ def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
 
 
+def test_worktrees_dir_is_still_refused_by_the_page(shipped):
+    _, sha = config_edit.read(shipped)
+    with pytest.raises(Refused):
+        form(shipped, (["project", "worktrees_dir"], "wt"))
+    text = SHIPPED.replace("  branch:", "  worktrees_dir: wt\n  branch:", 1)
+    assert "worktrees_dir: wt" in text
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=text, repo=REPO)
+
+
 @pytest.mark.parametrize("key, value", [
     (["project", "skills_dir"], "skills"),
     (["project", "docs", "spec_file"], "{module}-spec.md"),

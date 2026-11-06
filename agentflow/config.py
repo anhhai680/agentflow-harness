@@ -186,7 +186,7 @@ class Project:
     base_branch: str
     fork_from: str
     branch: str
-    worktrees_dir: str | None  # None: the state dir's `worktrees/` (`pipeline._set_up`)
+    worktrees_dir: str | None  # None: the state dir's `worktrees/` (`worktrees_root`)
     docs: dict[str, str]
     commit_trailer: str
     skills_dir: str = DEFAULT_SKILLS_DIR
@@ -366,6 +366,27 @@ def check_lane(cfg: Config, lane: str) -> None:
         raise ValueError("there is no spec lane: use `agentflow run feature --module <module> --to define`")
     if lane not in cfg.lanes:
         raise ValueError(f"unknown lane {lane!r}; known: {', '.join(cfg.lanes)}")
+
+
+def worktrees_root(cfg: Config, repo: Path) -> Path:
+    """The directory a run's worktree is made in: `project.worktrees_dir` under the repository when set, else the
+    state dir's `worktrees/` (outside the repository, so nothing needs a `.gitignore` line)."""
+    if cfg.project.worktrees_dir:
+        return repo / cfg.project.worktrees_dir
+    return pack.state_dir(repo) / "worktrees"
+
+
+def layer_files(cfg: Config) -> list[Path]:
+    """The files `cfg` was built from, bottom-up: the engine defaults, the pack and the user's file when it exists.
+    A pure function of `cfg` and the disk; `OSError` from looking for the user file is the caller's to catch."""
+    files = [layers.ENGINE_DEFAULTS, Path(cfg.path).resolve()]
+    try:
+        user = layers.user_config_path()
+    except RuntimeError:  # no home directory to look in: there is no user file
+        return files
+    if user.exists():
+        files.append(user)
+    return files
 
 
 # --------------------------------------------------------------------------- references
@@ -700,7 +721,11 @@ def _merge_layers(project: dict, path: Path, user: bool) -> tuple[dict, dict, Pa
             user_path = layers.user_config_path()
         except RuntimeError:  # no home directory to look in: there is no user file
             return merged, origins, None
-        if not user_path.exists():
+        try:
+            present = user_path.exists()
+        except OSError as exc:  # an unreadable parent directory: say which file, not a traceback
+            raise ConfigError("", f"cannot read {user_path}: {exc}") from exc
+        if not present:
             return merged, origins, None
         data = _read_yaml(user_path)
         data = {} if data is None else data  # an empty file sets nothing
@@ -1122,6 +1147,12 @@ class _Validator:
             except (KeyError, IndexError, ValueError, AttributeError) as exc:
                 self.error("project.docs.spec_file", f"spec_file cannot be filled in ({type(exc).__name__}: {exc}): "
                            "{module} is its only placeholder; write a literal brace as {{ or }}")
+        worktrees_dir = self.cfg.project.worktrees_dir
+        if worktrees_dir is not None and (posixpath.normpath(worktrees_dir.strip() or ".") == "."
+                                          or posixpath.isabs(worktrees_dir)
+                                          or ".." in posixpath.normpath(worktrees_dir).split("/")):
+            self.error("project.worktrees_dir", "worktrees_dir is a directory inside the repository, relative to its "
+                       "root and without '..'; leave it unset to keep worktrees in the state dir")
         skills_dir = self.cfg.project.skills_dir
         if skills_dir in ("", ".") or posixpath.isabs(skills_dir) or ".." in skills_dir.split("/"):
             self.error("project.skills_dir", "skills_dir is a directory inside the repository holding "

@@ -873,3 +873,55 @@ def test_version_and_engine_are_checked_on_the_pack_file_alone(tmp_path):
     _user_file("defaults:\n  run_budget_usd: 3\n")  # a user file can't supply them either
     with pytest.raises(ConfigError):
         load_config(target)
+
+
+# --------------------------------------------------------------------------- worktrees, and the files a run's layers come from
+
+
+def test_worktrees_default_into_the_state_dir(sparse_repo):
+    from agentflow.config import worktrees_root
+
+    cfg = _sparse_config(sparse_repo)
+    assert cfg.project.worktrees_dir is None
+    assert worktrees_root(cfg, sparse_repo) == pack.state_dir(sparse_repo) / "worktrees"
+
+
+def test_a_set_worktrees_dir_still_wins(tmp_cfg, sparse_repo):
+    from agentflow.config import worktrees_root
+
+    cfg = load_config(tmp_cfg({"project": {"worktrees_dir": "wt/runs"}}))
+    assert worktrees_root(cfg, sparse_repo) == sparse_repo / "wt" / "runs"
+    assert [i for i in validate(cfg, sparse_repo) if i.path == "project.worktrees_dir"] == []
+
+
+@pytest.mark.parametrize("value", ["/abs", "../up", "a/../../up", ""])
+def test_a_worktrees_dir_outside_the_repo_is_an_error(tmp_cfg, sparse_repo, value):
+    cfg = load_config(tmp_cfg({"project": {"worktrees_dir": value}}))
+    errors = [i for i in validate(cfg, sparse_repo) if i.level == "error" and i.path == "project.worktrees_dir"]
+    assert len(errors) == 1 and "relative" in errors[0].message
+
+
+def test_layer_files_lists_the_defaults_the_pack_and_the_user_file_that_exists(sparse_repo):
+    from agentflow import layers
+    from agentflow.config import layer_files
+
+    cfg = _sparse_config(sparse_repo)
+    assert layer_files(cfg) == [layers.ENGINE_DEFAULTS, Path(cfg.path).resolve()]  # no user file yet
+    user = _user_file("defaults:\n  run_budget_usd: 7\n")
+    assert layer_files(cfg) == [layers.ENGINE_DEFAULTS, Path(cfg.path).resolve(), user]
+
+
+def test_an_unreadable_user_file_location_is_a_config_error_naming_it(monkeypatch):
+    user = layers.user_config_path()
+    real = Path.exists
+
+    def exists(self):
+        if self == user:
+            raise PermissionError(13, "Permission denied")
+        return real(self)
+
+    monkeypatch.setattr(Path, "exists", exists)
+    with pytest.raises(ConfigError) as err:
+        load_config(PYTHON_CONFIG)
+    assert str(user) in str(err.value) and "cannot read" in str(err.value)
+    assert load_config(PYTHON_CONFIG, user=False).phases  # not asked for: not touched

@@ -9,7 +9,6 @@ project:
   base_branch: main            # the base the changed-path conditions compare against (`origin/<base_branch>`)
   fork_from: main              # the branch a run is cut from and its pull request goes to; `finish` brings it in first
   branch: "flow/{lane}/{slug}"
-  worktrees_dir: ../agentflow-harness-worktrees
   docs:
     specs: docs
     spec_file: "agentflow-{module}-proposal.md"   # the `harness` module is docs/agentflow-harness-proposal.md

@@ -49,8 +49,10 @@ from agentflow.autonomy import (
 from agentflow import pack, work_source
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, make_ctx
-from agentflow.config_trust import config_sha256, start_options
-from agentflow.config import Config, ConfigError, Phase, Step, check_lane, for_lane, load_config, validate
+from agentflow.config_trust import layers_sha256, start_options
+from agentflow.config import (
+    Config, ConfigError, Phase, Step, check_lane, for_lane, layer_files, load_config, validate, worktrees_root,
+)
 from agentflow.flow_control import condition_label, halted, read_json
 from agentflow.gitops import (
     GitError,
@@ -142,11 +144,10 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
 def _set_up(cfg: Config, repo: Path, run: Run, pipeline: str, params: dict, inputs: dict, opts: RunOptions) -> None:
     save(run, inputs)
     run.emit("run_options", from_phase=opts.from_phase, to_phase=opts.to_phase,
-             model_overrides=dict(opts.model_overrides), **start_options(cfg.path))
+             model_overrides=dict(opts.model_overrides), **start_options(cfg.path, layer_files(cfg)))
     slug = make_ctx(cfg, repo, pipeline, params).values["slug"]
     branch = _free_branch(repo, cfg.project.branch.replace("{lane}", pipeline).replace("{slug}", slug))
-    root = repo / cfg.project.worktrees_dir if cfg.project.worktrees_dir else pack.state_dir(repo) / "worktrees"
-    path = (root / run.id).resolve()
+    path = (worktrees_root(cfg, repo) / run.id).resolve()
     add_worktree(repo, path, branch, cfg.project.fork_from)
     run.emit("run_updated", branch=branch, worktree=str(path), base_sha=head(path))
     template = _check_new_module(cfg, params, opts.new_module)
@@ -229,7 +230,8 @@ class _Loop:
         self.config_sha = self._config_sha()
 
     def _config_sha(self) -> str | None:
-        """The hash of the config file when it is the repository's pack (the only one reloaded), else None."""
+        """The digest of the layer files (engine defaults, the pack, the user file) when the config is the repository's
+        pack (the only one reloaded), else None. It reads bytes only: a broken file still has a digest."""
         path = Path(self.cfg.path).resolve()
         try:
             if path != Path(pack.pack_config(self.run.repo)).resolve():
@@ -237,7 +239,7 @@ class _Loop:
         except (pack.PackError, subprocess.CalledProcessError, OSError):
             return None
         try:
-            return config_sha256(path)
+            return layers_sha256(layer_files(self.cfg))
         except OSError:
             return None
 

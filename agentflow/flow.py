@@ -418,9 +418,21 @@ def _continue(run, args: argparse.Namespace, cfg=None) -> int:
     if getattr(args, "detach", False):
         _spawn_resume(run, args)
         return 0
+    _note_changed_layers(run, cfg)
     _survive_hangup(run)
     _report(run, advance(run, cfg, RunOptions()))
     return 0
+
+
+def _note_changed_layers(run, cfg) -> None:
+    """One line naming the config layer files that changed since the run started: the run goes on with the current
+    files (`config_trust` decides which pack file is trusted, by its own hash)."""
+    from agentflow.config_trust import changed_layers
+
+    changed = changed_layers(run, cfg)
+    if changed:
+        print(f"note: config layer files changed since {run.id} started: {', '.join(map(str, changed))}; "
+              "the run goes on with the files as they are now.")
 
 
 def _parse_new_module(text: str | None) -> dict | None:
