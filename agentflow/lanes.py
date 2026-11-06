@@ -148,13 +148,18 @@ def _read_file_skills(text: str, skills_dir: str, inlined: frozenset[str] = froz
     return SKILL_LINE.sub(replace, text)
 
 
-def _drop_skill_section(body: str) -> str:
-    """`body` without the sections headed by the step's skill (`## The `{skill}` skill`), for a step that has none."""
+def _drop_skill_section(body: str, keep: bool = False) -> str:
+    """`body` for a step with no skill: the sections headed by the step's skill (`## The `{skill}` skill`) go, or,
+    with `keep` (the step has a brief), only their heading is renamed, so no empty `` skill`` is ever shown."""
     kept: list[str] = []
     skipping = False
     for line in body.split("\n"):
         if line.startswith("#"):
             skipping = SKILL_HEADING.match(line) is not None
+            if skipping and keep:
+                kept.append(line[:len(line) - len(line.lstrip("#"))] + " The brief")
+                skipping = False
+                continue
         if not skipping:
             kept.append(line)
     return "\n".join(kept).rstrip()
@@ -170,18 +175,21 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
     files = list(dict.fromkeys([*step.brief, *step.task_brief]))
     # A step with no configured `brief:` whose skill resolves has the skill's text as its brief, and its first
-    # prompt carries it. Not a continuation (its session has the text) and not a template that names the skill
-    # itself without a `{brief}` slot (a pack's own wording, which tells the agent to load it).
+    # prompt carries it. Not a continuation (its session has the text) and not a template that names a skill of
+    # the repository itself without a `{brief}` slot (a pack's own wording, which tells the agent to load it).
+    # A bundled skill is never loadable by name, so it is always inlined.
     skill_brief = None
-    if step.skill and not step.brief and not step.continuation \
-            and ("{brief}" in body or f"`{step.skill}` skill" not in body):
-        skill_brief = skill_text(cfg, ctx.repo, step.skill)
+    if step.skill and not step.brief and not step.continuation:
+        found = pack.skill_file(ctx.repo, cfg.project.skills_dir, step.skill)
+        owned = found is not None and not pack.is_bundled(found) and f"`{step.skill}` skill" in body
+        if "{brief}" in body or not owned:
+            skill_brief = skill_text(cfg, ctx.repo, step.skill)
     briefs = [skill_brief] if skill_brief is not None else []
     briefs.extend((ctx.repo / name).read_text(encoding="utf-8") for name in files)
     if skill_brief is not None and "{brief}" not in body:
         body = f"{body}\n\n{SKILL_BLOCK}"
-    if not step.skill and not briefs:
-        body = _drop_skill_section(body)
+    if not step.skill:  # no skill to name in a `## The `{skill}` skill` heading
+        body = _drop_skill_section(body, keep=bool(briefs))
     if step.skill and f"`{step.skill}` skill" not in body:
         line = (f"Use the `{step.skill}` skill: its full text is in this prompt, so do not load it."
                 if skill_brief is not None else f"Use the `{step.skill}` skill.")

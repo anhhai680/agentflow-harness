@@ -967,3 +967,22 @@ def test_a_step_without_a_skill_renders_no_empty_skill_heading(flow_repo):
         assert "`` skill" not in prompt and "{skill}" not in prompt and "{brief}" not in prompt, template
         assert "This is its full text" not in prompt, template
         assert "## When you finish" in prompt, template  # what follows the dropped section stays
+
+
+def test_a_pack_template_that_names_a_bundled_skill_still_gets_it_inlined(flow_repo, monkeypatch, tmp_path):
+    bundled_skill(monkeypatch, tmp_path)
+    (flow_repo.cfg.path.parent / "prompts" / "owned_bundled.md").write_text(
+        "Use the `agentflow-build` skill.\n\nGoal: do it.\n", encoding="utf-8")
+    step = make_step(prompt="owned_bundled.md", skill="agentflow-build")
+    prompt = skill_prompt(flow_repo, step)
+    assert "Rules with {module}" in prompt and "Its full text follows" in prompt  # an agent cannot load a bundled skill
+    codex = skill_prompt(flow_repo, step, rec={"agent": "codex"})
+    assert "Rules with {module}" in codex and "SKILL.md" not in codex  # nothing points it at a file that is not there
+
+
+def test_a_step_without_a_skill_but_with_a_brief_renders_no_empty_skill_heading(flow_repo):
+    (flow_repo.root / "mybrief.md").write_text("MY BRIEF\n", encoding="utf-8")
+    for template in ("fix.md", "fix_findings.md", "verify.md"):
+        prompt = skill_prompt(flow_repo, make_step(prompt=template, skill=None, brief=["mybrief.md"]))
+        assert "`` skill" not in prompt and "MY BRIEF" in prompt and "## The brief" in prompt, template
+        assert "## When you finish" in prompt, template
