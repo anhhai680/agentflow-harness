@@ -189,15 +189,18 @@ _RANK = {"engine": 0, "project": 2, "user": 3}  # a starter (`starter:<name>`) s
 
 
 def _layers(path: Path, text: str) -> _Layers:
-    """The layered view of the pack at `path`, whose text is `text`. A pack that does not load (a broken file, a
-    user file the pack refuses) falls back to the file alone, as the form was before the layers."""
+    """The layered view of the pack at `path`, whose text is `text`. A user file the pack refuses is left out; a
+    pack that does not load at all falls back to the file alone, as the form was before the layers."""
     project = yaml.safe_load(text) or {}
     project = project if isinstance(project, dict) else {}
     comments = _comments(text)
     try:
         cfg = load_config(path)
     except ConfigError:
-        return _Layers(project, project, {key: "project" for key in layers.leaf_keys(project)}, comments=comments)
+        try:  # a user file that does not load against this pack: the engine and the pack still do
+            cfg = load_config(path, user=False)
+        except ConfigError:
+            return _Layers(project, project, {key: "project" for key in layers.leaf_keys(project)}, comments=comments)
     engine_text = layers.ENGINE_DEFAULTS.read_text(encoding="utf-8")
     below, _ = layers.merge([layers.Layer("engine", yaml.safe_load(engine_text) or {}, layers.ENGINE_DEFAULTS)])
     if layers.owns_workflow(project):  # the pack writes the whole workflow: none of the engine's applies to it
@@ -433,21 +436,29 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(new_text)
         try:
-            new_cfg = load_config(Path(temp))
+            new_cfg = load_config(Path(temp))  # validated as a run would load it: with the user's own file
         except ConfigError as exc:
             _hold_unloadable(path, parsed)  # a pack format or engine change does not load: it is still refused
             return [Issue("error", exc.path, exc.message)]
+        try:
+            new_raw = load_config(Path(temp), user=False).raw
+        except ConfigError:  # not expected when the layered load passed: hold it as written
+            _hold_unloadable(path, parsed)
+            new_raw = None
         from agentflow.guards import settings_coverage
 
         issues = validate(new_cfg, repo) + settings_coverage(new_cfg, repo)
     finally:
         Path(temp).unlink(missing_ok=True)
+    # The protected settings are compared without the user file: none of them may come from it (`hitl.notify`, the
+    # one personal key among them, then compares equal on both sides), and a user file that does not load against
+    # the pack on disk (it names an agent of another repository) must not turn the hold off.
     try:
-        old_raw = load_config(path).raw  # both configs layered: a sparse pack's phases and agents come from below
+        old_raw = load_config(path, user=False).raw  # both layered on the engine: a sparse pack's phases and agents
     except ConfigError:  # the file on disk is broken already: there is nothing to hold
         old_raw = None
-    if old_raw is not None:
-        changed = _protected_changes(old_raw, new_cfg.raw)
+    if old_raw is not None and new_raw is not None:
+        changed = _protected_changes(old_raw, new_raw)
         if changed:
             raise Refused("these settings are protected and can only be changed in the file, in git: "
                           + ", ".join(changed))
@@ -458,7 +469,7 @@ def _hold_unloadable(path: Path, parsed: dict) -> None:
     """Refuse a text that changes a protected setting even when it no longer loads, comparing it as written with
     the file as written (a loaded config's `@` references are resolved, the new text's are not)."""
     try:
-        load_config(path)
+        load_config(path, user=False)  # whatever the user file holds, the pack on disk is what is held
         old = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (ConfigError, OSError, yaml.YAMLError):  # the file on disk is broken already: there is nothing to hold
         return
@@ -542,6 +553,8 @@ def _own_entries(lay: _Layers, key: tuple[str, ...], value: dict) -> dict | None
     mine = mine if isinstance(mine, dict) else {}
     own = {name: entry for name, entry in value.items()
            if name in mine or name not in below or type(below[name]) is not type(entry) or below[name] != entry}
+    # a `null` the pack states deletes an inherited entry, which the page therefore never shows: keep it deleted
+    own |= {name: None for name, entry in mine.items() if entry is None and name not in value}
     return own if own or stated else None
 
 
