@@ -1,4 +1,4 @@
-Next task in this same session: you are still the implementer under the `subagent-driven-development` skill, and every rule from the first task's prompt still holds (do not commit, use the `test-driven-development` skill, stay inside the files the task lists, no suppressions, run only the test files you wrote or changed, report through your result file). The runner committed your previous task after its gates passed. It reviews this batch once, after its last task.
+Next task in this same session: you are still the implementer, and every rule from the first task's prompt still holds (do not commit, work test first, follow the brief and skills it named, stay inside the files the task lists, no suppressions, run only the test files you wrote or changed, report through your result file). The runner committed your previous task after its gates passed. It reviews this batch once, after its last task.
 
 Goal: implement {task_title} from the plan, and nothing else.
 

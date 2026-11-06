@@ -1,5 +1,3 @@
-Use the `grilling` skill.
-
 Goal: turn the new module `{module}` into a short list of product questions for a human, each with your recommended option.
 
 Read, by path, and only what you need:

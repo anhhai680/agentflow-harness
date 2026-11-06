@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentflow"
+version = "2.0"  # keep equal to agentflow.pack.ENGINE_VERSION (test_packaging checks it)
+description = "A headless runner that drives Claude Code or Codex through a config-driven SDLC workflow."
+requires-python = ">=3.12"
+dependencies = ["pyyaml>=6"]
+
+[project.scripts]
+agentflow = "agentflow.flow:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentflow"]
+exclude = ["agentflow/tests", "agentflow/runs", "agentflow/workspaces", "agentflow/.gitignore"]
+
+# A local install caches its built wheel: rebuild it when any file under agentflow/ changes.
+# `uv tool install --reinstall --from . agentflow` is the fallback if uv does not pick a change up.
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "agentflow/**/*" }]

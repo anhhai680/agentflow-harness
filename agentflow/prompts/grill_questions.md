@@ -1,5 +1,3 @@
-Use the `grilling` skill.
-
 Goal: grill the design question "{topic}" into questions for a human, each with a recommended answer.
 
 Read the idea doc, if one is configured (`{idea}`): `grep -n '^## '` first, then only the sections the topic touches (Open Questions, Decisions Log, Not Doing). Never read it whole. Read the decision records it touches.

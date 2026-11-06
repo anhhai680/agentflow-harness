@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -12,12 +13,13 @@ import time
 import pytest
 
 from agentflow import gitops, lanes
-from agentflow.config import Phase, Step
-from agentflow.conditions import make_ctx
+from agentflow.config import PROMPT_PLACEHOLDERS, Phase, Step
+from agentflow.conditions import fmt, make_ctx
 from agentflow.events import parse_iso
 from agentflow.hitl import answer
 from agentflow.lanes import build_prompt
 from agentflow.state import Run
+from conftest import ENGINE
 
 KEY = "build/impl"
 DONE = {"status": "done", "summary": "did it"}
@@ -625,7 +627,7 @@ def test_build_prompt_parts(flow_repo):
     run = flow_repo.new_run()
     cfg = flow_repo.cfg
     ctx = make_ctx(cfg, flow_repo.root, "feature", {"module": "crm"}, run)
-    step = make_step(prompt="spec.md")
+    step = make_step(prompt="spec.md", skill="spec-driven-development", brief=["README.md"])  # an explicit brief: the skill line is plain
     extra = {"result_file": "/workspace/out/step.json"}
     first = build_prompt(cfg, step, ctx, {"sized": False, "agent": "claude"}, extra, "first")
     assert "Effort check" in first
@@ -643,7 +645,7 @@ def test_build_prompt_parts(flow_repo):
 def test_build_prompt_names_a_skill_the_template_leaves_out(flow_repo):
     run = flow_repo.new_run()
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
-    prompt = build_prompt(flow_repo.cfg, make_step(skill="writing-plans"), ctx, {"sized": True}, {}, "first")
+    prompt = build_prompt(flow_repo.cfg, make_step(skill="writing-plans", brief=["README.md"]), ctx, {"sized": True}, {}, "first")
     assert "Use the `writing-plans` skill." in prompt
     assert "do the step `impl`" in prompt
 
@@ -651,7 +653,7 @@ def test_build_prompt_names_a_skill_the_template_leaves_out(flow_repo):
 def test_codex_prompt_reads_skill_file(flow_repo):
     run = flow_repo.new_run()
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
-    prompt = build_prompt(flow_repo.cfg, make_step(prompt="plan.md"), ctx, {"sized": True, "agent": "codex"}, {}, "first")
+    prompt = build_prompt(flow_repo.cfg, make_step(prompt="plan.md", skill="writing-plans", brief=["README.md"]), ctx, {"sized": True, "agent": "codex"}, {}, "first")
     assert "Read `.claude/skills/writing-plans/SKILL.md` and follow it." in prompt
     assert "Use the `writing-plans` skill" not in prompt
 
@@ -799,3 +801,237 @@ def test_gitops_commit_rejects_a_staged_forbidden_path(flow_repo, git):
     assert git(flow_repo.root, "diff", "--cached", "--name-only").strip() == ""  # index clean
     assert (flow_repo.root / "CONSTRAINTS.md").read_text(encoding="utf-8") == "weaker\n"  # tree untouched
     assert (flow_repo.root / "fine.txt").is_file()
+
+
+# --------------------------------------------------------------------------- generic engine prompts
+
+ENGINE_TEMPLATES = sorted((ENGINE / "prompts").glob("*.md"))
+
+
+def test_engine_prompts_name_no_skill_and_no_base_branch():
+    for p in ENGINE_TEMPLATES:
+        text = p.read_text(encoding="utf-8")
+        assert not re.search(r"`[a-z][a-z0-9-]*` skill", text) and "origin/main" not in text, p.name
+
+
+@pytest.mark.parametrize("path", ENGINE_TEMPLATES, ids=lambda p: p.name)
+def test_every_engine_template_fills_with_every_placeholder(path):
+    text = path.read_text(encoding="utf-8")
+    assert set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", text)) <= PROMPT_PLACEHOLDERS
+    filled = fmt(text, {name: "x" for name in PROMPT_PLACEHOLDERS})
+    assert not [name for name in PROMPT_PLACEHOLDERS if "{" + name + "}" in filled]
+
+
+def test_skill_and_base_ref_placeholders(flow_repo):
+    assert {"skill", "base_ref"} <= PROMPT_PLACEHOLDERS
+    run = flow_repo.new_run()
+    ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
+    ctx.base_ref = "origin/develop"
+    for prompt in ("fix.md", "branch_review.md", "security_review.md"):
+        text = build_prompt(flow_repo.cfg, make_step(prompt=prompt, skill="x", brief=[]), ctx, {"sized": True}, {}, "first")
+        assert "{skill}" not in text and "{base_ref}" not in text and "origin/main" not in text, prompt
+    fix = build_prompt(flow_repo.cfg, make_step(prompt="fix.md", skill="x", brief=[]), ctx, {"sized": True}, {}, "first")
+    assert "## The `x` skill" in fix
+    review = build_prompt(flow_repo.cfg, make_step(prompt="branch_review.md", skill=None, brief=[]), ctx, {"sized": True}, {}, "first")
+    assert "`git diff origin/develop...HEAD`" in review
+
+
+# --------------------------------------------------------------------------- a step's skill text is its brief
+
+SKILL_BODY = 'Rules with {module} and {"a": 1} in them.\n'
+
+
+def bundled_skill(monkeypatch, tmp_path, name="agentflow-build", text=None):
+    """Point the engine's bundled skills at a tmp directory holding one skill, `name`."""
+    from agentflow import pack
+
+    root = tmp_path / "bundled-skills"
+    (root / name).mkdir(parents=True, exist_ok=True)
+    (root / name / "SKILL.md").write_text(text if text is not None else f"---\nname: {name}\n---\n\n{SKILL_BODY}",
+                                          encoding="utf-8")
+    monkeypatch.setattr(pack, "ENGINE_SKILLS", root)
+    return root
+
+
+def skill_prompt(flow_repo, step, extra=None, rec=None):
+    run = flow_repo.run or flow_repo.new_run()
+    ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
+    return build_prompt(flow_repo.cfg, step, ctx, {"sized": True, **(rec or {})}, extra or {}, "first")
+
+
+def test_a_step_without_brief_gets_its_skill_as_brief_verbatim(flow_repo, monkeypatch, tmp_path):
+    bundled_skill(monkeypatch, tmp_path)
+    prompt = skill_prompt(flow_repo, make_step(prompt="fix.md", skill="agentflow-build"))
+    assert SKILL_BODY.strip() in prompt  # braces and JSON reach the prompt as written
+    assert prompt.index("Rules with {module}") < prompt.index("## When you finish")
+    assert "name: agentflow-build" not in prompt  # the frontmatter is not the brief
+    assert "Use the `agentflow-build` skill: its full text is in this prompt, so do not load it." in prompt
+    assert "{brief}" not in prompt
+
+
+def test_a_template_without_brief_gets_the_skill_appended_before_the_result_contract(flow_repo, monkeypatch, tmp_path):
+    bundled_skill(monkeypatch, tmp_path)
+    prompt = skill_prompt(flow_repo, make_step(prompt="step.md", skill="agentflow-build"))
+    block = "## The `agentflow-build` skill\n\nIts full text follows, so you already have it: do not load it.\n\n"
+    assert block + SKILL_BODY.strip() in prompt
+    assert prompt.index(block) < prompt.index("## When you finish")
+    assert prompt.index("do the step `impl`") < prompt.index(block)
+
+
+def test_a_template_that_names_the_skill_itself_is_left_as_it_was(flow_repo, tmp_path):
+    (flow_repo.cfg.path.parent / "prompts" / "owned.md").write_text(
+        "Use the `test-driven-development` skill.\n\nGoal: do it.\n", encoding="utf-8")
+    prompt = skill_prompt(flow_repo, make_step(prompt="owned.md", skill="test-driven-development"))
+    assert "Use the `test-driven-development` skill.\n" in prompt
+    assert "Stub:" not in prompt and "its full text" not in prompt  # the pack's own wording stands
+
+
+def test_a_batch_continuation_does_not_resend_the_skill(flow_repo, monkeypatch, tmp_path):
+    bundled_skill(monkeypatch, tmp_path)
+    step = make_step(prompt="task_next.md", skill="agentflow-build", continuation=True)
+    prompt = skill_prompt(flow_repo, step, {"task_title": "Task 2: B", "task_text": "do b"})
+    assert "Rules with" not in prompt and "Its full text follows" not in prompt
+    assert "Use the `agentflow-build` skill.\n" in prompt  # the line it always had
+
+
+@pytest.mark.parametrize("script", [
+    [{"result": DONE}],                                                                 # its first, fresh session
+    [{"usage_pct": [81]}, {"result": DONE}],                                            # a rollover
+    [{"result": {"status": "effort_change", "effort": "high", "reason": "big"}}, {"result": DONE}],  # new effort
+])
+def test_a_continuation_in_a_fresh_session_still_gets_the_skill(flow_repo, monkeypatch, tmp_path, script):
+    bundled_skill(monkeypatch, tmp_path)
+    flow_repo.new_run()
+    flow_repo.script({KEY: script})
+    step = make_step(prompt="task_next.md", skill="agentflow-build", continuation=True)
+    assert run_step(flow_repo, step, extra={"task_title": "Task 2: B", "task_text": "do b"}) == "done"
+    for call in flow_repo.calls():
+        assert "--resume" not in call["argv"]
+        assert "Rules with {module}" in call["argv"][-1]  # no session holds the text yet, so it is sent
+
+
+def test_task_briefs_do_not_suppress_the_skill_text(flow_repo, monkeypatch, tmp_path):
+    bundled_skill(monkeypatch, tmp_path)
+    (flow_repo.root / "extra-brief.md").write_text("EXTRA BRIEF TEXT\n", encoding="utf-8")
+    step = make_step(prompt="task.md", skill="agentflow-build", task_brief=["extra-brief.md"])
+    prompt = skill_prompt(flow_repo, step, {"task_title": "Task 1: A", "task_text": "do a"})
+    assert "Rules with {module}" in prompt and "EXTRA BRIEF TEXT" in prompt
+    assert prompt.index("Rules with {module}") < prompt.index("EXTRA BRIEF TEXT")  # the skill comes first
+
+
+def test_a_repo_skill_wins_over_the_bundled_one(flow_repo, monkeypatch, tmp_path):
+    bundled_skill(monkeypatch, tmp_path)
+    mine = flow_repo.root / "mine" / "agentflow-build"
+    mine.mkdir(parents=True)
+    (mine / "SKILL.md").write_text("The repository's own build skill.\n", encoding="utf-8")
+    flow_repo.configure({"project": {"skills_dir": "mine"}})
+    prompt = skill_prompt(flow_repo, make_step(prompt="fix.md", skill="agentflow-build"))
+    assert "The repository's own build skill." in prompt and "Rules with" not in prompt
+
+
+def test_a_skill_written_only_in_the_runs_worktree_is_not_used(flow_repo):
+    run = flow_repo.new_run()
+    worktree = flow_repo.root.parent / "elsewhere"
+    (worktree / ".claude" / "skills" / "only-here").mkdir(parents=True)
+    (worktree / ".claude" / "skills" / "only-here" / "SKILL.md").write_text("PLANTED IN THE WORKTREE\n", encoding="utf-8")
+    run.state["worktree"] = str(worktree)
+    prompt = skill_prompt(flow_repo, make_step(prompt="step.md", skill="only-here"))
+    assert "PLANTED IN THE WORKTREE" not in prompt
+    assert "Use the `only-here` skill." in prompt  # unresolved: the plain line, as before
+
+
+def test_explicit_brief_files_still_win(flow_repo):
+    (flow_repo.root / "mybrief.md").write_text("MY BRIEF\n", encoding="utf-8")
+    prompt = skill_prompt(flow_repo, make_step(prompt="fix.md", skill="test-driven-development", brief=["mybrief.md"]))
+    assert "MY BRIEF" in prompt and "Stub:" not in prompt  # the skill's own text is not added
+    assert "Use the `test-driven-development` skill.\n" in prompt and "its full text is in this prompt" not in prompt
+
+
+@pytest.mark.parametrize("raw", [
+    "---\nname: x\n---\nBody\n",
+    "---\r\nname: x\r\n---\r\nBody\r\n",
+    "﻿---\nname: x\n---\nBody\n",
+], ids=["lf", "crlf", "bom"])
+def test_frontmatter_is_stripped_with_crlf_and_bom_and_kept_when_unclosed(flow_repo, monkeypatch, tmp_path, raw):
+    bundled_skill(monkeypatch, tmp_path, text=raw)
+    assert lanes.skill_text(flow_repo.cfg, flow_repo.root, "agentflow-build") == "Body\n"
+    bundled_skill(monkeypatch, tmp_path, text="---\nname: x\nBody with no closing line\n")
+    assert lanes.skill_text(flow_repo.cfg, flow_repo.root, "agentflow-build") == "---\nname: x\nBody with no closing line\n"
+    bundled_skill(monkeypatch, tmp_path, text="Plain body\r\nline two\r\n")
+    assert lanes.skill_text(flow_repo.cfg, flow_repo.root, "agentflow-build") == "Plain body\nline two\n"
+    assert lanes.skill_text(flow_repo.cfg, flow_repo.root, "no-such-skill") is None
+    assert lanes.skill_text(flow_repo.cfg, flow_repo.root, "../x") is None
+
+
+def test_codex_read_file_rewrite_leaves_an_inlined_skill_alone():
+    text = "Use the `a` skill: its full text is in this prompt, so do not load it.\n\nAlso use the `b` skill."
+    assert lanes._read_file_skills(text, "skills", frozenset({"a"})) == (
+        "Use the `a` skill: its full text is in this prompt, so do not load it.\n\nAlso read `skills/b/SKILL.md` and follow it.")
+    assert "Read `skills/a/SKILL.md`" in lanes._read_file_skills("Use the `a` skill.", "skills")  # two arguments still work
+
+
+def test_codex_prompt_does_not_read_a_file_for_an_inlined_skill(flow_repo, monkeypatch, tmp_path):
+    bundled_skill(monkeypatch, tmp_path)
+    prompt = skill_prompt(flow_repo, make_step(prompt="step.md", skill="agentflow-build"), rec={"agent": "codex"})
+    assert "Use the `agentflow-build` skill: its full text is in this prompt, so do not load it." in prompt
+    assert "SKILL.md" not in prompt
+
+
+def test_a_step_without_a_skill_renders_no_empty_skill_heading(flow_repo):
+    for template in ("fix.md", "fix_findings.md", "verify.md"):
+        prompt = skill_prompt(flow_repo, make_step(prompt=template, skill=None))
+        assert "`` skill" not in prompt and "{skill}" not in prompt and "{brief}" not in prompt, template
+        assert "This is its full text" not in prompt, template
+        assert "## When you finish" in prompt, template  # what follows the dropped section stays
+
+
+def test_a_pack_template_that_names_a_bundled_skill_still_gets_it_inlined(flow_repo, monkeypatch, tmp_path):
+    bundled_skill(monkeypatch, tmp_path)
+    (flow_repo.cfg.path.parent / "prompts" / "owned_bundled.md").write_text(
+        "Use the `agentflow-build` skill.\n\nGoal: do it.\n", encoding="utf-8")
+    step = make_step(prompt="owned_bundled.md", skill="agentflow-build")
+    prompt = skill_prompt(flow_repo, step)
+    assert "Rules with {module}" in prompt and "Its full text follows" in prompt  # an agent cannot load a bundled skill
+    codex = skill_prompt(flow_repo, step, rec={"agent": "codex"})
+    assert "Rules with {module}" in codex and "SKILL.md" not in codex  # nothing points it at a file that is not there
+
+
+def test_a_step_without_a_skill_but_with_a_brief_renders_no_empty_skill_heading(flow_repo):
+    (flow_repo.root / "mybrief.md").write_text("MY BRIEF\n", encoding="utf-8")
+    for template in ("fix.md", "fix_findings.md", "verify.md"):
+        prompt = skill_prompt(flow_repo, make_step(prompt=template, skill=None, brief=["mybrief.md"]))
+        assert "`` skill" not in prompt and "MY BRIEF" in prompt and "## The brief" in prompt, template
+        assert "## When you finish" in prompt, template
+
+
+@pytest.mark.parametrize("lane", ["feature", "bug"])
+def test_engine_prompts_inline_the_bundled_skills_over_a_sparse_pack(sparse_repo, lane):
+    # The engine's prompts and its bundled skills together, as a pack with no prompts and no skills runs them.
+    from agentflow import pack
+    from agentflow.config import for_lane, load_config
+
+    cfg = load_config(pack.pack_config(sparse_repo))
+    ctx = make_ctx(cfg, sparse_repo, lane, {"module": "x"})
+
+    def walk(steps):
+        for step in steps:
+            yield step
+            yield from walk(step.steps)
+            if step.review:
+                yield step.review
+
+    seen = 0
+    for phase in cfg.phases.values():
+        for step in walk(for_lane(phase.steps, lane)):
+            if not step.skill or step.type not in (None, "agent"):
+                continue
+            seen += 1
+            found = pack.skill_file(sparse_repo, cfg.project.skills_dir, step.skill)
+            assert found is not None and pack.is_bundled(found), step.id
+            h1 = next(line for line in found.read_text(encoding="utf-8").splitlines() if line.startswith("# "))
+            text = build_prompt(cfg, step, ctx, {}, {}, "normal")
+            assert f"Use the `{step.skill}` skill: its full text is in this prompt" in text, step.id
+            assert h1 in text, step.id
+            assert "## The `` skill" not in text, step.id
+            assert not [p for p in ("{skill}", "{brief}", "{base_ref}") if p in text], step.id
+    assert seen >= 5

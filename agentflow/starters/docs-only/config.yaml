@@ -1,0 +1,11 @@
+# Starter: a documentation repository. A config layer under the pack: the pack overrides it key by key.
+# It sets only the gates and which gate runs when; the workflow, the lanes and every other setting are the engine's.
+# `whitespace` checks every tracked file against the empty tree, so it works on a committed tree and on an unborn
+# HEAD. It turns off `blank-at-eol`, so a Markdown line break (two trailing spaces) is not flagged. It does not see
+# untracked files: a docs repository should add a real gate, such as a Markdown linter.
+gates:
+  whitespace: {run: 'git -c core.whitespace=-blank-at-eol diff --check "$(git hash-object -t tree /dev/null)"'}
+gate_sets:
+  setup: []
+  build: [whitespace]
+  verify: [whitespace]

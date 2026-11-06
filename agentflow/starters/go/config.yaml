@@ -1,0 +1,9 @@
+# Starter: a Go module. A config layer under the pack: the pack overrides it key by key.
+# It sets only the gates and which gate runs when; the workflow, the lanes and every other setting are the engine's.
+gates:
+  vet: {run: go vet ./...}
+  test: {run: go test ./...}
+gate_sets:
+  setup: []
+  build: [vet]
+  verify: [vet, test]

@@ -1,6 +1,6 @@
-You are the reviewer the `requesting-code-review` skill would dispatch: this fresh session is that reviewer, and the brief is at the end of this prompt. The runner is the controller: it gave you this review and acts on your findings. Do not run that skill's dispatch process, and do not spawn subagents.
+You are the reviewer: this fresh session is the reviewer a controller would dispatch, and the review brief is at the end of this prompt. The runner is the controller: it gave you this review and acts on your findings. Do not run a dispatch process, and do not spawn subagents.
 
-Goal: review the whole branch against its base: `git diff origin/main...HEAD` and the commit list.
+Goal: review the whole branch against its base: `git diff {base_ref}...HEAD` and the commit list.
 
 {earlier_findings}
 

@@ -71,6 +71,116 @@ def pairs(argv: list[str]) -> set[tuple[str, str]]:
 # --------------------------------------------------------------------------- the phase loop
 
 
+def test_a_pack_with_no_worktrees_dir_puts_the_worktree_in_the_state_dir(pipe):
+    from agentflow import pack
+
+    pipe.configure({**PIPE, "project": {"worktrees_dir": None}})  # the engine defaults have no worktrees_dir
+    assert pipe.cfg.project.worktrees_dir is None
+    run = begin(pipe)
+    worktree = Path(run.state["worktree"])
+    assert worktree.is_dir() and worktree == (pack.state_dir(pipe.root) / "worktrees" / run.id).resolve()
+
+
+# --------------------------------------------------------------------------- the config layers during and across a run
+
+
+def _user_file(text: str) -> Path:
+    from agentflow import layers
+
+    target = layers.user_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    return target
+
+
+def _live_loop(pipe, monkeypatch):
+    from agentflow import pack, pipeline
+
+    monkeypatch.setattr(pack, "pack_config", lambda repo: Path(pipe.cfg.path))  # the run's repo's own pack
+    run = pipe.new_run()
+    return pipeline._Loop(run, pipe.cfg, RunOptions()), run
+
+
+def test_a_changed_user_file_between_phases_is_reloaded(pipe, monkeypatch):
+    loop, run = _live_loop(pipe, monkeypatch)
+    loop.reload()
+    assert not [e for e in run.events.read() if e["type"].startswith("config_reload")]  # nothing changed
+    user = _user_file("defaults:\n  run_budget_usd: 7\n")  # a file that did not exist when the loop began
+    loop.reload()
+    assert loop.cfg.defaults.run_budget_usd == 7 and run.events.read()[-1]["type"] == "config_reloaded"
+    user.write_text("defaults:\n  run_budget_usd: 9\n", encoding="utf-8")
+    loop.reload()
+    assert loop.cfg.defaults.run_budget_usd == 9
+
+
+def test_a_broken_user_file_between_phases_is_skipped_with_its_reason(pipe, monkeypatch):
+    loop, run = _live_loop(pipe, monkeypatch)
+    before = loop.cfg
+    user = _user_file("gates:\n  unit: {run: evil}\n")  # a gate is not a personal setting
+    loop.reload()
+    assert loop.cfg is before
+    last = run.events.read()[-1]
+    assert last["type"] == "config_reload_skipped" and str(user) in last["reason"] and "not a personal setting" in last["reason"]
+    loop.reload()  # the same broken file is reported once
+    assert run.events.read()[-1]["seq"] == last["seq"]
+    user.write_text("defaults:\n  run_budget_usd: 3\n", encoding="utf-8")  # mended: taken
+    loop.reload()
+    assert loop.cfg.defaults.run_budget_usd == 3 and run.events.read()[-1]["type"] == "config_reloaded"
+
+
+def test_the_layers_digest_is_over_each_files_path_and_bytes_in_order(tmp_path):
+    from agentflow.config_trust import layers_sha256
+
+    a, b = tmp_path / "a.yaml", tmp_path / "b.yaml"
+    a.write_text("x: 1\n", encoding="utf-8")
+    b.write_text("y: 2\n", encoding="utf-8")
+    digest = layers_sha256([a, b])
+    assert len(digest) == 64 and digest == layers_sha256([a, b])
+    assert digest != layers_sha256([b, a])
+    b.write_text("y: 3\n", encoding="utf-8")
+    assert digest != layers_sha256([a, b])
+
+
+def test_start_records_the_layers_digest_and_each_files_digest(pipe):
+    from agentflow.config import layer_files
+    from agentflow.config_trust import layers_sha256
+
+    run = begin(pipe)
+    options = pipe.events(run, "run_options")[0]
+    files = layer_files(pipe.cfg)
+    assert options["layers_sha256"] == layers_sha256(files)
+    assert sorted(options["layer_digests"]) == sorted(str(p) for p in files)
+
+
+def test_resume_reports_changed_layer_files(pipe, capsys):
+    run = begin(pipe)
+    assert go(pipe, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    user = _user_file("defaults:\n  run_budget_usd: 7\n")  # appears after the run started
+    assert main(["resume", run.id]) == 0
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if "layer" in line and str(user) in line]
+    assert len(lines) == 1 and "changed since" in lines[0] and run.id in lines[0]
+    assert str(pipe.cfg.path) not in lines[0]  # only the files that changed are named
+
+
+def test_resume_says_nothing_when_no_layer_changed(pipe, capsys):
+    run = begin(pipe)
+    assert go(pipe, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    assert main(["resume", run.id]) == 0
+    assert "changed since" not in capsys.readouterr().out
+
+
+def test_a_run_started_before_the_digests_were_recorded_reports_nothing(pipe):
+    from agentflow.config_trust import changed_layers
+
+    run = pipe.new_run()
+    run.emit("run_options", config=str(Path(pipe.cfg.path).resolve()), config_sha256="0" * 64)  # the old record
+    _user_file("defaults:\n  run_budget_usd: 7\n")
+    assert changed_layers(run, pipe.cfg) == []
+
+
 def test_feature_stops_after_every_phase(pipe):
     run = begin(pipe)
     worktree = Path(run.state["worktree"])
@@ -404,6 +514,8 @@ def test_run_cli_preflight_missing_binary(pipe, capsys):
 
 
 def test_dry_run_feature(pipe, capsys):
+    from agentflow import pack
+
     assert main(["run", "feature", "--module", "demo", "--dry-run", "--config", str(pipe.cfg.path)]) == 0
     out = capsys.readouterr().out
     for phase in ("define", "plan", "build", "verify", "review", "ship"):
@@ -416,7 +528,7 @@ def test_dry_run_feature(pipe, capsys):
     assert "gh pr create --draft" in out
     assert pipe.calls() == []
     assert not runs_root(pipe.root).exists()
-    assert not (pipe.root.parent / "toy-worktrees").exists()
+    assert not (pack.state_dir(pipe.root) / "worktrees").exists()
 
 
 def test_run_cli_detach_starts_a_background_resume(pipe, monkeypatch):

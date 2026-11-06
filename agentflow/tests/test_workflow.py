@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ import pytest
 
 from agentflow.config import for_lane, load_config, resolve_model
 from agentflow.flow import main
-from conftest import PYTHON_CONFIG, PYTHON_SKILLS
+from conftest import PACKS, PYTHON_CONFIG, PYTHON_SKILLS
 from agentflow.hitl import answer, approve, reject
 from agentflow.lanes import build_prompt
 from agentflow.module_queue import feature_runs
@@ -36,6 +37,8 @@ MINOR_FINDING = {"severity": "minor", "file": "src/one.py", "line": 9, "text": "
 @pytest.fixture
 def pipe(flow_repo):
     flow_repo.configure(PIPE)
+    # the engine's prompts are skill-neutral: these tests pin the python pack's prompt wording, which it overrides
+    shutil.copytree(PACKS / "python" / ".agentflow" / "prompts", flow_repo.cfg.path.parent / "prompts", dirs_exist_ok=True)
     return flow_repo
 
 

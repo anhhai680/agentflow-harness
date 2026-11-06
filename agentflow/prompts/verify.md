@@ -1,5 +1,3 @@
-Use the `verification-before-completion` skill.
-
 Goal: prove the branch is done from the verify gates' output, not by assuming.
 
 {earlier_findings}
@@ -11,7 +9,7 @@ If something fails, say which gate and why, and fix only the cause. Never weaken
 No human reads this step before the run goes on. Put anything that still fails, or that you could not run, in the result's `findings` as `{"severity": "blocking", "file": "path", "line": 1, "text": "what and why"}`: a result that only mentions it in `summary` lets it through.
 Do not commit.
 
-## The `verification-before-completion` skill
+## The `{skill}` skill
 
 This is its full text, so you already have it: do not load it, follow it.
 

@@ -1,5 +1,3 @@
-Use the `receiving-code-review` skill.
-
 Goal: the `{phase}` phase found problems the runner must resolve. Make the plan that resolves them. Do not edit anything: `fix_findings` runs next and follows your plan, then the phase's checks run again.
 
 This is round {refine_round}.
@@ -14,7 +12,7 @@ Put the plan in the result's `signals`, as `{"fix_plan": [{"finding": "file:line
 
 Fix the cause, in the smallest change that does it. A fix may never weaken the repository's quality rules, skip a test or add a suppression. If a finding can only be resolved by a decision the docs do not settle, say so as a question with your recommended option.
 
-## The `receiving-code-review` skill
+## The `{skill}` skill
 
 This is its full text, so you already have it: do not load it, follow it.
 

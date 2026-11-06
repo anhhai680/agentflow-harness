@@ -264,6 +264,53 @@ def test_small_plan_shared_session(flow_repo, git):
     assert flow_repo.events(run, "review_result") == []
 
 
+STUB = "Stub: the executing-plans skill."
+
+
+def _small_plan_without_brief(flow_repo, monkeypatch, shared: bool) -> list:
+    """The `python` pack's small plan as the engine defaults write it (no `brief:`); returns the `(skill,
+    continuation)` of every prompt built for it."""
+    from agentflow import lanes
+
+    flow_repo.configure(SMALL)
+    step = next(s for s in flow_repo.cfg.phases["build"].steps if s.id == "build")
+    step.small_plan = {**{k: v for k, v in step.small_plan.items() if k != "brief"}, "shared_session": shared}
+    seen = []
+    real = lanes.build_prompt
+    monkeypatch.setattr(lanes, "build_prompt",
+                        lambda cfg, s, *rest: seen.append((s.skill, s.continuation)) or real(cfg, s, *rest))
+    return seen
+
+
+@pytest.mark.parametrize("shared", [True, False])
+def test_a_small_plan_task_that_resumes_the_session_does_not_resend_the_skill(flow_repo, monkeypatch, shared):
+    seen = _small_plan_without_brief(flow_repo, monkeypatch, shared)
+    run = begin_build(flow_repo, plan_text())
+    assert build(flow_repo, run) == ("done", True)
+    assert seen == [("executing-plans", False), ("executing-plans", shared)]
+    first, second = (c["argv"][-1] for c in flow_repo.calls())
+    assert STUB in first and "This is its full text" in first
+    if shared:  # a resumed session already holds the text: no skill section is left empty in its prompt
+        assert STUB not in second and "## The `executing-plans` skill" not in second
+        assert "Use the `executing-plans` skill." in second
+    else:
+        assert STUB in second
+
+
+@pytest.mark.parametrize("shared", [True, False])
+def test_a_small_plan_task_that_rolls_over_gets_the_skill_in_its_fresh_session(flow_repo, monkeypatch, shared):
+    seen = _small_plan_without_brief(flow_repo, monkeypatch, shared)
+    flow_repo.script({IMPL.format(n=2): [{"usage_pct": [81]}, {"result": DONE_RESULT}]})
+    run = begin_build(flow_repo, plan_text())
+    assert build(flow_repo, run) == ("done", True)
+    calls = flow_repo.calls()
+    assert steps(calls) == [IMPL.format(n=1), IMPL.format(n=2), IMPL.format(n=2)]
+    assert seen == [("executing-plans", False), ("executing-plans", shared), ("executing-plans", False)]
+    fresh = calls[2]["argv"][-1]
+    assert "--resume" not in calls[2]["argv"] and "a fresh session" in fresh
+    assert STUB in fresh and "This is its full text" in fresh  # a new session holds nothing: the skill goes again
+
+
 def test_foreach_with_every_task_ticked_reports_nothing_ran(lane, git):
     run = begin_build(lane, plan_text(ticked=(1, 2)))
     before = lane.head()
@@ -795,3 +842,40 @@ def test_a_refine_round_does_not_batch(batched):
     step = next(s for s in batched.cfg.phases["build"].steps if s.id == "build")
     run.emit("phase_rejected", by="me", phase="build", note="redo")
     assert executor._batches(batched.cfg.phases["build"], step, batched.root / PLAN_PATH, "build/build", {}) == {}
+
+
+# --------------------------------------------------------------------------- the review-feedback skill comes from the pack
+
+
+def test_blocking_findings_carry_the_review_feedback_skill_text(lane):
+    assert lane.cfg.skills_map["review_feedback"] == "receiving-code-review"
+    run = begin_build(lane, plan_text(count=1))
+    lane.script({REVIEW.format(n=1): [review(FINDING), review()]})
+    assert build(lane, run) == ("done", True)
+    fix = lane.calls()[2]["argv"][-1]
+    assert "Use the `receiving-code-review` skill: its full text is below, so do not load it." in fix
+    assert "Stub: the receiving-code-review skill." in fix and FINDING["text"] in fix
+    assert "name: receiving-code-review" not in fix  # the body only
+
+
+def test_blocking_findings_without_a_review_feedback_skill_do_not_crash(lane):
+    lane.configure({**BIG, "skills": {"map": {"review_feedback": None}}, "project": {"skills_dir": "no-skills-here"}})
+    assert "review_feedback" not in lane.cfg.skills_map and not (lane.root / "no-skills-here").exists()
+    run = begin_build(lane, plan_text(count=1))
+    lane.script({REVIEW.format(n=1): [review(FINDING), review()]})
+    assert build(lane, run) == ("done", True)
+    fix = lane.calls()[2]["argv"][-1]
+    assert FINDING["text"] in fix and "A reviewer found blocking problems" in fix
+    assert "its full text is below" not in fix and "Stub:" not in fix
+
+
+def test_only_a_batch_continuation_is_marked_as_one(batched, monkeypatch):
+    from agentflow import lanes
+
+    seen = []
+    real = lanes.build_prompt
+    monkeypatch.setattr(lanes, "build_prompt", lambda cfg, step, *rest: seen.append((step.id, step.continuation)) or real(cfg, step, *rest))
+    run = begin_build(batched, plan_text(count=3))
+    assert build(batched, run) == ("done", True)
+    flags = [continuation for step_id, continuation in seen if step_id == "build"]
+    assert flags == [False, True, True]  # the first member's prompt carries the skill; the later ones' sessions have it

@@ -16,7 +16,7 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agentflow import sources, work_source
+from agentflow import pack, sources, work_source
 from agentflow.config import ON_UNKNOWN_VALUES, Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.gitops import GhError, changed_files, gh_json
 from agentflow.guards import path_matches
@@ -92,6 +92,27 @@ def fmt(template: str, ctx_or_values: Ctx | dict[str, Any]) -> str:
         return str(values[name]) if name in values else match.group(0)
 
     return _PLACEHOLDER.sub(replace, template)
+
+
+def skill_text(cfg: Config, repo: Path, name: object) -> str | None:
+    """The body of skill `name`'s `SKILL.md` (the repository's, else the engine's bundled one), or None.
+
+    `repo` is the main checkout: a run's worktree holds what an agent wrote, so it is never a source of skill text.
+    A UTF-8 BOM and `\\r\\n` are normalised away; a frontmatter block (a first line `---` and a later line `---`)
+    is dropped, and a file whose frontmatter never closes is all body."""
+    file = pack.skill_file(repo, cfg.project.skills_dir, name)
+    if file is None:
+        return None
+    try:
+        text = file.read_text(encoding="utf-8").removeprefix("\ufeff").replace("\r\n", "\n")
+    except (OSError, UnicodeDecodeError):
+        return None
+    lines = text.split("\n")
+    if lines[0].rstrip() == "---":
+        for number, line in enumerate(lines[1:], start=1):
+            if line.rstrip() == "---":
+                return "\n".join(lines[number + 1:]).lstrip("\n")
+    return text
 
 
 # --------------------------------------------------------------------------- helpers

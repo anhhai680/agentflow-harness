@@ -7,6 +7,7 @@ it can find as a list of `Issue`s, so one run shows them all.
 
 from __future__ import annotations
 
+import copy
 import posixpath
 import re
 import shlex
@@ -17,7 +18,7 @@ from typing import Any, Literal
 
 import yaml
 
-from agentflow import pack
+from agentflow import layers, pack
 
 KNOWN_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 BUILTIN_CHECKS = (
@@ -36,6 +37,7 @@ BUILTIN_CHECKS = (
     "lane",
     "refine_round",
 )
+BASELINES = ("red", "green")  # what a gate's `baseline` may say about it on the base branch when the pack was set up
 ON_UNKNOWN_VALUES = ("ask_human", "agent", True, False)
 BACKLOG_KEYS = ("sync_base", "module_lane", "new_task", "module_row", "lane_labels")
 BACKLOG_FIELDS = ("issue", "task", "topic", "new_module", "after")  # the form fields agentflow knows
@@ -143,6 +145,8 @@ PROMPT_PLACEHOLDERS = frozenset(
         "stop_report",
         "ci_report",
         "sync_report",
+        "skill",
+        "base_ref",
     }
 )
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
@@ -174,7 +178,8 @@ DEFAULT_SKILLS_DIR = ".claude/skills"
 DEFAULT_SPEC_FILE = "{module}.md"  # a module's spec is `<docs.specs>/<spec_file>`
 REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea`, `decisions`, `glossary` are optional
 WORK_SOURCE_KINDS = ("capability_map",)  # a Markdown table with `Module id` and `Depends on` columns (`sources`)
-SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "verify", "ship")
+SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "verify", "ship",
+                   "review", "debug", "review_feedback")  # review_feedback: the skill sent with blocking findings
 
 
 @dataclass
@@ -182,7 +187,7 @@ class Project:
     base_branch: str
     fork_from: str
     branch: str
-    worktrees_dir: str
+    worktrees_dir: str | None  # None: the state dir's `worktrees/` (`worktrees_root`)
     docs: dict[str, str]
     commit_trailer: str
     skills_dir: str = DEFAULT_SKILLS_DIR
@@ -256,6 +261,7 @@ class Gate:
     run: str
     cwd: str | None = None
     when_exists: str | None = None
+    baseline: str | None = None  # `red`: it failed on the base branch when the pack was set up (a human fixes or deletes it)
 
 
 @dataclass
@@ -296,6 +302,8 @@ class Step:
     batch: dict | None = None  # a `foreach: plan_task` step: neighbouring small tasks share a session and a review
     brief: list[str] = field(default_factory=list)
     task_briefs: dict[str, str] = field(default_factory=dict)
+    task_brief: list[str] = field(default_factory=list)  # run time only, never configured: the `task_briefs` a plan task matched
+    continuation: bool = False  # run time only: a later batch member or shared small_plan task; its session has the skill
     name: str | None = None
     blocks_on_findings: bool = False  # its `findings` hold the phase back (`autonomy.phase_findings`)
     forbid: list[str] = field(default_factory=list)  # guardrails.forbidden_paths for this step only
@@ -345,6 +353,8 @@ class Config:
     ci: dict = field(default_factory=dict)
     work_source: WorkSource | None = None  # None: no modules to queue; `next` and the Backlog go on without them
     skills_map: dict[str, str] = field(default_factory=dict)  # the skill `next` names per kind of step (`skills.map`)
+    merged: dict = field(default_factory=dict)  # the layers merged, before `@` resolution (`raw` is after it)
+    layer_origins: dict[tuple[str, ...], str] = field(default_factory=dict)  # each leaf of `merged`: its layer's name
 
 
 def for_lane(steps: list[Step], lane: str) -> list[Step]:
@@ -358,6 +368,34 @@ def check_lane(cfg: Config, lane: str) -> None:
         raise ValueError("there is no spec lane: use `agentflow run feature --module <module> --to define`")
     if lane not in cfg.lanes:
         raise ValueError(f"unknown lane {lane!r}; known: {', '.join(cfg.lanes)}")
+
+
+def worktrees_root(cfg: Config, repo: Path) -> Path:
+    """The directory a run's worktree is made in: `project.worktrees_dir` under the repository when set, else the
+    state dir's `worktrees/` (outside the repository, so nothing needs a `.gitignore` line)."""
+    if cfg.project.worktrees_dir:
+        return repo / cfg.project.worktrees_dir
+    return pack.state_dir(repo) / "worktrees"
+
+
+def layer_files(cfg: Config) -> list[Path]:
+    """The files `cfg` was built from, bottom-up: the engine defaults, the pack's starter when it names one, the
+    pack and the user's file when it exists. A pure function of `cfg` and the disk; `OSError` from looking for the
+    user file is the caller's to catch."""
+    files = [layers.ENGINE_DEFAULTS, Path(cfg.path).resolve()]
+    try:
+        starter = layers.starter_file(cfg.merged.get("starter"))
+    except layers.LayerError:  # a pack loaded on its own (`layered=False`) never used the starter it names
+        starter = None
+    if starter is not None:
+        files.insert(1, starter)
+    try:
+        user = layers.user_config_path()
+    except RuntimeError:  # no home directory to look in: there is no user file
+        return files
+    if user.exists():
+        files.append(user)
+    return files
 
 
 # --------------------------------------------------------------------------- references
@@ -600,6 +638,7 @@ def _build_gates(data: dict) -> dict[str, Gate]:
             run=_require(raw, "run", path, str),
             cwd=_optional(raw, "cwd", path, str, None),
             when_exists=_optional(raw, "when_exists", path, str, None),
+            baseline=raw.get("baseline"),  # kept as written: `validate` refuses anything but red or green
         )
     return out
 
@@ -638,19 +677,102 @@ def _skills_map(raw: dict) -> dict[str, str]:
     return {str(k): str(v) for k, v in _optional(block, "map", "skills", dict, {}).items()}
 
 
-def load_config(path: Path) -> Config:
-    """Parse `path`, resolve `@` references and build the dataclasses."""
-    path = Path(path)
+MAX_DEPTH = 64  # a config file nested deeper than this is refused: no pack needs it, and every pass below recurses
+
+
+def _no_cycle(node: Any, path: Path, ancestors: set[int], done: set[int], depth: int = 0) -> None:
+    """Refuse a value that contains itself (a YAML anchor used inside its own node) or nests past `MAX_DEPTH`;
+    each shared node (an anchor used twice) is walked once."""
+    if not isinstance(node, (dict, list)) or id(node) in done:
+        return
+    if id(node) in ancestors:
+        raise ConfigError("", f"{path} holds a YAML anchor that refers to itself")
+    if depth > MAX_DEPTH:
+        raise ConfigError("", f"{path} is nested more than {MAX_DEPTH} levels deep")
+    ancestors.add(id(node))
+    for child in node.values() if isinstance(node, dict) else node:
+        _no_cycle(child, path, ancestors, done, depth + 1)
+    ancestors.discard(id(node))
+    done.add(id(node))
+
+
+def _read_yaml(path: Path) -> Any:
+    """`path` parsed. A file that can't be read, isn't YAML or holds a value that contains itself is a `ConfigError`
+    naming it, never a traceback."""
     try:
         loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        _no_cycle(loaded, path, set(), set())
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError("", f"cannot read {path}: {exc}") from exc
+    except RecursionError as exc:
+        raise ConfigError("", f"{path} is nested too deeply to read") from exc
+    return loaded
+
+
+def _read_mapping(path: Path) -> dict:
+    loaded = _read_yaml(path)
     if not isinstance(loaded, dict):
         raise ConfigError("", f"{path} must hold a mapping at the top level")
-    _check_format(loaded)
+    return loaded
 
+
+def _merge_layers(project: dict, path: Path, user: bool) -> tuple[dict, dict, Path | None]:
+    """`(merged, origins, user file or None)` for the stack engine defaults -> the starter the pack names (if any)
+    -> the pack -> the user's own file.
+
+    The user file is read only when `user` is true and it exists, and it is checked (`layers.check_user`) against
+    the merged layers below it before it is merged: it never reaches `merge` unchecked."""
+    try:
+        stack = [*layers.base_layers(project.get("starter")), layers.Layer("project", project, path)]
+        merged, origins = layers.merge(stack)
+        if not user:
+            return merged, origins, None
+        try:
+            user_path = layers.user_config_path()
+        except RuntimeError:  # no home directory to look in: there is no user file
+            return merged, origins, None
+        try:
+            present = user_path.exists()
+        except OSError as exc:  # an unreadable parent directory: say which file, not a traceback
+            raise ConfigError("", f"cannot read {user_path}: {exc}") from exc
+        if not present:
+            return merged, origins, None
+        data = _read_yaml(user_path)
+        data = {} if data is None else data  # an empty file sets nothing
+        layers.check_user(data, merged, user_path)
+        merged, origins = layers.merge([*stack, layers.Layer("user", data, user_path)])
+    except layers.LayerError as exc:
+        raise ConfigError(exc.path, exc.message) from exc
+    return merged, origins, user_path
+
+
+def load_config(path: Path, *, layered: bool = True, user: bool = True) -> Config:
+    """Merge the layers, resolve `@` references and build the dataclasses.
+
+    The layers are the engine defaults (`agentflow/defaults/config.yaml`), the starter the pack names with `starter:`
+    (`agentflow/starters/<name>/config.yaml`), the pack at `path` and the user's own file
+    (`layers.user_config_path`), bottom-up. `version` and `engine` are checked on the pack file alone.
+    `layered=False` loads the pack file alone, as before the layers; `user=False` leaves the user file unread.
+    An error at a key the user file set names that file."""
+    path = Path(path)
+    project = _read_mapping(path)
+    _check_format(project)
+    user_path: Path | None = None
+    if layered:
+        merged, origins, user_path = _merge_layers(project, path, user)
+    else:
+        merged, origins = copy.deepcopy(project), {key: "project" for key in layers.leaf_keys(project)}
+    try:
+        return _build(merged, origins, path)
+    except ConfigError as exc:
+        if user_path is not None and exc.path and layers.origin_of(origins, exc.path) == "user":
+            raise ConfigError(f"{user_path}: {exc.path}", exc.message) from exc
+        raise
+
+
+def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
     origins: dict[str, str] = {}
-    raw = _resolve(loaded, "", loaded, (), origins)
+    raw = _resolve(merged, "", merged, (), origins)
 
     project = _require(raw, "project", "", dict)
     defaults = _require(raw, "defaults", "", dict)
@@ -669,7 +791,7 @@ def load_config(path: Path) -> Config:
             base_branch=_require(project, "base_branch", "project", str),
             fork_from=_require(project, "fork_from", "project", str),
             branch=_require(project, "branch", "project", str),
-            worktrees_dir=_require(project, "worktrees_dir", "project", str),
+            worktrees_dir=_optional(project, "worktrees_dir", "project", str, None),
             docs=docs,
             commit_trailer=_require(project, "commit_trailer", "project", str),
             skills_dir=_skills_dir(_optional(project, "skills_dir", "project", str, DEFAULT_SKILLS_DIR)),
@@ -729,6 +851,8 @@ def load_config(path: Path) -> Config:
         ci=_optional(raw, "ci", "", dict, {}),
         work_source=_work_source(raw),
         skills_map=_skills_map(raw),
+        merged=merged,
+        layer_origins=layer_origins,
     )
 
 
@@ -827,8 +951,11 @@ class _Validator:
             self.error(path, "skill must be a name")
         elif skill in self.cfg.guardrails.user_only_skills:
             self.error(path, f"'{skill}' is a user-only skill: only the human runs it")
-        elif not (self.repo / self.cfg.project.skills_dir / skill / "SKILL.md").is_file():
-            self.error(path, f"skill '{skill}' has no {self.cfg.project.skills_dir}/{skill}/SKILL.md")
+        elif pack.SKILL_NAME.fullmatch(skill) is None or skill in (".", ".."):
+            self.error(path, f"'{skill}' is not a skill name: a skill is a directory name, not a path")
+        elif pack.skill_file(self.repo, self.cfg.project.skills_dir, skill) is None:
+            self.error(path, f"skill '{skill}' has no {self.cfg.project.skills_dir}/{skill}/SKILL.md "
+                             "and no bundled skill of that name")
 
     def prompt(self, prompt: Any, path: str) -> None:
         if not isinstance(prompt, str) or pack.prompt_path(self.cfg.path, prompt) is None:
@@ -862,9 +989,10 @@ class _Validator:
                 if name not in PROMPT_PLACEHOLDERS:
                     self.error(pack.prompt_label(self.cfg.path, file), f"unknown placeholder '{{{name}}}'")
 
-    def brief(self, files: list[str], prompt: str | None, path: str) -> None:
+    def brief(self, files: list[str], prompt: str | None, path: str, skill: Any = None) -> None:
         """A brief goes in the prompt at `{brief}`: a missing file, a `{brief}` with no file, or a file with no
-        `{brief}` would each lose it silently."""
+        `{brief}` would each lose it silently. A step with no `brief:` whose skill resolves (`pack.skill_file`)
+        has the skill's text as its brief, so a `{brief}` is used then."""
         for name in files:
             if not (self.repo / name).is_file():
                 self.error(path, f"brief '{name}' is not a file in this repository")
@@ -876,13 +1004,14 @@ class _Validator:
         used = "{brief}" in template.read_text(encoding="utf-8")
         label = pack.prompt_label(self.cfg.path, template)
         if used and not files:
-            self.error(path, f"{label} has a {{brief}} placeholder, so this step must name the file")
+            if pack.skill_file(self.repo, self.cfg.project.skills_dir, skill) is None:
+                self.error(path, f"{label} has a {{brief}} placeholder, so this step must name the file")
         elif files and not used:
             self.error(path, f"{label} has no {{brief}} placeholder, so this brief would never be sent")
 
     def step(self, step: Step, phase_ids: set[str]) -> None:
         p = step.path
-        self.brief(step.brief, step.prompt, _join(p, "brief"))
+        self.brief(step.brief, step.prompt, _join(p, "brief"), step.skill)
         for name in step.task_briefs.values():
             if not (self.repo / name).is_file():
                 self.error(_join(p, "task_briefs"), f"brief '{name}' is not a file in this repository")
@@ -991,7 +1120,8 @@ class _Validator:
             self.skill(small["skill"], _join(path, "skill"))
         if "prompt" in small:
             self.prompt(small["prompt"], _join(path, "prompt"))
-            self.brief(brief_files(small.get("brief"), _join(path, "brief")), small["prompt"], _join(path, "brief"))
+            self.brief(brief_files(small.get("brief"), _join(path, "brief")), small["prompt"], _join(path, "brief"),
+                       small.get("skill"))
 
     def batch(self, batch: Any, path: str, step: Step) -> None:
         if not isinstance(batch, dict):
@@ -1028,6 +1158,12 @@ class _Validator:
             except (KeyError, IndexError, ValueError, AttributeError) as exc:
                 self.error("project.docs.spec_file", f"spec_file cannot be filled in ({type(exc).__name__}: {exc}): "
                            "{module} is its only placeholder; write a literal brace as {{ or }}")
+        worktrees_dir = self.cfg.project.worktrees_dir
+        if worktrees_dir is not None and (posixpath.normpath(worktrees_dir.strip() or ".") == "."
+                                          or posixpath.isabs(worktrees_dir)
+                                          or ".." in posixpath.normpath(worktrees_dir).split("/")):
+            self.error("project.worktrees_dir", "worktrees_dir is a directory inside the repository, relative to its "
+                       "root and without '..'; leave it unset to keep worktrees in the state dir")
         skills_dir = self.cfg.project.skills_dir
         if skills_dir in ("", ".") or posixpath.isabs(skills_dir) or ".." in skills_dir.split("/"):
             self.error("project.skills_dir", "skills_dir is a directory inside the repository holding "
@@ -1074,7 +1210,7 @@ class _Validator:
             self.error("work_source.path", "path is a file inside the repository, relative to its root and without '..'")
 
     def skills_map(self) -> None:
-        """`skills.map`: the skill `agentflow next` names for each kind of step; each one is in `skills_dir`."""
+        """`skills.map`: the skill `agentflow next` names for each kind of step; each one is in `skills_dir` or bundled."""
         block = self.cfg.raw.get("skills")
         if block is None:
             return
@@ -1115,12 +1251,47 @@ class _Validator:
                            f"unknown permission_mode '{agent.permission_mode}': use one of {', '.join(PERMISSION_MODES)}")
 
     def gate_definitions(self) -> None:
+        confirmed = self.cfg.raw.get("gates_confirmed")
+        if confirmed is not None and not isinstance(confirmed, bool):
+            self.error("gates_confirmed", "gates_confirmed must be true or false")
+        elif confirmed is not True:
+            self.add("warning", "gates_confirmed", "detected or inherited gates are a proposal: check `gates` and "
+                     "`gate_sets`, then set `gates_confirmed: true`")
+        for name, gate in self.cfg.gates.items():
+            path = f"gates.{name}"
+            if gate.cwd is not None and (posixpath.isabs(gate.cwd) or ".." in gate.cwd.split("/")):
+                self.error(_join(path, "cwd"), "cwd must be a path inside the repository: relative, with no `..` part")
+            if gate.baseline is None:
+                continue
+            if gate.baseline not in BASELINES:
+                self.error(_join(path, "baseline"), f"baseline must be one of {', '.join(BASELINES)}")
+            elif gate.baseline == "red":
+                self.add("warning", _join(path, "baseline"),
+                         f"`{name}` failed on `{self.cfg.project.base_branch}` when the pack was set up: "
+                         "fix it and remove `baseline`, or delete the gate")
         if not self.cfg.gate_sets.get("verify"):
-            self.error("gate_sets.verify", "every pack declares the gates a diff must pass: gate_sets.verify")
+            self.error("gate_sets.verify", "every pack declares the gates a diff must pass: state them under "
+                       "`gates:` and list them in `gate_sets.verify` (a `starter:` can supply them)")
         for name, members in self.cfg.gate_sets.items():
             for i, member in enumerate(members):
                 if member not in self.cfg.gates:
                     self.error(f"gate_sets.{name}[{i}]", f"'{member}' is not a defined gate")
+
+    def bug_lane(self) -> None:
+        """The bug lane's red/green check runs the regression test only when a Bash allow rule covers it."""
+        from agentflow.guards import has_bash_allow_rule  # guards imports this module, so the import waits for the call
+
+        if "bug" not in self.cfg.lanes or has_bash_allow_rule(self.repo):
+            return
+        program = "<test runner>"
+        for member in self.cfg.gate_sets.get("verify") or []:
+            gate = self.cfg.gates.get(member)
+            words = gate.run.split() if gate else []
+            if words:
+                program = words[0]
+                break
+        self.add("warning", "lanes", "the bug lane's red/green check runs the regression test only when a Bash allow "
+                 f"rule in .claude/settings.json covers it: add a narrow rule such as `Bash({program} *)`")
 
     def phases(self) -> None:
         cfg = self.cfg
@@ -1342,6 +1513,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.skills_map()
     v.agents()
     v.gate_definitions()
+    v.bug_lane()
     v.conditions()
     v.phases()
     v.effort()

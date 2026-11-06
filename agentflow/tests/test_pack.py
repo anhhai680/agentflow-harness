@@ -313,7 +313,7 @@ def test_idea_placeholder_is_empty_without_an_idea_doc(tmp_cfg, repo_root):
 
 @pytest.mark.parametrize("key", ["specs", "plans"])
 def test_docs_specs_and_plans_are_required(tmp_cfg, repo_root, key):
-    cfg = load_config(tmp_cfg({"project": {"docs": {key: None}}}))
+    cfg = load_config(tmp_cfg(lambda data: data["project"]["docs"].__setitem__(key, None)))  # `null`: no default either
     assert any(i.level == "error" and i.path == f"project.docs.{key}" for i in validate(cfg, repo_root))
 
 
@@ -322,3 +322,113 @@ def test_doc_checks_need_the_idea_doc_and_the_decisions_dir(tmp_cfg, repo_root, 
     cfg = load_config(tmp_cfg({"project": {"docs": {key: None}}}))
     errors = [i for i in validate(cfg, repo_root) if i.level == "error"]
     assert errors and all(i.path.endswith(".checks") and f"project.docs.{key}" in i.message for i in errors)
+
+
+# --------------------------------------------------------------------------- bundled skills
+
+def _skill(root: Path, skills_dir: str, name: str, text: str = "repo") -> Path:
+    path = root / skills_dir / name / "SKILL.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_skill_file_prefers_the_repos_skill(tmp_path):
+    own = _skill(tmp_path, ".claude/skills", "agentflow-plan")
+    assert pack.skill_file(tmp_path, ".claude/skills", "agentflow-plan") == own
+    assert not pack.is_bundled(own)
+
+
+def test_skill_file_falls_back_to_the_bundled_skill(tmp_path):
+    found = pack.skill_file(tmp_path, ".claude/skills", "agentflow-plan")
+    assert found == pack.ENGINE_SKILLS / "agentflow-plan" / "SKILL.md" and found.is_file()
+    assert pack.is_bundled(found)
+    assert pack.skill_file(tmp_path, ".claude/skills", "no-such-skill") is None
+
+
+def test_skill_file_follows_a_symlinked_skills_dir(tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    own = _skill(elsewhere, "skills", "mine")
+    repo = tmp_path / "repo"
+    (repo / ".claude").mkdir(parents=True)
+    (repo / ".claude" / "skills").symlink_to(elsewhere / "skills", target_is_directory=True)  # like the fixtures
+    found = pack.skill_file(repo, ".claude/skills", "mine")
+    assert found is not None and found.read_text(encoding="utf-8") == "repo" and found.samefile(own)
+
+
+@pytest.mark.parametrize("name", ["../agentflow-plan", "a/b", "", ".", "..", "x\\y", "-x", "a\0b", "a b", None, 3])
+def test_skill_file_refuses_a_name_that_is_not_a_skill_name(tmp_path, name):
+    _skill(tmp_path, ".claude/skills", "x")                       # a name must not reach anything outside a skill dir
+    (tmp_path / "SKILL.md").write_text("outside", encoding="utf-8")
+    assert pack.skill_file(tmp_path, ".claude/skills", name) is None
+
+
+@pytest.mark.parametrize("skills_dir", ["/abs", "../out", "a/../../b", "..", "", "a\\..\\b", None, 3])
+def test_skill_file_refuses_a_skills_dir_outside_the_repo(tmp_path, skills_dir):
+    _skill(tmp_path.parent / f"{tmp_path.name}-out", "skills", "agentflow-plan")
+    assert pack.skill_file(tmp_path, skills_dir, "agentflow-plan") is None
+
+
+def test_skill_file_does_not_let_a_symlinked_skill_dir_name_escape_the_rule(tmp_path):
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "SKILL.md").write_text("x", encoding="utf-8")
+    (tmp_path / "skills").mkdir()
+    (tmp_path / "skills" / "linked").symlink_to(tmp_path / "out", target_is_directory=True)
+    assert pack.skill_file(tmp_path, "skills", "linked") == tmp_path / "skills" / "linked" / "SKILL.md"  # the name is the rule
+
+
+BUNDLED = sorted(p for p in pack.ENGINE_SKILLS.iterdir() if p.is_dir())
+STAGES = ("define", "plan", "build", "debug", "verify", "review", "respond")
+
+
+def test_the_bundle_holds_one_skill_per_stage():
+    assert [p.name for p in BUNDLED] == sorted(f"agentflow-{s}" for s in STAGES)
+
+
+def test_every_bundled_skill_names_itself_in_its_frontmatter():
+    for directory in BUNDLED:
+        lines = (directory / "SKILL.md").read_text(encoding="utf-8").splitlines()
+        assert len(lines) <= 80, directory.name
+        assert lines[0] == "---" and lines[1] == f"name: {directory.name}", directory.name
+        end = lines.index("---", 1)
+        assert any(line.startswith("description: ") and line[13:].strip() for line in lines[2:end]), directory.name
+
+
+def _bundled_text(stage: str) -> str:
+    return (pack.ENGINE_SKILLS / f"agentflow-{stage}" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_the_bundled_review_skill_uses_the_prompts_vocabulary():
+    text = _bundled_text("review")
+    for word in ("Critical", "Important", "Minor", "Declined to judge", "Output Format"):
+        assert word in text
+    for prompt in ("branch_review.md", "task_review.md"):  # the words the prompts map to blocking and minor
+        prompts = (pack.ENGINE_PROMPTS / prompt).read_text(encoding="utf-8")
+        assert "Critical or Important" in prompts and "Minor" in prompts and "Declined to judge" in prompts
+
+
+def test_bundled_build_and_verify_skills_leave_the_gates_to_the_runner():
+    build, verify = _bundled_text("build").lower(), _bundled_text("verify").lower()
+    assert "never commit" in build and "never run the whole suite" in build and "gates" in build
+    assert "do not run" in verify and "again" in verify and "evidence" in verify
+
+
+def test_the_bundled_plan_skill_states_the_format_the_engine_reads():
+    from agentflow import sources
+    text = _bundled_text("plan")
+    for part in ("### Task N:", "**Depends on:**", "**Files:**", "- Create:", "- Modify:", "- Test:", "- [ ] **Step"):
+        assert part in text
+    assert str(sources.MAX_TASK_STEPS) in text and str(sources.MAX_TASK_FILES) in text
+
+
+def test_a_plan_written_as_the_bundled_skill_says_parses(tmp_path):
+    from agentflow import sources
+    plan = tmp_path / "plan.md"
+    plan.write_text(
+        "# Plan\n\n### Task 1: First\n\n**Depends on:** none\n\n**Files:**\n- Create: `a.py`\n- Modify: `b.py`\n"
+        "- Test: `t.py`\n\n- [ ] **Step 1: Write the failing test**\n- [ ] **Step 2: Make it pass**\n\n"
+        "### Task 2: Second\n\n**Depends on:** Task 1\n\n**Files:**\n- Modify: `a.py`\n\n- [ ] **Step 1: Do it**\n",
+        encoding="utf-8")
+    first, second = sources.parse_plan(plan)
+    assert (first.n, first.title, first.depends_on, sources.task_size(first)) == (1, "First", [], (2, 3))
+    assert (second.n, second.depends_on, sources.task_size(second)) == (2, [1], (1, 1))

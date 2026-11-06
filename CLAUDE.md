@@ -14,11 +14,11 @@ Design docs (read by section, using `grep -n '^## '`):
 - `docs/agentflow-playbook.md`: how to operate runs. §10 is the cheat sheet and §14 the pack reference, one line per config key.
 - `docs/plans/`: implementation plans (`YYYY-MM-DD-agentflow-harness-<slice>.md`). Completed plans are records and aren't edited afterwards.
 
-There is no `pyproject.toml`: packaging belongs to slice PnP. There is no `CONSTRAINTS.md` either, so the quality bar is the pack's `gate_sets` plus the invariants below. There is no `docs/ideas/`, `docs/decisions/` or `docs/specs/`. A module's spec is its proposal, `docs/agentflow-<module>-proposal.md`.
+There is no `CONSTRAINTS.md`, so the quality bar is the pack's `gate_sets` plus the invariants below. There is no `docs/ideas/`, `docs/decisions/` or `docs/specs/`. A module's spec is its proposal, `docs/agentflow-<module>-proposal.md`.
 
 ## Commands
 
-The runtime needs Python 3.12+ and `uv`. `bin/agentflow` runs `agentflow/flow.py` as a `uv` script, and PyYAML comes from the script header. To put it on your PATH: `ln -s "$PWD/bin/agentflow" ~/.local/bin/agentflow`.
+The runtime needs Python 3.12+ and `uv`. `bin/agentflow` runs `agentflow/flow.py` as a `uv` script, and PyYAML comes from the script header. To put it on your PATH: `ln -s "$PWD/bin/agentflow" ~/.local/bin/agentflow`. `pyproject.toml` packages the engine as a tool with an `agentflow` console script (`uv tool install --from . agentflow`).
 
 ```bash
 # Tests. --no-project keeps uv from picking up any project file, and --import-mode=prepend is required
@@ -29,6 +29,7 @@ uv run --no-project --with pyyaml --with pytest pytest "agentflow/tests/test_pac
 # The pack's gates (.agentflow/config.yaml): `portability` gates build, and `engine_tests` (the full suite) gates verify
 uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_portability.py --import-mode=prepend -q
 
+uv tool install --reinstall --from . agentflow # install (or refresh) the packaged tool from this checkout
 bin/agentflow validate                         # after every config edit; it must print "0 warnings"
 bin/agentflow explain <lane> --module <id>     # what a lane would run, with no agent calls
 bin/agentflow run <lane> ... --dry-run         # prints the commands and creates nothing

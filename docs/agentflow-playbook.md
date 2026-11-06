@@ -25,7 +25,7 @@ You stay in charge of three things: answering the questions in `define` and `pla
 
 | Need | Check |
 |---|---|
-| Python 3.12+ and `uv` | `uv --version` (`bin/agentflow` runs the script with `uv`, and PyYAML comes from the script header) |
+| Python 3.12+ and `uv` | `uv --version` (the installed tool and `bin/agentflow` both run on `uv`; PyYAML comes from the package or the script header) |
 | `git` with an `origin` remote and the fork branch (`main` here) | `git remote -v`, `git branch --list main` |
 | GitHub CLI, signed in (needed by `ship`, `--issue`, and `queue`) | `gh auth status` |
 | Claude Code (the default agent) | `claude --version`, and run `claude` once interactively so it is signed in |
@@ -37,7 +37,16 @@ Agent runs spend real money. `defaults.run_budget_usd` (25 here) stops a run whe
 
 ## 3. One-time setup
 
-Run these from the repo root.
+Install the engine once as a tool, from a checkout of this repository. This puts an `agentflow` command on your PATH, and it runs from any directory:
+
+```bash
+uv tool install --from /path/to/agentflow-harness agentflow     # first install
+uv tool install --reinstall --from /path/to/agentflow-harness agentflow   # after pulling engine changes
+```
+
+`pyproject.toml` lists the files under `agentflow/` as `cache-keys`, so uv rebuilds its cached wheel when one changes. If an install still serves stale code, `--reinstall` is the fallback. `bin/agentflow` stays for working on the engine itself: it runs `agentflow/flow.py` straight from the checkout, so an edit takes effect with no reinstall.
+
+Then run these from the repo root of the project you drive.
 
 ```bash
 # 1. The config must be valid. It must print "0 warnings".
@@ -103,7 +112,7 @@ It prints the agent command per phase and the gate commands, and creates nothing
 agentflow run feature --module crm
 ```
 
-It creates a worktree under `../agentflow-harness-worktrees/<run>` on `flow/feature/<slug>`, forked from `main`, and starts at the first phase that is not skipped. It stops at the first question or approval. The run id looks like `20261030-0915-feature-crm`.
+It creates a worktree under the state dir's `worktrees/<run>` (`project.worktrees_dir` in the pack moves it) on `flow/feature/<slug>`, forked from `main`, and starts at the first phase that is not skipped. It stops at the first question or approval. The run id looks like `20261030-0915-feature-crm`.
 
 Useful options: `--from plan --to build` (start and stop at chosen phases; the `--to` phase still raises its approval), `--model plan=sonnet` (one phase's model, this run only; it replaces that phase's whole role map), `--detach` (run in the background, logging to `<state dir>/runs/<run>/runner.log`).
 
@@ -302,6 +311,9 @@ A module is done when its plan is fully checked and its PR is merged. The queue 
 
 ```bash
 agentflow validate                                  # after every config edit; 0 warnings
+agentflow config show                               # the pack file as written
+agentflow config show --effective [PREFIX]          # every value after the layers merge, with its layer
+                                                    #   (engine, project or user); PREFIX e.g. defaults, agents.claude
 agentflow next                                      # what now?
 agentflow explain <lane> --module X                 # what would run, no agent calls
 agentflow run <lane> … --dry-run                    # the commands, creates nothing
@@ -346,7 +358,7 @@ agentflow queue --max-parallel 2
 
 The engine (`agentflow/`) names no project: everything a repository decides is in its pack, the `.agentflow/` directory at the root of its main checkout (section 14). To use agentflow in another repository:
 
-1. Write `.agentflow/config.yaml`. Start from the `python` fixture pack (`agentflow/tests/fixtures/packs/python/.agentflow/config.yaml`), or from this repository's own `.agentflow/config.yaml`, and set its values: `project.*`, the `gates:` and `gate_sets:` (your quality bar's real commands; `gate_sets.verify` is required), the `conditions:` that read your docs, `overlays`, `guardrails`, and the lanes and steps you use. Every skill a step names must exist under `project.skills_dir`. `agentflow/tests/fixtures/packs/node` is the smallest pack that works.
+1. Write `.agentflow/config.yaml`. Start from the `python` fixture pack (`agentflow/tests/fixtures/packs/python/.agentflow/config.yaml`), or from this repository's own `.agentflow/config.yaml`, and set its values: `project.*`, the `gates:` and `gate_sets:` (your quality bar's real commands; `gate_sets.verify` is required), the `conditions:` that read your docs, `overlays`, `guardrails`, and the lanes and steps you use. Every skill a step names must exist under `project.skills_dir` or be one of the engine's bundled `agentflow-*` skills. `agentflow/tests/fixtures/packs/node` is the smallest pack that works.
 2. Put any prompt you want worded differently in `.agentflow/prompts/<name>.md`; it replaces the engine's file of the same name, and every other prompt comes from the engine.
 3. Run `agentflow validate` until it prints 0 warnings, then `agentflow explain <lane> --module <id>` and `agentflow run … --dry-run` before the first real run.
 
@@ -356,26 +368,44 @@ Runs and workspaces live in the state dir, outside the repository unless `paths.
 
 The pack is the repository's `.agentflow/` directory in the main checkout: `config.yaml`, and `prompts/` for any prompt that replaces the engine's file of the same name. `agentflow` never reads a linked worktree's copy. The engine adds `.agentflow/**` to every pack's forbidden paths and refuses a pack without a non-empty `gate_sets.verify`. One line per key: name, meaning, and whether the Settings page may change it.
 
+**Layers.** `config.yaml` is read over the engine defaults (`agentflow/defaults/config.yaml`), and under your own user file (`$XDG_CONFIG_HOME/agentflow/config.yaml`, else `~/.config/agentflow/config.yaml`), bottom-up: engine defaults, then the starter the pack names (if any), then the pack, then the user file. Mappings merge key by key. A list or a value replaces the one below it, and each entry of `gates` and `conditions`, `record_step` and `resolve_step` is replaced whole. `null` deletes a key from every layer below, and `version` and `engine` are read from the pack file alone. So a pack states only what differs from the defaults, and every key the defaults supply is optional in it. The defaults file carries the minimum pack's values for the keys the code has no fallback for (`effort.default`, `effort.allowed` and the required `context.*` keys: `autocompact_pct`, `rollover_pct`, `max_rollovers`, `progress_file` and `gate_output_lines`), and the engine's own fallback for the other optional ones:
+- In `project`: `base_branch` and `fork_from` (`main`), `branch` (`flow/{lane}/{slug}`), `skills_dir` (`.claude/skills`), `commit_trailer` (empty) and `docs` (`specs: docs`, `plans: docs/plans`). There is no default `worktrees_dir`: without one a run's worktree is in the state dir's `worktrees/`.
+- In `agents`: `claude` (its command, arguments, models, `effort_arg`, prices and `skill_loading`, with no `permission_mode` and no `max_turns`) and a disabled `codex`. A pack states `agents.claude.permission_mode` itself.
+- In `defaults`, `recovery`, `effort` and `context`: every key (no `defaults.env`), at the value the engine falls back to where it has a fallback and at the minimum pack's value where it has none, and `defaults.agent: claude`.
+- `guardrails` (empty lists), `hitl` (empty) and `dashboard` (`127.0.0.1`, port 7788). `gates` and `gate_sets` are empty: a pack names its own gates.
+- **The workflow:** `lanes` (`feature`, `bug`), `phases`, `conditions`, `record_step`, `resolve_step`, `phase_approval`, `checkpoints`, `autonomy`, `ci` and `skills`. Every step's skill is a `@skills.map.<key>` reference to one of the bundled skills, and its text is the step's brief. A pack that writes `phases:` with `steps` writes the whole workflow (and `lanes`), and the defaults' workflow is dropped. A pack that writes only a phase's `needs_approval`, `resolve`, `model` or `agent` adjusts the defaults' workflow.
+
+The user file holds personal settings only: `agents.<name>.models` for an agent a lower layer defines, `defaults.run_budget_usd`, `defaults.task_budget_usd`, `hitl.notify`, `hitl.remind_after_h` and `dashboard.port`. Any other key, a key that is not text, or a file that is not a mapping is an error naming the file and the key. Nothing in it can set a command, a gate, a guardrail or the workflow.
+
+`agentflow config show --effective [PREFIX]` prints every value with the layer it came from. The Settings page shows the same values, marks one that is not the pack's with `from engine`, `from starter:<name>` or `from user`, and saves into the pack only what the pack must state: for a mapping, the entries that differ from the layers below it or that the pack already states (an inherited entry is removed with `<name>: null` in the YAML tab). A value your user file sets is read-only on the page, so a personal value never lands in the committed pack.
+
+A live run sees a change to any layer file between its phases: the runner takes the new config when it loads, validates and keeps the phases, and records `config_reload_skipped` with the reason when it does not (a broken user file is skipped like a broken pack). `run_options` records the digest of the layer files at the start (`layers_sha256`, and each file's own in `layer_digests`). On `resume`, if any of them changed since, one line names the files, and the run goes on with the files as they are now: `config_trust` still decides which pack file is trusted, by its own hash. The trade-off: an engine upgrade that changes the default workflow is reported on resume, not refused. A run started before this record existed reports nothing.
+
 - `version`: the pack format, `2`. The engine reads format 2 only and refuses any other. Protected.
 - `engine`: the engine versions that may run the pack, comma-separated clauses of `>=`, `>`, `<=`, `<`, `==` on dotted numbers, such as `">=2,<3"`. A range that leaves this engine out is refused. Protected.
+- `starter`: `python-uv`, `node-pnpm`, `go` or `docs-only`; absent or `null` means none. It names a layer the engine ships (`agentflow/starters/<name>/config.yaml`) between the engine defaults and the pack: it supplies `gates` and `gate_sets.setup`, `build` and `verify` for that kind of repository, and nothing of the workflow, so the lanes stay the defaults. The pack overrides it key by key, as it does the engine defaults: a `gates.<name>` it states replaces the starter's whole, and a `gate_sets` list it states replaces the starter's list. Any other value, a path included, is refused, and the error lists the names. `docs-only` has one gate, `whitespace`, which runs `git diff --check` of every tracked file against the empty tree with `blank-at-eol` off, so a Markdown line break is not flagged. Git's other defaults still apply to every tracked file: `blank-at-eof` and `space-before-tab` flag a file that ends in a blank line, or a space before a tab in the indent, so a repository with such a file fails `build` and `verify` on adoption until the file is fixed. The gate doesn't see untracked files, and a docs repository should add a real gate, such as a Markdown linter. Protected.
 - `project`: branches (`base_branch`, `fork_from`, `branch`), `worktrees_dir`, the `docs` paths and the `commit_trailer`. Protected.
-- `project.skills_dir`: the directory holding `<skill>/SKILL.md` for every skill a step names, relative to the repository root; default `.claude/skills`. Protected.
+- `project.worktrees_dir`: where a run's worktree is made. Unset (the default): the state dir's `worktrees/`, outside the repository. Set: a directory relative to the repository root, without `..` (an absolute path or one that leaves the repository is a `validate` error). Protected, as `project` is.
+- `project.skills_dir`: the directory holding `<skill>/SKILL.md` for every skill a step names, relative to the repository root and without `..`; default `.claude/skills`. A skill name is a directory name (letters, digits, `.`, `_`, `:` and `-`, not starting with `-`), never a path. A name found in no `skills_dir` falls back to the engine's bundled `agentflow-define`, `agentflow-plan`, `agentflow-build`, `agentflow-debug`, `agentflow-verify`, `agentflow-review` and `agentflow-respond`, so a repository's own skill of the same name wins. Protected.
 - `project.docs`: `specs` and `plans` (directories) are required; `idea`, `decisions` and `glossary` are optional, and a step with `checks:` needs `idea` and `decisions`. `{idea}` is empty when `idea` is unset. `agentflow next` reads uncommitted changes under only these three as a design-doc change. The module list is not here: see `work_source`. Protected.
 - `project.docs.spec_file`: a module's spec file name inside `docs.specs`, with `{module}` in it and no other placeholder (write a literal brace as `{{` or `}}`); default `{module}.md`. `agentflow next` reads every file in `docs.specs` that fits it as a module's spec. Protected.
 - `paths.state_dir`: where runs (`runs/`) and agent workspaces (`workspaces/`) live; `~` is expanded and a relative path is relative to the main checkout. Default `${XDG_STATE_HOME:-~/.local/state}/agentflow/<repo-id>`, outside the repository (`<repo-id>` is the checkout's name and a hash of its path). A state dir inside the repository that git does not ignore is a `validate` warning. Protected.
 - `work_source`: where the modules `agentflow queue`, the Backlog and the `modules_done` check walk come from: `kind` and `path` (relative to the repository root). The only kind is `capability_map`, a Markdown table with `Module id` and `Depends on` columns, one row per module in build order; `{capability_map}` is its path. Optional: without it `{capability_map}` is empty, `agentflow next` skips the module order, the Backlog shows only the cards added on the page, and `agentflow queue` refuses to run. Protected.
-- `skills`: `skills.map` names the skill `agentflow next` suggests for each kind of next step: `decide`, `define`, `design_doc`, `plan`, `build`, `build_small`, `verify` and `ship`. Each must be a skill in `project.skills_dir`, and another key is an error. Optional: a step with no entry is named by its stage (`Build stage`). Protected.
+- `skills`: `skills.map` names the skill `agentflow next` suggests for each kind of next step: `decide`, `define`, `design_doc`, `plan`, `build`, `build_small`, `verify`, `ship`, `review`, `debug` and `review_feedback`. Another key is an error. `review` and `debug` name the skill for a review and for a bug fix, and `review_feedback` the skill sent with blocking per-task findings. Each must be a skill in `project.skills_dir` or one of the engine's bundled skills (a name that is not a skill name is an error). Optional: a step with no entry is named by its stage (`Build stage`). Protected.
 - `agents.<name>`: the command line and arguments of an agent CLI, its models, `max_turns` and prices. Protected, except `enabled`, `models`, `max_turns` and `prices`.
 - `defaults`: the default agent, timeouts, `fix_attempts` and budgets. Not protected, except `defaults.env`.
 - `recovery`: how long an outage may last and how many failed attempts a step gets. Not protected.
 - `effort`: the level a session starts at and the levels an agent may pick. Not protected.
 - `context`: auto-compact, rollover and the context window. Not protected, except `context.autocompact_env` and `context.progress_file`.
-- `gates`: names to shell commands, with `cwd` and `when_exists`. Protected.
+- `gates`: names to shell commands, with `cwd`, `when_exists` and `baseline`. Protected.
+- `gates_confirmed`: `true` once a human has checked `gates` and `gate_sets`, whether the pack wrote them or inherited them from a starter or the engine. Anything but `true` (absent included) is a `validate` warning, "detected or inherited gates are a proposal"; a value that is not a bool is an error. It is a bool, not bound to the commands that were confirmed: when an engine upgrade changes a starter's gates, `validate` does not ask again, so the release notes of an engine that changes a starter must say so. Protected, so the Settings page cannot confirm for you.
+- `gates.<name>.baseline`: `red` records that the gate failed on `project.base_branch` when the pack was set up, and is a `validate` warning ("`<gate>` failed on `<base_branch>` when the pack was set up: fix it and remove `baseline`, or delete the gate"); `green` is allowed; any other value is an error. Protected, as `gates` is.
+- `gates.<name>.cwd`: the directory a gate runs in, relative to the run's working directory (the worktree root when unset). It must be relative with no `..` part, otherwise `validate` refuses it. Protected, as `gates` is.
 - `gate_sets`: named lists of gates; `verify` is required. Protected.
 - `guardrails`: `forbidden_paths`, `reject_trailers` and `user_only_skills`. Protected.
 - `overlays`: the `security` and `eval` paths, keywords and added skills. Protected.
 - `conditions`: named checks the runner evaluates from files and git; `modules_done` reads `work_source` and takes no `from`. `finish` also runs the `eval` gate on a merged tree when the pack defines `eval_required` and it holds. Protected.
-- `lanes`: the kinds of work. Not protected.
+- `lanes`: the kinds of work. Not protected. When it includes `bug` and `.claude/settings*.json` in the main checkout holds no `Bash(...)` allow rule at all, `validate` warns at `lanes`: the bug lane's red/green check runs the regression test only when a Bash allow rule covers it, whatever `permission_mode` says. Add a narrow rule such as `Bash(<verify gate's program> *)`.
 - `record_step`, `resolve_step`: the steps that file a spec-gap answer and resolve a stop. Protected.
 - `autonomy`: what the runner decides by itself. Not protected.
 - `ci`: polling and fix rounds of the `ci` step. Not protected.

@@ -9,6 +9,7 @@ import json
 import pytest
 
 from agentflow.agents import RUNNER_ONLY_DENY
+from agentflow.layers import user_config_path
 from agentflow.config import ConfigError, Gate, Phase, Step, load_config, resolve_model
 from agentflow.pack import ENGINE_PROMPTS
 from conftest import PYTHON_CONFIG
@@ -147,7 +148,8 @@ def test_forbidden_paths_are_denied_before_the_edit(flow_repo):
     settings = json.loads(argv[argv.index("--settings") + 1])
     # `./`, not `/`: real `claude` ignored `Edit(/CONSTRAINTS.md)` from --settings and let the write through
     assert settings == {"permissions": {"deny": ["Edit(./CONSTRAINTS.md)", "Edit(./.claude/**)", "Edit(./.agentflow/**)",
-                                                 *RUNNER_ONLY_DENY, f"Edit(/{run.dir.parent}/**)"]}}
+                                                 *RUNNER_ONLY_DENY, f"Edit(/{run.dir.parent}/**)",
+                                                 f"Edit(/{user_config_path().parent}/**)"]}}
 
 
 def test_settings_hold_only_the_engine_floor_and_the_runner_only_denies_when_the_pack_forbids_nothing(flow_repo):
@@ -159,6 +161,7 @@ def test_settings_hold_only_the_engine_floor_and_the_runner_only_denies_when_the
     argv = flow_repo.calls()[0]["argv"]
     assert json.loads(argv[argv.index("--settings") + 1]) == {"permissions": {"deny": [
         "Edit(./.agentflow/**)", *RUNNER_ONLY_DENY, f"Edit(/{run.dir.parent}/**)",  # and the runner's own state
+        f"Edit(/{user_config_path().parent}/**)",  # and the user's own config file, which a live run reloads
     ]}}
 
 

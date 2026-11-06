@@ -1137,7 +1137,8 @@ function fieldInput(field, id) {
   if (kind === "bool") {
     const box = el("input", { type: "checkbox", id: id, disabled: ro });
     box.checked = field.value === true;
-    box.addEventListener("change", () => setEdit(field, box.checked || field.present ? box.checked : null));  // unset stays unset
+    const set = field.present || (field.value !== null && field.value !== undefined);  // in the pack or inherited
+    box.addEventListener("change", () => setEdit(field, box.checked || set ? box.checked : null));  // unset stays unset
     return box;
   }
   if (kind === "int" || kind === "number") {
@@ -1183,9 +1184,10 @@ function fieldRow(field) {
   const input = fieldInput(field, id);
   const label = field.kind === "map" || (field.kind === "list" && field.options)
     ? el("label", { text: field.label }) : el("label", { for: id, text: field.label });
+  const where = field.key.join(".") + (field.source && field.source !== "project" ? " · from " + field.source : "");
   const row = el("div", { class: "set-field" }, label,
-    field.kind === "map" ? el("span", { class: "set-key", text: field.key.join(".") }) : input,
-    field.kind === "map" ? input : el("span", { class: "set-key full", text: field.key.join(".") }),
+    field.kind === "map" ? el("span", { class: "set-key", text: where }) : input,
+    field.kind === "map" ? input : el("span", { class: "set-key full", text: where }),
     field.help ? el("div", { class: "sub full", text: field.help }) : null,
     field.readonly ? el("div", { class: "sub full", text: field.readonly }) : null);
   settings.rows.set(keyId(field.key), row);
@@ -1197,7 +1199,9 @@ function renderSettings() {
   if (!d) return;
   settings.rows.clear();
   $("settings-path").textContent = d.path;
-  $("settings-protected").textContent = "Protected, so only the file can change them: " + d.protected.join("; ") + ".";
+  const from = d.protected_sources || {};
+  $("settings-protected").textContent = "Protected, so only the file can change them: "
+    + d.protected.map((k) => from[k] ? k + " (from " + from[k] + ")" : k).join("; ") + ".";
   $("settings-form").replaceChildren(...d.sections.map((section) => el("div", { class: "set-section" },
     el("h3", { text: section.title }), el("p", { class: "muted", text: section.note }), section.fields.map(fieldRow))));
   $("settings-yaml").value = d.text;

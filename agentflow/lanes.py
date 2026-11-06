@@ -32,7 +32,7 @@ from agentflow.autonomy import AUTO_BY, eligible
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
 from agentflow.commit_checks import RUNNER_COMMITS, runner_head
-from agentflow.conditions import Ctx, fmt
+from agentflow.conditions import Ctx, fmt, skill_text
 from agentflow.config import Config, Phase, Step, resolve_model
 from agentflow.feature_lane import FeatureLane
 from agentflow.flow_control import (
@@ -66,6 +66,8 @@ DEFAULT_REFINE = "refine.md"
 DEFAULT_ROLE = "build"
 EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n?", re.DOTALL)
 SKILL_LINE = re.compile(r"\b([Uu])se the `([\w.:-]+)` skill")
+SKILL_HEADING = re.compile(r"#{1,6}[ \t]+.*`\{skill\}`")
+SKILL_BLOCK = ("## The `{skill}` skill\n\nIts full text follows, so you already have it: do not load it.\n\n{brief}")
 RESUMABLE = ("running", "waiting_human")
 UNSTARTED_STEP = (None, "pending")
 FOOTER = re.compile(r"^\s*Next:\s*`?([\w.:/-]+)`?\s+(?:—|–|--?)\s", re.MULTILINE)
@@ -133,14 +135,34 @@ def _phase_artifacts(ctx: Ctx, phase: str | None) -> str:
     return "\n".join(f"- `{path}`" for path in paths) or "(none yet)"
 
 
-def _read_file_skills(text: str, skills_dir: str) -> str:
-    """For agents that cannot load skills by name: point them at the skill file in `skills_dir` instead."""
+def _read_file_skills(text: str, skills_dir: str, inlined: frozenset[str] = frozenset()) -> str:
+    """For agents that cannot load skills by name: point them at the skill file in `skills_dir` instead.
+    A skill in `inlined` has its text in the prompt already, so its line stays as it is."""
 
     def replace(match: re.Match[str]) -> str:
+        if match.group(2) in inlined:
+            return match.group(0)
         read = "Read" if match.group(1) == "U" else "read"
         return f"{read} `{skills_dir}/{match.group(2)}/SKILL.md` and follow it"
 
     return SKILL_LINE.sub(replace, text)
+
+
+def _drop_skill_section(body: str, keep: bool = False) -> str:
+    """`body` for a step with no skill: the sections headed by the step's skill (`## The `{skill}` skill`) go, or,
+    with `keep` (the step has a brief), only their heading is renamed, so no empty `` skill`` is ever shown."""
+    kept: list[str] = []
+    skipping = False
+    for line in body.split("\n"):
+        if line.startswith("#"):
+            skipping = SKILL_HEADING.match(line) is not None
+            if skipping and keep:
+                kept.append(line[:len(line) - len(line.lstrip("#"))] + " The brief")
+                skipping = False
+                continue
+        if not skipping:
+            kept.append(line)
+    return "\n".join(kept).rstrip()
 
 
 def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode: Mode) -> str:
@@ -151,15 +173,38 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     """
     preamble = EFFORT_BLOCK.sub("" if rec.get("sized") else r"\1", _template(cfg, PREAMBLE))
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
+    files = list(dict.fromkeys([*step.brief, *step.task_brief]))
+    # A step with no configured `brief:` whose skill resolves has the skill's text as its brief, and its first
+    # prompt carries it. Not a continuation (its session has the text) and not a template that names a skill of
+    # the repository itself without a `{brief}` slot (a pack's own wording, which tells the agent to load it).
+    # A bundled skill is never loadable by name, so it is always inlined.
+    skill_brief = None
+    if step.skill and not step.brief and not step.continuation:
+        found = pack.skill_file(ctx.repo, cfg.project.skills_dir, step.skill)
+        owned = found is not None and not pack.is_bundled(found) and f"`{step.skill}` skill" in body
+        if "{brief}" in body or not owned:
+            skill_brief = skill_text(cfg, ctx.repo, step.skill)
+    briefs = [skill_brief] if skill_brief is not None else []
+    briefs.extend((ctx.repo / name).read_text(encoding="utf-8") for name in files)
+    if skill_brief is not None and "{brief}" not in body:
+        body = f"{body}\n\n{SKILL_BLOCK}"
+    if not step.skill:  # no skill to name in a `## The `{skill}` skill` heading
+        body = _drop_skill_section(body, keep=bool(briefs))
+    elif step.continuation and not briefs:  # the session already holds the skill's text: no empty section for it
+        body = _drop_skill_section(body)
     if step.skill and f"`{step.skill}` skill" not in body:
-        body = f"Use the `{step.skill}` skill.\n\n{body}"
+        line = (f"Use the `{step.skill}` skill: its full text is in this prompt, so do not load it."
+                if skill_brief is not None else f"Use the `{step.skill}` skill.")
+        body = f"{line}\n\n{body}"
     extra_skills = overlays.skill_lines(cfg, ctx, str(rec.get("role") or step.role or DEFAULT_ROLE), body)
     if extra_skills:
         body = f"{body}\n\n{extra_skills}"
     if extra.get("gate_evidence") and "{gate_evidence}" not in body:  # a `gates_first` template that has no slot
         body = f"{body}\n\n{{gate_evidence}}"
     values = _values(cfg, step, ctx, {})
-    values["brief"] = "\n\n".join((ctx.repo / name).read_text(encoding="utf-8") for name in step.brief)
+    values["brief"] = "\n\n".join(briefs)
+    values["skill"] = step.skill or ""
+    values["base_ref"] = ctx.base_ref
     values["earlier_findings"] = ""
     values["gate_evidence"] = ""
     if ctx.run is not None and ctx.run.handoff_path().exists():
@@ -173,7 +218,8 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     text = "\n\n".join(part.strip() for part in (preamble, body, _template(cfg, RESULT)))
     agent = cfg.agents.get(rec.get("agent") or cfg.defaults.agent)
     if agent is not None and agent.skill_loading == "read_file":
-        text = _read_file_skills(text, cfg.project.skills_dir)
+        text = _read_file_skills(text, cfg.project.skills_dir,
+                                 frozenset({step.skill}) if skill_brief is not None and step.skill else frozenset())
     return fmt(text, values) + "\n"
 
 
@@ -370,11 +416,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         if resuming and session:
             turn = _Turn(self._continue_prompt(sr, _answers(since, key), _approved(since, key)), session)
         elif mode == "refine" and session:
-            turn = _Turn(self._prompt(sr, sized=True), session)
+            turn = _Turn(self._prompt(sr, sized=True, resume=session), session)
         elif not session and status in UNSTARTED_STEP and shared.get("session_id"):
             sr.session = shared["session_id"]
             sr.effort = shared.get("effort") or sr.effort
-            turn = _Turn(self._prompt(sr, sized=True), sr.session)
+            turn = _Turn(self._prompt(sr, sized=True, resume=sr.session), sr.session)
         else:
             sized = bool(rec.get("sized"))
             turn = _Turn(self._prompt(sr, sized=sized), None, sizing=not sized)
@@ -788,8 +834,13 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
     def _values(self, sr: _StepRun) -> dict[str, str]:
         return _values(self.cfg, sr.step, self.ctx, sr.extra)
 
-    def _prompt(self, sr: _StepRun, sized: bool) -> str:
-        prompt = build_prompt(self.cfg, sr.step, self.ctx, self._rec(sr, sized), sr.extra, sr.mode)
+    def _prompt(self, sr: _StepRun, sized: bool, resume: str | None = None) -> str:
+        """The step's prompt for a turn that resumes session `resume`, or for a fresh session when it is None.
+
+        A fresh session (the first turn, a rollover, an effort change, a refine round whose session is gone)
+        holds nothing yet, so it is never built as a continuation: the skill's text goes in again."""
+        step = sr.step if resume else dataclasses.replace(sr.step, continuation=False)
+        prompt = build_prompt(self.cfg, step, self.ctx, self._rec(sr, sized), sr.extra, sr.mode)
         return f"{sr.lead}\n\n{prompt}" if sr.lead else prompt
 
     def _result_partial(self, sr: _StepRun) -> str:

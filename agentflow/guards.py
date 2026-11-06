@@ -173,7 +173,7 @@ def _load_rules(repo: Path) -> tuple[dict[str, list[str]], list[Issue]]:
             permissions = data.get("permissions", {})
             for kind in rules:
                 rules[kind].extend(str(x) for x in permissions.get(kind, []))
-        except (ValueError, AttributeError, TypeError) as exc:
+        except (OSError, ValueError, AttributeError, TypeError) as exc:  # OSError: a directory, no read permission
             issues.append(Issue("warning", f".claude/{name}", f"cannot read permission rules: {exc}"))
     return rules, issues
 
@@ -224,6 +224,17 @@ def command_allowed(repo: Path, command: str) -> bool:
     files)."""
     rules, _issues = _load_rules(main_checkout(repo))
     return _covered(rules, command.strip())
+
+
+def has_bash_allow_rule(repo: Path) -> bool:
+    """Whether `.claude/settings*.json` in the MAIN checkout of `repo` holds any `Bash(...)` allow rule at all
+    (a bare `Bash` counts). A directory that is no checkout is read as it is."""
+    try:
+        root = main_checkout(repo)
+    except (OSError, subprocess.CalledProcessError):
+        root = Path(repo)
+    rules, _issues = _load_rules(root)
+    return bool(_bash_patterns(rules["allow"]))
 
 
 def settings_coverage(cfg: Config, repo: Path) -> list[Issue]:

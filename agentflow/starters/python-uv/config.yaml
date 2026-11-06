@@ -1,0 +1,9 @@
+# Starter: a Python project built with uv. A config layer under the pack: the pack overrides it key by key.
+# It sets only the gates and which gate runs when; the workflow, the lanes and every other setting are the engine's.
+gates:
+  sync: {run: uv sync}
+  tests: {run: uv run pytest -q}
+gate_sets:
+  setup: [sync]
+  build: [tests]
+  verify: [tests]

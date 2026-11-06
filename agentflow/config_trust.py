@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Any
 
 from agentflow import pack
-from agentflow.config import ConfigError
+from agentflow.config import Config, ConfigError, layer_files
 from agentflow.state import Run
 
-__all__ = ["ConfigUntrusted", "config_sha256", "run_config_path", "start_options", "trusted_config_path"]
+__all__ = ["ConfigUntrusted", "changed_layers", "config_sha256", "layers_sha256", "run_config_path", "start_options",
+           "trusted_config_path"]
 
 
 class ConfigUntrusted(ConfigError):
@@ -32,10 +34,46 @@ def config_sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def start_options(path: Path) -> dict[str, str]:
-    """What `start` records in `run_options` about its config: the absolute path and the content hash."""
+def layers_sha256(paths: list[Path]) -> str:
+    """One SHA-256 over each file's path and bytes, in order: it changes when a layer file's content, its place in
+    the stack or the set of files changes. Bytes only: a broken file still has a digest."""
+    digest = hashlib.sha256()
+    for path in paths:
+        path = Path(path)
+        digest.update(str(path).encode("utf-8", "surrogateescape") + b"\0")
+        digest.update(path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def start_options(path: Path, layer_paths: list[Path] | None = None) -> dict[str, Any]:
+    """What `start` records in `run_options` about its config: the absolute path and the content hash, and with
+    `layer_paths` (`config.layer_files`) the digest of all the layers and each file's own digest, so a resume can
+    name the layer files that changed since."""
     path = Path(path).resolve()
-    return {"config": str(path), "config_sha256": config_sha256(path)}
+    options: dict[str, Any] = {"config": str(path), "config_sha256": config_sha256(path)}
+    if layer_paths is not None:
+        options["layers_sha256"] = layers_sha256(layer_paths)
+        options["layer_digests"] = {str(p): config_sha256(p) for p in layer_paths}
+    return options
+
+
+def changed_layers(run: Run, cfg: Config) -> list[Path]:
+    """The layer files of `cfg` that differ from the ones `run` started with: changed, new or gone. Empty when
+    nothing changed, when the run was started before the digests were recorded, or when `cfg` is not the config the
+    run started with (a `--config` the human named). It never decides what is trusted: see `trusted_config_path`."""
+    first = next((e for e in run.events.read() if e["type"] == "run_options"), None)
+    recorded = (first or {}).get("layer_digests")
+    if not isinstance(recorded, dict) or not recorded:
+        return []
+    if str((first or {}).get("config") or "") != str(Path(cfg.path).resolve()):
+        return []
+    try:
+        now = {str(p): config_sha256(p) for p in layer_files(cfg)}
+    except OSError:
+        return []  # a layer that cannot be read now is a load error the run reports itself
+    names = [name for name in recorded if recorded.get(name) != now.get(name)]
+    names += [name for name in now if name not in recorded]
+    return [Path(name) for name in names]
 
 
 def trusted_config_path(run: Run, explicit: str | Path | None, default: Path) -> Path:

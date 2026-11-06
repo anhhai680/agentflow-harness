@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(true)",
+      "Bash(python3 -m unittest *)"
+    ]
+  }
+}

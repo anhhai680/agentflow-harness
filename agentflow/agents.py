@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from . import layers
 from .config import AgentSpec, Config, ContextPolicy
 
 KILL_GRACE_S = 10
@@ -514,6 +515,10 @@ class ClaudeAgent(_CliAgent):
         deny = [*(f"Edit(./{path})" for path in call.forbidden_paths), *RUNNER_ONLY_DENY]
         if call.runs_root is not None:  # `//` + an absolute path is an absolute path in a permission rule
             deny.append(f"Edit(/{call.runs_root}/**)")
+        try:  # the user's own config file: a live run reloads it (`config.layer_files`), so no agent edits it
+            deny.append(f"Edit(/{layers.user_config_path().parent}/**)")
+        except RuntimeError:  # `Path.home()` with no home directory: there is no user file to protect
+            pass
         argv += ["--settings", json.dumps({"permissions": {"deny": deny}})]
         if spec.max_turns is not None:
             argv += ["--max-turns", str(spec.max_turns)]

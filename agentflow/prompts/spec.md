@@ -1,5 +1,3 @@
-Use the `spec-driven-development` skill.
-
 Goal: draft `{spec}` for module `{module}`.
 
 Read, by path:

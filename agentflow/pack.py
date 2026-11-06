@@ -12,12 +12,14 @@ import hashlib
 import os
 import re
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
 
 ENGINE_PROMPTS: Path = Path(__file__).parent / "prompts"
+ENGINE_SKILLS: Path = Path(__file__).resolve().parent / "skills"  # the generic stage skills the engine bundles
+SKILL_NAME = re.compile(r"(?!-)[\w.:-]+")  # a skill's directory name: the character set of `lanes.SKILL_LINE`, no leading `-`
 PACK_DIR = ".agentflow"
 PACK_VERSION = 2  # the pack format this engine reads (`version:`)
 ENGINE_VERSION = "2.0"  # what a pack's `engine:` range is checked against
@@ -169,3 +171,32 @@ def prompt_label(config_path: Path, file: Path) -> str:
     if file.parent == ENGINE_PROMPTS and file.parent != config_path.parent / "prompts":
         return f"engine:prompts/{file.name}"
     return f"prompts/{file.name}"
+
+
+def skill_file(repo: Path, skills_dir: str, name: object) -> Path | None:
+    """The `SKILL.md` a skill name resolves to: the repository's `<skills_dir>/<name>/SKILL.md`, else the engine's
+    bundled one, else None. Never raises, whatever the arguments.
+
+    The name is the containment: it must be a string that fully matches `SKILL_NAME` (so no separator, no leading
+    `-`, no NUL or whitespace) and is not `.` or `..`, and `skills_dir` must be a relative path of the repository
+    with no `..` part and no backslash. The candidates are built from those parts, never resolved, so a skills
+    directory that is itself a symlink out of the repository (as the fixtures link `.claude/skills`) still works."""
+    if not isinstance(name, str) or name in (".", "..") or SKILL_NAME.fullmatch(name) is None:
+        return None
+    if not isinstance(skills_dir, str) or not skills_dir or "\\" in skills_dir or "\0" in skills_dir:
+        return None
+    relative = PurePosixPath(skills_dir)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        return None
+    try:
+        for candidate in (Path(repo).joinpath(*relative.parts, name, "SKILL.md"), ENGINE_SKILLS / name / "SKILL.md"):
+            if candidate.is_file():
+                return candidate
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def is_bundled(path: Path) -> bool:
+    """Whether `path` (as `skill_file` returned it) is one of the engine's bundled skills."""
+    return ENGINE_SKILLS in Path(path).parents

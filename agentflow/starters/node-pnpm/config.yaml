@@ -1,0 +1,9 @@
+# Starter: a Node project built with pnpm. A config layer under the pack: the pack overrides it key by key.
+# It sets only the gates and which gate runs when; the workflow, the lanes and every other setting are the engine's.
+gates:
+  install: {run: pnpm install --frozen-lockfile}
+  test: {run: pnpm test}
+gate_sets:
+  setup: [install]
+  build: [test]
+  verify: [test]
