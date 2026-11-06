@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agentflow import gitops, sources, work_source
+from agentflow import gitops, pack, sources, work_source
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.gitops import uncommitted_paths
 from agentflow.guards import path_matches
@@ -150,9 +150,18 @@ def _module_ids(cfg: Config, repo: Path) -> list[str]:
     return [n.id for n in work_source.items(cfg, repo)]
 
 
-def _skill(cfg: Config, key: str, stage: str) -> str:
-    """The skill `skills.map` names for `key`, else the stage's name (`Build stage`)."""
-    return cfg.skills_map.get(key) or f"{stage} stage"
+def _skill(cfg: Config, repo: Path, key: str, stage: str) -> str:
+    """The skill `skills.map` names for `key`, else the stage's name (`Build stage`). A skill that only the engine's
+    bundled copy provides is marked as such: it exists in runner prompts, not for an interactive session. `repo` is
+    the main checkout, where a skill of the repository is looked up first."""
+    name = cfg.skills_map.get(key)
+    if not name:
+        return f"{stage} stage"
+    found = pack.skill_file(repo, cfg.project.skills_dir, name)
+    if found is not None and pack.is_bundled(found):
+        return (f"`{name}` (bundled with agentflow: a run uses it; "
+                "it is not installed for interactive sessions)")
+    return name
 
 
 def design_doc_paths(cfg: Config) -> list[str]:
@@ -189,7 +198,7 @@ def _some(paths: list[str], limit: int = 3) -> str:
     return shown + (f" and {len(paths) - limit} more" if len(paths) > limit else "")
 
 
-def rule_eval(cfg: Config, dirty: list[str]) -> NextAnswer | None:
+def rule_eval(cfg: Config, repo: Path, dirty: list[str]) -> NextAnswer | None:
     """Rule 2: uncommitted changes under `overlays.eval.when_paths` mean the eval lane."""
     globs = [str(g) for g in ((cfg.raw.get("overlays") or {}).get("eval") or {}).get("when_paths") or []]
     hits = [p for p in dirty if any(path_matches(p, g) for g in globs)]
@@ -198,7 +207,7 @@ def rule_eval(cfg: Config, dirty: list[str]) -> NextAnswer | None:
     return NextAnswer(
         "eval", "Verify",
         [f"{len(hits)} uncommitted path(s) under overlays.eval.when_paths: {_some(hits)}"],
-        _skill(cfg, "verify", "Verify"),
+        _skill(cfg, repo, "verify", "Verify"),
         "run the eval gate; a regression blocks the change",
     )
 
@@ -212,7 +221,7 @@ def rule_unchecked_plan(cfg: Config, repo: Path, plan: Path | None, ctx: Ctx) ->
     if not open_tasks:
         return None
     small = "plan_is_small" in cfg.conditions and evaluate(cfg, "plan_is_small", ctx).value is True
-    skill = _skill(cfg, "build_small", "Build") if small else _skill(cfg, "build", "Build")
+    skill = _skill(cfg, repo, "build_small", "Build") if small else _skill(cfg, repo, "build", "Build")
     return NextAnswer(
         "feature", "Build",
         [f"{plan.relative_to(repo).as_posix()}: {len(open_tasks)} of {len(tasks)} tasks unchecked "
@@ -232,8 +241,8 @@ def rule_checked_plan(cfg: Config, repo: Path, plan: Path | None) -> NextAnswer 
         return None
     evidence = [f"{plan.relative_to(repo).as_posix()} is fully checked",
                 f"{branch} has no merged pull request" if merged is False else f"could not check {branch}: {why}"]
-    return NextAnswer("feature", "Verify", evidence, _skill(cfg, "verify", "Verify"),
-                      f"then {_skill(cfg, 'ship', 'Ship')}")
+    return NextAnswer("feature", "Verify", evidence, _skill(cfg, repo, "verify", "Verify"),
+                      f"then {_skill(cfg, repo, 'ship', 'Ship')}")
 
 
 def rule_spec_without_plan(cfg: Config, repo: Path) -> NextAnswer | None:
@@ -253,12 +262,12 @@ def rule_spec_without_plan(cfg: Config, repo: Path) -> NextAnswer | None:
         if sources.find_plan(repo / docs["plans"], module) is None:
             return NextAnswer(
                 "feature", "Plan", [f"{spec.relative_to(repo).as_posix()} is approved and {module} has no plan"],
-                _skill(cfg, "plan", "Plan"), f"plan {module} from its approved spec",
+                _skill(cfg, repo, "plan", "Plan"), f"plan {module} from its approved spec",
             )
     return None
 
 
-def rule_design_doc(cfg: Config, dirty: list[str]) -> NextAnswer | None:
+def rule_design_doc(cfg: Config, repo: Path, dirty: list[str]) -> NextAnswer | None:
     """Rule 6: uncommitted changes only under the pack's `project.docs` `idea`, `decisions` or `glossary` (a
     directory matches every path under it)."""
     docs = design_doc_paths(cfg)
@@ -266,16 +275,16 @@ def rule_design_doc(cfg: Config, dirty: list[str]) -> NextAnswer | None:
         return None
     return NextAnswer(
         "design-doc", "Define", [f"{len(dirty)} uncommitted path(s), all design docs: {_some(dirty)}"],
-        _skill(cfg, "design_doc", "Define"),
+        _skill(cfg, repo, "design_doc", "Define"),
         "finish the design-doc edits, then commit when the user asks",
     )
 
 
-def rule_idle(cfg: Config, dirty: list[str]) -> NextAnswer:
+def rule_idle(cfg: Config, repo: Path, dirty: list[str]) -> NextAnswer:
     """Rule 7: nothing in flight."""
     evidence = (f"{len(dirty)} uncommitted path(s) fit no lane: {_some(dirty)}" if dirty
                 else "no uncommitted changes, no open plan, no approved spec waiting for a plan")
-    decide, define = _skill(cfg, "decide", "Define"), _skill(cfg, "define", "Define")
+    decide, define = _skill(cfg, repo, "decide", "Define"), _skill(cfg, repo, "define", "Define")
     return NextAnswer("none", "-", [evidence], decide if decide == define else f"{decide} or {define}",
                       f"nothing is in flight: ask what to do; {decide} for a decision, {define} for something to build")
 
@@ -287,12 +296,12 @@ def next_step(cfg: Config, repo: Path) -> NextAnswer:
     plan = newest_plan(repo / cfg.project.docs["plans"])
     ctx = _ctx(cfg, repo, plan)
     answer = (
-        rule_eval(cfg, dirty)
+        rule_eval(cfg, repo, dirty)
         or rule_unchecked_plan(cfg, repo, plan, ctx)
         or rule_checked_plan(cfg, repo, plan)
         or rule_spec_without_plan(cfg, repo)
-        or rule_design_doc(cfg, dirty)
-        or rule_idle(cfg, dirty)
+        or rule_design_doc(cfg, repo, dirty)
+        or rule_idle(cfg, repo, dirty)
     )
     line = security_line(cfg)
     if line and "security_path" in cfg.conditions:

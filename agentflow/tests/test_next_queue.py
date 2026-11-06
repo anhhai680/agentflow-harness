@@ -66,6 +66,21 @@ def test_next_unchecked_plan(fr):
     assert any("1 of 2 tasks unchecked" in line for line in answer.evidence)
 
 
+def test_next_marks_a_bundled_skill(fr):
+    write(fr.root, "docs/plans/2026-10-28-crm.md", PLAN_OPEN)
+    fr.cfg.skills_map["build_small"] = "agentflow-build"  # the fixture repo has no such skill: only the engine does
+    fr.cfg.skills_map["verify"] = "no-such-skill"  # found nowhere: named plainly
+    answer = next_step(fr.cfg, fr.root)
+    assert answer.next == ("`agentflow-build` (bundled with agentflow: a run uses it; "
+                           "it is not installed for interactive sessions)")
+    fr.cfg.skills_map["build_small"] = "no-such-skill"
+    assert next_step(fr.cfg, fr.root).next == "no-such-skill"
+    fr.cfg.project.skills_dir = "own-skills"  # not `.claude/skills`: the fixture repo links that to the shared fixture
+    write(fr.root, "own-skills/agentflow-build/SKILL.md", "# the repository's own\n")
+    fr.cfg.skills_map["build_small"] = "agentflow-build"  # a repo skill that shadows the bundled name is plain
+    assert next_step(fr.cfg, fr.root).next == "agentflow-build"
+
+
 def test_next_does_not_send_anyone_to_build_a_deferred_task(fr):
     write(fr.root, "docs/plans/2026-10-28-crm.md", PLAN_DEFERRED)
     answer = next_step(fr.cfg, fr.root)
