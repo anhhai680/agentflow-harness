@@ -1,8 +1,9 @@
 """The config layers: how the engine defaults, a starter, the project pack and the user file combine.
 
-A leaf module: it imports nothing from `config.py`, which loads the layers through it. `merge` only applies the
-layers it is given, bottom-up. `check_user` is the trust boundary for the user's own file, which may hold personal
-settings (`USER_KEYS`) and nothing else: no command, no guardrail, no gate, no new agent.
+A leaf module: it imports nothing from `config.py`, which loads the layers through it. `base_layers` reads the
+layers the engine owns (its defaults and a starter); the pack and the user file are read by `config.py`. `merge`
+only applies the layers it is given, bottom-up. `check_user` is the trust boundary for the user's own file, which
+may hold personal settings (`USER_KEYS`) and nothing else: no command, no guardrail, no gate, no new agent.
 """
 
 from __future__ import annotations
@@ -12,7 +13,10 @@ import os
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import yaml
+
 ENGINE_DEFAULTS = Path(__file__).resolve().parent / "defaults" / "config.yaml"
+STARTERS = Path(__file__).resolve().parent / "starters"  # one directory per starter, each holding a `config.yaml`
 WORKFLOW_KEYS = (
     "lanes", "phases", "conditions", "record_step", "resolve_step", "phase_approval", "checkpoints", "autonomy",
     "ci", "skills",
@@ -50,6 +54,49 @@ def user_config_path() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME", "")
     base = Path(xdg) if xdg and os.path.isabs(xdg) else Path.home() / ".config"
     return base / "agentflow" / "config.yaml"
+
+
+def starter_names() -> list[str]:
+    """The names of the starters the engine ships: the directories of `STARTERS`, sorted."""
+    try:
+        return sorted(p.name for p in STARTERS.iterdir() if p.is_dir() and (p / "config.yaml").is_file())
+    except OSError:
+        return []
+
+
+def starter_file(starter: object) -> Path | None:
+    """The config file of the starter a pack names; None when it names none (the key is absent or null).
+
+    A name is looked up in `starter_names()` and the path is built from the listed entry, never from the value the
+    pack wrote, so a value that is a path (`../defaults`, `/etc`), empty or not text can reach nothing outside
+    `STARTERS`. Anything that is not a listed name is a `LayerError` at `starter`."""
+    if starter is None:
+        return None
+    names = starter_names()
+    if isinstance(starter, str):
+        for listed in names:
+            if listed == starter:
+                return STARTERS / listed / "config.yaml"
+    raise LayerError("starter", f"unknown starter {starter!r}; the starters are {', '.join(names)}")
+
+
+def base_layers(starter: object) -> list[Layer]:
+    """The layers under the pack: the engine defaults, then the starter the pack names (`starter_file`)."""
+    stack = [Layer("engine", _read(ENGINE_DEFAULTS), ENGINE_DEFAULTS)]
+    path = starter_file(starter)
+    if path is not None:
+        stack.append(Layer(f"starter:{path.parent.name}", _read(path), path))
+    return stack
+
+
+def _read(path: Path) -> dict:
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise LayerError(str(path), f"cannot read the layer file: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise LayerError(str(path), "a layer file must hold a mapping at the top level")
+    return loaded
 
 
 def owns_workflow(data: dict) -> bool:

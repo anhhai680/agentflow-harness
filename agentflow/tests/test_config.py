@@ -925,3 +925,100 @@ def test_an_unreadable_user_file_location_is_a_config_error_naming_it(monkeypatc
         load_config(PYTHON_CONFIG)
     assert str(user) in str(err.value) and "cannot read" in str(err.value)
     assert load_config(PYTHON_CONFIG, user=False).phases  # not asked for: not touched
+
+
+# --------------------------------------------------------------------------- starters
+
+
+def _starter_pack(sparse_repo: Path, **extra) -> Path:
+    path = pack.pack_config(sparse_repo)
+    data = {"version": 2, "engine": ">=2,<3", "agents": {"claude": {"permission_mode": "bypassPermissions"}}, **extra}
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("name", ["docs-only", "go", "node-pnpm", "python-uv"])
+def test_every_starter_validates_with_no_errors(name, sparse_repo):
+    path = _starter_pack(sparse_repo, starter=name)
+    cfg = load_config(path)
+    assert [i for i in validate(cfg, sparse_repo) if i.level == "error"] == []
+    assert cfg.gate_sets["verify"] and set(cfg.gate_sets) >= {"setup", "build", "verify"}
+    assert cfg.layer_origins[("gates", next(iter(cfg.gates)))] == f"starter:{name}"
+    assert cfg.layer_origins[("lanes",)] == "engine"
+
+
+def test_no_starter_owns_the_workflow_or_sets_lanes():
+    from agentflow import layers
+
+    for name in layers.starter_names():
+        data = yaml.safe_load((layers.STARTERS / name / "config.yaml").read_text(encoding="utf-8"))
+        assert not layers.owns_workflow(data), name
+        assert "lanes" not in data and "phases" not in data, name
+        assert set(data["gate_sets"]) == {"setup", "build", "verify"} and data["gates"], name
+        assert all(g in data["gates"] for names in data["gate_sets"].values() for g in names), name
+
+
+def test_no_starter_is_the_same_as_an_absent_or_null_starter(sparse_repo):
+    absent = load_config(_starter_pack(sparse_repo, gates={"unit": {"run": "true"}},
+                                       gate_sets={"setup": [], "build": ["unit"], "verify": ["unit"]}))
+    null = load_config(_starter_pack(sparse_repo, starter=None, gates={"unit": {"run": "true"}},
+                                     gate_sets={"setup": [], "build": ["unit"], "verify": ["unit"]}))
+    assert "starter" not in null.merged  # a null deletes the key
+    assert absent.merged == null.merged and absent.layer_origins == null.layer_origins
+    assert set(absent.layer_origins.values()) == {"engine", "project"}
+
+
+@pytest.mark.parametrize("value", ["nope", "", "../defaults", "/etc", 3, ["go"]])
+def test_a_starter_that_is_not_a_known_name_is_refused(value, sparse_repo):
+    path = _starter_pack(sparse_repo, starter=value)
+    with pytest.raises(ConfigError) as err:
+        load_config(path)
+    assert err.value.path == "starter"
+    assert all(name in err.value.message for name in ("docs-only", "go", "node-pnpm", "python-uv"))
+
+
+def test_validate_reports_an_unknown_starter_instead_of_crashing(sparse_repo, monkeypatch, capsys):
+    _starter_pack(sparse_repo, starter="nope")
+    monkeypatch.chdir(sparse_repo)
+    assert main(["validate"]) == 1
+    out = capsys.readouterr().out
+    assert out.startswith("error starter: ") and "python-uv" in out
+
+
+def test_the_pack_overrides_its_starter(sparse_repo):
+    path = _starter_pack(sparse_repo, starter="python-uv", gates={"tests": {"run": "make check"}})
+    cfg = load_config(path)
+    assert cfg.gates["tests"].run == "make check" and cfg.layer_origins[("gates", "tests")] == "project"
+    assert cfg.gates["sync"].run == "uv sync" and cfg.layer_origins[("gates", "sync")] == "starter:python-uv"
+    assert cfg.gate_sets["verify"] == ["tests"]
+    again = _starter_pack(sparse_repo, starter="python-uv", gate_sets={"setup": [], "build": ["sync"], "verify": ["sync"]})
+    assert load_config(again).gate_sets["verify"] == ["sync"]
+
+
+def test_layer_files_names_the_starter_between_the_defaults_and_the_pack(sparse_repo):
+    from agentflow import layers
+    from agentflow.config import layer_files
+
+    cfg = load_config(_starter_pack(sparse_repo, starter="go"))
+    starter = layers.STARTERS / "go" / "config.yaml"
+    assert layer_files(cfg) == [layers.ENGINE_DEFAULTS, starter, Path(cfg.path).resolve()]
+    user = _user_file("defaults:\n  run_budget_usd: 7\n")
+    assert layer_files(cfg) == [layers.ENGINE_DEFAULTS, starter, Path(cfg.path).resolve(), user]
+
+
+def test_editing_a_starter_file_changes_the_layers_digest(sparse_repo, monkeypatch, tmp_path):
+    import shutil
+
+    from agentflow import layers
+    from agentflow.config import layer_files
+    from agentflow.config_trust import layers_sha256
+
+    copy = tmp_path / "starters"
+    shutil.copytree(layers.STARTERS, copy)
+    monkeypatch.setattr(layers, "STARTERS", copy)
+    cfg = load_config(_starter_pack(sparse_repo, starter="go"))
+    before = layers_sha256(layer_files(cfg))
+    target = copy / "go" / "config.yaml"
+    target.write_text(target.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8")
+    assert layers_sha256(layer_files(cfg)) != before
+

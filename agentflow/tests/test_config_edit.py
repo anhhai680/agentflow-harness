@@ -688,3 +688,47 @@ def test_the_repair_of_a_pack_that_needs_the_user_file_still_saves(sparse_repo):
     for user in (True, False):
         cfg = load_config(path, user=user)
         assert cfg.raw["gates"]["unit"]["run"] == "true" and cfg.defaults.step_timeout_min == 40
+
+
+# --------------------------------------------------------------------------- starters
+
+
+def test_starter_is_protected_on_the_page(sparse_repo):
+    path = _sparse(sparse_repo)
+    assert "starter" in config_edit._PROTECTED_KEYS and "starter" in config_edit.form_fields(path)["protected"]
+    text, sha = config_edit.read(path)
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(path, sha, text=text + "starter: go\n", repo=sparse_repo)
+    path.write_text(text + "starter: go\n", encoding="utf-8")
+    text, sha = config_edit.read(path)
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(path, sha, text=text.replace("starter: go", "starter: docs-only"), repo=sparse_repo)
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(path, sha, text=text.replace("starter: go\n", ""), repo=sparse_repo)
+
+
+def _custom_starter(monkeypatch, tmp_path: Path, body: str) -> None:
+    from agentflow import layers
+
+    (tmp_path / "starters" / "custom").mkdir(parents=True)
+    (tmp_path / "starters" / "custom" / "config.yaml").write_text(body, encoding="utf-8")
+    monkeypatch.setattr(layers, "STARTERS", tmp_path / "starters")
+
+
+def test_a_starter_is_a_layer_below_the_pack_on_the_page(sparse_repo, monkeypatch, tmp_path):
+    _custom_starter(monkeypatch, tmp_path, "gates: {unit: {run: 'true'}}\n"
+                    "hitl:\n  remind_after_h: 5   # a starter's own note\n"
+                    "autonomy:\n  resolve_kinds: {blocked: 4}\n")
+    path = _sparse(sparse_repo)
+    path.write_text(path.read_text(encoding="utf-8") + "starter: custom\n", encoding="utf-8")
+    fields = _fields(path)
+    remind = fields[("hitl", "remind_after_h")]
+    assert remind["value"] == 5 and remind["source"] == "starter:custom" and remind["help"] == "a starter's own note"
+    kinds = fields[("autonomy", "resolve_kinds")]
+    assert kinds["value"]["blocked"] == 4 and kinds["source"] == "starter:custom"
+    changed = {**kinds["value"], "new_kind": 1}  # only the entry the starter and the engine don't say is written
+    proposal = _sparse_form(path, (["autonomy", "resolve_kinds"], changed))
+    assert not proposal.errors, proposal.errors
+    assert sorted(changed_lines(proposal.diff)) == ["+autonomy: {resolve_kinds: {new_kind: 1}}"]
+    config_edit.save(path, proposal)
+    assert load_config(path).autonomy["resolve_kinds"] == changed

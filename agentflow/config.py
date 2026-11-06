@@ -377,9 +377,16 @@ def worktrees_root(cfg: Config, repo: Path) -> Path:
 
 
 def layer_files(cfg: Config) -> list[Path]:
-    """The files `cfg` was built from, bottom-up: the engine defaults, the pack and the user's file when it exists.
-    A pure function of `cfg` and the disk; `OSError` from looking for the user file is the caller's to catch."""
+    """The files `cfg` was built from, bottom-up: the engine defaults, the pack's starter when it names one, the
+    pack and the user's file when it exists. A pure function of `cfg` and the disk; `OSError` from looking for the
+    user file is the caller's to catch."""
     files = [layers.ENGINE_DEFAULTS, Path(cfg.path).resolve()]
+    try:
+        starter = layers.starter_file(cfg.merged.get("starter"))
+    except layers.LayerError:  # a pack loaded on its own (`layered=False`) never used the starter it names
+        starter = None
+    if starter is not None:
+        files.insert(1, starter)
     try:
         user = layers.user_config_path()
     except RuntimeError:  # no home directory to look in: there is no user file
@@ -707,13 +714,13 @@ def _read_mapping(path: Path) -> dict:
 
 
 def _merge_layers(project: dict, path: Path, user: bool) -> tuple[dict, dict, Path | None]:
-    """`(merged, origins, user file or None)` for the stack engine defaults -> the pack -> the user's own file.
+    """`(merged, origins, user file or None)` for the stack engine defaults -> the starter the pack names (if any)
+    -> the pack -> the user's own file.
 
     The user file is read only when `user` is true and it exists, and it is checked (`layers.check_user`) against
     the merged layers below it before it is merged: it never reaches `merge` unchecked."""
-    stack = [layers.Layer("engine", _read_mapping(layers.ENGINE_DEFAULTS), layers.ENGINE_DEFAULTS),
-             layers.Layer("project", project, path)]
     try:
+        stack = [*layers.base_layers(project.get("starter")), layers.Layer("project", project, path)]
         merged, origins = layers.merge(stack)
         if not user:
             return merged, origins, None
@@ -739,8 +746,9 @@ def _merge_layers(project: dict, path: Path, user: bool) -> tuple[dict, dict, Pa
 def load_config(path: Path, *, layered: bool = True, user: bool = True) -> Config:
     """Merge the layers, resolve `@` references and build the dataclasses.
 
-    The layers are the engine defaults (`agentflow/defaults/config.yaml`), the pack at `path` and the user's own
-    file (`layers.user_config_path`), bottom-up. `version` and `engine` are checked on the pack file alone.
+    The layers are the engine defaults (`agentflow/defaults/config.yaml`), the starter the pack names with `starter:`
+    (`agentflow/starters/<name>/config.yaml`), the pack at `path` and the user's own file
+    (`layers.user_config_path`), bottom-up. `version` and `engine` are checked on the pack file alone.
     `layered=False` loads the pack file alone, as before the layers; `user=False` leaves the user file unread.
     An error at a key the user file set names that file."""
     path = Path(path)

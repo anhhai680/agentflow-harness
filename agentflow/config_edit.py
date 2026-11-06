@@ -47,7 +47,7 @@ AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices")  # what a page ma
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
     "version", "engine", "gates", "gate_sets", "guardrails", "conditions", "overlays", "project", "phase_approval",
     "record_step", "resolve_step", "paths", "defaults.env", "context.autocompact_env", "context.progress_file",
-    "hitl.notify", "dashboard.host", "work_source", "skills",
+    "hitl.notify", "dashboard.host", "work_source", "skills", "starter",
 )
 PROTECTED = (
     *_PROTECTED_KEYS,
@@ -201,13 +201,15 @@ def _layers(path: Path, text: str) -> _Layers:
             cfg = load_config(path, user=False)
         except ConfigError:
             return _Layers(project, project, {key: "project" for key in layers.leaf_keys(project)}, comments=comments)
-    engine_text = layers.ENGINE_DEFAULTS.read_text(encoding="utf-8")
-    below, _ = layers.merge([layers.Layer("engine", yaml.safe_load(engine_text) or {}, layers.ENGINE_DEFAULTS)])
+    stack = layers.base_layers(cfg.merged.get("starter"))  # the engine defaults, then the pack's starter
+    below, _ = layers.merge(stack)
     if layers.owns_workflow(project):  # the pack writes the whole workflow: none of the engine's applies to it
         for key in layers.WORKFLOW_KEYS:
             below.pop(key, None)
     user_path = layers.user_config_path() if "user" in cfg.layer_origins.values() else None
-    every = _comments(engine_text)  # bottom-up: a higher layer's comment on the same key wins
+    every: dict[tuple[str, ...], str] = {}
+    for layer in stack:  # bottom-up: a higher layer's comment on the same key wins
+        every.update(_comments(layer.path.read_text(encoding="utf-8")))
     every.update(comments)
     if user_path is not None:
         try:

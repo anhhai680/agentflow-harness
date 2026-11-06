@@ -319,3 +319,80 @@ def test_rows_list_every_leaf_with_its_layer():
     assert len(keys) == len(set(keys)) == len(layers.leaf_keys(merged))
     assert keys.index("project.base_branch") < keys.index("gates.unit") < keys.index("defaults.agent")  # merged order
     assert layers.rows({}, {}) == []
+
+
+# --------------------------------------------------------------------------- starters
+
+STARTER_NAMES = ["docs-only", "go", "node-pnpm", "python-uv"]
+
+
+def test_starter_names_are_the_sorted_directories_of_the_starters_folder():
+    assert layers.STARTERS == Path(layers.__file__).resolve().parent / "starters"
+    assert layers.starter_names() == STARTER_NAMES
+    for name in STARTER_NAMES:
+        assert (layers.STARTERS / name / "config.yaml").is_file()
+
+
+def test_base_layers_is_the_engine_alone_without_a_starter():
+    for absent in (None,):
+        stack = layers.base_layers(absent)
+        assert [layer.name for layer in stack] == ["engine"] and stack[0].path == layers.ENGINE_DEFAULTS
+
+
+def test_base_layers_puts_the_named_starter_over_the_engine():
+    stack = layers.base_layers("go")
+    assert [layer.name for layer in stack] == ["engine", "starter:go"]
+    assert stack[1].path == layers.STARTERS / "go" / "config.yaml"
+    assert stack[1].data["gates"]["vet"] == {"run": "go vet ./..."}
+
+
+@pytest.mark.parametrize("value", ["nope", "", "../defaults", "/etc", "go/..", ".", "GO", "go ", 3, True, ["go"], {"go": 1}])
+def test_base_layers_refuses_anything_that_is_not_a_listed_name(value):
+    with pytest.raises(LayerError) as err:
+        layers.base_layers(value)
+    assert err.value.path == "starter"
+    assert all(name in err.value.message for name in STARTER_NAMES)
+
+
+def test_base_layers_builds_its_path_from_the_listed_entry_only(monkeypatch, tmp_path):
+    (tmp_path / "ok").mkdir()
+    (tmp_path / "ok" / "config.yaml").write_text("gates: {}\n", encoding="utf-8")
+    (tmp_path / "secret.yaml").write_text("gates: {x: {run: evil}}\n", encoding="utf-8")
+    monkeypatch.setattr(layers, "STARTERS", tmp_path)
+    assert layers.starter_names() == ["ok"]  # a file in the folder is not a starter
+    for sneaky in ("../" + tmp_path.name, "ok/..", "secret.yaml", str(tmp_path / "ok")):
+        with pytest.raises(LayerError):
+            layers.base_layers(sneaky)
+    assert layers.base_layers("ok")[1].path == tmp_path / "ok" / "config.yaml"
+
+
+def _docs_gate() -> str:
+    data = yaml.safe_load((layers.STARTERS / "docs-only" / "config.yaml").read_text(encoding="utf-8"))
+    return data["gates"]["whitespace"]["run"]
+
+
+def _gate(repo: Path):
+    import subprocess
+
+    return subprocess.run(_docs_gate(), shell=True, cwd=repo, capture_output=True, text=True)
+
+
+def test_the_docs_only_gate_passes_on_an_unborn_repo_and_a_markdown_line_break(tmp_path):
+    import subprocess
+
+    def git(*args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=tmp_path,
+                       check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    assert _gate(tmp_path).returncode == 0                                   # an unborn HEAD, nothing tracked
+    (tmp_path / "a.md").write_text("line one  \nline two\n", encoding="utf-8")  # a Markdown line break
+    git("add", "a.md")
+    assert _gate(tmp_path).returncode == 0                                   # still unborn, one staged file
+    git("commit", "-q", "-m", "docs")
+    assert _gate(tmp_path).returncode == 0                                   # a committed tree
+    (tmp_path / "b.md").write_text("x\n<<<<<<< HEAD\ny\n=======\nz\n>>>>>>> other\n", encoding="utf-8")
+    git("add", "b.md")
+    git("commit", "-q", "-m", "broken")
+    proc = _gate(tmp_path)
+    assert proc.returncode != 0 and "conflict marker" in proc.stdout + proc.stderr

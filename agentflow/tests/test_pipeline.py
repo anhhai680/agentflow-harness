@@ -514,6 +514,8 @@ def test_run_cli_preflight_missing_binary(pipe, capsys):
 
 
 def test_dry_run_feature(pipe, capsys):
+    from agentflow import pack
+
     assert main(["run", "feature", "--module", "demo", "--dry-run", "--config", str(pipe.cfg.path)]) == 0
     out = capsys.readouterr().out
     for phase in ("define", "plan", "build", "verify", "review", "ship"):
@@ -526,7 +528,7 @@ def test_dry_run_feature(pipe, capsys):
     assert "gh pr create --draft" in out
     assert pipe.calls() == []
     assert not runs_root(pipe.root).exists()
-    assert not (pipe.root.parent / "toy-worktrees").exists()
+    assert not (pack.state_dir(pipe.root) / "worktrees").exists()
 
 
 def test_run_cli_detach_starts_a_background_resume(pipe, monkeypatch):
