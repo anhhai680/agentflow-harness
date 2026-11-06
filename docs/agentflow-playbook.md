@@ -25,7 +25,7 @@ You stay in charge of three things: answering the questions in `define` and `pla
 
 | Need | Check |
 |---|---|
-| Python 3.12+ and `uv` | `uv --version` (`bin/agentflow` runs the script with `uv`, and PyYAML comes from the script header) |
+| Python 3.12+ and `uv` | `uv --version` (the installed tool and `bin/agentflow` both run on `uv`; PyYAML comes from the package or the script header) |
 | `git` with an `origin` remote and the fork branch (`main` here) | `git remote -v`, `git branch --list main` |
 | GitHub CLI, signed in (needed by `ship`, `--issue`, and `queue`) | `gh auth status` |
 | Claude Code (the default agent) | `claude --version`, and run `claude` once interactively so it is signed in |
@@ -37,7 +37,16 @@ Agent runs spend real money. `defaults.run_budget_usd` (25 here) stops a run whe
 
 ## 3. One-time setup
 
-Run these from the repo root.
+Install the engine once as a tool, from a checkout of this repository. This puts an `agentflow` command on your PATH, and it runs from any directory:
+
+```bash
+uv tool install --from /path/to/agentflow-harness agentflow     # first install
+uv tool install --reinstall --from /path/to/agentflow-harness agentflow   # after pulling engine changes
+```
+
+`pyproject.toml` lists the files under `agentflow/` as `cache-keys`, so uv rebuilds its cached wheel when one changes. If an install still serves stale code, `--reinstall` is the fallback. `bin/agentflow` stays for working on the engine itself: it runs `agentflow/flow.py` straight from the checkout, so an edit takes effect with no reinstall.
+
+Then run these from the repo root of the project you drive.
 
 ```bash
 # 1. The config must be valid. It must print "0 warnings".
