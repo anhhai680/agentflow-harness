@@ -960,6 +960,25 @@ def test_no_starter_owns_the_workflow_or_sets_lanes():
         assert all(g in data["gates"] for names in data["gate_sets"].values() for g in names), name
 
 
+def test_no_engine_layer_confirms_the_gates():
+    # Only a human confirms a pack's gates: neither the engine defaults nor a starter may set `gates_confirmed`.
+    from agentflow import layers
+
+    def keys(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                yield key
+                yield from keys(value)
+        elif isinstance(node, list):
+            for item in node:
+                yield from keys(item)
+
+    files = [p for root in (layers.ENGINE_DEFAULTS.parent, layers.STARTERS) for p in root.rglob("*") if p.is_file()]
+    assert layers.ENGINE_DEFAULTS in files and len(files) > len(layers.starter_names())
+    for path in files:
+        assert "gates_confirmed" not in set(keys(yaml.safe_load(path.read_text(encoding="utf-8")))), path
+
+
 def test_no_starter_is_the_same_as_an_absent_or_null_starter(sparse_repo):
     absent = load_config(_starter_pack(sparse_repo, gates={"unit": {"run": "true"}},
                                        gate_sets={"setup": [], "build": ["unit"], "verify": ["unit"]}))
