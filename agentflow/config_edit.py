@@ -424,7 +424,15 @@ def save(path: Path, proposal: Proposal) -> str:
 
 
 def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
-    """Load and validate `new_text` beside `path` (so `prompts/` resolves), and hold the protected settings."""
+    """Load and validate `new_text` beside `path` (so `prompts/` resolves), and hold the protected settings.
+
+    The protected settings are compared after `@` resolution, once per way both the file on disk and the new text
+    load: without the user's own file, and with it. Each pair sees the same engine defaults and the same user file
+    on both sides, so a change that only a reference reaches still shows. A user file that does not load against
+    the file on disk (it names another repository's agent) leaves the user-less pair, and a pack on disk that loads
+    only with the user file leaves the other. A new text that loads only with the user file is an error: it would
+    break for a teammate and for CI. A file on disk that loads neither way is broken already: nothing is held, so
+    it can be repaired here."""
     try:
         parsed = yaml.safe_load(new_text)
     except yaml.YAMLError as exc:
@@ -440,38 +448,47 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
         except ConfigError as exc:
             _hold_unloadable(path, parsed)  # a pack format or engine change does not load: it is still refused
             return [Issue("error", exc.path, exc.message)]
+        needs_user: ConfigError | None = None
         try:
-            new_raw = load_config(Path(temp), user=False).raw
-        except ConfigError:  # not expected when the layered load passed: hold it as written
-            _hold_unloadable(path, parsed)
-            new_raw = None
+            new_alone: dict | None = load_config(Path(temp), user=False).raw
+        except ConfigError as exc:
+            needs_user, new_alone = exc, None
         from agentflow.guards import settings_coverage
 
         issues = validate(new_cfg, repo) + settings_coverage(new_cfg, repo)
     finally:
         Path(temp).unlink(missing_ok=True)
-    # The protected settings are compared without the user file: none of them may come from it (`hitl.notify`, the
-    # one personal key among them, then compares equal on both sides), and a user file that does not load against
-    # the pack on disk (it names an agent of another repository) must not turn the hold off.
-    try:
-        old_raw = load_config(path, user=False).raw  # both layered on the engine: a sparse pack's phases and agents
-    except ConfigError:  # the file on disk is broken already: there is nothing to hold
-        old_raw = None
-    if old_raw is not None and new_raw is not None:
-        changed = _protected_changes(old_raw, new_raw)
-        if changed:
-            raise Refused("these settings are protected and can only be changed in the file, in git: "
-                          + ", ".join(changed))
+    pairs = [(old, new) for old, new in ((_raw_or_none(path, user=False), new_alone),
+                                         (_raw_or_none(path, user=True), new_cfg.raw))
+             if old is not None and new is not None]
+    if not pairs and needs_user is not None:
+        _hold_unloadable(path, parsed)  # the file on disk loads only without the user file: hold it as written
+    changed = list(dict.fromkeys(key for old, new in pairs for key in _protected_changes(old, new)))
+    if changed:
+        raise Refused("these settings are protected and can only be changed in the file, in git: " + ", ".join(changed))
+    if needs_user is not None:
+        where = f" ({needs_user.path}: {needs_user.message})" if needs_user.path else f" ({needs_user.message})"
+        return [Issue("error", needs_user.path, "the pack must load without your personal user file: it would break "
+                      "for teammates and CI" + where), *issues]
     return issues
+
+
+def _raw_or_none(path: Path, *, user: bool) -> dict | None:
+    try:
+        return load_config(path, user=user).raw
+    except ConfigError:
+        return None
 
 
 def _hold_unloadable(path: Path, parsed: dict) -> None:
     """Refuse a text that changes a protected setting even when it no longer loads, comparing it as written with
-    the file as written (a loaded config's `@` references are resolved, the new text's are not)."""
+    the file as written (a loaded config's `@` references are resolved, the new text's are not). Only a file on
+    disk that loads, with or without the user file, is held: a broken one can be repaired."""
+    if _raw_or_none(path, user=False) is None and _raw_or_none(path, user=True) is None:
+        return
     try:
-        load_config(path, user=False)  # whatever the user file holds, the pack on disk is what is held
         old = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (ConfigError, OSError, yaml.YAMLError):  # the file on disk is broken already: there is nothing to hold
+    except (OSError, yaml.YAMLError):
         return
     changed = _protected_changes(old, parsed)
     if changed:

