@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agentflow import detect, flow, init, layers, pack
+from agentflow import detect, doctor, flow, init, layers, pack
 from agentflow.config import Gate, load_config
 from conftest import PYTHON_CONFIG, run_git
 
@@ -137,13 +137,13 @@ def statuses(rows: list) -> dict[str, str]:
 
 def tiny_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """The provisional pack's gates time out after the shortest time `gates` allows (one second)."""
-    real = init.load_config
+    real = doctor.load_config
 
     def load(*args, **kwargs):
         cfg = real(*args, **kwargs)
         return dataclasses.replace(cfg, defaults=dataclasses.replace(cfg.defaults, gate_timeout_min=0.001))
 
-    monkeypatch.setattr(init, "load_config", load)
+    monkeypatch.setattr(doctor, "load_config", load)
 
 
 def no_red(repo: Path) -> bool:
@@ -490,7 +490,7 @@ def test_init_prints_a_bash_allow_rule_for_the_bug_lane(toy_repo):
     set_ci(toy_repo, [{"name": "Tests", "run": "pytest -q tests"}])
     code, out = run_init(toy_repo)
     assert code == 0, out
-    assert "Bash(pytest *)" in out
+    assert "Bash(pytest -q *)" in out
     shutil.rmtree(toy_repo / ".agentflow")
     set_ci(toy_repo, [{"name": "Hello", "run": "echo hi"}], files={
         "pyproject.toml": "[project]\nname = 'toy'\n[tool.pytest.ini_options]\naddopts = '-q'\n"})
@@ -506,3 +506,64 @@ def test_the_baseline_checkout_runs_no_hook(toy_repo, tmp_path):
     code, out = run_init(toy_repo, baseline=True)
     assert code == 0, out
     assert not marker.exists()
+
+
+# --- fix round 1 ------------------------------------------------------------------------------------------------------
+
+def _cfg_with(gates: dict[str, str]):
+    cfg = load_config(PYTHON_CONFIG, user=False)
+    return dataclasses.replace(cfg, gates={n: Gate(n, run) for n, run in gates.items()},
+                               gate_sets={"setup": [], "build": [], "verify": list(gates)})
+
+
+def test_a_runner_that_could_not_start_its_tool_or_a_signal_death_is_an_error_not_red(toy_repo):
+    cfg = _cfg_with({"spawn": "echo 'error: Failed to spawn: `nosuchtool`' >&2; exit 2",
+                     "shell_said": "echo 'sh: 1: nosuchtool: not found'; exit 1",
+                     "bash_said": "echo 'bash: nosuchtool: command not found'; exit 1",
+                     "killed": "exit 137", "plain": "exit 1"})
+    rows = init.baseline(cfg, toy_repo, "main", set(), io.StringIO())
+    assert statuses(rows) == {"spawn": "error", "shell_said": "error", "bash_said": "error", "killed": "error",
+                              "plain": "fail"}
+
+
+@pytest.mark.parametrize("run,rule", [
+    ("python -m pytest -q", "Bash(python -m pytest *)"),
+    ("python3 -m pytest", "Bash(python3 -m pytest *)"),
+    ("node --test", "Bash(node --test *)"),
+    ("uv --frozen run pytest", "Bash(uv --frozen run pytest *)"),
+    ('git -c core.whitespace=-blank-at-eol diff --check "$(git hash-object -t tree /dev/null)"',
+     "Bash(git -c core.whitespace=-blank-at-eol diff *)"),
+    ("uv run pytest -q", "Bash(uv run pytest *)"),
+    ("npm run test", "Bash(npm run test *)"),
+    ("pytest -q tests", "Bash(pytest -q *)"),
+    ("ruff check .", "Bash(ruff check *)"),
+    ("cd app && pytest -q", "Bash(pytest -q *)"),
+    ("python script.py", None), ("python -X dev -m pytest", None), ("node test.js", None), ("node", None),
+    ("git", None), ("git --no-pager", None), ("uv --frozen", None), ("bash -e -c 'pytest'", None),
+    ("sh run-tests.sh", None), ("test -f x", None)])
+def test_the_bash_allow_rule_is_never_a_bare_interpreter_or_dispatcher(run, rule):
+    assert init._allow_rule(run) == rule
+
+
+def test_the_docs_only_starter_gets_a_narrow_git_rule(toy_repo):
+    set_ci(toy_repo, [{"name": "Hello", "run": "echo hi"}])
+    code, out = run_init(toy_repo, starter="docs-only")
+    assert code == 0, out
+    assert "Bash(git -c core.whitespace=-blank-at-eol diff *)" in out and "Bash(git *)" not in out
+
+
+def test_a_second_baseline_while_one_runs_refuses_and_leaves_the_others_worktree(toy_repo):
+    import fcntl
+
+    state = pack.state_dir(toy_repo)
+    state.mkdir(parents=True, exist_ok=True)
+    live = state / "baseline-live"  # the other init's worktree, in use
+    run_git(toy_repo, "worktree", "add", "-q", "--detach", str(live), "main")
+    with open(state / "init.lock", "a+") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        code, out = run_init(toy_repo, baseline=True)
+    assert code == 1 and "init" in out and "another" in out
+    assert live.is_dir() and live.resolve() in worktrees(toy_repo)
+    assert not (toy_repo / ".agentflow").exists()
+    code, out = run_init(toy_repo, baseline=True)  # the lock is free again
+    assert code == 0, out

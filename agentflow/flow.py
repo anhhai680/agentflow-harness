@@ -107,23 +107,13 @@ def cmd_config_show(args: argparse.Namespace) -> int:
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Check the tools and logins a run needs; exit 1 when any check fails."""
     from agentflow import doctor
-    from agentflow.config import ConfigError, load_config
-    from agentflow.layers import user_config_path
+    from agentflow.config import ConfigError
     from agentflow.pack import PackError
 
     try:
         repo = _find_repo()
         config_path = Path(args.config) if args.config else _pack_config()
-        extra: list[doctor.Check] = []
-        try:
-            cfg = load_config(config_path)
-        except ConfigError as exc:
-            user_file = str(user_config_path())
-            if user_file not in str(exc):
-                raise
-            extra.append(doctor.Check("user config", "fail", str(exc),
-                                      f"fix or delete {user_file} (`agentflow validate` shows the same error)"))
-            cfg = load_config(config_path, user=False)
+        cfg, extra = doctor.load_checked(config_path)
     except ConfigError as exc:
         where = f"{exc.path}: " if exc.path else ""
         print(f"error {where}{exc.message}")

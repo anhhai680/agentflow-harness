@@ -17,8 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from agentflow import pack
-from agentflow.config import Config
+from agentflow import layers, pack
+from agentflow.config import Config, ConfigError, load_config
 
 TIMEOUT_S = 20  # each external command
 
@@ -39,10 +39,10 @@ class Check:
     fix: str = ""
 
 
-def gate_programs(command: str) -> list[str]:
-    """The programs a gate's shell `command` runs, in order and without repeats: the first word of each simple
-    command, once `NAME=value` prefixes are skipped. A shell builtin or keyword, and a word starting with `$`, is
-    no program. Raises `ValueError` when the command can't be tokenised (an unbalanced quote)."""
+def simple_commands(command: str) -> list[list[str]]:
+    """The words of each simple command in a shell `command`, in order, once `NAME=value` prefixes and a leading
+    keyword (`if`, `then`, `do`, `!` ...) are skipped; an empty command is left out. Raises `ValueError` when the
+    command can't be tokenised (an unbalanced quote)."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";()<>|&\n")
     lexer.commenters = "#"
     lexer.whitespace = " \t\r"  # a newline separates commands, like `;`
@@ -53,16 +53,26 @@ def gate_programs(command: str) -> list[str]:
             segments.append([])
         else:
             segments[-1].append(token)
-    found: list[str] = []
+    commands: list[list[str]] = []
     for words in segments:
         rest = list(words)
         while rest and (_ASSIGNMENT.match(rest[0]) or rest[0] in _PREFIXES):
             rest.pop(0)
-        if not rest or rest[0] in _BUILTINS or rest[0].startswith("$"):
+        if rest:
+            commands.append(rest)
+    return commands
+
+
+def gate_programs(command: str) -> list[str]:
+    """The programs a gate's shell `command` runs, in order and without repeats: the first word of each simple
+    command (`simple_commands`). A shell builtin or keyword, and a word starting with `$`, is no program. Raises
+    `ValueError` when the command can't be tokenised (an unbalanced quote)."""
+    programs: list[str] = []
+    for words in simple_commands(command):
+        if words[0] in _BUILTINS or words[0].startswith("$") or words[0] in programs:
             continue
-        if rest[0] not in found:
-            found.append(rest[0])
-    return found
+        programs.append(words[0])
+    return programs
 
 
 def _run(argv: list[str], cwd: Path) -> tuple[int | None, str]:
@@ -161,6 +171,46 @@ def _state_dir_check(repo: Path) -> Check:
     return Check("state dir", "ok", f"{directory} is writable")
 
 
+def gate_path(cfg: Config) -> str:
+    """The PATH a gate's programs are looked up on: `defaults.env.PATH`, else this process's."""
+    return cfg.defaults.env.get("PATH") or os.environ.get("PATH", os.defpath)
+
+
+def found(program: str, path: str) -> bool:
+    """True when `program` is on `path`: a bare name found there, or an absolute path that exists. A relative path
+    (`./gradlew`) is never found: it may be created by setup."""
+    return bool(shutil.which(program, path=path)) and (os.path.isabs(program) or "/" not in program)
+
+
+def missing_programs(cfg: Config, checks: list[Check]) -> set[str]:
+    """The programs behind the failed `gate:<name>` checks in `checks` that are not on the gates' PATH."""
+    path = gate_path(cfg)
+    missing: set[str] = set()
+    for check in checks:
+        name = check.name.removeprefix("gate:")
+        if check.status != "fail" or name == check.name or name not in cfg.gates:
+            continue
+        try:
+            programs = gate_programs(cfg.gates[name].run)
+        except ValueError:
+            continue
+        missing.update(p for p in programs if not found(p, path))
+    return missing
+
+
+def load_checked(path: Path) -> tuple[Config, list[Check]]:
+    """The config at `path`, layered. A broken user file is a failed `user config` check, and the config is loaded
+    without it; any other `ConfigError` is raised."""
+    try:
+        return load_config(path), []
+    except ConfigError as exc:
+        user_file = str(layers.user_config_path())
+        if user_file not in str(exc):
+            raise
+        check = Check("user config", "fail", str(exc), f"fix or delete {user_file} (`agentflow validate` shows the same error)")
+        return load_config(path, user=False), [check]
+
+
 def _gate_names(cfg: Config) -> list[str]:
     names: list[str] = []
     for members in cfg.gate_sets.values():
@@ -172,7 +222,7 @@ def _gate_names(cfg: Config) -> list[str]:
 
 def _gate_checks(cfg: Config) -> tuple[list[Check], bool]:
     """The `gate:<name>` checks, and whether any gate runs `docker`."""
-    path = cfg.defaults.env.get("PATH") or os.environ.get("PATH", os.defpath)
+    path = gate_path(cfg)
     has_setup = bool(cfg.gate_sets.get("setup"))
     checks: list[Check] = []
     uses_docker = False
@@ -186,7 +236,7 @@ def _gate_checks(cfg: Config) -> tuple[list[Check], bool]:
         uses_docker = uses_docker or "docker" in programs
         problems: list[Check] = []
         for program in programs:
-            if shutil.which(program, path=path) and (os.path.isabs(program) or "/" not in program):
+            if found(program, path):
                 continue
             if "/" in program and not os.path.isabs(program):
                 problems.append(Check(label, "warn", f"`{program}` is relative: it may be created by setup"))

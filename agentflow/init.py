@@ -7,16 +7,18 @@ holds runs unless the human passes `--baseline`.
 
 The baseline runs the gates in a throwaway worktree of the base branch, under `<state_dir>/baseline-*`, with the
 caller's virtualenv left out of the environment. Only a plain non-zero exit makes a gate `fail` (red); a missing
-program, exit 126 or 127, a timeout, a missing `cwd` or a failed setup is an environment problem, never red. The
+program, exit 126 or 127, an exit of 128 or more (a signal), a runner that says it could not start a command, a
+timeout, a missing `cwd` or a failed setup is an environment problem, never red. One baseline runs at a time per
+repository (`<state_dir>/init.lock`). The
 worktree goes in a `finally`, also on a timeout and on SIGTERM or SIGHUP (they raise `KeyboardInterrupt` while the
 baseline runs), and an interrupted baseline writes no pack. Cleanup touches only init's own `baseline-*` worktrees.
 """
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -30,7 +32,7 @@ from typing import Any, Literal, TextIO
 import yaml
 
 from agentflow import detect, doctor, layers, pack, safeio
-from agentflow.config import Config, ConfigError, Gate, load_config
+from agentflow.config import Config, ConfigError, Gate
 from agentflow.detect import Detected
 from agentflow.gates import GateResult, resolve, run_gates
 
@@ -51,9 +53,17 @@ _GATES_FROM = {"ci": "read from the CI workflows", "scripts": "read from the pro
                "starter": "the project's own setup; the starter supplies the rest"}
 _REF = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/+@-]*")  # a ref that can't be read as an option
 _EXIT = re.compile(r"exit (-?\d+)")
-_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SUBCOMMAND = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]*")
+_PROGRAM = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*")  # a bare name: never a path, a quote or a backslash
+_FLAG = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_.:=+@/-]*")
+_MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
 _SHELLS = frozenset("bash sh zsh dash ksh env sudo xargs nohup exec eval".split())
+_INTERPRETER = re.compile(r"(python|pypy)[0-9.]*|node|nodejs|ruby|perl|php|deno|bun|java|lua|Rscript")
+_DISPATCHERS = frozenset("git uv npm pnpm yarn npx go cargo poetry pip pip3 pipenv docker make bundle corepack dotnet "
+                         "gradle mvn rake mix hatch pdm".split())  # what they run is their subcommand
+_FLAG_ARGS = {"git": ("-c", "-C"), "uv": ("--directory", "--project", "--python", "-p"), "make": ("-C", "-f"),
+              "npm": ("--prefix",), "pnpm": ("-C", "--dir", "--filter", "-F"), "yarn": ("--cwd",), "go": ("-C",)}
+_COULD_NOT_START = ("Failed to spawn", "command not found", ": not found")  # a runner that could not start a tool
 _COMMAND_WIDTH = 60
 
 Status = Literal["pass", "fail", "error", "skipped", "not run"]
@@ -332,6 +342,26 @@ class _Interrupts:
             raise KeyboardInterrupt(f"signal {self.pending}")
 
 
+class BaselineBusy(RuntimeError):
+    """Another `agentflow init --baseline` holds this repository's baseline lock."""
+
+
+def _lock(state: Path) -> int:
+    """`<state>/init.lock`, opened and locked (exclusive, without waiting); `BaselineBusy` when another holds it."""
+    path = state / "init.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise BaselineBusy(f"another `agentflow init --baseline` is running on this repository (it holds {path}): "
+                           "wait for it to finish, then run init again") from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _gates_of(cfg: Config, set_name: str) -> list[Gate]:
     members = cfg.gate_sets.get(set_name) or []
     try:
@@ -356,12 +386,18 @@ def _row(gate: Gate, result: GateResult) -> BaselineRow:
         return BaselineRow(gate.name, gate.run, "pass", seconds)
     match = _EXIT.fullmatch(result.reason)
     code = int(match.group(1)) if match else None
-    if code is not None and code > 0 and code not in (126, 127):
+    said = next((line.strip() for line in reversed(result.tail.splitlines())
+                 if any(mark in line for mark in _COULD_NOT_START)), None)
+    if code is not None and 0 < code < 128 and code not in (126, 127) and said is None:
         return BaselineRow(gate.name, gate.run, "fail", seconds, result.reason)
     if code in (126, 127):
         note = f"exit {code}: the command could not run (not found, or not executable)"
-    elif code is not None:
-        note = f"killed by signal {-code}" if code < 0 else result.reason
+    elif code is not None and code < 0:
+        note = f"killed by signal {-code}"
+    elif code is not None and code >= 128:
+        note = f"exit {code}: killed by a signal ({code - 128}), not a test result"
+    elif said is not None:
+        note = f"exit {code}: a command could not start ({said[:120]})"
     else:
         note = result.reason
     return BaselineRow(gate.name, gate.run, "error", seconds, note)
@@ -403,7 +439,9 @@ def baseline(cfg: Config, repo: Path, base_ref: str, missing: set[str], out: Tex
     """Run `cfg`'s setup gates, then each gate of `build` and `verify` once, in a throwaway worktree of `base_ref`.
 
     `missing` holds the programs doctor did not find: a gate running one is `not run`. The first setup gate that
-    fails stops the baseline. Only a plain non-zero exit is `fail`. The worktree is removed whatever happens."""
+    fails stops the baseline. Only a plain non-zero exit below 128, with no "could not start" line in its output, is
+    `fail`. The worktree is removed whatever happens. `<state>/init.lock` is held throughout: `BaselineBusy` when
+    another baseline holds it."""
     repo = Path(repo)
     setup = _gates_of(cfg, "setup")
     checks = list({g.name: g for g in [*_gates_of(cfg, "build"), *_gates_of(cfg, "verify")]}.values())
@@ -412,31 +450,35 @@ def baseline(cfg: Config, repo: Path, base_ref: str, missing: set[str], out: Tex
         print(f"baseline not run: `{_show(base_ref)}` does not exist here", file=out)
         return _not_run([*setup, *checks], f"`{base_ref}` does not exist here")
     state = safeio.ensure_dir(pack.state_dir(repo))
-    with _Interrupts() as interrupts:
-        directory: Path | None = None
-        before = _footprint(repo)
-        try:
-            _clean_leftovers(repo, state, out)
-            directory = Path(tempfile.mkdtemp(prefix="baseline-", dir=state))
-            # no hook runs at the checkout: only the commands printed below run
-            code, message = _git(repo, "-c", f"core.hooksPath={os.devnull}", "worktree", "add", "--detach",
-                                 str(directory), commit)
-            if code != 0:
-                print(f"baseline not run: git could not create the worktree: {_show(message)}", file=out)
-                return _not_run([*setup, *checks], "the worktree could not be created")
-            print(f"baseline: running these commands once in {directory}, a worktree of `{_show(base_ref)}` "
-                  f"({commit[:12]}):", file=out)
-            for gate in setup:
-                print(f"  setup {gate.name}: {_show(gate.run)}{_where(gate)}", file=out)
-            for gate in checks:
-                print(f"  gate  {gate.name}: {_show(gate.run)}{_where(gate)}", file=out)
-            env = {key: value for key, value in os.environ.items() if key not in DROPPED_ENV}
-            return _run_all(cfg, setup, checks, directory, state / "baseline-logs", env, missing)
-        finally:
-            with interrupts.deferred():
-                if directory is not None:
-                    _remove_worktree(repo, directory, out)
-                _report_footprint(before, _footprint(repo), out)
+    lock = _lock(state)  # held for the whole baseline: a second init's cleanup must not take this one's worktree
+    try:
+        with _Interrupts() as interrupts:
+            directory: Path | None = None
+            before = _footprint(repo)
+            try:
+                _clean_leftovers(repo, state, out)
+                directory = Path(tempfile.mkdtemp(prefix="baseline-", dir=state))
+                # no hook runs at the checkout: only the commands printed below run
+                code, message = _git(repo, "-c", f"core.hooksPath={os.devnull}", "worktree", "add", "--detach",
+                                     str(directory), commit)
+                if code != 0:
+                    print(f"baseline not run: git could not create the worktree: {_show(message)}", file=out)
+                    return _not_run([*setup, *checks], "the worktree could not be created")
+                print(f"baseline: running these commands once in {directory}, a worktree of `{_show(base_ref)}` "
+                      f"({commit[:12]}):", file=out)
+                for gate in setup:
+                    print(f"  setup {gate.name}: {_show(gate.run)}{_where(gate)}", file=out)
+                for gate in checks:
+                    print(f"  gate  {gate.name}: {_show(gate.run)}{_where(gate)}", file=out)
+                env = {key: value for key, value in os.environ.items() if key not in DROPPED_ENV}
+                return _run_all(cfg, setup, checks, directory, state / "baseline-logs", env, missing)
+            finally:
+                with interrupts.deferred():
+                    if directory is not None:
+                        _remove_worktree(repo, directory, out)
+                    _report_footprint(before, _footprint(repo), out)
+    finally:
+        os.close(lock)
 
 
 # --- init -----------------------------------------------------------------------------------------------------------
@@ -446,55 +488,53 @@ def _show(text: Any) -> str:
     return "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii") for ch in str(text))
 
 
-def _load_provisional(path: Path) -> tuple[Config, list[doctor.Check]]:
-    """The provisional pack, layered like a real one; a broken user file is a failed check and is left out."""
-    try:
-        return load_config(path), []
-    except ConfigError as exc:
-        user_file = str(layers.user_config_path())
-        if user_file not in str(exc):
-            raise
-        check = doctor.Check("user config", "fail", str(exc),
-                             f"fix or delete {user_file} (`agentflow validate` shows the same error)")
-        return load_config(path, user=False), [check]
-
-
-def _missing_programs(cfg: Config, checks: list[doctor.Check]) -> set[str]:
-    """The programs behind doctor's failed `gate:` checks that are not on PATH."""
-    path = cfg.defaults.env.get("PATH") or os.environ.get("PATH", os.defpath)
-    missing: set[str] = set()
-    for check in checks:
-        name = check.name.removeprefix("gate:")
-        if check.status != "fail" or name == check.name or name not in cfg.gates:
-            continue
-        try:
-            programs = doctor.gate_programs(cfg.gates[name].run)
-        except ValueError:
-            continue
-        missing.update(p for p in programs
-                       if not (shutil.which(p, path=path) and (os.path.isabs(p) or "/" not in p)))
-    return missing
+def _rule_words(words: list[str]) -> list[str] | None:
+    """The words of a narrow allow rule for one simple command (`words[0]` is its program), or None when no rule
+    narrower than the program itself can be told: an interpreter without `-m <module>` (or `node --test`), a
+    subcommand program with no subcommand after its flags, or a word that isn't plain."""
+    program, rest = words[0], words[1:]
+    if program in _SHELLS or not _PROGRAM.fullmatch(program):
+        return None
+    if _INTERPRETER.fullmatch(program):
+        if program.startswith(("python", "pypy")) and rest[:1] == ["-m"] and len(rest) > 1 and _MODULE.fullmatch(rest[1]):
+            return [program, "-m", rest[1]]
+        if program in ("node", "nodejs") and rest[:1] == ["--test"]:
+            return [program, "--test"]
+        return None
+    taken, i = [program], 0
+    while i < len(rest) and rest[i].startswith("-"):
+        if not _FLAG.fullmatch(rest[i]):
+            return None
+        taken.append(rest[i])
+        if rest[i] in _FLAG_ARGS.get(program, ()):  # a flag known to take the next word as its value
+            if i + 1 >= len(rest) or not _FLAG.fullmatch("-" + rest[i + 1]):
+                return None
+            taken.append(rest[i + 1])
+            i += 1
+        i += 1
+    subcommands: list[str] = []
+    if program in _DISPATCHERS or len(taken) == 1:  # after a runner's flags come its arguments, not subcommands
+        for word in rest[i:i + 2]:
+            if not _SUBCOMMAND.fullmatch(word):
+                break
+            subcommands.append(word)
+    if program in _DISPATCHERS and not subcommands:
+        return None
+    return taken + subcommands
 
 
 def _allow_rule(run: str) -> str | None:
-    """A narrow `Bash(...)` rule for the first program `run` starts with (and up to two subcommand words), or None
-    when it starts with a shell or no program."""
+    """A narrow `Bash(...)` rule for the first program `run` runs, or None when none can be told (`_rule_words`)."""
     try:
         programs = doctor.gate_programs(run)
-        words = shlex.split(run, comments=True)
+        commands = doctor.simple_commands(run)
     except ValueError:
         return None
-    if not programs or programs[0] in _SHELLS:
+    if not programs:
         return None
-    while words and _ASSIGNMENT.match(words[0]):
-        words.pop(0)
-    taken = [programs[0]]
-    if words and words[0] == programs[0]:
-        for word in words[1:3]:
-            if not _SUBCOMMAND.fullmatch(word):
-                break
-            taken.append(word)
-    return f"Bash({' '.join(taken)} *)"
+    words = next(c for c in commands if c[0] == programs[0])
+    taken = _rule_words(words)
+    return f"Bash({' '.join(taken)} *)" if taken else None
 
 
 def _table(rows: list[list[str]]) -> list[str]:
@@ -587,7 +627,7 @@ def init(repo: Path, *, starter: str | None, run_baseline: bool, out: TextIO) ->
     try:
         safeio.write_text(provisional, render_pack(found, base=base))
         try:
-            cfg, extra = _load_provisional(provisional)
+            cfg, extra = doctor.load_checked(provisional)
         except ConfigError as exc:
             return refuse(f"the pack it rendered does not load ({exc}); no pack was written")
         checks = [*extra, *doctor.run_checks(cfg, repo)]
@@ -597,7 +637,10 @@ def init(repo: Path, *, starter: str | None, run_baseline: bool, out: TextIO) ->
             elif _commit_of(repo, found.base_ref) is None:
                 why_not = f"`{_show(found.base_ref)}` does not exist here"
             else:
-                rows = baseline(cfg, repo, found.base_ref, _missing_programs(cfg, checks), out)
+                try:
+                    rows = baseline(cfg, repo, found.base_ref, doctor.missing_programs(cfg, checks), out)
+                except BaselineBusy as exc:
+                    return refuse(f"{exc}; no pack was written")
         red = frozenset(r.gate for r in rows or [] if r.status == "fail")
         data = pack_data(found, base=base, red=red)
         try:
