@@ -19,6 +19,7 @@ from agentflow.agents import (
     parse_codex_line,
 )
 from agentflow.config import load_config
+from agentflow.layers import user_config_path
 from agentflow.state import runs_root
 from conftest import PYTHON_CONFIG
 
@@ -143,7 +144,29 @@ def test_runner_denies_edits_to_the_runs_root(repo_root):
 
 
 def test_claude_argv_without_a_runs_root_adds_no_rule_for_it(claude, call):
-    assert not [rule for rule in deny_rules(claude.argv(call)) if rule.startswith("Edit(//")]
+    user_dir_rule = f"Edit(/{user_config_path().parent}/**)"
+    assert not [rule for rule in deny_rules(claude.argv(call)) if rule.startswith("Edit(//") and rule != user_dir_rule]
+
+
+def test_runner_denies_edits_to_the_user_config_dir(claude, call, monkeypatch, tmp_path):
+    # A live run reloads the user file (`config.layer_files`): an agent that wrote it would change its own run.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    for c in (call, dataclasses.replace(call, runs_root=tmp_path / "runs")):
+        assert f"Edit(/{tmp_path / 'cfg' / 'agentflow'}/**)" in deny_rules(claude.argv(c))
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    assert f"Edit(/{tmp_path / 'home' / '.config' / 'agentflow'}/**)" in deny_rules(claude.argv(call))
+
+
+def test_runner_skips_the_user_config_dir_rule_without_a_home(claude, call, monkeypatch):
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+
+    def no_home(cls):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "home", classmethod(no_home))
+    deny = deny_rules(claude.argv(call))
+    assert set(RUNNER_ONLY_DENY) <= set(deny) and not [rule for rule in deny if rule.startswith("Edit(//")]
 
 
 def test_claude_argv_add_dir_never_directly_before_prompt(claude, call, runs):
