@@ -190,6 +190,8 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
         body = f"{body}\n\n{SKILL_BLOCK}"
     if not step.skill:  # no skill to name in a `## The `{skill}` skill` heading
         body = _drop_skill_section(body, keep=bool(briefs))
+    elif step.continuation and not briefs:  # the session already holds the skill's text: no empty section for it
+        body = _drop_skill_section(body)
     if step.skill and f"`{step.skill}` skill" not in body:
         line = (f"Use the `{step.skill}` skill: its full text is in this prompt, so do not load it."
                 if skill_brief is not None else f"Use the `{step.skill}` skill.")
@@ -414,11 +416,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         if resuming and session:
             turn = _Turn(self._continue_prompt(sr, _answers(since, key), _approved(since, key)), session)
         elif mode == "refine" and session:
-            turn = _Turn(self._prompt(sr, sized=True), session)
+            turn = _Turn(self._prompt(sr, sized=True, resume=session), session)
         elif not session and status in UNSTARTED_STEP and shared.get("session_id"):
             sr.session = shared["session_id"]
             sr.effort = shared.get("effort") or sr.effort
-            turn = _Turn(self._prompt(sr, sized=True), sr.session)
+            turn = _Turn(self._prompt(sr, sized=True, resume=sr.session), sr.session)
         else:
             sized = bool(rec.get("sized"))
             turn = _Turn(self._prompt(sr, sized=sized), None, sizing=not sized)
@@ -832,8 +834,13 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
     def _values(self, sr: _StepRun) -> dict[str, str]:
         return _values(self.cfg, sr.step, self.ctx, sr.extra)
 
-    def _prompt(self, sr: _StepRun, sized: bool) -> str:
-        prompt = build_prompt(self.cfg, sr.step, self.ctx, self._rec(sr, sized), sr.extra, sr.mode)
+    def _prompt(self, sr: _StepRun, sized: bool, resume: str | None = None) -> str:
+        """The step's prompt for a turn that resumes session `resume`, or for a fresh session when it is None.
+
+        A fresh session (the first turn, a rollover, an effort change, a refine round whose session is gone)
+        holds nothing yet, so it is never built as a continuation: the skill's text goes in again."""
+        step = sr.step if resume else dataclasses.replace(sr.step, continuation=False)
+        prompt = build_prompt(self.cfg, step, self.ctx, self._rec(sr, sized), sr.extra, sr.mode)
         return f"{sr.lead}\n\n{prompt}" if sr.lead else prompt
 
     def _result_partial(self, sr: _StepRun) -> str:

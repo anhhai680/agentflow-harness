@@ -894,6 +894,22 @@ def test_a_batch_continuation_does_not_resend_the_skill(flow_repo, monkeypatch, 
     assert "Use the `agentflow-build` skill.\n" in prompt  # the line it always had
 
 
+@pytest.mark.parametrize("script", [
+    [{"result": DONE}],                                                                 # its first, fresh session
+    [{"usage_pct": [81]}, {"result": DONE}],                                            # a rollover
+    [{"result": {"status": "effort_change", "effort": "high", "reason": "big"}}, {"result": DONE}],  # new effort
+])
+def test_a_continuation_in_a_fresh_session_still_gets_the_skill(flow_repo, monkeypatch, tmp_path, script):
+    bundled_skill(monkeypatch, tmp_path)
+    flow_repo.new_run()
+    flow_repo.script({KEY: script})
+    step = make_step(prompt="task_next.md", skill="agentflow-build", continuation=True)
+    assert run_step(flow_repo, step, extra={"task_title": "Task 2: B", "task_text": "do b"}) == "done"
+    for call in flow_repo.calls():
+        assert "--resume" not in call["argv"]
+        assert "Rules with {module}" in call["argv"][-1]  # no session holds the text yet, so it is sent
+
+
 def test_task_briefs_do_not_suppress_the_skill_text(flow_repo, monkeypatch, tmp_path):
     bundled_skill(monkeypatch, tmp_path)
     (flow_repo.root / "extra-brief.md").write_text("EXTRA BRIEF TEXT\n", encoding="utf-8")

@@ -602,8 +602,8 @@ REQUIRED = {("defaults", "agent"), ("effort", "default"), ("effort", "allowed"),
             ("context", "rollover_pct"), ("context", "max_rollovers"), ("context", "progress_file"),
             ("context", "gate_output_lines")}
 STEP_SKILLS = {  # each default step, by its id path, and the `skills.map` key its skill comes from
-    "define/debug": "debug", "define/draft": "define", "define/grill_open_questions/grill": "define",
-    "define/grill_open_questions/apply": "define", "plan/plan": "plan", "build/build": "build",
+    "define/debug": "debug", "define/draft": "define", "define/grill_open_questions/grill": "decide",
+    "define/grill_open_questions/apply": "design_doc", "plan/plan": "plan", "build/build": "build",
     "build/build/review": "review", "build/build/small_plan": "build_small", "build/regression_test": "build",
     "build/fix": "build", "verify/plan_fixes": "review_feedback", "verify/fix_findings": "review_feedback",
     "verify/verify": "verify", "review/plan_fixes": "review_feedback", "review/fix_findings": "review_feedback",
@@ -694,6 +694,13 @@ def test_explain_runs_on_a_sparse_pack(sparse_repo, monkeypatch, capsys, lane):
     assert main(["explain", lane, "--module", "greet"]) == 0, capsys.readouterr().out
 
 
+def test_a_sparse_pack_dry_run_passes_the_effort(sparse_repo, monkeypatch, capsys):
+    monkeypatch.chdir(sparse_repo)
+    assert main(["run", "feature", "--module", "greet", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "--effort medium" in out and "--permission-mode bypassPermissions" in out and "--max-turns" not in out
+
+
 def test_every_default_step_has_an_explicit_id_and_a_mapped_skill():
     seen = {}
     for where, step in _default_steps():
@@ -706,6 +713,19 @@ def test_every_default_step_has_an_explicit_id_and_a_mapped_skill():
     assert DEFAULTS["checkpoints"] == {} and "approval_note" not in DEFAULTS["phases"]["plan"]
     for gone in ("spec_defines_contracts", "spec_api_reviewed", "spec_needs_api_design", "security_path"):
         assert gone not in DEFAULTS["conditions"]
+
+
+def test_a_sparse_pack_maps_a_default_step_to_its_own_skill(sparse_repo):
+    target = pack.pack_config(sparse_repo)
+    skill = sparse_repo / ".claude" / "skills" / "grilling" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: grilling\n---\nAsk hard questions.\n", encoding="utf-8")
+    target.write_text(yaml.safe_dump({**SPARSE_PACK, "skills": {"map": {"decide": "grilling"}}}), encoding="utf-8")
+    cfg = load_config(target)
+    [group] = [s for s in cfg.phases["define"].steps if s.id == "grill_open_questions"]
+    assert {s.id: s.skill for s in group.steps if s.skill} == {"grill": "grilling", "apply": "agentflow-define"}
+    assert cfg.skills_map["define"] == "agentflow-define"  # the rest of the defaults' map stays
+    assert [i for i in validate(cfg, sparse_repo) if i.level == "error"] == []
 
 
 def test_every_skills_map_reference_in_the_defaults_resolves(tmp_path):

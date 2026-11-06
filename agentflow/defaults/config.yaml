@@ -27,6 +27,7 @@ agents:
     command: [claude]
     base_args: [-p, --output-format, stream-json, --verbose]
     models: {plan: opus, build: sonnet, mechanical: haiku, review: sonnet, debug: opus}  # fallback when a phase sets no model
+    effort_arg: [--effort, "{effort}"]   # the level is the agent's choice (see `effort:`), never set per step
     skill_loading: native
     prices:                      # USD per 1M tokens; prices a session Claude never reported a cost for (rollover, timeout)
       claude-opus-5-5:   {input: 4.00, output: 20.00, cache_read: 0.20, cache_write_5m: 5.00,  cache_write_1h: 8.00}
@@ -154,10 +155,10 @@ phases:
         when: spec_has_open_questions
         repeat: {until: {not: spec_has_open_questions}, max_rounds: 2}
         steps:
-          - {id: grill, skill: "@skills.map.define", role: plan, prompt: grill_spec_questions.md,
+          - {id: grill, skill: "@skills.map.decide", role: plan, prompt: grill_spec_questions.md,
              output: "runs/{run}/questions.md"}
           - {id: answers, type: checkpoint, wait_for: answered_file}
-          - {id: apply, skill: "@skills.map.define", role: build, prompt: spec_apply.md,
+          - {id: apply, skill: "@skills.map.design_doc", role: build, prompt: spec_apply.md,
              commit: true, message: "Resolve open questions in the {module} spec"}
       - {id: spec_approval, lanes: [feature], gates: [], when: spec_awaits_approval}  # keeps `define` for its approval
   plan:
