@@ -286,6 +286,18 @@ def test_settings_coverage_malformed_file_is_a_warning(tmp_path):
     assert ".claude/settings.json" in paths
 
 
+def test_settings_file_that_is_a_directory_is_no_allow_rule_and_validate_does_not_raise(tmp_path):
+    from agentflow.config import validate
+
+    (tmp_path / ".claude" / "settings.json").mkdir(parents=True)
+    assert guards.has_bash_allow_rule(tmp_path) is False
+    cfg = cfg_with({"ok": "true"})
+    assert "bug" in cfg.lanes
+    issues = validate(cfg, tmp_path)  # an unreadable settings file is no allow rule, never an OSError into a live run
+    assert "lanes" in [i.path for i in issues]  # the bug lane's red/green warning: no Bash allow rule was read
+    assert ".claude/settings.json" in [i.path for i in settings_coverage(cfg, tmp_path)]
+
+
 def test_validate_command_reports_coverage_warnings(tmp_cfg, monkeypatch, repo_root, capsys):
     def patch(d: dict) -> None:
         d["gates"].update({"make": {"run": "make lint"}})

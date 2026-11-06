@@ -173,7 +173,7 @@ def _load_rules(repo: Path) -> tuple[dict[str, list[str]], list[Issue]]:
             permissions = data.get("permissions", {})
             for kind in rules:
                 rules[kind].extend(str(x) for x in permissions.get(kind, []))
-        except (ValueError, AttributeError, TypeError) as exc:
+        except (OSError, ValueError, AttributeError, TypeError) as exc:  # OSError: a directory, no read permission
             issues.append(Issue("warning", f".claude/{name}", f"cannot read permission rules: {exc}"))
     return rules, issues
 
