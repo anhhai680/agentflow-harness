@@ -516,3 +516,37 @@ def test_batch_is_checked(tmp_cfg):
     found = errors(issues_for(tmp_cfg, patch))
     for key in ("max_tasks", "max_files", "prompt"):
         assert ("error", f"phases.build.steps[1].batch.{key}") in found
+
+
+def test_validate_accepts_a_bundled_skill(tmp_cfg):
+    def patch(data):
+        phase_step(data, "define", "contracts")["skill"] = "agentflow-plan"  # in no skills dir of the repo
+
+    assert not [i for i in issues_for(tmp_cfg, patch) if i.path == "phases.define.steps[4].skill"]
+
+
+def test_validate_names_both_places_for_a_missing_skill(tmp_cfg):
+    def patch(data):
+        phase_step(data, "define", "contracts")["skill"] = "no-such-skill"
+
+    [issue] = [i for i in issues_for(tmp_cfg, patch) if i.path == "phases.define.steps[4].skill"]
+    assert issue.message.startswith("skill ")
+    assert ".claude/skills/no-such-skill/SKILL.md" in issue.message
+    assert "and no bundled skill of that name" in issue.message
+
+
+@pytest.mark.parametrize("name", ["../x", "a/b", "-x", "", "a b", "x\\y"])
+def test_validate_refuses_a_path_as_a_skill_name(tmp_cfg, name):
+    def patch(data):
+        phase_step(data, "define", "contracts")["skill"] = name
+
+    [issue] = [i for i in issues_for(tmp_cfg, patch) if i.path == "phases.define.steps[4].skill"]
+    assert issue.level == "error" and "not a skill name" in issue.message
+
+
+def test_skills_map_accepts_review_debug_and_review_feedback(tmp_cfg):
+    patch = {"skills": {"map": {"review": "agentflow-review", "debug": "agentflow-debug",
+                                "review_feedback": "agentflow-respond"}}}
+    assert not [i for i in issues_for(tmp_cfg, patch) if i.path.startswith("skills")]
+    bad = issues_for(tmp_cfg, {"skills": {"map": {"review_feedback": "../x", "reviews": "agentflow-review"}}})
+    assert ("error", "skills.map.review_feedback") in errors(bad) and ("error", "skills.map.reviews") in errors(bad)

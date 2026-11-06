@@ -198,6 +198,17 @@ def test_the_form_refuses_the_paths_the_runner_reads(shipped, key, value):
         form(shipped, (key, value))
 
 
+@pytest.mark.parametrize("key", ["review", "debug", "review_feedback"])
+def test_new_skills_map_keys_are_refused_by_the_page(shipped, key):
+    with pytest.raises(Refused):
+        form(shipped, (["skills", "map", key], "agentflow-review"))
+    _, sha = config_edit.read(shipped)
+    text = SHIPPED.replace("    ship: finishing-a-development-branch",
+                           f"    {key}: agentflow-review\n    ship: finishing-a-development-branch", 1)
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=text, repo=REPO)
+
+
 def test_yaml_text_that_does_not_load_or_validate_reports_why(shipped):
     _, sha = config_edit.read(shipped)
     broken = config_edit.propose(shipped, sha, text="version: [", repo=REPO)

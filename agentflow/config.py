@@ -176,7 +176,8 @@ DEFAULT_SKILLS_DIR = ".claude/skills"
 DEFAULT_SPEC_FILE = "{module}.md"  # a module's spec is `<docs.specs>/<spec_file>`
 REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea`, `decisions`, `glossary` are optional
 WORK_SOURCE_KINDS = ("capability_map",)  # a Markdown table with `Module id` and `Depends on` columns (`sources`)
-SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "verify", "ship")
+SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "verify", "ship",
+                   "review", "debug", "review_feedback")  # review_feedback: the skill sent with blocking findings
 
 
 @dataclass
@@ -829,8 +830,11 @@ class _Validator:
             self.error(path, "skill must be a name")
         elif skill in self.cfg.guardrails.user_only_skills:
             self.error(path, f"'{skill}' is a user-only skill: only the human runs it")
-        elif not (self.repo / self.cfg.project.skills_dir / skill / "SKILL.md").is_file():
-            self.error(path, f"skill '{skill}' has no {self.cfg.project.skills_dir}/{skill}/SKILL.md")
+        elif pack.SKILL_NAME.fullmatch(skill) is None or skill in (".", ".."):
+            self.error(path, f"'{skill}' is not a skill name: a skill is a directory name, not a path")
+        elif pack.skill_file(self.repo, self.cfg.project.skills_dir, skill) is None:
+            self.error(path, f"skill '{skill}' has no {self.cfg.project.skills_dir}/{skill}/SKILL.md "
+                             "and no bundled skill of that name")
 
     def prompt(self, prompt: Any, path: str) -> None:
         if not isinstance(prompt, str) or pack.prompt_path(self.cfg.path, prompt) is None:
@@ -1076,7 +1080,7 @@ class _Validator:
             self.error("work_source.path", "path is a file inside the repository, relative to its root and without '..'")
 
     def skills_map(self) -> None:
-        """`skills.map`: the skill `agentflow next` names for each kind of step; each one is in `skills_dir`."""
+        """`skills.map`: the skill `agentflow next` names for each kind of step; each one is in `skills_dir` or bundled."""
         block = self.cfg.raw.get("skills")
         if block is None:
             return
