@@ -136,6 +136,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if any(c.status == "fail" for c in checks) else 0
 
 
+def cmd_init(args: argparse.Namespace) -> int:
+    """Write a sparse pack for this repository; with `--baseline`, run its gates once on the base branch first."""
+    from agentflow import init
+    from agentflow.config import ConfigError
+
+    try:
+        repo = _find_repo()
+        here = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd(), capture_output=True, text=True)
+        if here.returncode == 0 and here.stdout.strip() and Path(here.stdout.strip()).resolve() != repo:
+            print(f"init: this is a linked worktree; the pack goes into the main checkout, {repo}")
+        return init.init(repo, starter=args.starter, run_baseline=args.baseline, out=sys.stdout)
+    except ConfigError as exc:
+        print(f"error: init: {exc.message}")
+    except Exception as exc:  # init's own failure, never a run's: say so, and that no run is involved
+        print(f"error: init stopped on an unexpected {type(exc).__name__}: {exc}")
+    return 1
+
+
 def _load_cfg(args: argparse.Namespace):
     from agentflow.config import load_config
 
@@ -833,6 +851,14 @@ def _continue_flags(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentflow", description="Run the repo's agent workflow, from idea to ship.")
     sub = parser.add_subparsers(dest="command", required=True)
+    ini = sub.add_parser("init", help="write a sparse pack for this repository from what it holds (base branch, "
+                                      "starter, gates, docs); runs no gate unless you pass --baseline")
+    ini.add_argument("--starter", help="the starter to build on (default: picked from the repository's manifests)")
+    ini.add_argument("--baseline", action="store_true",
+                     help="run the detected gates once on the base branch, in a throwaway worktree, and mark a gate "
+                          "that fails there `baseline: red`")
+    ini.set_defaults(func=cmd_init)
+
     doc = sub.add_parser("doctor", help="check this machine can run the pack: agent CLIs and logins, gh, the remote, "
                                         "Docker, the state dir and each gate's programs")
     doc.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")

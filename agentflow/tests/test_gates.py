@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from pathlib import Path
 
 import pytest
@@ -107,3 +108,16 @@ def test_each_gate_records_how_long_it_ran(tmp_git, tmp_path):
     slow, fast, gone = run_gates(cfg, ["slow", "fast", "gone"], tmp_git, tmp_path / "logs")
     assert slow.duration_s >= 0.2 > fast.duration_s
     assert gone.skipped and gone.duration_s < 0.2
+
+
+def test_run_gates_env_base_replaces_the_inherited_environment(tmp_git, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_INHERITED", "from-the-caller")
+    cfg = cfg_with({"show": "echo inherited=${AGENTFLOW_INHERITED:-unset} base=${AGENTFLOW_BASE:-unset} "
+                            "pack=${AGENTFLOW_PACK:-unset}"})
+    cfg = dataclasses.replace(cfg, defaults=dataclasses.replace(cfg.defaults, env={"AGENTFLOW_PACK": "p"}))
+    (default,) = run_gates(cfg, ["show"], tmp_git, tmp_path / "a")
+    assert "inherited=from-the-caller base=unset pack=p" in default.tail
+    base = {k: v for k, v in os.environ.items() if k != "AGENTFLOW_INHERITED"} | {"AGENTFLOW_BASE": "b",
+                                                                                  "AGENTFLOW_PACK": "overridden"}
+    (replaced,) = run_gates(cfg, ["show"], tmp_git, tmp_path / "b", env_base=base)
+    assert "inherited=unset base=b pack=p" in replaced.tail  # defaults.env still goes on top
