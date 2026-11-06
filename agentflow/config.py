@@ -143,6 +143,8 @@ PROMPT_PLACEHOLDERS = frozenset(
         "stop_report",
         "ci_report",
         "sync_report",
+        "skill",
+        "base_ref",
     }
 )
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",

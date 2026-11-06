@@ -11,11 +11,11 @@ from pathlib import Path
 
 import pytest
 
-import agentflow
 from agentflow import pack
 from agentflow.conditions import explain, make_ctx
 from agentflow.config import load_config, validate
-from conftest import ENGINE, PACKS as PACKS_DIR, run_git
+from conftest import ENGINE, PACKS as PACKS_DIR, ROOT, run_git
+from test_packaging import _engine_files
 
 PACKS = ["python", "node"]
 DENYLIST = re.compile(r"(?i:tivacare)|CONSTRAINTS\.md|src/|docs/specs|docs/ideas|CAPABILITY-MAP|SPEC-|floor_guard|webadmin|next-step")
@@ -69,10 +69,15 @@ def test_this_repos_pack_validates_clean(repo_root):
 
 
 def test_engine_names_no_pack_strings():
-    engine = Path(agentflow.__file__).parent
-    files = [*sorted(engine.glob("*.py")), engine / "dashboard.html", *sorted(engine.glob("prompts/*.md"))]
-    hits = [f"{f.name}:{n}: {line.strip()}" for f in files
-            for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1) if DENYLIST.search(line)]
+    """Every engine file git knows (tracked, or untracked and not ignored) under `agentflow/`, minus the tests:
+    the code, the dashboard, the default prompts, and any packaging data or bundled skill files."""
+    hits = []
+    for name in _engine_files():
+        try:
+            text = (ROOT / name).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            pytest.fail(f"{name} is not UTF-8 text, so the portability scan cannot read it")
+        hits += [f"{name}:{n}: {line.strip()}" for n, line in enumerate(text.splitlines(), 1) if DENYLIST.search(line)]
     assert hits == []
 
 

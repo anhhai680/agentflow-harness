@@ -1,5 +1,3 @@
-Use the `systematic-debugging` skill.
-
 Goal: step `{stop_key}` stopped, and no human is watching. Find out why, and fix the cause so that step can finish.
 
 It stopped with `{stop_kind}`: {stop_summary}
@@ -16,7 +14,7 @@ Investigate before you change anything, in this work tree. The step's own sessio
 
 Say in your summary what the cause was and what you changed. Do not commit: the runner commits.
 
-## The `systematic-debugging` skill
+## The `{skill}` skill
 
 This is its full text, so you already have it: do not load it, follow it.
 

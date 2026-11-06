@@ -1,5 +1,3 @@
-Use the `api-and-interface-design` skill.
-
 Goal: the API review of `{spec}`, before any plan is written. Make the routes, messages, data models and the interfaces other modules call exact, in the spec's own contract sections.
 
 In this module's own spec, read only the sections that define routes, messages, models and interfaces. Write your edits as you go, in small steps, and append to `{progress}` after each one, so a replaced session can carry on.

@@ -1,6 +1,4 @@
-Use the `security-and-hardening` skill.
-
-Goal: review this branch's diff for security problems, using the `security-auditor` agent on the branch diff (`git diff origin/main...HEAD`).
+Goal: review this branch's diff for security problems, using the `security-auditor` agent on the branch diff (`git diff {base_ref}...HEAD`).
 
 {earlier_findings}
 

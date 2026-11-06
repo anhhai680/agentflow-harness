@@ -1,5 +1,3 @@
-Use the `receiving-code-review` skill.
-
 Goal: the `{phase}` phase found problems. Carry out the fix plan, with the smallest change that addresses each finding.
 
 The findings:
@@ -10,7 +8,7 @@ The plan is in `signals.fix_plan` of this phase's `plan_fixes` result, under `{r
 The phase's checks run again after you, so do not review your own work. Run the verify gates before you finish.
 Never weaken the repository's quality rules, skip a test or add a suppression. Do not commit: the runner commits.
 
-## The `receiving-code-review` skill
+## The `{skill}` skill
 
 This is its full text, so you already have it: do not load it, follow it.
 

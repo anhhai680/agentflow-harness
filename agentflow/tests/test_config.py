@@ -7,7 +7,6 @@ import yaml
 
 from agentflow.config import ConfigError, Issue, load_config, validate
 from agentflow.flow import main, repo_root
-from agentflow.pack import ENGINE_PROMPTS
 from conftest import PYTHON_CONFIG
 
 CFG = PYTHON_CONFIG
@@ -38,7 +37,7 @@ def test_package_design_belongs_to_the_plan_not_the_spec():
             yield from skills(step.steps)
 
     assert "codebase-design" not in set(skills(load_config(CFG).phases["define"].steps))
-    assert "`codebase-design` skill" in (ENGINE_PROMPTS / "plan.md").read_text(encoding="utf-8")
+    assert "`codebase-design` skill" in (CFG.parent / "prompts" / "plan.md").read_text(encoding="utf-8")
 
 
 def test_eval_steps_map_to_a_verify_skill_and_lanes_hold_no_repo_paths():

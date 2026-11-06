@@ -1,5 +1,3 @@
-Use the `systematic-debugging` skill.
-
 Goal: find the root cause of the bug. Do not fix it in this step.
 
 The report: read the run's inputs, `{run_dir}/issue.md` (from `--issue`), `{run_dir}/bug.log` (from `--log`) or `{run_dir}/task.md` (from `--task`), whichever exist.

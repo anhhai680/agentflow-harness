@@ -160,6 +160,8 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
         body = f"{body}\n\n{{gate_evidence}}"
     values = _values(cfg, step, ctx, {})
     values["brief"] = "\n\n".join((ctx.repo / name).read_text(encoding="utf-8") for name in step.brief)
+    values["skill"] = step.skill or ""
+    values["base_ref"] = ctx.base_ref
     values["earlier_findings"] = ""
     values["gate_evidence"] = ""
     if ctx.run is not None and ctx.run.handoff_path().exists():

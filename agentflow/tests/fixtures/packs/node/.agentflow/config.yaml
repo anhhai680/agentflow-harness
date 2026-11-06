@@ -1,4 +1,4 @@
-# agentflow's minimum pack: a Node project with one lane, no prompt overrides (no prompts/ dir), no work source,
+# agentflow's minimum pack: a Node project with one lane, prompt overrides that keep the skill wording the engine prompts no longer name, no work source,
 # no idea doc, skills in skills/ and the default spec file name. `agentflow validate` checks it.
 version: 2
 engine: ">=2,<3"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -12,12 +13,13 @@ import time
 import pytest
 
 from agentflow import gitops, lanes
-from agentflow.config import Phase, Step
-from agentflow.conditions import make_ctx
+from agentflow.config import PROMPT_PLACEHOLDERS, Phase, Step
+from agentflow.conditions import fmt, make_ctx
 from agentflow.events import parse_iso
 from agentflow.hitl import answer
 from agentflow.lanes import build_prompt
 from agentflow.state import Run
+from conftest import ENGINE
 
 KEY = "build/impl"
 DONE = {"status": "done", "summary": "did it"}
@@ -625,7 +627,7 @@ def test_build_prompt_parts(flow_repo):
     run = flow_repo.new_run()
     cfg = flow_repo.cfg
     ctx = make_ctx(cfg, flow_repo.root, "feature", {"module": "crm"}, run)
-    step = make_step(prompt="spec.md")
+    step = make_step(prompt="spec.md", skill="spec-driven-development")
     extra = {"result_file": "/workspace/out/step.json"}
     first = build_prompt(cfg, step, ctx, {"sized": False, "agent": "claude"}, extra, "first")
     assert "Effort check" in first
@@ -651,7 +653,7 @@ def test_build_prompt_names_a_skill_the_template_leaves_out(flow_repo):
 def test_codex_prompt_reads_skill_file(flow_repo):
     run = flow_repo.new_run()
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
-    prompt = build_prompt(flow_repo.cfg, make_step(prompt="plan.md"), ctx, {"sized": True, "agent": "codex"}, {}, "first")
+    prompt = build_prompt(flow_repo.cfg, make_step(prompt="plan.md", skill="writing-plans"), ctx, {"sized": True, "agent": "codex"}, {}, "first")
     assert "Read `.claude/skills/writing-plans/SKILL.md` and follow it." in prompt
     assert "Use the `writing-plans` skill" not in prompt
 
@@ -799,3 +801,36 @@ def test_gitops_commit_rejects_a_staged_forbidden_path(flow_repo, git):
     assert git(flow_repo.root, "diff", "--cached", "--name-only").strip() == ""  # index clean
     assert (flow_repo.root / "CONSTRAINTS.md").read_text(encoding="utf-8") == "weaker\n"  # tree untouched
     assert (flow_repo.root / "fine.txt").is_file()
+
+
+# --------------------------------------------------------------------------- generic engine prompts
+
+ENGINE_TEMPLATES = sorted((ENGINE / "prompts").glob("*.md"))
+
+
+def test_engine_prompts_name_no_skill_and_no_base_branch():
+    for p in ENGINE_TEMPLATES:
+        text = p.read_text(encoding="utf-8")
+        assert not re.search(r"`[a-z][a-z0-9-]*` skill", text) and "origin/main" not in text, p.name
+
+
+@pytest.mark.parametrize("path", ENGINE_TEMPLATES, ids=lambda p: p.name)
+def test_every_engine_template_fills_with_every_placeholder(path):
+    text = path.read_text(encoding="utf-8")
+    assert set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", text)) <= PROMPT_PLACEHOLDERS
+    filled = fmt(text, {name: "x" for name in PROMPT_PLACEHOLDERS})
+    assert not [name for name in PROMPT_PLACEHOLDERS if "{" + name + "}" in filled]
+
+
+def test_skill_and_base_ref_placeholders(flow_repo):
+    assert {"skill", "base_ref"} <= PROMPT_PLACEHOLDERS
+    run = flow_repo.new_run()
+    ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
+    ctx.base_ref = "origin/develop"
+    for prompt in ("fix.md", "branch_review.md", "security_review.md"):
+        text = build_prompt(flow_repo.cfg, make_step(prompt=prompt, skill="x", brief=[]), ctx, {"sized": True}, {}, "first")
+        assert "{skill}" not in text and "{base_ref}" not in text and "origin/main" not in text, prompt
+    fix = build_prompt(flow_repo.cfg, make_step(prompt="fix.md", skill="x", brief=[]), ctx, {"sized": True}, {}, "first")
+    assert "## The `x` skill" in fix
+    review = build_prompt(flow_repo.cfg, make_step(prompt="branch_review.md", skill=None, brief=[]), ctx, {"sized": True}, {}, "first")
+    assert "`git diff origin/develop...HEAD`" in review
