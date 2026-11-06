@@ -172,6 +172,17 @@ def test_next_eval_beats_open_plan(fr):
     assert next_step(fr.cfg, fr.root).lane == "eval"
 
 
+def test_next_names_the_bundled_note_once_in_its_answer(fr):
+    for key in ("decide", "define"):  # both bundled: the idle answer names them in `next` and again in `reason`
+        fr.cfg.skills_map[key] = "agentflow-define"
+    text = module_queue.format_answer(next_step(fr.cfg, fr.root))
+    assert text.count("bundled with agentflow") == 1 and "`agentflow-define`" in text
+    fr.cfg.skills_map["define"] = "agentflow-plan"  # two bundled skills: still one note
+    answer = next_step(fr.cfg, fr.root)
+    assert answer.next == f"`agentflow-define` or `agentflow-plan` {module_queue.BUNDLED_NOTE}"
+    assert module_queue.format_answer(answer).count("bundled with agentflow") == 1
+
+
 def test_next_nothing_in_flight(fr):
     answer = next_step(fr.cfg, fr.root)
     assert answer.lane == "none"

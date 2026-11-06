@@ -150,18 +150,30 @@ def _module_ids(cfg: Config, repo: Path) -> list[str]:
     return [n.id for n in work_source.items(cfg, repo)]
 
 
+BUNDLED_NOTE = "(bundled with agentflow: a run uses it; it is not installed for interactive sessions)"
+
+
+def _bundled(cfg: Config, repo: Path, key: str) -> bool:
+    """Whether the skill `skills.map` names for `key` is one only the engine's bundled copy provides. `repo` is the
+    main checkout, where a skill of the repository is looked up first."""
+    name = cfg.skills_map.get(key)
+    found = pack.skill_file(repo, cfg.project.skills_dir, name) if name else None
+    return found is not None and pack.is_bundled(found)
+
+
 def _skill(cfg: Config, repo: Path, key: str, stage: str) -> str:
-    """The skill `skills.map` names for `key`, else the stage's name (`Build stage`). A skill that only the engine's
-    bundled copy provides is marked as such: it exists in runner prompts, not for an interactive session. `repo` is
-    the main checkout, where a skill of the repository is looked up first."""
+    """The skill `skills.map` names for `key` (in backticks when it is bundled), else the stage's name (`Build
+    stage`). The bundled note itself is added once per answer, by `_noted`."""
     name = cfg.skills_map.get(key)
     if not name:
         return f"{stage} stage"
-    found = pack.skill_file(repo, cfg.project.skills_dir, name)
-    if found is not None and pack.is_bundled(found):
-        return (f"`{name}` (bundled with agentflow: a run uses it; "
-                "it is not installed for interactive sessions)")
-    return name
+    return f"`{name}`" if _bundled(cfg, repo, key) else name
+
+
+def _noted(cfg: Config, repo: Path, text: str, *keys: str) -> str:
+    """`text` (an answer's `next`) with `BUNDLED_NOTE` once when any skill of `keys` is bundled: such a skill
+    exists in runner prompts, not for an interactive session."""
+    return f"{text} {BUNDLED_NOTE}" if any(_bundled(cfg, repo, key) for key in keys) else text
 
 
 def design_doc_paths(cfg: Config) -> list[str]:
@@ -207,7 +219,7 @@ def rule_eval(cfg: Config, repo: Path, dirty: list[str]) -> NextAnswer | None:
     return NextAnswer(
         "eval", "Verify",
         [f"{len(hits)} uncommitted path(s) under overlays.eval.when_paths: {_some(hits)}"],
-        _skill(cfg, repo, "verify", "Verify"),
+        _noted(cfg, repo, _skill(cfg, repo, "verify", "Verify"), "verify"),
         "run the eval gate; a regression blocks the change",
     )
 
@@ -221,7 +233,8 @@ def rule_unchecked_plan(cfg: Config, repo: Path, plan: Path | None, ctx: Ctx) ->
     if not open_tasks:
         return None
     small = "plan_is_small" in cfg.conditions and evaluate(cfg, "plan_is_small", ctx).value is True
-    skill = _skill(cfg, repo, "build_small", "Build") if small else _skill(cfg, repo, "build", "Build")
+    key = "build_small" if small else "build"
+    skill = _noted(cfg, repo, _skill(cfg, repo, key, "Build"), key)
     return NextAnswer(
         "feature", "Build",
         [f"{plan.relative_to(repo).as_posix()}: {len(open_tasks)} of {len(tasks)} tasks unchecked "
@@ -241,8 +254,8 @@ def rule_checked_plan(cfg: Config, repo: Path, plan: Path | None) -> NextAnswer 
         return None
     evidence = [f"{plan.relative_to(repo).as_posix()} is fully checked",
                 f"{branch} has no merged pull request" if merged is False else f"could not check {branch}: {why}"]
-    return NextAnswer("feature", "Verify", evidence, _skill(cfg, repo, "verify", "Verify"),
-                      f"then {_skill(cfg, repo, 'ship', 'Ship')}")
+    verify = _noted(cfg, repo, _skill(cfg, repo, "verify", "Verify"), "verify", "ship")
+    return NextAnswer("feature", "Verify", evidence, verify, f"then {_skill(cfg, repo, 'ship', 'Ship')}")
 
 
 def rule_spec_without_plan(cfg: Config, repo: Path) -> NextAnswer | None:
@@ -262,7 +275,7 @@ def rule_spec_without_plan(cfg: Config, repo: Path) -> NextAnswer | None:
         if sources.find_plan(repo / docs["plans"], module) is None:
             return NextAnswer(
                 "feature", "Plan", [f"{spec.relative_to(repo).as_posix()} is approved and {module} has no plan"],
-                _skill(cfg, repo, "plan", "Plan"), f"plan {module} from its approved spec",
+                _noted(cfg, repo, _skill(cfg, repo, "plan", "Plan"), "plan"), f"plan {module} from its approved spec",
             )
     return None
 
@@ -275,7 +288,7 @@ def rule_design_doc(cfg: Config, repo: Path, dirty: list[str]) -> NextAnswer | N
         return None
     return NextAnswer(
         "design-doc", "Define", [f"{len(dirty)} uncommitted path(s), all design docs: {_some(dirty)}"],
-        _skill(cfg, repo, "design_doc", "Define"),
+        _noted(cfg, repo, _skill(cfg, repo, "design_doc", "Define"), "design_doc"),
         "finish the design-doc edits, then commit when the user asks",
     )
 
@@ -285,7 +298,8 @@ def rule_idle(cfg: Config, repo: Path, dirty: list[str]) -> NextAnswer:
     evidence = (f"{len(dirty)} uncommitted path(s) fit no lane: {_some(dirty)}" if dirty
                 else "no uncommitted changes, no open plan, no approved spec waiting for a plan")
     decide, define = _skill(cfg, repo, "decide", "Define"), _skill(cfg, repo, "define", "Define")
-    return NextAnswer("none", "-", [evidence], decide if decide == define else f"{decide} or {define}",
+    return NextAnswer("none", "-", [evidence],
+                      _noted(cfg, repo, decide if decide == define else f"{decide} or {define}", "decide", "define"),
                       f"nothing is in flight: ask what to do; {decide} for a decision, {define} for something to build")
 
 
