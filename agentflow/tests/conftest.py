@@ -51,6 +51,14 @@ def _state_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+@pytest.fixture(autouse=True)
+def _config_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """No test reads the developer's own user file (`layers.user_config_path`): its config home is a tmp dir."""
+    home = tmp_path / "xdg-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
+    return home
+
+
 @pytest.fixture
 def repo_root() -> Path:
     return REPO

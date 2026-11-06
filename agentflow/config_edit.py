@@ -36,13 +36,13 @@ import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from agentflow.config import KNOWN_EFFORT_LEVELS, ConfigError, Issue, load_config, validate
+from agentflow.layers import PHASE_FREE_KEYS
 
 __all__ = ["Conflict", "EditError", "Proposal", "Refused", "form_fields", "propose", "read", "save"]
 
 MAX_TEXT = 512 * 1024
 MERGE_TAG = "tag:yaml.org,2002:merge"
 AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices")  # what a page may change in an `agents.<name>` block
-PHASE_FREE_KEYS = ("needs_approval", "resolve", "model", "agent")  # the rest of a phase is the workflow itself
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
     "version", "engine", "gates", "gate_sets", "guardrails", "conditions", "overlays", "project", "phase_approval",
     "record_step", "resolve_step", "paths", "defaults.env", "context.autocompact_env", "context.progress_file",
