@@ -313,7 +313,7 @@ def test_idea_placeholder_is_empty_without_an_idea_doc(tmp_cfg, repo_root):
 
 @pytest.mark.parametrize("key", ["specs", "plans"])
 def test_docs_specs_and_plans_are_required(tmp_cfg, repo_root, key):
-    cfg = load_config(tmp_cfg({"project": {"docs": {key: None}}}))
+    cfg = load_config(tmp_cfg(lambda data: data["project"]["docs"].__setitem__(key, None)))  # `null`: no default either
     assert any(i.level == "error" and i.path == f"project.docs.{key}" for i in validate(cfg, repo_root))
 
 

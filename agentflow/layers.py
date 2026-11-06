@@ -126,14 +126,47 @@ def merge(stack: list[Layer]) -> tuple[dict, dict[Key, str]]:
     return merged, origins
 
 
+def leaf_keys(data: dict) -> list[Key]:
+    """The leaves `merge` records for `data` as the only layer: what a pack file states (a null states nothing)."""
+    out: list[Key] = []
+
+    def walk(node: dict, prefix: Key) -> None:
+        for key, value in node.items():
+            here = (*prefix, key)
+            if value is None:
+                continue
+            if isinstance(value, dict) and value and not _is_whole(here):
+                walk(value, here)
+            else:
+                out.append(here)
+
+    walk(data, ())
+    return out
+
+
 def _leaves(data: Any, prefix: Key = ()) -> list[Key]:
     if isinstance(data, dict) and data:
         return [leaf for key, value in data.items() for leaf in _leaves(value, (*prefix, str(key)))]
     return [prefix] if prefix else []  # an empty file has no leaf
 
 
+def _text_keys(data: Any, path: Path, prefix: Key = ()) -> None:
+    """Refuse a key that is not text anywhere in `data`: `merge` uses a key as it is, so an int `1` must never pass
+    the checks below as the text `"1"` (an agent the pack defines) and then create an agent of its own."""
+    if not isinstance(data, dict):
+        return
+    for key, value in data.items():
+        if not isinstance(key, str):
+            where = ".".join((*prefix, str(key)))
+            raise LayerError(f"{path}: {where}", "a key in a user config file is text: quote it")
+        _text_keys(value, path, (*prefix, key))
+
+
 def check_user(data: dict, lower: dict, path: Path) -> None:
     """Refuse a user file that holds anything but `USER_KEYS`, or names an agent the layers below don't define."""
+    if not isinstance(data, dict):
+        raise LayerError(str(path), "a user config file is a mapping of personal settings")
+    _text_keys(data, path)
     for leaf in _leaves(data):
         dotted = ".".join(leaf)
         where = f"{path}: {dotted}"

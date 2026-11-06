@@ -145,7 +145,8 @@ def _set_up(cfg: Config, repo: Path, run: Run, pipeline: str, params: dict, inpu
              model_overrides=dict(opts.model_overrides), **start_options(cfg.path))
     slug = make_ctx(cfg, repo, pipeline, params).values["slug"]
     branch = _free_branch(repo, cfg.project.branch.replace("{lane}", pipeline).replace("{slug}", slug))
-    path = (repo / cfg.project.worktrees_dir / run.id).resolve()
+    root = repo / cfg.project.worktrees_dir if cfg.project.worktrees_dir else pack.state_dir(repo) / "worktrees"
+    path = (root / run.id).resolve()
     add_worktree(repo, path, branch, cfg.project.fork_from)
     run.emit("run_updated", branch=branch, worktree=str(path), base_sha=head(path))
     template = _check_new_module(cfg, params, opts.new_module)

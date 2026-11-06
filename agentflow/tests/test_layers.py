@@ -278,3 +278,22 @@ def test_engine_defaults_path_and_the_exported_keys():
     assert "phases" in layers.WORKFLOW_KEYS and "gates" not in layers.WORKFLOW_KEYS
     from agentflow import config_edit
     assert config_edit.PHASE_FREE_KEYS is layers.PHASE_FREE_KEYS
+
+
+@pytest.mark.parametrize("user", [
+    {"agents": {1: {"models": {"build": "x"}}}},          # merge would use the int key itself
+    {"agents": {"claude": {"models": {True: "x"}}}},      # YAML 1.1 reads `on:`/`yes:` as a bool
+    {None: {"port": 1}},
+])
+def test_the_user_layer_refuses_a_key_that_is_not_text(user):
+    lower = {"agents": {"1": {"command": ["x"]}, "claude": {"command": ["claude"]}}}
+    with pytest.raises(LayerError) as err:
+        check_user(user, lower, USER_FILE)
+    assert err.value.path.startswith(f"{USER_FILE}") and "text" in err.value.message
+
+
+@pytest.mark.parametrize("data", [["dashboard"], "port: 1", 7])
+def test_the_user_layer_refuses_a_file_that_is_not_a_mapping(data):
+    with pytest.raises(LayerError) as err:
+        check_user(data, pack_with_agents(), USER_FILE)
+    assert err.value.path == str(USER_FILE) and "mapping of personal settings" in err.value.message

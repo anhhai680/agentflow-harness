@@ -264,6 +264,26 @@ def test_small_plan_shared_session(flow_repo, git):
     assert flow_repo.events(run, "review_result") == []
 
 
+@pytest.mark.parametrize("shared", [True, False])
+def test_a_small_plan_task_that_resumes_the_session_does_not_resend_the_skill(flow_repo, monkeypatch, shared):
+    from agentflow import lanes
+
+    flow_repo.configure(SMALL)
+    step = next(s for s in flow_repo.cfg.phases["build"].steps if s.id == "build")
+    step.small_plan = {**{k: v for k, v in step.small_plan.items() if k != "brief"},  # as in the engine defaults
+                       "shared_session": shared}
+    seen = []
+    real = lanes.build_prompt
+    monkeypatch.setattr(lanes, "build_prompt",
+                        lambda cfg, s, *rest: seen.append((s.skill, s.continuation)) or real(cfg, s, *rest))
+    run = begin_build(flow_repo, plan_text())
+    assert build(flow_repo, run) == ("done", True)
+    assert seen == [("executing-plans", False), ("executing-plans", shared)]
+    first, second = (c["argv"][-1] for c in flow_repo.calls())
+    assert "Stub: the executing-plans skill." in first
+    assert ("Stub: the executing-plans skill." in second) is not shared  # a resumed session already holds it
+
+
 def test_foreach_with_every_task_ticked_reports_nothing_ran(lane, git):
     run = begin_build(lane, plan_text(ticked=(1, 2)))
     before = lane.head()

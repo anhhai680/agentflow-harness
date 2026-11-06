@@ -174,6 +174,33 @@ def pack_repo_python(tmp_path: Path) -> Path:
     return root
 
 
+SPARSE_PACK = {  # a pack that states only what the engine defaults can't know: its gates and its permission line
+    "version": 2,
+    "engine": ">=2,<3",
+    "gates": {"unit": {"run": "true"}},
+    "gate_sets": {"setup": [], "build": ["unit"], "verify": ["unit"]},
+    "agents": {"claude": {"permission_mode": "bypassPermissions"}},
+}
+
+
+@pytest.fixture
+def sparse_repo(tmp_path: Path) -> Path:
+    """A tmp git repo on `main` with one commit holding a sparse pack (`SPARSE_PACK`) and nothing else of agentflow's:
+    no skills, no prompts, so the engine defaults, its bundled skills and its prompts carry every run."""
+    root = tmp_path / "sparse"
+    root.mkdir()
+    run_git(root, "init", "-q", "-b", "main")
+    run_git(root, "config", "user.name", "Test")
+    run_git(root, "config", "user.email", "test@example.com")
+    run_git(root, "config", "commit.gpgsign", "false")
+    (root / "README.md").write_text("hello\n", encoding="utf-8")
+    (root / ".agentflow").mkdir()
+    (root / ".agentflow" / "config.yaml").write_text(yaml.safe_dump(SPARSE_PACK, sort_keys=False), encoding="utf-8")
+    run_git(root, "add", "-A")
+    run_git(root, "commit", "-q", "-m", "initial")
+    return root
+
+
 @pytest.fixture
 def repo(tmp_git: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A real git repo that is also the working directory, so CLI commands find it."""

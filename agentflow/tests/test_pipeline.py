@@ -71,6 +71,16 @@ def pairs(argv: list[str]) -> set[tuple[str, str]]:
 # --------------------------------------------------------------------------- the phase loop
 
 
+def test_a_pack_with_no_worktrees_dir_puts_the_worktree_in_the_state_dir(pipe):
+    from agentflow import pack
+
+    pipe.configure({**PIPE, "project": {"worktrees_dir": None}})  # the engine defaults have no worktrees_dir
+    assert pipe.cfg.project.worktrees_dir is None
+    run = begin(pipe)
+    worktree = Path(run.state["worktree"])
+    assert worktree.is_dir() and worktree == (pack.state_dir(pipe.root) / "worktrees" / run.id).resolve()
+
+
 def test_feature_stops_after_every_phase(pipe):
     run = begin(pipe)
     worktree = Path(run.state["worktree"])

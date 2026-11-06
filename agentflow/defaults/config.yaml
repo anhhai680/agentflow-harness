@@ -1,0 +1,239 @@
+# The engine defaults: the bottom layer under every pack (`layers.py`). A pack states only what differs from here;
+# `null` in a pack deletes a key. A pack that writes `phases:` with steps writes the whole workflow (`lanes`,
+# `phases`, `conditions`, `record_step`, `resolve_step`, `phase_approval`, `checkpoints`, `autonomy`, `ci`, `skills`)
+# and none of the workflow below applies to it. No gate and no permission line here: a pack states its own.
+# A string value that starts with "@" is a reference to another key, resolved after the layers are merged.
+
+project:
+  base_branch: main            # the base the changed-path conditions compare against (`origin/<base_branch>`)
+  fork_from: main              # the branch a run is cut from and its pull request goes to
+  branch: "flow/{lane}/{slug}"
+  skills_dir: .claude/skills   # a repository's own skills; the engine's bundled skills are the fallback
+  commit_trailer: ""
+  docs:
+    specs: docs
+    plans: docs/plans
+
+gates: {}                      # names to commands: every pack states its own
+gate_sets: {}                  # a pack with no non-empty `gate_sets.verify` is refused
+
+guardrails:
+  forbidden_paths: []          # `.agentflow/**` is always forbidden, whatever a pack says
+  reject_trailers: []
+  user_only_skills: []
+
+agents:
+  claude:
+    command: [claude]
+    base_args: [-p, --output-format, stream-json, --verbose]
+    models: {plan: opus, build: sonnet, mechanical: haiku, review: sonnet, debug: opus}  # fallback when a phase sets no model
+    skill_loading: native
+    prices:                      # USD per 1M tokens; prices a session Claude never reported a cost for (rollover, timeout)
+      claude-opus-5-5:   {input: 4.00, output: 20.00, cache_read: 0.20, cache_write_5m: 5.00,  cache_write_1h: 8.00}
+      claude-sonnet-5-5: {input: 2.00, output: 10.00, cache_read: 0.10, cache_write_5m: 2.50,  cache_write_1h: 4.00}
+      claude-haiku-5-5:  {input: 0.10, output: 0.50,  cache_read: 0.01, cache_write_5m: 0.125, cache_write_1h: 0.20}
+  codex:
+    enabled: false
+    command: [codex]
+    models: {plan: gpt-5-codex, build: gpt-5-codex, review: gpt-5-codex}
+
+defaults:
+  agent: claude
+  step_timeout_min: 45
+  gate_timeout_min: 30
+  fix_attempts: 3
+  run_budget_usd: 25
+  task_budget_usd: 0           # 0: a feature run's budget does not grow with its plan
+
+recovery:
+  give_up_h: 24
+  failed_attempts: 3
+
+effort:
+  default: medium
+  allowed: [low, medium, high]
+
+context:
+  autocompact_pct: 60
+  autocompact_env: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+  rollover_pct: 80
+  max_rollovers: 2
+  context_window_tokens: auto
+  default_window_tokens: 200000
+  progress_file: "runs/{run}/progress.md"
+  gate_output_lines: 200
+
+hitl: {}
+
+dashboard:
+  host: 127.0.0.1
+  port: 7788
+
+# ------------------------------------------------------------------------------------------------ the workflow
+
+skills:
+  map:                         # each kind of step's skill; a pack maps its own skills here
+    decide: agentflow-define
+    define: agentflow-define
+    design_doc: agentflow-define
+    plan: agentflow-plan
+    build: agentflow-build
+    build_small: agentflow-build
+    debug: agentflow-debug
+    verify: agentflow-verify
+    review: agentflow-review
+    review_feedback: agentflow-respond
+
+conditions:                    # evaluated by the runner from files and git, never by a model
+  spec_exists:            {check: file_exists, path: "{spec}"}
+  spec_has_open_questions:
+    check: section_items
+    file: "{spec}"
+    section: '^## Open Questions'
+    stop_at: ['^\*\*Resolved']
+    none_patterns: ['^(- )?None\b']
+    min: 1
+    on_unknown: false
+  spec_is_approved:
+    check: status_line
+    file: "{spec}"
+    approved: '^Status: (approved|accepted)'
+    pending: '^Status: proposed'
+    on_unknown: ask_human
+  spec_awaits_approval: {not: spec_is_approved, on_unknown: false}
+  refine_round:           {check: refine_round}
+  plan_is_small:          {check: plan_tasks, file: "{plan}", max: 3}
+  plan_exists_unchecked:  {check: plan_unchecked, file: "{plan}"}
+  plan_done:
+    all:
+      - {check: file_exists, path: "{plan}"}
+      - {not: plan_exists_unchecked}
+  build_done:             {all: [{check: lane, is: feature}, plan_done]}
+
+lanes: [feature, bug]
+
+record_step:                   # a spec gap settled during a run: it files the answer in the spec
+  {id: record_decision, skill: "@skills.map.design_doc", role: build, prompt: record_decision.md, commit: true,
+   message: "Decide {topic} in the {module} spec"}
+
+resolve_step:                  # a stop in a `resolve: true` phase, run before a human hears of it
+  {id: resolve, skill: "@skills.map.debug", role: plan, prompt: resolve.md}
+
+autonomy:
+  non_blocking_severities: [minor, low, info, nit]
+  finding_rounds: 2
+  answer_recommended: true
+  revert_forbidden: 1
+  resolve_kinds:
+    blocked: 2
+    blocked_repeat: 2
+    step_timeout: 2
+    gate_failed: 2
+    fix_attempts_exhausted: 2
+    red_test_passes: 2
+    review_unresolved: 1
+
+ci:
+  poll_s: 60
+  appear_min: 5
+  timeout_min: 45
+  fix_rounds: 3
+  rerun_rounds: 1
+  sync_rounds: 2
+
+phases:
+  define:
+    needs_approval: true
+    model: {default: opus, build: sonnet}
+    steps:
+      - {id: debug, lanes: [bug], skill: "@skills.map.debug", role: debug, prompt: debug.md}
+      - {id: draft, lanes: [feature], skill: "@skills.map.define", role: plan, prompt: spec.md,
+         output: "{spec}", unless: spec_exists, commit: true, message: "Draft the {module} spec"}
+      - id: grill_open_questions
+        lanes: [feature]
+        when: spec_has_open_questions
+        repeat: {until: {not: spec_has_open_questions}, max_rounds: 2}
+        steps:
+          - {id: grill, skill: "@skills.map.define", role: plan, prompt: grill_spec_questions.md,
+             output: "runs/{run}/questions.md"}
+          - {id: answers, type: checkpoint, wait_for: answered_file}
+          - {id: apply, skill: "@skills.map.define", role: build, prompt: spec_apply.md,
+             commit: true, message: "Resolve open questions in the {module} spec"}
+      - {id: spec_approval, lanes: [feature], gates: [], when: spec_awaits_approval}  # keeps `define` for its approval
+  plan:
+    needs_approval: true
+    model: {default: opus, build: sonnet}
+    skip_if: plan_exists_unchecked
+    steps:
+      - {id: plan, lanes: [feature], skill: "@skills.map.plan", role: plan, prompt: plan.md,
+         output: "{plan_target}", commit: true, message: "Plan {module}"}
+  build:
+    needs_approval: false
+    resolve: true
+    model: {default: sonnet, review: sonnet, plan: opus}
+    skip_if: build_done
+    steps:
+      - &setup
+        {id: setup, lanes: [feature, bug], type: gate, gates: setup}
+      - id: build
+        lanes: [feature]
+        foreach: plan_task
+        skill: "@skills.map.build"
+        role: build
+        prompt: task.md
+        gates: build
+        fix_loop: true
+        review: {id: review, skill: "@skills.map.review", role: review, prompt: task_review.md}
+        commit: per_task
+        batch: {max_tasks: 3, max_files: 3, prompt: task_next.md}
+        small_plan: {when: plan_is_small, skill: "@skills.map.build_small", prompt: task_inline.md,
+                     shared_session: true, review: false}
+      - {id: regression_test, lanes: [bug], skill: "@skills.map.build", role: build, prompt: regression_test.md,
+         expect: red}
+      - {id: fix, lanes: [bug], skill: "@skills.map.build", role: build, prompt: fix.md,
+         gates: verify, expect: green, fix_loop: true, commit: true, message: "Fix {slug}"}
+  verify:
+    needs_approval: false
+    resolve: true
+    model: sonnet
+    steps:
+      - *setup
+      - &plan_fixes
+        {id: plan_fixes, lanes: [feature, bug], skill: "@skills.map.review_feedback", role: plan, model: opus,
+         prompt: plan_fixes.md, when: refine_round}
+      - &fix_findings
+        {id: fix_findings, lanes: [feature, bug], skill: "@skills.map.review_feedback", role: build,
+         prompt: fix_findings.md, when: refine_round, gates: verify, fix_loop: true, commit: true,
+         message: "Fix findings"}
+      - {id: verify, lanes: [feature, bug], skill: "@skills.map.verify", role: build, prompt: verify.md,
+         blocks_on_findings: true, gates_first: true, gates: verify, fix_loop: true, commit: true,
+         message: "Fix issues found in verification"}
+  review:
+    needs_approval: false
+    resolve: true
+    model: {default: sonnet, build: sonnet}
+    steps:
+      - {<<: *setup, lanes: [feature, bug], when: refine_round}
+      - *plan_fixes
+      - *fix_findings
+      - {id: branch_review, lanes: [feature, bug], skill: "@skills.map.review", role: review,
+         prompt: branch_review.md, blocks_on_findings: true}
+  ship:
+    needs_approval: false
+    steps:
+      - id: finish
+        type: finish
+        gates: setup
+        sync: {id: sync, skill: "@skills.map.debug", role: plan, prompt: sync_conflicts.md, gates: verify,
+               fix_loop: true}
+      - id: ci
+        type: ci
+        gates: setup
+        fix: {id: fix, skill: "@skills.map.debug", role: plan, prompt: ci_fix.md, gates: verify, fix_loop: true,
+              forbid: [".github/workflows/**"], commit: true, message: "Fix CI failures"}
+
+phase_approval:
+  refine_prompt: refine.md
+  show: [handoff, diff, step_results, skipped_steps, gates, review_findings]
+
+checkpoints: {}

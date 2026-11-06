@@ -338,6 +338,8 @@ class FeatureLane:
         continues = bool((self.run.state["steps"].get(share) or {}).get("session_id")) if share else False
         if batch and continues and step.batch and step.batch.get("prompt"):
             impl_step = dataclasses.replace(impl_step, prompt=str(step.batch["prompt"]), continuation=True)
+        elif continues and small.get("active") and small.get("shared_session"):  # its session holds the skill text
+            impl_step = dataclasses.replace(impl_step, continuation=True)
         extra = self._task_extra(task, rel)
         if self._task_agent(phase, impl_step, f"{tkey}/implement", extra, share) != "done":
             return "stopped"

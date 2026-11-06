@@ -7,6 +7,7 @@ it can find as a list of `Issue`s, so one run shows them all.
 
 from __future__ import annotations
 
+import copy
 import posixpath
 import re
 import shlex
@@ -17,7 +18,7 @@ from typing import Any, Literal
 
 import yaml
 
-from agentflow import pack
+from agentflow import layers, pack
 
 KNOWN_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 BUILTIN_CHECKS = (
@@ -185,7 +186,7 @@ class Project:
     base_branch: str
     fork_from: str
     branch: str
-    worktrees_dir: str
+    worktrees_dir: str | None  # None: the state dir's `worktrees/` (`pipeline._set_up`)
     docs: dict[str, str]
     commit_trailer: str
     skills_dir: str = DEFAULT_SKILLS_DIR
@@ -300,7 +301,7 @@ class Step:
     brief: list[str] = field(default_factory=list)
     task_briefs: dict[str, str] = field(default_factory=dict)
     task_brief: list[str] = field(default_factory=list)  # run time only, never configured: the `task_briefs` a plan task matched
-    continuation: bool = False  # run time only: a batch's later member, whose session already holds the first one's prompt
+    continuation: bool = False  # run time only: a later batch member or shared small_plan task; its session has the skill
     name: str | None = None
     blocks_on_findings: bool = False  # its `findings` hold the phase back (`autonomy.phase_findings`)
     forbid: list[str] = field(default_factory=list)  # guardrails.forbidden_paths for this step only
@@ -350,6 +351,8 @@ class Config:
     ci: dict = field(default_factory=dict)
     work_source: WorkSource | None = None  # None: no modules to queue; `next` and the Backlog go on without them
     skills_map: dict[str, str] = field(default_factory=dict)  # the skill `next` names per kind of step (`skills.map`)
+    merged: dict = field(default_factory=dict)  # the layers merged, before `@` resolution (`raw` is after it)
+    layer_origins: dict[tuple[str, ...], str] = field(default_factory=dict)  # each leaf of `merged`: its layer's name
 
 
 def for_lane(steps: list[Step], lane: str) -> list[Step]:
@@ -643,19 +646,97 @@ def _skills_map(raw: dict) -> dict[str, str]:
     return {str(k): str(v) for k, v in _optional(block, "map", "skills", dict, {}).items()}
 
 
-def load_config(path: Path) -> Config:
-    """Parse `path`, resolve `@` references and build the dataclasses."""
-    path = Path(path)
+MAX_DEPTH = 64  # a config file nested deeper than this is refused: no pack needs it, and every pass below recurses
+
+
+def _no_cycle(node: Any, path: Path, ancestors: set[int], done: set[int], depth: int = 0) -> None:
+    """Refuse a value that contains itself (a YAML anchor used inside its own node) or nests past `MAX_DEPTH`;
+    each shared node (an anchor used twice) is walked once."""
+    if not isinstance(node, (dict, list)) or id(node) in done:
+        return
+    if id(node) in ancestors:
+        raise ConfigError("", f"{path} holds a YAML anchor that refers to itself")
+    if depth > MAX_DEPTH:
+        raise ConfigError("", f"{path} is nested more than {MAX_DEPTH} levels deep")
+    ancestors.add(id(node))
+    for child in node.values() if isinstance(node, dict) else node:
+        _no_cycle(child, path, ancestors, done, depth + 1)
+    ancestors.discard(id(node))
+    done.add(id(node))
+
+
+def _read_yaml(path: Path) -> Any:
+    """`path` parsed. A file that can't be read, isn't YAML or holds a value that contains itself is a `ConfigError`
+    naming it, never a traceback."""
     try:
         loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        _no_cycle(loaded, path, set(), set())
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError("", f"cannot read {path}: {exc}") from exc
+    except RecursionError as exc:
+        raise ConfigError("", f"{path} is nested too deeply to read") from exc
+    return loaded
+
+
+def _read_mapping(path: Path) -> dict:
+    loaded = _read_yaml(path)
     if not isinstance(loaded, dict):
         raise ConfigError("", f"{path} must hold a mapping at the top level")
-    _check_format(loaded)
+    return loaded
 
+
+def _merge_layers(project: dict, path: Path, user: bool) -> tuple[dict, dict, Path | None]:
+    """`(merged, origins, user file or None)` for the stack engine defaults -> the pack -> the user's own file.
+
+    The user file is read only when `user` is true and it exists, and it is checked (`layers.check_user`) against
+    the merged layers below it before it is merged: it never reaches `merge` unchecked."""
+    stack = [layers.Layer("engine", _read_mapping(layers.ENGINE_DEFAULTS), layers.ENGINE_DEFAULTS),
+             layers.Layer("project", project, path)]
+    try:
+        merged, origins = layers.merge(stack)
+        if not user:
+            return merged, origins, None
+        try:
+            user_path = layers.user_config_path()
+        except RuntimeError:  # no home directory to look in: there is no user file
+            return merged, origins, None
+        if not user_path.exists():
+            return merged, origins, None
+        data = _read_yaml(user_path)
+        data = {} if data is None else data  # an empty file sets nothing
+        layers.check_user(data, merged, user_path)
+        merged, origins = layers.merge([*stack, layers.Layer("user", data, user_path)])
+    except layers.LayerError as exc:
+        raise ConfigError(exc.path, exc.message) from exc
+    return merged, origins, user_path
+
+
+def load_config(path: Path, *, layered: bool = True, user: bool = True) -> Config:
+    """Merge the layers, resolve `@` references and build the dataclasses.
+
+    The layers are the engine defaults (`agentflow/defaults/config.yaml`), the pack at `path` and the user's own
+    file (`layers.user_config_path`), bottom-up. `version` and `engine` are checked on the pack file alone.
+    `layered=False` loads the pack file alone, as before the layers; `user=False` leaves the user file unread.
+    An error at a key the user file set names that file."""
+    path = Path(path)
+    project = _read_mapping(path)
+    _check_format(project)
+    user_path: Path | None = None
+    if layered:
+        merged, origins, user_path = _merge_layers(project, path, user)
+    else:
+        merged, origins = copy.deepcopy(project), {key: "project" for key in layers.leaf_keys(project)}
+    try:
+        return _build(merged, origins, path)
+    except ConfigError as exc:
+        if user_path is not None and exc.path and layers.origin_of(origins, exc.path) == "user":
+            raise ConfigError(f"{user_path}: {exc.path}", exc.message) from exc
+        raise
+
+
+def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
     origins: dict[str, str] = {}
-    raw = _resolve(loaded, "", loaded, (), origins)
+    raw = _resolve(merged, "", merged, (), origins)
 
     project = _require(raw, "project", "", dict)
     defaults = _require(raw, "defaults", "", dict)
@@ -674,7 +755,7 @@ def load_config(path: Path) -> Config:
             base_branch=_require(project, "base_branch", "project", str),
             fork_from=_require(project, "fork_from", "project", str),
             branch=_require(project, "branch", "project", str),
-            worktrees_dir=_require(project, "worktrees_dir", "project", str),
+            worktrees_dir=_optional(project, "worktrees_dir", "project", str, None),
             docs=docs,
             commit_trailer=_require(project, "commit_trailer", "project", str),
             skills_dir=_skills_dir(_optional(project, "skills_dir", "project", str, DEFAULT_SKILLS_DIR)),
@@ -734,6 +815,8 @@ def load_config(path: Path) -> Config:
         ci=_optional(raw, "ci", "", dict, {}),
         work_source=_work_source(raw),
         skills_map=_skills_map(raw),
+        merged=merged,
+        layer_origins=layer_origins,
     )
 
 
@@ -1127,7 +1210,8 @@ class _Validator:
 
     def gate_definitions(self) -> None:
         if not self.cfg.gate_sets.get("verify"):
-            self.error("gate_sets.verify", "every pack declares the gates a diff must pass: gate_sets.verify")
+            self.error("gate_sets.verify", "every pack declares the gates a diff must pass: state them under "
+                       "`gates:` and list them in `gate_sets.verify` (a `starter:` can supply them)")
         for name, members in self.cfg.gate_sets.items():
             for i, member in enumerate(members):
                 if member not in self.cfg.gates:
