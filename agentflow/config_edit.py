@@ -434,8 +434,9 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
     the file on disk (it names another repository's agent) leaves the user-less pair, and a pack on disk that loads
     only with the user file leaves the other: then the new pack's protected values must also be the same with and
     without the user file, and they are held as written too. A new text that loads only with the user file is an error: it would
-    break for a teammate and for CI. A file on disk that loads neither way is broken already: nothing is held, so
-    it can be repaired here."""
+    break for a teammate and for CI. When no pair loads (the file on disk loads neither way, or only the way the
+    new text does not), the protected settings are held as written: a broken file can be repaired here, but not
+    by changing a protected setting."""
     try:
         parsed = yaml.safe_load(new_text)
     except yaml.YAMLError as exc:
@@ -464,15 +465,17 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
     old_alone, old_user = _raw_or_none(path, user=False), _raw_or_none(path, user=True)
     pairs = [(old, new) for old, new in ((old_alone, new_alone), (old_user, new_cfg.raw))
              if old is not None and new is not None]
-    if not pairs and needs_user is not None:
-        _hold_unloadable(path, parsed)  # the file on disk loads only without the user file: hold it as written
     changed = [key for old, new in pairs for key in _protected_changes(old, new)]
+    if not pairs:  # the file on disk loads neither way, or only the way the new text does not: hold it as written
+        changed += _written_changes(path, parsed)
     if old_alone is None and old_user is not None and new_alone is not None:
         # The file on disk needs the user file, so only the pair with it was compared, and there a key the user
         # file overrides resolves to the user's value on both sides. The new pack must not make a protected value
         # depend on the personal file (`hitl.notify` is itself personal), and it is also held as written.
         changed += [key for key in _protected_changes(new_alone, new_cfg.raw) if key != "hitl.notify"]
         changed += _written_changes(path, parsed)
+        if _get(new_alone, ("hitl", "notify")) != _get(parsed, ("hitl", "notify")):  # a reference could change it
+            changed.append("hitl.notify")
     changed = list(dict.fromkeys(changed))
     if changed:
         raise Refused("these settings are protected and can only be changed in the file, in git: " + ", ".join(changed))
@@ -502,10 +505,8 @@ def _raw_or_none(path: Path, *, user: bool) -> dict | None:
 
 def _hold_unloadable(path: Path, parsed: dict) -> None:
     """Refuse a text that changes a protected setting even when it no longer loads, comparing it as written with
-    the file as written (a loaded config's `@` references are resolved, the new text's are not). Only a file on
-    disk that loads, with or without the user file, is held: a broken one can be repaired."""
-    if _raw_or_none(path, user=False) is None and _raw_or_none(path, user=True) is None:
-        return
+    the file as written (a loaded config's `@` references are resolved, the new text's are not). It holds whatever
+    the file on disk loads: one that loads neither way can be repaired, but not by changing a protected setting."""
     changed = _written_changes(path, parsed)
     if changed:
         raise Refused("these settings are protected and can only be changed in the file, in git: " + ", ".join(changed))
