@@ -567,3 +567,65 @@ def test_a_second_baseline_while_one_runs_refuses_and_leaves_the_others_worktree
     assert not (toy_repo / ".agentflow").exists()
     code, out = run_init(toy_repo, baseline=True)  # the lock is free again
     assert code == 0, out
+
+
+# --- final review fixes -----------------------------------------------------------------------------------------------
+
+def test_baseline_runs_the_branch_not_a_tag_of_the_same_name(toy_repo, monkeypatch):
+    rows = capture_rows(monkeypatch)
+    set_ci(toy_repo, [{"name": "Tests", "run": "test -f on_main.txt"}], files={"on_main.txt": "x\n"})
+    run_git(toy_repo, "checkout", "-q", "-b", "side")
+    run_git(toy_repo, "rm", "-q", "on_main.txt")
+    run_git(toy_repo, "commit", "-q", "-m", "not on main")
+    run_git(toy_repo, "tag", "main")
+    run_git(toy_repo, "checkout", "-q", "main")
+    code, out = run_init(toy_repo, baseline=True)
+    assert code == 0, out
+    assert statuses(rows)["tests"] == "pass"
+    assert "a worktree of `main`" in out and "read from `main`" in out and "refs/heads" not in out
+
+
+def test_a_docker_daemon_that_is_down_means_docker_gates_are_not_run(toy_repo, fakebin, monkeypatch):
+    rows = capture_rows(monkeypatch)
+    _script(fakebin / "docker", "exit 1\n")
+    set_ci(toy_repo, [{"name": "Tests", "run": "docker compose run tests"}])
+    code, out = run_init(toy_repo, baseline=True)
+    assert code == 0, out
+    assert statuses(rows)["tests"] == "not run" and "docker" in rows[-1].note
+    assert no_red(toy_repo)
+
+
+def test_baseline_drops_the_callers_venv_from_path_and_git_variables(toy_repo, tmp_path, monkeypatch):
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv_bin.parent))
+    monkeypatch.setenv("PATH", f"{venv_bin}{os.pathsep}{os.environ['PATH']}")
+    for name, value in (("GIT_DIR", toy_repo / ".git"), ("GIT_WORK_TREE", toy_repo),
+                        ("GIT_INDEX_FILE", toy_repo / ".git" / "index")):
+        monkeypatch.setenv(name, str(value))
+    cfg = _cfg_with({"path": f'case ":$PATH:" in *":{venv_bin}:"*) exit 1 ;; esac',
+                     "git_vars": 'test -z "$GIT_DIR$GIT_WORK_TREE$GIT_INDEX_FILE"'})
+    rows = init.baseline(cfg, toy_repo, "refs/heads/main", set(), io.StringIO())
+    assert statuses(rows) == {"path": "pass", "git_vars": "pass"}
+    assert git_status(toy_repo) == ""
+
+
+def test_terminal_escapes_from_the_repository_are_not_printed(toy_repo, monkeypatch, capsys):
+    set_ci(toy_repo, [{"name": "Tests", "run": "\x1b[1Atool --test"}])
+    code, out = run_init(toy_repo)
+    assert code == 0, out
+    assert "\x1b" not in out and "\\x1b[1Atool" in out
+    text = doctor.render([doctor.Check("gate:x\x1b[2J", "fail", "`\x1b[1A` is not on PATH", "install `\x1b[1A`")])
+    assert "\x1b" not in text
+
+
+def test_the_baseline_names_its_log_folder_when_a_gate_fails_or_errs(toy_repo):
+    set_ci(toy_repo, [{"name": "Tests", "run": "test -f pyproject.toml"}])
+    code, out = run_init(toy_repo, baseline=True)
+    assert code == 0, out
+    assert "baseline-logs" not in out.split("baseline:\n")[-1]
+    shutil.rmtree(toy_repo / ".agentflow")
+    set_ci(toy_repo, [{"name": "Tests", "run": "test -f nope.txt"}])
+    code, out = run_init(toy_repo, baseline=True)
+    assert code == 0, out
+    assert f"logs: {pack.state_dir(toy_repo) / 'baseline-logs'}" in out

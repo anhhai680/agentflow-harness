@@ -419,10 +419,10 @@ def test_default_branch_from_origin_head(make):
     _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop")
     assert detect.default_branch(repo) == ("develop", ["create it locally: `git branch develop origin/develop`"])
     found = detect.detect(repo)
-    assert found.base_branch == "develop" and found.base_ref == "origin/develop"
+    assert found.base_branch == "develop" and found.base_ref == "refs/remotes/origin/develop"
     _git(repo, "branch", "develop", "origin/develop")
     assert detect.default_branch(repo) == ("develop", [])
-    assert detect.detect(repo).base_ref == "develop"
+    assert detect.detect(repo).base_ref == "refs/heads/develop"
 
 
 def test_default_branch_prefers_a_local_main_over_the_current_branch(make):
@@ -467,7 +467,7 @@ def test_detection_reads_the_base_branch_not_the_working_tree(make):
     _commit(repo, ci("- name: Tests\n  run: pytest\n- name: Lint\n  run: ruff check ."))
     _write(repo, {"package.json": json.dumps({"scripts": {"test": "jest"}})})
     found = detect.detect(repo)
-    assert list(found.gates) == ["tests"] and found.base_ref == "main"
+    assert list(found.gates) == ["tests"] and found.base_ref == "refs/heads/main"
     (repo / ".github" / "workflows" / "ci.yml").unlink()  # even a deleted working-tree file is still read from `main`
     assert list(detect.detect(repo).gates) == ["tests"]
 
@@ -523,3 +523,35 @@ def test_docs_alternatives_and_the_default_specs_directory_note(make):
     found = detect.detect(make({f"docs/{SPEC_DIR}/a.md": ""}))
     assert "set `project.docs.specs` to that directory" in notes_text(found)
     assert found.docs == {}
+
+
+def test_a_tag_named_like_the_base_branch_does_not_shadow_it(make):
+    repo = make(ci("- name: Tests\n  run: pytest"))
+    _git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, ci("- name: Lint\n  run: ruff check ."))
+    _git(repo, "tag", "main")  # a tag `main` on another tree: a bare `main` would name it
+    _git(repo, "checkout", "-q", "main")
+    found = detect.detect(repo)
+    assert found.base_branch == "main" and found.base_ref == "refs/heads/main"
+    assert list(found.gates) == ["tests"]
+
+
+def test_a_workflow_alias_bomb_is_one_note_and_quick(make):
+    steps = "\n".join("      - {uses: a/b@v1}" for _ in range(2000))
+    jobs = "\n".join(f"  j{i}: {{runs-on: x, steps: *s}}" for i in range(2000))
+    text = f"on: push\njobs:\n  first:\n    runs-on: x\n    steps: &s\n{steps}\n{jobs}\n"
+    assert len(text) < detect.MAX_BYTES
+    import time
+    started = time.monotonic()
+    found = detect.detect(make({".github/workflows/bomb.yml": text}))
+    assert time.monotonic() - started < 10  # mostly parsing the 110 KB file; the 4,000,000 step references are never walked
+    assert found.gates == {}
+    assert len(found.notes) <= detect.MAX_NOTES + 1
+    assert any("bomb.yml" in n and "too many" in n for n in found.notes)
+
+
+def test_notes_are_capped_with_a_count_of_the_rest(make):
+    jobs = "\n".join(f"  j{i}:\n    runs-on: x\n    steps:\n      - uses: a/b@v1\n      - uses: c/d@v1" for i in range(150))
+    found = detect.detect(make({".github/workflows/many.yml": f"on: push\njobs:\n{jobs}\n"}))
+    assert len(found.notes) == detect.MAX_NOTES + 1
+    assert found.notes[-1] == f"\u2026and {300 - detect.MAX_NOTES} more notes"

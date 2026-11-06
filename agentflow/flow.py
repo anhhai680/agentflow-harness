@@ -128,7 +128,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_init(args: argparse.Namespace) -> int:
     """Write a sparse pack for this repository; with `--baseline`, run its gates once on the base branch first."""
-    from agentflow import init
+    from agentflow import doctor, init
     from agentflow.config import ConfigError
 
     try:
@@ -138,9 +138,9 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"init: this is a linked worktree; the pack goes into the main checkout, {repo}")
         return init.init(repo, starter=args.starter, run_baseline=args.baseline, out=sys.stdout)
     except ConfigError as exc:
-        print(f"error: init: {exc.message}")
+        print(f"error: init: {doctor.printable(exc.message)}")
     except Exception as exc:  # init's own failure, never a run's: say so, and that no run is involved
-        print(f"error: init stopped on an unexpected {type(exc).__name__}: {exc}")
+        print(f"error: init stopped on an unexpected {type(exc).__name__}: {doctor.printable(exc)}")
     return 1
 
 

@@ -183,9 +183,10 @@ def found(program: str, path: str) -> bool:
 
 
 def missing_programs(cfg: Config, checks: list[Check]) -> set[str]:
-    """The programs behind the failed `gate:<name>` checks in `checks` that are not on the gates' PATH."""
+    """The programs behind the failed `gate:<name>` checks in `checks` that are not on the gates' PATH, and `docker`
+    when the `docker` check failed (its daemon doesn't answer, so a gate running it can't run)."""
     path = gate_path(cfg)
-    missing: set[str] = set()
+    missing: set[str] = {"docker"} if any(c.name == "docker" and c.status == "fail" for c in checks) else set()
     for check in checks:
         name = check.name.removeprefix("gate:")
         if check.status != "fail" or name == check.name or name not in cfg.gates:
@@ -262,14 +263,22 @@ def run_checks(cfg: Config, repo: Path) -> list[Check]:
     return [*checks, *gate_checks]
 
 
+def printable(text: object) -> str:
+    """`text` safe to print on a terminal: a newline or a control character (an escape sequence a repository or a
+    tool's output may hold) is written as its backslash escape."""
+    return "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii") for ch in str(text))
+
+
 def render(checks: list[Check]) -> str:
-    """One line per check (and an indented fix under a warning or failure), then a summary line."""
-    width = max((len(c.name) for c in checks), default=0)
+    """One line per check (and an indented fix under a warning or failure), then a summary line. Every text is
+    `printable`: a check's detail can quote the repository or a tool's output."""
+    names = [printable(c.name) for c in checks]
+    width = max((len(n) for n in names), default=0)
     lines: list[str] = []
-    for check in checks:
-        lines.append(f"{check.status:<4}  {check.name:<{width}}  {check.detail}")
+    for check, name in zip(checks, names):
+        lines.append(f"{check.status:<4}  {name:<{width}}  {printable(check.detail)}")
         if check.fix and check.status != "ok":
-            lines.append(f"      {'':<{width}}  fix: {check.fix}")
+            lines.append(f"      {'':<{width}}  fix: {printable(check.fix)}")
     failed = sum(c.status == "fail" for c in checks)
     warned = sum(c.status == "warn" for c in checks)
     lines.append(f"{len(checks)} checks: {len(checks) - failed - warned} ok, {warned} warning{'s' if warned != 1 else ''}, "

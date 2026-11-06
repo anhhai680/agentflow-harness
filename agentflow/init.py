@@ -22,6 +22,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -36,9 +37,12 @@ from agentflow.config import Config, ConfigError, Gate
 from agentflow.detect import Detected
 from agentflow.gates import GateResult, resolve, run_gates
 
+_show = doctor.printable
+
 ENGINE_RANGE = ">=2,<3"
 GIT_TIMEOUT_S = 120
 DROPPED_ENV = ("VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONPATH")  # the caller's Python environment, not the project's
+GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")  # they would point git at the caller's repository, not the worktree
 ALREADY = "this repository already has a pack: edit it, or remove .agentflow to start over"
 SYMLINKED = f"{pack.PACK_DIR} is a symlink: init writes the pack only into a real folder"
 PERMISSION_COMMENT = ("runs are headless: this lets the agent use its tools; deny rules, hooks and agentflow's guards "
@@ -196,7 +200,7 @@ def render_pack(d: Detected, *, base: dict, red: frozenset[str] = frozenset()) -
 
 def _git(repo: Path, *args: str) -> tuple[int, str]:
     """`(exit code, stdout)` of `git -C repo args`, or `(code, stderr)` when it failed; never raises."""
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env = {**{k: v for k, v in os.environ.items() if k not in GIT_ENV}, "GIT_TERMINAL_PROMPT": "0"}
     try:
         proc = subprocess.run(["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL, capture_output=True,
                               text=True, errors="replace", timeout=GIT_TIMEOUT_S, env=env)
@@ -435,6 +439,26 @@ def _where(gate: Gate) -> str:
     return f"  (in {_show(gate.cwd)})" if gate.cwd else ""
 
 
+def _short_ref(ref: str) -> str:
+    """A full ref as people write it: `refs/heads/main` is `main`, `refs/remotes/origin/main` is `origin/main`."""
+    return ref.removeprefix("refs/heads/").removeprefix("refs/remotes/")
+
+
+def _baseline_env() -> dict[str, str]:
+    """This process's environment without the caller's Python environment or git variables: `DROPPED_ENV` and
+    `GIT_ENV` go, and so do their `bin` folders on PATH (`$VIRTUAL_ENV/bin`, `$CONDA_PREFIX/bin`, and this
+    interpreter's own when it runs in a virtualenv, such as the one `uv run --script` makes)."""
+    bins = {os.path.realpath(os.path.join(os.environ[k], "bin")) for k in ("VIRTUAL_ENV", "CONDA_PREFIX")
+            if os.environ.get(k)}
+    if sys.prefix != sys.base_prefix:
+        bins.add(os.path.realpath(os.path.join(sys.prefix, "bin")))
+    env = {k: v for k, v in os.environ.items() if k not in DROPPED_ENV and k not in GIT_ENV}
+    if "PATH" in env:
+        env["PATH"] = os.pathsep.join(p for p in env["PATH"].split(os.pathsep)
+                                      if not p or os.path.realpath(p) not in bins)
+    return env
+
+
 def baseline(cfg: Config, repo: Path, base_ref: str, missing: set[str], out: TextIO) -> list[BaselineRow]:
     """Run `cfg`'s setup gates, then each gate of `build` and `verify` once, in a throwaway worktree of `base_ref`.
 
@@ -447,8 +471,8 @@ def baseline(cfg: Config, repo: Path, base_ref: str, missing: set[str], out: Tex
     checks = list({g.name: g for g in [*_gates_of(cfg, "build"), *_gates_of(cfg, "verify")]}.values())
     commit = _commit_of(repo, base_ref)
     if commit is None:
-        print(f"baseline not run: `{_show(base_ref)}` does not exist here", file=out)
-        return _not_run([*setup, *checks], f"`{base_ref}` does not exist here")
+        print(f"baseline not run: `{_show(_short_ref(base_ref))}` does not exist here", file=out)
+        return _not_run([*setup, *checks], f"`{_show(_short_ref(base_ref))}` does not exist here")
     state = safeio.ensure_dir(pack.state_dir(repo))
     lock = _lock(state)  # held for the whole baseline: a second init's cleanup must not take this one's worktree
     try:
@@ -464,13 +488,13 @@ def baseline(cfg: Config, repo: Path, base_ref: str, missing: set[str], out: Tex
                 if code != 0:
                     print(f"baseline not run: git could not create the worktree: {_show(message)}", file=out)
                     return _not_run([*setup, *checks], "the worktree could not be created")
-                print(f"baseline: running these commands once in {directory}, a worktree of `{_show(base_ref)}` "
-                      f"({commit[:12]}):", file=out)
+                print(f"baseline: running these commands once in {directory}, a worktree of "
+                      f"`{_show(_short_ref(base_ref))}` ({commit[:12]}):", file=out)
                 for gate in setup:
                     print(f"  setup {gate.name}: {_show(gate.run)}{_where(gate)}", file=out)
                 for gate in checks:
                     print(f"  gate  {gate.name}: {_show(gate.run)}{_where(gate)}", file=out)
-                env = {key: value for key, value in os.environ.items() if key not in DROPPED_ENV}
+                env = _baseline_env()
                 return _run_all(cfg, setup, checks, directory, state / "baseline-logs", env, missing)
             finally:
                 with interrupts.deferred():
@@ -482,11 +506,6 @@ def baseline(cfg: Config, repo: Path, base_ref: str, missing: set[str], out: Tex
 
 
 # --- init -----------------------------------------------------------------------------------------------------------
-
-def _show(text: Any) -> str:
-    """`text` safe to print: a newline or a control character (a terminal escape) is written as its escape."""
-    return "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii") for ch in str(text))
-
 
 def _rule_words(words: list[str]) -> list[str] | None:
     """The words of a narrow allow rule for one simple command (`words[0]` is its program), or None when no rule
@@ -547,7 +566,7 @@ def _short(text: str) -> str:
 
 
 def _print_detection(d: Detected, notes: list[str], out: TextIO) -> None:
-    where = f"`{_show(d.base_ref)}`" if d.base_ref else "the working tree (no commits yet)"
+    where = f"`{_show(_short_ref(d.base_ref))}`" if d.base_ref else "the working tree (no commits yet)"
     print(f"detected, read from {where}:", file=out)
     print(f"  base branch  {_show(d.base_branch)}", file=out)
     print(f"  starter      {d.starter}", file=out)
@@ -635,7 +654,7 @@ def init(repo: Path, *, starter: str | None, run_baseline: bool, out: TextIO) ->
             if found.base_ref is None:
                 why_not = "the repository has no commits yet"
             elif _commit_of(repo, found.base_ref) is None:
-                why_not = f"`{_show(found.base_ref)}` does not exist here"
+                why_not = f"`{_show(_short_ref(found.base_ref))}` does not exist here"
             else:
                 try:
                     rows = baseline(cfg, repo, found.base_ref, doctor.missing_programs(cfg, checks), out)
@@ -672,6 +691,8 @@ def init(repo: Path, *, starter: str | None, run_baseline: bool, out: TextIO) ->
               f"baseline not run: pass --baseline to run the detected gates once on `{base_name}`", file=out)
     else:
         _print_baseline(rows, out)
+        if any(r.status in ("fail", "error") for r in rows):
+            print(f"  logs: {pack.state_dir(repo) / 'baseline-logs'}", file=out)
         if red and set(data["gate_sets"]["verify"]) <= red:
             print(f"every verify gate fails on `{base_name}`: runs cannot pass verify until you fix them", file=out)
     merged = _effective(found, data)

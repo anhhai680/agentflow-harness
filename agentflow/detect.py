@@ -26,6 +26,10 @@ import yaml
 from agentflow import layers
 
 MAX_BYTES = 1024 * 1024  # a larger file is not read
+MAX_STEPS = 500  # a workflow file with more steps (across its jobs) is not read: YAML aliases can repeat a list cheaply
+MAX_JOBS = 200
+MAX_ENV = 200  # variables in one `env:` mapping
+MAX_NOTES = 200  # notes kept per run; the rest are counted in one last note
 GIT_TIMEOUT_S = 30
 WORKFLOWS = ".github/workflows"
 GUESSED = "guessed the base branch from the current branch: check `project.base_branch`"
@@ -51,7 +55,8 @@ _DOC_DIRS = {"specs": (_SPEC_DIR, "docs/rfcs", "docs/proposals"), "plans": ("doc
 @dataclass
 class Detected:
     base_branch: str
-    base_ref: str | None  # what the files were read from; None for a repository with no commit, read from its tree
+    base_ref: str | None  # the full ref the files were read from (`refs/heads/<b>`, `refs/remotes/origin/<b>` or
+    # `HEAD`), so a tag of the same name can't shadow it; None for a repository with no commit, read from its tree
     starter: str
     gates: dict[str, dict] = field(default_factory=dict)  # written whole into the pack; empty when the starter's stand
     gate_sets: dict[str, list[str]] = field(default_factory=dict)
@@ -192,9 +197,9 @@ def _base_ref(repo: Path, branch: str, notes: list[str]) -> str | None:
         notes.append("no commits yet: files are read from the working tree, not from a base branch")
         return None
     if _local(repo, branch):
-        return branch
+        return f"refs/heads/{branch}"
     if _remote(repo, branch):
-        return f"origin/{branch}"
+        return f"refs/remotes/origin/{branch}"
     notes.append(f"no branch `{branch}` to read from: files are read from HEAD")
     return "HEAD"
 
@@ -302,7 +307,10 @@ def _text_or_absent(owner: dict, key: str, what: str) -> str | None:
 
 def _env_of(owner: dict, what: str) -> dict[str, str]:
     out: dict[str, str] = {}
-    for key, value in _mapping(owner, "env", what).items():
+    mapping = _mapping(owner, "env", what)
+    if len(mapping) > MAX_ENV:
+        raise _Skip(f"`{what}` has more than {MAX_ENV} variables")
+    for key, value in mapping.items():
         if isinstance(value, bool):
             value = "true" if value else "false"
         if value is None:
@@ -512,6 +520,9 @@ def _workflow_gates(name: str, text: str, notes: list[str], gates: _Gates) -> No
         jobs = wf.get("jobs")
         if not isinstance(jobs, dict):
             raise _Skip("`jobs` is not a mapping")
+        steps = sum(len(j["steps"]) for j in jobs.values() if isinstance(j, dict) and isinstance(j.get("steps"), list))
+        if len(jobs) > MAX_JOBS or steps > MAX_STEPS:
+            raise _Skip(f"too many steps ({len(jobs)} jobs, {steps} steps; at most {MAX_JOBS} and {MAX_STEPS}): not read")
         wf_run = _run_defaults(wf, "")
         wf_env = _env_of(wf, "env")
     except _Skip as skip:
@@ -630,4 +641,10 @@ def detect(repo: Path, starter: str | None = None) -> Detected:
         base_branch=branch, base_ref=ref, starter=picked, gates=gates, gate_sets=gate_sets, gate_source=source,
         docs=_docs(src, notes),
         skills=[n for n in src.ls(".claude/skills") if src.exists(f".claude/skills/{n}/SKILL.md")],
-        agent_docs=[n for n in ("CLAUDE.md", "AGENTS.md") if src.exists(n)], notes=notes)
+        agent_docs=[n for n in ("CLAUDE.md", "AGENTS.md") if src.exists(n)], notes=_capped(notes))
+
+
+def _capped(notes: list[str]) -> list[str]:
+    if len(notes) <= MAX_NOTES:
+        return notes
+    return [*notes[:MAX_NOTES], f"\u2026and {len(notes) - MAX_NOTES} more notes"]

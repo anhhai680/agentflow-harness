@@ -558,7 +558,7 @@ Each slice is planned with `writing-plans` (`docs/plans/YYYY-MM-DD-agentflow-har
 - Slice 1: run `agentflow run feature --module <m> --dry-run` and a real past-shaped run. The conformance audit must report 100% on the reference route. Then deliberately skip `branch_review` in a test config and check that the audit blocks `finish` and queues the review.
 - Slice 2: `uv run --no-project --with pyyaml --with pytest pytest agentflow/tests --import-mode=prepend -q` is green with no test edits, and `agentflow explain` output is identical before and after for every lane.
 - Settings (every slice): `agentflow/tests/test_config_edit.py` covers three cases. Each new Form field round-trips through `propose`/`save` and keeps comments and anchors. Each new protected key is refused from the page with the "protected" message. A `needs_approval: false` on `plan`, or an autonomy promotion with a red scorecard, is refused by validate. Then a manual check: `agentflow dashboard` → Settings shows the new sections with help text, and Review and save shows the diff.
-- Plug and play (engine CI, every release): an e2e test clones three fixture repos (Python/uv with a GitHub Actions workflow, Node/pnpm, docs-only with no skills dir). It runs `init` → `doctor` → `validate` (0 warnings after `gates_confirmed`) → `explain` → `run --dry-run`. Pass criteria:
+- Plug and play (engine CI, every release): an e2e test clones three fixture repos (Python/uv with a GitHub Actions workflow, Node/pnpm, docs-only with no skills dir). It runs `init` → `doctor` → `validate` (0 warnings after `gates_confirmed`; see §1c, deviation 4) → `explain` → `run --dry-run`. Pass criteria:
   - the gates are detected from CI
   - nothing is written in the repo except `.agentflow/`
   - `rm -rf .agentflow` leaves `git status` clean
@@ -575,6 +575,6 @@ Each slice is planned with `writing-plans` (`docs/plans/YYYY-MM-DD-agentflow-har
   - propose a route whose p90 is over the remaining budget → the validator must reject it
 
   Each stop writes a stop report with a forecast, and no cap can be set to 0/unset through `validate` or the Settings page.
-- Portability (every slice): the engine suite passes on both fixture packs, the denylist test passes, and `agentflow init --starter python-uv` in an empty temp repo followed by `agentflow validate` prints 0 warnings.
+- Portability (every slice): the engine suite passes on both fixture packs, the denylist test passes, and `agentflow init --starter python-uv` in an empty temp repo followed by `agentflow validate` prints 0 warnings (see §1c, deviation 4).
 - Memory: kill the runner mid-build, then `agentflow resume`. The rebuilt digest must equal the one from before the kill (byte-compare, from events only). A test checks that a conductor prompt contains no agent-written text (no `progress.md` content) and stays under `memory.digest_tokens`. An over-cap digest emits `memory_truncated`.
 - Slice 3+: the route-eval suite scores 100% obligation coverage, and the scorecard shows conductor runs against the baseline with no SLO in red before any promotion.
