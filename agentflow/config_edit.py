@@ -430,7 +430,8 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
     load: without the user's own file, and with it. Each pair sees the same engine defaults and the same user file
     on both sides, so a change that only a reference reaches still shows. A user file that does not load against
     the file on disk (it names another repository's agent) leaves the user-less pair, and a pack on disk that loads
-    only with the user file leaves the other. A new text that loads only with the user file is an error: it would
+    only with the user file leaves the other: then the new pack's protected values must also be the same with and
+    without the user file, and they are held as written too. A new text that loads only with the user file is an error: it would
     break for a teammate and for CI. A file on disk that loads neither way is broken already: nothing is held, so
     it can be repaired here."""
     try:
@@ -458,12 +459,19 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
         issues = validate(new_cfg, repo) + settings_coverage(new_cfg, repo)
     finally:
         Path(temp).unlink(missing_ok=True)
-    pairs = [(old, new) for old, new in ((_raw_or_none(path, user=False), new_alone),
-                                         (_raw_or_none(path, user=True), new_cfg.raw))
+    old_alone, old_user = _raw_or_none(path, user=False), _raw_or_none(path, user=True)
+    pairs = [(old, new) for old, new in ((old_alone, new_alone), (old_user, new_cfg.raw))
              if old is not None and new is not None]
     if not pairs and needs_user is not None:
         _hold_unloadable(path, parsed)  # the file on disk loads only without the user file: hold it as written
-    changed = list(dict.fromkeys(key for old, new in pairs for key in _protected_changes(old, new)))
+    changed = [key for old, new in pairs for key in _protected_changes(old, new)]
+    if old_alone is None and old_user is not None and new_alone is not None:
+        # The file on disk needs the user file, so only the pair with it was compared, and there a key the user
+        # file overrides resolves to the user's value on both sides. The new pack must not make a protected value
+        # depend on the personal file (`hitl.notify` is itself personal), and it is also held as written.
+        changed += [key for key in _protected_changes(new_alone, new_cfg.raw) if key != "hitl.notify"]
+        changed += _written_changes(path, parsed)
+    changed = list(dict.fromkeys(changed))
     if changed:
         raise Refused("these settings are protected and can only be changed in the file, in git: " + ", ".join(changed))
     if needs_user is not None:
@@ -471,6 +479,16 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
         return [Issue("error", needs_user.path, "the pack must load without your personal user file: it would break "
                       "for teammates and CI" + where), *issues]
     return issues
+
+
+def _written_changes(path: Path, parsed: dict) -> list[str]:
+    """The protected settings `parsed` changes compared with the file on disk, both as written (no layers, no
+    `@` resolution)."""
+    try:
+        old = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return []
+    return _protected_changes(old if isinstance(old, dict) else {}, parsed)
 
 
 def _raw_or_none(path: Path, *, user: bool) -> dict | None:
@@ -486,11 +504,7 @@ def _hold_unloadable(path: Path, parsed: dict) -> None:
     disk that loads, with or without the user file, is held: a broken one can be repaired."""
     if _raw_or_none(path, user=False) is None and _raw_or_none(path, user=True) is None:
         return
-    try:
-        old = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
-        return
-    changed = _protected_changes(old, parsed)
+    changed = _written_changes(path, parsed)
     if changed:
         raise Refused("these settings are protected and can only be changed in the file, in git: " + ", ".join(changed))
 
