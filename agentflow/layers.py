@@ -144,6 +144,19 @@ def leaf_keys(data: dict) -> list[Key]:
     return out
 
 
+def rows(merged: dict, origins: dict[Key, str]) -> list[tuple[str, Any, str]]:
+    """One `(dotted key, value, layer)` per leaf of `merged` (as `leaf_keys` walks it), in merged order. A leaf the
+    origins don't name itself, such as a key set below a lower layer's `{}`, takes the layer `origin_of` finds."""
+    out: list[tuple[str, Any, str]] = []
+    for key in leaf_keys(merged):
+        value: Any = merged
+        for part in key:
+            value = value[part]
+        dotted = ".".join(str(part) for part in key)
+        out.append((dotted, value, origins.get(key) or origin_of(origins, dotted) or "?"))
+    return out
+
+
 def _leaves(data: Any, prefix: Key = ()) -> list[Key]:
     if isinstance(data, dict) and data:
         return [leaf for key, value in data.items() for leaf in _leaves(value, (*prefix, str(key)))]

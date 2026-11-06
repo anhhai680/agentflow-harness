@@ -311,6 +311,9 @@ A module is done when its plan is fully checked and its PR is merged. The queue 
 
 ```bash
 agentflow validate                                  # after every config edit; 0 warnings
+agentflow config show                               # the pack file as written
+agentflow config show --effective [PREFIX]          # every value after the layers merge, with its layer
+                                                    #   (engine, project or user); PREFIX e.g. defaults, agents.claude
 agentflow next                                      # what now?
 agentflow explain <lane> --module X                 # what would run, no agent calls
 agentflow run <lane> … --dry-run                    # the commands, creates nothing
@@ -373,6 +376,8 @@ The pack is the repository's `.agentflow/` directory in the main checkout: `conf
 - **The workflow:** `lanes` (`feature`, `bug`), `phases`, `conditions`, `record_step`, `resolve_step`, `phase_approval`, `checkpoints`, `autonomy`, `ci` and `skills`. Every step's skill is a `@skills.map.<key>` reference to one of the bundled skills, and its text is the step's brief. A pack that writes `phases:` with `steps` writes the whole workflow (and `lanes`), and the defaults' workflow is dropped. A pack that writes only a phase's `needs_approval`, `resolve`, `model` or `agent` adjusts the defaults' workflow.
 
 The user file holds personal settings only: `agents.<name>.models` for an agent a lower layer defines, `defaults.run_budget_usd`, `defaults.task_budget_usd`, `hitl.notify`, `hitl.remind_after_h` and `dashboard.port`. Any other key, a key that is not text, or a file that is not a mapping is an error naming the file and the key. Nothing in it can set a command, a gate, a guardrail or the workflow.
+
+`agentflow config show --effective [PREFIX]` prints every value with the layer it came from. The Settings page shows the same values, marks one that is not the pack's with `from engine` or `from user`, and saves into the pack only what the pack must state: for a mapping, the entries that differ from the layers below it or that the pack already states (an inherited entry is removed with `<name>: null` in the YAML tab). A value your user file sets is read-only on the page, so a personal value never lands in the committed pack.
 
 A live run sees a change to any layer file between its phases: the runner takes the new config when it loads, validates and keeps the phases, and records `config_reload_skipped` with the reason when it does not (a broken user file is skipped like a broken pack). `run_options` records the digest of the layer files at the start (`layers_sha256`, and each file's own in `layer_digests`). On `resume`, if any of them changed since, one line names the files, and the run goes on with the files as they are now: `config_trust` still decides which pack file is trusted, by its own hash. The trade-off: an engine upgrade that changes the default workflow is reported on resume, not refused. A run started before this record existed reports nothing.
 

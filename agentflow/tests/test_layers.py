@@ -6,6 +6,7 @@ import copy
 from pathlib import Path
 
 import pytest
+import yaml
 
 from agentflow import layers
 from agentflow.layers import Layer, LayerError, check_user, merge, origin_of, owns_workflow
@@ -297,3 +298,24 @@ def test_the_user_layer_refuses_a_file_that_is_not_a_mapping(data):
     with pytest.raises(LayerError) as err:
         check_user(data, pack_with_agents(), USER_FILE)
     assert err.value.path == str(USER_FILE) and "mapping of personal settings" in err.value.message
+
+
+def test_rows_list_every_leaf_with_its_layer():
+    engine = yaml.safe_load(layers.ENGINE_DEFAULTS.read_text(encoding="utf-8"))
+    project = {"gates": {"unit": {"run": "true"}}, "hitl": {"remind_after_h": 2},
+               "agents": {"claude": {"models": {"build": "opus"}}}}
+    user = {"defaults": {"run_budget_usd": 9}}
+    merged, origins = merge([L("engine", engine), L("project", project), L("user", user)])
+    rows = layers.rows(merged, origins)
+    assert ("defaults.step_timeout_min", 45, "engine") in rows
+    assert ("defaults.run_budget_usd", 9, "user") in rows
+    assert ("gates.unit", {"run": "true"}, "project") in rows                 # a whole entry is one row
+    assert ("agents.claude.models.build", "opus", "project") in rows
+    assert ("agents.claude.models.plan", "opus", "engine") in rows
+    assert ("hitl.remind_after_h", 2, "project") in rows                      # below an engine `{}`
+    assert ("record_step", merged["record_step"], "engine") in rows
+    assert ("guardrails.forbidden_paths", [], "engine") in rows               # an empty list is a leaf
+    keys = [key for key, _, _ in rows]
+    assert len(keys) == len(set(keys)) == len(layers.leaf_keys(merged))
+    assert keys.index("project.base_branch") < keys.index("gates.unit") < keys.index("defaults.agent")  # merged order
+    assert layers.rows({}, {}) == []

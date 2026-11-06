@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import yaml
 
 from agentflow import hitl
 from agentflow.events import RunLock
@@ -532,3 +533,62 @@ def test_late_approval_on_an_ended_run_leaves_the_phase_row_alone(pipe):
     run.emit("phase_approval_raised", phase="build", round=0)
     assert run.state["phases"]["build"]["status"] == "running"
     assert run.state["waiting"] is None and run.state["status"] == "cancelled"
+
+
+# --------------------------------------------------------------------------- agentflow config show
+
+
+def _user_file(data: dict) -> Path:
+    from agentflow import layers
+
+    target = layers.user_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data), encoding="utf-8")
+    return target
+
+
+def test_config_show_effective_names_each_layer(sparse_repo, monkeypatch, capsys):
+    monkeypatch.chdir(sparse_repo)
+    _user_file({"defaults": {"run_budget_usd": 9}})
+    assert main(["config", "show", "--effective"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "defaults.step_timeout_min: 45  [engine]" in lines
+    assert 'gates.unit: {"run": "true"}  [project]' in lines             # a whole entry is one line of JSON
+    assert 'agents.claude.permission_mode: "bypassPermissions"  [project]' in lines
+    assert "defaults.run_budget_usd: 9  [user]" in lines
+    assert 'agents.claude.models.plan: "opus"  [engine]' in lines
+
+    assert main(["config", "show", "--effective", "defaults"]) == 0
+    only = capsys.readouterr().out.splitlines()
+    assert only and all(line.startswith("defaults.") for line in only)
+    assert "defaults.run_budget_usd: 9  [user]" in only
+    assert main(["config", "show", "--effective", "defaults.step"]) == 0      # segments, not characters
+    assert capsys.readouterr().out == ""
+    assert main(["config", "show", "--effective", "defaults.agent"]) == 0
+    assert capsys.readouterr().out.splitlines() == ['defaults.agent: "claude"  [engine]']
+
+
+def test_config_show_prints_the_pack_as_written(sparse_repo, monkeypatch, capsys):
+    monkeypatch.chdir(sparse_repo)
+    text = (sparse_repo / ".agentflow" / "config.yaml").read_text(encoding="utf-8")
+    _user_file({"defaults": {"run_budget_usd": 9}})  # never layered into the file as written
+    assert main(["config", "show"]) == 0
+    assert capsys.readouterr().out == text
+
+
+def test_config_show_takes_config_like_the_other_commands(sparse_repo, monkeypatch, capsys, tmp_path):
+    monkeypatch.chdir(sparse_repo)
+    other = tmp_path / "other" / "config.yaml"
+    other.parent.mkdir()
+    pack = yaml.safe_load((sparse_repo / ".agentflow" / "config.yaml").read_text(encoding="utf-8"))
+    pack["defaults"] = {"step_timeout_min": 50}
+    other.write_text(yaml.safe_dump(pack, sort_keys=False), encoding="utf-8")
+    assert main(["config", "show", "--config", str(other)]) == 0
+    assert capsys.readouterr().out == other.read_text(encoding="utf-8")
+    assert main(["config", "show", "--effective", "defaults.step_timeout_min", "--config", str(other)]) == 0
+    assert capsys.readouterr().out == "defaults.step_timeout_min: 50  [project]\n"
+    with pytest.raises(SystemExit):  # the top-level parser has no --config
+        main(["--config", str(other), "config", "show"])
+    capsys.readouterr()
+    assert main(["config", "show", "--config", str(tmp_path / "missing.yaml")]) == 1
+    assert capsys.readouterr().out.startswith("error")

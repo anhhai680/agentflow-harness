@@ -35,6 +35,7 @@ from typing import Any
 import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
+from agentflow import layers
 from agentflow.config import KNOWN_EFFORT_LEVELS, ConfigError, Issue, load_config, validate
 from agentflow.layers import PHASE_FREE_KEYS
 
@@ -172,6 +173,60 @@ def _get(data: Any, key: tuple[str, ...]) -> tuple[bool, Any]:
     return True, data
 
 
+@dataclass
+class _Layers:
+    """The file as written and the layered config it makes: the form shows the effective values (`merged`) and
+    writes only into the project file (`project`)."""
+    project: dict                                  # the pack file as written
+    merged: dict                                   # every layer merged, before `@` resolution (`Config.merged`)
+    origins: dict[tuple[str, ...], str]            # each leaf of `merged`: its layer (`Config.layer_origins`)
+    below: dict = field(default_factory=dict)      # the layers below the project merged, as they apply to it
+    user_path: Path | None = None                  # the user's own file, when it sets anything
+    comments: dict[tuple[str, ...], str] = field(default_factory=dict)  # each key's line comment, any layer's
+
+
+_RANK = {"engine": 0, "project": 2, "user": 3}  # a starter (`starter:<name>`) sits between the engine and the pack
+
+
+def _layers(path: Path, text: str) -> _Layers:
+    """The layered view of the pack at `path`, whose text is `text`. A pack that does not load (a broken file, a
+    user file the pack refuses) falls back to the file alone, as the form was before the layers."""
+    project = yaml.safe_load(text) or {}
+    project = project if isinstance(project, dict) else {}
+    comments = _comments(text)
+    try:
+        cfg = load_config(path)
+    except ConfigError:
+        return _Layers(project, project, {key: "project" for key in layers.leaf_keys(project)}, comments=comments)
+    engine_text = layers.ENGINE_DEFAULTS.read_text(encoding="utf-8")
+    below, _ = layers.merge([layers.Layer("engine", yaml.safe_load(engine_text) or {}, layers.ENGINE_DEFAULTS)])
+    if layers.owns_workflow(project):  # the pack writes the whole workflow: none of the engine's applies to it
+        for key in layers.WORKFLOW_KEYS:
+            below.pop(key, None)
+    user_path = layers.user_config_path() if "user" in cfg.layer_origins.values() else None
+    every = _comments(engine_text)  # bottom-up: a higher layer's comment on the same key wins
+    every.update(comments)
+    if user_path is not None:
+        try:
+            every.update(_comments(user_path.read_text(encoding="utf-8")))
+        except OSError:
+            pass
+    return _Layers(project, cfg.merged, cfg.layer_origins, below, user_path, every)
+
+
+def _under(origins: dict[tuple[str, ...], str], key: tuple[str, ...]) -> list[str]:
+    return [origin for leaf, origin in origins.items() if leaf[:len(key)] == key]
+
+
+def _source(lay: _Layers, key: tuple[str, ...]) -> str:
+    """The layer a field's value comes from; a mapping's, the highest layer among its entries. A key no layer
+    sets is the project's to set."""
+    under = _under(lay.origins, key)
+    if not under or not _get(lay.merged, key)[0]:
+        return "project"
+    return max(under, key=lambda origin: _RANK.get(origin, 1))
+
+
 def _catalog(raw: dict) -> list[dict]:
     """The form's sections, each with its fields' definitions (no values yet)."""
     sections = []
@@ -216,42 +271,53 @@ def _options(field_def: dict, raw: dict) -> list[str] | None:
     return options
 
 
+_INHERITED_ENTRY = "An entry from a lower layer can't be removed here: write `<name>: null` for it in the YAML tab."
+
+
 def form_fields(path: Path) -> dict:
-    """What the Settings page shows: the file's text and hash, the form (each field with its value and the
-    file's comment on that line), and the protected settings."""
+    """What the Settings page shows: the file's text and hash, the form (each field with its effective value, the
+    layer it comes from, whether the file states it, and the line comment on it in any layer's file), and the
+    protected settings with the layer each comes from when that is not the pack."""
     text, digest = read(path)
-    raw = yaml.safe_load(text) or {}
-    comments = _comments(text)
+    lay = _layers(path, text)
+    index = _field_index(lay)
     sections = []
-    for section in _catalog(raw):
+    for section in _catalog(lay.merged):
         fields = []
         for fdef in section["fields"]:
             key = tuple(fdef["key"])
-            parent_ok, _ = _get(raw, key[:-1])
+            parent_ok, _ = _get(lay.merged, key[:-1])
             if not parent_ok:
                 continue
-            present, value = _get(raw, key)
-            item = {**fdef, "value": value, "present": present, "help": comments.get(key, "")}
-            options = _options(fdef, raw)
-            if options is not None:
-                item["options"] = options
-            if isinstance(value, str) and value.startswith("@"):
+            _, value = _get(lay.merged, key)
+            item = {**index[key], "value": value, "present": _get(lay.project, key)[0], "source": _source(lay, key),
+                    "help": lay.comments.get(key, "")}
+            if item["kind"] == "map" and any(_RANK.get(o, 1) < _RANK["project"] for o in _under(lay.origins, key)):
+                item["help"] = f"{item['help'].rstrip('.')}. {_INHERITED_ENTRY}" if item["help"] else _INHERITED_ENTRY
+            if not item.get("readonly") and isinstance(value, str) and value.startswith("@"):
                 item["readonly"] = "a reference to another key; change it in the YAML tab"
             fields.append(item)
         if fields:
             sections.append({**section, "fields": fields})
-    return {"path": str(path), "sha256": digest, "text": text, "sections": sections, "protected": list(PROTECTED)}
+    sources = {dotted: _source(lay, tuple(dotted.split("."))) for dotted in _PROTECTED_KEYS}
+    return {"path": str(path), "sha256": digest, "text": text, "sections": sections, "protected": list(PROTECTED),
+            "protected_sources": {dotted: src for dotted, src in sources.items() if src != "project"}}
 
 
-def _field_index(raw: dict) -> dict[tuple[str, ...], dict]:
+def _field_index(lay: _Layers) -> dict[tuple[str, ...], dict]:
+    """Every field the form may hold, with its options and, for a value the user's own file sets (or a mapping
+    with an entry from it), why it is read-only: the page never writes a personal value into the pack."""
     index = {}
-    for section in _catalog(raw):
+    for section in _catalog(lay.merged):
         for fdef in section["fields"]:
             fdef = {**fdef}
-            options = _options(fdef, raw)
+            options = _options(fdef, lay.merged)
             if options is not None:
                 fdef["options"] = options
-            index[tuple(fdef["key"])] = fdef
+            key = tuple(fdef["key"])
+            if "user" in _under(lay.origins, key):
+                fdef["readonly"] = f"set in your user config ({lay.user_path}), which overrides the pack"
+            index[key] = fdef
     return index
 
 
@@ -325,7 +391,7 @@ def propose(path: Path, base_sha256: str, *, changes: list | None = None, text: 
             raise EditError(f"text must be at most {MAX_TEXT} bytes")
         new_text = text.replace("\r\n", "\n")
     else:
-        new_text = _apply_form(current, changes)
+        new_text = _apply_form(current, changes, path)
     issues = _check(path, new_text, repo or path.parent)
     diff = "".join(difflib.unified_diff(current.splitlines(keepends=True), new_text.splitlines(keepends=True),
                                         "config.yaml", "config.yaml (new)"))
@@ -377,7 +443,7 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
     finally:
         Path(temp).unlink(missing_ok=True)
     try:
-        old_raw = load_config(path).raw
+        old_raw = load_config(path).raw  # both configs layered: a sparse pack's phases and agents come from below
     except ConfigError:  # the file on disk is broken already: there is nothing to hold
         old_raw = None
     if old_raw is not None:
@@ -426,11 +492,15 @@ def _protected_changes(old: dict, new: dict) -> list[str]:
 # --------------------------------------------------------------------------- form changes as text edits
 
 
-def _apply_form(text: str, changes: Any) -> str:
+def _apply_form(text: str, changes: Any, path: Path) -> str:
+    """`text` (the pack at `path`) with the form's `changes` written into it. A field is checked against the layered
+    config, and only what the pack itself must state is written: a mapping's entries that differ from the layers
+    below it, or that the pack already states."""
     if not isinstance(changes, list) or not changes:
         raise EditError("changes must be a non-empty list")
-    raw = yaml.safe_load(text) or {}
-    index = _field_index(raw)
+    lay = _layers(path, text)
+    raw = lay.project
+    index = _field_index(lay)
     expected = copy.deepcopy(raw)
     for change in changes:
         if not isinstance(change, dict) or set(change) != {"key", "value"}:
@@ -440,14 +510,18 @@ def _apply_form(text: str, changes: Any) -> str:
             raise Refused(f"{key!r} is not a setting this page can change; use the YAML tab")
         fdef = index[tuple(key)]
         if fdef.get("readonly"):
-            raise Refused(f"{'.'.join(key)} cannot be changed here")
-        present, old_value = _get(raw, tuple(key))
+            raise Refused(f"{'.'.join(key)} cannot be changed here: {fdef['readonly']}")
+        present, old_value = _get(lay.merged, tuple(key))  # an inherited reference is one too
         if present and isinstance(old_value, str) and old_value.startswith("@"):
             raise Refused(f"{'.'.join(key)} is a reference to another key; change it in the YAML tab")
         problem = _check_value(fdef, change["value"])
         if problem:
             raise EditError(problem)
         value = change["value"]
+        if fdef["kind"] == "map":
+            value = _own_entries(lay, tuple(key), value)
+            if value is None:  # every entry is what the layers below already say: nothing to write
+                continue
         if value is None:
             text = _edit(text, tuple(key), _DELETE)
             _drop(expected, tuple(key))
@@ -457,6 +531,18 @@ def _apply_form(text: str, changes: Any) -> str:
     if yaml.safe_load(text) != expected:
         raise EditError("the change could not be made while keeping the file's layout; make it in the YAML tab")
     return text
+
+
+def _own_entries(lay: _Layers, key: tuple[str, ...], value: dict) -> dict | None:
+    """The entries of a mapping the pack must state: those it states already, and those whose value differs from
+    the merge of the layers below it. None when the pack states no such mapping and there is nothing to add."""
+    _, below = _get(lay.below, key)
+    below = below if isinstance(below, dict) else {}
+    stated, mine = _get(lay.project, key)
+    mine = mine if isinstance(mine, dict) else {}
+    own = {name: entry for name, entry in value.items()
+           if name in mine or name not in below or type(below[name]) is not type(entry) or below[name] != entry}
+    return own if own or stated else None
 
 
 def _put(data: dict, key: tuple[str, ...], value: Any) -> None:

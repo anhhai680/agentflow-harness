@@ -77,6 +77,33 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config_show(args: argparse.Namespace) -> int:
+    """The pack file as written, or (`--effective`) every leaf of the layered config with the layer it came from."""
+    from agentflow.config import ConfigError, load_config
+    from agentflow.layers import rows
+    from agentflow.pack import PackError
+
+    try:
+        config_path = Path(args.config) if args.config else _pack_config()
+        if not args.effective:
+            sys.stdout.write(config_path.read_text(encoding="utf-8"))
+            return 0
+        cfg = load_config(config_path)
+    except ConfigError as exc:
+        where = f"{exc.path}: " if exc.path else ""
+        print(f"error {where}{exc.message}")
+        return 1
+    except (PackError, OSError) as exc:
+        print(f"error {exc}")
+        return 1
+    prefix = args.effective if isinstance(args.effective, str) else ""
+    for dotted, value, layer in rows(cfg.merged, cfg.layer_origins):
+        if prefix and dotted != prefix and not dotted.startswith(prefix + "."):
+            continue
+        print(f"{dotted}: {json.dumps(value, ensure_ascii=False, default=str)}  [{layer}]")
+    return 0
+
+
 def _load_cfg(args: argparse.Namespace):
     from agentflow.config import load_config
 
@@ -777,6 +804,15 @@ def build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser("validate", help="check config.yaml: skills, prompts, conditions, references")
     check.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     check.set_defaults(func=cmd_validate)
+
+    conf = sub.add_parser("config", help="show the pack file, or the effective config with each value's layer")
+    conf_sub = conf.add_subparsers(dest="config_command", required=True)
+    show = conf_sub.add_parser("show", help="print the pack file as written; --effective: the merged layers")
+    show.add_argument("--effective", nargs="?", const=True, default=False, metavar="PREFIX",
+                      help="every value after the engine defaults, the pack and your user file are merged, as "
+                           "`<key>: <JSON>  [<layer>]`; a PREFIX (e.g. `defaults` or `agents.claude`) shows only its keys")
+    show.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+    show.set_defaults(func=cmd_config_show)
 
     status = sub.add_parser("status", help="list runs with phase, step, status and spend, or show one run")
     status.add_argument("run", nargs="?", help="a run id (or a part of it that matches one run)")
