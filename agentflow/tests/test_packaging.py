@@ -29,12 +29,14 @@ OFFLINE_MARKERS = (
 
 
 def _engine_files() -> list[str]:
-    """Every engine file git knows (tracked, or untracked and not ignored) under `agentflow/`, minus the tests."""
+    """Every engine file git knows (tracked, or untracked and not ignored) under `agentflow/`, minus the tests and
+    the checkout's own `.gitignore`."""
     out = subprocess.run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "agentflow"],
         cwd=ROOT, capture_output=True, text=True, check=True,
     ).stdout
-    return sorted(p for p in out.splitlines() if p and not p.startswith("agentflow/tests/"))
+    return sorted(p for p in out.splitlines()
+                  if p and not p.startswith("agentflow/tests/") and p != "agentflow/.gitignore")
 
 
 def _uv_or_skip() -> str:
@@ -84,6 +86,12 @@ def test_wheel_holds_every_engine_file_and_no_tests(tmp_path):
     names = set(zipfile.ZipFile(wheel).namelist())
     assert set(_engine_files()) <= names
     assert not any(n.startswith("agentflow/tests/") for n in names)
+    assert "agentflow/.gitignore" not in names
+
+
+def test_wheel_excludes_the_checkouts_gitignore():
+    exclude = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["hatch"]["build"]["targets"]["wheel"]["exclude"]
+    assert "agentflow/.gitignore" in exclude
 
 
 def test_installed_tool_runs_outside_this_checkout(tmp_path):

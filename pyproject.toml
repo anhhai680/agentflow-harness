@@ -14,7 +14,7 @@ agentflow = "agentflow.flow:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentflow"]
-exclude = ["agentflow/tests", "agentflow/runs", "agentflow/workspaces"]
+exclude = ["agentflow/tests", "agentflow/runs", "agentflow/workspaces", "agentflow/.gitignore"]
 
 # A local install caches its built wheel: rebuild it when any file under agentflow/ changes.
 # `uv tool install --reinstall --from . agentflow` is the fallback if uv does not pick a change up.
