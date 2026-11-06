@@ -1002,3 +1002,36 @@ def test_a_step_without_a_skill_but_with_a_brief_renders_no_empty_skill_heading(
         prompt = skill_prompt(flow_repo, make_step(prompt=template, skill=None, brief=["mybrief.md"]))
         assert "`` skill" not in prompt and "MY BRIEF" in prompt and "## The brief" in prompt, template
         assert "## When you finish" in prompt, template
+
+
+@pytest.mark.parametrize("lane", ["feature", "bug"])
+def test_engine_prompts_inline_the_bundled_skills_over_a_sparse_pack(sparse_repo, lane):
+    # The engine's prompts and its bundled skills together, as a pack with no prompts and no skills runs them.
+    from agentflow import pack
+    from agentflow.config import for_lane, load_config
+
+    cfg = load_config(pack.pack_config(sparse_repo))
+    ctx = make_ctx(cfg, sparse_repo, lane, {"module": "x"})
+
+    def walk(steps):
+        for step in steps:
+            yield step
+            yield from walk(step.steps)
+            if step.review:
+                yield step.review
+
+    seen = 0
+    for phase in cfg.phases.values():
+        for step in walk(for_lane(phase.steps, lane)):
+            if not step.skill or step.type not in (None, "agent"):
+                continue
+            seen += 1
+            found = pack.skill_file(sparse_repo, cfg.project.skills_dir, step.skill)
+            assert found is not None and pack.is_bundled(found), step.id
+            h1 = next(line for line in found.read_text(encoding="utf-8").splitlines() if line.startswith("# "))
+            text = build_prompt(cfg, step, ctx, {}, {}, "normal")
+            assert f"Use the `{step.skill}` skill: its full text is in this prompt" in text, step.id
+            assert h1 in text, step.id
+            assert "## The `` skill" not in text, step.id
+            assert not [p for p in ("{skill}", "{brief}", "{base_ref}") if p in text], step.id
+    assert seen >= 5
