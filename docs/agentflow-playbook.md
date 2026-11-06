@@ -310,6 +310,7 @@ A module is done when its plan is fully checked and its PR is merged. The queue 
 ## 10. Cheat sheet
 
 ```bash
+agentflow init [--starter NAME] [--baseline]        # write a sparse pack for this repository (section 13)
 agentflow doctor                                    # agent CLIs and logins, gh, origin, Docker, state dir, gate tools
 agentflow validate                                  # after every config edit; 0 warnings
 agentflow config show                               # the pack file as written
@@ -358,13 +359,25 @@ agentflow queue --max-parallel 2
 
 ## 13. Using agentflow in another repository
 
-The engine (`agentflow/`) names no project: everything a repository decides is in its pack, the `.agentflow/` directory at the root of its main checkout (section 14). To use agentflow in another repository:
+The engine (`agentflow/`) names no project: everything a repository decides is in its pack, the `.agentflow/` directory at the root of its main checkout (section 14). `agentflow init` writes a sparse pack, about 15 lines, and everything it doesn't write comes from the engine defaults and a starter (`python-uv`, `node-pnpm`, `go` or `docs-only`).
 
-1. Write `.agentflow/config.yaml`. Start from the `python` fixture pack (`agentflow/tests/fixtures/packs/python/.agentflow/config.yaml`), or from this repository's own `.agentflow/config.yaml`, and set its values: `project.*`, the `gates:` and `gate_sets:` (your quality bar's real commands; `gate_sets.verify` is required), the `conditions:` that read your docs, `overlays`, `guardrails`, and the lanes and steps you use. Every skill a step names must exist under `project.skills_dir` or be one of the engine's bundled `agentflow-*` skills. `agentflow/tests/fixtures/packs/node` is the smallest pack that works.
-2. Put any prompt you want worded differently in `.agentflow/prompts/<name>.md`; it replaces the engine's file of the same name, and every other prompt comes from the engine.
-3. Run `agentflow validate` until it prints 0 warnings, then `agentflow explain <lane> --module <id>` and `agentflow run … --dry-run` before the first real run.
+1. **Install the engine** as a tool, once per machine (section 3): `uv tool install --from /path/to/agentflow-harness agentflow`.
+2. **Run `agentflow init [--starter NAME] [--baseline]`** from the repository, on any branch. It reads the base branch through git, never the working tree (unless the repository has no commit yet), and runs nothing from the repository unless you pass `--baseline`. It:
+   - finds the base branch from `origin`, picks the starter from `pyproject.toml`, `package.json` or `go.mod` (`--starter` overrides it), and proposes gates: from the CI workflow steps first (`.github/workflows/*.yml`), then `package.json` scripts, `pyproject.toml` tool sections and `Makefile` targets, else the starter's. A step it can't run the way CI does (an action, an install, a matrix value) is skipped with a note.
+   - finds `docs/plans`, ADR and spec folders, the repository's own skills and its `CLAUDE.md`/`AGENTS.md`;
+   - runs `doctor` (step 6) and prints its table;
+   - with `--baseline` only: runs each proposed gate once on the base branch in a throwaway worktree in the state dir, and prints a table (gate, command, pass/fail/error, seconds, note). A gate that fails there is written with `baseline: red`, so a run isn't blamed for it, and it leaves the gate sets (if every verify gate is red, they stay, and `init` says runs can't pass verify until you fix them). A missing tool, a timeout or a failed setup is an `error`, never red;
+   - writes `.agentflow/config.yaml` once, with `gates_confirmed: false` and `agents.claude.permission_mode: bypassPermissions` (with a comment saying what it allows), and nothing else in the repository.
 
-Runs and workspaces live in the state dir, outside the repository unless `paths.state_dir` puts them inside it; then add that directory to `.gitignore` (`agentflow validate` warns until you do).
+   It refuses when the repository already has a pack: edit it, or `rm -rf .agentflow` to start over.
+3. **Read the notes and the gate table.** The gates are a proposal, and the quality bar is yours to decide: fix the commands, add the gates CI doesn't show, and fix or delete a red gate. `agentflow config show --effective gates` shows the gates together with the starter's.
+4. **If you use the bug lane** (on by default), add the `Bash(...)` rule `init` printed to `permissions.allow` in `.claude/settings.json` (shared) or your git-ignored `.claude/settings.local.json`. The bug lane's red/green check runs the regression test only when an allow rule covers it, and `validate` warns until one does.
+5. **Set `gates_confirmed: true`** in the pack. `validate` warns until you do.
+6. **Check:** `agentflow doctor` (agent CLIs and logins, `gh`, `origin`, Docker, the state dir, each gate's programs), `agentflow validate` (it must print 0 warnings), `agentflow explain feature --module <id>`, and `agentflow run feature --module <id> --dry-run`. Then commit the pack in a PR of its own, so the team reviews the gates and the permission line.
+
+Prompts: put any prompt you want worded differently in `.agentflow/prompts/<name>.md`; it replaces the engine's file of the same name. Skills: a step's skill text is its brief, read from the repository's `project.skills_dir` first and the engine's bundled `agentflow-*` skills second; map your own skills per stage in `skills.map` (section 14). A repository with no skills dir runs on the bundled ones.
+
+Runs, workspaces and worktrees live in the state dir, outside the repository unless `paths.state_dir` puts them inside it; then add that directory to `.gitignore` (`agentflow validate` warns until you do). Removing agentflow from a repository is `rm -rf .agentflow`.
 
 ## 14. Pack reference
 

@@ -148,6 +148,24 @@ Precedence, highest first:
 ### Multi-project
 One `agentflow dashboard` serves every repo registered on the machine (`agentflow init` registers it). Each repo has its own Board, Scorecard, memory and baseline. `agentflow status --all-projects` gives the cross-repo view. Budgets and autonomy levels are always per project.
 
+### Deviations in slice PnP (as built)
+Slice PnP shipped in two plans (§5). Where it differs from the text above:
+
+From PnP-1 (`docs/plans/2026-11-05-agentflow-harness-slice-pnp-1.md`):
+1. **The bundled skills** are define, plan, build, debug, verify, review and respond (taking review feedback). `ship` is not bundled, because no agent step ships: `finish` is runner code.
+2. **The engine defaults carry no `permission_mode`.** A pack states `agents.claude.permission_mode: bypassPermissions` itself, and `init` writes it with a comment, so the team reviews it in the pack's PR. Decided 2026-11-06.
+3. **The bug lane on a repository with no Bash allow rule.** Its red/green check (`bug_eval.py`, through `guards.command_allowed`) needs a Bash allow rule that covers the test command, whatever `permission_mode` says. A sparse pack's repository usually has none, so `validate` warns about it; `guards.py` is unchanged. Decided 2026-11-06.
+
+From PnP-2 (`docs/plans/2026-11-06-agentflow-harness-slice-pnp-2.md`):
+1. **`init` runs no gate without `--baseline`.** Detected gates are a proposal, and nothing from the repository runs until a human asks. The gate baseline above is opt-in. Decided 2026-11-06.
+2. **`init` writes the permission line itself:** `agents.claude.permission_mode: bypassPermissions`, with a comment. Decided 2026-11-06.
+3. **The bug lane needs a Bash allow rule, and `init` prints one,** built narrowly from the first verify gate's command. Decided 2026-11-06.
+4. **The Portability check** (`init --starter python-uv` in an empty repo, then `validate` reports 0 warnings) is read together with the `gates_confirmed` rule: `validate` reports exactly the `gates_confirmed` warning, and 0 once it is set. With PnP-1's third deviation, both this check and the "0 warnings after `gates_confirmed`" of the plug-and-play test hold once the human has also added the Bash rule `init` printed (the test puts it in the git-ignored `.claude/settings.local.json`, so the repository still shows only `.agentflow/`).
+
+Not built in this slice: the multi-project registry and `status --all-projects`, `agentflow hook install`, `migrate`, `config diff-defaults`, `agentflow baseline` on an existing pack, Settings saving to the user layer, autonomy levels and the conductor, and a Rust starter. `init` does not map a repository's own skills into `skills.map`.
+
+**Time to first dry run: not measured.** The plug-and-play test (`agentflow/tests/test_plug_and_play.py`) proves the path from `init` to `run --dry-run` on the three fixture repositories, but nobody has timed it on a real repository against the 10-minute target.
+
 ---
 
 ## 2. What is missing (gap analysis)
@@ -505,7 +523,7 @@ All of it comes from `events.jsonl`, the existing single source of truth, throug
 - Add the two fixture packs and the denylist test.
 - `agentflow explain` output for every lane must be identical before and after.
 
-**Slice PnP: make the engine plug and play** (1c):
+**Slice PnP (done, 2026-11-06; `docs/plans/2026-11-05-agentflow-harness-slice-pnp-1.md`, `docs/plans/2026-11-06-agentflow-harness-slice-pnp-2.md`): make the engine plug and play** (1c; its deviations are recorded at the end of 1c):
 - packaging as an installable tool with a console script
 - the state dir outside the repo
 - layered config and `config show --effective`
