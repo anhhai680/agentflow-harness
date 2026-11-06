@@ -57,9 +57,12 @@ def user_config_path() -> Path:
 
 
 def starter_names() -> list[str]:
-    """The names of the starters the engine ships: the directories of `STARTERS`, sorted."""
+    """The names of the starters the engine ships: the directories of `STARTERS`, sorted (not a hidden one, and not
+    a symlink, which could lead out of the folder)."""
     try:
-        return sorted(p.name for p in STARTERS.iterdir() if p.is_dir() and (p / "config.yaml").is_file())
+        return sorted(p.name for p in STARTERS.iterdir()
+                      if not p.name.startswith(".") and not p.is_symlink() and p.is_dir()
+                      and (p / "config.yaml").is_file())
     except OSError:
         return []
 

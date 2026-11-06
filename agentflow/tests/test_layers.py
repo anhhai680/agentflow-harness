@@ -366,6 +366,19 @@ def test_base_layers_builds_its_path_from_the_listed_entry_only(monkeypatch, tmp
     assert layers.base_layers("ok")[1].path == tmp_path / "ok" / "config.yaml"
 
 
+def test_starter_names_skip_hidden_and_symlinked_directories(monkeypatch, tmp_path):
+    starters, outside = tmp_path / "starters", tmp_path / "outside"
+    for folder in (starters / "ok", starters / ".hidden", outside):
+        folder.mkdir(parents=True)
+        (folder / "config.yaml").write_text("gates: {}\n", encoding="utf-8")
+    (starters / "linked").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(layers, "STARTERS", starters)
+    assert layers.starter_names() == ["ok"]
+    for name in (".hidden", "linked"):
+        with pytest.raises(LayerError):
+            layers.base_layers(name)
+
+
 def _docs_gate() -> str:
     data = yaml.safe_load((layers.STARTERS / "docs-only" / "config.yaml").read_text(encoding="utf-8"))
     return data["gates"]["whitespace"]["run"]
