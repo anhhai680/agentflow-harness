@@ -661,6 +661,17 @@ def test_plan_warnings_for_big_tasks(cfg, tmp_path):
     assert plan_warnings(make_ctx(cfg, tmp_path, "feature", {"module": "other"})) == []
 
 
+def test_plan_warnings_for_forbidden_files(cfg, tmp_path):
+    plans = tmp_path / "docs" / "plans"
+    plans.mkdir(parents=True)
+    forbidden = cfg.guardrails.forbidden_paths[0]
+    (plans / "2026-10-29-crm.md").write_text(
+        f"### Task 1: Needs a human\n\n- Modify: `{forbidden}`\n- [ ] **Step 1: s**\n"
+        "### Task 2: Done\n\n- Modify: `.agentflow/config.yaml`\n- [x] **Step 1: s**\n", encoding="utf-8")
+    warnings = plan_warnings(make_ctx(cfg, tmp_path, "feature", {"module": "crm"}))
+    assert len(warnings) == 1 and "Task 1" in warnings[0] and forbidden in warnings[0]
+
+
 def test_cond_result_defaults():
     r = CondResult(True, "because")
     assert r.on_unknown == "ask_human"
