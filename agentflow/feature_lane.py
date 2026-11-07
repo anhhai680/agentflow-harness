@@ -27,9 +27,10 @@ the task is committed on top as `Refine Task N: <title>` with the note in the bo
 answer `unchanged`. A task parked in the round holds back only the tasks that depend on it.
 A rejected stop inside one task (`refine.scope`, `<step>/task-<n>`) refines only that task: the other
 committed tasks are passed over as if committed in the round, unless a step of theirs still waits on an
-earlier round's refine. An implementer that answers `unchanged` and leaves the tree as its round started
-gets no review (`review_skipped`) and no gate run: the task is recorded as committed in the round with
-no commit (`sha: null`).
+earlier round's refine. A stop inside a batch of several tasks refines the whole phase. An implementer
+that answers `unchanged`, leaves the tree as its round started, and started from the task's committed
+work gets no review (`review_skipped`) and no gate run: the task is recorded as committed in the round
+with no commit (`sha: null`).
 
 A small plan has no per-task review. A `needs_human` result with `can_continue_without` (and
 `hitl.park_independent`) parks the task: the question is asked without stopping, and tasks that do
@@ -312,15 +313,24 @@ class FeatureLane:
         scope = (self.run.state.get("refine") or {}).get("scope")
         if not scope or tkey == scope:
             return True
-        steps = self.run.state["steps"]
-        return any(row.get("status") == "refine_pending" for key, row in steps.items() if key.startswith(tkey + "/"))
+        steps = self.run.state["steps"]  # the task's own steps only: a resolver's row (`…/resolve-N`) is never settled
+        return any((steps.get(f"{tkey}/{part}") or {}).get("status") == "refine_pending"
+                   for part in ("implement", "review", "commit"))
 
-    def _changed_nothing(self, impl_key: str) -> bool:
-        """The implementer answered `unchanged` and the tree is the one its last `step_started` recorded."""
+    def _changed_nothing(self, tkey: str) -> bool:
+        """The implementer answered `unchanged`, the tree is the one its last `step_started` recorded, and that
+        tree held nothing uncommitted of this task's (an earlier round's edits left by a stop are still to review)."""
+        impl_key = f"{tkey}/implement"
         if (self.run.state["steps"].get(impl_key) or {}).get("status") != "unchanged":
             return False
         started = [e for e in self.run.events.read() if e["type"] == "step_started" and e.get("key") == impl_key]
-        return bool(started) and bool(started[-1].get("start_tree")) and started[-1]["start_tree"] == snapshot(self.worktree)
+        if not started:
+            return False
+        start_tree, start_head = str(started[-1].get("start_tree") or ""), str(started[-1].get("start_head") or "")
+        if not start_tree or not start_head or start_tree != snapshot(self.worktree):
+            return False
+        held = self._held_paths(tkey)  # other parked tasks' files are theirs, not this task's
+        return not [p for p in changed_paths(self.worktree, f"{start_head}^{{tree}}", start_tree) if p not in held]
 
     def _committed(self, tkey: str, round_: int = 0) -> bool:
         return any(e["type"] == "task_committed" and e.get("key") == tkey and int(e.get("round") or 0) == round_
@@ -390,7 +400,7 @@ class FeatureLane:
         open_findings: list[dict] = []
         review = step.review if not small.get("active") or small.get("review") else None
         last = not batch or task.n == batch[-1].n
-        if round_ and self._changed_nothing(f"{tkey}/implement"):  # nothing to review or gate: the tree passed before
+        if round_ and self._changed_nothing(tkey):  # nothing to review or gate: the tree passed before
             review_key = f"{tkey}/review"
             if review is not None and not any(e["type"] == "review_skipped" and e.get("key") == review_key
                                               for e in self._round_events(phase)):

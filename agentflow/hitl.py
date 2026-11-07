@@ -358,7 +358,7 @@ def park_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, question
 
 def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool) -> str:
     """The inbox line that says what each way out of this stop does."""
-    scoped = task_scope(key.split("/")[0], key)
+    scoped = rejected_scope(run, key.split("/")[0], key)
     back = f"task {scoped[1]}" if scoped else "the phase"
     reject = f"`agentflow reject {run.id} {key} --note \"...\"` sends {back} back for a refine round."
     if has_questions:
@@ -524,16 +524,31 @@ def task_scope(phase: str, key: str) -> tuple[str, int] | None:
     return (match.group(0), int(match.group(1))) if match else None
 
 
+def rejected_scope(run: Run, phase: str, key: str) -> tuple[str, int] | None:
+    """`task_scope`, unless the task was one of a batch of several (`plan_batched`): the batch's members before
+    its last were committed without a review of their own, so a stop in the batch sends the whole phase back."""
+    scoped = task_scope(phase, key)
+    if scoped is None:
+        return None
+    prefix = scoped[0].rsplit("/", 1)[0]
+    batched = [e for e in run.events.read() if e["type"] == "plan_batched" and e.get("key") == prefix]
+    batches = (batched[-1].get("batches") or []) if batched else []
+    if any(isinstance(b, list) and len(b) > 1 and scoped[1] in b for b in batches):
+        return None
+    return scoped
+
+
 def reject(run: Run, target: str, by: str, note: str) -> None:
     """Reject a phase (or the phase an inner checkpoint belongs to): record the note and start a refine round.
-    A stop inside a plan task sends only that task back (`scope`); any other target refines the whole phase."""
+    A stop inside a plan task sends only that task back (`scope`), unless the task was batched with others;
+    any other target refines the whole phase."""
     note = nfc(note).strip()
     if not note:
         raise ValueError("a rejection needs a note")
     with run.locked():
         kind, name = _resolve(run, target)
         phase = name if kind == "phase" else (run.state["waiting"]["phase"] or name.split("/")[0])
-        scoped = task_scope(phase, name) if kind == "checkpoint" else None
+        scoped = rejected_scope(run, phase, name) if kind == "checkpoint" else None
         open_refine(run, phase, by, note, {"key": name} if kind == "checkpoint" else {},
                     scope=scoped[0] if scoped else None)
 
