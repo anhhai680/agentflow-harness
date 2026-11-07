@@ -651,6 +651,36 @@ def test_reopened_step_is_resumable_and_rejection_drops_parked(run):
     assert run.state["steps"]["build/b/task-2/implement"]["status"] == "refine_pending"
 
 
+def test_a_scoped_rejection_refines_only_its_task(run):
+    for key in ("build/setup", "build/b", "build/b/task-1/implement", "build/b/task-2/implement",
+                "build/b/task-2/review", "build/b/task-20/implement"):
+        run.emit("step_finished", key=key, status="done", summary="ok")
+    run.emit("step_parked", kind="needs_human", key="build/b/task-2/implement", phase="build", summary="", questions=[])
+    run.emit("step_parked", kind="needs_human", key="build/b/task-3/implement", phase="build", summary="", questions=[])
+    run.emit("phase_rejected", phase="build", round=1, note="redo two", key="build/b/task-2/implement",
+             scope="build/b/task-2")
+    assert run.state["refine"] == {"phase": "build", "round": 1, "note": "redo two", "scope": "build/b/task-2"}
+    steps = run.state["steps"]
+    for key in ("build/b/task-2/implement", "build/b/task-2/review", "build/b"):  # and the foreach that holds it
+        assert steps[key]["status"] == "refine_pending" and steps[key]["round"] == 1
+    for key in ("build/setup", "build/b/task-1/implement", "build/b/task-20/implement"):
+        assert steps[key]["status"] == "done"
+    assert steps["build/b/task-3/implement"]["status"] == "parked"
+    assert list(run.state["parked"]) == ["build/b/task-3/implement"]  # only the task's own park is dropped
+    assert state_json(run) == replay(run.events.read())
+
+
+def test_a_skipped_review_is_recorded_until_a_review_runs(run):
+    run.emit("step_finished", key="build/b/task-1/review", status="done", summary="ok")
+    run.emit("phase_rejected", phase="build", round=1, note="redo")
+    run.emit("review_skipped", key="build/b/task-1/review", reason="unchanged", round=1)
+    assert run.state["reviews"]["build/b/task-1/review"] == {"skipped": True, "reason": "unchanged", "round": 1}
+    row = run.state["steps"]["build/b/task-1/review"]  # settled, so the round leaves nothing pending
+    assert row["status"] == "skipped" and row["skip_reason"] == "unchanged"
+    run.emit("review_result", key="build/b/task-1/review", round=1, findings=[], blocking=0, blocking_findings=[])
+    assert "skipped" not in run.state["reviews"]["build/b/task-1/review"]
+
+
 def test_status_spend_includes_a_session_still_running():
     from agentflow.flow import _spend
 

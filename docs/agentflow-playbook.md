@@ -140,6 +140,8 @@ agentflow approve <run> plan          # next phase starts in a fresh session
 agentflow reject  <run> plan --note "Split task 3 into two tasks"   # refine round; note is required
 ```
 
+Rejecting a stop inside one plan task (`build/build/task-2/implement`, `…/review` or `…/commit`) sends only that task back for a refine round; the other tasks keep their commits and start no session. Rejecting the phase still refines every task. In any refine round of `build`, a task whose implementer answers `unchanged` and leaves the tree alone gets no review and no gate run (while the run is in `build`, its card shows `– review task N (unchanged)`).
+
 `approve`, `reject`, `answer` and `retry` record the action and then **continue the run in the foreground**. Add `--detach` to continue in the background, or `--no-continue` to only record. Wherever a command takes `<run>`, any part of the id that matches one run is enough.
 
 On the dashboard, approving `plan` starts `build`, because `build` needs no human. Approving `define` doesn't start `plan`: when the next phase also needs you, the card rests as **ready** in its column, and you choose:
@@ -323,7 +325,7 @@ agentflow run <lane> --module X [--from P] [--to P] [--model P=m] [--detach]
 agentflow inbox | status | agents                   # what is waiting, running, spent
 agentflow answer <run> --set q1="…"                 # ids as the inbox shows them; --key for a parked step
 agentflow approve <run> <phase|step-key> [--budget N]
-agentflow reject <run> <phase> --note "…"
+agentflow reject <run> <phase|step-key> --note "…"     # a stop inside a plan task refines only that task
 agentflow retry <run> <step-key>                    # a fresh session
 agentflow pause | resume | cancel <run>
 agentflow resume <run> --mark-done                  # a ready run: skip to ship, open the draft PR

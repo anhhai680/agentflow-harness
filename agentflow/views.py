@@ -134,6 +134,17 @@ def _last_gates(state: dict) -> list[dict]:
     return list(last.values())
 
 
+def _review_skips(state: dict) -> list[dict]:
+    """The current phase's per-task reviews a refine round skipped because the implementer changed nothing."""
+    prefix = f"{state.get('phase') or ''}/"
+    skips = []
+    for key, review in (state.get("reviews") or {}).items():
+        match = TASK_KEY.match(key)
+        if isinstance(review, dict) and review.get("skipped") and match and key.startswith(prefix):
+            skips.append({"key": key, "task": int(match["n"]), "reason": review.get("reason")})
+    return skips
+
+
 def _live_agents(state: dict) -> list[dict]:
     return [row for row in state.get("agents", {}).values() if _alive(row.get("pid"))]
 
@@ -238,6 +249,7 @@ def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metri
         "spend": round(float(state.get("spend_usd") or 0.0) + sum(float(r.get("spend") or 0.0) for r in live), 6),
         "budget": state.get("budget_usd"),
         "gates": _last_gates(state),
+        "review_skipped": _review_skips(state),
         "phase_since": since,
         "time_in_phase_s": _age(now, since),
         "waiting": {k: waiting.get(k) for k in ("kind", "key", "summary")} if waiting else None,

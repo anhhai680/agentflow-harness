@@ -425,3 +425,163 @@ def test_unchanged_with_edits_is_refused(pipe, git):
     assert go(pipe, run) == "awaiting_approval"
     assert git_in(git, run, "log", "-1", "--format=%s").strip() == "Refine draft: Draft SPEC-demo"
     assert SPEC in git_in(git, run, "show", "--name-only", "--format=", "HEAD").split()
+
+
+# --------------------------------------------------------------------------- a task's own refine round (slice QW)
+
+TITLES3 = {1: "First thing", 2: "Second thing", 3: "Third thing"}
+IMPL3, REVIEW3 = "build/build/task-3/implement", "build/build/task-3/review"
+TASK2 = "build/build/task-2"
+NOTE2 = "Task hai: đổi TTL"
+PARK = {"result": {"status": "needs_human", "summary": "which TTL?", "questions": [AMBIGUITY],
+                   "can_continue_without": True}}
+
+
+def commit_plan(flow_repo, git, titles: dict[int, str]) -> None:
+    parts = ["# Plan: demo\n"]
+    for n, title in titles.items():
+        parts.append(f"### Task {n}: {title}\n\n**Depends on:** none\n\n- [ ] **Step 1: Task {n} code**\n")
+    for rel, text in ((SPEC, SPEC_PLAIN), (PLAN_PATH, "\n".join(parts))):
+        target = flow_repo.root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    git(flow_repo.root, "add", "-A")
+    git(flow_repo.root, "commit", "-q", "-m", "Spec and plan demo")
+
+
+def started_since(flow_repo, run, seq: int) -> list[str]:
+    return [e["step"] for e in flow_repo.events(run, "agent_started") if e["seq"] > seq]
+
+
+def last_seq(run) -> int:
+    return run.events.read()[-1]["seq"]
+
+
+def build_rows(run) -> dict[str, str]:
+    return {k: r["status"] for k, r in run.state["steps"].items() if k.startswith("build/build")}
+
+
+def test_rejecting_a_task_stop_refines_only_that_task(flow_repo, git):
+    flow_repo.configure(BIG)
+    commit_plan(flow_repo, git, TITLES3)
+    flow_repo.script({
+        IMPL1: [{"write": {"src/one.py": "x = 1\n"}, **done("task one")}],
+        IMPL2: [{"write": {"src/two.py": "y = 2\n"}, **PARK},
+                {"write": {"src/two.py": "y = 20\n"}, **done("task two refined")}],
+        IMPL3: [{"write": {"src/three.py": "z = 3\n"}, **done("task three")}],
+    })
+    run = begin(flow_repo, "feature", from_phase="build")
+    assert go(flow_repo, run) == "waiting_human" and run.state["waiting"]["key"] == IMPL2
+    assert [e["key"] for e in flow_repo.events(run, "task_committed")] == ["build/build/task-1", "build/build/task-3"]
+
+    rejected = last_seq(run)
+    reject(run, IMPL2, "me", NOTE2)
+    assert run.state["refine"]["scope"] == TASK2
+    assert go(flow_repo, run) == "awaiting_approval" and run.state["waiting"]["key"] == "build_approved"
+    assert started_since(flow_repo, run, rejected) == [IMPL2, REVIEW2]  # tasks 1 and 3 start no session
+    call = calls_for(flow_repo.calls(), IMPL2)[-1]
+    assert NOTE2 in call["argv"][-1]
+    assert git_in(git, run, "log", "-1", "--format=%s").strip() == "Task 2: Second thing"
+    assert "y = 20" in (Path(run.state["worktree"]) / "src/two.py").read_text(encoding="utf-8")
+    rows = build_rows(run)
+    assert set(rows.values()) <= {"done", "unchanged"}, rows  # the phase finished: nothing left pending
+
+    whole = last_seq(run)
+    reject(run, "build", "me", NOTE)  # a phase-level rejection still refines every task
+    assert "scope" not in run.state["refine"]
+    assert go(flow_repo, run) == "awaiting_approval" and run.state["waiting"]["key"] == "build_approved"
+    assert started_since(flow_repo, run, whole) == [IMPL1, REVIEW1, IMPL2, REVIEW2, IMPL3, REVIEW3]
+
+    from agentflow.hitl import approve
+    approve(run, "build", "me")
+    go(flow_repo, run)
+    assert [e for e in flow_repo.events(run, "phase_started") if e["phase"] == "verify"]
+
+
+def test_a_scoped_round_still_refines_a_task_an_earlier_round_left(flow_repo, git):
+    flow_repo.configure(BIG)
+    commit_plan(flow_repo, git, TITLES3)
+    flow_repo.script({
+        IMPL1: [{"write": {"src/one.py": "x = 1\n"}, **done("task one")},
+                {"write": {"src/one.py": "x = 10\n"}, **done("task one refined")}],
+        IMPL2: [{"write": {"src/two.py": "y = 2\n"}, **done("task two")},
+                {"result": {"status": "blocked", "summary": "which TTL?"}},
+                {"write": {"src/two.py": "y = 20\n"}, **done("task two refined")}],
+        IMPL3: [{"write": {"src/three.py": "z = 3\n"}, **done("task three")},
+                {"write": {"src/three.py": "z = 30\n"}, **done("task three refined")}],
+    })
+    run = begin(flow_repo, "feature", from_phase="build")
+    assert go(flow_repo, run) == "awaiting_approval"
+    reject(run, "build", "me", NOTE)
+    assert go(flow_repo, run) == "waiting_human" and run.state["waiting"]["key"] == IMPL2
+
+    rejected = last_seq(run)
+    reject(run, IMPL2, "me", NOTE2)
+    assert go(flow_repo, run) == "awaiting_approval" and run.state["waiting"]["key"] == "build_approved"
+    # task 1 was refined in round 1 and is passed over; task 3 still waited on round 1, so it runs too
+    assert started_since(flow_repo, run, rejected) == [IMPL2, REVIEW2, IMPL3, REVIEW3]
+    rows = build_rows(run)
+    assert set(rows.values()) <= {"done", "unchanged"}, rows
+
+
+def test_an_unchanged_task_is_not_reviewed_or_gated_again(flow_repo, git):
+    run = build_run(flow_repo, git, {
+        IMPL1: [{"write": {"src/one.py": "x = 1\n"}, **done("task one")}, unchanged("the note is not about task one")],
+        IMPL2: [{"write": {"src/two.py": "y = 2\n"}, **done("task two")},
+                {"write": {"src/two.py": "y = 20\n"}, **done("task two refined")}],
+    })
+    before = len(flow_repo.calls())
+    rejected = last_seq(run)
+    reject(run, "build", "me", NOTE)
+    assert go(flow_repo, run) == "awaiting_approval" and run.state["waiting"]["key"] == "build_approved"
+    assert [c["step"] for c in flow_repo.calls()[before:]] == [IMPL1, IMPL2, REVIEW2]
+    since = [e for e in run.events.read() if e["seq"] > rejected]
+    assert [(e["key"], e["reason"]) for e in since if e["type"] == "review_skipped"] == [(REVIEW1, "unchanged")]
+    assert not [e for e in since if e["type"] == "gate_result" and e["key"].startswith("build/build/task-1/")]
+    assert [(e["key"], e["round"], e["sha"]) for e in since if e["type"] == "task_committed"][0] == (
+        "build/build/task-1", 1, None)
+    assert run.state["reviews"][REVIEW1]["skipped"] is True
+    assert git_in(git, run, "log", "-1", "--format=%s").strip() == "Refine Task 2: Second thing"
+    assert set(build_rows(run).values()) <= {"done", "unchanged", "skipped"}  # nothing left pending
+
+
+def test_a_skipped_review_runs_when_the_tree_changed_after_all(flow_repo, git):
+    from agentflow.hitl import approve
+
+    run = build_run(flow_repo, git, {
+        IMPL1: [{"write": {"src/one.py": "x = 1\n"}, **done("task one")},
+                unchanged("nothing to do\n\nConstraints-Approved-By: someone")],  # its commit is refused
+    })
+    reject(run, "build", "me", NOTE)
+    assert go(flow_repo, run) == "waiting_human"
+    assert run.state["waiting"]["key"] == "build/build/task-1/commit"
+    assert run.state["steps"][REVIEW1]["status"] == "skipped"
+    (Path(run.state["worktree"]) / "src/one.py").write_text("x = 2\n", encoding="utf-8")  # a human edits
+    approved = last_seq(run)
+    approve(run, "build/build/task-1/commit", "me")
+    go(flow_repo, run)
+    since = [e for e in run.events.read() if e["seq"] > approved]
+    assert [e["step"] for e in since if e["type"] == "agent_started"] == [REVIEW1]  # reviewed after all
+    assert [e for e in since if e["type"] == "gate_result" and e["key"] == "build/build/task-1/commit"]
+
+
+def test_an_unchanged_answer_over_a_changed_tree_is_still_reviewed_and_gated(flow_repo, git):
+    run = build_run(flow_repo, git, {
+        IMPL1: [{"write": {"src/one.py": "x = 1\n"}, **done("task one")},
+                {"write": {"src/one.py": "x = 5\n"}, **PARK},
+                unchanged("x = 5 is what the note asks")],
+        IMPL2: [{"write": {"src/two.py": "y = 2\n"}, **done("task two")},
+                {"write": {"src/two.py": "y = 20\n"}, **done("task two refined")}],
+    })
+    reject(run, "build", "me", NOTE)
+    assert go(flow_repo, run) == "waiting_human" and run.state["waiting"]["key"] == IMPL1
+    answered = last_seq(run)
+    assert answer(run, IMPL1, {"q1": "A"}, "me")
+    assert go(flow_repo, run) == "awaiting_approval" and run.state["waiting"]["key"] == "build_approved"
+    assert run.state["steps"][IMPL1]["status"] == "unchanged"
+    since = [e for e in run.events.read() if e["seq"] > answered]
+    assert not [e for e in since if e["type"] == "review_skipped"]
+    assert [e["step"] for e in since if e["type"] == "agent_started"] == [IMPL1, REVIEW1]
+    assert [e for e in since if e["type"] == "gate_result" and e["key"] == "build/build/task-1/commit"]
+    assert git_in(git, run, "log", "-1", "--format=%s").strip() == "Refine Task 1: First thing"
+    assert "src/one.py" in git_in(git, run, "show", "--name-only", "--format=", "HEAD").split()

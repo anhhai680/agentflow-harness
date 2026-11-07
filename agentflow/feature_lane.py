@@ -25,6 +25,11 @@ fresh session over the refine diff (from the task's previous commit),
 with blocking findings, the fix round and `review_unresolved` as above counted within the round, and
 the task is committed on top as `Refine Task N: <title>` with the note in the body. A reviewer cannot
 answer `unchanged`. A task parked in the round holds back only the tasks that depend on it.
+A rejected stop inside one task (`refine.scope`, `<step>/task-<n>`) refines only that task: the other
+committed tasks are passed over as if committed in the round, unless a step of theirs still waits on an
+earlier round's refine. An implementer that answers `unchanged` and leaves the tree as its round started
+gets no review (`review_skipped`) and no gate run: the task is recorded as committed in the round with
+no commit (`sha: null`).
 
 A small plan has no per-task review. A `needs_human` result with `can_continue_without` (and
 `hitl.park_independent`) parks the task: the question is asked without stopping, and tasks that do
@@ -228,7 +233,7 @@ class FeatureLane:
             if not task.open and impl_key not in self.run.state["steps"]:
                 continue
             if self._committed(tkey):
-                if refine and not self._committed(tkey, refine):
+                if refine and not self._committed(tkey, refine) and self._sent_back(tkey):
                     if self._parked(tkey) or any(dep in held for dep in task.depends_on):
                         held.add(task.n)
                         continue
@@ -300,6 +305,23 @@ class FeatureLane:
                 return events[index + 1 :]
         return events
 
+    def _sent_back(self, tkey: str) -> bool:
+        """Whether this refine round refines committed task `tkey`: every task in a phase-level round. A round
+        scoped to one task (a rejected stop inside it) passes over the others as if already committed in the
+        round, unless a step of theirs still waits on an earlier round's refine (`refine_pending`)."""
+        scope = (self.run.state.get("refine") or {}).get("scope")
+        if not scope or tkey == scope:
+            return True
+        steps = self.run.state["steps"]
+        return any(row.get("status") == "refine_pending" for key, row in steps.items() if key.startswith(tkey + "/"))
+
+    def _changed_nothing(self, impl_key: str) -> bool:
+        """The implementer answered `unchanged` and the tree is the one its last `step_started` recorded."""
+        if (self.run.state["steps"].get(impl_key) or {}).get("status") != "unchanged":
+            return False
+        started = [e for e in self.run.events.read() if e["type"] == "step_started" and e.get("key") == impl_key]
+        return bool(started) and bool(started[-1].get("start_tree")) and started[-1]["start_tree"] == snapshot(self.worktree)
+
     def _committed(self, tkey: str, round_: int = 0) -> bool:
         return any(e["type"] == "task_committed" and e.get("key") == tkey and int(e.get("round") or 0) == round_
                    for e in self.run.events.read())
@@ -368,7 +390,16 @@ class FeatureLane:
         open_findings: list[dict] = []
         review = step.review if not small.get("active") or small.get("review") else None
         last = not batch or task.n == batch[-1].n
+        if round_ and self._changed_nothing(f"{tkey}/implement"):  # nothing to review or gate: the tree passed before
+            review_key = f"{tkey}/review"
+            if review is not None and not any(e["type"] == "review_skipped" and e.get("key") == review_key
+                                              for e in self._round_events(phase)):
+                self.run.emit("review_skipped", key=review_key, reason="unchanged", round=round_)
+            return self._commit_task(plan, task, tkey, [], round_, gates=None, phase=phase)
         if review is not None and last:
+            if (self.run.state["steps"].get(f"{tkey}/review") or {}).get("status") == "skipped":
+                # skipped earlier in the round, but the tree changed since (a human edited at a stop): review it
+                self.run.emit("step_retry", key=f"{tkey}/review", reason="the tree changed since the review was skipped")
             start = None
             rextra = extra
             if batch and len(batch) > 1:

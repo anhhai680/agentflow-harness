@@ -417,6 +417,14 @@ def _on_review_result(state: dict, ev: dict) -> None:
     state["reviews"][key] = {k: v for k, v in ev.items() if k not in ("seq", "ts", "type", "by", "key")}
 
 
+def _on_review_skipped(state: dict, ev: dict) -> None:
+    """A refine round's implementer changed nothing, so its task was not reviewed again; a later review replaces it."""
+    state["reviews"][ev["key"]] = {"skipped": True, "reason": ev.get("reason"), "round": ev.get("round")}
+    row = _step_row(state, ev["key"])
+    row["status"] = "skipped"  # settled: the round leaves nothing pending
+    row["skip_reason"] = ev.get("reason")
+
+
 def _on_hitl_raised(state: dict, ev: dict) -> None:
     key = ev["key"]
     wait = {
@@ -586,19 +594,28 @@ def _on_run_archived(state: dict, ev: dict) -> None:
     state["archived"] = {"by": ev.get("by"), "at": ev.get("ts")}
 
 
+def _in_scope(key: str, scope: str | None) -> bool:
+    """Whether a rejection scoped to one plan task (`<phase>/<step>/task-<n>`) sends `key` back: the task's
+    own steps, and the steps that hold it (the `foreach` step), or the phase would never reach the task."""
+    return not scope or key == scope or key.startswith(scope + "/") or scope.startswith(key + "/")
+
+
 def _on_phase_rejected(state: dict, ev: dict) -> None:
     phase, round_ = ev["phase"], ev.get("round", 1)
+    scope = ev.get("scope") or None
     row = _phase_row(state, phase)
     row["status"] = "refining"
     row["round"] = round_
-    for step in state["steps"].values():
-        if step["phase"] == phase:
+    for key, step in state["steps"].items():
+        if step["phase"] == phase and _in_scope(key, scope):  # a step outside the scope keeps its status
             step["status"] = "refine_pending"
             step["round"] = round_
     state["refine"] = {"phase": phase, "round": round_, "note": ev.get("note", "")}
+    if scope:
+        state["refine"]["scope"] = scope
     state["resolving"] = None
     parked = state.setdefault("parked", {})
-    for key in [k for k, item in parked.items() if item.get("phase") == phase]:
+    for key in [k for k, item in parked.items() if item.get("phase") == phase and _in_scope(k, scope)]:
         parked.pop(key)  # its step runs again in the refine round
     state["waiting"] = None
     if state["status"] not in TERMINAL:
@@ -705,6 +722,7 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "env_dropped": _on_env_dropped,
     "gate_result": _on_gate_result,
     "review_result": _on_review_result,
+    "review_skipped": _on_review_skipped,
     "hitl_raised": _on_hitl_raised,
     "run_held": _on_run_held,
     "run_hold_ended": _on_run_hold_ended,

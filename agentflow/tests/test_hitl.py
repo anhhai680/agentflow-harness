@@ -445,6 +445,26 @@ def test_reject_an_inner_checkpoint_refines_its_phase(run, cfg, macos_calls):
     assert run.state["waiting"] is None
 
 
+@pytest.mark.parametrize("key", ["build/build/task-2/implement", "build/build/task-2/commit"])
+def test_rejecting_a_task_stop_refines_only_that_task(run, cfg, macos_calls, key):
+    path = raise_hitl(cfg, run, "blocked", key, "cannot go on")
+    assert "sends task 2 back for a refine round" in path.read_text(encoding="utf-8")
+    reject(run, key, "me", "redo task two")
+    assert run.state["refine"] == {"phase": "build", "round": 1, "note": "redo task two",
+                                   "scope": "build/build/task-2"}
+    ev = [e for e in run.events.read() if e["type"] == "phase_rejected"][-1]
+    assert ev["scope"] == "build/build/task-2" and ev["key"] == key
+
+
+@pytest.mark.parametrize("key", ["build/build", "build/setup", "build/build/task-x/implement"])
+def test_rejecting_a_stop_outside_a_task_refines_the_phase(run, cfg, macos_calls, key):
+    path = raise_hitl(cfg, run, "blocked", key, "cannot go on")
+    assert "sends the phase back for a refine round" in path.read_text(encoding="utf-8")
+    reject(run, key, "me", "redo")
+    assert "scope" not in run.state["refine"]
+    assert "scope" not in [e for e in run.events.read() if e["type"] == "phase_rejected"][-1]
+
+
 # ------------------------------------------------------------------ inbox listing and CLI
 
 

@@ -413,6 +413,8 @@ function cardNode(card) {
   const where = card.task ? "Task " + card.task + " ▸ " + (card.step || "").split("/").pop() : (card.step || "not started");
   const gates = el("div", { class: "sub" }, card.gates.map((g) =>
     el("span", { class: g.skipped ? "gate-skip" : g.passed ? "gate-ok" : "gate-bad", text: (g.skipped ? "– " : g.passed ? "✓ " : "✗ ") + g.gate + " " })));
+  // A refine round's implementer changed nothing, so its task was not reviewed again.
+  const skips = (card.review_skipped || []).map((r) => el("span", { class: "gate-skip", title: "review skipped: " + r.reason, text: "– review task " + r.task + " (" + r.reason + ") " }));
   const node = el("article", { class: "card " + card.status, tabindex: "0", role: "button", draggable: card.ready ? "true" : null, onclick: () => openDrawer(card.run_id) },
     el("div", { class: "title", text: card.module }),
     el("div", { class: "sub", text: where }),
@@ -421,6 +423,7 @@ function cardNode(card) {
     agent,
     el("div", { class: "sub", text: "ctx " + (typeof card.context_pct === "number" ? Math.round(card.context_pct) + "%" : "-") + " · " + money(card.spend) + (card.budget ? " / " + money(card.budget) : "") }),
     card.gates.length ? gates : null,
+    skips.length ? el("div", { class: "sub" }, skips) : null,
     el("div", { class: "sub", text: "in phase " + ago(card.time_in_phase_s) + " · total " + dur(card.wall_s) }),
     card.pr_link ? prNode(card) : null,
     card.ready ? movesNode(card) : null);

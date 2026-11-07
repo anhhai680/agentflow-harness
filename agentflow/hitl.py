@@ -358,7 +358,9 @@ def park_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, question
 
 def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool) -> str:
     """The inbox line that says what each way out of this stop does."""
-    reject = f"`agentflow reject {run.id} {key} --note \"...\"` sends the phase back for a refine round."
+    scoped = task_scope(key.split("/")[0], key)
+    back = f"task {scoped[1]}" if scoped else "the phase"
+    reject = f"`agentflow reject {run.id} {key} --note \"...\"` sends {back} back for a refine round."
     if has_questions:
         return f"Fill in the `Answer:` lines below, or run `agentflow answer {run.id}`."
     if kind in CLEARED_BY_APPROVE:
@@ -516,25 +518,37 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
         return False
 
 
+def task_scope(phase: str, key: str) -> tuple[str, int] | None:
+    """`("<phase>/<step>/task-<n>", n)` when `key` is a stop inside plan task n of `phase`, else None."""
+    match = re.match(rf"^{re.escape(phase)}/[^/]+/task-(\d+)(?=/|$)", key)
+    return (match.group(0), int(match.group(1))) if match else None
+
+
 def reject(run: Run, target: str, by: str, note: str) -> None:
-    """Reject a phase (or the phase an inner checkpoint belongs to): record the note and start a refine round."""
+    """Reject a phase (or the phase an inner checkpoint belongs to): record the note and start a refine round.
+    A stop inside a plan task sends only that task back (`scope`); any other target refines the whole phase."""
     note = nfc(note).strip()
     if not note:
         raise ValueError("a rejection needs a note")
     with run.locked():
         kind, name = _resolve(run, target)
         phase = name if kind == "phase" else (run.state["waiting"]["phase"] or name.split("/")[0])
-        open_refine(run, phase, by, note, {"key": name} if kind == "checkpoint" else {})
+        scoped = task_scope(phase, name) if kind == "checkpoint" else None
+        open_refine(run, phase, by, note, {"key": name} if kind == "checkpoint" else {},
+                    scope=scoped[0] if scoped else None)
 
 
-def open_refine(run: Run, phase: str, by: str, note: str, extra: dict | None = None) -> None:
-    """Send `phase` back for a refine round: what a rejection does, and what the runner does with findings."""
+def open_refine(run: Run, phase: str, by: str, note: str, extra: dict | None = None,
+                scope: str | None = None) -> None:
+    """Send `phase` back for a refine round: what a rejection does, and what the runner does with findings.
+    With `scope` (`<phase>/<step>/task-<n>`) only that plan task's steps are refined."""
     note = nfc(note).strip()
     round_ = run.state["phases"].get(phase, {}).get("round", 0) + 1
     note_path = run.refine_note_path(phase, round_)
     note_path.parent.mkdir(parents=True, exist_ok=True)
     note_path.write_text(nfc(f"# Refine round {round_} of {phase}\n\nRejected by {by}.\n\n{note}\n"), encoding="utf-8")
-    run.emit("phase_rejected", by=by, phase=phase, round=round_, note=note, **(extra or {}))
+    scoped = {"scope": scope} if scope else {}
+    run.emit("phase_rejected", by=by, phase=phase, round=round_, note=note, **(extra or {}), **scoped)
 
 
 def remind_due(cfg: Config, repo: Path, now: datetime | None = None) -> list[str]:

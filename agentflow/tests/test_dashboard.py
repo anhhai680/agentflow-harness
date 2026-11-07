@@ -278,6 +278,19 @@ def test_board_and_run_detail(dash):
     assert detail["attach"] == f"agentflow attach {planning.id}"
 
 
+def test_a_card_shows_a_review_a_refine_round_skipped(dash):
+    run = dash.flow.new_run({"module": "crm"})
+    run.emit("phase_started", phase="build")
+    run.emit("step_started", key="build/build/task-2/implement", phase="build", task={"n": 2, "of": 3})
+    run.emit("review_skipped", key="build/build/task-2/review", reason="unchanged", round=1)
+    run.emit("review_skipped", key="plan/plan/task-1/review", reason="unchanged", round=1)  # not this phase's
+    assert card_of(dash)["review_skipped"] == [{"key": "build/build/task-2/review", "task": 2, "reason": "unchanged"}]
+    run.emit("review_result", key="build/build/task-2/review", round=1, findings=[], blocking=0, blocking_findings=[])
+    assert card_of(dash)["review_skipped"] == []  # a review that ran replaces the skip
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    assert re.search(r"review_skipped[^\n]*gate-skip", source)  # drawn in the existing skipped style
+
+
 def test_tails_never_follow_symlinks_out_of_the_run(dash, tmp_path):
     run = awaiting(dash.flow)
     secret = tmp_path / "secret.txt"
