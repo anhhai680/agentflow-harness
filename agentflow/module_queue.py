@@ -498,8 +498,7 @@ def done_reason(
         if merged is None:
             problem = problem or f"could not tell whether {branch} is merged: {_first_line(why)}"
     if prior and not _origin_complete(view):  # origin could not be read in full: it decides nothing
-        from_origin = prior == finished.SPEC_SAYS or prior.startswith(finished.plan_complete(""))
-        if prior == finished.MERGED or (from_origin and not vetoed):
+        if prior == finished.MERGED or (finished.from_origin(prior) and not vetoed):
             return prior, None
     return None, problem
 

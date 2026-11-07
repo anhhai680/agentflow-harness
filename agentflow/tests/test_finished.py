@@ -84,15 +84,24 @@ def test_recorded_merges_queue_entries_and_live_marks(tmp_git):
         {"id": "b", "status": "done"},                                   # written before reasons: merged
         {"id": "c", "status": "backlog"},
         {"id": "d", "status": "done", "done_reason": finished.BY_HAND},  # its mark is gone
-        {"id": "e", "status": "done", "done_reason": finished.MERGED},   # vetoed since
+        {"id": "e", "status": "done", "done_reason": finished.MERGED},   # vetoed since: a merge is no origin evidence
         {"id": "f", "status": "done", "done_reason": finished.BY_HAND},  # still marked
+        {"id": "h", "status": "done", "done_reason": finished.SPEC_SAYS},              # vetoed since
+        {"id": "i", "status": "done", "done_reason": finished.plan_complete("next")},  # vetoed since
     ])
-    finished.veto(tmp_git, "e", "pat")
+    for module in ("e", "h", "i"):
+        finished.veto(tmp_git, module, "pat")
     finished.mark(tmp_git, "f", "pat")
     finished.mark(tmp_git, "g", "pat")  # marked after the last assessment
     assert finished.recorded(tmp_git) == {
-        "a": finished.SPEC_SAYS, "b": finished.MERGED, "f": finished.BY_HAND, "g": finished.BY_HAND,
+        "a": finished.SPEC_SAYS, "b": finished.MERGED, "e": finished.MERGED, "f": finished.BY_HAND,
+        "g": finished.BY_HAND,
     }
+
+
+def test_from_origin_names_the_reasons_a_veto_overrides():
+    assert finished.from_origin(finished.SPEC_SAYS) and finished.from_origin(finished.plan_complete("main"))
+    assert not any(finished.from_origin(r) for r in (finished.MERGED, finished.BY_HAND, "", "plan complete"))
 
 
 def test_recorded_keeps_hand_marked_entries_when_the_marks_file_is_unreadable(tmp_git):

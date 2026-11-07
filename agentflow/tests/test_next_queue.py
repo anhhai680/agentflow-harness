@@ -1092,21 +1092,31 @@ def test_a_hand_marked_done_does_not_stick_as_merged_after_unmark(dq):
     assert dq.merges.calls == ["flow/feature/crm"]  # a hand mark is no merge: gh is asked once it is gone
 
 
-def test_cached_entries_apply_live_marks_on_top_of_the_last_assessment(dq):
+def test_cached_entries_apply_live_marks_on_top_of_the_last_assessment(dq, tmp_path):
     from agentflow import finished, sources
+    from conftest import land_on_origin
 
     write(dq.root, "docs/plans/2026-10-28-platform.md", PLAN_DONE)
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-staff-auth.md": spec_text("Status: done")})
     dq.merges.answer = (True, "")
     assess(dq)
-    nodes = [sources.ModuleNode("platform", []), sources.ModuleNode("crm", ["platform"])]
+    nodes = [sources.ModuleNode("platform", []), sources.ModuleNode("staff-auth", ["platform"]),
+             sources.ModuleNode("crm", ["platform"])]
     cached = {e["id"]: e for e in module_queue.cached_entries(dq.root, nodes, {})}
     assert (cached["platform"]["status"], cached["platform"]["done_reason"]) == ("done", finished.MERGED)
+    assert cached["staff-auth"]["done_reason"] == finished.SPEC_SAYS
     assert cached["crm"]["status"] == "backlog" and "done_reason" not in cached["crm"]
     finished.mark(dq.root, "crm", "cli")
     finished.veto(dq.root, "platform", "cli")
+    finished.veto(dq.root, "staff-auth", "cli")
     cached = {e["id"]: e for e in module_queue.cached_entries(dq.root, nodes, {})}
     assert (cached["crm"]["status"], cached["crm"]["done_reason"]) == ("done", finished.BY_HAND)
-    assert cached["platform"]["status"] == "backlog"
+    assert cached["staff-auth"]["status"] == "backlog"  # a veto ignores origin evidence
+    assert (cached["platform"]["status"], cached["platform"]["done_reason"]) == ("done", finished.MERGED)  # not a merge
+    entries = assess(dq)  # the assessment agrees with the cached view
+    assert entries["staff-auth"]["status"] == "backlog"
+    assert entries["platform"]["done_reason"] == finished.MERGED
+    assert finished.recorded(dq.root) == {"platform": finished.MERGED, "crm": finished.BY_HAND}
 
 
 def test_next_skips_done_modules_in_both_spec_and_checked_plan_rules(dq):

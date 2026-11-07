@@ -38,6 +38,12 @@ def plan_complete(branch: str) -> str:
     return f"plan complete on {branch}"
 
 
+def from_origin(reason: str) -> bool:
+    """Whether `reason` comes from origin evidence (`SPEC_SAYS` or `plan_complete`): the reasons a veto overrides. A
+    merge (`MERGED`) and a hand mark (`BY_HAND`) are not."""
+    return reason == SPEC_SAYS or reason.startswith(plan_complete(""))
+
+
 def _unreadable(path: Path, why: str) -> str:
     return f"{path} is unreadable ({why}); fix it or delete it, then mark again"
 
@@ -122,8 +128,9 @@ def recorded(repo: Path) -> dict[str, str]:
     """`{module: reason}` for every module that is done now, from files only (no git, no `gh`).
 
     The last assessment's done entries in `QUEUE_FILE` (a missing reason, from before reasons were kept, is
-    `MERGED`; a broken file counts as none), less an entry done by hand whose mark is gone and any entry with a live
-    veto, plus every live done mark as `BY_HAND`. When the marks file cannot be read, the entries stay as recorded,
+    `MERGED`; a broken file counts as none), less an entry done by hand whose mark is gone and an entry done by
+    origin evidence (`from_origin`) with a live veto, plus every live done mark as `BY_HAND`. A veto ignores origin
+    evidence only: a module done as `MERGED` stays done. When the marks file cannot be read, the entries stay as recorded,
     so a module marked done by hand stays done."""
     try:
         data = json.loads((runs_root(repo) / QUEUE_FILE).read_text(encoding="utf-8"))
@@ -140,7 +147,7 @@ def recorded(repo: Path) -> dict[str, str]:
         return done
     for module, reason in list(done.items()):
         state = (marks.get(module) or {}).get("state")
-        if state == "not_done" or (reason == BY_HAND and state != "done"):
+        if (state == "not_done" and from_origin(reason)) or (reason == BY_HAND and state != "done"):
             del done[module]
     for module, mark_ in marks.items():
         if mark_["state"] == "done":
@@ -148,5 +155,5 @@ def recorded(repo: Path) -> dict[str, str]:
     return done
 
 
-__all__ = ["BY_HAND", "LOCK", "MARKS", "MERGED", "QUEUE_FILE", "SPEC_SAYS", "mark", "plan_complete", "read_marks",
-           "recorded", "unmark", "veto"]
+__all__ = ["BY_HAND", "LOCK", "MARKS", "MERGED", "QUEUE_FILE", "SPEC_SAYS", "from_origin", "mark", "plan_complete",
+           "read_marks", "recorded", "unmark", "veto"]
