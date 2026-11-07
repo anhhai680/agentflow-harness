@@ -25,7 +25,7 @@ import re
 import signal
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
@@ -73,10 +73,13 @@ def _kill_group(proc: subprocess.Popen) -> None:
         os.killpg(proc.pid, signal.SIGKILL)
 
 
-def _shell(command: str, cwd: Path, timeout_s: float, env: dict[str, str] | None = None) -> tuple[int | None, str]:
+def _shell(command: str, cwd: Path, timeout_s: float, env: dict[str, str] | None = None,
+           env_base: Mapping[str, str] | None = None) -> tuple[int | None, str]:
     """`(exit code, output)` of `command` run by the shell in its own process group; `(None, output)` when
-    it was killed at `timeout_s`. The group is killed whenever this is left with it still running."""
-    proc = subprocess.Popen(command, shell=True, cwd=cwd, env=os.environ | (env or {}), stdin=subprocess.DEVNULL,
+    it was killed at `timeout_s`. The group is killed whenever this is left with it still running. The
+    environment is `env_base` (default: this process's) with `env` on top."""
+    base = os.environ if env_base is None else env_base
+    proc = subprocess.Popen(command, shell=True, cwd=cwd, env={**base, **(env or {})}, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                             errors="replace", start_new_session=True)
     try:
@@ -100,21 +103,21 @@ def _minutes(value: float) -> str:
 
 
 def _run_one(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min: float,
-             env: dict[str, str] | None = None) -> GateResult:
+             env: dict[str, str] | None = None, env_base: Mapping[str, str] | None = None) -> GateResult:
     started = time.monotonic()
-    result = _run_gate(gate, cwd, log_dir, tail_lines, timeout_min, env)
+    result = _run_gate(gate, cwd, log_dir, tail_lines, timeout_min, env, env_base)
     return replace(result, duration_s=round(time.monotonic() - started, 3))
 
 
 def _run_gate(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min: float,
-              env: dict[str, str] | None) -> GateResult:
+              env: dict[str, str] | None, env_base: Mapping[str, str] | None = None) -> GateResult:
     if gate.when_exists and not (cwd / gate.when_exists).exists():
         return GateResult(gate.name, False, True, f"{gate.when_exists} missing", None, "")
     run_dir = cwd / gate.cwd if gate.cwd else cwd
     if not run_dir.is_dir():
         reason = f"cwd {gate.cwd} does not exist in {cwd}"
         return GateResult(gate.name, False, False, reason, None, f"The gate did not run: {reason}.")
-    code, output = _shell(gate.run, run_dir, max(1.0, timeout_min * 60), env)
+    code, output = _shell(gate.run, run_dir, max(1.0, timeout_min * 60), env, env_base)
     if code is None:
         output += f"\n[agentflow: killed after {_minutes(timeout_min)}]\n"
     log_path = log_dir / f"{gate.name}.log"
@@ -129,16 +132,18 @@ def _run_gate(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min
     return GateResult(gate.name, passed, False, "" if passed else f"exit {code}", log_path, tail)
 
 
-def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path) -> list[GateResult]:
+def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path, *,
+              env_base: Mapping[str, str] | None = None) -> list[GateResult]:
     """Run gates in order (all of them, even after a failure) with `cwd` as the worktree root.
 
     A `str` names a `gate_sets` entry. Each gate's full output goes to `<log_dir>/<gate>.log`
     after a `$ <command>` line; `tail` keeps the last `context.gate_output_lines` lines. Each gate
-    gets `defaults.gate_timeout_min`.
+    gets `defaults.gate_timeout_min`. Its environment is `env_base` (default: this process's
+    environment) with `defaults.env` on top.
     """
     cwd, log_dir = Path(cwd), Path(log_dir)
     timeout = cfg.defaults.gate_timeout_min
-    return [_run_one(g, cwd, log_dir, cfg.context.gate_output_lines, timeout, cfg.defaults.env)
+    return [_run_one(g, cwd, log_dir, cfg.context.gate_output_lines, timeout, cfg.defaults.env, env_base)
             for g in _resolve(cfg, names)]
 
 

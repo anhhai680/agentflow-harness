@@ -3,7 +3,8 @@
 `write_text` and `open_append` open the final path component with `O_NOFOLLOW`, so a symlink there raises
 `SymlinkRefused` (an `OSError`) instead of writing through it; `ensure_dir` refuses a symlinked directory.
 `replace_file` (used for the agent workspace, where the agent may plant anything) removes whatever is at
-the path first and creates the file new and exclusive. `read_bytes` reads a regular file without
+the path first and creates the file new and exclusive. `write_new` creates a file only where nothing is yet
+(`agentflow init` writes the pack with it, so it never overwrites one). `read_bytes` reads a regular file without
 following a symlink, up to a size limit.
 """
 
@@ -56,6 +57,35 @@ def write_text(path: Path, text: str) -> Path:
     fd = _open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
+    return path
+
+
+def write_new(path: Path, text: str, mode: int = 0o644) -> Path:
+    """Create `path` holding `text`, exclusively: `FileExistsError` when anything is already there (a file, a
+    folder, a symlink, even a dangling one), `SymlinkRefused` when its folder is a symlink. The file is opened
+    relative to its folder, itself opened without following a symlink, so the folder can't be swapped for a
+    link between the check and the write. A write that fails part way removes the file it created."""
+    path = Path(path)
+    ensure_dir(path.parent)
+    try:
+        folder = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR) or path.parent.is_symlink():
+            raise _refused(path.parent, exc) from exc
+        raise
+    try:
+        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=folder)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except BaseException:
+            try:
+                os.unlink(path.name, dir_fd=folder)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(folder)
     return path
 
 
