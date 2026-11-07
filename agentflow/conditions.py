@@ -566,12 +566,28 @@ def first_phase_with_work(cfg: Config, lane: str, ctx: Ctx) -> str | None:
     return None
 
 
+def forbidden_plan_files(cfg: Config, tasks: list[sources.PlanTask]) -> dict[int, list[str]]:
+    """Open plan tasks that name a path `guardrails.forbidden_paths` refuses, by task number. No agent session in a
+    run can write such a file, so a human has to (or the plan has to drop it)."""
+    patterns = cfg.guardrails.forbidden_paths
+    found = {}
+    for task in tasks:
+        if task.open and (paths := sources.forbidden_task_files(
+                task, lambda path: any(path_matches(path, pattern) for pattern in patterns))):
+            found[task.n] = paths
+    return found
+
+
 def plan_warnings(ctx: Ctx) -> list[str]:
-    """Plan tasks that look too big for one session."""
+    """Plan tasks that look too big for one session, or that need a file no agent may write."""
     rel = ctx.values.get("plan", "")
     if not rel:
         return []
     warnings: list[str] = []
-    for task in sources.parse_plan(ctx.repo / rel):
+    tasks = sources.parse_plan(ctx.repo / rel)
+    for task in tasks:
         warnings.extend(sources.task_size_warnings(task))
+    for n, paths in forbidden_plan_files(ctx.cfg, tasks).items():
+        warnings.append(f"Task {n} names {', '.join(paths)}, which `guardrails.forbidden_paths` refuses in a run: "
+                        "a human must make that change")
     return warnings

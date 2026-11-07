@@ -334,7 +334,7 @@ agentflow queue --max-parallel 2
 ## 11. Safety model in five lines
 
 1. Agents get one writable folder besides the work tree: `<state dir>/workspaces/<run>/`. The run's events, state, inbox and lock live in `<state dir>/runs/`, outside it, and the runner denies agents any edit there.
-2. The runner refuses a step that touches a path in the pack's `guardrails.forbidden_paths` (such as `.claude/**` or the golden test files) or the pack itself (`.agentflow/**`, always), that moves `HEAD`, or that uses a user-only skill. It re-checks before every commit and before the push.
+2. The runner refuses a step that touches a path in the pack's `guardrails.forbidden_paths` (such as `.claude/**` or the golden test files) or the pack itself (`.agentflow/**`, always), that moves `HEAD`, or that uses a user-only skill. It re-checks before every commit and before the push. A plan task that names such a path (a `Create:` or `Modify:` line) stops `build` before its first task and shows in `explain`: a human makes that change, or the plan drops it.
 3. Only the runner pushes, only commits it made, never with `--force`. It never writes `Constraints-Approved-By`.
 4. The dashboard listens on `127.0.0.1` only and every request needs the token. Do not paste the dashboard URL into chat or tickets.
 5. **Residual risk:** gates such as `uv run pytest` execute code from the work tree, which the agent wrote, with your permissions. The guards catch what that code changes in git, not everything it could do on your machine. Review the diff at every approval, and for risky work run agentflow in a disposable environment.
