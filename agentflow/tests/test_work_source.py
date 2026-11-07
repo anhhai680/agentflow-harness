@@ -519,3 +519,51 @@ def test_modules_done_names_the_spec_files_for_an_unknown_module(specs):
     write(specs.root, "docs/specs/SPEC-a.md", "# A\n")
     ghost = evaluate(specs.cfg, "deps_merged", make_ctx(specs.cfg, specs.root, "feature", {"module": "ghost"}))
     assert ghost.value is None and ghost.reason.endswith(": module 'ghost' is not in the spec files")
+
+
+def _long_spec(root: Path, name: str, before: str, after: str) -> Path:
+    """A spec of `before`, then `x` padding (no `## ` heading) up to byte `HEADER_MAX`, then `after`."""
+    path = root / "docs" / "specs" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pad = sources.HEADER_MAX - len(before.encode("utf-8"))
+    path.write_bytes(before.encode("utf-8") + b"x" * max(pad, 0) + after.encode("utf-8"))
+    return path
+
+
+def _deps(cfg, root: Path, module: str) -> list[str]:
+    return next(n.deps for n in work_source.items(cfg, root) if n.id == module)
+
+
+def test_a_header_past_header_max_with_no_heading_read_blocks(plain):
+    # ~9.6 KB of preamble with no `## ` (only `#` / `###` headings), then the dependency line past the cut
+    preamble = "# Long\n\n### Context\n" + ("prose line of the preamble\n" * 360)
+    write(plain.root, "docs/specs/long.md", preamble + "\nDepends on: a\n")
+    assert (plain.root / "docs/specs/long.md").stat().st_size > sources.HEADER_MAX
+    assert _deps(plain.cfg, plain.root, "long") == [sources.CUT_DEP]
+    node = sources.ModuleNode("long", [sources.CUT_DEP])
+    assert "which is not in the capability map" in module_queue._map_problem(node, {"long": [sources.CUT_DEP]})
+
+
+def test_a_dependency_line_straddling_the_cut_blocks_not_a_shorter_id(plain):
+    # the read stops after `Depends on: crm`, so the truncated id must never stand alone
+    path = plain.root / "docs" / "specs" / "straddle.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    head = "# S\n\n" + "x" * (sources.HEADER_MAX - len("# S\n\n") - len("\nDepends on: crm")) + "\nDepends on: crm"
+    path.write_bytes(head.encode("utf-8") + b"-api\n\n## Scope\n")
+    assert sources.read_header(path).endswith("Depends on: crm")
+    assert _deps(plain.cfg, plain.root, "straddle") == ["crm", sources.CUT_DEP]  # blocked: CUT_DEP is no module
+
+
+def test_a_long_spec_whose_header_ends_inside_the_read_is_unchanged(plain):
+    write(plain.root, "docs/specs/ended.md", "# E\n\nDepends on: a\n\n## Scope\n" + "body\n" * 3000)
+    assert (plain.root / "docs/specs/ended.md").stat().st_size > sources.HEADER_MAX
+    assert _deps(plain.cfg, plain.root, "ended") == ["a"]
+
+
+@pytest.mark.parametrize("extra", [0, -1])
+def test_a_spec_of_at_most_header_max_bytes_is_unchanged(plain, extra):
+    body = "# U\n\nDepends on: a\n"
+    path = _long_spec(plain.root, "under.md", body, "")
+    path.write_bytes(path.read_bytes()[: sources.HEADER_MAX + extra])
+    assert path.stat().st_size == sources.HEADER_MAX + extra
+    assert _deps(plain.cfg, plain.root, "under") == ["a"]

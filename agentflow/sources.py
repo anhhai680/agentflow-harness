@@ -381,6 +381,14 @@ def spec_header(text: str) -> list[tuple[str, bool]]:
     return out
 
 
+def header_ends(text: str) -> bool:
+    """Whether `text` holds the end of a spec's header: a `## ` heading outside a code fence. A header read cut at
+    `HEADER_MAX` without one may go on past the cut, so its dependencies are not all known."""
+    lines = text.splitlines()
+    fenced = _fence_flags(lines)
+    return any(not inside and line.startswith(_HEADER_END) for line, inside in zip(lines, fenced, strict=True))
+
+
 def _dep_value(header: list[tuple[str, bool]], start: int, first: str) -> tuple[list[str], bool, int]:
     """The parts of one `Depends on:` value whose captured text is `first`: when that is empty or ends with `,`,
     the header lines after `start` that are bullets or carry on the comma list. Returns the parts, whether any

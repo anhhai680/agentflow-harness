@@ -117,10 +117,14 @@ def _list_specs(cfg: Config, repo: Path) -> tuple[list[sources.ModuleNode], list
             deps = known[1]
         else:
             try:
-                deps = sources.spec_deps(sources.read_header(folder / name))
+                text = sources.read_header(folder / name)
             except OSError:
                 skipped.append(f"{name} (unreadable)")
                 continue
+            deps = sources.spec_deps(text)
+            if info.st_size > sources.HEADER_MAX and not sources.header_ends(text):
+                # the header may go on past the bytes read (a dependency line there, or one cut mid-id): block
+                deps = list(dict.fromkeys([*deps, sources.CUT_DEP]))
         fresh[name] = (stamp, deps)
         nodes.append(sources.ModuleNode(module, list(deps)))
     with _HEADERS_LOCK:
