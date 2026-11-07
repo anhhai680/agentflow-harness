@@ -39,6 +39,10 @@ SPEC_DEPENDS = re.compile(r"^[-*>\s]*Depends on\**\s*:[\s*]*(.*)$", re.IGNORECAS
 NO_DEPS = re.compile(r"^none\.?(\s*\(.*\))?\.?$", re.IGNORECASE)  # the only values that mean "no dependencies"
 CUT_DEP = "<Depends on line too long>"  # a dependency line cut at LINE_MAX: it blocks, since its end was not read
 BAD_DEP = "<unreadable dependency>"  # a dependency that is not printable ASCII of at most 80 characters: it blocks
+# A spec over HEADER_MAX bytes with no `## ` heading in the bytes read: its header may go on past them, so the
+# module blocks until the header ends sooner (`work_source` adds it)
+LONG_HEADER = "<spec header longer than 8 KB: put a '## ' heading in its first 8 KB>"
+_NONE_MARKS = ("—", "-", "–")  # `deps_cell`'s explicit "none" for a value
 _DEP_MAX = 80
 _HEADER_END = "## "
 _BULLET = re.compile(r"^\s*[-*+]\s(.*)$")  # a `-`, `*` or `+` bullet (its text is stripped after)
@@ -396,14 +400,18 @@ def _dep_value(header: list[tuple[str, bool]], start: int, first: str) -> tuple[
     parts, cut, i = [first], False, start
     if first and not first.endswith(","):
         return parts, cut, i
+    blank = False  # blank lines skipped after an empty value: past them only a bullet list carries it on
     while i < len(header):
         line, was_cut = header[i]
+        if not line.strip() and parts == [""]:
+            blank, i = True, i + 1
+            continue
         if not line.strip() or SPEC_DEPENDS.match(line) or line.lstrip().startswith("#"):
             break
         bullet = _BULLET.match(line)
         if bullet:
             parts.append(bullet.group(1).strip())
-        elif not parts[-1] or parts[-1].endswith(","):
+        elif not blank and (not parts[-1] or parts[-1].endswith(",")):
             parts.append(line.strip())
         else:
             break
@@ -423,8 +431,9 @@ def _dep_id(dep: str) -> str:
 
 def spec_deps(text: str) -> list[str]:
     """The modules a spec depends on, from every `Depends on:` line of its header (`spec_header`) and the bullets
-    or comma list that follow one ending in `,` or nothing. Only `none`, `none.` or `none (…)` means none; every
-    other id is kept in order, once, so an unknown one blocks. A cut line adds `CUT_DEP`."""
+    or comma list that follow one ending in `,` or nothing (bullets may come after a blank line). Only `none`,
+    `none.` or `none (…)` (or the map's `—`) means none; every other id is kept in order, once, so an unknown one
+    blocks. A value with no id at all is `BAD_DEP`, so a bare `Depends on:` blocks too. A cut line adds `CUT_DEP`."""
     header = spec_header(text)
     found: list[str] = []
     i = 0
@@ -437,6 +446,8 @@ def spec_deps(text: str) -> list[str]:
         parts, cut, i = _dep_value(header, i, match.group(1).strip())
         value = ", ".join(p for p in parts if p)
         ids = [] if NO_DEPS.match(value) else [d for d in (_dep_id(d) for d in deps_cell(value)) if d]
+        if not ids and not NO_DEPS.match(value) and value.strip() not in _NONE_MARKS:
+            ids = [BAD_DEP]
         if was_cut or cut:
             ids.append(CUT_DEP)
         found += ids

@@ -1225,12 +1225,15 @@ class _Validator:
             self.error("work_source.path", "specs reads project.docs.specs; remove path")
         specs = self.cfg.project.docs.get("specs")
         if isinstance(specs, str) and specs.strip():
-            root = Path(self.repo).resolve()
             target = Path(self.repo) / specs
+            try:
+                inside = target.resolve().is_relative_to(Path(self.repo).resolve())
+            except (OSError, RuntimeError):  # a symlink loop on the way (RuntimeError on Python 3.12)
+                inside = False
             if posixpath.isabs(specs) or ".." in posixpath.normpath(specs).split("/"):
                 self.error("project.docs.specs", "a specs work source lists project.docs.specs: a directory inside "
                            "the repository, relative to its root and without '..'")
-            elif target.is_symlink() or not target.resolve().is_relative_to(root):
+            elif target.is_symlink() or not inside:
                 self.error("project.docs.specs", "a specs work source does not list a symlinked directory or one "
                            "outside the repository")
             elif target.exists() and not target.is_dir():

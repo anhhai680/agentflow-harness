@@ -76,9 +76,12 @@ def directory(cfg: Config, repo: Path) -> Path | None:
     raw = cfg.project.docs.get("specs")
     if not isinstance(raw, str) or not raw.strip() or Path(raw).is_absolute():
         return None
-    root = Path(repo).resolve()
     path = Path(repo) / raw
-    if path.is_symlink() or not path.resolve().is_relative_to(root) or not path.is_dir():
+    try:
+        inside = Path(path).resolve().is_relative_to(Path(repo).resolve())
+    except (OSError, RuntimeError):  # a symlink loop on the way (RuntimeError on Python 3.12)
+        return None
+    if path.is_symlink() or not inside or not path.is_dir():
         return None
     return path
 
@@ -99,7 +102,10 @@ def _list_specs(cfg: Config, repo: Path) -> tuple[list[sources.ModuleNode], list
     if len(fitting) > limit:
         skipped.append(f"… and {len(fitting) - limit} more (over {limit} files)")
         fitting = fitting[:limit]
-    key = str(folder.resolve())
+    try:
+        key = str(folder.resolve())
+    except (OSError, RuntimeError):
+        return [], []
     with _HEADERS_LOCK:
         cached = dict(_HEADERS.get(key, {}))
     fresh: dict[str, tuple[tuple[int, int], list[str]]] = {}
@@ -126,10 +132,13 @@ def _list_specs(cfg: Config, repo: Path) -> tuple[list[sources.ModuleNode], list
             except OSError:
                 skipped.append(f"{name} (unreadable)")
                 continue
-            deps = sources.spec_deps(text)
             if info.st_size > sources.HEADER_MAX and not sources.header_ends(text):
-                # the header may go on past the bytes read (a dependency line there, or one cut mid-id): block
-                deps = list(dict.fromkeys([*deps, sources.CUT_DEP]))
+                # the header may go on past the bytes read: drop the last line, which the cut may have split (a
+                # `Depends on: crm` of `crm-api`), keep what was read whole, and block on LONG_HEADER
+                text = text[: text.rfind("\n") + 1]
+                deps = list(dict.fromkeys([*sources.spec_deps(text), sources.LONG_HEADER]))
+            else:
+                deps = sources.spec_deps(text)
         fresh[name] = (stamp, deps)
         nodes.append(sources.ModuleNode(module, list(deps)))
     with _HEADERS_LOCK:

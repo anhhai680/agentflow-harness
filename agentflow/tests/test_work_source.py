@@ -361,6 +361,14 @@ def test_a_specs_source_lists_one_module_per_spec_file_with_header_deps(specs):
     ("Depends on: none, a", ["none", "a"]),
     ("Depends on: a" + "b" * 600, [sources.BAD_DEP, sources.CUT_DEP]),   # an id over 80 chars, on a cut line
     ("Depends on: \x1b[31mred", [sources.BAD_DEP]),
+    ("**Depends on:**\n\n- a\n- b\n\n## Scope", ["a", "b"]),          # a blank line before the bullets
+    ("Depends on:\n\n\n* a\n+ b", ["a", "b"]),
+    ("**Depends on:**", [sources.BAD_DEP]),                               # no value: blocks, only `none` is none
+    ("**Depends on:**\n\n## Scope\n- a", [sources.BAD_DEP]),
+    ("**Depends on:**\n\n**Owner:** me", [sources.BAD_DEP]),             # metadata after a blank is no dependency
+    ("Depends on: ..", [sources.BAD_DEP]),                                # a value that cleans to no id
+    ("Depends on: -", []),                                                # the capability map's explicit none marks
+    ("Depends on: \u2014", []),
 ])
 def test_dependency_line_forms(header, deps):
     assert sources.spec_deps(f"# X\n\n{header}\n") == deps
@@ -539,19 +547,27 @@ def test_a_header_past_header_max_with_no_heading_read_blocks(plain):
     preamble = "# Long\n\n### Context\n" + ("prose line of the preamble\n" * 360)
     write(plain.root, "docs/specs/long.md", preamble + "\nDepends on: a\n")
     assert (plain.root / "docs/specs/long.md").stat().st_size > sources.HEADER_MAX
-    assert _deps(plain.cfg, plain.root, "long") == [sources.CUT_DEP]
-    node = sources.ModuleNode("long", [sources.CUT_DEP])
-    assert "which is not in the capability map" in module_queue._map_problem(node, {"long": [sources.CUT_DEP]})
+    assert _deps(plain.cfg, plain.root, "long") == [sources.LONG_HEADER]
+    assert sources.LONG_HEADER.isascii() and sources.LONG_HEADER.isprintable()
+    node = sources.ModuleNode("long", [sources.LONG_HEADER])
+    assert module_queue._map_problem(node, {"long": [sources.LONG_HEADER]}, "spec files") == (
+        f"depends on {sources.LONG_HEADER}, which is not in the spec files")
+
+
+def test_a_long_header_keeps_the_dependencies_it_read_and_blocks(plain):
+    write(plain.root, "docs/specs/early.md", "# E\n\nDepends on: a\n\n" + "prose\n" * 2000)
+    assert (plain.root / "docs/specs/early.md").stat().st_size > sources.HEADER_MAX
+    assert _deps(plain.cfg, plain.root, "early") == ["a", sources.LONG_HEADER]
 
 
 def test_a_dependency_line_straddling_the_cut_blocks_not_a_shorter_id(plain):
-    # the read stops after `Depends on: crm`, so the truncated id must never stand alone
+    # the read stops after `Depends on: crm` of `crm-api`: the cut last line is dropped, so `crm` never stands in
     path = plain.root / "docs" / "specs" / "straddle.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     head = "# S\n\n" + "x" * (sources.HEADER_MAX - len("# S\n\n") - len("\nDepends on: crm")) + "\nDepends on: crm"
     path.write_bytes(head.encode("utf-8") + b"-api\n\n## Scope\n")
     assert sources.read_header(path).endswith("Depends on: crm")
-    assert _deps(plain.cfg, plain.root, "straddle") == ["crm", sources.CUT_DEP]  # blocked: CUT_DEP is no module
+    assert _deps(plain.cfg, plain.root, "straddle") == [sources.LONG_HEADER]  # blocked: it is no module
 
 
 def test_a_long_spec_whose_header_ends_inside_the_read_is_unchanged(plain):
@@ -567,3 +583,19 @@ def test_a_spec_of_at_most_header_max_bytes_is_unchanged(plain, extra):
     path.write_bytes(path.read_bytes()[: sources.HEADER_MAX + extra])
     assert path.stat().st_size == sources.HEADER_MAX + extra
     assert _deps(plain.cfg, plain.root, "under") == ["a"]
+
+
+def test_a_symlink_loop_under_the_specs_directory_is_an_error_not_a_crash(specs, tmp_cfg, monkeypatch):
+    loopy = load_config(tmp_cfg({**SPECS, "project": {"docs": {"specs": "loopy"}}}, name="loop.yaml"))
+    write(specs.root, "loopy/SPEC-a.md", "# A\n")
+    real = Path.resolve
+
+    def resolve(self, strict=False):
+        if self.name == "loopy":  # Python 3.12 raises RuntimeError on a symlink loop in a parent component
+            raise RuntimeError(f"Symlink loop from {self!r}")
+        return real(self, strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert work_source.directory(loopy, specs.root) is None
+    assert work_source.items(loopy, specs.root) == [] and work_source.skipped(loopy, specs.root) == []
+    assert errors_at(loopy, specs.root, "project.docs.specs")
