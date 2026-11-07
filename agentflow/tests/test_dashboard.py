@@ -273,8 +273,8 @@ def test_a_card_shows_the_soft_and_the_hard_budget(dash):
     (row,) = metrics_view(dash.flow.root, dash.flow.cfg)["runs"]
     assert (row["soft_budget"], row["budget"]) == (defaults.run_budget_usd, defaults.run_budget_hard_usd)
     source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
-    for field in ("card.soft_budget", "st.soft_budget_usd", "r.soft_budget", "data.run_budget_hard_usd"):
-        assert field in source
+    for needle in ("card.soft_budget", "st.soft_budget_usd", "r.soft_budget", "data.run_budget_hard_usd"):
+        assert needle in source
 
 
 def test_board_and_run_detail(dash):
