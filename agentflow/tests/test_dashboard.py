@@ -131,6 +131,11 @@ def test_api_rejects_without_token(dash):
     assert dash.get("/api/agents")[0] == 200
 
 
+def test_the_board_names_the_work_source_kind_and_the_skipped_files(dash):
+    data = payload(dash.get("/api/board")[2])
+    assert data["backlog_skipped"] == [] and data["work_source_kind"] == "capability_map"
+
+
 def test_security_headers_on_every_response(dash):
     for status, headers, _ in (dash.get("/api/board"), dash.get("/api/board", token=None), dash.get("/", token=None)):
         assert headers["x-content-type-options"] == "nosniff"

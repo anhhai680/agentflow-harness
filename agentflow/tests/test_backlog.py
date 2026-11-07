@@ -586,3 +586,57 @@ def test_a_spec_with_an_unknown_dependency_is_blocked_naming_the_spec_files(sbk)
         sbk.start("module:b")
     with pytest.raises(Refused, match="module ghost is not in the spec files"):
         sbk.start("module:ghost")
+
+
+def test_a_spec_module_card_starts_a_feature_run_for_that_module(sbk):
+    write(sbk.root, "docs/specs/SPEC-c.md", "# C\n")
+    sbk.refresh()
+    assert "module:a" not in sbk.cards() and sbk.cards()["module:c"]["status"] in ("ready", "parallel")
+    sbk.start("module:c")
+    assert sbk.spawn.calls[-1]["params"] == {"module": "c"} and sbk.spawn.calls[-1]["lane"] == "feature"
+
+
+def test_a_new_feature_card_carries_its_text_and_dependencies_as_the_task(sbk):
+    item = backlog.add(sbk.cfg, sbk.root, "feature",
+                       {"new_module": {"module": "e", "responsibility": "Export  reports", "deps": ["a"]}})
+    sbk.start(f"card:{item.id}")
+    call = sbk.spawn.calls[-1]
+    assert call["params"] == {"module": "e", "task": "Export reports\n\nDepends on: a"} and call["new_module"] is None
+    assert call["lane"] == "feature"
+
+
+def test_a_new_feature_card_with_no_dependencies_says_none(sbk):
+    item = backlog.add(sbk.cfg, sbk.root, "feature",
+                       {"new_module": {"module": "e", "responsibility": "Export reports", "deps": []}})
+    sbk.start(f"card:{item.id}")
+    assert sbk.spawn.calls[-1]["params"]["task"] == "Export reports\n\nDepends on: none"
+
+
+def test_a_new_feature_card_cannot_reuse_an_existing_spec_module_id(sbk):
+    with pytest.raises(backlog.Invalid, match="already a module"):
+        backlog.add(sbk.cfg, sbk.root, "feature",
+                    {"new_module": {"module": "a", "responsibility": "Again", "deps": []}})
+
+
+def test_a_new_feature_card_whose_spec_appeared_since_is_refused_at_start(sbk):
+    item = backlog.add(sbk.cfg, sbk.root, "feature",
+                       {"new_module": {"module": "e", "responsibility": "Export reports", "deps": []}})
+    write(sbk.root, "docs/specs/SPEC-e.md", "# E\n\n**Depends on:** none\n")
+    with pytest.raises(Refused, match="a spec for e now exists; start module:e instead"):
+        backlog.begin_start(sbk.cfg, sbk.root, f"card:{item.id}")
+    assert sbk.spawn.calls == []
+
+
+def test_the_backlog_names_the_files_that_are_not_modules(sbk):
+    assert backlog.snapshot(sbk.cfg, sbk.root)["skipped"] == []
+    write(sbk.root, "docs/specs/SPEC-Foo Bar.md", "# Foo\n")
+    assert backlog.snapshot(sbk.cfg, sbk.root)["skipped"] == ["SPEC-Foo Bar.md"]
+
+
+def test_a_capability_map_backlog_names_no_skipped_files(bk):
+    assert backlog.snapshot(bk.cfg, bk.root)["skipped"] == []
+
+
+def test_the_spec_prompt_tells_the_agent_about_task_md_and_the_depends_on_header():
+    text = (Path(backlog.__file__).parent / "prompts" / "spec.md").read_text(encoding="utf-8")
+    assert "{run_dir}/task.md" in text and "**Depends on:**" in text

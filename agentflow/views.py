@@ -258,6 +258,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
     now = now or datetime.now(UTC)
     phases = list(cfg.phases)
     done_days = cfg.dashboard.get("show_done_days", DEFAULT_DONE_DAYS)
+    from agentflow import work_source
     from agentflow.backlog import snapshot
 
     pile = snapshot(cfg, repo)
@@ -293,6 +294,8 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
         "lane_labels": pile["lane_labels"],
         "after_choices": pile["after_choices"],
         "modules": pile["modules"],
+        "backlog_skipped": pile["skipped"],
+        "work_source_kind": work_source.kind(cfg),
         "needs_human": needs,
         "counts": dict(counts),
         "agents_running": {"total": sum(by_agent.values()), "by_agent": dict(by_agent), "by_model": dict(by_model)},

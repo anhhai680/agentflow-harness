@@ -240,7 +240,9 @@ def _new_module_fields(value: Any, nodes: list[sources.ModuleNode], book: Backlo
         raise Invalid("deps must be a list of module ids")
     in_map = {n.id for n in nodes}
     if module in in_map:
-        raise Invalid(f"{module} is already in the {noun}")
+        if noun == "capability map":
+            raise Invalid(f"{module} is already in the {noun}")
+        raise Invalid(f"{module} is already a module in the {noun}: start module:{module} instead")
     outside = [d for d in deps if d not in in_map]
     if outside:
         raise Invalid(f"{', '.join(outside)} is not in the {noun}: a new module can only depend on modules "
@@ -459,6 +461,7 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         "lane_labels": lane_labels(cfg),
         "after_choices": choices,
         "modules": [n.id for n in pic["nodes"]],
+        "skipped": work_source.skipped(cfg, repo),
         "sync_note": pic["state"].get("sync_note") or "",
     }
 
@@ -475,6 +478,12 @@ class StartJob:
     to_phase: str | None
     new_module: dict | None
     label: str = ""
+
+
+def _spec_task(new_module: dict) -> str:
+    """The `--task` text of a new module's run in a `specs` pack: its responsibility, then its dependencies."""
+    deps = ", ".join(new_module.get("deps") or []) or "none"
+    return f"{new_module['responsibility']}\n\nDepends on: {deps}"
 
 
 def parse_key(key: Any) -> tuple[str, str]:
@@ -511,6 +520,10 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
             raise Refused(f"{key} is already starting")
         if item is not None and item.status == "started" and kind == "card":
             raise Refused(f"{key} has already started")
+        if kind == "card" and new_module is not None and work_source.kind(cfg) == "specs":
+            if any(n.id == params.get("module") for n in pic["nodes"]):
+                raise Refused(f"a spec for {params['module']} now exists; start module:{params['module']} instead")
+            params["task"], new_module = _spec_task(new_module), None
         info = pic["view"].get(key)
         if info and info["blocked_by"]:
             raise Refused(f"{_label_of(key, pic)} is blocked: runs after "

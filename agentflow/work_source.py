@@ -36,6 +36,11 @@ def _kind(cfg: Config) -> str | None:
     return cfg.work_source.kind if cfg.work_source is not None else None
 
 
+def kind(cfg: Config) -> str | None:
+    """The work source's kind (`capability_map` or `specs`), or None when the pack has no work source."""
+    return _kind(cfg)
+
+
 def noun(cfg: Config) -> str:
     """The words messages use for where the modules are listed: `capability map` (also with no work source) or
     `spec files`."""
