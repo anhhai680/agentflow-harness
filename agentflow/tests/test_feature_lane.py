@@ -177,7 +177,7 @@ def test_review_findings_back_once_then_hitl(lane, git):
     assert build(lane, run) == ("stopped", True)
     calls = lane.calls()
     assert steps(calls) == [impl_key, review_key, impl_key, review_key]
-    impl_session, review_session = session_of(lane, run, impl_key), session_of(lane, run, review_key)
+    impl_session = session_of(lane, run, impl_key)
     fix = calls[2]["argv"]
     assert ("--resume", impl_session) in pairs(fix) and ("--effort", "medium") in pairs(fix)
     assert "receiving-code-review" in fix[-1] and FINDING["text"] in fix[-1] and "src/one.py:3" in fix[-1]

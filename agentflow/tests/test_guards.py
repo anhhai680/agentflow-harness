@@ -6,7 +6,7 @@ import json
 import pytest
 
 from agentflow import flow, guards
-from agentflow.config import Gate, load_config
+from agentflow.config import load_config
 from agentflow.state import runs_root
 from conftest import PYTHON_CONFIG
 from agentflow.guards import (

@@ -35,7 +35,8 @@ def make_worktree(root: Path, git) -> Path:
 
 
 def test_pack_prompt_wins_over_engine_default(tmp_path):
-    (tmp_path / "prompts").mkdir(); (tmp_path / "prompts/step.md").write_text("pack")
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts/step.md").write_text("pack")
     assert pack.prompt_path(tmp_path / "config.yaml", "step.md") == tmp_path / "prompts/step.md"
     assert pack.prompt_path(tmp_path / "config.yaml", "debug.md") == pack.ENGINE_PROMPTS / "debug.md"
     assert pack.prompt_path(tmp_path / "config.yaml", "nope.md") is None
@@ -43,7 +44,8 @@ def test_pack_prompt_wins_over_engine_default(tmp_path):
 
 def test_prompt_files_and_labels(tmp_path):
     config = tmp_path / "config.yaml"
-    (tmp_path / "prompts").mkdir(); (tmp_path / "prompts/step.md").write_text("pack")
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts/step.md").write_text("pack")
     files = pack.prompt_files(config)
     assert files["step.md"] == tmp_path / "prompts/step.md"
     assert files["debug.md"] == pack.ENGINE_PROMPTS / "debug.md"
@@ -202,7 +204,8 @@ def test_state_dir_expands_the_home_dir(tmp_git, monkeypatch, tmp_path):
 
 
 def test_state_dir_default_is_outside_the_repo(tmp_git, monkeypatch, tmp_path):
-    write_pack(tmp_git, {}); monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    write_pack(tmp_git, {})
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
     got = pack.state_dir(tmp_git)
     assert got.parent == tmp_path / "xdg/agentflow" and got.name.startswith(tmp_git.name + "-")
 
@@ -211,7 +214,8 @@ def test_state_dir_default_is_resolved_through_a_symlinked_xdg_home(tmp_git, mon
     real = tmp_path / "real-xdg"
     real.mkdir()
     (tmp_path / "xdg-link").symlink_to(real, target_is_directory=True)
-    write_pack(tmp_git, {}); monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-link"))
+    write_pack(tmp_git, {})
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-link"))
     got = pack.state_dir(tmp_git)
     assert got == got.resolve() and got.parent == real.resolve() / "agentflow"
 
