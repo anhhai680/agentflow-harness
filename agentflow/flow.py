@@ -673,6 +673,21 @@ def cmd_queue(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_backlog(args: argparse.Namespace) -> int:
+    """`backlog done <module>` marks a module finished by hand; `backlog undone <module>` takes that mark off, or
+    (with none) vetoes the origin evidence that says it is done."""
+    from agentflow import backlog
+
+    act = backlog.mark_done if args.backlog_command == "done" else backlog.mark_not_done
+    try:
+        for line in act(_load_cfg(args), _find_repo(), args.module, _by(args)):
+            print(line)
+        return 0
+    except (backlog.Refused, *_human_errors()) as exc:
+        print(f"error: {exc}")
+        return 1
+
+
 # --------------------------------------------------------------------------- run control and live views
 
 
@@ -950,6 +965,17 @@ def build_parser() -> argparse.ArgumentParser:
     nxt = sub.add_parser("next", help="the lane, stage and next skill for the repo as it stands now")
     nxt.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     nxt.set_defaults(func=cmd_next)
+
+    blg = sub.add_parser("backlog", help="mark a Backlog module finished (or not) by hand")
+    blg_sub = blg.add_subparsers(dest="backlog_command", required=True)
+    for verb, text in (("done", "mark a module done by hand (refused while it has a live run)"),
+                       ("undone", "remove a module's hand mark, or with none, ignore the origin evidence that says "
+                                  "it is done")):
+        one = blg_sub.add_parser(verb, help=text)
+        one.add_argument("module", help="a module id from the work source")
+        one.add_argument("--by", help="who is marking it (default: the current user)")
+        one.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+        one.set_defaults(func=cmd_backlog)
 
     que = sub.add_parser("queue", help="start modules in capability-map order as their dependencies merge")
     que.add_argument("--max-parallel", type=int, default=2, help="runs live at once (default 2)")

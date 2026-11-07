@@ -330,6 +330,9 @@ agentflow resume <run> --mark-done                  # a ready run: skip to ship,
 agentflow dashboard                                 # token is in the URL fragment; keep it private
 agentflow queue --max-parallel 2
 agentflow queue --include-specs                     # a pack with work_source specs: queue every spec file's module
+agentflow backlog done <module> [--by NAME]         # mark a module finished by hand (refused while it has a live run)
+agentflow backlog undone <module> [--by NAME]       # remove that hand mark; with none, ignore the origin evidence that
+                                                    #   says it is done (a merged module stays done)
 ```
 
 ## 11. Safety model in five lines

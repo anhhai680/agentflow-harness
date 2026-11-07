@@ -1042,3 +1042,26 @@ def test_old_runs_stay_in_metrics_and_on_the_board(flow_repo):
     assert [c["run_id"] for c in board(flow_repo.root, flow_repo.cfg, now=later)["cards"]] == [run.id]
     card = board(flow_repo.root, flow_repo.cfg, now=later)["cards"][0]
     assert card["wall_s"] >= 0 and card["spend"] == 1.25
+
+
+def test_the_board_carries_the_done_modules_and_the_note_and_a_lane_that_is_not_the_module_lane_sees_none(bdash):
+    from agentflow import finished
+
+    finished.mark(bdash.flow.root, "c", "test")
+    data = payload(bdash.get("/api/board")[2])
+    assert data["backlog_done"] == [{"key": "module:c", "id": "c", "reason": "done by hand"}]
+    assert data["done_note"] == "" and "module:c" not in {c["key"] for c in data["backlog"]}
+    other = payload(bdash.get("/api/board?lane=bug")[2])
+    assert other["backlog_done"] == [] and "done_note" in other
+    assert payload(bdash.get("/api/board?lane=feature")[2])["backlog_done"] == data["backlog_done"]
+
+
+def test_the_page_shows_the_done_modules_in_a_details_that_keeps_its_open_state():
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    block = source[source.index("function doneNode"):source.index("function renderBoard")]
+    assert 'el("details"' in block and '"Done (" +' in block and "ontoggle" in block
+    assert "ui.doneOpen" in block and "open: ui.doneOpen" in block
+    assert "item.reason" in block and "Start" not in block  # one line each, no Start button
+    assert "innerHTML" not in block  # every text goes through el()'s textContent
+    assert "data.done_note" in source and "doneNode(data.backlog_done" in source
+    assert "ontoggle" in source[source.index("function el("):source.index("function toast")]

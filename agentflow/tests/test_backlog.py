@@ -7,7 +7,8 @@ import os
 from pathlib import Path
 
 import pytest
-from agentflow import backlog, module_queue
+from agentflow import backlog, finished, module_queue
+from agentflow.flow import main
 from agentflow.backlog import Invalid, Refused
 from agentflow.state import Run, runs_root
 
@@ -640,3 +641,113 @@ def test_a_capability_map_backlog_names_no_skipped_files(bk):
 def test_the_spec_prompt_tells_the_agent_about_task_md_and_the_depends_on_header():
     text = (Path(backlog.__file__).parent / "prompts" / "spec.md").read_text(encoding="utf-8")
     assert "{run_dir}/task.md" in text and "**Depends on:**" in text
+
+
+# --------------------------------------------------------------------------- finished modules and `backlog done|undone`
+
+
+def test_a_module_marked_done_by_hand_leaves_the_cards_and_is_listed_as_done_with_no_refresh(bk):
+    finished.mark(bk.root, "b", "cli")
+    pile = backlog.snapshot(bk.cfg, bk.root)
+    assert {"key": "module:b", "id": "b", "reason": "done by hand"} in pile["done"]
+    assert "module:b" not in bk.cards() and pile["done_note"] == ""
+    finished.unmark(bk.root, "b")
+    assert "module:b" in bk.cards()
+    assert all(d["id"] != "b" for d in backlog.snapshot(bk.cfg, bk.root)["done"])
+
+
+def test_done_modules_come_in_work_source_order_with_the_reason_the_assessment_recorded(bk):
+    bk.refresh()  # a is merged
+    finished.mark(bk.root, "c", "cli")
+    done = backlog.snapshot(bk.cfg, bk.root)["done"]
+    assert [(d["id"], d["reason"]) for d in done] == [("a", finished.MERGED), ("c", finished.BY_HAND)]
+
+
+def test_a_corrupt_marks_file_is_noted_and_a_module_marked_earlier_stays_done(bk):
+    finished.mark(bk.root, "b", "cli")
+    bk.refresh()
+    (runs_root(bk.root) / finished.MARKS).write_text("{not json", encoding="utf-8")
+    pile = backlog.snapshot(bk.cfg, bk.root)
+    assert pile["done_note"] and "done_marks.json" in pile["done_note"]
+    assert "b" in [d["id"] for d in pile["done"]] and "module:b" not in bk.cards()
+
+
+def test_backlog_done_refuses_a_name_that_is_not_a_module(bk, capsys):
+    bk.fr.install_pack()
+    assert main(["backlog", "done", "ghost"]) == 1
+    assert "not a module" in capsys.readouterr().out
+    assert finished.read_marks(bk.root)[0] == {}
+
+
+def test_backlog_done_refuses_a_module_with_a_live_run_until_it_is_cancelled(bk, capsys):
+    bk.fr.install_pack()
+    bk.refresh()
+    bk.start("module:b")
+    (run,) = module_queue.feature_runs(bk.cfg, bk.root).values()
+    assert main(["backlog", "done", "b"]) == 1
+    assert run.id in capsys.readouterr().out
+    run.emit("run_cancelled", by="test", killed=[], skipped=[])
+    assert main(["backlog", "done", "b"]) == 0
+
+
+def test_backlog_done_records_who_marked_it_and_prints_it(bk, capsys):
+    bk.fr.install_pack()
+    assert main(["backlog", "done", "b", "--by", "pat"]) == 0
+    assert "b marked done by hand" in capsys.readouterr().out
+    assert finished.read_marks(bk.root)[0]["b"]["by"] == "pat"
+    assert "b" in finished.recorded(bk.root)  # the assessment under the lock recorded it too
+
+
+def test_backlog_done_defaults_the_actor_to_the_current_user(bk, monkeypatch):
+    import getpass
+
+    bk.fr.install_pack()
+    monkeypatch.setattr(getpass, "getuser", lambda: "sam")
+    assert main(["backlog", "done", "b"]) == 0
+    assert finished.read_marks(bk.root)[0]["b"]["by"] == "sam"
+
+
+def test_backlog_undone_removes_a_hand_mark_and_then_records_a_veto(bk, capsys):
+    bk.fr.install_pack()
+    assert main(["backlog", "done", "b"]) == 0
+    capsys.readouterr()
+    assert main(["backlog", "undone", "b"]) == 0
+    assert "b hand mark removed" in capsys.readouterr().out
+    assert finished.read_marks(bk.root)[0] == {} and "module:b" in bk.cards()
+    assert main(["backlog", "undone", "b"]) == 0
+    assert "b marked not done by hand: origin evidence is ignored" in capsys.readouterr().out
+    assert finished.read_marks(bk.root)[0]["b"]["state"] == "not_done"
+
+
+def test_a_veto_does_not_unmerge_a_merged_module(bk, capsys):
+    bk.fr.install_pack()
+    assert main(["backlog", "undone", "a"]) == 0
+    assert "a" in [d["id"] for d in backlog.snapshot(bk.cfg, bk.root)["done"]]
+
+
+def test_the_commands_keep_the_change_and_say_so_when_the_queue_is_running(bk, capsys):
+    bk.fr.install_pack()
+    with module_queue.queue_lock(bk.root):
+        assert main(["backlog", "done", "b"]) == 0
+    out = capsys.readouterr().out
+    assert "the queue is running; the Backlog shows it on its next refresh" in out
+    assert "b" in [d["id"] for d in backlog.snapshot(bk.cfg, bk.root)["done"]]
+
+
+def test_the_commands_exit_1_with_the_repair_text_when_the_marks_file_is_unreadable(bk, capsys):
+    bk.fr.install_pack()
+    root = runs_root(bk.root)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / finished.MARKS).write_text("[]", encoding="utf-8")
+    for verb in ("done", "undone"):
+        assert main(["backlog", verb, "b"]) == 1
+        assert "fix it or delete it" in capsys.readouterr().out
+
+
+def test_the_text_board_lists_the_done_modules(bk):
+    from agentflow.views import board, board_table
+
+    finished.mark(bk.root, "b", "cli")
+    text = board_table(board(bk.root, bk.cfg))
+    assert "done: b (done by hand)" in text
+    assert "done:" not in board_table({**board(bk.root, bk.cfg), "backlog_done": [], "done_note": ""})

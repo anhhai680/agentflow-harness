@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agentflow import intake, module_queue, sources, work_source
+from agentflow import finished, intake, module_queue, sources, work_source
 from agentflow.conditions import first_phase_with_work, make_ctx
 from agentflow.config import check_lane
 from agentflow.events import EventLog, nfc
@@ -410,8 +410,9 @@ def _first_phase(cfg: Config, repo: Path, lane: str, module: str | None) -> str 
 
 
 def snapshot(cfg: Config, repo: Path) -> dict:
-    """The Backlog column for the board: `cards`, the New task form (`new_task`, `lane_phases`, `after_choices`)
-    and the last base-branch sync note."""
+    """The Backlog column for the board: `cards`, the finished modules (`done`, each with its `reason`, and
+    `done_note`, the error from reading the hand marks or `""`), the New task form (`new_task`, `lane_phases`,
+    `after_choices`) and the last base-branch sync note."""
     repo = Path(repo)
     pic = _picture(cfg, repo)
     view, book, lane = pic["view"], pic["book"], module_queue.module_lane(cfg)
@@ -448,6 +449,8 @@ def snapshot(cfg: Config, repo: Path) -> dict:
             continue
         cards.append(make(f"card:{item.id}", "card", item.id, item.label, item.lane, item,
                           deps=[*item.after, *item.deps], new=item.new_module is not None))
+    done = [{"key": f"module:{n.id}", "id": n.id, "reason": by_entry[n.id].get("done_reason") or finished.MERGED}
+            for n in pic["nodes"] if by_entry[n.id]["status"] == "done"]
     live_runs = [{"key": f"run:{r.id}", "label": _label_of_run(r), "kind": "run"} for r in _live_runs(pic["runs"])]
     choices = [{"key": c["key"], "label": c["label"], "kind": c["kind"]} for c in cards if c["kind"] == "card"]
     choices += live_runs
@@ -456,6 +459,8 @@ def snapshot(cfg: Config, repo: Path) -> dict:
     forms = new_task(cfg)
     return {
         "cards": cards,
+        "done": done,
+        "done_note": finished.read_marks(repo)[1] or "",
         "new_task": forms,
         "lane_phases": {ln: lane_phases(cfg, ln) for ln in forms},
         "lane_labels": lane_labels(cfg),
@@ -464,6 +469,60 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         "skipped": work_source.skipped(cfg, repo),
         "sync_note": pic["state"].get("sync_note") or "",
     }
+
+
+# --------------------------------------------------------------------------- marking a module done by hand
+
+QUEUE_RUNNING = "the queue is running; the Backlog shows it on its next refresh"
+
+
+def _known_module(cfg: Config, repo: Path, module: str) -> None:
+    if module not in [n.id for n in _map_nodes(cfg, repo)]:
+        raise Invalid(f"{module!r} is not a module of this {work_source.noun(cfg)}")
+
+
+def _reassess(cfg: Config, repo: Path) -> list[str]:
+    """Record the new state in `queue.json` under the queue lock; when `agentflow queue` holds it, the change
+    stays and the Backlog shows it from the marks file until the next refresh."""
+    try:
+        with module_queue.queue_lock(repo):
+            if _map_nodes(cfg, repo):
+                module_queue.assess_modules(cfg, repo)
+    except module_queue.QueueBusy:
+        return [QUEUE_RUNNING]
+    return []
+
+
+def mark_done(cfg: Config, repo: Path, module: str, by: str) -> list[str]:
+    """Mark `module` done by hand; the lines to print. `Invalid` when it is not a module, `Refused` when it has a
+    live run, `ValueError` (with how to repair it) when the marks file is unreadable."""
+    repo = Path(repo)
+    _known_module(cfg, repo, module)
+    error = finished.read_marks(repo)[1]
+    if error:
+        raise ValueError(error)
+    run = module_queue.feature_runs(cfg, repo).get(module)
+    if run is not None and run.state["status"] in module_queue._LIVE:
+        raise Refused(f"{module} has a live run, {run.id} ({run.state['status']}); cancel it first or let it finish")
+    finished.mark(repo, module, by)
+    return [f"{module} marked done by hand", *_reassess(cfg, repo)]
+
+
+def mark_not_done(cfg: Config, repo: Path, module: str, by: str) -> list[str]:
+    """Take a hand mark off `module`, or, with none, veto the origin evidence that says it is done (a merged
+    module stays done). The lines to print; the errors are those of `mark_done`, less the live run."""
+    repo = Path(repo)
+    _known_module(cfg, repo, module)
+    marks, error = finished.read_marks(repo)
+    if error:
+        raise ValueError(error)
+    if (marks.get(module) or {}).get("state") == "done":
+        finished.unmark(repo, module)  # a veto stays as it is: only the hand mark goes
+        message = f"{module} hand mark removed"
+    else:
+        finished.veto(repo, module, by)
+        message = f"{module} marked not done by hand: origin evidence is ignored"
+    return [message, *_reassess(cfg, repo)]
 
 
 # --------------------------------------------------------------------------- starting
