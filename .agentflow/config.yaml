@@ -15,6 +15,8 @@ project:
     plans: docs/plans
   commit_trailer: "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
+work_source: {kind: specs}      # one module per file in `project.docs.specs` that fits `spec_file`
+
 skills:
   map:                          # the skill `agentflow next` names for each kind of next step
     decide: grilling
@@ -324,8 +326,10 @@ dashboard:
   agents: {show_exited_min: 10, idle_warn_min: 5}
   backlog:
     sync_base: true
+    module_lane: feature
     lane_labels:                    # the page's words for a lane; a lane left out shows its own name
       feature: Feature
       bug: Bug fix
     new_task:                       # lane: its form fields; a lane left out can't be added from the page
-      bug: [issue, task, after]     # no work source: a feature run starts from the CLI (`agentflow run feature --module <id>`)
+      feature: [new_module, after]  # a feature card writes docs/agentflow-<id>-proposal.md
+      bug: [issue, task, after]

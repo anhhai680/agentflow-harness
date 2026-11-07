@@ -168,6 +168,26 @@ Not built in this slice: the multi-project registry and `status --all-projects`,
 
 ---
 
+## 1d. Team backlog
+
+Slice TB-A1 (`docs/plans/2026-11-07-agentflow-harness-slice-tb-a1.md`) lets a team start work from its own spec files. A pack may set `work_source: {kind: specs}`, which lists one module per file in `project.docs.specs` that fits `project.docs.spec_file`. The Backlog shows each module as a card and starts it in `dashboard.backlog.module_lane`, and a new feature card writes the module's spec file.
+
+### Deviations in slice TB-A1 (as built)
+1. **The spec header's `Depends on:` line** can be bold or plain, with a colon, and its bullets or a comma continuation count. An unknown, unreadable or cut dependency blocks the module.
+2. **The task of a new feature card** carries the card's dependencies as a `Depends on:` line, and the spec prompt gains two sentences, not one. A new spec's dependencies are kept only when the define agent writes them into the header. Until then the card blocks on them, and the spec approval checkpoint shows them to the person who approves.
+3. **`--new-module` in a `specs` pack** is refused by `_check_new_module`, which points to `--module --task`. `add_item` is a no-op for `specs`.
+4. **`init` writes the `specs` source** only when `detect` finds a top-level `specs/`, `docs/rfcs` or `docs/proposals`. A repository with only `docs/`, or with `docs/specs/`, gets no `specs` source. For `docs/specs/`, `detect` prints a note, and the source is a manual addition.
+5. **Files that are not modules** are skipped: non-slug ids, symlinks, directories and unreadable files. Under the bare `{module}.md` pattern, `index`, `readme`, `template` and `changelog` are skipped too.
+6. **`work_source.path`:** a `specs` source takes none, and always reads `project.docs.specs`.
+7. **`agentflow queue` on a `specs` pack** needs `--include-specs`. Each run still runs its `define` and `plan` agent steps before it stops for approval.
+8. **Modules finished before agentflow:** until slice TB-A2, such a module shows as startable unless its plan is finished and its branch is merged, which is today's rule.
+9. **No engine version bump.** An older 2.x engine refuses `kind: specs` loudly in `validate`.
+10. **No shipped-slice proposals to mark.** The "mark the shipped slices' proposals done" step has nothing to do here: this repository has one proposal, and it is still in progress.
+
+This repository's pack turns the source on (`work_source: {kind: specs}`, `module_lane: feature`, and a `feature` New task form), so `harness` is a Backlog card.
+
+---
+
 ## 2. What is missing (gap analysis)
 
 | # | Missing piece | Today | Needed for a harness |
@@ -531,6 +551,12 @@ All of it comes from `events.jsonl`, the existing single source of truth, throug
 - the bundled generic skills plus `skills.map`
 
 Every later slice then lands in the engine already generic. The engine already lives in its own repository (this one, with its own `.agentflow/` pack); what remains of the cutover is installing it as a tool. Playbook §13 "Using agentflow in another repository" is replaced by `agentflow init --starter <python-uv|node-pnpm|docs-only>`.
+
+**Slice TB-A1 (done, 2026-11-07; `docs/plans/2026-11-07-agentflow-harness-slice-tb-a1.md`): the team backlog from spec files** (1d; its deviations are recorded there):
+- the `specs` work source, with dependencies read from each spec's header
+- the Backlog starts spec modules and new feature cards, and names the files that are not modules
+- `init` writes the `specs` source and a feature-starting Backlog when it finds a specs directory
+- this repository's pack turns the source on
 
 **Rule for every slice:** any `config.yaml` key it adds or changes ships with the matching Settings change (3.9): a Form field or a `_PROTECTED_KEYS` entry, validate cross-checks, `tests/test_config_edit.py` cases, and the field list in guide §11 "Changing behaviour".
 
