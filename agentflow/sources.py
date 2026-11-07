@@ -404,13 +404,14 @@ def cut_lines(text: str, limit: int = LINE_MAX) -> str:
 
 
 def says_done(text: str, pattern: str) -> bool | None:
-    """Whether a line of the spec's header (`spec_header`: before its first `## `, fences left out, each line cut to
-    `LINE_MAX`) matches `pattern`, case-insensitively. None when `pattern` does not compile."""
+    """Whether a line of the spec's header (`spec_header`: before its first `## `, fences left out) matches `pattern`,
+    case-insensitively. A line cut at `LINE_MAX` never counts: its end was not read. None when `pattern` does not
+    compile."""
     try:
         rx = re.compile(pattern, re.IGNORECASE)
     except re.error:
         return None
-    return any(rx.search(line) for line, _was_cut in spec_header(text))
+    return any(rx.search(line) for line, was_cut in spec_header(text) if not was_cut)
 
 
 _PLAN_SPEC = re.compile(r"^\s*\*\*Spec:\*\*(.*)$")

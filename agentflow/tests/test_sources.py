@@ -261,6 +261,16 @@ def test_says_done_reads_the_header_and_refuses_a_bad_pattern():
     assert sources.says_done("# S\n\n**Status:** done\n", "(") is None
 
 
+def test_says_done_never_counts_a_header_line_cut_at_line_max():
+    from agentflow import sources
+    from agentflow.config import DEFAULT_DONE_STATUS
+
+    long_line = "Status:" + " " * 501 + "done-ish, not really"  # the cut at 512 falls right after `done`
+    assert long_line[: sources.LINE_MAX].endswith("done")
+    assert sources.says_done(f"# S\n\n{long_line}\n\n## A\n", DEFAULT_DONE_STATUS) is False
+    assert sources.says_done(f"# S\n\n{long_line}\nStatus: done\n\n## A\n", DEFAULT_DONE_STATUS) is True
+
+
 def test_plan_spec_is_the_basename_of_the_header_spec_path():
     from agentflow import sources
 
