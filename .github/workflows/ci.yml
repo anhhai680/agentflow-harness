@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR supersedes the run in flight.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      # Rules live in pyproject.toml [tool.ruff.lint]. The version is pinned so a ruff release can't redden main.
+      - name: ruff check
+        run: uvx ruff@0.17.4 check .
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The suite builds throwaway git repos and commits in them.
+      - name: Configure git identity
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.com"
+          git config --global init.defaultBranch main
+      # Same command as the pack's `engine_tests` gate (.agentflow/config.yaml).
+      - name: pytest
+        run: uv run --no-project --python 3.12 --with pyyaml --with pytest pytest agentflow/tests --import-mode=prepend -q

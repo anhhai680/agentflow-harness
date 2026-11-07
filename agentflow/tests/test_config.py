@@ -581,7 +581,7 @@ def test_a_brief_template_with_no_brief_and_no_skill_is_still_an_error(tmp_cfg):
 
 import dataclasses  # noqa: E402
 
-from agentflow import layers, pack  # noqa: E402
+from agentflow import layers  # noqa: E402
 from conftest import PACKS, ROOT, SPARSE_PACK  # noqa: E402
 
 DEFAULTS = yaml.safe_load(layers.ENGINE_DEFAULTS.read_text(encoding="utf-8"))

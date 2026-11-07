@@ -20,3 +20,7 @@ exclude = ["agentflow/tests", "agentflow/runs", "agentflow/workspaces", "agentfl
 # `uv tool install --reinstall --from . agentflow` is the fallback if uv does not pick a change up.
 [tool.uv]
 cache-keys = [{ file = "pyproject.toml" }, { file = "agentflow/**/*" }]
+
+# Lint: `ruff check .` (CI runs it). Correctness rules only; formatting is not enforced.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

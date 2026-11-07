@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from agentflow.flow import main
 from agentflow.gates import GateResult, run_doc_checks
-from agentflow.hitl import approve, parse_answers
+from agentflow.hitl import parse_answers
 from agentflow.pipeline import RunOptions, advance, start
 from agentflow.state import Run
 from conftest import ENGINE, run_git
