@@ -16,7 +16,7 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agentflow import pack, sources, work_source
+from agentflow import finished, pack, sources, work_source
 from agentflow.config import ON_UNKNOWN_VALUES, Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.gitops import GhError, changed_files, gh_json
 from agentflow.guards import path_matches
@@ -267,7 +267,9 @@ def _merged_heads(ctx: Ctx) -> set[str]:
 
 
 def _modules_done(spec: dict, ctx: Ctx) -> tuple[bool | None, str]:
-    """Whether every module the run's module depends on (in the pack's work source) has a merged pull request."""
+    """Whether every module the run's module depends on (in the pack's work source) is done: recorded done by the
+    last assessment or by hand (`finished.recorded`, whatever the reason), else with a merged pull request. `gh` is
+    asked only about the dependencies not recorded."""
     module = ctx.values.get("module", "")
     nodes = work_source.items(ctx.cfg, ctx.repo)
     node = next((n for n in nodes if n.id == module), None)
@@ -275,19 +277,24 @@ def _modules_done(spec: dict, ctx: Ctx) -> tuple[bool | None, str]:
         return None, f"module '{module}' is not in the {work_source.noun(ctx.cfg)}"
     if not node.deps:
         return True, f"{module} has no dependencies"
+    done = finished.recorded(ctx.repo)
+    missing = [dep for dep in node.deps if dep not in done]
+    if not missing:
+        return True, "done: " + ", ".join(f"{dep} ({done[dep]})" for dep in node.deps)
     try:
         heads = _merged_heads(ctx)
     except GhError as exc:
         return None, f"gh failed: {exc}"
     template = ctx.cfg.project.branch.replace("{lane}", "feature")
-    missing = [
+    unmerged = [
         dep
-        for dep in node.deps
+        for dep in missing
         if not any(re.fullmatch(re.escape(template.replace("{slug}", dep)) + r"(-\d+)?", h) for h in heads)
     ]
-    if missing:
-        return False, f"not merged yet: {', '.join(missing)}"
-    return True, f"merged: {', '.join(node.deps)}"
+    if unmerged:
+        return False, f"not merged yet: {', '.join(unmerged)}"
+    return True, f"merged: {', '.join(missing)}" + "".join(f"; done: {dep} ({done[dep]})" for dep in node.deps
+                                                             if dep in done)
 
 
 def _gate_passed(spec: dict, ctx: Ctx) -> tuple[bool | None, str]:

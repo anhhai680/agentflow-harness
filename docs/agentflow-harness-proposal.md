@@ -172,6 +172,8 @@ Not built in this slice: the multi-project registry and `status --all-projects`,
 
 Slice TB-A1 (`docs/plans/2026-11-07-agentflow-harness-slice-tb-a1.md`) lets a team start work from its own spec files. A pack may set `work_source: {kind: specs}`, which lists one module per file in `project.docs.specs` that fits `project.docs.spec_file`. The Backlog shows each module as a card and starts it in `dashboard.backlog.module_lane`, and a new feature card writes the module's spec file.
 
+Slice TB-A2 (`docs/plans/2026-11-07-agentflow-harness-slice-tb-a2.md`) lets the Backlog recognise modules that are already finished, show the reason, and let a person mark or unmark them.
+
 ### Deviations in slice TB-A1 (as built)
 1. **The spec header's `Depends on:` line** can be bold or plain, with a colon, and its bullets or a comma continuation count. An unknown, unreadable or cut dependency blocks the module.
 2. **The task of a new feature card** carries the card's dependencies as a `Depends on:` line, and the spec prompt gains two sentences, not one. A new spec's dependencies are kept only when the define agent writes them into the header. Until then the card blocks on them, and the spec approval checkpoint shows them to the person who approves.
@@ -180,9 +182,23 @@ Slice TB-A1 (`docs/plans/2026-11-07-agentflow-harness-slice-tb-a1.md`) lets a te
 5. **Files that are not modules** are skipped: non-slug ids, symlinks, directories and unreadable files. Under the bare `{module}.md` pattern, `index`, `readme`, `template` and `changelog` are skipped too.
 6. **`work_source.path`:** a `specs` source takes none, and always reads `project.docs.specs`.
 7. **`agentflow queue` on a `specs` pack** needs `--include-specs`. Each run still runs its `define` and `plan` agent steps before it stops for approval.
-8. **Modules finished before agentflow:** until slice TB-A2, such a module shows as startable unless its plan is finished and its branch is merged, which is today's rule.
+8. **Modules finished before agentflow:** in slice TB-A1, such a module shows as startable unless its plan is finished and its branch is merged, which is today's rule. Slice TB-A2 changes this (see its deviations below).
 9. **No engine version bump.** An older 2.x engine refuses `kind: specs` loudly in `validate`.
 10. **No shipped-slice proposals to mark.** The "mark the shipped slices' proposals done" step has nothing to do here: this repository has one proposal, and it is still in progress.
+
+### Deviations in slice TB-A2 (as built)
+1. **Hand marks and vetoes** live in `runs/done_marks.json` (`agentflow/finished.py`), not in `backlog.jsonl`. `agentflow backlog done` marks a module done, and `agentflow backlog undone` removes a mark, or vetoes origin evidence.
+2. **Finished work is read from `refs/remotes/origin/<fork_from>`**, the branch pull requests merge into, not from `origin/<base_branch>` or from the work tree. Unpushed commits on `fork_from` don't count. Merged-branch detection and hand marks work with no `origin`. In a repository with no readable `origin/<fork_from>`, a module already recorded as `merged` (or as done by origin evidence) stays done: a newly opened plan doesn't reopen it, and a veto doesn't reopen a `merged` one. Only editing `queue.json` does.
+3. **The cheap reasons come before `gh`.** These rules apply to `capability_map` packs too: (a) a hand mark makes a module done, and a veto removes only a Done that origin evidence gave; (b) a spec header status on origin that says done makes it done; (c) a newest dated plan on origin makes it done with no `gh` call when it is fully ticked, names the module's spec file on its `**Spec:**` line, and both origin listings were complete; (d) `modules_done` counts every dependency the last assessment recorded as done, whatever the reason, and asks `gh` only for the rest; (e) `agentflow next` skips done modules in `rule_spec_without_plan` and `rule_checked_plan`; (f) a plan belongs to a module by its dated name and the longest known id; (g) done entries in `queue.json` gain `done_reason`.
+4. **A plan belongs to a module** by its dated name, the longest known id and, for the no-`gh` rule, its `**Spec:**` line. The other `next` rules still use `find_plan`.
+5. **The reason words** are `done by hand`, `spec says done`, `plan complete on <branch>` and `merged`. They replace the spec's "merged PR" and "plan complete".
+6. **The default `done_status`** accepts bold, list and quote forms and matches header lines only. It still accepts a trailing qualifier such as `Status: done pending review`; a veto fixes such a case. A header line cut at 512 characters never counts as saying done.
+7. **A veto ignores only origin evidence** (the spec says done, or the plan is complete on origin). A module already done as `merged` stays done after a veto, in every view, because a merged branch is not origin evidence.
+8. **An unreadable `runs/done_marks.json`:** hand marks recorded in `queue.json` stay done. A veto cannot be read, so origin evidence creates no new Done until the file is repaired, and the queue log says so. The CLI refuses to change marks and prints the repair text.
+9. **Origin that cannot be read in full** (no `origin`, git fails or times out, or a listing is over the count or byte limit): a module recorded earlier as done by origin evidence, or as `merged`, stays done. Nothing new becomes done from origin evidence on a partial listing. The one exception is the module's own spec file, as far as it was read (its last, possibly cut, line is dropped), which can still say done.
+10. **`modules_done` and `agentflow next`** read what the last assessment recorded, and the dashboard refreshes it every 60 s (`REFRESH_EVERY_S`) while `agentflow queue` refreshes it every `--interval` (default 30 s, `INTERVAL_S`). With neither running, only the hand marks are current.
+11. **In TB-A2, the module list is still read from the work tree,** and the fresh re-check before a start (spec B4) isn't built. Both move to PR B.
+12. **An approved spec with no plan,** finished before agentflow, needs `agentflow backlog done`.
 
 This repository's pack turns the source on (`work_source: {kind: specs}`, `module_lane: feature`, and a `feature` New task form), so `harness` is a Backlog card.
 
@@ -557,6 +573,12 @@ Every later slice then lands in the engine already generic. The engine already l
 - the Backlog starts spec modules and new feature cards, and names the files that are not modules
 - `init` writes the `specs` source and a feature-starting Backlog when it finds a specs directory
 - this repository's pack turns the source on
+
+**Slice TB-A2 (done, 2026-11-07; `docs/plans/2026-11-07-agentflow-harness-slice-tb-a2.md`): finished modules in the team backlog** (1d; its deviations are recorded there):
+- finished work is read from `origin/<fork_from>`: a spec that says done, or a complete plan that names its spec, before `gh` is asked about a merge
+- each done module shows its reason in the Backlog
+- `agentflow backlog done` and `undone` mark a module by hand or veto origin evidence, kept in `runs/done_marks.json`
+- the module list and the fresh re-check before a start move to PR B
 
 **Rule for every slice:** any `config.yaml` key it adds or changes ships with the matching Settings change (3.9): a Form field or a `_PROTECTED_KEYS` entry, validate cross-checks, `tests/test_config_edit.py` cases, and the field list in guide §11 "Changing behaviour".
 

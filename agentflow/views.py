@@ -260,6 +260,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
     done_days = cfg.dashboard.get("show_done_days", DEFAULT_DONE_DAYS)
     from agentflow import work_source
     from agentflow.backlog import snapshot
+    from agentflow.module_queue import module_lane
 
     pile = snapshot(cfg, repo)
     cards, counts, spend_today = [], Counter(), 0.0
@@ -288,6 +289,8 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
         "columns": ["Backlog", *phases, "Done"],
         "cards": cards,
         "backlog": [c for c in pile["cards"] if lane is None or c["lane"] == lane],
+        "backlog_done": pile["done"] if lane is None or lane == module_lane(cfg) else [],
+        "done_note": pile["done_note"],
         "sync_note": pile["sync_note"],
         "new_task": pile["new_task"],
         "lane_phases": pile["lane_phases"],
@@ -737,6 +740,10 @@ def board_table(data: dict) -> str:
     lines = _table(rows)
     if data["backlog"]:
         lines.append("Backlog: " + ", ".join(_backlog_text(card) for card in data["backlog"]))
+    if data.get("backlog_done"):
+        lines.append("done: " + ", ".join(f"{m['id']} ({m['reason']})" for m in data["backlog_done"]))
+    if data.get("done_note"):
+        lines.append(f"warning: {data['done_note']}")
     lines.append(f"Needs human ({len(data['needs_human'])}):")
     for item in data["needs_human"]:
         lines.append(f"  {item['run_id']} · {item['key']} · {item['kind']} · {_short(item['age_s'])} ago")

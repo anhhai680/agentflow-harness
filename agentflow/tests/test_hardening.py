@@ -336,21 +336,25 @@ def test_running_run_without_a_runner_shows_stalled(repo, cfg):
 
 
 def test_queue_reports_a_crashed_run_and_frees_its_slot(flow_repo, monkeypatch):
-    from agentflow import module_queue
+    from agentflow import finished, module_queue
     from agentflow.sources import ModuleNode
 
+    view = module_queue.origin_view(flow_repo.cfg, flow_repo.root)  # what `assess_modules` reads once per assessment
+    seen = (view, module_queue.known_ids(flow_repo.cfg, flow_repo.root, view), finished.read_marks(flow_repo.root))
     run = flow_repo.new_run({"module": "platform"})
     run.emit("runner_error", error="disk full", exception="OSError")
     entry, holds_slot, problem = module_queue._assess(
-        flow_repo.cfg, flow_repo.root, ModuleNode("platform", []), run, {}, [])
+        flow_repo.cfg, flow_repo.root, ModuleNode("platform", []), run, {}, [], *seen)
     assert not holds_slot and problem and "crashed" in problem and "disk full" in problem and "resume" in problem
     other = flow_repo.new_run({"module": "crm"})
     stale = "2026-01-01T00:00:00+00:00"
     monkeypatch.setitem(other.state, "updated_at", stale)
-    _entry, holds, why = module_queue._assess(flow_repo.cfg, flow_repo.root, ModuleNode("crm", []), other, {}, [])
+    _entry, holds, why = module_queue._assess(flow_repo.cfg, flow_repo.root, ModuleNode("crm", []), other, {}, [],
+                                          *seen)
     assert not holds and why and "crashed" in why
     fresh = flow_repo.new_run({"module": "settings"})
-    _entry, holds, why = module_queue._assess(flow_repo.cfg, flow_repo.root, ModuleNode("settings", []), fresh, {}, [])
+    _entry, holds, why = module_queue._assess(flow_repo.cfg, flow_repo.root, ModuleNode("settings", []), fresh, {}, [],
+                                          *seen)
     assert holds and why is None  # just started: its background runner has not taken the lock yet
 
 

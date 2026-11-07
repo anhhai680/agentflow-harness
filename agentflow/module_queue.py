@@ -23,14 +23,14 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agentflow import gitops, pack, sources, work_source
+from agentflow import finished, gitops, pack, sources, work_source
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.gitops import uncommitted_paths
 from agentflow.guards import path_matches
@@ -244,10 +244,13 @@ def rule_unchecked_plan(cfg: Config, repo: Path, plan: Path | None, ctx: Ctx) ->
 
 
 def rule_checked_plan(cfg: Config, repo: Path, plan: Path | None) -> NextAnswer | None:
-    """Rule 4: the newest plan is fully checked and its branch is not merged."""
+    """Rule 4: the newest plan is fully checked and its branch is not merged. A module the last assessment found
+    done (`finished.recorded`) is skipped."""
     if plan is None or not sources.parse_plan(plan):
         return None
     module = plan_module(plan, _module_ids(cfg, repo))
+    if module in finished.recorded(repo):
+        return None
     branch = module_branch(cfg, module, feature_runs(cfg, repo).get(module))
     merged, why = branch_is_merged(cfg, repo, branch)
     if merged is True:
@@ -259,7 +262,7 @@ def rule_checked_plan(cfg: Config, repo: Path, plan: Path | None) -> NextAnswer 
 
 
 def rule_spec_without_plan(cfg: Config, repo: Path) -> NextAnswer | None:
-    """Rule 5: an approved spec has no plan yet (work-source order first)."""
+    """Rule 5: an approved spec has no plan yet (work-source order first). A done module is skipped."""
     docs = cfg.project.docs
     specs_dir = repo / docs["specs"]
     cond = cfg.conditions.get("spec_is_approved") or {}
@@ -268,7 +271,10 @@ def rule_spec_without_plan(cfg: Config, repo: Path) -> NextAnswer | None:
     by_module = sources.spec_modules(specs_dir, cfg.project.spec_file)
     order = [m for m in _module_ids(cfg, repo) if m in by_module]
     order += sorted(m for m in by_module if m not in order)
+    done = finished.recorded(repo)
     for module in order:
+        if module in done:
+            continue
         spec = by_module[module]
         if sources.spec_status(spec, str(cond["approved"]), str(cond["pending"])) != "approved":
             continue
@@ -336,7 +342,7 @@ class QueueState:
 
     @staticmethod
     def path(repo: Path) -> Path:
-        return runs_root(repo) / "queue.json"
+        return runs_root(repo) / finished.QUEUE_FILE
 
     @classmethod
     def load(cls, repo: Path) -> QueueState:
@@ -362,8 +368,146 @@ def _first_line(text: str) -> str:
     return next((line.strip() for line in str(text).splitlines() if line.strip()), "")
 
 
+@dataclass(frozen=True)
+class OriginView:
+    """The spec and plan files on `refs/remotes/origin/<fork_from>`, read once per assessment. A listing is None
+    when git could not read it; `complete` is False when some file was left out (count, size or byte budget)."""
+
+    specs: gitops.Listing | None
+    plans: gitops.Listing | None
+    branch: str
+
+
+PLAN_READ_MAX = 1 << 20  # the most bytes of one plan read from origin; a longer plan is truncated, so not finished
+
+
+def origin_view(cfg: Config, repo: Path) -> OriginView:
+    """`OriginView` of `docs.specs` (the module spec files, each read to `HEADER_MAX`) and `docs.plans` (the dated
+    plan files, each read to `PLAN_READ_MAX`) at `refs/remotes/origin/<fork_from>`, the ref given in full."""
+    docs, spec_file = cfg.project.docs, cfg.project.spec_file
+    ref = f"refs/remotes/origin/{cfg.project.fork_from}"
+
+    def is_spec(name: str) -> bool:
+        ids = sources.spec_ids([name], spec_file)
+        return bool(ids) and all(sources.is_module_id(i, spec_file) for i in ids)
+
+    def is_plan(name: str) -> bool:
+        return _PLAN_NAME.fullmatch(name) is not None
+
+    def listing(key: str, keep: Callable[[str], bool], limit: int) -> gitops.Listing | None:
+        directory = docs.get(key)
+        if not isinstance(directory, str) or not directory.strip():
+            return None
+        return gitops.blobs_at(repo, ref, directory, keep, limit)
+
+    return OriginView(listing("specs", is_spec, sources.HEADER_MAX), listing("plans", is_plan, PLAN_READ_MAX),
+                      cfg.project.fork_from)
+
+
+def known_ids(cfg: Config, repo: Path, view: OriginView) -> set[str]:
+    """Every module id a plan name may be for: the work source's, and those of the spec files listed on origin."""
+    known = set(_module_ids(cfg, repo))
+    if isinstance(view.specs, gitops.Listing):
+        known |= set(sources.spec_ids(view.specs.blobs, cfg.project.spec_file))
+    return known
+
+
+def own_plans(names: Iterable[str], module: str, known: set[str]) -> list[str]:
+    """The sorted plan names of `names` that belong to `module`: dated `YYYY-MM-DD-<module>[-suffix].md`, and no
+    longer known id fits them (`2026-01-01-user-auth.md` is `user-auth`'s when that id is known, never `user`'s)."""
+    ids = sorted(known | {module})
+    return sorted(n for n in names if sources.is_plan_name(n, module) and plan_module(Path(n), ids) == module)
+
+
+def _finished(tasks: list[sources.PlanTask]) -> bool:
+    """Tasks exist and none is open (a deferred task waits on later modules, not this one)."""
+    return bool(tasks) and not any(t.open for t in tasks)
+
+
+def _origin_plan(view: OriginView, module: str, known: set[str]) -> gitops.Blob | None:
+    """The newest of `module`'s plans listed on origin, or None."""
+    if view.plans is None:
+        return None
+    own = own_plans(view.plans.blobs, module, known)
+    return view.plans.blobs[own[-1]] if own else None
+
+
+def _origin_plan_finished(blob: gitops.Blob | None) -> bool:
+    return blob is not None and not blob.truncated and _finished(sources.parse_plan_text(sources.cut_lines(blob.text)))
+
+
+def _plan_finished(cfg: Config, repo: Path, module: str, view: OriginView, known: set[str]) -> bool:
+    """Whether `module`'s newest plan is fully checked, in the work tree or on `origin/<fork_from>` (`view`). A
+    merged pull request lands on origin, while the work tree may sit on another branch or lag behind it, so the work
+    tree alone can leave a merged module's dependents blocked. A plan cut short on origin is not finished."""
+    plans_dir = Path(repo) / cfg.project.docs["plans"]
+    names = [p.name for p in plans_dir.iterdir() if p.is_file()] if plans_dir.is_dir() else []
+    own = own_plans(names, module, known)
+    if own and _finished(sources.parse_plan(plans_dir / own[-1])):
+        return True
+    return _origin_plan_finished(_origin_plan(view, module, known))
+
+
+def _origin_complete(view: OriginView) -> bool:
+    return all(isinstance(x, gitops.Listing) and x.complete for x in (view.specs, view.plans))
+
+
+def done_reason(
+    cfg: Config, repo: Path, node: sources.ModuleNode, run: Run | None, old: dict, view: OriginView,
+    known: set[str], marks: tuple[dict[str, dict], str | None],
+) -> tuple[str | None, str | None]:
+    """`(reason, problem)`: why `node` is done (a `finished` reason), or None, and why that could not be told.
+
+    The first that holds: a live hand mark (`BY_HAND`); with no live veto, a spec header on origin that matches
+    `project.docs.done_status` (`SPEC_SAYS`); with no live veto and both origin listings complete, a newest own plan
+    on origin read in full, fully ticked and naming the module's spec file (`plan_complete`); a finished newest plan
+    (work tree or origin) whose branch `gh` says is merged (`MERGED`; a prior done entry recorded as merged, or from
+    before reasons were kept, is not asked about again). When origin could not be read in full, a prior Done from
+    origin evidence or a merge stays as it was. When the marks file is unreadable, a prior hand mark stays, and
+    origin evidence makes no new Done (the file may hold a veto) but keeps an earlier one."""
+    by_hand, error = marks
+    mark = (by_hand.get(node.id) or {}).get("state")
+    said = old.get("done_reason")
+    prior = (said if isinstance(said, str) and said else finished.MERGED) if old.get("status") == "done" else None
+    if mark == "done" or (error and prior == finished.BY_HAND):
+        return finished.BY_HAND, None
+    vetoed = mark == "not_done"
+    trust_origin = not vetoed and not error  # an unreadable marks file may hide a veto: origin makes no new Done
+    try:
+        spec_name = cfg.project.spec_file.format(module=node.id)
+    except (KeyError, IndexError, ValueError, AttributeError):  # `validate` reports it; origin then decides nothing
+        spec_name = None
+    problem = None
+    if trust_origin and isinstance(view.specs, gitops.Listing) and spec_name in view.specs.blobs:
+        blob = view.specs.blobs[spec_name]
+        text = blob.text[: blob.text.rfind("\n") + 1] if blob.truncated else blob.text  # a cut last line may lie
+        says = sources.says_done(text, cfg.project.done_status)
+        if says is None:
+            problem = "project.docs.done_status is not a valid regex"
+        elif says:
+            return finished.SPEC_SAYS, None
+    plan = _origin_plan(view, node.id, known)
+    if (trust_origin and spec_name and _origin_complete(view) and plan is not None and _origin_plan_finished(plan)
+            and sources.plan_spec(plan.text) == spec_name):
+        return finished.plan_complete(view.branch), None
+    if _plan_finished(cfg, repo, node.id, view, known):
+        if prior == finished.MERGED:
+            return finished.MERGED, None
+        branch = module_branch(cfg, node.id, run)
+        merged, why = branch_is_merged(cfg, repo, branch)
+        if merged is True:
+            return finished.MERGED, None
+        if merged is None:
+            problem = problem or f"could not tell whether {branch} is merged: {_first_line(why)}"
+    if prior and (not _origin_complete(view) or error):  # origin, or a veto, could not be read: keep what was
+        if prior == finished.MERGED or (finished.from_origin(prior) and not vetoed):
+            return prior, None
+    return None, problem
+
+
 def _assess(
     cfg: Config, repo: Path, node: sources.ModuleNode, run: Run | None, old: dict, notes: list[str],
+    view: OriginView, known: set[str], marks: tuple[dict[str, dict], str | None],
 ) -> tuple[dict, bool, str | None]:
     """`(entry, occupies_a_slot, problem)` for one module; `problem` says why it cannot move without a person."""
     recorded = old.get("run_id")
@@ -371,19 +515,11 @@ def _assess(
     if run is None and recorded:  # started by an earlier tick, but its run directory is gone (cleaned up by hand)
         notes.append(f"queue: {node.id}: run {recorded} no longer exists; treating {node.id} as not started")
         entry["run_id"] = None
-    problem = None
-    finished = _plan_finished(cfg, repo, node.id)
-    if finished:
-        branch = module_branch(cfg, node.id, run)
-        if old.get("status") == "done":
-            merged = True
-        else:
-            merged, why = branch_is_merged(cfg, repo, branch)
-            if merged is None:
-                problem = f"could not tell whether {branch} is merged: {_first_line(why)}"
-        if merged is True:
-            entry["status"] = "done"
-            return entry, False, None
+    reason, problem = done_reason(cfg, repo, node, run, old, view, known, marks)
+    if reason:
+        entry["status"] = "done"
+        entry["done_reason"] = reason
+        return entry, False, None
     if run is None:
         return entry, False, problem
     status = run.state["status"]
@@ -401,26 +537,10 @@ def _assess(
             f"run {run.id} {status}{why}; a human must retry or replace it (see `agentflow status {run.id}`)"
         )
     marked = run.state.get("marked_done")
-    if status == "done" and marked and not finished:  # its plan will never finish on this run: say so, don't wait
+    if status == "done" and marked and not _plan_finished(cfg, repo, node.id, view, known):
+        # its plan will never finish on this run: say so, don't wait
         problem = problem or f"run {run.id} was marked done after {marked['phase']} with its plan unfinished; a human decides how {node.id} goes on"
     return entry, status in _LIVE, problem
-
-
-def _plan_finished(cfg: Config, repo: Path, module: str) -> bool:
-    """Whether `module`'s newest plan is fully checked (a deferred task waits on later modules, not this one), in
-    the work tree or on `origin/<fork_from>`. A merged pull request lands on origin, while the work tree may sit on
-    another branch or lag behind it, so the work tree alone can leave a merged module's dependents blocked."""
-
-    def finished(tasks: list[sources.PlanTask]) -> bool:
-        return bool(tasks) and not any(t.open for t in tasks)
-
-    plans = cfg.project.docs["plans"]
-    plan = sources.find_plan(repo / plans, module)
-    if plan and finished(sources.parse_plan(plan)):
-        return True
-    on_origin = gitops.files_at(repo, f"origin/{cfg.project.fork_from}", plans)
-    names = sorted(n for n in on_origin if sources.is_plan_name(n, module))
-    return bool(names) and finished(sources.parse_plan_text(on_origin[names[-1]]))
 
 
 def _crash(run: Run, now: datetime | None = None) -> str | None:
@@ -518,9 +638,15 @@ def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = 
     runs = feature_runs(cfg, repo)
     graph = {n.id: list(n.deps) for n in nodes}
     noun = work_source.noun(cfg)
+    view = origin_view(cfg, repo)  # one bounded read of origin per assessment
+    known = known_ids(cfg, repo, view)
+    marks = finished.read_marks(repo)
     entries, problems, occupied, notes = [], {}, 0, []
+    if marks[1]:
+        notes.append(f"queue: {marks[1]}; until then origin evidence marks no module newly done")
     for node in nodes:
-        entry, holds, problem = _assess(cfg, repo, node, runs.get(node.id), prior.get(node.id, {}), notes)
+        entry, holds, problem = _assess(cfg, repo, node, runs.get(node.id), prior.get(node.id, {}), notes,
+                                        view, known, marks)
         entries.append(entry)
         problems[node.id] = _map_problem(node, graph, noun) or problem
         occupied += holds
@@ -577,20 +703,25 @@ def queue_tick(
 
 
 def cached_entries(repo: Path, nodes: list[sources.ModuleNode], runs: dict[str, Run]) -> list[dict]:
-    """`queue.json`-shaped entries for the map, from files only (no `gh`): `done` is whatever the last assessment
-    recorded, a module with a run is `running` or `waiting`, the rest is `backlog`."""
+    """`queue.json`-shaped entries for the map, from files only (no git, no `gh`): `done` (with its `done_reason`) is
+    what the last assessment recorded with the live hand marks and vetoes on top (`finished.recorded`), a module with
+    a run is `running` or `waiting`, the rest is `backlog`."""
     prior = {m["id"]: m for m in QueueState.load(repo).modules}
+    done = finished.recorded(repo)
     entries = []
     for node in nodes:
         run = runs.get(node.id)
-        if prior.get(node.id, {}).get("status") == "done":
+        if node.id in done:
             status = "done"
         elif run is None:
             status = "backlog"
         else:
             status = "running" if run.state["status"] in _ACTIVE else "waiting"
-        entries.append({"id": node.id, "deps": list(node.deps), "status": status, "run_id": run.id if run else None,
-                        "blocked": prior.get(node.id, {}).get("blocked")})
+        entry = {"id": node.id, "deps": list(node.deps), "status": status, "run_id": run.id if run else None,
+                 "blocked": prior.get(node.id, {}).get("blocked")}
+        if status == "done":
+            entry["done_reason"] = done[node.id]
+        entries.append(entry)
     return entries
 
 
@@ -823,7 +954,7 @@ def spawn_feature_run(
 
 
 __all__ = [
-    "Assessment", "NextAnswer", "QueueBusy", "QueueState", "StartFailed", "assess_modules", "cached_entries",
-    "dependency_view", "format_answer",
+    "Assessment", "NextAnswer", "OriginView", "QueueBusy", "QueueState", "StartFailed", "assess_modules",
+    "cached_entries", "dependency_view", "done_reason", "format_answer", "known_ids", "origin_view", "own_plans",
     "module_lane", "next_step", "queue_lock", "queue_tick", "run_queue", "spawn_feature_run", "spawn_run",
 ]

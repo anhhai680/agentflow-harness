@@ -445,6 +445,40 @@ def test_modules_done_uses_merged_pull_requests(cfg, fake_gh, monkeypatch, tmp_p
     assert evaluate(cfg, "deps_merged", ctx).value is None
 
 
+def _sample_map(tmp_path: Path) -> None:
+    (tmp_path / "docs" / "specs").mkdir(parents=True)
+    shutil.copy(FIXTURES / "capability-sample.md", tmp_path / "docs" / "specs" / "CAPABILITY-MAP.md")
+
+
+def test_modules_done_counts_recorded_dependencies_without_asking_gh(cfg, fake_gh, monkeypatch, tmp_path):
+    from agentflow import finished
+
+    _sample_map(tmp_path)
+    finished.mark(tmp_path, "alpha", "t")
+    finished.mark(tmp_path, "beta", "t")
+    monkeypatch.setenv("FAKE_GH_FAIL", "1")  # gh would fail: it is never asked
+    for module in ("beta", "gamma"):
+        r = evaluate(cfg, "deps_merged", make_ctx(cfg, tmp_path, "feature", {"module": module}))
+        assert r.value is True, r.reason
+    assert not fake_gh.exists()
+
+
+def test_modules_done_asks_gh_only_for_the_dependencies_not_recorded(cfg, fake_gh, monkeypatch, tmp_path):
+    from agentflow import finished
+
+    _sample_map(tmp_path)
+    finished.mark(tmp_path, "alpha", "t")
+    ctx = make_ctx(cfg, tmp_path, "feature", {"module": "gamma"})  # depends on alpha and beta
+    monkeypatch.setenv("FAKE_GH_JSON", json.dumps([{"headRefName": "flow/feature/beta"}]))
+    assert evaluate(cfg, "deps_merged", ctx).value is True
+    assert fake_gh.read_text(encoding="utf-8").count("pr list") == 1
+    monkeypatch.setenv("FAKE_GH_JSON", json.dumps([{"headRefName": "flow/feature/alpha"}]))  # alpha is not what counts
+    r = evaluate(cfg, "deps_merged", ctx)
+    assert r.value is False and "beta" in r.reason and "alpha" not in r.reason
+    monkeypatch.setenv("FAKE_GH_FAIL", "1")
+    assert evaluate(cfg, "deps_merged", ctx).value is None
+
+
 def test_modules_done_with_no_dependencies_needs_no_gh(cfg, monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", str(tmp_path))  # no gh at all
     ctx = make_ctx(cfg, PACK, "feature", {"module": "greet"})

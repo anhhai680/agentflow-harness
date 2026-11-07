@@ -175,6 +175,7 @@ def test_yaml_text_may_change_anything_but_the_protected_settings(shipped):
     ("  commit_trailer:", "  skills_dir: skills\n  commit_trailer:"),                  # project.skills_dir added
     ('    spec_file: "SPEC-{module}.md"', '    spec_file: "{module}-spec.md"'),             # changed
     ('    spec_file: "SPEC-{module}.md"   # a module\'s spec is <specs>/<spec_file>\n', ""),  # removed
+    ("    plans: docs/plans\n", '    plans: docs/plans\n    done_status: "^Status: finished"\n'),  # project.docs.done_status
     ("version: 2\n", "version: 2\npaths:\n  state_dir: ../elsewhere\n"),              # paths.state_dir
     ("  path: docs/specs/CAPABILITY-MAP.md", "  path: docs/other.md"),                  # work_source
     ("    ship: finishing-a-development-branch", "    ship: executing-plans"),           # skills.map
@@ -210,6 +211,7 @@ def test_worktrees_dir_is_still_refused_by_the_page(shipped):
 @pytest.mark.parametrize("key, value", [
     (["project", "skills_dir"], "skills"),
     (["project", "docs", "spec_file"], "{module}-spec.md"),
+    (["project", "docs", "done_status"], "^Status: finished"),
     (["paths", "state_dir"], "../elsewhere"),
     (["work_source", "path"], "docs/other.md"),
     (["skills", "map", "ship"], "executing-plans"),

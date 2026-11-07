@@ -786,3 +786,370 @@ def test_cmd_queue_on_a_specs_pack_needs_include_specs(sqrepo, monkeypatch, caps
     assert main(["queue", "--once", "--include-specs"]) == 0
     assert spawned == [("platform", None)]
     assert "started platform" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- finished modules and their reasons
+
+
+class Merges:
+    """`branch_is_merged` that records the branches it was asked about and answers `answer`."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.answer: tuple[bool | None, str] = (False, "")
+
+    def __call__(self, cfg, repo, branch: str) -> tuple[bool | None, str]:
+        self.calls.append(branch)
+        return self.answer
+
+
+@pytest.fixture
+def dq(qrepo, monkeypatch):
+    """`qrepo` (the capability map, `fork_from: next`) with `branch_is_merged` counted (`dq.merges`)."""
+    qrepo.merges = Merges()
+    monkeypatch.setattr(module_queue, "branch_is_merged", qrepo.merges)
+    return qrepo
+
+
+def spec_text(status: str) -> str:
+    return f"# Spec\n\n{status}\n\n## Scope\n\nWhat it does.\n"
+
+
+def naming(module: str, plan: str = PLAN_DONE) -> str:
+    """`plan` with the header line naming `module`'s spec file."""
+    return plan.replace("# Plan\n\n", f"# Plan\n\n**Spec:** `docs/specs/SPEC-{module}.md`\n\n", 1)
+
+
+def assess(fr) -> dict[str, dict]:
+    return {e["id"]: e for e in module_queue.assess_modules(fr.cfg, fr.root).entries}
+
+
+def recorded_on_disk(fr) -> dict[str, dict]:
+    return {m["id"]: m for m in QueueState.load(fr.root).modules}
+
+
+def test_a_module_done_by_hand_is_done_without_asking_gh(dq):
+    from agentflow import finished
+
+    write(dq.root, "docs/plans/2026-10-28-crm.md", PLAN_DONE)  # would ask gh, were the mark not first
+    finished.mark(dq.root, "crm", "cli")
+    crm = assess(dq)["crm"]
+    assert (crm["status"], crm["done_reason"]) == ("done", finished.BY_HAND)
+    assert recorded_on_disk(dq)["crm"]["done_reason"] == finished.BY_HAND
+    assert "done_reason" not in recorded_on_disk(dq)["platform"]  # only done entries carry a reason
+    assert dq.merges.calls == []
+
+
+def test_a_veto_stops_origin_evidence_but_not_a_merged_branch(dq, tmp_path):
+    from agentflow import finished
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-crm.md": spec_text("Status: done"),
+                                  "docs/plans/2026-10-01-crm.md": naming("crm")})
+    assert assess(dq)["crm"]["done_reason"] == finished.SPEC_SAYS
+    finished.veto(dq.root, "crm", "pat")
+    dq.merges.answer = (False, "")
+    crm = assess(dq)["crm"]
+    assert crm["status"] == "backlog" and "done_reason" not in crm
+    dq.merges.answer = (True, "")
+    assert assess(dq)["crm"]["done_reason"] == finished.MERGED
+
+
+def test_a_spec_on_origin_whose_header_says_done_is_done(dq, tmp_path):
+    from agentflow import finished
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-crm.md": spec_text("**Status:** done")})
+    entries = assess(dq)
+    assert (entries["crm"]["status"], entries["crm"]["done_reason"]) == ("done", finished.SPEC_SAYS)
+    assert entries["platform"]["status"] == "backlog"
+    assert dq.merges.calls == []
+
+
+@pytest.mark.parametrize("line", ["Status: shipped", "**Status: implemented** 2026-01-02", "- **Status:** done",
+                                  "> Status: done"])
+def test_each_status_form_counts(line, dq, tmp_path):
+    from agentflow import finished
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-crm.md": spec_text(line)})
+    assert assess(dq)["crm"].get("done_reason") == finished.SPEC_SAYS
+
+
+@pytest.mark.parametrize("line", ["Status: done-ish", "Status: not done", "Statusdone"])
+def test_lookalike_status_lines_do_not_count(line, dq, tmp_path):
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-crm.md": spec_text(line)})
+    assert assess(dq)["crm"]["status"] == "backlog"
+
+
+def test_a_done_status_in_a_fence_or_below_the_first_section_does_not_count(dq, tmp_path):
+    from conftest import land_on_origin
+
+    text = "# Spec\n\n```\nStatus: done\n```\n\n**Status:** draft\n\n## History\n\nStatus: done\n"
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-crm.md": text})
+    assert assess(dq)["crm"]["status"] == "backlog"
+
+
+def test_a_bad_done_status_pattern_is_a_problem_not_a_crash(dq, tmp_path):
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-crm.md": spec_text("Status: done")})
+    dq.cfg.project.done_status = "("  # set after load: validate would have refused it
+    found = module_queue.assess_modules(dq.cfg, dq.root)
+    crm = {e["id"]: e for e in found.entries}["crm"]
+    assert crm["status"] == "backlog"
+    assert "project.docs.done_status" in (crm.get("blocked") or "")
+
+
+def test_a_spec_or_plan_finished_only_in_the_work_tree_does_not_count(dq):
+    run_git(dq.root, "checkout", "-q", "-b", "unmerged-work")
+    write(dq.root, "docs/specs/SPEC-crm.md", spec_text("**Status:** done"))
+    write(dq.root, "docs/plans/2026-10-28-crm.md", naming("crm"))
+    commit_all(dq.root)  # committed on a branch nobody merged: origin has neither file
+    dq.merges.answer = (False, "")
+    crm = assess(dq)["crm"]
+    assert crm["status"] == "backlog" and "done_reason" not in crm
+
+
+def test_the_newest_dated_plan_ticked_on_origin_and_naming_its_spec_is_done_without_gh(dq, tmp_path):
+    from agentflow import finished
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/plans/2026-10-28-crm.md": naming("crm"),
+                                  "docs/plans/2026-10-28-platform.md": naming("platform", PLAN_DEFERRED)})
+    entries = assess(dq)
+    assert entries["crm"]["done_reason"] == finished.plan_complete("next") == "plan complete on next"
+    assert entries["platform"]["done_reason"] == finished.plan_complete("next")  # a deferred task waits on others
+    assert dq.merges.calls == []
+
+
+def test_a_ticked_plan_that_does_not_name_the_modules_spec_needs_a_merged_branch(dq, tmp_path):
+    from agentflow import finished
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/plans/2026-10-28-crm.md": PLAN_DONE,
+                                  "docs/plans/2026-10-28-platform.md": naming("settings")})
+    dq.merges.answer = (False, "")
+    entries = assess(dq)
+    assert entries["crm"]["status"] == entries["platform"]["status"] == "backlog"
+    assert sorted(dq.merges.calls) == ["flow/feature/crm", "flow/feature/platform"]
+    dq.merges.answer = (True, "")
+    assert assess(dq)["crm"]["done_reason"] == finished.MERGED
+
+
+def test_an_older_ticked_plan_does_not_finish_a_module_whose_newer_plan_is_open(dq, tmp_path):
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/plans/2026-10-01-crm.md": naming("crm"),
+                                  "docs/plans/2026-10-28-crm-rework.md": naming("crm", PLAN_OPEN)})
+    dq.merges.answer = (True, "")
+    assert assess(dq)["crm"]["status"] == "backlog"
+    assert dq.merges.calls == []  # the newest plan is open: nothing to ask gh about
+
+
+def test_an_undated_plan_file_is_never_a_plan(dq, tmp_path):
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/plans/crm.md": naming("crm")})
+    write(dq.root, "docs/plans/crm.md", naming("crm"))
+    dq.merges.answer = (True, "")
+    assert assess(dq)["crm"]["status"] == "backlog"
+    assert dq.merges.calls == []
+    assert module_queue.own_plans(["crm.md", "2026-10-28-crm.md"], "crm", {"crm"}) == ["2026-10-28-crm.md"]
+
+
+def test_a_truncated_plan_on_origin_is_not_finished(dq, tmp_path):
+    from conftest import land_on_origin
+
+    padding = "\n<!-- " + "x" * (1 << 20) + " -->\n"  # past the 1 MB a plan is read to, under the size skipped
+    land_on_origin(dq, tmp_path, {"docs/plans/2026-10-28-crm.md": naming("crm") + padding})
+    dq.merges.answer = (True, "")
+    assert assess(dq)["crm"]["status"] == "backlog"
+    assert dq.merges.calls == []
+
+
+def test_a_long_heading_line_in_an_origin_plan_is_cut_before_parsing(dq, tmp_path, monkeypatch):
+    from agentflow import finished, sources
+    from conftest import land_on_origin
+
+    plan = naming("crm", "# Plan\n\n### Task 1: " + "y" * ((1 << 20) - 4096) + "\n\n- [x] done\n")
+    land_on_origin(dq, tmp_path, {"docs/plans/2026-10-28-crm.md": plan})
+    seen: list[int] = []
+    real = sources.parse_plan_text
+
+    def spy(text: str):
+        seen.append(max((len(line) for line in text.splitlines()), default=0))
+        return real(text)
+
+    monkeypatch.setattr(sources, "parse_plan_text", spy)
+    assert assess(dq)["crm"]["done_reason"] == finished.plan_complete("next")
+    assert seen and max(seen) <= sources.LINE_MAX
+
+
+def test_no_other_modules_plan_finishes_a_prefix_module(dq, tmp_path):
+    from conftest import land_on_origin
+
+    write(dq.root, "docs/specs/CAPABILITY-MAP.md",
+          "| Module id | Responsibility | Depends on |\n|---|---|---|\n| `user` | users | — |\n")
+    commit_all(dq.root)
+    land_on_origin(dq, tmp_path, {
+        "docs/specs/SPEC-user-auth.md": spec_text("**Status:** draft"),  # `user-auth` is known from origin
+        "docs/plans/2026-01-01-user-auth.md": naming("user-auth"),
+        "docs/plans/2026-01-02-user-profile.md": naming("user-profile"),  # no source knows `user-profile`
+    })
+    dq.merges.answer = (False, "")
+    assert assess(dq)["user"]["status"] == "backlog"
+    names = ["2026-01-01-user-auth.md", "2026-01-02-user-profile.md", "2026-01-03-user.md"]
+    assert module_queue.own_plans(names, "user", {"user", "user-auth"}) == ["2026-01-02-user-profile.md",
+                                                                            "2026-01-03-user.md"]
+    assert module_queue.own_plans(names, "user-auth", {"user"}) == ["2026-01-01-user-auth.md"]
+
+
+def test_an_old_done_entry_without_a_reason_stays_done_while_gh_fails(dq, monkeypatch):
+    from agentflow import finished
+
+    write(dq.root, "docs/plans/2026-10-28-platform.md", PLAN_DONE)
+    QueueState([{"id": "platform", "deps": [], "status": "done", "run_id": None}]).save(dq.root)  # before reasons
+    dq.merges.answer = (None, "fake gh: failing as asked")
+    platform = assess(dq)["platform"]
+    assert (platform["status"], platform["done_reason"]) == ("done", finished.MERGED)
+    assert dq.merges.calls == []
+    assert finished.recorded(dq.root)["platform"] == finished.MERGED
+
+
+def test_origin_unreadable_or_incomplete_keeps_earlier_conclusions(dq, tmp_path, monkeypatch):
+    from agentflow import finished, gitops
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-crm.md": spec_text("Status: done"),
+                                  "docs/plans/2026-10-28-platform.md": naming("platform")})
+    entries = assess(dq)
+    assert entries["crm"]["done_reason"] == finished.SPEC_SAYS
+    assert entries["platform"]["done_reason"] == finished.plan_complete("next")
+    real = gitops.blobs_at
+
+    monkeypatch.setattr(gitops, "blobs_at", lambda *a, **k: None)  # git failed or timed out
+    entries = assess(dq)
+    assert entries["crm"]["done_reason"] == finished.SPEC_SAYS
+    assert entries["platform"]["done_reason"] == finished.plan_complete("next")
+
+    def partial(*args, **kwargs):
+        found = real(*args, **kwargs)
+        return None if found is None else gitops.Listing({}, False)
+
+    monkeypatch.setattr(gitops, "blobs_at", partial)  # too many files to list in full
+    entries = assess(dq)
+    assert entries["crm"]["done_reason"] == finished.SPEC_SAYS
+    assert entries["platform"]["done_reason"] == finished.plan_complete("next")
+
+    monkeypatch.setattr(gitops, "blobs_at", real)
+    run_git(dq.root, "update-ref", "-d", "refs/remotes/origin/next")  # no origin ref at all
+    assert assess(dq)["crm"]["done_reason"] == finished.SPEC_SAYS
+    assert dq.merges.calls == []
+
+
+def test_a_ticked_plan_in_an_incomplete_listing_is_not_plan_complete(dq, tmp_path, monkeypatch):
+    from agentflow import gitops
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/plans/2026-10-28-crm.md": naming("crm")})
+    real = gitops.blobs_at
+
+    def incomplete(*args, **kwargs):
+        found = real(*args, **kwargs)
+        return None if found is None else gitops.Listing(found.blobs, False)
+
+    monkeypatch.setattr(gitops, "blobs_at", incomplete)
+    dq.merges.answer = (False, "")
+    crm = assess(dq)["crm"]
+    assert crm["status"] == "backlog" and "done_reason" not in crm
+
+
+def test_a_merged_branch_with_a_finished_plan_is_still_done_as_merged(dq):
+    from agentflow import finished
+
+    write(dq.root, "docs/plans/2026-10-28-crm.md", PLAN_DONE)
+    dq.merges.answer = (True, "")
+    assert assess(dq)["crm"]["done_reason"] == finished.MERGED
+    assert dq.merges.calls == ["flow/feature/crm"]
+    dq.merges.answer = (None, "gh is down")
+    assert assess(dq)["crm"]["done_reason"] == finished.MERGED  # recorded as merged: gh is not asked again
+    assert dq.merges.calls == ["flow/feature/crm"]
+
+
+def test_a_hand_marked_done_does_not_stick_as_merged_after_unmark(dq):
+    from agentflow import finished
+
+    write(dq.root, "docs/plans/2026-10-28-crm.md", PLAN_DONE)
+    finished.mark(dq.root, "crm", "cli")
+    assert assess(dq)["crm"]["done_reason"] == finished.BY_HAND
+    assert finished.unmark(dq.root, "crm") is True
+    dq.merges.answer = (False, "")
+    crm = assess(dq)["crm"]
+    assert crm["status"] == "backlog" and "done_reason" not in crm
+    assert dq.merges.calls == ["flow/feature/crm"]  # a hand mark is no merge: gh is asked once it is gone
+
+
+def test_cached_entries_apply_live_marks_on_top_of_the_last_assessment(dq, tmp_path):
+    from agentflow import finished, sources
+    from conftest import land_on_origin
+
+    write(dq.root, "docs/plans/2026-10-28-platform.md", PLAN_DONE)
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-staff-auth.md": spec_text("Status: done")})
+    dq.merges.answer = (True, "")
+    assess(dq)
+    nodes = [sources.ModuleNode("platform", []), sources.ModuleNode("staff-auth", ["platform"]),
+             sources.ModuleNode("crm", ["platform"])]
+    cached = {e["id"]: e for e in module_queue.cached_entries(dq.root, nodes, {})}
+    assert (cached["platform"]["status"], cached["platform"]["done_reason"]) == ("done", finished.MERGED)
+    assert cached["staff-auth"]["done_reason"] == finished.SPEC_SAYS
+    assert cached["crm"]["status"] == "backlog" and "done_reason" not in cached["crm"]
+    finished.mark(dq.root, "crm", "cli")
+    finished.veto(dq.root, "platform", "cli")
+    finished.veto(dq.root, "staff-auth", "cli")
+    cached = {e["id"]: e for e in module_queue.cached_entries(dq.root, nodes, {})}
+    assert (cached["crm"]["status"], cached["crm"]["done_reason"]) == ("done", finished.BY_HAND)
+    assert cached["staff-auth"]["status"] == "backlog"  # a veto ignores origin evidence
+    assert (cached["platform"]["status"], cached["platform"]["done_reason"]) == ("done", finished.MERGED)  # not a merge
+    entries = assess(dq)  # the assessment agrees with the cached view
+    assert entries["staff-auth"]["status"] == "backlog"
+    assert entries["platform"]["done_reason"] == finished.MERGED
+    assert finished.recorded(dq.root) == {"platform": finished.MERGED, "crm": finished.BY_HAND}
+
+
+def test_next_skips_done_modules_in_both_spec_and_checked_plan_rules(dq):
+    from agentflow import finished
+
+    write(dq.root, "docs/specs/SPEC-crm.md", APPROVED_SPEC.format(m="crm"))
+    commit_all(dq.root)
+    assert next_step(dq.cfg, dq.root).stage == "Plan"
+    finished.mark(dq.root, "crm", "cli")
+    assert next_step(dq.cfg, dq.root).lane == "none"  # crm is done: no plan is asked for
+    finished.unmark(dq.root, "crm")
+    write(dq.root, "docs/plans/2026-10-28-crm.md", PLAN_DONE)
+    commit_all(dq.root)
+    assert next_step(dq.cfg, dq.root).stage == "Verify"
+    assert dq.merges.calls == ["flow/feature/crm"]
+    finished.mark(dq.root, "crm", "cli")
+    assert next_step(dq.cfg, dq.root).lane == "none"
+    assert dq.merges.calls == ["flow/feature/crm"]  # a done module's branch is not asked about
+
+
+def test_a_corrupt_marks_file_lets_origin_evidence_make_no_new_done(dq, tmp_path):
+    from agentflow import finished
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-platform.md": spec_text("Status: done")})
+    assert assess(dq)["platform"]["done_reason"] == finished.SPEC_SAYS
+    finished.veto(dq.root, "crm", "pat")
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-crm.md": spec_text("Status: done"),
+                                  "docs/plans/2026-10-28-crm.md": naming("crm")})
+    assert assess(dq)["crm"]["status"] == "backlog"  # vetoed
+    (runs_root(dq.root) / finished.MARKS).write_text('{"crm": {"state": "not_d', encoding="utf-8")  # torn
+    messages: list[str] = []
+    entries = {e["id"]: e for e in module_queue.assess_modules(dq.cfg, dq.root, log=messages.append).entries}
+    assert entries["crm"]["status"] == "backlog"  # the veto can't be read: origin evidence makes nothing done
+    assert entries["platform"]["done_reason"] == finished.SPEC_SAYS  # an earlier Done stays
+    assert [m for m in messages if finished.MARKS in m and "unreadable" in m]

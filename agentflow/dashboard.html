@@ -43,6 +43,8 @@ main { padding: 12px 16px 40px; }
 .card.done, .card.ready { border-left-color: var(--ok); }
 .card[draggable="true"] { cursor: grab; }
 .card.backlog { cursor: default; }
+.done-modules { margin: 6px 0; }
+.done-modules summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .card.backlog.parallel { border-left-color: var(--ok); }  /* the green of .gate-ok */
 .card.backlog.blocked { border-left-color: var(--muted); }
 .card.backlog.starting { border-left-color: var(--warn); }
@@ -252,7 +254,7 @@ const TOKEN = (function () {
   return token;
 })();
 
-const ui = { view: "board", drawer: null, board: null, agents: null, workflow: null, dragging: null };
+const ui = { view: "board", drawer: null, board: null, agents: null, workflow: null, dragging: null, doneOpen: false };
 const $ = (id) => document.getElementById(id);
 const workLabel = (lane) => (ui.board && ui.board.lane_labels[lane]) || lane;  // a lane with no label, or an old run's, shows its name
 
@@ -264,6 +266,7 @@ function el(tag, props, ...children) {
     else if (key === "text") node.textContent = String(value);
     else if (key === "title") node.title = String(value);
     else if (key === "onclick") node.addEventListener("click", value);
+    else if (key === "ontoggle") node.addEventListener("toggle", value);
     else if (/^(type|value|name|for|id|role|tabindex|aria-[a-z]+|readonly|checked|placeholder|open|draggable|href|target|rel|disabled|maxlength|multiple|min|max|step|spellcheck)$/.test(key)) node.setAttribute(key, String(value));
   }
   for (const child of children.flat()) {
@@ -535,6 +538,14 @@ function newTaskDialog() {
   });
 }
 
+// Modules that are finished, with why. One line each and no Start button: the open state survives the SSE re-render.
+function doneNode(done) {
+  if (!done.length) return null;
+  return el("details", { class: "done-modules", open: ui.doneOpen ? "true" : null, ontoggle: (ev) => { ui.doneOpen = ev.target.open; } },
+    el("summary", { text: "Done (" + done.length + ")" }),
+    done.map((item) => el("div", { class: "muted", text: item.id + " · " + item.reason })));
+}
+
 function renderBoard(data) {
   ui.board = data;
   const counts = Object.entries(data.counts).map(([k, v]) => k.replace("_", " ") + " " + v).join(" · ") || "no runs";
@@ -546,6 +557,8 @@ function renderBoard(data) {
     const col = el("div", { class: "col" }, el("h2", {}, el("span", { text: name }), el("span", { text: String(name === "Backlog" ? data.backlog.length : cards.length) })));
     dropOn(col, name);
     if (name === "Backlog") col.append(...data.backlog.map(backlogNode));
+    if (name === "Backlog" && data.done_note) col.append(el("div", { class: "muted gate-bad", text: "Done marks not read: " + data.done_note }));
+    if (name === "Backlog" && (data.backlog_done || []).length) col.append(doneNode(data.backlog_done));
     if (name === "Backlog" && (data.backlog_skipped || []).length) col.append(el("div", { class: "muted", text: "Not modules: " + data.backlog_skipped.join(", ") }));
     for (const card of cards) col.append(cardNode(card));
     return col;

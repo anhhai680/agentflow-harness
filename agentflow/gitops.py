@@ -6,7 +6,8 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -399,19 +400,140 @@ def fetch_remote_branch(repo: Path, branch: str, timeout: int = 60) -> bool:
         return False
 
 
-def files_at(repo: Path, ref: str, directory: str) -> dict[str, str]:
-    """`{name: text}` for the files directly in `directory` at `ref`; empty when the ref or directory is missing."""
+BLOB_SKIP = 4 << 20  # an entry larger than this is left out
+BLOBS_MAX = 500  # kept entries read from one directory
+BYTES_MAX = 16 << 20  # total size of the distinct blobs read from one directory
+GIT_READ_TIMEOUT_S = 60
+_DRAIN_CHUNK = 64 << 10
+
+
+@dataclass(frozen=True)
+class Blob:
+    text: str
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class Listing:
+    blobs: dict[str, Blob]
+    complete: bool
+
+
+def blobs_at(repo: Path, ref: str, directory: str, keep: Callable[[str], bool], limit: int) -> Listing | None:
+    """The regular files directly in `directory` at `ref` whose basename passes `keep`, each cut to `limit` bytes.
+
+    Streams `git cat-file --batch`, so memory per blob stays at `limit`. `None` when git could not read (missing ref,
+    git failed, or timed out); an empty complete `Listing` when only the directory is missing. `complete` is False when
+    an entry was left out for size, count or byte budget, or because its blob was missing.
+    """
+    directory = directory.strip("/")
     try:
-        listing = _git(Path(repo), "ls-tree", "-z", "--name-only", f"{ref}:{directory.strip('/')}")
-    except (OSError, subprocess.CalledProcessError):
-        return {}
-    files: dict[str, str] = {}
-    for name in filter(None, listing.split("\0")):
+        proc = subprocess.run(
+            ["git", "ls-tree", "-z", "-l", ref, "--", f"{directory}/" if directory else "."], cwd=Path(repo),
+            capture_output=True, timeout=GIT_READ_TIMEOUT_S, stdin=subprocess.DEVNULL, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    complete = True
+    entries: list[tuple[str, str]] = []  # (basename, sha)
+    sizes: dict[str, int] = {}
+    total = 0
+    for record in proc.stdout.decode("utf-8", errors="replace").split("\0"):
+        meta, tab, path = record.partition("\t")
+        fields = meta.split()
+        if not tab or len(fields) != 4 or fields[0] not in ("100644", "100755"):
+            continue
+        name = path.rsplit("/", 1)[-1]
+        if "\n" in name or not keep(name):
+            continue
+        sha, size = fields[2], int(fields[3]) if fields[3].isdigit() else -1
+        if size < 0 or size > BLOB_SKIP or len(entries) >= BLOBS_MAX:
+            complete = False
+            continue
+        if sha not in sizes:
+            if total + size > BYTES_MAX:
+                complete = False
+                continue
+            sizes[sha] = size
+            total += size
+        entries.append((name, sha))
+    if not sizes:
+        return Listing({}, complete)
+    read = _cat_file_batch(Path(repo), list(sizes), limit)
+    if read is None:
+        return None
+    blobs: dict[str, Blob] = {}
+    for name, sha in entries:
+        if sha in read:
+            blobs[name] = read[sha]
+        else:
+            complete = False
+    return Listing(blobs, complete)
+
+
+def _cat_file_batch(repo: Path, shas: list[str], limit: int) -> dict[str, Blob] | None:
+    """`{sha: Blob}` from one `git cat-file --batch`; a missing sha is absent. `None` on any failure or timeout."""
+    try:
+        proc = subprocess.Popen(["git", "cat-file", "--batch"], cwd=repo, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    timed_out = threading.Event()
+
+    def expire() -> None:
+        timed_out.set()
+        proc.kill()
+
+    def feed() -> None:
         try:
-            files[name] = _git(Path(repo), "show", f"{ref}:{directory.strip('/')}/{name}")
-        except (OSError, subprocess.CalledProcessError, UnicodeDecodeError):
-            continue  # a subdirectory or an unreadable blob is not a plan
-    return files
+            assert proc.stdin is not None
+            proc.stdin.write("".join(f"{sha}\n" for sha in shas).encode())
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass  # git went away; the read below sees it
+
+    timer = threading.Timer(GIT_READ_TIMEOUT_S, expire)
+    writer = threading.Thread(target=feed, daemon=True)
+    timer.start()
+    writer.start()
+    out: dict[str, Blob] = {}
+    ok = False
+    try:
+        assert proc.stdout is not None
+        stream = proc.stdout
+        for _ in shas:
+            header = stream.readline().split()
+            if len(header) == 2 and header[1] == b"missing":
+                continue
+            if len(header) != 3 or not header[2].isdigit():
+                return None
+            size = int(header[2])
+            body = stream.read(min(size, limit))
+            if len(body) != min(size, limit):
+                return None
+            rest = size - len(body)
+            while rest > 0:
+                chunk = stream.read(min(rest, _DRAIN_CHUNK))
+                if not chunk:
+                    return None
+                rest -= len(chunk)
+            if stream.read(1) != b"\n":
+                return None
+            out[header[0].decode("ascii", errors="replace")] = Blob(body.decode("utf-8", errors="replace"), size > len(body))
+        ok = not timed_out.is_set()
+        return out if ok else None
+    except (OSError, ValueError):
+        return None
+    finally:
+        timer.cancel()
+        if not ok or proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        if proc.stdout:
+            proc.stdout.close()
+        writer.join(timeout=1)
 
 
 def changed_since(worktree: Path, sha: str) -> list[str]:
