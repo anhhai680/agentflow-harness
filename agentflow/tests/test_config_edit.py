@@ -186,6 +186,17 @@ def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
 
 
+def test_yaml_text_may_not_switch_the_work_source_to_specs(shipped):
+    _, sha = config_edit.read(shipped)
+    lines = SHIPPED.splitlines(keepends=True)
+    old = "".join(line for line in lines if line.startswith(("  kind: capability_map", "  path: docs/specs/CAPABILITY")))
+    assert old in SHIPPED
+    text = SHIPPED.replace(old, "  kind: specs\n", 1)
+    assert yaml.safe_load(text)["work_source"] == {"kind": "specs"}
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=text, repo=REPO)
+
+
 def test_worktrees_dir_is_still_refused_by_the_page(shipped):
     _, sha = config_edit.read(shipped)
     with pytest.raises(Refused):

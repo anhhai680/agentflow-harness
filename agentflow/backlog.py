@@ -219,7 +219,16 @@ def _check_after(cfg: Config, repo: Path, after: Any, nodes: list[sources.Module
     return out
 
 
-def _new_module_fields(value: Any, nodes: list[sources.ModuleNode], book: Backlog) -> dict:
+def unremovable(cfg: Config) -> str:
+    """Why a module listed by the work source cannot be removed from the Backlog."""
+    noun = work_source.noun(cfg)
+    if noun == "capability map":
+        return "a capability-map module lives in the map; it cannot be removed here"
+    return f"a module from the {noun} lives there; it cannot be removed here"
+
+
+def _new_module_fields(value: Any, nodes: list[sources.ModuleNode], book: Backlog,
+                       noun: str = "capability map") -> dict:
     if not isinstance(value, dict):
         raise Invalid("new_module must have a module id, a responsibility and dependencies")
     module = str(value.get("module") or "")
@@ -231,10 +240,10 @@ def _new_module_fields(value: Any, nodes: list[sources.ModuleNode], book: Backlo
         raise Invalid("deps must be a list of module ids")
     in_map = {n.id for n in nodes}
     if module in in_map:
-        raise Invalid(f"{module} is already in the capability map")
+        raise Invalid(f"{module} is already in the {noun}")
     outside = [d for d in deps if d not in in_map]
     if outside:
-        raise Invalid(f"{', '.join(outside)} is not in the capability map: a new module can only depend on modules "
+        raise Invalid(f"{', '.join(outside)} is not in the {noun}: a new module can only depend on modules "
                       "already there (add the second one after the first merges)")
     if any(i.new_module and i.params.get("module") == module for i in book.items.values()
            if i.status in (*LIVE, "started") and i.source == "form"):
@@ -283,7 +292,7 @@ def add(cfg: Config, repo: Path, lane: str, fields: dict, after: Any = (), to_ph
             elif name in ("task", "topic"):
                 params[name] = _text(fields[name], name)
             else:
-                new_module = _new_module_fields(fields["new_module"], nodes, book)
+                new_module = _new_module_fields(fields["new_module"], nodes, book, work_source.noun(cfg))
                 params["module"], kind = new_module["module"], "module"
         refs = _check_after(cfg, repo, after, nodes, book)
         if "issue" in params:
@@ -320,7 +329,7 @@ def remove(cfg: Config, repo: Path, item_id: str) -> None:
         if item is None or item.status == "removed":
             raise Refused("no such card")
         if item.source != "form":
-            raise Refused("a capability-map module lives in the map; it cannot be removed here")
+            raise Refused(unremovable(cfg))
         if item.status != "backlog":
             raise Refused(f"the card is {'starting' if item.status == 'starting' else 'already a run'}")
         waiting = [i for i in book.items.values()
@@ -361,7 +370,8 @@ def _picture(cfg: Config, repo: Path) -> dict:
     runs = list_runs(repo)
     nodes = _map_nodes(cfg, repo)
     source = work_source.file(cfg, repo)
-    if not nodes and module_queue.module_lane(cfg) and source is not None and not source.is_file():
+    mapped = cfg.work_source is not None and cfg.work_source.kind == "capability_map"
+    if not nodes and mapped and module_queue.module_lane(cfg) and source is not None and not source.is_file():
         # no map file here: show what an earlier `agentflow queue` recorded, if anything (a pack with no work
         # source has no modules at all, so the board holds only the cards added on the page)
         nodes = [sources.ModuleNode(m["id"], list(m.get("deps") or [])) for m in module_queue.QueueState.load(repo).modules]
@@ -371,7 +381,7 @@ def _picture(cfg: Config, repo: Path) -> dict:
     state = _load_state(repo)
     merged = {k: v for k, v in (state.get("merged") or {}).items() if isinstance(k, str)}
     view = module_queue.dependency_view(
-        nodes, entries, book.cards(), merged=merged, runs={r.id: r for r in runs},
+        nodes, entries, book.cards(), merged=merged, runs={r.id: r for r in runs}, noun=work_source.noun(cfg),
     )
     return {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "view": view, "state": state}
 
@@ -486,7 +496,7 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
         if kind == "module":
             node = next((n for n in pic["nodes"] if n.id == name), None)
             if node is None:
-                raise Refused(f"module {name} is not in the capability map"
+                raise Refused(f"module {name} is not in the {work_source.noun(cfg)}"
                               + ("" if lane else " (dashboard.backlog.module_lane is not set)"))
             if {e["id"]: e for e in pic["entries"]}[name]["status"] != "backlog":
                 raise Refused(f"module {name} already has a run or is done")

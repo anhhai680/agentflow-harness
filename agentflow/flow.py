@@ -646,6 +646,14 @@ def cmd_queue(args: argparse.Namespace) -> int:
         if args.interval <= 0:
             raise ValueError(f"--interval must be above 0, got {args.interval}")
         cfg = _load_cfg(args)
+        repo = _find_repo()
+        if cfg.work_source is not None and cfg.work_source.kind == "specs" and not args.include_specs:
+            from agentflow import work_source
+
+            # every spec file is a module here, finished or not: starting them all must be asked for
+            print(f"error: this pack's work source is its spec files: {len(work_source.items(cfg, repo))} modules "
+                  "are listed; pass --include-specs to queue them")
+            return 1
         problem = _preflight(cfg)
         if problem:
             print(f"error: {problem}")
@@ -653,7 +661,6 @@ def cmd_queue(args: argparse.Namespace) -> int:
         lane = module_lane(cfg)
         if lane is None:
             raise ValueError("dashboard.backlog.module_lane is not set in config.yaml: the queue does not know which lane runs a module")
-        repo = _find_repo()
         config = Path(args.config).resolve() if args.config else None
         return run_queue(cfg, repo, args.max_parallel,
                          lambda module: spawn_feature_run(repo, module, lane=lane, config=config),
@@ -948,6 +955,8 @@ def build_parser() -> argparse.ArgumentParser:
     que.add_argument("--max-parallel", type=int, default=2, help="runs live at once (default 2)")
     que.add_argument("--once", action="store_true", help="tick one time and exit (for cron and tests)")
     que.add_argument("--interval", type=float, default=30.0, help="seconds between ticks (default 30)")
+    que.add_argument("--include-specs", action="store_true",
+                     help="with work_source specs, queue every spec file's module (refused without it)")
     que.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     que.set_defaults(func=cmd_queue)
 

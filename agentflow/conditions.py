@@ -73,7 +73,8 @@ def make_ctx(cfg: Config, repo: Path, pipeline: str, params: dict, run: Run | No
         "plan": plan.relative_to(repo).as_posix() if plan else "",
         "plan_target": f"{docs['plans']}/{today}-{module}-{slug}.md" if module else "",
         "idea": docs.get("idea") or "",
-        "capability_map": cfg.work_source.path if cfg.work_source is not None else "",
+        "capability_map": (cfg.work_source.path if cfg.work_source is not None
+                           and cfg.work_source.kind == "capability_map" else ""),
         "topic": str(params.get("topic") or ""),
         "issue": str(params.get("issue") or ""),
         "run": run.id if run else "",
@@ -271,7 +272,7 @@ def _modules_done(spec: dict, ctx: Ctx) -> tuple[bool | None, str]:
     nodes = work_source.items(ctx.cfg, ctx.repo)
     node = next((n for n in nodes if n.id == module), None)
     if node is None:
-        return None, f"module '{module}' is not in the capability map"
+        return None, f"module '{module}' is not in the {work_source.noun(ctx.cfg)}"
     if not node.deps:
         return True, f"{module} has no dependencies"
     try:

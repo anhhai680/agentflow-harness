@@ -553,3 +553,36 @@ def test_a_peer_whose_run_has_finished_does_not_make_a_card_parallel(bk):
     list_runs(bk.root)[-1].emit("run_finished")  # b's run is Done: its PR is open
     card = bk.cards()["module:c"]
     assert card["status"] == "ready" and "module:b" in [p["key"] for p in card["parallel_with"]]
+
+
+# --------------------------------------------------------------------------- a pack whose work source is its spec files
+
+
+@pytest.fixture
+def sbk(flow_repo, monkeypatch, tmp_path):
+    """`bk`'s Board over a `specs` pack: `docs/specs/SPEC-a.md` committed, `a` merged, one refresh."""
+    monkeypatch.setenv("PATH", f"{GH_BIN}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(tmp_path / "gh.log"))
+    merges = Merges()
+    monkeypatch.setattr(module_queue, "branch_is_merged", merges)
+    flow_repo.configure({"work_source": {"kind": "specs", "path": None}})
+    write(flow_repo.root, "docs/specs/SPEC-a.md", "# A\n\n**Depends on:** none\n")
+    run_git(flow_repo.root, "add", "-A")
+    run_git(flow_repo.root, "commit", "-q", "-m", "spec a")
+    board = Board(flow_repo, merges)
+    board.merge_module("a")
+    board.refresh()
+    return board
+
+
+def test_a_spec_with_an_unknown_dependency_is_blocked_naming_the_spec_files(sbk):
+    write(sbk.root, "docs/specs/SPEC-b.md", "# B\n\n**Depends on:** ghost\n")
+    cards = sbk.cards()
+    assert "module:a" not in cards  # merged, so not in Backlog
+    card = cards["module:b"]
+    assert card["status"] == "blocked"
+    assert [b["text"] for b in card["blocked_by"]] == ["ghost (not in the spec files)"]
+    with pytest.raises(Refused, match="ghost"):
+        sbk.start("module:b")
+    with pytest.raises(Refused, match="module ghost is not in the spec files"):
+        sbk.start("module:ghost")

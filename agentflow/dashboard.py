@@ -487,7 +487,7 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 kind, name = backlog.parse_key(_text(body, "item", required=True))
                 if kind != "card":
-                    raise backlog.Refused("a capability-map module lives in the map; it cannot be removed here")
+                    raise backlog.Refused(backlog.unremovable(server.cfg))
                 backlog.remove(server.cfg, server.repo, name)
                 self._json(200, {"ok": True})
         except backlog.Refused as exc:

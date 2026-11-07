@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -259,7 +261,7 @@ def test_the_python_pack_has_no_work_source_or_skills_errors(cfg, repo_root):
 
 def test_a_work_source_of_another_kind_is_an_error(tmp_cfg, repo_root):
     cfg = load_config(tmp_cfg({"work_source": {"kind": "github_issues"}}))
-    assert errors_at(cfg, repo_root, "work_source.kind") == ["the only work source this engine reads is capability_map"]
+    assert errors_at(cfg, repo_root, "work_source.kind") == ["the work source kinds are capability_map and specs"]
 
 
 @pytest.mark.parametrize("path", ["", "/abs/map.md", "../map.md"])
@@ -307,3 +309,213 @@ def test_state_dir_check_without_git_does_not_crash(tmp_git, monkeypatch):
 
     monkeypatch.setattr(config.subprocess, "run", no_git)
     assert not [i for i in validate(cfg, tmp_git) if i.path == "paths.state_dir"]
+
+
+# --------------------------------------------------------------------------- the `specs` kind
+
+SPECS = {"work_source": {"kind": "specs", "path": None}}  # `None` deletes the python pack's map path
+
+
+def _pack(fr, tmp_cfg, patch: dict, name: str) -> SimpleNamespace:
+    """`fr`'s repository with the python pack plus `patch`, loaded from its own file so `fr.cfg` stays as it was."""
+    return SimpleNamespace(root=fr.root, cfg=load_config(tmp_cfg(patch, name=name)), fr=fr)
+
+
+@pytest.fixture
+def specs(fr, tmp_cfg):
+    """A pack whose work source is its spec files, `docs/specs/SPEC-<id>.md`."""
+    return _pack(fr, tmp_cfg, SPECS, "specs.yaml")
+
+
+@pytest.fixture
+def plain(fr, tmp_cfg):
+    """`specs` with the default `{module}.md` spec file name."""
+    return _pack(fr, tmp_cfg, {**SPECS, "project": {"docs": {"spec_file": None}}}, "plain.yaml")
+
+
+def issues_at(cfg, repo, prefixes: tuple[str, ...]) -> list:
+    return [i for i in validate(cfg, repo) if i.path.startswith(prefixes)]
+
+
+def warnings_at(cfg, repo, path: str) -> list[str]:
+    return [i.message for i in validate(cfg, repo) if i.level == "warning" and i.path == path]
+
+
+def test_a_specs_source_lists_one_module_per_spec_file_with_header_deps(specs):
+    write(specs.root, "docs/specs/SPEC-b.md", "# B\n\n**Depends on:** `a`\n\n## Scope\n**Depends on:** z\n")
+    write(specs.root, "docs/specs/SPEC-a.md", "# A\n\nDepends on: None (standalone).\n")
+    write(specs.root, "docs/specs/notes.md", "# not a spec\n")
+    assert work_source.items(specs.cfg, specs.root) == [sources.ModuleNode("a", []), sources.ModuleNode("b", ["a"])]
+    assert work_source.skipped(specs.cfg, specs.root) == []  # notes.md does not fit the spec file name
+
+
+@pytest.mark.parametrize("header, deps", [
+    ("**Depends on**: a, b", ["a", "b"]),
+    ("- Depends on: `a`.", ["a"]),
+    ("Depends on the auth module for tokens.", []),
+    ("**Depends on:** ghost, Auth", ["ghost", "Auth"]),
+    ("**Depends on:**\n- a\n- b\n\nmore", ["a", "b"]),
+    ("Depends on: a,\n  b", ["a", "b"]),
+    ("Depends on: a\nDepends on: c", ["a", "c"]),
+    ("Depends on: none-pay", ["none-pay"]),
+    ("Depends on: none, a", ["none", "a"]),
+    ("Depends on: a" + "b" * 600, [sources.BAD_DEP, sources.CUT_DEP]),   # an id over 80 chars, on a cut line
+    ("Depends on: \x1b[31mred", [sources.BAD_DEP]),
+])
+def test_dependency_line_forms(header, deps):
+    assert sources.spec_deps(f"# X\n\n{header}\n") == deps
+
+
+@pytest.mark.parametrize("header", ["Depends on: none", "**Depends on:** None.", "Depends on: none (standalone)",
+                                    "Depends on: NONE (yet)."])
+def test_only_none_means_no_dependencies(header):
+    assert sources.spec_deps(f"# X\n\n{header}\n") == []
+
+
+def test_dependency_lines_in_a_fence_or_past_the_header_do_not_count():
+    assert sources.spec_deps("# X\n\n```\nDepends on: a\n```\n\n## Scope\nDepends on: b\n") == []
+    assert sources.spec_header("# X\n```\nfenced\n```\nkept\n## Next\nafter\n") == [("# X", False), ("kept", False)]
+    assert sources.spec_header("x" * 600) == [("x" * sources.LINE_MAX, True)]
+
+
+def test_spec_ids_names_every_file_that_fits_and_is_module_id_filters_them():
+    assert sources.spec_ids(["Foo Bar.md", "ok.md", "x.txt", "index.md"], "{module}.md") == {
+        "Foo Bar": "Foo Bar.md", "ok": "ok.md", "index": "index.md"}
+    assert sources.spec_ids(["SPEC-a.md", "a.md"], "SPEC-{module}.md") == {"a": "SPEC-a.md"}
+    assert sources.is_module_id("ok", "{module}.md") and not sources.is_module_id("Foo Bar", "{module}.md")
+    assert not sources.is_module_id("index", "{module}.md") and sources.is_module_id("index", "SPEC-{module}.md")
+
+
+def test_read_header_reads_at_most_its_limit_and_replaces_bad_bytes(tmp_path):
+    path = tmp_path / "x.md"
+    path.write_bytes(b"# X\n\xff" + b"y" * 100)
+    assert sources.read_header(path, limit=6) == "# X\n�y"
+
+
+def test_files_that_are_not_modules_are_skipped_only_under_the_bare_pattern(plain, specs):
+    folder = plain.root / "docs" / "specs"
+    for name in ("ok.md", "README.md", "index.md", "template.md", "Foo Bar.md"):
+        write(plain.root, f"docs/specs/{name}", "# spec\n")
+    (folder / "ln.md").symlink_to(folder / "ok.md")
+    (folder / "dir.md").mkdir()
+    assert [n.id for n in work_source.items(plain.cfg, plain.root)] == ["ok"]
+    assert work_source.skipped(plain.cfg, plain.root) == sorted(
+        ["README.md", "index.md", "template.md", "Foo Bar.md", "ln.md", "dir.md"])
+    assert not issues_at(plain.cfg, plain.root, ("work_source", "project.docs.specs"))
+    write(specs.root, "docs/specs/SPEC-index.md", "# Index module\n")
+    assert [n.id for n in work_source.items(specs.cfg, specs.root)] == ["index"]
+    assert work_source.skipped(specs.cfg, specs.root) == []
+
+
+def test_an_unreadable_spec_is_skipped_not_raised(plain, monkeypatch):
+    write(plain.root, "docs/specs/ok.md", "# ok\n")
+    write(plain.root, "docs/specs/locked.md", "# locked\n")
+    real = sources.read_header
+
+    def read_header(path, limit=sources.HEADER_MAX):
+        if Path(path).name == "locked.md":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, limit)
+
+    monkeypatch.setattr(sources, "read_header", read_header)
+    assert [n.id for n in work_source.items(plain.cfg, plain.root)] == ["ok"]
+    assert work_source.skipped(plain.cfg, plain.root) == ["locked.md (unreadable)"]
+
+
+def test_entries_past_specs_max_are_skipped_once(plain, monkeypatch):
+    for name in ("a", "b", "c", "d"):
+        write(plain.root, f"docs/specs/{name}.md", "# spec\n")
+    monkeypatch.setattr(sources, "SPECS_MAX", 2)
+    assert [n.id for n in work_source.items(plain.cfg, plain.root)] == ["a", "b"]
+    assert work_source.skipped(plain.cfg, plain.root) == ["… and 2 more (over 2 files)"]
+
+
+def test_headers_are_reread_only_when_a_file_changes(plain, monkeypatch):
+    write(plain.root, "docs/specs/a.md", "# A\n")
+    write(plain.root, "docs/specs/b.md", "# B\n\nDepends on: a\n")
+    calls: list[str] = []
+    real = sources.read_header
+
+    def read_header(path, limit=sources.HEADER_MAX):
+        calls.append(Path(path).name)
+        return real(path, limit)
+
+    monkeypatch.setattr(sources, "read_header", read_header)
+    first = work_source.items(plain.cfg, plain.root)
+    assert work_source.items(plain.cfg, plain.root) == first
+    assert sorted(calls) == ["a.md", "b.md"]
+    target = plain.root / "docs" / "specs" / "a.md"
+    st = target.stat()
+    os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))  # a touch
+    work_source.items(plain.cfg, plain.root)
+    assert sorted(calls) == ["a.md", "a.md", "b.md"]
+    write(plain.root, "docs/specs/a.md", "# A\n\nDepends on: c, d\n")  # a new size: read again, new deps
+    assert work_source.items(plain.cfg, plain.root)[0] == sources.ModuleNode("a", ["c", "d"])
+    assert sorted(calls) == ["a.md", "a.md", "a.md", "b.md"]
+
+
+def test_a_specs_pack_validates_clean(specs):
+    write(specs.root, "docs/specs/SPEC-a.md", "# A\n")
+    assert not issues_at(specs.cfg, specs.root, ("work_source", "project.docs", "dashboard.backlog"))
+
+
+def test_a_specs_pack_with_a_path_a_bad_docs_dir_or_no_module_lane_is_reported(specs, tmp_cfg, tmp_path):
+    with_path = load_config(tmp_cfg({"work_source": {"kind": "specs", "path": "docs/specs"}}, name="p.yaml"))
+    assert errors_at(with_path, specs.root, "work_source.path") == ["specs reads project.docs.specs; remove path"]
+    (tmp_path / "elsewhere").mkdir()
+    (specs.root / "speclink").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    linked = load_config(tmp_cfg({**SPECS, "project": {"docs": {"specs": "speclink"}}}, name="l.yaml"))
+    assert errors_at(linked, specs.root, "project.docs.specs")
+    assert work_source.directory(linked, specs.root) is None
+    write(specs.root, "notadir.md", "# a file\n")
+    a_file = load_config(tmp_cfg({**SPECS, "project": {"docs": {"specs": "notadir.md"}}}, name="f.yaml"))
+    assert errors_at(a_file, specs.root, "project.docs.specs")
+    assert work_source.directory(a_file, specs.root) is None
+    for bad in ("../outside", str(tmp_path / "elsewhere")):
+        outside = load_config(tmp_cfg({**SPECS, "project": {"docs": {"specs": bad}}}, name="o.yaml"))
+        assert errors_at(outside, specs.root, "project.docs.specs"), bad
+        assert work_source.directory(outside, specs.root) is None
+    no_lane = load_config(tmp_cfg({**SPECS, "dashboard": {"backlog": {"module_lane": None}}}, name="n.yaml"))
+    assert warnings_at(no_lane, specs.root, "dashboard.backlog.module_lane") == [
+        "a specs work source lists modules only for the module_lane"]
+    assert not warnings_at(specs.cfg, specs.root, "dashboard.backlog.module_lane")
+
+
+def test_a_new_module_field_without_module_row_is_clean_only_for_a_specs_pack(fr, tmp_cfg):
+    form = {"dashboard": {"backlog": {"new_task": {"feature": ["new_module", "after"]}, "module_row": None}}}
+    where = "dashboard.backlog.new_task.feature"
+    write(fr.root, "docs/specs/SPEC-a.md", "# A\n")
+    assert not errors_at(load_config(tmp_cfg({**SPECS, **form}, name="s.yaml")), fr.root, where)
+    assert errors_at(load_config(tmp_cfg(form, name="m.yaml")), fr.root, where)
+    assert errors_at(load_config(tmp_cfg({"work_source": None, **form}, name="z.yaml")), fr.root, where)
+
+
+def test_capability_map_wording_is_unchanged_and_specs_wording_names_spec_files(fr, specs):
+    assert work_source.noun(fr.cfg) == "capability map"
+    assert work_source.noun(specs.cfg) == "spec files"
+    assert work_source.noun(dataclasses.replace(fr.cfg, work_source=None)) == "capability map"
+
+
+def test_add_item_is_a_no_op_and_capability_map_placeholder_is_empty_for_specs(specs):
+    write(specs.root, "docs/specs/SPEC-a.md", "# A\n")
+    folder = specs.root / "docs" / "specs"
+    before = {p.name: p.read_bytes() for p in folder.iterdir()}
+    work_source.add_item(specs.cfg, specs.root, {"Module id": "{module}", "Depends on": "{deps}"},
+                         {"module": "c", "responsibility": "sea", "deps": ["a"]})
+    assert {p.name: p.read_bytes() for p in folder.iterdir()} == before
+    assert make_ctx(specs.cfg, specs.root, "feature", {"module": "a"}).values["capability_map"] == ""
+    assert work_source.file(specs.cfg, specs.root) is None
+    assert work_source.directory(specs.cfg, specs.root) == specs.root / "docs" / "specs"
+
+
+def test_a_new_module_flag_is_refused_for_a_specs_pack(specs):
+    from agentflow import pipeline
+
+    with pytest.raises(ValueError, match="--task"):
+        pipeline._check_new_module(specs.cfg, {"module": "e"}, {"module": "e", "responsibility": "x", "deps": []})
+
+
+def test_modules_done_names_the_spec_files_for_an_unknown_module(specs):
+    write(specs.root, "docs/specs/SPEC-a.md", "# A\n")
+    ghost = evaluate(specs.cfg, "deps_merged", make_ctx(specs.cfg, specs.root, "feature", {"module": "ghost"}))
+    assert ghost.value is None and ghost.reason.endswith(": module 'ghost' is not in the spec files")

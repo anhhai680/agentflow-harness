@@ -7,7 +7,10 @@ never count as headings or boxes, so a plan can quote examples of its own format
 
 from __future__ import annotations
 
+import os
 import re
+import stat
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -24,6 +27,21 @@ _DEPENDS_TASK = re.compile(r"\bTask\s+(\d+)\b", re.IGNORECASE)
 _FILE_LINE = re.compile(r"^\s*[-*+]\s+(?:Create|Modify|Test|Delete|Rename)\s*:", re.IGNORECASE)
 _BACKTICKED = re.compile(r"`([^`]+)`")
 _ROW_SPLIT = re.compile(r"(?<!\\)\|")
+
+MODULE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]*$")  # a module id: a lowercase slug. Use it with `fullmatch` only
+NOT_MODULES = frozenset({"index", "readme", "template", "changelog"})  # not modules under the bare `{module}.md`
+HEADER_MAX = 8192  # the most bytes of a spec file read for its header
+LINE_MAX = 512  # a header line is cut to this many characters before it is matched
+SPECS_MAX = 500  # the most entries of the specs directory examined
+# A spec header's dependency line: `**Depends on:** a`, `**Depends on**: a`, `Depends on: a`, `- Depends on: a`.
+# The colon is required, so prose such as "Depends on the auth module" is not one.
+SPEC_DEPENDS = re.compile(r"^[-*>\s]*Depends on\**\s*:[\s*]*(.*)$", re.IGNORECASE)
+NO_DEPS = re.compile(r"^none\.?(\s*\(.*\))?\.?$", re.IGNORECASE)  # the only values that mean "no dependencies"
+CUT_DEP = "<Depends on line too long>"  # a dependency line cut at LINE_MAX: it blocks, since its end was not read
+BAD_DEP = "<unreadable dependency>"  # a dependency that is not printable ASCII of at most 80 characters: it blocks
+_DEP_MAX = 80
+_HEADER_END = "## "
+_BULLET = re.compile(r"^\s*[-*+]\s(.*)$")  # a `-`, `*` or `+` bullet (its text is stripped after)
 
 
 @dataclass
@@ -242,10 +260,14 @@ def capability_map(path: Path) -> list[ModuleNode]:
         if len(cells) <= max(id_col, deps_col):
             continue
         module_id = cells[id_col].strip("` ")
-        raw_deps = cells[deps_col].strip()
-        deps = [] if raw_deps in ("", "—", "-", "–") else [d.strip("` ") for d in raw_deps.split(",") if d.strip("` ")]
-        nodes.append(ModuleNode(module_id, deps))
+        nodes.append(ModuleNode(module_id, deps_cell(cells[deps_col])))
     return nodes
+
+
+def deps_cell(raw: str) -> list[str]:
+    """The module ids in one `Depends on` value: comma-separated, backticks dropped; `—`, `-`, `–` or empty is none."""
+    raw = raw.strip()
+    return [] if raw in ("", "—", "-", "–") else [d.strip("` ") for d in raw.split(",") if d.strip("` ")]
 
 
 def _cell(text: str) -> str:
@@ -308,14 +330,109 @@ def spec_modules(specs_dir: Path, spec_file: str) -> dict[str, Path]:
     specs_dir = Path(specs_dir)
     if not specs_dir.is_dir():
         return {}
+    paths = {path.name: path for path in sorted(specs_dir.iterdir())}
+    return {module: paths[name] for module, name in spec_ids(paths, spec_file).items() if paths[name].is_file()}
+
+
+def spec_ids(names: Iterable[str], spec_file: str) -> dict[str, str]:
+    """`{id: name}` for each of `names` that fits `spec_file`, in the order given. Every fitting name is here, a
+    non-slug id such as `Foo Bar` too: `is_module_id` says which ids are modules."""
     parts = [re.escape(p.replace("{{", "{").replace("}}", "}")) for p in spec_file.split("{module}")]
     pattern = re.compile(parts[0] + "(?P<module>.+)" + "(?P=module)".join(parts[1:]))
-    found = {}
-    for path in sorted(specs_dir.iterdir()):
-        match = pattern.fullmatch(path.name)
-        if match and path.is_file():
-            found[match.group("module")] = path
+    found: dict[str, str] = {}
+    for name in names:
+        match = pattern.fullmatch(name)
+        if match:
+            found[match.group("module")] = name
     return found
+
+
+def is_module_id(module: str, spec_file: str) -> bool:
+    """Whether a spec file's id names a module: a lowercase slug, and under the bare `{module}.md` not one of the
+    files a docs folder holds anyway (`NOT_MODULES`: `index`, `readme`, `template`, `changelog`)."""
+    if MODULE_ID.fullmatch(module) is None:
+        return False
+    return not (spec_file == "{module}.md" and module in NOT_MODULES)
+
+
+def read_header(path: Path, limit: int = HEADER_MAX) -> str:
+    """At most `limit` bytes of the regular file at `path`, decoded as UTF-8 with bad bytes replaced. It never
+    follows a symlink or waits on a pipe: either raises `OSError`, as an unreadable file does."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        data = handle.read(limit)
+    return data.decode("utf-8", errors="replace")
+
+
+def spec_header(text: str) -> list[tuple[str, bool]]:
+    """`(line, was_cut)` for each line of a spec before its first `## ` heading, leaving out fenced lines. Each line
+    is cut to `LINE_MAX` characters; `was_cut` says it was longer."""
+    lines = text.splitlines()
+    fenced = _fence_flags(lines)
+    out: list[tuple[str, bool]] = []
+    for line, inside in zip(lines, fenced, strict=True):
+        if inside:
+            continue
+        if line.startswith(_HEADER_END):
+            break
+        out.append((line[:LINE_MAX], len(line) > LINE_MAX))
+    return out
+
+
+def _dep_value(header: list[tuple[str, bool]], start: int, first: str) -> tuple[list[str], bool, int]:
+    """The parts of one `Depends on:` value whose captured text is `first`: when that is empty or ends with `,`,
+    the header lines after `start` that are bullets or carry on the comma list. Returns the parts, whether any
+    line read was cut, and the index of the first line not read."""
+    parts, cut, i = [first], False, start
+    if first and not first.endswith(","):
+        return parts, cut, i
+    while i < len(header):
+        line, was_cut = header[i]
+        if not line.strip() or SPEC_DEPENDS.match(line) or line.lstrip().startswith("#"):
+            break
+        bullet = _BULLET.match(line)
+        if bullet:
+            parts.append(bullet.group(1).strip())
+        elif not parts[-1] or parts[-1].endswith(","):
+            parts.append(line.strip())
+        else:
+            break
+        cut = cut or was_cut
+        i += 1
+    return parts, cut, i
+
+
+def _dep_id(dep: str) -> str:
+    """One dependency as it is kept: backticks, `*` and `.` stripped from both ends, and `BAD_DEP` in place of
+    text that is not printable ASCII of at most 80 characters, so raw repository text never reaches a terminal."""
+    dep = dep.strip("`*. ")
+    if not dep.isascii() or not dep.isprintable() or len(dep) > _DEP_MAX:
+        return BAD_DEP
+    return dep
+
+
+def spec_deps(text: str) -> list[str]:
+    """The modules a spec depends on, from every `Depends on:` line of its header (`spec_header`) and the bullets
+    or comma list that follow one ending in `,` or nothing. Only `none`, `none.` or `none (…)` means none; every
+    other id is kept in order, once, so an unknown one blocks. A cut line adds `CUT_DEP`."""
+    header = spec_header(text)
+    found: list[str] = []
+    i = 0
+    while i < len(header):
+        line, was_cut = header[i]
+        i += 1
+        match = SPEC_DEPENDS.match(line)
+        if match is None:
+            continue
+        parts, cut, i = _dep_value(header, i, match.group(1).strip())
+        value = ", ".join(p for p in parts if p)
+        ids = [] if NO_DEPS.match(value) else [d for d in (_dep_id(d) for d in deps_cell(value)) if d]
+        if was_cut or cut:
+            ids.append(CUT_DEP)
+        found += ids
+    return list(dict.fromkeys(found))
 
 
 def spec_status(path: Path, approved_re: str, pending_re: str) -> Literal["approved", "pending", "unknown"]:
