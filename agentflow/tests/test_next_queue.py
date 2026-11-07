@@ -1135,3 +1135,21 @@ def test_next_skips_done_modules_in_both_spec_and_checked_plan_rules(dq):
     finished.mark(dq.root, "crm", "cli")
     assert next_step(dq.cfg, dq.root).lane == "none"
     assert dq.merges.calls == ["flow/feature/crm"]  # a done module's branch is not asked about
+
+
+def test_a_corrupt_marks_file_lets_origin_evidence_make_no_new_done(dq, tmp_path):
+    from agentflow import finished
+    from conftest import land_on_origin
+
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-platform.md": spec_text("Status: done")})
+    assert assess(dq)["platform"]["done_reason"] == finished.SPEC_SAYS
+    finished.veto(dq.root, "crm", "pat")
+    land_on_origin(dq, tmp_path, {"docs/specs/SPEC-crm.md": spec_text("Status: done"),
+                                  "docs/plans/2026-10-28-crm.md": naming("crm")})
+    assert assess(dq)["crm"]["status"] == "backlog"  # vetoed
+    (runs_root(dq.root) / finished.MARKS).write_text('{"crm": {"state": "not_d', encoding="utf-8")  # torn
+    messages: list[str] = []
+    entries = {e["id"]: e for e in module_queue.assess_modules(dq.cfg, dq.root, log=messages.append).entries}
+    assert entries["crm"]["status"] == "backlog"  # the veto can't be read: origin evidence makes nothing done
+    assert entries["platform"]["done_reason"] == finished.SPEC_SAYS  # an earlier Done stays
+    assert [m for m in messages if finished.MARKS in m and "unreadable" in m]

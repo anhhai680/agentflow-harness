@@ -463,7 +463,8 @@ def done_reason(
     on origin read in full, fully ticked and naming the module's spec file (`plan_complete`); a finished newest plan
     (work tree or origin) whose branch `gh` says is merged (`MERGED`; a prior done entry recorded as merged, or from
     before reasons were kept, is not asked about again). When origin could not be read in full, a prior Done from
-    origin evidence or a merge stays as it was. When the marks file is unreadable, a prior hand mark stays."""
+    origin evidence or a merge stays as it was. When the marks file is unreadable, a prior hand mark stays, and
+    origin evidence makes no new Done (the file may hold a veto) but keeps an earlier one."""
     by_hand, error = marks
     mark = (by_hand.get(node.id) or {}).get("state")
     said = old.get("done_reason")
@@ -471,12 +472,13 @@ def done_reason(
     if mark == "done" or (error and prior == finished.BY_HAND):
         return finished.BY_HAND, None
     vetoed = mark == "not_done"
+    trust_origin = not vetoed and not error  # an unreadable marks file may hide a veto: origin makes no new Done
     try:
         spec_name = cfg.project.spec_file.format(module=node.id)
     except (KeyError, IndexError, ValueError, AttributeError):  # `validate` reports it; origin then decides nothing
         spec_name = None
     problem = None
-    if not vetoed and isinstance(view.specs, gitops.Listing) and spec_name in view.specs.blobs:
+    if trust_origin and isinstance(view.specs, gitops.Listing) and spec_name in view.specs.blobs:
         blob = view.specs.blobs[spec_name]
         text = blob.text[: blob.text.rfind("\n") + 1] if blob.truncated else blob.text  # a cut last line may lie
         says = sources.says_done(text, cfg.project.done_status)
@@ -485,7 +487,7 @@ def done_reason(
         elif says:
             return finished.SPEC_SAYS, None
     plan = _origin_plan(view, node.id, known)
-    if (not vetoed and spec_name and _origin_complete(view) and plan is not None and _origin_plan_finished(plan)
+    if (trust_origin and spec_name and _origin_complete(view) and plan is not None and _origin_plan_finished(plan)
             and sources.plan_spec(plan.text) == spec_name):
         return finished.plan_complete(view.branch), None
     if _plan_finished(cfg, repo, node.id, view, known):
@@ -497,7 +499,7 @@ def done_reason(
             return finished.MERGED, None
         if merged is None:
             problem = problem or f"could not tell whether {branch} is merged: {_first_line(why)}"
-    if prior and not _origin_complete(view):  # origin could not be read in full: it decides nothing
+    if prior and (not _origin_complete(view) or error):  # origin, or a veto, could not be read: keep what was
         if prior == finished.MERGED or (finished.from_origin(prior) and not vetoed):
             return prior, None
     return None, problem
@@ -640,6 +642,8 @@ def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = 
     known = known_ids(cfg, repo, view)
     marks = finished.read_marks(repo)
     entries, problems, occupied, notes = [], {}, 0, []
+    if marks[1]:
+        notes.append(f"queue: {marks[1]}; until then origin evidence marks no module newly done")
     for node in nodes:
         entry, holds, problem = _assess(cfg, repo, node, runs.get(node.id), prior.get(node.id, {}), notes,
                                         view, known, marks)
