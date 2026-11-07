@@ -177,7 +177,9 @@ class Issue:
 DEFAULT_SKILLS_DIR = ".claude/skills"
 DEFAULT_SPEC_FILE = "{module}.md"  # a module's spec is `<docs.specs>/<spec_file>`
 REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea`, `decisions`, `glossary` are optional
-WORK_SOURCE_KINDS = ("capability_map",)  # a Markdown table with `Module id` and `Depends on` columns (`sources`)
+# `capability_map`: a Markdown table with `Module id` and `Depends on` columns (`sources.capability_map`);
+# `specs`: one module per spec file in `project.docs.specs`, its dependencies from the header (`sources.spec_deps`)
+WORK_SOURCE_KINDS = ("capability_map", "specs")
 SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "verify", "ship",
                    "review", "debug", "review_feedback")  # review_feedback: the skill sent with blocking findings
 
@@ -198,8 +200,8 @@ class Project:
 class WorkSource:
     """Where the modules `agentflow queue`, the Backlog and `modules_done` walk come from (`work_source:`)."""
 
-    kind: Literal["capability_map"]
-    path: str  # relative to the repository root
+    kind: Literal["capability_map", "specs"]
+    path: str  # relative to the repository root; `""` for `specs`, which always reads `project.docs.specs`
 
 
 @dataclass
@@ -669,7 +671,10 @@ def _work_source(raw: dict) -> WorkSource | None:
     block = _optional(raw, "work_source", "", dict, None)
     if block is None:
         return None
-    return WorkSource(kind=_require(block, "kind", "work_source", str), path=_require(block, "path", "work_source", str))
+    kind = _require(block, "kind", "work_source", str)
+    if kind == "capability_map":
+        return WorkSource(kind=kind, path=_require(block, "path", "work_source", str))
+    return WorkSource(kind=kind, path=_optional(block, "path", "work_source", str, ""))
 
 
 def _skills_map(raw: dict) -> dict[str, str]:
@@ -1199,15 +1204,45 @@ class _Validator:
                      "add it to .gitignore, or leave paths.state_dir unset for a state dir outside the repository")
 
     def work_source(self) -> None:
-        """`work_source:`: one kind, `capability_map`, at a path inside the repository."""
+        """`work_source:`: `capability_map` at a path inside the repository, or `specs`, which takes no path and
+        reads `project.docs.specs`."""
         ws = self.cfg.work_source
         if ws is None:
             return
         if ws.kind not in WORK_SOURCE_KINDS:
-            self.error("work_source.kind", "the only work source this engine reads is capability_map")
+            self.error("work_source.kind", "the work source kinds are capability_map and specs")
+        if ws.kind == "specs":
+            self.specs_source()
+            return
         path = ws.path.strip()
         if not path or posixpath.isabs(path) or ".." in posixpath.normpath(path).split("/"):
             self.error("work_source.path", "path is a file inside the repository, relative to its root and without '..'")
+
+    def specs_source(self) -> None:
+        """A `specs` work source whose Backlog would be empty without a word: a `path` it never reads, a specs
+        directory it cannot list, or no lane to run its modules in."""
+        if self.cfg.work_source is not None and self.cfg.work_source.path.strip():
+            self.error("work_source.path", "specs reads project.docs.specs; remove path")
+        specs = self.cfg.project.docs.get("specs")
+        if isinstance(specs, str) and specs.strip():
+            target = Path(self.repo) / specs
+            try:
+                inside = target.resolve().is_relative_to(Path(self.repo).resolve())
+            except (OSError, RuntimeError):  # a symlink loop on the way (RuntimeError on Python 3.12)
+                inside = False
+            if posixpath.isabs(specs) or ".." in posixpath.normpath(specs).split("/"):
+                self.error("project.docs.specs", "a specs work source lists project.docs.specs: a directory inside "
+                           "the repository, relative to its root and without '..'")
+            elif target.is_symlink() or not inside:
+                self.error("project.docs.specs", "a specs work source does not list a symlinked directory or one "
+                           "outside the repository")
+            elif target.exists() and not target.is_dir():
+                self.error("project.docs.specs", "a specs work source lists project.docs.specs, which is not a "
+                           "directory")
+        block = self.cfg.dashboard.get("backlog")
+        if not (isinstance(block, dict) and block.get("module_lane")):
+            self.add("warning", "dashboard.backlog.module_lane",
+                     "a specs work source lists modules only for the module_lane")
 
     def skills_map(self) -> None:
         """`skills.map`: the skill `agentflow next` names for each kind of step; each one is in `skills_dir` or bundled."""
@@ -1438,6 +1473,7 @@ class _Validator:
         tasks = block.get("new_task")
         if tasks is None:
             return
+        specs = self.cfg.work_source is not None and self.cfg.work_source.kind == "specs"  # a new spec has no row
         if not isinstance(tasks, dict):
             self.error(f"{path}.new_task", "must map a lane to its form fields")
             return
@@ -1451,7 +1487,9 @@ class _Validator:
                 self.error(where, f"unknown field {', '.join(unknown)}; known: {', '.join(BACKLOG_FIELDS)}")
             elif not [f for f in fields if f != "after"]:
                 self.error(where, "needs a field to fill in besides `after`")
-            elif "new_module" in fields and (lane != module_lane or not isinstance(row, dict)):
+            elif "new_module" in fields and specs and lane != module_lane:
+                self.error(where, "`new_module` belongs to the module_lane")
+            elif "new_module" in fields and not specs and (lane != module_lane or not isinstance(row, dict)):
                 self.error(where, "`new_module` belongs to the module_lane and needs dashboard.backlog.module_row")
 
 

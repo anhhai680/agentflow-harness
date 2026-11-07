@@ -503,7 +503,7 @@ function newTaskDialog() {
     if (wanted.includes("new_module")) {
       parts.push(...text("nt-module", "Module id (lowercase, - or _)", false, 60));
       parts.push(...text("nt-resp", "What it does", "short", 400));
-      parts.push(...pick("nt-deps", "Depends on", true, data.modules.map((m) => ({ key: m, label: m })), "Only modules already in the map."));
+      parts.push(...pick("nt-deps", "Depends on", true, data.modules.map((m) => ({ key: m, label: m })), data.work_source_kind === "specs" ? "Only modules already in the spec files." : "Only modules already in the map."));
     }
     const phases = data.lane_phases[kind()] || [];
     parts.push(...pick("nt-stop", "Stop after", false, [{ key: "", label: "(run to the end)" }, ...phases.map((p) => ({ key: p, label: p }))]));
@@ -546,6 +546,7 @@ function renderBoard(data) {
     const col = el("div", { class: "col" }, el("h2", {}, el("span", { text: name }), el("span", { text: String(name === "Backlog" ? data.backlog.length : cards.length) })));
     dropOn(col, name);
     if (name === "Backlog") col.append(...data.backlog.map(backlogNode));
+    if (name === "Backlog" && (data.backlog_skipped || []).length) col.append(el("div", { class: "muted", text: "Not modules: " + data.backlog_skipped.join(", ") }));
     for (const card of cards) col.append(cardNode(card));
     return col;
   });

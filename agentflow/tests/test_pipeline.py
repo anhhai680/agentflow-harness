@@ -512,6 +512,10 @@ def test_run_cli_preflight_missing_binary(pipe, capsys):
     assert "agentflow-no-such-binary" in capsys.readouterr().out
 
 
+def test_dry_run_feature_for_a_new_module_with_a_task(pipe):
+    assert main(["run", "feature", "--module", "e", "--task", "t", "--dry-run", "--config", str(pipe.cfg.path)]) == 0
+
+
 def test_dry_run_feature(pipe, capsys):
     from agentflow import pack
 

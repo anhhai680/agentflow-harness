@@ -44,7 +44,7 @@ INTERVAL_S = 30.0
 SPAWN_TIMEOUT_S = 180
 DESIGN_DOC_KEYS = ("idea", "decisions", "glossary")  # the `project.docs` paths a design-doc change touches
 _PLAN_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}-(.+)\.md$")
-_MODULE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_MODULE_ID = sources.MODULE_ID
 _STARTED = re.compile(r"^Started (\S+) in ", re.MULTILINE)
 _LIVE = ("running", "refining", "waiting_human", "awaiting_approval", "paused", "ready")
 _ACTIVE = ("running", "refining")
@@ -457,10 +457,10 @@ def _cycle_through(start: str, deps: dict[str, list[str]]) -> list[str] | None:
     return None
 
 
-def _map_problem(node: sources.ModuleNode, deps: dict[str, list[str]]) -> str | None:
+def _map_problem(node: sources.ModuleNode, deps: dict[str, list[str]], noun: str = "capability map") -> str | None:
     unknown = [d for d in node.deps if d not in deps]
     if unknown:
-        return f"depends on {', '.join(unknown)}, which is not in the capability map"
+        return f"depends on {', '.join(unknown)}, which is not in the {noun}"
     cycle = _cycle_through(node.id, deps)
     if cycle:
         members = cycle[:-1]
@@ -517,11 +517,12 @@ def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = 
     prior = {m["id"]: m for m in QueueState.load(repo).modules}
     runs = feature_runs(cfg, repo)
     graph = {n.id: list(n.deps) for n in nodes}
+    noun = work_source.noun(cfg)
     entries, problems, occupied, notes = [], {}, 0, []
     for node in nodes:
         entry, holds, problem = _assess(cfg, repo, node, runs.get(node.id), prior.get(node.id, {}), notes)
         entries.append(entry)
-        problems[node.id] = _map_problem(node, graph) or problem
+        problems[node.id] = _map_problem(node, graph, noun) or problem
         occupied += holds
     for message in notes:
         say(message)
@@ -600,12 +601,13 @@ _RUN_WORDS = {"running": "running", "refining": "running", "waiting_human": "wai
 
 def dependency_view(
     nodes: list[sources.ModuleNode], entries: list[dict], cards: list, *,
-    merged: dict[str, bool | None] | None = None, runs: dict[str, Run] | None = None,
+    merged: dict[str, bool | None] | None = None, runs: dict[str, Run] | None = None, noun: str = "capability map",
 ) -> dict[str, dict]:
     """For each unfinished item, `blocked_by`, `parallel_with` and `parallel`.
 
-    Items are `module:<id>` (the capability map, with the states in `entries`) and `card:<id>` (cards added on the
-    page; each has `id`, `label`, `status`, `run_id`, `after` and `deps`). A dependency is met when its pull request
+    Items are `module:<id>` (the work source, with the states in `entries`; `noun` is what a module missing from it
+    is "not in") and `card:<id>` (cards added on the page; each has `id`, `label`, `status`, `run_id`, `after`
+    and `deps`). A dependency is met when its pull request
     is merged: a map module once `entries` says `done`, a started card or a `run:<id>` once `merged[run_id]` is
     true. A card still in Backlog, a run still going, an open pull request and a failed or cancelled run all keep
     their dependents blocked, and each says which.
@@ -646,7 +648,7 @@ def dependency_view(
         kind, _, name = key.partition(":")
         if kind == "module":
             if name not in by_entry:
-                return "not in the capability map"
+                return f"not in the {noun}"
             run_id = by_entry[name].get("run_id")
             return run_word(run_id) if run_id else "not started"
         if kind == "card":

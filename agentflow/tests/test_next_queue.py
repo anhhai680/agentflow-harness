@@ -760,3 +760,29 @@ def test_spawn_run_passes_the_stop_phase_and_the_new_module_row(qrepo, tmp_path)
 def test_spawn_run_refuses_what_could_become_a_flag_or_a_path(qrepo, lane, params):
     with pytest.raises(StartFailed):
         module_queue.spawn_run(qrepo.root, lane, params, command=["true"])
+
+
+@pytest.fixture
+def sqrepo(fr):
+    """`qrepo` for a pack whose work source is its spec files: two of them, `crm` after `platform`."""
+    fr.configure({"work_source": {"kind": "specs", "path": None}})
+    write(fr.root, "docs/specs/SPEC-platform.md", APPROVED_SPEC.format(m="platform"))
+    write(fr.root, "docs/specs/SPEC-crm.md", APPROVED_SPEC.format(m="crm") + "\n**Depends on:** platform\n")
+    commit_all(fr.root)
+    return fr
+
+
+def test_cmd_queue_on_a_specs_pack_needs_include_specs(sqrepo, monkeypatch, capsys):
+    sqrepo.install_pack()
+    spawned: list[tuple] = []
+    monkeypatch.setattr("agentflow.flow._preflight", lambda cfg: None)
+    monkeypatch.setattr(module_queue, "spawn_feature_run",
+                        lambda repo, module, lane, config=None: spawned.append((module, config)) or f"run-{module}")
+    assert main(["queue", "--once"]) == 1
+    out = capsys.readouterr().out
+    assert ("this pack's work source is its spec files: 2 modules are listed; pass --include-specs to queue them"
+            in out)
+    assert spawned == []
+    assert main(["queue", "--once", "--include-specs"]) == 0
+    assert spawned == [("platform", None)]
+    assert "started platform" in capsys.readouterr().out

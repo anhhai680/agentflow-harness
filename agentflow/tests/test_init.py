@@ -192,6 +192,42 @@ def test_the_written_pack_loads_back_to_the_rendered_data(toy_repo):
     assert cfg.gates["tests"].run == multi and cfg.gate_sets["setup"] == ["sync"]
 
 
+SPECS_COMMENT = ("# the Backlog: one module per spec file in project.docs.specs; a new feature card writes a new "
+                 "spec\n")
+
+
+def _detected(**docs: str) -> detect.Detected:
+    return detect.Detected(base_branch="main", base_ref=None, starter="python-uv", docs=dict(docs))
+
+
+def test_a_found_specs_directory_adds_a_specs_work_source_and_a_feature_backlog():
+    found = _detected(specs="docs/proposals")
+    base = init.base_of(found.starter)
+    data = init.pack_data(found, base=base)
+    assert data["work_source"] == {"kind": "specs"}
+    assert data["dashboard"] == {"backlog": {"module_lane": "feature",
+                                             "new_task": {"feature": ["new_module", "after"],
+                                                          "bug": ["issue", "task", "after"]}}}
+    text = init.render_pack(found, base=base)
+    assert SPECS_COMMENT + "work_source:\n  kind: specs\ndashboard:\n  backlog:\n    module_lane: feature\n" in text
+    assert yaml.safe_load(text) == data
+
+
+def test_no_specs_directory_means_no_work_source_or_backlog():
+    found = _detected(plans="docs/plans")
+    base = init.base_of(found.starter)
+    data = init.pack_data(found, base=base)
+    assert "work_source" not in data and "dashboard" not in data
+    text = init.render_pack(found, base=base)
+    assert "work_source" not in text and "dashboard" not in text
+
+
+def test_a_specs_directory_that_looks_like_a_reference_adds_no_work_source():
+    found = _detected(specs="@specs")  # dropped by `_checked`, so the work source would read the wrong folder
+    data = init.pack_data(found, base=init.base_of(found.starter))
+    assert "work_source" not in data and "dashboard" not in data
+
+
 def test_a_base_branch_other_than_main_is_written(toy_repo):
     run_git(toy_repo, "branch", "-m", "main", "trunk")
     run_git(toy_repo, "config", "init.defaultBranch", "trunk")

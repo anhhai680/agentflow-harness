@@ -553,3 +553,90 @@ def test_a_peer_whose_run_has_finished_does_not_make_a_card_parallel(bk):
     list_runs(bk.root)[-1].emit("run_finished")  # b's run is Done: its PR is open
     card = bk.cards()["module:c"]
     assert card["status"] == "ready" and "module:b" in [p["key"] for p in card["parallel_with"]]
+
+
+# --------------------------------------------------------------------------- a pack whose work source is its spec files
+
+
+@pytest.fixture
+def sbk(flow_repo, monkeypatch, tmp_path):
+    """`bk`'s Board over a `specs` pack: `docs/specs/SPEC-a.md` committed, `a` merged, one refresh."""
+    monkeypatch.setenv("PATH", f"{GH_BIN}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(tmp_path / "gh.log"))
+    merges = Merges()
+    monkeypatch.setattr(module_queue, "branch_is_merged", merges)
+    flow_repo.configure({"work_source": {"kind": "specs", "path": None}})
+    write(flow_repo.root, "docs/specs/SPEC-a.md", "# A\n\n**Depends on:** none\n")
+    run_git(flow_repo.root, "add", "-A")
+    run_git(flow_repo.root, "commit", "-q", "-m", "spec a")
+    board = Board(flow_repo, merges)
+    board.merge_module("a")
+    board.refresh()
+    return board
+
+
+def test_a_spec_with_an_unknown_dependency_is_blocked_naming_the_spec_files(sbk):
+    write(sbk.root, "docs/specs/SPEC-b.md", "# B\n\n**Depends on:** ghost\n")
+    cards = sbk.cards()
+    assert "module:a" not in cards  # merged, so not in Backlog
+    card = cards["module:b"]
+    assert card["status"] == "blocked"
+    assert [b["text"] for b in card["blocked_by"]] == ["ghost (not in the spec files)"]
+    with pytest.raises(Refused, match="ghost"):
+        sbk.start("module:b")
+    with pytest.raises(Refused, match="module ghost is not in the spec files"):
+        sbk.start("module:ghost")
+
+
+def test_a_spec_module_card_starts_a_feature_run_for_that_module(sbk):
+    write(sbk.root, "docs/specs/SPEC-c.md", "# C\n")
+    sbk.refresh()
+    assert "module:a" not in sbk.cards() and sbk.cards()["module:c"]["status"] in ("ready", "parallel")
+    sbk.start("module:c")
+    assert sbk.spawn.calls[-1]["params"] == {"module": "c"} and sbk.spawn.calls[-1]["lane"] == "feature"
+
+
+def test_a_new_feature_card_carries_its_text_and_dependencies_as_the_task(sbk):
+    item = backlog.add(sbk.cfg, sbk.root, "feature",
+                       {"new_module": {"module": "e", "responsibility": "Export  reports", "deps": ["a"]}})
+    sbk.start(f"card:{item.id}")
+    call = sbk.spawn.calls[-1]
+    assert call["params"] == {"module": "e", "task": "Export reports\n\nDepends on: a"} and call["new_module"] is None
+    assert call["lane"] == "feature"
+
+
+def test_a_new_feature_card_with_no_dependencies_says_none(sbk):
+    item = backlog.add(sbk.cfg, sbk.root, "feature",
+                       {"new_module": {"module": "e", "responsibility": "Export reports", "deps": []}})
+    sbk.start(f"card:{item.id}")
+    assert sbk.spawn.calls[-1]["params"]["task"] == "Export reports\n\nDepends on: none"
+
+
+def test_a_new_feature_card_cannot_reuse_an_existing_spec_module_id(sbk):
+    with pytest.raises(backlog.Invalid, match="already a module"):
+        backlog.add(sbk.cfg, sbk.root, "feature",
+                    {"new_module": {"module": "a", "responsibility": "Again", "deps": []}})
+
+
+def test_a_new_feature_card_whose_spec_appeared_since_is_refused_at_start(sbk):
+    item = backlog.add(sbk.cfg, sbk.root, "feature",
+                       {"new_module": {"module": "e", "responsibility": "Export reports", "deps": []}})
+    write(sbk.root, "docs/specs/SPEC-e.md", "# E\n\n**Depends on:** none\n")
+    with pytest.raises(Refused, match="a spec for e now exists; start module:e instead"):
+        backlog.begin_start(sbk.cfg, sbk.root, f"card:{item.id}")
+    assert sbk.spawn.calls == []
+
+
+def test_the_backlog_names_the_files_that_are_not_modules(sbk):
+    assert backlog.snapshot(sbk.cfg, sbk.root)["skipped"] == []
+    write(sbk.root, "docs/specs/SPEC-Foo Bar.md", "# Foo\n")
+    assert backlog.snapshot(sbk.cfg, sbk.root)["skipped"] == ["SPEC-Foo Bar.md"]
+
+
+def test_a_capability_map_backlog_names_no_skipped_files(bk):
+    assert backlog.snapshot(bk.cfg, bk.root)["skipped"] == []
+
+
+def test_the_spec_prompt_tells_the_agent_about_task_md_and_the_depends_on_header():
+    text = (Path(backlog.__file__).parent / "prompts" / "spec.md").read_text(encoding="utf-8")
+    assert "{run_dir}/task.md" in text and "**Depends on:**" in text
