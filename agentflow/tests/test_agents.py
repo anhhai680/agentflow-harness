@@ -665,15 +665,19 @@ def test_a_codex_call_that_exits_cleanly_is_no_interruption():
     assert acc.to_outcome(0).interruption is None  # codex sends no `result` event
 
 
-def test_a_run_agent_does_not_inherit_a_dropped_variable(fake, fake_claude, call, monkeypatch, tmp_path):
+def test_a_run_agent_does_not_inherit_a_dropped_variable(fake, fake_claude, call, cfg, monkeypatch):
+    from agentflow import run_env
+    from agentflow.config import EnvInherit
+
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", "LEAKED_URL,KEPT_URL,FROM_PACK")
     monkeypatch.setenv("LEAKED_URL", "leak-sentinel-7f3a")
     monkeypatch.setenv("KEPT_URL", "kept-value")
-    base = {k: v for k, v in os.environ.items() if k != "LEAKED_URL"}  # what `run_env.base` made of the process
-    recorded = fake_claude.env(dataclasses.replace(call, env_base=base, env={"FROM_PACK": "1"}))
+    cfg = dataclasses.replace(cfg, defaults=dataclasses.replace(
+        cfg.defaults, env_inherit=EnvInherit(drop=["LEAKED_*"], drop_dotenv=[])))
+    fake_claude.run(dataclasses.replace(call, env_base=run_env.base(cfg), env={"FROM_PACK": "1"}), collect()[1])
+    recorded = fake.calls()[0]["env"]
+    assert "LEAKED_URL" not in recorded and recorded["KEPT_URL"] == "kept-value"
     assert recorded["AGENTFLOW_RUN"] == call.run_id and recorded["FROM_PACK"] == "1"
-    events, on_event = collect()
-    fake_claude.run(dataclasses.replace(call, env_base=base), on_event)
-    assert fake.calls()[0]["env"]["AGENTFLOW_RUN"] == call.run_id
 
 
 def test_the_process_environment_reaches_the_agent_only_when_the_call_has_no_base(fake, fake_claude, call, monkeypatch):
