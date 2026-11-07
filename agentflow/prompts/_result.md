@@ -11,3 +11,4 @@ Write your result as JSON to `{result_file}`, then stop. Use this exact path. Th
 - `questions` (with `needs_human`, or with `done` in a step whose job is to ask them): a list of `{"id": "q1", "question": "...", "options": [{"key": "A", "label": "...", "recommended": true}], "evidence": ["path#section"], "kind": "spec_gap"}`; `kind` is one of `spec_gap`, `ambiguity`, `conflict`, `review_dispute`, `other`.
 - `can_continue_without`: `true` when later independent tasks can go on while your question waits.
 - Optional: `signals` (an object), `findings` and `risks` (lists).
+- `facts`: only in a resolver session: up to 5 one-line statements that hold for the whole run (an environment cause, a tool quirk), so later sessions do not rediscover them.

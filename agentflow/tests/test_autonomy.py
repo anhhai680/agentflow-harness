@@ -267,6 +267,71 @@ def test_the_resolver_gets_the_stop_on_opus_and_the_step_keeps_its_session(auto)
     assert "--resume" in [c for c in auto.calls() if c["step"] == RED][-1]["argv"]
 
 
+FACT = "the runner's shell sets X_URL to an unreachable host"
+
+
+def resolver_done(*facts: str, summary: str = "đã rõ") -> dict:
+    return done(summary, facts=list(facts))
+
+
+def test_a_fact_a_resolver_finds_reaches_the_next_session(auto):
+    auto.script({RED: [BLOCKED, GOOD_TEST], RESOLVE: [resolver_done(FACT)], "build/fix": [FIXED]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "done"
+    assert [(e["text"], e["key"]) for e in auto.events(run, "run_fact")] == [(FACT, RESOLVE)]
+    assert run.state["facts"] == [{"text": FACT, "key": RESOLVE}]
+    prompt = next(c for c in auto.calls() if c["step"] == "build/fix")["argv"][-1]  # a step that starts after it
+    assert f"## What this run already found\n\nEarlier sessions of this run established these. Check one before relying on it; do not diagnose it again.\n\n- {FACT}\n\n## The step" in prompt
+
+
+def test_the_same_fact_from_a_second_resolver_is_not_added_twice(auto):
+    auto.script({RED: [BLOCKED, BLOCKED, GOOD_TEST], RESOLVE: [resolver_done(FACT)],
+                 f"{RED}/resolve-2": [resolver_done(FACT.upper(), "another thing", FACT)], "build/fix": [FIXED]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "done"
+    assert [e["text"] for e in auto.events(run, "run_fact")] == [FACT, "another thing"]
+    assert [f["text"] for f in run.state["facts"]] == [FACT, "another thing"]
+
+
+def test_facts_in_a_step_that_is_not_a_resolver_are_ignored(auto):
+    auto.script({RED: [{"result": {**GOOD_TEST["result"], "facts": [FACT]}}], "build/fix": [FIXED]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "done"
+    assert not auto.events(run, "run_fact") and run.state["facts"] == []
+    assert "What this run already found" not in next(c for c in auto.calls() if c["step"] == "build/fix")["argv"][-1]
+
+
+def test_a_resolver_that_names_no_facts_adds_none(auto):
+    auto.script({RED: [BLOCKED, GOOD_TEST], RESOLVE: [done("đã rõ")], "build/fix": [FIXED]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "done"
+    assert not auto.events(run, "run_fact") and run.state["facts"] == []
+    assert "What this run already found" not in next(c for c in auto.calls() if c["step"] == "build/fix")["argv"][-1]
+
+
+def test_a_second_resolver_is_told_what_the_first_found_for_another_step(auto):
+    auto.script({RED: [BLOCKED, GOOD_TEST], RESOLVE: [done("x" * 700)],
+                 "build/fix": [BLOCKED, FIXED], "build/fix/resolve-1": [done("thứ hai")]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "done"
+    first = next(c for c in auto.calls() if c["step"] == RESOLVE)["argv"][-1]
+    second = next(c for c in auto.calls() if c["step"] == "build/fix/resolve-1")["argv"][-1]
+    assert "Earlier resolver findings in this run" not in first  # nothing earlier, and it is not its own
+    assert "### Earlier resolver findings in this run" in second
+    assert f"- `{RED}`: " + "x" * 600 + "\n" in second and "x" * 601 not in second  # cut to 600 characters
+
+
+def test_the_report_keeps_the_last_three_findings_of_other_steps(auto):
+    run = auto.new_run()
+    for n in range(5):
+        run.emit("resolve_finished", key=f"build/step-{n}", stop_kind="blocked", summary=f"finding {n}")
+    run.emit("resolve_finished", key="build/mine", stop_kind="blocked", summary="my own")
+    report = auto.executor(run).stop_report("build/mine")
+    assert "### Earlier resolver findings in this run" in report
+    assert [n for n in range(5) if f"finding {n}" in report] == [2, 3, 4] and "my own" not in report
+    assert "### Earlier resolver findings" not in auto.executor(auto.new_run()).stop_report("build/mine")
+
+
 def test_a_step_that_stays_blocked_stops_for_a_human_after_its_attempts(auto, notified):
     auto.script({RED: [BLOCKED] * 3, f"{RED}/resolve-2": [done("vẫn chưa")]})
     run = begin_bug(auto, to="build")

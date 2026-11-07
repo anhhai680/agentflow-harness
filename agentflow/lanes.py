@@ -64,6 +64,9 @@ RESULT = "_result.md"
 DEFAULT_TEMPLATE = "step.md"
 DEFAULT_REFINE = "refine.md"
 DEFAULT_ROLE = "build"
+RUN_FACTS_LINE = re.compile(r"^\{run_facts\}\n\n", re.MULTILINE)  # the preamble's slot, dropped whole when empty
+RESOLVER_FINDINGS_SHOWN = 3
+RESOLVER_FINDING_MAX = 600
 EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n?", re.DOTALL)
 SKILL_LINE = re.compile(r"\b([Uu])se the `([\w.:-]+)` skill")
 SKILL_HEADING = re.compile(r"#{1,6}[ \t]+.*`\{skill\}`")
@@ -107,8 +110,19 @@ def _values(cfg: Config, step: Step, ctx: Ctx, extra: dict) -> dict[str, str]:
     values["progress"] = str(agent_dir / "progress.md")
     values["handoff"] = str(agent_dir / "handoff.md")
     values["questions"] = str(agent_dir / "questions.md")
+    values["run_facts"] = _run_facts(run)
     values.update({name: str(value) for name, value in extra.items()})
     return values
+
+
+def _run_facts(run: Run | None) -> str:
+    """What earlier resolver sessions of the run found, as a section of the prompt; "" when there is nothing."""
+    facts = [str(f.get("text")) for f in (run.state.get("facts") or []) if f.get("text")] if run is not None else []
+    if not facts:
+        return ""
+    lines = "\n".join(f"- {fact}" for fact in facts)
+    return ("## What this run already found\n\nEarlier sessions of this run established these. Check one before "
+            f"relying on it; do not diagnose it again.\n\n{lines}")
 
 
 def _refine_values(ctx: Ctx, rec: dict) -> dict[str, str]:
@@ -171,7 +185,10 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     The preamble's effort check is kept only while `rec["sized"]` is false. Placeholders are
     filled in one pass over the joined text, so values that hold braces go in verbatim.
     """
+    values = _values(cfg, step, ctx, {})
     preamble = EFFORT_BLOCK.sub("" if rec.get("sized") else r"\1", _template(cfg, PREAMBLE))
+    if not values["run_facts"]:
+        preamble = RUN_FACTS_LINE.sub("", preamble)
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
     files = list(dict.fromkeys([*step.brief, *step.task_brief]))
     # A step with no configured `brief:` whose skill resolves has the skill's text as its brief, and its first
@@ -201,7 +218,6 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
         body = f"{body}\n\n{extra_skills}"
     if extra.get("gate_evidence") and "{gate_evidence}" not in body:  # a `gates_first` template that has no slot
         body = f"{body}\n\n{{gate_evidence}}"
-    values = _values(cfg, step, ctx, {})
     values["brief"] = "\n\n".join(briefs)
     values["skill"] = step.skill or ""
     values["base_ref"] = ctx.base_ref
@@ -887,7 +903,17 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
     def stop_report(self, key: str) -> str:
         """What the resolver is told beyond the stop's summary: the inbox page a human would have read."""
         path = self.run.inbox_path(key)
-        return path.read_text(encoding="utf-8") if path.is_file() else "(no report)"
+        report = path.read_text(encoding="utf-8") if path.is_file() else "(no report)"
+        earlier = self._earlier_resolver_findings(key)
+        return f"{report.rstrip()}\n\n{earlier}" if earlier else report
+
+    def _earlier_resolver_findings(self, key: str) -> str:
+        """The last few resolver summaries the run has for steps other than `key`, so a second resolver does not
+        start from nothing. A summary is model text: one line, cut."""
+        found = [(e.get("key"), " ".join(str(e.get("summary") or "").split())[:RESOLVER_FINDING_MAX])
+                 for e in self.run.events.read() if e["type"] == "resolve_finished" and e.get("key") != key]
+        shown = [f"- `{k}`: {summary}" for k, summary in found if summary][-RESOLVER_FINDINGS_SHOWN:]
+        return "### Earlier resolver findings in this run\n\n" + "\n".join(shown) if shown else ""
 
     def _denied_report(self, key: str) -> str:
         """The inbox section naming what was denied since the last approval, each once, so one fix covers it."""

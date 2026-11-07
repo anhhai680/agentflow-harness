@@ -10,6 +10,8 @@ import pytest
 from agentflow import hitl
 from agentflow.flow import main
 from agentflow.hitl import (
+    FACT_MAX,
+    FACTS_PER_RESULT,
     NotWaiting,
     Option,
     Question,
@@ -78,6 +80,24 @@ def macos_calls(monkeypatch):
 
 
 # ------------------------------------------------------------------ result schema
+
+
+def test_result_facts_are_cleaned_cut_and_capped(tmp_path):
+    p = tmp_path / "r.json"
+    assert read_result(write_result(p, {"status": "done", "summary": "x"})).facts == []
+    raw = ["  the shell sets a URL\n\tto a dead host\x00\x1b[31m  ", "e\u0301 is one letter", "x" * 500, "", "   "]
+    facts = read_result(write_result(p, {"status": "done", "summary": "x", "facts": raw})).facts
+    assert facts[0] == "the shell sets a URL to a dead host[31m"  # whitespace collapsed, control characters gone
+    assert facts[1] == "\u00e9 is one letter"  # NFC
+    assert facts[2] == "x" * FACT_MAX
+    many = [f"fact {n}" for n in range(9)]
+    assert read_result(write_result(p, {"status": "done", "summary": "x", "facts": many})).facts == many[:FACTS_PER_RESULT]
+
+
+@pytest.mark.parametrize("facts", ["one fact", {"a": "b"}, [1], [["nested"]], [None]])
+def test_result_facts_must_be_a_list_of_strings(tmp_path, facts):
+    with pytest.raises(ResultError):
+        read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x", "facts": facts}))
 
 
 def test_result_schema(tmp_path):

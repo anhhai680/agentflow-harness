@@ -15,6 +15,7 @@ from agentflow import pack
 from agentflow.events import EventError, EventLog, RunLock, lock_state
 from agentflow.flow import _human_errors, main
 from agentflow.state import (
+    RUN_FACTS_MAX,
     Run,
     RunNotFound,
     display_status,
@@ -706,3 +707,30 @@ def test_sessions_add_up_separately(run):
     run.emit("agent_exited", session_id="s-2", exit_code=0, cost=0.25)
     run.emit("agent_exited", session_id=None, exit_code=1, cost=0.25, cost_estimated=True)
     assert run.state["spend_usd"] == 1.0
+
+
+# --------------------------------------------------------------------------- run facts
+
+
+def test_run_facts_start_empty_and_old_states_still_replay(run):
+    assert initial_state()["facts"] == []
+    assert run.state["facts"] == []
+    assert replay([])["facts"] == []
+
+
+def test_run_fact_appends_dedupes_and_keeps_the_newest(run):
+    run.emit("run_fact", text="Shell sets a URL", key="build/x/resolve-1")
+    run.emit("run_fact", text="second", key="build/x/resolve-1")
+    assert run.state["facts"] == [{"text": "Shell sets a URL", "key": "build/x/resolve-1"},
+                                  {"text": "second", "key": "build/x/resolve-1"}]
+    run.emit("run_fact", text="SHELL sets a url", key="build/y/resolve-1")  # the same fact again: once, as the newest
+    assert [f["text"] for f in run.state["facts"]] == ["second", "SHELL sets a url"]
+    for n in range(RUN_FACTS_MAX + 3):
+        run.emit("run_fact", text=f"fact {n}", key="build/x/resolve-2")
+    assert [f["text"] for f in run.state["facts"]] == [f"fact {n}" for n in range(3, RUN_FACTS_MAX + 3)]
+    assert state_json(run) == replay(run.events.read()) == run.state
+
+
+def test_run_fact_needs_its_text_and_key(run):
+    with pytest.raises(EventError):
+        run.emit("run_fact", text="no key")

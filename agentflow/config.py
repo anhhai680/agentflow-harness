@@ -143,6 +143,7 @@ PROMPT_PLACEHOLDERS = frozenset(
         "stop_key",
         "stop_summary",
         "stop_report",
+        "run_facts",
         "ci_report",
         "sync_report",
         "skill",

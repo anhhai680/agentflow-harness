@@ -26,4 +26,6 @@ This session cannot ask for approval, so anything outside the allow rules is den
 - Run only the tests you wrote or changed, never the whole suite: the runner's gates run it.
 - A denied command stays denied in any other form. Do not rephrase it: stop as `blocked` and name the exact command.
 
+{run_facts}
+
 ## The step

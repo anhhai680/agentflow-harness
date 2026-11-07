@@ -28,6 +28,7 @@ from .events import EventError, EventLog, RunLock, lock_state, nfc, now_iso
 TERMINAL = ("done", "failed", "cancelled")
 SLUG_PARAMS = ("slug", "module", "issue", "topic", "task", "log")  # an explicit slug (an issue's) wins
 SLUG_MAX = 40
+RUN_FACTS_MAX = 8  # what a resolver found that the run keeps for every later session (the newest)
 
 
 class RunNotFound(Exception):
@@ -68,6 +69,7 @@ def initial_state() -> dict:
         "budget_usd": None,
         "context_windows": {},
         "env_dropped": [],
+        "facts": [],
         "gates": {},
         "reviews": {},
         "effort_changes": [],
@@ -463,6 +465,13 @@ def _on_resolve_started(state: dict, ev: dict) -> None:
         _clear_wait(state)
 
 
+def _on_run_fact(state: dict, ev: dict) -> None:
+    """A fact a resolver session found, kept for every later session. A repeat (any case) moves to the newest place."""
+    text = str(ev["text"])
+    kept = [f for f in state.get("facts") or [] if str(f.get("text")).casefold() != text.casefold()]
+    state["facts"] = [*kept, {"text": text, "key": ev["key"]}][-RUN_FACTS_MAX:]
+
+
 def _on_resolve_finished(state: dict, ev: dict) -> None:
     state["resolving"] = None
 
@@ -703,6 +712,7 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "step_reopened": _on_step_reopened,
     "resolve_started": _on_resolve_started,
     "resolve_finished": _on_resolve_finished,
+    "run_fact": _on_run_fact,
     "ci_watching": _on_ci_watching,
     "pr_marked_ready": _on_pr_marked_ready,
     "hitl_answered": _on_hitl_answered,
@@ -746,6 +756,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "step_reopened": ("key",),
     "resolve_started": ("key",),
     "resolve_finished": ("key",),
+    "run_fact": ("text", "key"),
     "agent_started": (("session_id", "pid"),),
     "agent_session": ("session_id",),
     "context_window": ("model", "tokens"),

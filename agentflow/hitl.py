@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -30,6 +31,8 @@ QUESTION_KINDS = ("spec_gap", "ambiguity", "conflict", "review_dispute", "other"
 QUESTION_ID = re.compile(r"^[\w.\-]+$")
 HEADING = re.compile(r"^### (\S+) — (.*)$", re.MULTILINE)
 ANSWER_LINE = re.compile(r"^Answer:[ \t]*(.*)$", re.MULTILINE)
+FACT_MAX = 300  # characters of one `facts` entry
+FACTS_PER_RESULT = 5
 DEFAULT_TITLE = "agentflow: {run} needs you"
 NOTIFY_TIMEOUT_S = 10
 MESSAGE_MAX = 240
@@ -78,6 +81,7 @@ class StepResult:
     signals: dict = field(default_factory=dict)
     findings: list = field(default_factory=list)
     risks: list = field(default_factory=list)
+    facts: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- result.json
@@ -87,6 +91,19 @@ def _text(value: Any, name: str) -> str:
     if isinstance(value, str) and value.strip():
         return nfc(value)
     raise ResultError(f"{name} must be a non-empty string")
+
+
+def clean_fact(text: str) -> str:
+    """One `facts` entry as the run keeps it: NFC, control characters dropped, whitespace collapsed to single
+    spaces, and cut to `FACT_MAX`. It is model text, so it is cut before anything reads it further."""
+    text = "".join(ch for ch in text[: FACT_MAX * 4] if ch.isspace() or unicodedata.category(ch) != "Cc")
+    return nfc(" ".join(text.split()))[:FACT_MAX].rstrip()
+
+
+def _parse_facts(raw: Any) -> list[str]:
+    if not isinstance(raw, list) or not all(isinstance(f, str) for f in raw):
+        raise ResultError("facts must be a list of strings")
+    return [fact for fact in (clean_fact(f) for f in raw[:FACTS_PER_RESULT]) if fact]
 
 
 def _parse_question(raw: Any, index: int) -> Question:
@@ -151,6 +168,7 @@ def read_result(path: Path, refine: bool = False) -> StepResult:
     signals, findings, risks = raw.get("signals", {}), raw.get("findings", []), raw.get("risks", [])
     if not isinstance(signals, dict) or not isinstance(findings, list) or not isinstance(risks, list):
         raise ResultError("signals must be an object; findings and risks must be lists")
+    facts = _parse_facts(raw.get("facts", []))
     return StepResult(
         status=status,
         summary=nfc(summary),
@@ -162,6 +180,7 @@ def read_result(path: Path, refine: bool = False) -> StepResult:
         signals=nfc(signals),
         findings=nfc(findings),
         risks=nfc(risks),
+        facts=facts,
     )
 
 

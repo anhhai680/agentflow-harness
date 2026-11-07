@@ -217,8 +217,24 @@ class Resolver:
             return False
         self.run.refresh()
         summary = str((self.run.state["steps"].get(session_key) or {}).get("result") or "")
+        self._remember_facts(session_key)
         self._finish(key, kind, summary)
         return True
+
+    def _remember_facts(self, session_key: str) -> None:
+        """Keep what a resolver session found for every later session of the run. Only a resolver's result is read
+        for `facts`; a fact already known (any case) is not added again."""
+        if RESOLVE_MARK not in session_key:
+            return
+        try:
+            found = read_result(self.run.result_path(session_key)).facts
+        except ResultError:
+            return
+        known = {str(f.get("text")).casefold() for f in self.run.state.get("facts") or []}
+        for text in found:
+            if text.casefold() not in known:
+                known.add(text.casefold())
+                self.run.emit("run_fact", text=text, key=session_key)
 
     def _finish(self, key: str, kind: str, summary: str) -> None:
         self.run.emit("resolve_finished", key=key, stop_kind=kind, summary=summary)

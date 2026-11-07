@@ -12,7 +12,7 @@ Investigate before you change anything, in this work tree. The step's own sessio
 - If the step needs something only a human can give, stop as `blocked` and name it exactly. That is a good result: a human then reads your diagnosis.
 - Never weaken the repository's quality rules, edit the eval baseline, lower a threshold, skip a test or add a suppression.
 
-Say in your summary what the cause was and what you changed. Do not commit: the runner commits.
+Say in your summary what the cause was and what you changed. If the cause is not specific to this step (an environment cause, a tool quirk), also list it in `facts`, one line each, so later sessions do not rediscover it. Do not commit: the runner commits.
 
 ## The `{skill}` skill
 

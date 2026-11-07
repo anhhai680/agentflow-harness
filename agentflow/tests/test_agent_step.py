@@ -1035,3 +1035,40 @@ def test_engine_prompts_inline_the_bundled_skills_over_a_sparse_pack(sparse_repo
             assert "## The `` skill" not in text, step.id
             assert not [p for p in ("{skill}", "{brief}", "{base_ref}") if p in text], step.id
     assert seen >= 5
+
+
+# --------------------------------------------------------------------------- what the run already found
+
+
+def _prompt(flow_repo, sized: bool = False) -> str:
+    run = flow_repo.run if flow_repo.run is not None else flow_repo.new_run()
+    ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
+    return build_prompt(flow_repo.cfg, make_step(), ctx, {"sized": sized, "agent": "claude", "role": "build"}, {}, "normal")
+
+
+def test_without_facts_the_prompt_has_no_heading_and_no_stray_blank_lines(flow_repo):
+    flow_repo.new_run()
+    prompt = _prompt(flow_repo)
+    assert "What this run already found" not in prompt and "{run_facts}" not in prompt
+    assert "\n\n\n" not in prompt.split("## The step")[0]  # (the skill's own text further down has some)
+    # the last bullet of the preamble's shell rules runs straight into the step's own text, one blank line between
+    assert re.search(r"stop as `blocked` and name the exact command\.\n\n## The step\n\n", prompt)
+
+
+def test_a_run_with_no_facts_key_in_its_state_builds_the_same_prompt(flow_repo):
+    run = flow_repo.new_run()
+    plain = _prompt(flow_repo)
+    del run.state["facts"]  # a state written before facts existed
+    assert _prompt(flow_repo) == plain
+
+
+def test_facts_go_into_the_preamble_before_the_step(flow_repo):
+    run = flow_repo.new_run()
+    plain = _prompt(flow_repo)
+    run.emit("run_fact", text="a tool quirk {step_id}", key="build/x/resolve-1")
+    run.emit("run_fact", text="an environment cause", key="build/x/resolve-1")
+    prompt = _prompt(flow_repo)
+    block = ("## What this run already found\n\nEarlier sessions of this run established these. Check one before "
+             "relying on it; do not diagnose it again.\n\n- a tool quirk {step_id}\n- an environment cause\n\n## The step")
+    assert block in prompt  # braces in a fact go in verbatim
+    assert prompt.replace(block, "## The step") == plain
