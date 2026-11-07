@@ -41,7 +41,8 @@ so a resumed run picks every task up where it stopped.
 
 `record_decisions` runs before an answered step resumes: an answer to a `spec_gap` question (or one
 given with `--record`) runs `record_step` and commits its `message` (default `Decide <question> in the
-<module> spec`) with only the files that step changed. `ambiguity`/`review_dispute` answers go in the task's commit body.
+<module> spec`) with only the files that step changed. `ambiguity`/`review_dispute`/`boundary` answers go in the task's
+commit body. The pull request lists every answer the runner took itself (`by: runner`) under "Decisions the runner took".
 
 `run_finish` first brings the latest `origin/<fork_from>` into the branch (`sync_lane`), then refuses
 uncommitted changes, pushes the branch (never forced) and opens a draft pull request against `fork_from` whose
@@ -85,7 +86,8 @@ TASK_KEY = re.compile(r"/task-\d+/(implement|review)$")
 TASK_N = re.compile(r"/task-(\d+)/")
 DONE_STATUSES = ("done", "unchanged")
 SUMMARY_MAX = 60
-DEFAULT_RECORD = {"spec_gap": "record_step", "ambiguity": "commit_body", "review_dispute": "commit_body"}
+DEFAULT_RECORD = {"spec_gap": "record_step", "ambiguity": "commit_body", "review_dispute": "commit_body",
+                  "boundary": "commit_body"}
 
 
 def question_summary(text: str, limit: int = SUMMARY_MAX) -> str:
@@ -668,7 +670,7 @@ class FeatureLane:
         return {**DEFAULT_RECORD, **(self.cfg.hitl.get("record_decisions") or {})}
 
     def _body_answers(self, tkey: str) -> list[str]:
-        """Answers to the task's questions whose kind goes in the commit body (`ambiguity`, `review_dispute`)."""
+        """Answers to the task's questions whose kind goes in the commit body (`ambiguity`, `review_dispute`, `boundary`)."""
         mode = self._record_mode()
         events = self.run.events.read()
         lines = []
@@ -862,7 +864,8 @@ def _skipped_lines(state: dict) -> list[str]:
 
 
 def _runner_decisions(events: list[dict]) -> list[str]:
-    """Every question the runner answered with the asker's recommended option."""
+    """Every question the runner answered with the asker's recommended option: step key, question id, option, so a
+    reviewer of the pull request checks each one."""
     lines = []
     for event in events:
         if event["type"] != "hitl_answered" or event.get("by") != AUTO_BY:
@@ -872,7 +875,8 @@ def _runner_decisions(events: list[dict]) -> list[str]:
             option = chosen.get(question["id"])
             labels = [o.get("label") for o in question.get("options") or [] if o.get("key") == option]
             text = " ".join(str(question.get("question", "")).split())
-            lines.append(f"- `{event.get('key')}`: {text} → {labels[0] if labels else option}")
+            label = " ".join(str(labels[0] if labels else option).split())
+            lines.append(f"- `{event.get('key')}` {question['id']} (option {option}): {text} → {label}")
     return lines
 
 

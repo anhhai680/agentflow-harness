@@ -127,7 +127,8 @@ resolve_step:                  # a stop in a `resolve: true` phase, run before a
 autonomy:
   non_blocking_severities: [minor, low, info, nit]
   finding_rounds: 2
-  answer_recommended: true
+  answer_recommended: true  # in every phase, except kinds in human_question_kinds
+  human_question_kinds: [boundary]  # never answered by the runner
   revert_forbidden: 1
   resolve_kinds:
     blocked: 2

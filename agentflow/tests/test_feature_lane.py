@@ -578,6 +578,33 @@ def test_finish_pushes_and_opens_draft_pr(flow_repo, gh, git):
     assert flow_repo.events(run, "pr_opened")[0]["url"] == "https://github.com/acme/repo/pull/42"
 
 
+def test_the_pull_request_lists_each_decision_the_runner_took(flow_repo, gh):
+    from agentflow.feature_lane import render_pr_body
+
+    run = begin_finish(flow_repo)
+    for key, by, kind in (("plan/plan", "runner", "spec_gap"), (IMPL.format(n=1), "me", "ambiguity")):
+        run.emit("hitl_raised", kind="needs_human", key=key, phase=key.split("/")[0], summary="s",
+                 questions=[{**question(kind), "options": [{"key": "A", "label": "Theo tiến trình", "recommended": True},
+                                                           {"key": "B", "label": "Mỗi lượt"}]}])
+        run.emit("hitl_answered", key=key, by=by, answers={"q1": "A"})
+    body = render_pr_body(run)
+    section = body.split("## Decisions the runner took\n\n", 1)[1].split("\n\n## ", 1)[0]
+    assert section == "- `plan/plan` q1 (option A): Lưu bộ nhớ đệm token CRM? → Theo tiến trình"  # a human's is not listed
+
+
+def test_a_human_answer_to_a_boundary_question_goes_in_the_commit_body(lane, git):
+    run = begin_build(lane, plan_text({1: "none", 2: "Task 1"}))
+    impl1 = IMPL.format(n=1)
+    lane.script({impl1: [needs_human("boundary"), {"write": {"src/one.py": "x\n"}, "result": DONE_RESULT}]})
+    assert build(lane, run) == ("stopped", True)
+    assert run.state["waiting"]["key"] == impl1
+    assert answer(run, impl1, {"q1": "B: hỏi trước"}, by="me")
+    assert build(lane, run) == ("done", True)
+    body = git(lane.root, "log", "-1", "--format=%B", commit_of(git, lane.root, "Task 1: First thing"))
+    assert "q1 (boundary)" in body and "hỏi trước" in body
+    assert not [c for c in steps(lane.calls()) if "/record-" in c]  # not filed in the spec
+
+
 def test_finish_refuses_dirty_tree(flow_repo, gh, git):
     run = begin_finish(flow_repo)
     worktree = Path(run.state["worktree"])

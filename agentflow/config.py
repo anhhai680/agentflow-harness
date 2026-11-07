@@ -52,7 +52,10 @@ REMOVED_DEFAULTS = {  # keys that were read but never acted on: a value here wou
     "push": "`finish` always pushes the run's own branch",
     "pr": "`finish` always opens a draft pull request, and the `ci` step marks it ready",
 }
-AUTONOMY_KEYS = ("non_blocking_severities", "finding_rounds", "resolve_kinds", "answer_recommended", "revert_forbidden")
+AUTONOMY_KEYS = ("non_blocking_severities", "finding_rounds", "resolve_kinds", "answer_recommended", "revert_forbidden",
+                 "human_question_kinds")
+# The `kind` of a `needs_human` question. `boundary`: the repository's docs reserve the decision for a human.
+QUESTION_KINDS = ("spec_gap", "ambiguity", "conflict", "review_dispute", "boundary", "other")
 CI_KEYS = ("poll_s", "appear_min", "timeout_min", "fix_rounds", "rerun_rounds", "sync_rounds")
 STEP_KEYS = (
     "id",
@@ -1475,6 +1478,12 @@ class _Validator:
         for key in cfg.autonomy:
             if key not in AUTONOMY_KEYS:
                 self.error(f"autonomy.{key}", "unknown autonomy key")
+        if not isinstance(cfg.autonomy.get("answer_recommended", False), bool):
+            self.error("autonomy.answer_recommended", "answer_recommended must be true or false")
+        human = cfg.autonomy.get("human_question_kinds", [])
+        if not isinstance(human, list) or any(kind not in QUESTION_KINDS for kind in human):
+            self.error("autonomy.human_question_kinds",
+                       f"human_question_kinds must be a list of question kinds: {', '.join(QUESTION_KINDS)}")
         rounds = cfg.autonomy.get("finding_rounds", 0)
         if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 0:
             self.error("autonomy.finding_rounds", "finding_rounds must be a whole number, 0 or more")

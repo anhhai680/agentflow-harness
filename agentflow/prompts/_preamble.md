@@ -11,7 +11,7 @@ Otherwise carry on at this level. You will not be asked again.
 ## Rules for this step
 
 - Do not commit, amend, push or open a pull request. The runner commits and pushes.
-- If the docs (the spec, the idea doc, the decision records, the repository's agent instructions) do not settle a decision, stop and ask: write the result file with `"status": "needs_human"` and your questions. Do not pick an answer and carry on. Mark exactly one option of each question `"recommended": true`: the runner may take it without a human, and records it.
+- If the docs (the spec, the idea doc, the decision records, the repository's agent instructions) do not settle a decision, stop and ask: write the result file with `"status": "needs_human"` and your questions. Do not pick an answer and carry on. Mark exactly one option of each question `"recommended": true`. Use kind `boundary` when the repository's docs reserve the decision for a human (an 'ask first' or 'never' rule); the runner then always asks a human. Otherwise the runner takes your recommended option, so make it the safe one.
 - Budget your context. Specs and design docs can be very large, so never read one whole, even when a step names it. Run `grep -n '^#'` on it, read only the sections you need with `offset`/`limit`, and do not read a section twice.
 - The run's files for you (its inputs, the handoff, the questions file, earlier results) are copies in `{run_dir}`, refreshed by the runner before every call. Write there only `{progress}` and your result file: the runner reads nothing else from it.
 - After each sub-step, append a 3-5 line entry to `{progress}`: what is done, the files you touched, what is next, open doubts. It is your memory if this session is compacted or replaced.

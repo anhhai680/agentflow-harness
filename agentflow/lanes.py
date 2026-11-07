@@ -29,7 +29,7 @@ from typing import Literal, TextIO
 
 from agentflow import overlays, pack, run_env, workspace
 from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
-from agentflow.autonomy import AUTO_BY, eligible
+from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
 from agentflow.commit_checks import RUNNER_COMMITS, runner_head
@@ -565,8 +565,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
                 continue
             if result.status == "needs_human" and not writes_questions(sr.step):  # a grill's questions are its output
                 questions = [asdict(q) for q in result.questions]
+                # A set the runner answers itself is never parked: it is raised quietly, `Resolver.take_over` (the one
+                # place the runner answers) takes the recommended options, and the step resumes after any `record_step`.
                 if (result.can_continue_without and self.may_park(sr.key)
-                        and not eligible(self.cfg, "needs_human", sr.key, questions)):
+                        and not runner_settles(self.cfg, self.run, "needs_human", sr.key, questions)):
                     held = changed_paths(self.worktree, sr.start_tree, called.after)
                     park_hitl(self.cfg, self.run, "needs_human", sr.key, result.summary, result.questions, held)
                     return "stopped"

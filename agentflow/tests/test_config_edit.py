@@ -496,6 +496,25 @@ def test_the_settings_form_has_a_soft_and_a_hard_budget(shipped):
         form(shipped, (["defaults", "run_budget_hard_usd"], 0))
 
 
+def test_the_settings_form_has_the_question_kinds_only_a_human_answers(shipped, sparse_repo):
+    from agentflow.config import QUESTION_KINDS
+
+    fields = _fields(shipped)
+    kinds = fields[("autonomy", "human_question_kinds")]
+    assert kinds["label"] == "Question kinds only a human answers"
+    assert (kinds["kind"], kinds["options"], kinds["value"]) == ("list", list(QUESTION_KINDS), ["boundary"])
+    assert "boundary" in QUESTION_KINDS
+    proposal = form(shipped, (["autonomy", "human_question_kinds"], ["boundary", "spec_gap"]))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).autonomy["human_question_kinds"] == ["boundary", "spec_gap"]
+    with pytest.raises(EditError):
+        form(shipped, (["autonomy", "human_question_kinds"], ["taste"]))  # not a question kind
+    sparse = _fields(_sparse(sparse_repo))
+    assert sparse[("autonomy", "human_question_kinds")]["help"] == "never answered by the runner"  # the engine's comment
+    assert sparse[("autonomy", "answer_recommended")]["help"] == "in every phase, except kinds in human_question_kinds"
+
+
 def test_a_hard_budget_set_in_the_user_file_is_read_only(sparse_repo):
     path = _sparse(sparse_repo)
     user = _user_file({"defaults": {"run_budget_hard_usd": 90}})

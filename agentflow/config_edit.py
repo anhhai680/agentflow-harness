@@ -36,7 +36,7 @@ import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from agentflow import layers
-from agentflow.config import KNOWN_EFFORT_LEVELS, ConfigError, Issue, load_config, validate
+from agentflow.config import KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ConfigError, Issue, load_config, validate
 from agentflow.layers import PHASE_FREE_KEYS
 
 __all__ = ["Conflict", "EditError", "Proposal", "Refused", "form_fields", "propose", "read", "save"]
@@ -142,6 +142,8 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("autonomy", "non_blocking_severities"), "Non-blocking severities", {"kind": "list"}),
         (("autonomy", "finding_rounds"), "Finding rounds", _INT),
         (("autonomy", "answer_recommended"), "Take recommended answers", {"kind": "bool"}),
+        (("autonomy", "human_question_kinds"), "Question kinds only a human answers",
+         {"kind": "list", "options": list(QUESTION_KINDS)}),
         (("autonomy", "revert_forbidden"), "Forbidden-path reverts per step", _INT),
         (("autonomy", "resolve_kinds"), "Resolver sessions per stop kind", {"kind": "map", "value_kind": "int", "min": 1}),
     ]),

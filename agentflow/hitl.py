@@ -22,12 +22,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .config import Config
+from .config import QUESTION_KINDS, Config
 from .events import nfc, parse_iso
 from .state import TERMINAL, Run, list_runs
 
 RESULT_STATUSES = ("done", "blocked", "needs_human", "effort_change", "unchanged")
-QUESTION_KINDS = ("spec_gap", "ambiguity", "conflict", "review_dispute", "other")
 QUESTION_ID = re.compile(r"^[\w.\-]+$")
 HEADING = re.compile(r"^### (\S+) — (.*)$", re.MULTILINE)
 ANSWER_LINE = re.compile(r"^Answer:[ \t]*(.*)$", re.MULTILINE)
@@ -331,9 +330,9 @@ def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questio
     render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
     run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
              questions=[asdict(q) for q in questions], inbox=str(path))
-    from agentflow.autonomy import eligible  # the runner tries this stop first; it notifies if it cannot settle it
+    from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
 
-    if not eligible(cfg, kind, key, [asdict(q) for q in questions]):
+    if not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions]):
         notify(cfg, _title_for(cfg, run), summary or f"{key} needs a decision", run=run)
     return path
 

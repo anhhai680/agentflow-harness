@@ -1174,3 +1174,31 @@ def test_a_pack_without_the_bug_lane_needs_no_allow_rule(sparse_repo):
     raw["lanes"] = ["feature"]
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     assert _bug_lane_warnings(validate(load_config(path), sparse_repo)) == []
+
+
+def test_human_question_kinds_default_to_boundary(tmp_cfg):
+    from agentflow.autonomy import human_kinds
+
+    engine = yaml.safe_load((Path(pack.__file__).parent / "defaults" / "config.yaml").read_text(encoding="utf-8"))
+    assert engine["autonomy"]["human_question_kinds"] == ["boundary"]
+    patch = {"autonomy": {"human_question_kinds": None}}  # a pack that writes the whole workflow and leaves it out
+    cfg = load_config(tmp_cfg(patch))
+    assert "human_question_kinds" not in cfg.autonomy and human_kinds(cfg) == ("boundary",)
+    assert not [path for _, path in errors(issues_for(tmp_cfg, patch)) if path.startswith("autonomy")]
+
+
+@pytest.mark.parametrize("value", [["boundary", "taste"], "boundary", [1], {"boundary": True}])
+def test_human_question_kinds_must_be_a_list_of_known_kinds(tmp_cfg, value):
+    found = errors(issues_for(tmp_cfg, {"autonomy": {"human_question_kinds": value}}))
+    assert ("error", "autonomy.human_question_kinds") in found
+
+
+@pytest.mark.parametrize("value", [[], ["boundary", "spec_gap"]])
+def test_human_question_kinds_may_be_empty_or_name_any_question_kind(tmp_cfg, value):
+    found = errors(issues_for(tmp_cfg, {"autonomy": {"human_question_kinds": value}}))
+    assert not [path for _, path in found if path.startswith("autonomy")]
+
+
+def test_answer_recommended_must_be_a_bool(tmp_cfg):
+    found = errors(issues_for(tmp_cfg, {"autonomy": {"answer_recommended": "sometimes"}}))
+    assert ("error", "autonomy.answer_recommended") in found

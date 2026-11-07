@@ -10,9 +10,14 @@ Nothing here names a phase. A phase's `needs_approval` and `resolve`, a step's `
   hears of it. The runner acts through the ways out a human has (`answer`, a reopened step), so a stop has one
   meaning whoever settles it. The resolver's session runs as `<key>/resolve-<n>` under the same guards and gates
   as any other, and only the original step's own checks can finish that step.
+- **Questions** (`needs_human`): with `autonomy.answer_recommended`, the runner takes the one recommended option of
+  every question in **any** phase, `resolve: true` or not, parked or not, records it as `by: runner` and notifies
+  one line. A question whose `kind` is in `autonomy.human_question_kinds` (`boundary` by default: the docs reserve
+  the decision for a human) makes the whole set a human's, as does one the runner already answered on that step
+  (`asked_again`), so a step that keeps asking never loops.
 
-What stays a human's: every kind not in `autonomy.resolve_kinds`, a resolver's own stop, and any stop once its
-attempts are used.
+What stays a human's: every other kind not in `autonomy.resolve_kinds`, any stop outside a `resolve: true` phase
+that is not a question, a resolver's own stop, and any stop once its attempts are used.
 """
 
 from __future__ import annotations
@@ -20,10 +25,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from agentflow.commit_checks import runner_head
-from agentflow.config import Config, Phase, Step
+from agentflow.config import QUESTION_KINDS, Config, Phase, Step
 from agentflow.flow_control import halted
 from agentflow.gitops import restore_paths
-from agentflow.hitl import ResultError, answer, notify_run, read_result
+from agentflow.hitl import ResultError, answer, clean_fact, notify_run, read_result
 from agentflow.state import Run
 
 if TYPE_CHECKING:
@@ -34,6 +39,9 @@ RESOLVE_MARK = "/resolve-"
 GUARD_KIND = "guard_violation"
 FORBIDDEN = "forbidden_path"
 QUESTIONS_KIND = "needs_human"
+DEFAULT_HUMAN_KINDS = ("boundary",)  # `autonomy.human_question_kinds` when no layer sets it
+QUESTION_CMP_MAX = 2000  # characters of a question's text `asked_again` compares
+OPTION_SHOWN = 40  # characters of an option key in the notification of an answer the runner took
 
 
 # --------------------------------------------------------------------------- findings
@@ -127,19 +135,66 @@ def recommended_answers(questions: list[dict]) -> dict[str, str] | None:
     return answers or None
 
 
-def eligible(cfg: Config, kind: str, key: str, questions: list[dict]) -> bool:
-    """Whether the runner may try to settle this stop. A stop it may not try is a human's at once.
+def human_kinds(cfg: Config) -> tuple[str, ...]:
+    """The question kinds only a human answers. Unset is the engine's default; a value that is not a list (which
+    `validate` refuses) is every kind, so a broken setting never lets the runner answer a reserved decision."""
+    kinds = cfg.autonomy.get("human_question_kinds")
+    if kinds is None:
+        return DEFAULT_HUMAN_KINDS
+    if not isinstance(kinds, (list, tuple)):
+        return QUESTION_KINDS
+    return tuple(str(kind) for kind in kinds)
 
-    A stop of the resolver's own session is always a human's: it is what the resolver could not settle.
+
+def eligible(cfg: Config, kind: str, key: str, questions: list[dict]) -> bool:
+    """Whether the runner may try to settle this stop, from the config alone. A stop it may not try is a human's at
+    once.
+
+    A stop of the resolver's own session is always a human's: it is what the resolver could not settle. Questions
+    are settled in every phase; every other kind only in a `resolve: true` phase.
     """
     phase = _phase_of(cfg, key)
-    if phase is None or not phase.resolve or RESOLVE_MARK in key:
+    if phase is None or RESOLVE_MARK in key:
         return False
     if kind == QUESTIONS_KIND:
-        return bool(cfg.autonomy.get("answer_recommended")) and recommended_answers(questions) is not None
+        reserved = human_kinds(cfg)
+        return (cfg.autonomy.get("answer_recommended") is True and recommended_answers(questions) is not None
+                and not any(str(q.get("kind") or "other") in reserved for q in questions))
+    if not phase.resolve:
+        return False
     if kind == GUARD_KIND:
         return int(cfg.autonomy.get("revert_forbidden") or 0) > 0
     return kind in (cfg.autonomy.get("resolve_kinds") or {})
+
+
+def _said(question: dict) -> str:
+    """A question's text, compared case- and space-blind. Model text: cut before it is normalised."""
+    return " ".join(str(question.get("question") or "")[:QUESTION_CMP_MAX].split()).casefold()
+
+
+def asked_again(run: Run, key: str, questions: list[dict]) -> bool:
+    """Whether a question here is one the runner already answered on `key` since a human last acted on it. Taking the
+    same option again would only ask the step the same thing again, so such a set is a human's."""
+    asked: list[dict] = []
+    answered: set[str] = set()
+    for event in run.events.read():
+        if event.get("key") != key:
+            continue
+        if event["type"] in ("hitl_raised", "step_parked"):
+            asked = list(event.get("questions") or [])
+        elif event["type"] == "hitl_answered" and event.get("by") == AUTO_BY:
+            answered |= {_said(q) for q in asked}
+        elif event["type"] in ("hitl_answered", "hitl_approved"):  # a human's attention starts afresh
+            answered = set()
+    return any(_said(q) in answered for q in questions)
+
+
+def runner_settles(cfg: Config, run: Run, kind: str, key: str, questions: list[dict]) -> bool:
+    """Whether the runner takes this stop over (`Resolver.take_over`), so no human is told of it yet: `eligible`, and
+    for questions not a set it already answered on this step."""
+    if not eligible(cfg, kind, key, questions):
+        return False
+    return kind != QUESTIONS_KIND or not asked_again(run, key, questions)
 
 
 def _since_human(events: list[dict], key: str) -> list[dict]:
@@ -175,12 +230,16 @@ class Resolver:
         wait = self.run.state["waiting"]
         if wait is None or halted(self.run.state["status"]):
             return False
-        if not eligible(self.cfg, wait["kind"], wait["key"], wait["questions"]):
-            return False
         kind, key = wait["kind"], wait["key"]
+        if not runner_settles(self.cfg, self.run, kind, key, wait["questions"]):
+            return False  # `raise_hitl` told a human already
         if kind == QUESTIONS_KIND:
             answers = recommended_answers(wait["questions"]) or {}
-            return answer(self.run, key, answers, AUTO_BY)
+            if not answer(self.run, key, answers, AUTO_BY):
+                return False
+            taken = ", ".join(f"{qid}={clean_fact(option)[:OPTION_SHOWN]}" for qid, option in answers.items())  # model text
+            notify_run(self.cfg, self.run, f"took the recommended answer(s) {taken} in {key}; the decision is recorded")
+            return True
         settled = self._revert(key) if kind == GUARD_KIND else self._resolve(wait)
         if not settled:
             self.run.refresh()

@@ -190,7 +190,8 @@ resolve_step:                   # a stop in a `resolve: true` phase, run as <key
 autonomy:                       # what the runner does on its own; which phases it applies to is on each phase
   non_blocking_severities: [minor, low, info, nit]   # any other severity, or none, blocks: findings fail closed
   finding_rounds: 2             # refine rounds the runner opens on blocking findings, then the phase goes to a human
-  answer_recommended: true      # a `needs_human` whose questions all have a recommended option takes it
+  answer_recommended: true      # a `needs_human` whose questions all have a recommended option takes it, in any phase
+  human_question_kinds: [boundary]  # never answered by the runner: the docs reserve the decision for a human
   revert_forbidden: 1           # put a forbidden path back and tell the step, this often per step
   resolve_kinds:                # stop kind: resolver sessions per step. Any kind not here stops for a human
     blocked: 2

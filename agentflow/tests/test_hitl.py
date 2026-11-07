@@ -151,6 +151,16 @@ def test_result_reads_questions_and_extras(tmp_path):
     assert res.can_continue_without is True and res.signals == {"answer": "yes"} and res.risks == ["r1"]
 
 
+def test_result_accepts_a_boundary_question_and_refuses_an_unknown_kind(tmp_path):
+    asked = {"id": "q1", "question": "Đổi lược đồ có cần hỏi trước không?", "kind": "boundary",
+             "options": [{"key": "A", "label": "Hỏi trước", "recommended": True}]}
+    res = read_result(write_result(tmp_path / "r.json", {"status": "needs_human", "summary": "x", "questions": [asked]}))
+    assert [q.kind for q in res.questions] == ["boundary"]
+    with pytest.raises(ResultError, match="boundary"):  # the error lists the kinds there are
+        read_result(write_result(tmp_path / "r.json", {"status": "needs_human", "summary": "x",
+                                                       "questions": [{**asked, "kind": "taste"}]}))
+
+
 @pytest.mark.parametrize("bad", [
     {"question": "no id"},
     {"id": "q 1", "question": "space in id"},
@@ -216,7 +226,8 @@ def test_inbox_title_and_question_stay_on_one_line(tmp_path):
 
 
 def test_raise_hitl_notifies(run, cfg, macos_calls, capsys):
-    path = raise_hitl(cfg, run, "needs_human", "plan/task-1/implement", "Task 1 needs a TTL", [one_question()])
+    asked = dataclasses.replace(one_question(), kind="boundary")  # one only a human answers, in any phase
+    path = raise_hitl(cfg, run, "needs_human", "plan/task-1/implement", "Task 1 needs a TTL", [asked])
     assert path == run.inbox_path("plan/task-1/implement") and path.exists()
     assert "\a" in capsys.readouterr().err
     (argv,) = macos_calls
@@ -231,6 +242,12 @@ def test_raise_hitl_notifies(run, cfg, macos_calls, capsys):
     assert run.state["status"] == "waiting_human"
     assert parse_answers(path) == {"q1": ""}
     assert f"agentflow answer {run.id}" in path.read_text(encoding="utf-8")
+
+
+def test_a_question_the_runner_takes_is_raised_without_a_notification(run, cfg, macos_calls, capsys):
+    raise_hitl(cfg, run, "needs_human", "plan/task-1/implement", "Task 1 needs a TTL", [one_question()])
+    assert run.state["waiting"]["key"] == "plan/task-1/implement"  # the resolver answers it next
+    assert macos_calls == [] and "\a" not in capsys.readouterr().err
 
 
 def test_notify_failures_are_events_not_exceptions(run, cfg, monkeypatch, capsys):
