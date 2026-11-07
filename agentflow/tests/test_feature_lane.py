@@ -572,7 +572,8 @@ def test_finish_pushes_and_opens_draft_pr(flow_repo, gh, git):
     assert body.rstrip().endswith(PR_FOOTER)
     assert "verify/eval_gate" in body and "eval_paths_touched = false" in body
     assert "medium → high" in body and "many files" in body
-    assert f"Spend: $0.00 of ${flow_repo.cfg.defaults.run_budget_usd:.2f}" in body
+    defaults = flow_repo.cfg.defaults
+    assert f"Spend: $0.00 of ${defaults.run_budget_usd:.2f} soft · ${defaults.run_budget_hard_usd:.2f} hard" in body
     assert run.state["pr_url"] == "https://github.com/acme/repo/pull/42"
     assert flow_repo.events(run, "pr_opened")[0]["url"] == "https://github.com/acme/repo/pull/42"
 
@@ -763,48 +764,85 @@ def scaled(flow_repo, run) -> list[dict]:
 
 
 def test_the_budget_grows_to_fit_the_plan_once(flow_repo):
-    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2}})
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2, "run_budget_hard_usd": 50}})
     run = begin_build(flow_repo, plan_text())
     assert build(flow_repo, run) == ("done", True)
     [event] = scaled(flow_repo, run)
-    assert event["raised"] and event["tasks"] == 2 and event["previous"] == 2
-    assert run.state["budget_usd"] == event["budget_usd"] >= 1.5 * 2 + 0.25 * 2
+    assert event["raised"] and event["soft"] is True and event["tasks"] == 2 and event["previous"] == 2
+    assert run.state["soft_budget_usd"] == event["budget_usd"] >= 1.5 * 2 + 0.25 * 2  # the soft limit grows
+    assert run.state["budget_usd"] == 50  # the hard limit never does
+    assert flow_repo.events(run, "budget_estimate_over_hard") == []
     build(flow_repo, run)
     assert len(scaled(flow_repo, run)) == 1
 
 
 def test_ticked_tasks_do_not_count_toward_the_budget(flow_repo):
-    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2}})
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2, "run_budget_hard_usd": 50}})
     run = begin_build(flow_repo, plan_text(ticked=(1,)))
     build(flow_repo, run)
     assert scaled(flow_repo, run)[0]["tasks"] == 1
 
 
 def test_the_budget_is_never_lowered(flow_repo):
-    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 100}})
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 100, "run_budget_hard_usd": 200}})
     run = begin_build(flow_repo, plan_text())
     build(flow_repo, run)
     [event] = scaled(flow_repo, run)
     assert not event["raised"]
-    assert run.state["budget_usd"] == 100
-    assert not [e for e in flow_repo.events(run, "run_updated") if e.get("budget_usd") is not None]
+    assert (run.state["soft_budget_usd"], run.state["budget_usd"]) == (100, 200)
+    assert not [e for e in flow_repo.events(run, "run_updated")
+                if e.get("budget_usd") is not None or e.get("soft_budget_usd") is not None]
 
 
 def test_a_budget_a_human_set_is_kept(flow_repo):
-    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2}})
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2, "run_budget_hard_usd": 50}})
     run = begin_build(flow_repo, plan_text())
     run.emit("run_updated", by="human", budget_usd=2.5)
     build(flow_repo, run)
     assert scaled(flow_repo, run) == []
-    assert run.state["budget_usd"] == 2.5
+    assert (run.state["budget_usd"], run.state["soft_budget_usd"]) == (2.5, 2)
 
 
 def test_no_per_task_budget_leaves_the_budget_alone(flow_repo):
-    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 0, "run_budget_usd": 2}})
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 0, "run_budget_usd": 2, "run_budget_hard_usd": 50}})
     run = begin_build(flow_repo, plan_text())
     build(flow_repo, run)
     assert scaled(flow_repo, run) == []
-    assert run.state["budget_usd"] == 2
+    assert (run.state["soft_budget_usd"], run.state["budget_usd"]) == (2, 50)
+
+
+def test_an_estimate_above_the_hard_budget_notifies_once_and_goes_on(flow_repo, monkeypatch):
+    from agentflow import feature_lane
+
+    sent = []
+    monkeypatch.setattr(feature_lane, "notify_run", lambda cfg, run, message: sent.append(message))
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2, "run_budget_hard_usd": 3}})
+    run = begin_build(flow_repo, plan_text())
+    assert build(flow_repo, run) == ("done", True)  # no stop: the hard limit is not reached, only estimated past
+    [over] = flow_repo.events(run, "budget_estimate_over_hard")
+    assert over["estimate"] >= 1.5 * 2 + 0.25 * 2 and over["hard"] == 3
+    assert run.state["budget_usd"] == 3 and run.state["soft_budget_usd"] == over["estimate"]
+    assert len(sent) == 1 and "$3.00" in sent[0]
+    assert flow_repo.events(run, "hitl_raised") == []
+    build(flow_repo, run)
+    assert len(flow_repo.events(run, "budget_estimate_over_hard")) == 1 and len(sent) == 1
+
+
+def test_a_run_from_before_the_soft_budget_scales_as_before(flow_repo):
+    from agentflow.state import Run, runs_root
+
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2, "run_budget_hard_usd": 3}})
+    begin_build(flow_repo, plan_text())
+    run_id = "20260101-0000-feature-old"
+    (runs_root(flow_repo.root) / run_id).mkdir(parents=True)
+    run = flow_repo.run = Run(flow_repo.root, run_id)
+    run.agent_dir.mkdir(parents=True)
+    run.emit("run_started", run_id=run_id, pipeline="feature", params={"module": "demo"}, budget_usd=2)
+    assert build(flow_repo, run) == ("done", True)
+    [event] = scaled(flow_repo, run)
+    assert event["raised"] and "soft" not in event
+    assert run.state["budget_usd"] == event["budget_usd"] >= 1.5 * 2 + 0.25 * 2 and run.state["soft_budget_usd"] is None
+    assert flow_repo.events(run, "budget_estimate_over_hard") == []
 
 
 # --------------------------------------------------------------------------- batches of small tasks

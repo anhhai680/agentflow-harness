@@ -23,8 +23,8 @@ WORKFLOW_KEYS = (
 )
 PHASE_FREE_KEYS = ("needs_approval", "resolve", "model", "agent")  # the rest of a phase is the workflow itself
 USER_KEYS = (  # dotted patterns of the settings that are personal; `*` matches exactly one segment
-    "agents.*.models", "defaults.run_budget_usd", "defaults.task_budget_usd", "hitl.notify", "hitl.remind_after_h",
-    "dashboard.port",
+    "agents.*.models", "defaults.run_budget_usd", "defaults.run_budget_hard_usd", "defaults.task_budget_usd",
+    "hitl.notify", "hitl.remind_after_h", "dashboard.port",
 )
 _WHOLE_ENTRIES = (("record_step",), ("resolve_step",))  # replaced whole, like each entry of `conditions`/`gates`
 _WHOLE_PARENTS = ("conditions", "gates")

@@ -1,7 +1,8 @@
 """The agent step lifecycle: run one config step through an agent until it is done or needs a human.
 
-`Executor.run_agent_step` goes round one loop per agent call, in this order: budget check, then
-model and effort (from state; `effort.default` for a new step), prompt, tree snapshot, the call
+`Executor.run_agent_step` goes round one loop per agent call, in this order: budget check (the soft
+budget notifies once, the hard one stops), then model and effort (from state; `effort.default` for a
+new step), prompt, tree snapshot, the call
 (`agent_started` ... `agent_exited`, spend, one `permission_denied` per denial), guards, the
 `result.json`, gates and doc checks (`checks:`, which always have the fix loop) with the fix loop,
 rollover; and once the result is `done` and the gates pass: the progress check, the commit
@@ -513,8 +514,14 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         while True:
             budget = self.run.state.get("budget_usd") or self.cfg.defaults.run_budget_usd
             spend = float(self.run.state.get("spend_usd") or 0.0)
+            soft = self.run.state.get("soft_budget_usd")
+            if soft and spend >= soft and not self._soft_noted(soft):
+                self.run.emit("budget_soft_reached", spend_usd=spend, soft_usd=soft, hard_usd=budget)
+                notify_run(self.cfg, self.run, f"spent ${spend:.2f}: past the soft budget ${soft:.2f}; "
+                                               f"it goes on and stops at ${budget:.2f}")
             if budget and spend >= budget:
-                return self._stop(sr, "budget_exceeded", f"The run has spent ${spend:.2f} of its ${budget:.2f} budget.")
+                which = "hard budget" if soft is not None else "budget"  # a run from before the soft budget has one
+                return self._stop(sr, "budget_exceeded", f"The run has spent ${spend:.2f} of its ${budget:.2f} {which}.")
 
             called = self._call(sr, turn)
             if self.run.refresh()["status"] in TERMINAL:
@@ -826,6 +833,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         extra = {"tree": tree} if tree else {}
         self.run.emit("step_finished", key=sr.key, status="done", summary=result.summary, sha=sha, **extra)
         return "done"
+
+    def _soft_noted(self, soft: float) -> bool:
+        """The run already said it passed this soft budget: a soft limit notifies once per value, and plan sizing
+        raising it is a new value."""
+        return any(e["type"] == "budget_soft_reached" and e.get("soft_usd") == soft for e in self.run.events.read())
 
     def _stop(self, sr: _StepRun, kind: str, summary: str, extra: str = "") -> Outcome:
         raise_hitl(self.cfg, self.run, kind, sr.key, summary, extra=extra)

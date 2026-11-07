@@ -328,7 +328,7 @@ def test_approve_resumes_a_runner_stop(flow_repo):
 
 
 def test_plain_approve_goes_past_a_budget_stop(flow_repo):
-    flow_repo.configure({"defaults": {"run_budget_usd": 0.015}})
+    flow_repo.configure({"defaults": {"run_budget_usd": 0.015, "run_budget_hard_usd": 0.015}})
     run = flow_repo.new_run()
     flow_repo.script({"build/impl": [{"result_raw": "not json", "cost": 0.02}]})
     assert run_steps(flow_repo, [agent("impl")]) == ("stopped", True)
@@ -336,12 +336,12 @@ def test_plain_approve_goes_past_a_budget_stop(flow_repo):
     assert f"`agentflow approve {run.id} build/impl`" in run.inbox_path("build/impl").read_text(encoding="utf-8")
     approve(run, "build/impl", by="me")
     assert run.state["waiting"] is None
-    assert run.state["budget_usd"] == pytest.approx(0.035)  # spent 0.02, plus one more budget of 0.015
+    assert run.state["budget_usd"] == pytest.approx(0.035)  # spent 0.02, plus one more soft budget of 0.015
     assert run_steps(flow_repo, [agent("impl")]) == ("done", True)
 
 
 def test_budget_stop_asks_again_after_another_budget_is_spent(flow_repo):
-    flow_repo.configure({"defaults": {"run_budget_usd": 0.015}})
+    flow_repo.configure({"defaults": {"run_budget_usd": 0.015, "run_budget_hard_usd": 0.015}})
     run = flow_repo.new_run()
     flow_repo.script({"build/impl": [{"result_raw": "not json", "cost": 0.02}, {"result_raw": "not json", "cost": 0.02}]})
     assert run_steps(flow_repo, [agent("impl")]) == ("stopped", True)
@@ -350,8 +350,91 @@ def test_budget_stop_asks_again_after_another_budget_is_spent(flow_repo):
     assert [e["kind"] for e in flow_repo.events(run, "hitl_raised")] == ["budget_exceeded", "budget_exceeded"]
 
 
+def hard_stop(flow_repo, soft: float = 0.01, hard: float = 0.015):
+    """A run stopped at its hard budget after spending 0.02."""
+    flow_repo.configure({"defaults": {"run_budget_usd": soft, "run_budget_hard_usd": hard}})
+    run = flow_repo.new_run()
+    flow_repo.script({"build/impl": [{"result_raw": "not json", "cost": 0.02}]})
+    assert run_steps(flow_repo, [agent("impl")]) == ("stopped", True)
+    assert run.state["waiting"]["kind"] == "budget_exceeded"
+    return run
+
+
+def test_a_plain_approve_of_a_hard_stop_adds_one_soft_budget(flow_repo):
+    run = hard_stop(flow_repo)
+    inbox = run.inbox_path("build/impl").read_text(encoding="utf-8")
+    assert "hard budget" in inbox and "$0.01" in inbox  # the limit that stopped it, and what a plain approve adds
+    approve(run, "build/impl", by="me")
+    assert run.state["budget_usd"] == pytest.approx(0.03)  # spent 0.02, plus the soft budget of 0.01
+    assert run.state["soft_budget_usd"] == 0.01  # left alone
+
+
+def test_a_plain_approve_takes_the_soft_step_the_caller_passes(flow_repo):
+    run = hard_stop(flow_repo)
+    run.emit("run_updated", by="runner", soft_budget_usd=0.012)  # plan sizing raised the run's soft limit
+    approve(run, "build/impl", by="me", budget_step=0.005)  # the pack's `run_budget_usd` as the CLI reads it
+    assert run.state["budget_usd"] == pytest.approx(0.025)
+    assert run.state["soft_budget_usd"] == 0.012
+
+
+def test_budget_on_a_hard_stop_wins_over_the_soft_step(flow_repo):
+    run = hard_stop(flow_repo)
+    approve(run, "build/impl", by="me", budget=5, budget_step=0.005)
+    assert run.state["budget_usd"] == 5
+
+
+def test_a_run_from_before_the_soft_budget_approves_as_before(flow_repo):
+    from agentflow.state import Run, runs_root
+
+    flow_repo.configure({"defaults": {"run_budget_usd": 0.01, "run_budget_hard_usd": 1}})
+    run_id = "20260101-0000-feature-old"
+    (runs_root(flow_repo.root) / run_id).mkdir(parents=True)
+    run = flow_repo.run = Run(flow_repo.root, run_id)
+    run.agent_dir.mkdir(parents=True)
+    run.emit("run_started", run_id=run_id, pipeline="feature", params={"module": "crm"}, budget_usd=0.015)
+    flow_repo.script({"build/impl": [{"result_raw": "not json", "cost": 0.02}]})
+    assert run_steps(flow_repo, [agent("impl")], run) == ("stopped", True)
+    assert run.state["waiting"]["kind"] == "budget_exceeded" and run.state["soft_budget_usd"] is None
+    assert "hard" not in run.state["waiting"]["summary"]  # its one budget, worded as before
+    assert "one more budget's worth" in run.inbox_path("build/impl").read_text(encoding="utf-8")
+    assert flow_repo.events(run, "budget_soft_reached") == []
+    approve(run, "build/impl", by="me", budget_step=0.5)
+    assert run.state["budget_usd"] == pytest.approx(0.035)  # spent 0.02, plus its one budget of 0.015, as before
+
+
+def test_cli_and_dashboard_approve_add_the_packs_soft_budget(flow_repo, monkeypatch):
+    from agentflow import dashboard
+    from agentflow.flow import main
+
+    monkeypatch.chdir(flow_repo.root)
+    cli, web = hard_stop(flow_repo, soft=0.005), None
+    cli.emit("run_updated", by="runner", soft_budget_usd=0.012)  # sized up by the plan: not what a plain approve adds
+    assert main(["approve", cli.id, "build/impl", "--no-continue", "--config", str(flow_repo.cfg.path)]) == 0
+    assert cli.refresh()["budget_usd"] == pytest.approx(0.025)  # spent 0.02, plus the pack's soft budget of 0.005
+    web = hard_stop(flow_repo, soft=0.005)
+    web.emit("run_updated", by="runner", soft_budget_usd=0.012)
+    dashboard._approve(web, {"target": "build/impl"}, flow_repo.cfg)
+    assert web.state["budget_usd"] == pytest.approx(0.025)
+
+
+def test_the_soft_budget_notifies_once_per_value_and_never_stops(flow_repo, monkeypatch):
+    from agentflow import lanes
+
+    sent = []
+    monkeypatch.setattr(lanes, "notify_run", lambda cfg, run, message: sent.append(message))
+    flow_repo.configure({"defaults": {"run_budget_usd": 0.015, "run_budget_hard_usd": 1}})
+    run = flow_repo.new_run()
+    flow_repo.script({"build/impl": [{"result_raw": "not json", "cost": 0.02}]})
+    assert run_steps(flow_repo, [agent("impl"), agent("more")]) == ("done", True)
+    assert [e["soft_usd"] for e in flow_repo.events(run, "budget_soft_reached")] == [0.015]
+    run.emit("run_updated", by="runner", soft_budget_usd=0.025)
+    assert run_steps(flow_repo, [agent("again")]) == ("done", True)
+    assert [e["soft_usd"] for e in flow_repo.events(run, "budget_soft_reached")] == [0.015, 0.025]
+    assert len(sent) == 2 and flow_repo.events(run, "hitl_raised") == []
+
+
 def test_explicit_budget_on_a_budget_stop_sets_the_limit(flow_repo):
-    flow_repo.configure({"defaults": {"run_budget_usd": 0.015}})
+    flow_repo.configure({"defaults": {"run_budget_usd": 0.015, "run_budget_hard_usd": 0.015}})
     run = flow_repo.new_run()
     flow_repo.script({"build/impl": [{"result_raw": "not json", "cost": 0.02}]})
     assert run_steps(flow_repo, [agent("impl")]) == ("stopped", True)

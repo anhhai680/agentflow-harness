@@ -8,6 +8,7 @@ it can find as a list of `Issue`s, so one run shows them all.
 from __future__ import annotations
 
 import copy
+import math
 import posixpath
 import re
 import shlex
@@ -240,11 +241,12 @@ class Defaults:
     agent: str
     step_timeout_min: int
     fix_attempts: int
-    run_budget_usd: float
+    run_budget_usd: float  # the soft limit: crossing it notifies once, and the run goes on
     gate_timeout_min: float = 30
     env: dict[str, str] = field(default_factory=dict)  # for every agent session and gate of a run
-    task_budget_usd: float = 0  # a feature run's budget grows to fit its plan (`feature_lane._scale_budget`); 0 = off
+    task_budget_usd: float = 2  # a feature run's soft budget grows to fit its plan (`feature_lane._scale_budget`); 0 = off
     env_inherit: EnvInherit = field(default_factory=EnvInherit)  # the inherited variables a run does not pass on
+    run_budget_hard_usd: float = 65  # the hard limit: the run stops for a human's approval when it crosses it
 
 
 @dataclass
@@ -845,8 +847,9 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
             run_budget_usd=_optional(defaults, "run_budget_usd", "defaults", (int, float), 25),
             gate_timeout_min=_optional(defaults, "gate_timeout_min", "defaults", (int, float), 30),
             env=_string_map(defaults.get("env"), "defaults.env"),
-            task_budget_usd=_optional(defaults, "task_budget_usd", "defaults", (int, float), 0),
+            task_budget_usd=_optional(defaults, "task_budget_usd", "defaults", (int, float), 2),
             env_inherit=_env_inherit(defaults.get("env_inherit")),
+            run_budget_hard_usd=_optional(defaults, "run_budget_hard_usd", "defaults", (int, float), 65),
         ),
         effort=EffortPolicy(
             default=_require(effort, "default", "effort", str),
@@ -1316,6 +1319,19 @@ class _Validator:
                 self.error(f"defaults.env_inherit.drop_dotenv[{index}]",
                            "drop_dotenv holds repository-relative file paths: no leading `/`, no `..`")
 
+    def budgets(self) -> None:
+        soft, hard = self.cfg.defaults.run_budget_usd, self.cfg.defaults.run_budget_hard_usd
+        sound = True
+        for key, value, what in (("run_budget_usd", soft, "the soft limit, which only notifies"),
+                                 ("run_budget_hard_usd", hard, "the hard limit, where the run stops")):
+            if isinstance(value, bool) or not math.isfinite(value) or not value > 0:
+                self.error(f"defaults.{key}", f"{key} ({what}) must be a finite positive number of USD")
+                sound = False
+        if sound and hard < soft:
+            self.error("defaults.run_budget_hard_usd",
+                       f"run_budget_hard_usd ({hard}) is below run_budget_usd ({soft}): the hard limit, where the run "
+                       f"stops, must be at least the soft limit, which only notifies")
+
     def agents(self) -> None:
         defaults = self.cfg.defaults.agent
         spec = self.cfg.agents.get(defaults)
@@ -1325,6 +1341,7 @@ class _Validator:
             self.error("defaults.agent", f"agent '{defaults}' is disabled")
         if not self.cfg.defaults.task_budget_usd >= 0:
             self.error("defaults.task_budget_usd", "task_budget_usd must be 0 (off) or a positive number of USD")
+        self.budgets()
         self.env_inherit()
         if not self.cfg.defaults.gate_timeout_min > 0:
             self.error("defaults.gate_timeout_min", "gate_timeout_min must be a positive number of minutes")

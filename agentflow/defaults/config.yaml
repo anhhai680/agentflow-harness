@@ -43,8 +43,9 @@ defaults:
   step_timeout_min: 45
   gate_timeout_min: 30
   fix_attempts: 3
-  run_budget_usd: 25
-  task_budget_usd: 0           # 0: a feature run's budget does not grow with its plan
+  run_budget_usd: 25  # soft: notify once when spend crosses it; the run goes on
+  run_budget_hard_usd: 65  # hard: the run stops for a human's approval
+  task_budget_usd: 2  # the soft budget grows to fit the plan
   env_inherit:                 # what a run's agents and gates do not inherit from the process that started it
     drop: []                   #   names or globs, such as "*_URL"
     drop_dotenv: [".env"]      #   a variable with the same name and value as a line of these files is dropped

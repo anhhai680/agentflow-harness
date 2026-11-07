@@ -173,10 +173,12 @@ def _money(value: float | None) -> str:
 
 
 def _spend(state: dict) -> str:
-    """The run's spend: finished sessions plus the live cost of sessions still running (as the dashboard shows)."""
-    budget = state["budget_usd"]
+    """The run's spend: finished sessions plus the live cost of sessions still running (as the dashboard shows),
+    then `/ soft · hard` budget, or `/ budget` for a run started before the soft budget."""
+    budget, soft = state["budget_usd"], state.get("soft_budget_usd")
     live = sum(float(row.get("spend") or 0.0) for row in (state.get("agents") or {}).values())
-    return _money(float(state["spend_usd"] or 0.0) + live) + (f" / {_money(budget)}" if budget else "")
+    limits = (f" / {_money(soft)} · {_money(budget)}" if soft and budget else f" / {_money(budget)}" if budget else "")
+    return _money(float(state["spend_usd"] or 0.0) + live) + limits
 
 
 def _table(rows: list[list[str]]) -> list[str]:
@@ -377,14 +379,23 @@ def _approval_offer(cfg, run, key: str) -> str | None:
 
 
 def cmd_approve(args: argparse.Namespace) -> int:
+    from agentflow.config import ConfigError
     from agentflow.hitl import approve
+    from agentflow.pack import PackError
     from agentflow.state import find_run
 
     try:
         run = find_run(_find_repo(), args.run)
-        approve(run, args.target, _by(args), budget=args.budget, hold=args.no_continue, note=args.note)
+        cfg = None
+        if args.budget is None and (run.state["waiting"] or {}).get("kind") == "budget_exceeded":
+            try:  # a plain approve of the hard budget adds one soft budget, the pack's `run_budget_usd`
+                cfg = _run_cfg(run, args)
+            except (ConfigError, PackError):
+                cfg = None  # the run's own soft budget instead; continuing reports the config error
+        approve(run, args.target, _by(args), budget=args.budget, hold=args.no_continue, note=args.note,
+                budget_step=cfg.defaults.run_budget_usd if cfg is not None else None)
         print(f"approved {args.target} for {run.id}.")
-        return _continue(run, args)
+        return _continue(run, args, cfg)
     except _human_errors() as exc:
         print(f"error: {exc}")
         return 1
@@ -918,7 +929,8 @@ def build_parser() -> argparse.ArgumentParser:
     app.add_argument("target")
     app.add_argument("--by", help="who is approving (default: the current user)")
     app.add_argument("--note", help="what to tell the agent an approved stop resumes (what changed, what to do)")
-    app.add_argument("--budget", type=float, help="set the run's budget (USD); without it, approving a budget stop allows one more budget's worth")
+    app.add_argument("--budget", type=float, help="set the run's hard budget (USD); without it, approving a hard-budget "
+                                                  "stop allows the spend so far plus one soft budget (run_budget_usd)")
     _continue_flags(app)
     app.set_defaults(func=cmd_approve)
 

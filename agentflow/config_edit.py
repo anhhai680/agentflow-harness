@@ -112,12 +112,15 @@ _NUM = {"kind": "number", "min": 0}
 _PCT = {"kind": "int", "min": 1, "max": 100}
 
 _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
-    ("Run defaults", "A running run picks these up when its next phase starts; the budget is set when a run starts.", [
+    ("Run defaults", "A running run picks these up when its next phase starts; the budgets are set when a run starts.", [
         (("defaults", "agent"), "Default agent", {"kind": "enum", "options": "@agents"}),
         (("defaults", "step_timeout_min"), "Step timeout (min)", _POS),
         (("defaults", "gate_timeout_min"), "Gate timeout (min)", {"kind": "number", "min": 0, "exclusive_min": True}),
         (("defaults", "fix_attempts"), "Fix attempts per gate failure", _INT),
-        (("defaults", "run_budget_usd"), "Run budget (USD, new runs)", {"kind": "number", "min": 0, "exclusive_min": True}),
+        (("defaults", "run_budget_usd"), "Soft budget (USD, new runs): notify only",
+         {"kind": "number", "min": 0, "exclusive_min": True}),
+        (("defaults", "run_budget_hard_usd"), "Hard budget (USD, new runs): the run stops for approval",
+         {"kind": "number", "min": 0, "exclusive_min": True}),
         (("defaults", "task_budget_usd"), "Budget per plan task (USD, 0 = off)", {"kind": "number", "min": 0}),
     ]),
     ("Recovery", "How long the runner keeps trying on its own after an outage or a failed call.", [

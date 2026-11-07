@@ -516,6 +516,30 @@ def test_a_negative_task_budget_is_refused(tmp_cfg):
     assert ("error", "defaults.task_budget_usd") in errors(issues_for(tmp_cfg, {"defaults": {"task_budget_usd": -1}}))
 
 
+def test_the_budgets_default_to_a_soft_and_a_hard_limit(tmp_cfg):
+    defaults = load_config(tmp_cfg({"defaults": {"run_budget_usd": None, "run_budget_hard_usd": None,
+                                                  "task_budget_usd": None}})).defaults
+    assert (defaults.run_budget_usd, defaults.run_budget_hard_usd, defaults.task_budget_usd) == (25, 65, 2)
+
+
+@pytest.mark.parametrize("patch, key", [
+    ({"run_budget_usd": 30, "run_budget_hard_usd": 20}, "defaults.run_budget_hard_usd"),  # hard below soft
+    ({"run_budget_usd": 0}, "defaults.run_budget_usd"),
+    ({"run_budget_usd": -1}, "defaults.run_budget_usd"),
+    ({"run_budget_usd": float("inf"), "run_budget_hard_usd": float("inf")}, "defaults.run_budget_usd"),
+    ({"run_budget_hard_usd": 0}, "defaults.run_budget_hard_usd"),
+    ({"run_budget_hard_usd": -5}, "defaults.run_budget_hard_usd"),
+    ({"run_budget_hard_usd": float("nan")}, "defaults.run_budget_hard_usd"),
+])
+def test_the_budgets_must_be_positive_and_the_hard_one_not_below_the_soft(tmp_cfg, patch, key):
+    assert (("error", key)) in errors(issues_for(tmp_cfg, {"defaults": patch}))
+
+
+def test_a_hard_budget_equal_to_the_soft_one_is_allowed(tmp_cfg):
+    found = errors(issues_for(tmp_cfg, {"defaults": {"run_budget_usd": 10, "run_budget_hard_usd": 10}}))
+    assert not [path for _, path in found if "budget" in path]
+
+
 def test_env_inherit_defaults_to_dropping_the_dotenv_twins(tmp_cfg):
     inherit = load_config(tmp_cfg()).defaults.env_inherit
     assert inherit.drop == [] and inherit.drop_dotenv == [".env"]

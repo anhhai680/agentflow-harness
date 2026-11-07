@@ -377,12 +377,29 @@ def test_rollover_with_a_done_result_is_done(flow_repo):
 
 
 def test_budget_exceeded_stops(flow_repo):
-    flow_repo.configure({"defaults": {"run_budget_usd": 0.015}})
+    flow_repo.configure({"defaults": {"run_budget_usd": 0.015, "run_budget_hard_usd": 0.015}})
     run = flow_repo.new_run()
     assert run_step(flow_repo, make_step(gates=["fail"], fix_loop=True)) == "stopped"
     assert len(flow_repo.calls()) == 2
     assert hitl_kinds(flow_repo, run) == ["budget_exceeded"]
     assert run.state["spend_usd"] == pytest.approx(0.02)
+    assert "hard budget" in run.state["waiting"]["summary"]
+
+
+def test_the_soft_budget_only_notifies(flow_repo, monkeypatch):
+    sent = []
+    monkeypatch.setattr(lanes, "notify_run", lambda cfg, run, message: sent.append(message))
+    flow_repo.configure({"defaults": {"run_budget_usd": 0.015, "run_budget_hard_usd": 1}})
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"result_raw": "not json", "cost": 0.02}, {"result": DONE}, {"result": DONE}]})
+    assert run_step(flow_repo) == "done"
+    assert len(flow_repo.calls()) >= 2  # the spend crossed the soft limit before a later call
+    [soft] = flow_repo.events(run, "budget_soft_reached")
+    assert soft["soft_usd"] == 0.015 and soft["hard_usd"] == 1 and soft["spend_usd"] >= 0.015
+    assert len([m for m in sent if "soft budget" in m]) == 1
+    assert "stops at $1.00" in sent[0]  # names the hard limit that does stop it
+    assert hitl_kinds(flow_repo, run) == [] and run.state["waiting"] is None
+    assert run.state["steps"][KEY]["status"] == "done"
 
 
 def test_timeout_escalates(flow_repo, monkeypatch):

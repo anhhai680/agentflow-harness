@@ -326,7 +326,7 @@ def _title_for(cfg: Config, run: Run) -> str:
 def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questions: list[Question] | tuple = (), extra: str = "") -> Path:
     """Stop the run for a human: write the inbox file, record `hitl_raised`, notify. Returns the inbox path."""
     questions = list(questions)
-    how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).", _how_to_go_on(run, kind, key, bool(questions))]
+    how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).", _how_to_go_on(run, kind, key, bool(questions), cfg)]
     path = run.inbox_path(key)
     render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
     run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
@@ -356,7 +356,7 @@ def park_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, question
     return path
 
 
-def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool) -> str:
+def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config) -> str:
     """The inbox line that says what each way out of this stop does."""
     scoped = rejected_scope(run, key.split("/")[0], key)
     back = f"task {scoped[1]}" if scoped else "the phase"
@@ -365,6 +365,12 @@ def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool) -> str:
         return f"Fill in the `Answer:` lines below, or run `agentflow answer {run.id}`."
     if kind in CLEARED_BY_APPROVE:
         return f"`agentflow approve {run.id} {key}` accepts it and the run goes on; {reject}"
+    if kind == "budget_exceeded" and run.state.get("soft_budget_usd") is not None:
+        hard = float(run.state.get("budget_usd") or 0.0)
+        return (f"The run stopped at its hard budget of ${hard:.2f}. `agentflow approve {run.id} {key}` sets the hard "
+                f"budget to the spend so far plus ${cfg.defaults.run_budget_usd:.2f} (one soft budget, "
+                f"`defaults.run_budget_usd`) and goes on, then asks again (add `--budget <usd>` to set the hard budget "
+                f"yourself); {reject}")
     if kind == "budget_exceeded":
         return (f"`agentflow approve {run.id} {key}` goes on with one more budget's worth of spend, then asks again "
                 f"(add `--budget <usd>` to set the limit yourself); {reject}")
@@ -465,7 +471,7 @@ def answer(run: Run, key: str, answers: dict[str, str], by: str, record: bool = 
 
 
 def approve(run: Run, target: str, by: str, budget: float | None = None, hold: bool = False,
-            note: str | None = None) -> bool:
+            note: str | None = None, budget_step: float | None = None) -> bool:
     """Approve a phase (`plan` or `plan_approved`), clear an inner checkpoint, or resume a runner stop.
 
     `hold` rests an approved phase as ready (`phase_ready`) instead of leaving the run to go on, and True is
@@ -473,8 +479,11 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
     A `type: checkpoint` step or a repeat group past `max_rounds` is cleared (`checkpoint_cleared`).
     Any other stop is one the runner raised on an unfinished step (blocked, fix attempts exhausted,
     timeout, ...): `hitl_approved` puts that step back to resumable, so the runner resumes its session
-    and still verifies and commits it. A `budget_exceeded` stop is a request for approval: with no `budget`,
-    the approval allows one more budget's worth of spend, so the run goes on and asks again after that.
+    and still verifies and commits it. A `budget_exceeded` stop (the hard budget) is a request for approval:
+    `budget` sets the hard budget exactly; with none, the hard budget becomes the spend so far plus
+    `budget_step` (the callers pass the pack's `defaults.run_budget_usd`, the soft budget), else plus the
+    run's own soft budget, so the run goes on and asks again after that. The soft budget is left alone. A run
+    started before the soft budget existed allows one more of its one budget's worth, as it always did.
 
     `note` goes to the agent that the approval resumes. A `blocked_repeat` stop needs one: the session already
     blocked again with nothing changed, so a plain approval would only repeat that.
@@ -507,7 +516,13 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
             raise NotWaiting(f"{name!r} is waiting for answers, not an approval; use `agentflow answer {run.id}`")
         if waiting["kind"] == "budget_exceeded" and budget is None:
             spend = float(run.state["spend_usd"] or 0.0)
-            budget = spend + float(run.state["budget_usd"] or spend)
+            soft = run.state.get("soft_budget_usd")
+            if soft is None:  # a run started before the soft budget: one more of its one budget
+                budget = spend + float(run.state["budget_usd"] or spend)
+            else:
+                sound = budget_step is not None and math.isfinite(budget_step) and budget_step > 0
+                step = budget_step if sound else soft
+                budget = spend + float(step)
         if budget is not None:
             run.emit("run_updated", by=by, budget_usd=budget)
         if waiting["kind"] in CLEARED_BY_APPROVE:

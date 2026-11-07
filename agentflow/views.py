@@ -248,6 +248,7 @@ def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metri
         "context_pct": live[-1].get("context_pct") if live else None,
         "spend": round(float(state.get("spend_usd") or 0.0) + sum(float(r.get("spend") or 0.0) for r in live), 6),
         "budget": state.get("budget_usd"),
+        "soft_budget": state.get("soft_budget_usd"),  # None: a run started before the soft budget
         "gates": _last_gates(state),
         "review_skipped": _review_skips(state),
         "phase_since": since,
@@ -316,6 +317,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
         "agents_running": {"total": sum(by_agent.values()), "by_agent": dict(by_agent), "by_model": dict(by_model)},
         "spend_today": round(spend_today, 2),
         "run_budget_usd": cfg.defaults.run_budget_usd,
+        "run_budget_hard_usd": cfg.defaults.run_budget_hard_usd,
         "generated_at": now.isoformat(timespec="seconds"),
     }
 
@@ -692,6 +694,7 @@ def metrics_view(repo: Path, cfg: Config, lane: str | None = None, date_from: da
             "status": display_status(run),
             "archived": bool(state.get("archived")),
             "budget": state.get("budget_usd"),
+            "soft_budget": state.get("soft_budget_usd"),
             "pr_link": _pr_link(state),
             "started_on": day.isoformat() if day else None,
             "metrics": metrics,
@@ -748,6 +751,8 @@ def board_table(data: dict) -> str:
     for card in data["cards"]:
         cells = [_cell(card) if col == card["column"] else "" for col in columns]
         budget = f"/${card['budget']:.0f}" if card["budget"] else ""
+        if card["budget"] and card.get("soft_budget"):
+            budget = f"/${card['soft_budget']:.0f}·${card['budget']:.0f}"
         rows.append([card["run_id"], *cells, f"${card['spend']:.2f}{budget}"])
     lines = _table(rows)
     if data["backlog"]:

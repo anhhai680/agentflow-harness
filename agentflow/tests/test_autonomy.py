@@ -378,12 +378,23 @@ def test_stops_outside_a_resolve_phase_are_a_humans(auto, notified):
 
 
 def test_a_budget_stop_is_never_settled(flow_repo, notified):
-    flow_repo.configure({**PIPE, "defaults": {"run_budget_usd": 0.0001}}, autopilot=True)
+    flow_repo.configure({**PIPE, "defaults": {"run_budget_usd": 0.0001, "run_budget_hard_usd": 0.0001}}, autopilot=True)
     flow_repo.script({"define/debug": [{**done("ok"), "cost": 1.0}]})
     run = begin_bug(flow_repo)
     assert go(flow_repo, run) == "waiting_human"
     assert run.state["waiting"]["kind"] == "budget_exceeded"
     assert not flow_repo.events(run, "resolve_started")
+
+
+def test_crossing_the_soft_budget_is_never_a_stop(flow_repo, notified):
+    flow_repo.configure({**PIPE, "defaults": {"run_budget_usd": 0.0001, "run_budget_hard_usd": 100}}, autopilot=True)
+    flow_repo.script({"define/debug": [{**done("ok"), "cost": 1.0}]})
+    run = begin_bug(flow_repo)
+    go(flow_repo, run)  # the bug lane walks on to whatever stops it next, never the soft budget
+    assert (run.state["waiting"] or {}).get("kind") != "budget_exceeded"
+    assert len(flow_repo.events(run, "budget_soft_reached")) == 1
+    assert not [e for e in flow_repo.events(run, "hitl_raised") if e["kind"] == "budget_exceeded"]
+    assert sum("soft budget" in text for text in notified) == 1
 
 
 # --------------------------------------------------------------------------- questions

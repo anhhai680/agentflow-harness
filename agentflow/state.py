@@ -66,7 +66,8 @@ def initial_state() -> dict:
         "spend_usd": 0.0,
         "session_costs": {},
         "hold": None,
-        "budget_usd": None,
+        "budget_usd": None,  # the hard limit: the run stops when its spend crosses it
+        "soft_budget_usd": None,  # the soft limit: crossing it only notifies; None for a run started before it
         "context_windows": {},
         "env_dropped": [],
         "facts": [],
@@ -174,8 +175,9 @@ def _on_run_started(state: dict, ev: dict) -> None:
     for field in ("branch", "worktree", "base_sha"):
         if ev.get(field) is not None:
             state[field] = ev[field]
-    if ev.get("budget_usd") is not None:
-        state["budget_usd"] = ev["budget_usd"]
+    for field in ("budget_usd", "soft_budget_usd"):
+        if ev.get(field) is not None:
+            state[field] = ev[field]
     state["status"] = "running"
 
 
@@ -184,7 +186,7 @@ def _on_run_options(state: dict, ev: dict) -> None:
 
 
 def _on_run_updated(state: dict, ev: dict) -> None:
-    for field in ("branch", "worktree", "base_sha", "pr_url", "budget_usd"):
+    for field in ("branch", "worktree", "base_sha", "pr_url", "budget_usd", "soft_budget_usd"):
         if ev.get(field) is not None:
             state[field] = ev[field]
 
@@ -902,7 +904,8 @@ class Run:
                 run_id = f"{base}-{n}"
         run = cls(repo, run_id)
         run.agent_dir.mkdir(parents=True, exist_ok=True)
-        run.emit("run_started", run_id=run_id, pipeline=pipeline, params=params, budget_usd=cfg.defaults.run_budget_usd)
+        run.emit("run_started", run_id=run_id, pipeline=pipeline, params=params,
+                 budget_usd=cfg.defaults.run_budget_hard_usd, soft_budget_usd=cfg.defaults.run_budget_usd)
         return run
 
     @classmethod

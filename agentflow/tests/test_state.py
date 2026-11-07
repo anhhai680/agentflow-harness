@@ -90,6 +90,26 @@ def test_reduce_is_pure():
     assert reduce(state, event) == out
 
 
+def test_the_soft_budget_is_carried_by_run_started_and_run_updated():
+    state = initial_state()
+    assert state["soft_budget_usd"] is None
+    started = {"seq": 1, "ts": "2026-10-29T10:00:00.000+00:00", "type": "run_started", "pipeline": "feature",
+               "params": {}, "run_id": "r1", "budget_usd": 65, "soft_budget_usd": 25}
+    state = reduce(state, started)
+    assert (state["budget_usd"], state["soft_budget_usd"]) == (65, 25)
+    state = reduce(state, {"seq": 2, "ts": started["ts"], "type": "run_updated", "soft_budget_usd": 31.5})
+    assert (state["budget_usd"], state["soft_budget_usd"]) == (65, 31.5)
+    old = reduce(initial_state(), {**started, "soft_budget_usd": None})  # a run started before the soft budget
+    assert (old["budget_usd"], old["soft_budget_usd"]) == (65, None)
+
+
+def test_status_spend_shows_the_soft_and_the_hard_budget():
+    from agentflow.flow import _spend
+
+    state = {"budget_usd": 65, "soft_budget_usd": 25, "spend_usd": 1.0, "agents": {}}
+    assert _spend(state) == "$1.00 / $25.00 · $65.00"
+
+
 def test_agent_rows(run):
     run.emit("step_started", key="build/task", phase="build")
     run.emit("agent_started", agent="claude", pid=77, model="sonnet", effort="medium", step="build/task",
@@ -373,7 +393,10 @@ def test_run_create_and_paths(run, repo, cfg):
     assert runs_root(repo) == pack.state_dir(repo) / "runs" and not runs_root(repo).is_relative_to(repo.resolve())
     started = run.events.read()[0]
     assert started["type"] == "run_started" and started["params"] == {"module": "crm"}
-    assert run.state["run_id"] == run.id and run.state["budget_usd"] == cfg.defaults.run_budget_usd
+    assert run.state["run_id"] == run.id and run.state["budget_usd"] == cfg.defaults.run_budget_hard_usd
+    assert run.state["soft_budget_usd"] == cfg.defaults.run_budget_usd
+    assert (started["budget_usd"], started["soft_budget_usd"]) == (cfg.defaults.run_budget_hard_usd,
+                                                                   cfg.defaults.run_budget_usd)
     assert run.state["pipeline"] == "feature"
     key = "build/implement/task-3/implement"
     assert run.result_path(key) == run.dir / "results" / "build__implement__task-3__implement.json"
