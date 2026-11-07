@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from agentflow import pack
+from agentflow import backlog, pack
 from agentflow.config import load_config
 from conftest import ENGINE, ROOT, run_git
 
@@ -145,6 +145,35 @@ def test_init_to_dry_run(kind: str, tmp_path: Path, fakebin: Path) -> None:
     assert git_status(repo) == "?? .agentflow/config.yaml"
     shutil.rmtree(repo / ".agentflow")
     assert git_status(repo) == ""
+
+
+def test_init_in_a_repository_with_specs_writes_a_specs_backlog(tmp_path: Path, fakebin: Path) -> None:
+    repo = toy("docs", tmp_path)
+    proposals = repo / "docs" / "proposals"
+    proposals.mkdir()
+    for name in ("greet.md", "index.md", "README.md"):
+        (proposals / name).write_text("# Greet\n\nStatus: approved\n", encoding="utf-8")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", "proposals")
+    run_git(repo, "push", "-q", "origin", "main")
+
+    init = agentflow(repo, "init")
+    assert init.returncode == 0, _shown(init)
+    cfg = load_config(pack.pack_config(repo))
+    assert cfg.work_source.kind == "specs" and cfg.project.docs["specs"] == "docs/proposals"
+
+    add_bug_lane_rule(repo, init.stdout)
+    validate = agentflow(repo, "validate")
+    assert validate.returncode == 0, _shown(validate)
+    warnings = [line for line in validate.stdout.splitlines() if line.startswith("warning ")]
+    assert len(warnings) == 1 and warnings[0].startswith(CONFIRM_WARNING), _shown(validate)
+    confirm_gates(repo)
+
+    cards = backlog.snapshot(load_config(pack.pack_config(repo)), repo)["cards"]
+    assert sorted(c["id"] for c in cards if c["kind"] == "module") == ["greet"], cards
+    dry_run = agentflow(repo, "run", "feature", "--module", "greet", "--dry-run")
+    assert dry_run.returncode == 0, _shown(dry_run)
+    assert git_status(repo) == "?? .agentflow/config.yaml"
 
 
 def test_init_then_validate_for_a_starter_in_an_empty_repo(tmp_path: Path, fakebin: Path) -> None:

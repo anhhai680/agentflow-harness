@@ -164,6 +164,11 @@ def pack_data(d: Detected, *, base: dict, red: frozenset[str] = frozenset()) -> 
         project["docs"] = changed_docs
     if project:
         data["project"] = project
+    if "specs" in docs:  # fixed data only: nothing from the repository is copied into these two keys
+        data["work_source"] = {"kind": "specs"}
+        data["dashboard"] = {"backlog": {"module_lane": "feature",
+                                         "new_task": {"feature": ["new_module", "after"],
+                                                      "bug": ["issue", "task", "after"]}}}
     base_gates = base.get("gates") if isinstance(base.get("gates"), dict) else {}
     for name in [*gates, *(n for n in base_gates if n not in gates)]:
         if name in red:
@@ -184,6 +189,9 @@ def render_pack(d: Detected, *, base: dict, red: frozenset[str] = frozenset()) -
               f"# {PERMISSION_COMMENT}\n" + _dump({"agents": data["agents"]})]
     if "project" in data:
         blocks.append("# what differs from the engine defaults\n" + _dump({"project": data["project"]}))
+    if "work_source" in data:
+        blocks.append("# the Backlog: one module per spec file in project.docs.specs; a new feature card writes a new "
+                      "spec\n" + _dump({"work_source": data["work_source"], "dashboard": data["dashboard"]}))
     if "gates" in data:
         comment = f"# {_GATES_FROM.get(d.gate_source, 'detected')}; each gate replaces the starter's gate of its name\n"
         if red:
