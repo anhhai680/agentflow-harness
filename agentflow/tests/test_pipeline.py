@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from agentflow.flow import main
-from agentflow.gitops import GitError
 from agentflow.hitl import approve, reject
 from agentflow.pipeline import RunOptions, advance, footer_next, start
 from agentflow.state import Run, runs_root

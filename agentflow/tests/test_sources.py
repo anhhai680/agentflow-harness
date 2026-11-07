@@ -12,6 +12,8 @@ from agentflow.sources import (
     find_plan,
     parse_plan,
     spec_status,
+    forbidden_task_files,
+    task_files,
     task_size_warnings,
     tick_task,
 )
@@ -230,3 +232,10 @@ def test_a_task_joins_only_when_its_dependencies_are_in_the_batch_or_before_it()
              batch_task(5, deps=[])]
     assert plan_batches(tasks, 3, 3) == [[1, 2, 3], [4, 5]]
     assert plan_batches(tasks, 4, 3) == [[1, 2, 3], [4, 5]]  # 4 may not join [1, 2, 3]: 5 is not in it
+
+
+def test_forbidden_task_files_reads_only_file_lines_outside_fences():
+    task = PlanTask(1, "T", "### Task 1: T\n\n- Create: `eval/baseline.json`, `src/a.py`\n- Test: `tests/a.py`\n"
+                    "```\n- Create: `eval/fenced.json`\n```\nNote `eval/other.json` in prose.\n", False, [])
+    assert task_files(task) == ["eval/baseline.json", "src/a.py", "tests/a.py"]
+    assert forbidden_task_files(task, lambda path: path.startswith("eval/")) == ["eval/baseline.json"]

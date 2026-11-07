@@ -112,6 +112,32 @@ def sessions_of(flow_repo, run, key: str) -> list[str]:
     return [e["session_id"] for e in flow_repo.events(run, "agent_session") if e["key"] == key]
 
 
+# --------------------------------------------------------------------------- tasks that need a forbidden file
+
+
+FORBIDDEN_PLAN = (plan_text(count=2) + "\n- Create: `eval/baseline.json`\n").replace(
+    "### Task 2: Second thing\n", "### Task 2: Second thing\n\n- Create: `eval/baseline.json`\n- Test: `tests/test_two.py`\n")
+
+
+def test_plan_naming_a_forbidden_file_stops_before_any_task(flow_repo):
+    flow_repo.configure({**BIG, "guardrails": {"forbidden_paths": ["eval/baseline.json"]}})
+    run = begin_build(flow_repo, FORBIDDEN_PLAN)
+    assert build(flow_repo, run) == ("stopped", True)
+    assert flow_repo.calls() == []  # no session is spent on task 1 first
+    waiting = run.state["waiting"]
+    assert waiting["kind"] == "blocked" and waiting["key"] == "build/build"
+    assert "Task 2: eval/baseline.json" in waiting["summary"] and "Task 1" not in waiting["summary"]
+
+
+def test_approving_the_forbidden_file_stop_goes_on(flow_repo):
+    flow_repo.configure({**BIG, "guardrails": {"forbidden_paths": ["eval/baseline.json"]}})
+    run = begin_build(flow_repo, FORBIDDEN_PLAN)
+    assert build(flow_repo, run) == ("stopped", True)
+    approve(run, "build/build", by="me")  # the human made the change themselves
+    assert build(flow_repo, run) == ("done", True)
+    assert IMPL.format(n=2) in steps(flow_repo.calls())
+
+
 # --------------------------------------------------------------------------- per-task sessions, review, commits
 
 
@@ -177,7 +203,7 @@ def test_review_findings_back_once_then_hitl(lane, git):
     assert build(lane, run) == ("stopped", True)
     calls = lane.calls()
     assert steps(calls) == [impl_key, review_key, impl_key, review_key]
-    impl_session, review_session = session_of(lane, run, impl_key), session_of(lane, run, review_key)
+    impl_session = session_of(lane, run, impl_key)
     fix = calls[2]["argv"]
     assert ("--resume", impl_session) in pairs(fix) and ("--effort", "medium") in pairs(fix)
     assert "receiving-code-review" in fix[-1] and FINDING["text"] in fix[-1] and "src/one.py:3" in fix[-1]

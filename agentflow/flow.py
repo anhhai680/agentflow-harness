@@ -215,7 +215,7 @@ def _print_run_detail(run) -> None:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    from agentflow.state import RunNotFound, display_status, find_run, list_runs
+    from agentflow.state import display_status, find_run, list_runs
 
     if args.watch:
         from agentflow.views import board, board_table

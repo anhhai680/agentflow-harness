@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Literal
 from agentflow import sources
 from agentflow.autonomy import AUTO_BY, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
-from agentflow.conditions import Ctx, fmt, skill_text
+from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
 from agentflow.config import Config, Phase, Step, brief_files
 from agentflow.flow_control import current_refine, refine_note_block, refine_subject
 from agentflow.gates import gates_ok, run_gates
@@ -144,6 +144,8 @@ class FeatureLane:
             raise_hitl(self.cfg, self.run, "blocked", prefix,
                        f"{prefix} runs once per plan task, but there is no plan for `{module}` yet.")
             return "stopped"
+        if self._needs_human_files(plan, prefix):
+            return "stopped"
         self._task_total = len(sources.parse_plan(plan))
         self._scale_budget(plan)
         small = self._small_plan(phase, step, prefix)
@@ -188,6 +190,26 @@ class FeatureLane:
             self.run.emit("run_updated", budget_usd=target)
         self.run.emit("budget_scaled", budget_usd=max(target, current), previous=current, tasks=unticked,
                       per_task=per_task, raised=raised)
+
+    def _needs_human_files(self, plan: Path, prefix: str) -> bool:
+        """Stop before the first task when an open task names a forbidden path: the guards would fail that task
+        after every task before it was built. An approval of this stop (the human made the change, or edited the
+        plan) lets the run go on; the check is not repeated. True = stopped."""
+        if self._waiting_on(prefix):
+            return True
+        if any(e["type"] == "hitl_approved" and e.get("key") == prefix for e in self.run.events.read()):
+            return False
+        tasks = sources.parse_plan(plan)
+        todo = [t for t in tasks if not self._committed(f"{prefix}/task-{t.n}")]
+        found = forbidden_plan_files(self.cfg, todo)
+        if not found:
+            return False
+        lines = "; ".join(f"Task {n}: {', '.join(paths)}" for n, paths in found.items())
+        raise_hitl(self.cfg, self.run, "blocked", prefix,
+                   f"The plan needs files that `guardrails.forbidden_paths` refuses in a run, so no agent can write "
+                   f"them ({lines}). Make those changes yourself in the run's worktree and commit them, or edit the "
+                   f"plan to drop them, then approve.")
+        return True
 
     def _plan_pass(self, phase: Phase, step: Step, plan: Path, rel: str, prefix: str,
                    small: dict) -> tuple[bool, set[int], bool]:

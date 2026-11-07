@@ -11,6 +11,7 @@ import os
 import re
 import stat
 from collections.abc import Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -175,16 +176,28 @@ def tick_task(path: Path, n: int) -> None:
     raise ValueError(f"no Task {n} in {path}")
 
 
+def task_files(task: PlanTask) -> list[str]:
+    """The paths a task's `Create:` / `Modify:` / `Test:` / `Delete:` / `Rename:` lines name, outside code fences."""
+    lines = task.text.splitlines()
+    fenced = _fence_flags(lines)
+    files: dict[str, None] = {}
+    for i, line in enumerate(lines):
+        if not fenced[i] and _FILE_LINE.match(line):
+            files.update((s, None) for s in _BACKTICKED.findall(line) if "/" in s or "." in s)
+    return list(files)
+
+
 def task_size(task: PlanTask) -> tuple[int, int]:
     """`(checkbox steps, files named)` outside code fences."""
     lines = task.text.splitlines()
     fenced = _fence_flags(lines)
     steps = sum(1 for i, line in enumerate(lines) if not fenced[i] and _BOX.match(line))
-    files: set[str] = set()
-    for i, line in enumerate(lines):
-        if not fenced[i] and _FILE_LINE.match(line):
-            files.update(s for s in _BACKTICKED.findall(line) if "/" in s or "." in s)
-    return steps, len(files)
+    return steps, len(task_files(task))
+
+
+def forbidden_task_files(task: PlanTask, is_forbidden: Callable[[str], bool]) -> list[str]:
+    """The files the task names that `is_forbidden` refuses: an agent cannot write them in a run, so a human must."""
+    return [path for path in task_files(task) if is_forbidden(path)]
 
 
 def task_size_warnings(task: PlanTask) -> list[str]:
