@@ -32,6 +32,7 @@ HEADING = re.compile(r"^### (\S+) — (.*)$", re.MULTILINE)
 ANSWER_LINE = re.compile(r"^Answer:[ \t]*(.*)$", re.MULTILINE)
 FACT_MAX = 300  # characters of one `facts` entry
 FACTS_PER_RESULT = 5
+_INVISIBLE_CATEGORIES = ("Cc", "Cf")  # control characters, and format ones: bidi overrides, zero-width, BOM
 DEFAULT_TITLE = "agentflow: {run} needs you"
 NOTIFY_TIMEOUT_S = 10
 MESSAGE_MAX = 240
@@ -93,9 +94,12 @@ def _text(value: Any, name: str) -> str:
 
 
 def clean_fact(text: str) -> str:
-    """One `facts` entry as the run keeps it: NFC, control characters dropped, whitespace collapsed to single
-    spaces, and cut to `FACT_MAX`. It is model text, so it is cut before anything reads it further."""
-    text = "".join(ch for ch in text[: FACT_MAX * 4] if ch.isspace() or unicodedata.category(ch) != "Cc")
+    """One `facts` entry as the run keeps it: NFC, control and format characters dropped (a bidi override or a
+    zero-width character could reorder or hide what a reader sees), whitespace collapsed to single spaces, and cut
+    to `FACT_MAX`. It is model text, so it is cut before anything reads it further. Any one line of model text
+    shown to a human (a notification, the pull request body) goes through it too."""
+    text = "".join(ch for ch in text[: FACT_MAX * 4]
+                   if ch.isspace() or unicodedata.category(ch) not in _INVISIBLE_CATEGORIES)
     return nfc(" ".join(text.split()))[:FACT_MAX].rstrip()
 
 

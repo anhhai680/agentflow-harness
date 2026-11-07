@@ -75,7 +75,7 @@ from agentflow.gitops import (
     push,
 )
 from agentflow.guards import changed_paths, snapshot
-from agentflow.hitl import ResultError, notify_run, raise_hitl, read_result
+from agentflow.hitl import ResultError, clean_fact, notify_run, raise_hitl, read_result
 
 if TYPE_CHECKING:
     from agentflow.state import Run
@@ -865,7 +865,8 @@ def _skipped_lines(state: dict) -> list[str]:
 
 def _runner_decisions(events: list[dict]) -> list[str]:
     """Every question the runner answered with the asker's recommended option: step key, question id, option, so a
-    reviewer of the pull request checks each one."""
+    reviewer of the pull request checks each one. The question, its id, the option and its label are model text, so
+    each is one clean line (`clean_fact`): a newline cannot break the list and a bidi override cannot reorder it."""
     lines = []
     for event in events:
         if event["type"] != "hitl_answered" or event.get("by") != AUTO_BY:
@@ -874,9 +875,9 @@ def _runner_decisions(events: list[dict]) -> list[str]:
         for question in _questions_for(events, event):
             option = chosen.get(question["id"])
             labels = [o.get("label") for o in question.get("options") or [] if o.get("key") == option]
-            text = " ".join(str(question.get("question", "")).split())
-            label = " ".join(str(labels[0] if labels else option).split())
-            lines.append(f"- `{event.get('key')}` {question['id']} (option {option}): {text} → {label}")
+            qid, text = clean_fact(str(question["id"])), clean_fact(str(question.get("question", "")))
+            label = clean_fact(str(labels[0] if labels else option))
+            lines.append(f"- `{event.get('key')}` {qid} (option {clean_fact(str(option))}): {text} → {label}")
     return lines
 
 

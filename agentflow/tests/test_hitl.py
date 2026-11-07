@@ -94,6 +94,13 @@ def test_result_facts_are_cleaned_cut_and_capped(tmp_path):
     assert read_result(write_result(p, {"status": "done", "summary": "x", "facts": many})).facts == many[:FACTS_PER_RESULT]
 
 
+def test_clean_fact_drops_format_characters():
+    # a bidi override, a zero-width space and a byte-order mark are invisible, and can reorder or hide what a
+    # reviewer reads in a prompt, a notification or a pull request body
+    assert hitl.clean_fact("﻿use ‮evil‬ the​ cache⁦ here⁩") == "use evil the cache here"
+    assert hitl.clean_fact("a​b") == "ab"
+
+
 @pytest.mark.parametrize("facts", ["one fact", {"a": "b"}, [1], [["nested"]], [None]])
 def test_result_facts_must_be_a_list_of_strings(tmp_path, facts):
     with pytest.raises(ResultError):
