@@ -45,6 +45,9 @@ defaults:
   fix_attempts: 3
   run_budget_usd: 25
   task_budget_usd: 0           # 0: a feature run's budget does not grow with its plan
+  env_inherit:                 # what a run's agents and gates do not inherit from the process that started it
+    drop: []                   #   names or globs, such as "*_URL"
+    drop_dotenv: [".env"]      #   a variable with the same name and value as a line of these files is dropped
 
 recovery:
   give_up_h: 24

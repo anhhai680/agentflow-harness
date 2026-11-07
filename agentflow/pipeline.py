@@ -46,7 +46,7 @@ from agentflow.autonomy import (
     findings_note,
     phase_findings,
 )
-from agentflow import pack, work_source
+from agentflow import pack, run_env, work_source
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
@@ -279,6 +279,13 @@ class _Loop:
         self.run.emit("run_finished")
         return "done"
 
+    def record_env(self) -> None:
+        """Record, by name only, the inherited variables this run does not pass on, when the set is not the one
+        last recorded (so a start records it, and a resume only when it changed)."""
+        names = sorted({name for name, _ in run_env.dropped(self.cfg)})
+        if names != self.run.state.get("env_dropped", []):
+            self.run.emit("env_dropped", names=names)
+
     def go(self) -> str:
         run = self.run
         run.refresh()
@@ -292,6 +299,7 @@ class _Loop:
             self.opts.to_phase = None
         if state["status"] in ("paused", "error", "ready"):  # a human resumed, or the last runner stopped on an error
             run.emit("run_resumed")
+        self.record_env()
         names = list(self.cfg.phases)
         first = self.opts.from_phase or names[0]
         for index in range(names.index(first), len(names)):

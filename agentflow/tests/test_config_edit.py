@@ -187,6 +187,19 @@ def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
 
 
+def test_the_inherited_environment_settings_are_protected(shipped):
+    _, sha = config_edit.read(shipped)
+    old = '    POSTGRES_HOST_PORT: "55432"\n'
+    assert old in SHIPPED
+    for added in ('  env_inherit: {drop: ["*_URL"]}\n', "  env_inherit: {drop_dotenv: []}\n"):  # a run's agents see the leak again
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=SHIPPED.replace(old, old + added, 1), repo=REPO)
+    for key, value in ((["defaults", "env_inherit", "drop"], ["X"]), (["defaults", "env_inherit", "drop_dotenv"], [])):
+        with pytest.raises(Refused):  # the form has no field for it
+            form(shipped, (key, value))
+    assert "defaults.env_inherit" in config_edit.PROTECTED
+
+
 def test_yaml_text_may_not_switch_the_work_source_to_specs(shipped):
     _, sha = config_edit.read(shipped)
     lines = SHIPPED.splitlines(keepends=True)

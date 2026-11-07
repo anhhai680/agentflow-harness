@@ -13,7 +13,7 @@ import os
 import signal
 import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -46,6 +46,7 @@ class AgentCall:
     env: dict[str, str] = field(default_factory=dict)  # `defaults.env`
     forbidden_paths: list[str] = field(default_factory=list)  # `guardrails.forbidden_paths`
     runs_root: Path | None = None  # the runner's own state (`state.runs_root`): no agent edits it
+    env_base: Mapping[str, str] | None = None  # the inherited environment (`run_env.base`); None: this process's
 
 
 @dataclass
@@ -440,7 +441,7 @@ class _CliAgent(abc.ABC):
             proc = subprocess.Popen(
                 argv,
                 cwd=call.cwd,
-                env=os.environ | self.env(call),
+                env={**(os.environ if call.env_base is None else call.env_base), **self.env(call)},
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=stderr,

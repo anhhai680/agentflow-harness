@@ -516,6 +516,26 @@ def test_a_negative_task_budget_is_refused(tmp_cfg):
     assert ("error", "defaults.task_budget_usd") in errors(issues_for(tmp_cfg, {"defaults": {"task_budget_usd": -1}}))
 
 
+def test_env_inherit_defaults_to_dropping_the_dotenv_twins(tmp_cfg):
+    inherit = load_config(tmp_cfg()).defaults.env_inherit
+    assert inherit.drop == [] and inherit.drop_dotenv == [".env"]
+
+
+@pytest.mark.parametrize("patch", [
+    {"drop": ["has space"]}, {"drop": ["a;b"]}, {"drop": [""]}, {"drop": ["X" * 129]},
+    {"drop_dotenv": ["../.env"]}, {"drop_dotenv": ["a/../../.env"]}, {"drop_dotenv": ["/etc/env"]}, {"drop_dotenv": [""]},
+])
+def test_a_bad_env_inherit_is_refused(tmp_cfg, patch):
+    got = errors(issues_for(tmp_cfg, {"defaults": {"env_inherit": patch}}))
+    assert any(path.startswith("defaults.env_inherit.") for _, path in got)
+
+
+def test_a_good_env_inherit_validates(tmp_cfg):
+    patch = {"drop": ["*_URL", "A_B", "X[12]"], "drop_dotenv": [".env", "web/.env.local"]}
+    assert [p for _, p in errors(issues_for(tmp_cfg, {"defaults": {"env_inherit": patch}}))
+            if p.startswith("defaults.env_inherit")] == []
+
+
 def test_batch_is_checked(tmp_cfg):
     def patch(data):
         phase_step(data, "build", "build")["batch"] = {"max_tasks": 1, "max_files": -1, "prompt": "nope.md"}

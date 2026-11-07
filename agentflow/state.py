@@ -67,6 +67,7 @@ def initial_state() -> dict:
         "hold": None,
         "budget_usd": None,
         "context_windows": {},
+        "env_dropped": [],
         "gates": {},
         "reviews": {},
         "effort_changes": [],
@@ -397,6 +398,11 @@ def _on_context_window(state: dict, ev: dict) -> None:
     state["context_windows"][ev["model"]] = int(ev["tokens"])
 
 
+def _on_env_dropped(state: dict, ev: dict) -> None:
+    """The inherited variables the run does not pass on: names only, never a value."""
+    state["env_dropped"] = sorted({str(name) for name in ev.get("names") or []})
+
+
 def _on_gate_result(state: dict, ev: dict) -> None:
     key = ev.get("key") or state["step"] or "run"
     state["gates"].setdefault(key, []).append({
@@ -687,6 +693,7 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "subagent_started": _on_subagent_started,
     "subagent_finished": _on_subagent_finished,
     "context_window": _on_context_window,
+    "env_dropped": _on_env_dropped,
     "gate_result": _on_gate_result,
     "review_result": _on_review_result,
     "hitl_raised": _on_hitl_raised,

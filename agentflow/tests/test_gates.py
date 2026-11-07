@@ -121,3 +121,31 @@ def test_run_gates_env_base_replaces_the_inherited_environment(tmp_git, tmp_path
                                                                                   "AGENTFLOW_PACK": "overridden"}
     (replaced,) = run_gates(cfg, ["show"], tmp_git, tmp_path / "b", env_base=base)
     assert "inherited=unset base=b pack=p" in replaced.tail  # defaults.env still goes on top
+
+
+def test_a_gate_does_not_see_a_variable_the_dotenv_file_repeats(tmp_git, tmp_path, monkeypatch):
+    (tmp_git / ".env").write_text("LEAKED_URL=leak-sentinel-7f3a\n", encoding="utf-8")
+    monkeypatch.setenv("LEAKED_URL", "leak-sentinel-7f3a")
+    monkeypatch.setenv("KEPT_URL", "kept-value")
+    cfg = cfg_with({"show": "env"})
+    cfg = dataclasses.replace(cfg, path=tmp_git / ".agentflow" / "config.yaml")
+    (g,) = run_gates(cfg, ["show"], tmp_git, tmp_path / "logs")
+    log = g.log_path.read_text()
+    assert "LEAKED_URL" not in log and "KEPT_URL=kept-value" in log
+
+
+def test_defaults_env_reaches_a_gate_even_when_the_name_is_dropped(tmp_git, tmp_path, monkeypatch):
+    monkeypatch.setenv("LEAKED_URL", "leak-sentinel-7f3a")
+    cfg = cfg_with({"show": "env"})
+    inherit = dataclasses.replace(cfg.defaults.env_inherit, drop=["LEAKED_*"])
+    defaults = dataclasses.replace(cfg.defaults, env_inherit=inherit, env={"LEAKED_URL": "from-pack"})
+    cfg = dataclasses.replace(cfg, defaults=defaults, path=tmp_git / ".agentflow" / "config.yaml")
+    (g,) = run_gates(cfg, ["show"], tmp_git, tmp_path / "logs")
+    log = g.log_path.read_text()
+    assert "LEAKED_URL=from-pack" in log and "leak-sentinel-7f3a" not in log
+
+
+def test_an_explicit_env_base_still_wins_over_the_default(tmp_git, tmp_path, monkeypatch):
+    monkeypatch.setenv("LEAKED_URL", "leak-sentinel-7f3a")
+    (g,) = run_gates(cfg_with({"show": "env"}), ["show"], tmp_git, tmp_path / "logs", env_base={"PATH": os.environ["PATH"]})
+    assert "LEAKED_URL" not in g.log_path.read_text()

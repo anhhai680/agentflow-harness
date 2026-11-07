@@ -69,7 +69,8 @@ def _checks(tmp_cfg, repo: Path, patch=None) -> dict[str, Check]:
 def test_doctor_is_all_ok_with_every_tool_present_and_logged_in(tmp_cfg, repo):
     checks = _checks(tmp_cfg, repo)
     assert {n: c.status for n, c in checks.items()} == {
-        "agent:claude": "ok", "gh": "ok", "remote": "ok", "state dir": "ok", "gate:build": "ok"}
+        "agent:claude": "ok", "gh": "ok", "remote": "ok", "state dir": "ok", "inherited environment": "ok",
+        "gate:build": "ok"}
     assert "network" in checks["gh"].detail
 
 
@@ -247,3 +248,45 @@ def test_cli_doctor_exits_1_on_any_failure_and_0_otherwise(tmp_cfg, repo, monkey
     monkeypatch.setenv("FAKE_GH_FAIL", "1")
     assert flow.main(["doctor", "--config", str(path)]) == 1
     assert "gh auth login" in capsys.readouterr().out
+
+
+def test_inherited_environment_is_ok_when_nothing_is_dropped(tmp_cfg, repo):
+    check = _checks(tmp_cfg, repo)["inherited environment"]
+    assert check.status == "ok" and "nothing" in check.detail
+
+
+def test_inherited_environment_warns_with_names_and_the_file_never_values(tmp_cfg, repo, monkeypatch):
+    (repo / ".env").write_text("X_URL=leak-sentinel-7f3a\nY_KEY=leak-sentinel-7f3a\n", encoding="utf-8")
+    monkeypatch.setenv("X_URL", "leak-sentinel-7f3a")
+    monkeypatch.setenv("Y_KEY", "leak-sentinel-7f3a")
+    check = _checks(tmp_cfg, repo)["inherited environment"]
+    assert check.status == "warn"
+    assert "X_URL" in check.detail and "Y_KEY" in check.detail and ".env" in check.detail
+    assert "leak-sentinel-7f3a" not in check.detail + check.fix
+    assert "dropped from runs" in check.fix and "defaults.env" in check.fix
+
+
+def test_inherited_environment_names_the_drop_pattern(tmp_cfg, repo, monkeypatch):
+    monkeypatch.setenv("APP_DATABASE_URL", "leak-sentinel-7f3a")
+    patch = _patch()
+
+    def both(data):
+        patch(data)
+        data["defaults"] = {**data.get("defaults", {}), "env_inherit": {"drop": ["*_DATABASE_URL"], "drop_dotenv": []}}
+
+    check = _checks(tmp_cfg, repo, both)["inherited environment"]
+    assert check.status == "warn" and "APP_DATABASE_URL" in check.detail and "*_DATABASE_URL" in check.detail
+    assert "leak-sentinel-7f3a" not in check.detail
+
+
+def test_inherited_environment_lists_a_long_set_briefly(tmp_cfg, repo, monkeypatch):
+    for i in range(60):
+        monkeypatch.setenv(f"LEAK_{i:02d}", "v")
+    patch = _patch()
+
+    def both(data):
+        patch(data)
+        data["defaults"] = {**data.get("defaults", {}), "env_inherit": {"drop": ["LEAK_*"], "drop_dotenv": []}}
+
+    check = _checks(tmp_cfg, repo, both)["inherited environment"]
+    assert check.status == "warn" and "more" in check.detail and len(check.detail) < 600

@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, TextIO
 
-from agentflow import overlays, pack, workspace
+from agentflow import overlays, pack, run_env, workspace
 from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
 from agentflow.autonomy import AUTO_BY, eligible
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
@@ -603,6 +603,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             agent_profile=sr.agent_profile,
             context_window=self.context_window_for(sr.key, sr.model),
             env=self.cfg.defaults.env,
+            env_base=run_env.base(self.cfg),
             forbidden_paths=[*self.cfg.guardrails.forbidden_paths, *sr.step.forbid],
         )
 

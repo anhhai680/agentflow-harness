@@ -554,3 +554,44 @@ def test_run_cli_detach_starts_a_background_resume(pipe, monkeypatch):
     assert call["start_new_session"] is True and call["stdin"] is not None
     assert pipe.calls() == []  # the foreground process started the run and nothing else
     assert Run.load(pipe.root, run_dir.name).state["worktree"]
+
+
+# --------------------------------------------------------------------------- the inherited environment
+
+
+def _env_events(run) -> list[dict]:
+    return [e for e in run.events.read() if e["type"] == "env_dropped"]
+
+
+def test_a_run_records_the_variables_it_does_not_inherit_by_name_only(pipe, monkeypatch):
+    (Path(pipe.cfg.path).parent.parent / ".env").write_text("X_URL=leak-sentinel-7f3a\n", encoding="utf-8")
+    monkeypatch.setenv("X_URL", "leak-sentinel-7f3a")
+    run = begin(pipe)
+    assert go(pipe, run) == "awaiting_approval"
+    (event,) = _env_events(run)
+    assert event["names"] == ["X_URL"] and run.state["env_dropped"] == ["X_URL"]
+    for name in ("events.jsonl", "state.json"):
+        assert "leak-sentinel-7f3a" not in (run.dir / name).read_text(encoding="utf-8")
+    approve(run, "define", by="me")
+    assert main(["resume", run.id]) == 0  # the same set again: nothing new
+    assert len(_env_events(run)) == 1
+
+
+def test_a_changed_set_is_recorded_again(pipe, monkeypatch):
+    dotenv = Path(pipe.cfg.path).parent.parent / ".env"
+    dotenv.write_text("X_URL=a1\n", encoding="utf-8")
+    monkeypatch.setenv("X_URL", "a1")
+    run = begin(pipe)
+    assert go(pipe, run) == "awaiting_approval"
+    monkeypatch.delenv("X_URL")
+    approve(run, "define", by="me")
+    assert main(["resume", run.id]) == 0
+    assert [e["names"] for e in _env_events(run)] == [["X_URL"], []]
+    run.refresh()
+    assert run.state["env_dropped"] == []
+
+
+def test_a_run_with_nothing_to_drop_records_nothing(pipe, monkeypatch):
+    run = begin(pipe)
+    assert go(pipe, run) == "awaiting_approval"
+    assert _env_events(run) == [] and run.state["env_dropped"] == []

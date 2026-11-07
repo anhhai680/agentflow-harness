@@ -227,6 +227,14 @@ PRICE_KEYS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h
 
 
 @dataclass
+class EnvInherit:
+    """`defaults.env_inherit`: what a run's agents and gates do not inherit from the process that started it."""
+
+    drop: list[str] = field(default_factory=list)  # names or fnmatch globs
+    drop_dotenv: list[str] = field(default_factory=lambda: [".env"])  # repo-relative files: a same-valued variable is dropped
+
+
+@dataclass
 class Defaults:
     agent: str
     step_timeout_min: int
@@ -235,6 +243,7 @@ class Defaults:
     gate_timeout_min: float = 30
     env: dict[str, str] = field(default_factory=dict)  # for every agent session and gate of a run
     task_budget_usd: float = 0  # a feature run's budget grows to fit its plan (`feature_lane._scale_budget`); 0 = off
+    env_inherit: EnvInherit = field(default_factory=EnvInherit)  # the inherited variables a run does not pass on
 
 
 @dataclass
@@ -475,6 +484,26 @@ def _string_map(value: Any, path: str) -> dict[str, str]:
     if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
         raise ConfigError(path, "must map names to strings (quote numbers)")
     return dict(value)
+
+
+def _env_inherit(value: Any) -> EnvInherit:
+    path = "defaults.env_inherit"
+    if value is None:
+        return EnvInherit()
+    if not isinstance(value, dict):
+        raise ConfigError(path, "expected a mapping with `drop` and `drop_dotenv`")
+    unknown = sorted(str(k) for k in value if k not in ("drop", "drop_dotenv"))
+    if unknown:
+        raise ConfigError(path, f"unknown key {unknown[0]!r}; expected `drop` and `drop_dotenv`")
+    default = EnvInherit()
+    return EnvInherit(
+        drop=_string_list(value["drop"], f"{path}.drop") if value.get("drop") is not None else default.drop,
+        drop_dotenv=(_string_list(value["drop_dotenv"], f"{path}.drop_dotenv")
+                     if value.get("drop_dotenv") is not None else default.drop_dotenv),
+    )
+
+
+_ENV_PATTERN = re.compile(r"[A-Za-z0-9_*?\[\]!-]{1,128}")
 
 
 def _string_list(value: Any, path: str) -> list[str]:
@@ -816,6 +845,7 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
             gate_timeout_min=_optional(defaults, "gate_timeout_min", "defaults", (int, float), 30),
             env=_string_map(defaults.get("env"), "defaults.env"),
             task_budget_usd=_optional(defaults, "task_budget_usd", "defaults", (int, float), 0),
+            env_inherit=_env_inherit(defaults.get("env_inherit")),
         ),
         effort=EffortPolicy(
             default=_require(effort, "default", "effort", str),
@@ -1273,6 +1303,18 @@ class _Validator:
             if key in (self.cfg.raw.get("defaults") or {}):
                 self.error(f"defaults.{key}", f"defaults.{key} was removed: {why}. Delete the key")
 
+    def env_inherit(self) -> None:
+        inherit = self.cfg.defaults.env_inherit
+        for index, pattern in enumerate(inherit.drop):
+            if not _ENV_PATTERN.fullmatch(pattern):
+                self.error(f"defaults.env_inherit.drop[{index}]",
+                           "drop holds variable names or globs (letters, digits, `_`, `*`, `?`, `[]`), at most 128 characters")
+        for index, rel in enumerate(inherit.drop_dotenv):
+            parts = rel.split("/")
+            if not rel or rel.startswith("/") or ".." in parts or "\0" in rel or "\\" in rel:
+                self.error(f"defaults.env_inherit.drop_dotenv[{index}]",
+                           "drop_dotenv holds repository-relative file paths: no leading `/`, no `..`")
+
     def agents(self) -> None:
         defaults = self.cfg.defaults.agent
         spec = self.cfg.agents.get(defaults)
@@ -1282,6 +1324,7 @@ class _Validator:
             self.error("defaults.agent", f"agent '{defaults}' is disabled")
         if not self.cfg.defaults.task_budget_usd >= 0:
             self.error("defaults.task_budget_usd", "task_budget_usd must be 0 (off) or a positive number of USD")
+        self.env_inherit()
         if not self.cfg.defaults.gate_timeout_min > 0:
             self.error("defaults.gate_timeout_min", "gate_timeout_min must be a positive number of minutes")
         for name, agent in self.cfg.agents.items():
