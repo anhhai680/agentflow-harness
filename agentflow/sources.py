@@ -398,6 +398,40 @@ def spec_header(text: str) -> list[tuple[str, bool]]:
     return out
 
 
+def cut_lines(text: str, limit: int = LINE_MAX) -> str:
+    """`text` with every line cut to `limit` characters: text from a git ref is untrusted, so no regex sees more."""
+    return "\n".join(line[:limit] for line in text.splitlines())
+
+
+def says_done(text: str, pattern: str) -> bool | None:
+    """Whether a line of the spec's header (`spec_header`: before its first `## `, fences left out, each line cut to
+    `LINE_MAX`) matches `pattern`, case-insensitively. None when `pattern` does not compile."""
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return None
+    return any(rx.search(line) for line, _was_cut in spec_header(text))
+
+
+_PLAN_SPEC = re.compile(r"^\s*\*\*Spec:\*\*(.*)$")
+
+
+def plan_spec(text: str) -> str | None:
+    """The basename of the first backticked path on a `**Spec:**` line of the plan's header (before its first
+    `### Task`, fences left out, each line cut to `LINE_MAX`), or None."""
+    lines = cut_lines(text).splitlines()
+    for line, inside in zip(lines, _fence_flags(lines), strict=True):
+        if inside:
+            continue
+        if _TASK_HEADING.match(line):
+            break
+        match = _PLAN_SPEC.match(line)
+        path = _BACKTICKED.search(match.group(1)) if match else None
+        if path:
+            return path.group(1).strip().rsplit("/", 1)[-1] or None
+    return None
+
+
 def header_ends(text: str) -> bool:
     """Whether `text` holds the end of a spec's header: a `## ` heading outside a code fence. A header read cut at
     `HEADER_MAX` without one may go on past the cut, so its dependencies are not all known."""

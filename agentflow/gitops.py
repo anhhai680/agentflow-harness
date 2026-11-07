@@ -400,21 +400,6 @@ def fetch_remote_branch(repo: Path, branch: str, timeout: int = 60) -> bool:
         return False
 
 
-def files_at(repo: Path, ref: str, directory: str) -> dict[str, str]:
-    """`{name: text}` for the files directly in `directory` at `ref`; empty when the ref or directory is missing."""
-    try:
-        listing = _git(Path(repo), "ls-tree", "-z", "--name-only", f"{ref}:{directory.strip('/')}")
-    except (OSError, subprocess.CalledProcessError):
-        return {}
-    files: dict[str, str] = {}
-    for name in filter(None, listing.split("\0")):
-        try:
-            files[name] = _git(Path(repo), "show", f"{ref}:{directory.strip('/')}/{name}")
-        except (OSError, subprocess.CalledProcessError, UnicodeDecodeError):
-            continue  # a subdirectory or an unreadable blob is not a plan
-    return files
-
-
 BLOB_SKIP = 4 << 20  # an entry larger than this is left out
 BLOBS_MAX = 500  # kept entries read from one directory
 BYTES_MAX = 16 << 20  # total size of the distinct blobs read from one directory

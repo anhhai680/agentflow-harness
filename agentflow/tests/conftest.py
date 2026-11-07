@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -315,6 +316,25 @@ class FlowRepo:
 
     def head(self) -> str:
         return run_git(self.root, "rev-parse", "HEAD").strip()
+
+
+def land_on_origin(flow_repo: FlowRepo, tmp_path: Path, files: dict[str, str], fetch: bool = True) -> None:
+    """Merge `files` (`{path: text}`) into origin's `fork_from` the way a merged pull request does: from another
+    clone, a fresh one per call. With `fetch`, the checkout then fetches origin, so `origin/<fork_from>` has them."""
+    clone = Path(tempfile.mkdtemp(dir=tmp_path)) / "merger"
+    run_git(tmp_path, "clone", "-q", str(flow_repo.origin), str(clone))
+    for key, value in (("user.name", "Merger"), ("user.email", "merger@example.com"), ("commit.gpgsign", "false")):
+        run_git(clone, "config", key, value)
+    run_git(clone, "checkout", "-q", flow_repo.cfg.project.fork_from)
+    for rel, text in files.items():
+        target = clone / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    run_git(clone, "add", "-A")
+    run_git(clone, "commit", "-q", "-m", "merge pull request")
+    run_git(clone, "push", "-q", "origin", flow_repo.cfg.project.fork_from)
+    if fetch:
+        run_git(flow_repo.root, "fetch", "-q", "origin")
 
 
 @pytest.fixture

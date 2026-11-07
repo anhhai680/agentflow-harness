@@ -296,6 +296,28 @@ def test_a_spec_file_that_cannot_be_filled_is_an_error(tmp_cfg, repo_root, spec_
     assert errors_at(cfg, repo_root, "project.docs.spec_file")
 
 
+def test_a_done_status_that_does_not_compile_is_an_error(tmp_cfg, repo_root):
+    cfg = load_config(tmp_cfg({"project": {"docs": {"done_status": "("}}}))
+    assert cfg.project.done_status == "("
+    found = errors_at(cfg, repo_root, "project.docs.done_status")
+    assert found and "project.docs.done_status" in found[0]
+    fine = load_config(tmp_cfg({"project": {"docs": {"done_status": r"^Status:\s*finished"}}}))
+    assert not errors_at(fine, repo_root, "project.docs.done_status")
+
+
+def test_the_default_done_status_reads_the_forms_a_spec_header_uses():
+    import re
+
+    from agentflow.config import DEFAULT_DONE_STATUS
+
+    rx = re.compile(DEFAULT_DONE_STATUS, re.IGNORECASE)
+    for line in ("Status: done", "**Status:** done", "**Status: shipped** 2026-01-02", "- **Status:** done",
+                 "> Status: done", "status: Implemented"):
+        assert rx.search(line), line
+    for line in ("Status: done-ish", "Status: not done", "Statusdone", "The Status: done"):
+        assert not rx.search(line), line
+
+
 def test_state_dir_check_without_git_does_not_crash(tmp_git, monkeypatch):
     from test_pack import write_pack
 

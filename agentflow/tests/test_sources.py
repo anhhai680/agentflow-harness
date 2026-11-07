@@ -239,3 +239,33 @@ def test_forbidden_task_files_reads_only_file_lines_outside_fences():
                     "```\n- Create: `eval/fenced.json`\n```\nNote `eval/other.json` in prose.\n", False, [])
     assert task_files(task) == ["eval/baseline.json", "src/a.py", "tests/a.py"]
     assert forbidden_task_files(task, lambda path: path.startswith("eval/")) == ["eval/baseline.json"]
+
+
+# --------------------------------------------------------------------------- origin text: cut_lines, says_done, plan_spec
+
+
+def test_cut_lines_cuts_every_line():
+    from agentflow import sources
+
+    text = "a" * 600 + "\n" + "b" * 10 + "\n" + "c" * 513
+    assert [len(line) for line in sources.cut_lines(text).splitlines()] == [512, 10, 512]
+    assert sources.cut_lines("xyz\nw", limit=2) == "xy\nw"
+
+
+def test_says_done_reads_the_header_and_refuses_a_bad_pattern():
+    from agentflow import sources
+    from agentflow.config import DEFAULT_DONE_STATUS
+
+    assert sources.says_done("# S\n\n**Status:** done\n\n## A\n", DEFAULT_DONE_STATUS) is True
+    assert sources.says_done("# S\n\n## A\n\nStatus: done\n", DEFAULT_DONE_STATUS) is False
+    assert sources.says_done("# S\n\n**Status:** done\n", "(") is None
+
+
+def test_plan_spec_is_the_basename_of_the_header_spec_path():
+    from agentflow import sources
+
+    assert sources.plan_spec("# P\n\n**Spec:** `docs/specs/SPEC-crm.md`, section A\n\n### Task 1: x\n") == "SPEC-crm.md"
+    assert sources.plan_spec("# P\n\n**Spec:** none\n\n### Task 1: x\n") is None
+    assert sources.plan_spec("# P\n\n```\n**Spec:** `a/SPEC-x.md`\n```\n") is None  # a fenced example
+    assert sources.plan_spec("# P\n\n### Task 1: x\n\n**Spec:** `a/SPEC-x.md`\n") is None  # below the header
+    assert sources.plan_spec("# P\n\n**Spec:** " + "x" * 600 + " `a/SPEC-x.md`\n") is None  # past the cut

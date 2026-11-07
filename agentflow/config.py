@@ -176,6 +176,9 @@ class Issue:
 
 DEFAULT_SKILLS_DIR = ".claude/skills"
 DEFAULT_SPEC_FILE = "{module}.md"  # a module's spec is `<docs.specs>/<spec_file>`
+# A spec header line that says the module is finished, matched per line with `re.IGNORECASE`: `Status: done`,
+# `**Status:** done`, `**Status: shipped** 2026-01-02`, `- **Status:** done`, `> Status: done`; never `done-ish`
+DEFAULT_DONE_STATUS = r"^[-*>\s]*Status[\s:*]+(done|shipped|implemented)(?![\w-])"
 REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea`, `decisions`, `glossary` are optional
 # `capability_map`: a Markdown table with `Module id` and `Depends on` columns (`sources.capability_map`);
 # `specs`: one module per spec file in `project.docs.specs`, its dependencies from the header (`sources.spec_deps`)
@@ -194,6 +197,7 @@ class Project:
     commit_trailer: str
     skills_dir: str = DEFAULT_SKILLS_DIR
     spec_file: str = DEFAULT_SPEC_FILE
+    done_status: str = DEFAULT_DONE_STATUS
 
 
 @dataclass
@@ -801,6 +805,7 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
             commit_trailer=_require(project, "commit_trailer", "project", str),
             skills_dir=_skills_dir(_optional(project, "skills_dir", "project", str, DEFAULT_SKILLS_DIR)),
             spec_file=_optional(docs, "spec_file", "project.docs", str, DEFAULT_SPEC_FILE),
+            done_status=_optional(docs, "done_status", "project.docs", str, DEFAULT_DONE_STATUS),
         ),
         agents={name: _build_agent(name, spec, f"agents.{name}") for name, spec in agents.items()},
         defaults=Defaults(
@@ -1163,6 +1168,11 @@ class _Validator:
             except (KeyError, IndexError, ValueError, AttributeError) as exc:
                 self.error("project.docs.spec_file", f"spec_file cannot be filled in ({type(exc).__name__}: {exc}): "
                            "{module} is its only placeholder; write a literal brace as {{ or }}")
+        try:
+            re.compile(self.cfg.project.done_status, re.IGNORECASE)
+        except re.error as exc:
+            self.error("project.docs.done_status", f"project.docs.done_status is not a valid regex ({exc}): it is "
+                       "matched against each line of a spec's header")
         worktrees_dir = self.cfg.project.worktrees_dir
         if worktrees_dir is not None and (posixpath.normpath(worktrees_dir.strip() or ".") == "."
                                           or posixpath.isabs(worktrees_dir)
