@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from agentflow.signals import COUNT_FAMILIES, FAMILIES, aggregate_signals, parse_target, run_signals
 
