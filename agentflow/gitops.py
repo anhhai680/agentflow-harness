@@ -261,12 +261,14 @@ def commit_lessons(worktree: Path, message: str, cfg: Config) -> str:
 
     In order: the message is checked against `guardrails.reject_trailers` before anything is staged (a rejected
     trailer raises `CommitRejected` and changes nothing). Any other changed, staged or untracked path, a type
-    change, a symlink at the lessons file or at its directory, or a lessons path that is not a regular file
-    inside the worktree raises `CommitRejected` (kind `forbidden_path`) after the index is reset to `HEAD`.
+    change, a symlink at the lessons file or at its directory, a hard-linked lessons file, or a lessons path that
+    is not a regular file inside the worktree raises `CommitRejected` (kind `forbidden_path`) after the index is
+    reset to `HEAD`.
     An unchanged or absent lessons file raises `NothingToCommit`. The commit runs with no hooks
     (`core.hooksPath=/dev/null`, `--no-verify`) and is limited to the lessons path. The commit actually created
-    is checked again: one parent, the old `HEAD`; exactly the lessons file changed, as a regular file; no
-    rejected trailer. A failure raises `CommitRejected` naming the commit, which is left in place for a human
+    is checked again: one parent, the old `HEAD`; exactly the lessons file changed, as a regular file whose blob
+    is the one checked and staged (`git commit -- <path>` reads the file again, so a swap in between shows here);
+    no rejected trailer. A failure raises `CommitRejected` naming the commit, which is left in place for a human
     (never rolled back silently)."""
     worktree = Path(worktree)
     before = head(worktree)
@@ -292,6 +294,8 @@ def commit_lessons(worktree: Path, message: str, cfg: Config) -> str:
         raise NothingToCommit(f"{LESSONS_FILE} is unchanged or absent in {worktree}")
     if not lessons.is_file() or lessons.resolve() != worktree.resolve() / LESSONS_FILE:
         raise _lessons_refused(worktree, f"{LESSONS_FILE} is not a regular file inside the worktree")
+    if os.lstat(lessons).st_nlink != 1:
+        raise _lessons_refused(worktree, f"{LESSONS_FILE} is a hard link (it has other names, maybe outside the worktree)")
 
     _git_or_raise(worktree, "add", "--", LESSONS_FILE)
     raw = [f for f in _git(worktree, "diff", "--cached", "--raw", "-z", "--no-renames", "--no-abbrev").split("\0") if f]
@@ -300,8 +304,9 @@ def commit_lessons(worktree: Path, message: str, cfg: Config) -> str:
         raise NothingToCommit(f"{LESSONS_FILE} is unchanged in {worktree}")
     if staged != [LESSONS_FILE]:
         raise _lessons_refused(worktree, "the index holds other paths: " + ", ".join(repr(p) for p in staged))
-    if raw[0].split()[1] != "100644":
-        raise _lessons_refused(worktree, f"{LESSONS_FILE} would be committed with mode {raw[0].split()[1]}, "
+    _, mode, _, blob, *_ = raw[0].split()
+    if mode != "100644":
+        raise _lessons_refused(worktree, f"{LESSONS_FILE} would be committed with mode {mode}, "
                                "not as a regular file (100644)")
 
     proc = subprocess.run(
@@ -326,6 +331,9 @@ def commit_lessons(worktree: Path, message: str, cfg: Config) -> str:
         why, kind = "it changes " + ", ".join(repr(p) for p in changed) + f", not only {LESSONS_FILE}", "forbidden_path"
     elif not entry or entry[0] != "100644":
         why, kind = f"it records {LESSONS_FILE} with mode {entry[0] if entry else 'none'}, not 100644", "forbidden_path"
+    elif entry[2] != blob:
+        why, kind = (f"it records {LESSONS_FILE} as blob {entry[2][:12]}, not the checked and staged {blob[:12]} "
+                     "(the file changed between the check and the commit)"), "forbidden_path"
     else:
         return sha
     raise CommitRejected(f"commit {sha[:12]} was created, but {why}; it is left in place for a human to inspect "

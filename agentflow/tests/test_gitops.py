@@ -366,6 +366,47 @@ def test_commit_lessons_checks_the_commit_it_created(tmp_git, cfg, monkeypatch, 
     assert caught.value.kind == kind
 
 
+def _tamper_before_commit(monkeypatch, tamper) -> None:
+    """Run `tamper()` after every check on the staged lessons file, just before `commit_lessons` runs `git commit`."""
+    real = gitops.subprocess.run
+
+    def run(args, *a, **kw):
+        if isinstance(args, list) and "commit" in args and "--no-verify" in args:
+            tamper()
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitops.subprocess, "run", run)
+
+
+@pytest.mark.parametrize("swap", ["dir_symlink", "content"])
+def test_commit_lessons_checks_the_committed_blob_is_the_staged_one(tmp_git, cfg, monkeypatch, tmp_path, swap):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "lessons.md").write_text("EXTERNAL\n", encoding="utf-8")
+
+    def do() -> None:
+        if swap == "dir_symlink":
+            (tmp_git / ".agentflow").rename(tmp_path / "moved-pack")
+            os.symlink(outside, tmp_git / ".agentflow")
+        else:
+            (tmp_git / LESSONS).write_text("EXTERNAL\n", encoding="utf-8")
+
+    _tamper_before_commit(monkeypatch, do)
+    _write_lessons(tmp_git)
+    with pytest.raises(CommitRejected, match="left in place") as caught:
+        commit_lessons(tmp_git, "Add lessons.", cfg)
+    assert caught.value.kind == "forbidden_path"
+    assert "not the checked and staged" in str(caught.value)
+
+
+def test_commit_lessons_refuses_a_hard_linked_lessons_file(tmp_git, cfg, tmp_path):
+    outside = tmp_path / "outside-lessons.md"
+    outside.write_text("planted\n", encoding="utf-8")
+    (tmp_git / ".agentflow").mkdir()
+    os.link(outside, tmp_git / LESSONS)
+    _assert_refused(tmp_git, cfg, match="hard link")
+
+
 def test_plain_commit_still_refuses_the_lessons_file(tmp_git, cfg):
     before = _head(tmp_git)
     _write_lessons(tmp_git)
