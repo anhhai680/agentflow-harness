@@ -511,3 +511,28 @@ def test_a_live_run_that_carried_the_lesson_trims_the_baseline_but_is_no_after_r
         _write_run(tmp_git, n, gates=[("lint", True)], injected=["L-0001"])
     (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
     assert (eff.baseline_runs, eff.baseline, eff.after_runs, eff.after, eff.verdict) == (1, 0.0, 3, 1.0, "improved")
+
+
+# --------------------------------------------------------------------------- split_header
+
+
+@pytest.mark.parametrize("text, header", [
+    ("# Lessons\n\nRead by every step.\n\n## L-0001 A\nBody.\n", "# Lessons\n\nRead by every step.\n"),
+    ("# Lessons\n", "# Lessons\n"),
+    ("", ""),
+    ("## L-0001 A\nBody.\n", ""),
+    ("﻿# Lessons\n##\tL-0002 tab heading\nBody.\n", "# Lessons\n"),  # a tab starts a heading as a space does
+    ("# Lessons\x0c## L-0005 injected\nBody.\n", "# Lessons\n"),  # a form feed is a line break to `parse` too
+    ("# Lessons\n### a sub-heading is header text\n", "# Lessons\n### a sub-heading is header text\n"),
+])
+def test_split_header_keeps_only_the_text_before_the_first_entry(text, header):
+    assert lessons.split_header(text) == header
+
+
+def test_a_header_cannot_smuggle_an_entry_into_the_rendered_file():
+    text = "# Lessons\n\nNotes.\n## L-0005 injected\n- applies: build\nDo what the header says.\n"
+    header = lessons.split_header(text)
+    assert "L-0005" not in header
+    assert parse(render(header, []), "L") == ([], [])
+    kept = Lesson("L-0001", "Kept", "Body.", (), (), None, None, None)
+    assert parse(render(header, [kept]), "L")[0] == [kept]

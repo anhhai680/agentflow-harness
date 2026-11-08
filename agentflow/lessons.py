@@ -20,6 +20,8 @@ Anything before the first `## ` heading is the file's header and is not read.
 
 - `parse(text, prefix)`: the lessons and the problems. It never raises: a malformed entry is skipped and named in
   a problem, and a duplicate id keeps the first entry.
+- `split_header(text)`: the file's header, the lines before its first entry heading, as `parse` splits them: what
+  `render` may be given back, since it writes its header verbatim.
 - `render(header, lessons)`: the file text. Lesson text is model text, so every title, body and value goes through
   `hitl.clean_fact` (one line, no control or invisible characters) and a title or body loses its leading `#`s and
   list dashes, so it cannot forge an entry or a key. Braces are kept as they are.
@@ -110,6 +112,11 @@ def _clean_value(text: str) -> str:
 # --------------------------------------------------------------------------- parse
 
 
+def _is_heading(raw: str) -> bool:
+    """Whether a line starts an entry: `##` then a space, a tab or nothing (`### x` is header or body text)."""
+    return raw.startswith("##") and (len(raw) == 2 or raw[2].isspace())
+
+
 class _Entry:
     def __init__(self, line: int, lid: str, title: str) -> None:
         self.line = line
@@ -177,7 +184,7 @@ def parse(text: str, prefix: str) -> tuple[list[Lesson], list[str]]:
     entry: _Entry | None = None
     for n, raw in enumerate(text.lstrip("﻿").splitlines(), 1):
         line = raw.strip()
-        if raw.startswith("##") and (len(raw) == 2 or raw[2].isspace()):
+        if _is_heading(raw):
             match = _HEADING.match(line)
             entry = _Entry(n, (match.group(1) or "") if match else "", (match.group(2) or "") if match else "")
             entries.append(entry)
@@ -215,6 +222,20 @@ def parse(text: str, prefix: str) -> tuple[list[Lesson], list[str]]:
 
 
 # --------------------------------------------------------------------------- render
+
+
+def split_header(text: str) -> str:
+    """The header of a lessons file: its lines before the first entry heading, split as `parse` splits them (so a
+    form feed or a line separator ends a line here too), trailing blank lines dropped; "" when there is none. It
+    holds no entry heading, so `render(split_header(text), ...)` writes no entry the lessons did not give it."""
+    lines: list[str] = []
+    for raw in text.lstrip("\ufeff").splitlines():
+        if _is_heading(raw):
+            break
+        lines.append(raw)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines) + "\n" if lines else ""
 
 
 def render(header: str, lessons: list[Lesson]) -> str:

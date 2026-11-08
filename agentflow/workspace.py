@@ -7,8 +7,8 @@ may write, so nothing an agent writes can change a run's state.
 
 Before every agent call, `prepare` refreshes the workspace's read-only-by-convention copies of the run's
 inputs from the run directory, which stays the source of truth: `issue.md`, `bug.log`, `task.md`,
-`questions.md`, `handoff.md`, `handoffs/*.md` and `results/*.json` (the checked results of earlier
-steps). Whatever the agent left at those names (an edit, a symlink, a folder) is replaced, never written
+`questions.md`, `handoff.md`, `handoffs/*.md`, `results/*.json` (the checked results of earlier
+steps) and, for a retro run, `retro/digest.md` as `digest.md` (`RETRO_DIGEST`). Whatever the agent left at those names (an edit, a symlink, a folder) is replaced, never written
 through. The agent writes its result to `out/<step>.json` (`AGENTFLOW_RESULT`) and its notes to
 `progress.md`; the runner reads only those two, and `take_result` copies a result into the run
 directory (`Run.result_path`) before anything parses it, so later readers see the checked copy only.
@@ -27,8 +27,11 @@ INPUT_FILES = ("issue.md", "bug.log", "task.md", "questions.md", "handoff.md")
 INPUT_DIRS = {"handoffs": "*.md", "results": "*.json"}
 OUT_DIR = "out"
 RESULT_LIMIT = 1_000_000  # bytes; a result file is a few lines of JSON
+RETRO_DIGEST = ("retro", "digest.md")  # a retro run's digest, under its run directory; the workspace gets `digest.md`
+DIGEST_NAME = "digest.md"
+DIGEST_LIMIT = 4_000_000  # bytes; a digest is capped by `memory.digest_tokens`, but its fixed sections are not
 
-__all__ = ["INPUT_DIRS", "INPUT_FILES", "OUT_DIR", "clear_result", "prepare", "take_result"]
+__all__ = ["INPUT_DIRS", "INPUT_FILES", "OUT_DIR", "RETRO_DIGEST", "clear_result", "prepare", "take_result"]
 
 
 def _real_dir(path: Path) -> Path:
@@ -57,6 +60,22 @@ def _mirror(source: Path, target: Path) -> None:
         safeio.remove(target)
 
 
+def _mirror_digest(run: Run, target: Path) -> None:
+    """Copy a retro run's digest to `target`, or remove `target` when there is none. The digest is read without
+    following a symlink, at the file or at its folder, so only the runner's own file is ever copied."""
+    folder = run.dir / RETRO_DIGEST[0]
+    data = None
+    if not folder.is_symlink() and folder.is_dir():
+        try:
+            data = safeio.read_bytes(folder / RETRO_DIGEST[1], DIGEST_LIMIT)
+        except (OSError, ValueError):
+            data = None
+    if data is None:
+        safeio.remove(target)
+    else:
+        safeio.replace_file(target, data)
+
+
 def prepare(run: Run) -> Path:
     """Refresh the workspace's copies of the run's inputs; returns the workspace directory."""
     root = _root(run)
@@ -70,6 +89,7 @@ def prepare(run: Run) -> Path:
                 safeio.remove(entry)
         for name in sorted(wanted):
             _mirror(run.dir / folder / name, target / name)
+    _mirror_digest(run, root / DIGEST_NAME)
     _real_dir(root / OUT_DIR)
     return root
 

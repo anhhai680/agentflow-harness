@@ -653,13 +653,15 @@ FULL_PACKS = {"python": PYTHON_CONFIG, "node": PACKS / "node" / ".agentflow" / "
 # Where a full pack's loaded config differs from the same file loaded alone (`layered=False`), and why. A full pack
 # writes its whole workflow, so the engine's workflow never applies to it; only keys outside the workflow it left
 # unset can come from the engine defaults.
+_RETRO_STEP = "the engine's retro step: a retro is the engine's pipeline, so no pack needs to state it"
 INHERITED = {
-    "python": {},
+    "python": {"retro_step": _RETRO_STEP},
     "node": {
         "agents.codex": "the engine's codex agent, disabled: it runs no step unless the pack enables it",
         "agents.claude.prices": "the engine's price table: it prices only a session Claude reported no cost for",
+        "retro_step": _RETRO_STEP,
     },
-    "this repo": {},
+    "this repo": {"retro_step": _RETRO_STEP},
 }
 # The keys of `defaults`, `context`, `effort` and `recovery` that load_config requires (no code fallback). The engine
 # defaults hold the values the engine's minimum fixture pack (`node`) writes for them.
@@ -1267,3 +1269,30 @@ def test_memory_bounds_are_validated(tmp_cfg, key, value):
                                        ("digest_tokens", 50000), ("retro_every_days", 0), ("retro_every_days", 90)])
 def test_memory_bounds_are_inclusive(tmp_cfg, key, value):
     assert not [i for i in issues_for(tmp_cfg, {"memory": {key: value}}) if i.path.startswith("memory")]
+
+
+# --------------------------------------------------------------------------- the retro step
+
+
+def test_the_retro_step_comes_from_the_engine_defaults(cfg):
+    step = cfg.retro_step
+    assert step is not None
+    assert (step.id, step.skill, step.role, step.prompt, step.commit) == ("retro", "agentflow-retro", "review",
+                                                                          "retro.md", False)
+    assert DEFAULTS["retro_step"] == {"id": "retro", "skill": "agentflow-retro", "role": "review", "prompt": "retro.md"}
+    assert "retro_step" not in layers.WORKFLOW_KEYS  # a pack that writes its whole workflow keeps it
+
+
+def test_a_pack_lane_named_retro_is_refused(tmp_cfg):
+    def patch(data):
+        data["lanes"] = [*data["lanes"], "retro"]
+
+    issues = issues_for(tmp_cfg, patch)
+    [issue] = [i for i in issues if i.level == "error" and i.path.startswith("lanes")]
+    assert issue.path == "lanes[4]" and "retro" in issue.message
+
+
+def test_a_broken_retro_step_is_an_error(tmp_cfg):
+    issues = issues_for(tmp_cfg, {"retro_step": {"id": "retro", "skill": "no-such-skill", "role": "review",
+                                                 "prompt": "retro.md"}})
+    assert ("error", "retro_step.skill") in errors(issues)

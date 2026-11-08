@@ -385,6 +385,7 @@ class Config:
     recovery: Recovery = field(default_factory=Recovery)
     autonomy: dict = field(default_factory=dict)
     resolve_step: Step | None = None
+    retro_step: Step | None = None  # the one session of a retro run (`retro.run_retro`); not part of any lane
     ci: dict = field(default_factory=dict)
     work_source: WorkSource | None = None  # None: no modules to queue; `next` and the Backlog go on without them
     skills_map: dict[str, str] = field(default_factory=dict)  # the skill `next` names per kind of step (`skills.map`)
@@ -917,6 +918,7 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
         ),
         autonomy=_optional(raw, "autonomy", "", dict, {}),
         resolve_step=builder.step(raw["resolve_step"], "resolve_step") if raw.get("resolve_step") else None,
+        retro_step=builder.step(raw["retro_step"], "retro_step") if raw.get("retro_step") else None,
         ci=_optional(raw, "ci", "", dict, {}),
         work_source=_work_source(raw),
         skills_map=_skills_map(raw),
@@ -1453,6 +1455,16 @@ class _Validator:
             self.step(cfg.record_step, {cfg.record_step.id})
         if cfg.resolve_step is not None:
             self.step(cfg.resolve_step, {cfg.resolve_step.id})
+        if cfg.retro_step is not None:
+            self.step(cfg.retro_step, {cfg.retro_step.id})
+
+    def lanes(self) -> None:
+        """`retro` is the engine's own pipeline (`RETRO_PIPELINE`): a lane of that name would make its runs read as
+        retros, which no digest reads and no lesson counts."""
+        for i, lane in enumerate(self.cfg.lanes):
+            if lane == RETRO_PIPELINE:
+                self.error(f"lanes[{i}]", f"`{RETRO_PIPELINE}` is the engine's retro pipeline, not a lane: "
+                           "give this lane another name")
 
     def approval_note(self, phase: Phase, path: str) -> None:
         note = phase.approval_note
@@ -1697,6 +1709,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.agents()
     v.gate_definitions()
     v.bug_lane()
+    v.lanes()
     v.conditions()
     v.phases()
     v.effort()

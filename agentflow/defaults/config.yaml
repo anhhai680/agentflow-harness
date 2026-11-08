@@ -130,6 +130,9 @@ record_step:                   # a spec gap settled during a run: it files the a
 resolve_step:                  # a stop in a `resolve: true` phase, run before a human hears of it
   {id: resolve, skill: "@skills.map.debug", role: plan, prompt: resolve.md}
 
+retro_step:                    # the one session of a retro run (`agentflow retro`): it proposes lessons and changes no file
+  {id: retro, skill: agentflow-retro, role: review, prompt: retro.md}
+
 autonomy:
   non_blocking_severities: [minor, low, info, nit]
   finding_rounds: 2

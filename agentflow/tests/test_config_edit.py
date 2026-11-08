@@ -201,6 +201,17 @@ def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
 
 
+def test_retro_step_is_protected(shipped):
+    assert "retro_step" in config_edit.PROTECTED
+    with pytest.raises(Refused):  # the form has no field for it
+        form(shipped, (["retro_step", "prompt"], "other.md"))
+    _, sha = config_edit.read(shipped)
+    for added in ("retro_step: {id: retro, skill: agentflow-retro, role: review, prompt: refine.md}\n",
+                  "retro_step: null\n"):  # what the retro session reads, or no retro at all
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)
+
+
 def test_the_inherited_environment_settings_are_protected(shipped):
     _, sha = config_edit.read(shipped)
     old = '    POSTGRES_HOST_PORT: "55432"\n'
