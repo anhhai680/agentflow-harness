@@ -831,7 +831,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         for r in results:
             self.run.emit("gate_result", key=sr.key, gate=r.name, passed=r.passed, skipped=r.skipped,
                           reason=r.reason, log=str(r.log_path) if r.log_path else None,
-                          duration_s=r.duration_s)
+                          duration_s=r.duration_s, tail="" if (r.passed or r.skipped) else r.tail)
         return [] if gates_ok(results) else [r for r in results if not (r.passed or r.skipped)]
 
     def _prerun_still_holds(self, sr: _StepRun) -> bool:

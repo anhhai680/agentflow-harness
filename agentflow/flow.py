@@ -825,7 +825,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
 
     try:
         run = find_run(_find_repo(), args.run)
-        key = retry(run, args.key, _by(args))
+        key = retry(run, args.key, _by(args), reason=args.reason)
         print(f"retrying {key} for {run.id}.")
         return _continue(run, args)
     except _human_errors() as exc:
@@ -1030,6 +1030,7 @@ def build_parser() -> argparse.ArgumentParser:
     ret.add_argument("run")
     ret.add_argument("key", nargs="?", help="the step key to retry (default: the run's failed step)")
     ret.add_argument("--by", help="who is retrying (default: the current user)")
+    ret.add_argument("--reason", metavar="TEXT", help="why the step is retried; recorded for the run's lessons")
     _continue_flags(ret)
     ret.set_defaults(func=cmd_retry)
 

@@ -136,6 +136,19 @@ def test_fix_loop_resumes_and_stops(flow_repo):
     assert not [e for e in flow_repo.events(run, "step_finished") if e.get("status") == "done"]
 
 
+def test_a_failed_gate_result_carries_its_tail(flow_repo):
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, make_step(gates=["fail"], fix_loop=True)) == "stopped"
+    ev = flow_repo.events(run, "gate_result")[-1]
+    assert ev["passed"] is False and "boom" in ev["tail"]
+
+
+def test_a_passed_gate_result_has_an_empty_tail(flow_repo):
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, make_step(gates=["ok"], fix_loop=True)) == "done"
+    assert flow_repo.events(run, "gate_result")[-1]["tail"] == ""
+
+
 def test_fix_loop_keeps_high_effort(flow_repo):
     run = flow_repo.new_run()
     flow_repo.script({KEY: [{"result": {"status": "effort_change", "effort": "high", "reason": "hard"}}]})

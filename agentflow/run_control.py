@@ -300,7 +300,7 @@ def wait_for_agents(run: Run, cfg: Config, key: str, timeout_s: float, grace_s: 
 # --------------------------------------------------------------------------- retry
 
 
-def retry(run: Run, key: str | None, by: str) -> str:
+def retry(run: Run, key: str | None, by: str, reason: str | None = None) -> str:
     """Put `key` (default: the run's failed step) back to pending; returns the key. The caller resumes."""
     with run.locked():
         _refuse_terminal(run, "retry")
@@ -320,7 +320,7 @@ def retry(run: Run, key: str | None, by: str) -> str:
             if waiting.get("kind") == "phase_approval" or waiting.get("questions"):
                 raise ControlError(f"{key!r} waits for an answer or an approval, not a retry")
             run.emit("hitl_approved", by=by, key=key, kind=waiting["kind"], summary=waiting.get("summary", ""))
-        run.emit("step_retry", by=by, key=key)
+        run.emit("step_retry", by=by, key=key, reason=reason)
     return key
 
 

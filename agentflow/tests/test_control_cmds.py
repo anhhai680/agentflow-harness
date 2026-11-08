@@ -244,6 +244,22 @@ def test_retry_failed_step_resumes(pipe, git):
     assert run.state["steps"]["define/idea/idea_questions"]["status"] == "done"
 
 
+def test_retry_records_the_humans_reason(pipe):
+    run = pipe.new_run()
+    run.emit("step_started", key="build/x", phase="build")
+    retry(run, "build/x", "human", reason="flaky network")
+    retry(run, "build/x", "human")
+    events = pipe.events(run, "step_retry")
+    assert [e["reason"] for e in events] == ["flaky network", None]
+
+
+def test_cli_retry_takes_a_reason(pipe, capsys):
+    run = pipe.new_run()
+    run.emit("step_started", key="build/x", phase="build")
+    assert main(["retry", run.id, "build/x", "--reason", "flaky network", "--no-continue"]) == 0
+    assert pipe.events(run, "step_retry")[-1]["reason"] == "flaky network"
+
+
 def test_retry_keeps_the_guard_on_an_unreverted_violation(pipe):
     pipe.script({"define/idea/idea_questions": [{"write": {"CONSTRAINTS.md": "weaker\n"}, "result": DONE}]})
     run = begin(pipe)

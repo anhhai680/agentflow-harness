@@ -331,6 +331,9 @@ def _title_for(cfg: Config, run: Run) -> str:
 # --------------------------------------------------------------------------- stopping for a human
 
 
+EVENT_EXTRA_MAX = 4000  # the stop report kept in `hitl_raised`: the last characters, where a log's cause is
+
+
 def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questions: list[Question] | tuple = (), extra: str = "") -> Path:
     """Stop the run for a human: write the inbox file, record `hitl_raised`, notify. Returns the inbox path."""
     questions = list(questions)
@@ -338,7 +341,7 @@ def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questio
     path = run.inbox_path(key)
     render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
     run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
-             questions=[asdict(q) for q in questions], inbox=str(path))
+             questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:])
     from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
 
     if not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions]):
