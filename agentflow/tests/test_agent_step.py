@@ -1285,3 +1285,124 @@ def test_a_pack_override_without_the_placeholder_still_renders(flow_repo):
     prompt = self_checks_prompt(flow_repo, "task.md", gates, {"build": ["py_lint"]})
     assert OLD_LINT_LINE in prompt
     assert "{self_checks}" not in prompt and "lint ." not in prompt
+
+
+# --------------------------------------------------------------------------- lessons from earlier runs
+
+
+@pytest.fixture
+def no_engine_lessons(flow_repo, monkeypatch, tmp_path):
+    """Lessons on (the suite's pack turns them off) and the engine's seed lessons out of the way, so a test sees
+    only the pack's lessons file."""
+    from agentflow import pack
+
+    flow_repo.cfg.memory.lessons_max_tokens = 1500
+    monkeypatch.setattr(pack, "ENGINE_LESSONS", tmp_path / "no-engine-lessons.md")
+
+
+def _write_pack_lessons(flow_repo, text: str) -> None:
+    pack_dir = flow_repo.root / ".agentflow"
+    pack_dir.mkdir(exist_ok=True)
+    (pack_dir / "lessons.md").write_text(text, encoding="utf-8")
+
+
+LESSON_ONE = "## L-0001 Lint first\n- review_by: 2099-01-01\nRun `ruff`.\n"
+
+
+def test_no_lessons_no_heading_and_no_blank_lines(flow_repo, no_engine_lessons):
+    flow_repo.new_run()
+    prompt = _prompt(flow_repo)
+    assert "Lessons from earlier runs" not in prompt and "{lessons}" not in prompt
+    assert "\n\n\n" not in prompt.split("## The step")[0]
+    assert re.search(r"stop as `blocked` and name the exact command\.\n\n## The step\n\n", prompt)
+
+
+def test_pack_lessons_go_into_the_preamble(flow_repo, no_engine_lessons):
+    flow_repo.new_run()
+    _write_pack_lessons(flow_repo, LESSON_ONE)
+    prompt = _prompt(flow_repo)
+    assert "- **L-0001** Lint first: Run `ruff`." in prompt
+    assert prompt.index("Lessons from earlier runs") < prompt.index("## The step")
+    assert "\n\n\n" not in prompt.split("## The step")[0]
+
+
+def test_lessons_follow_the_code_map(flow_repo, no_engine_lessons):
+    run = flow_repo.new_run()
+    run.emit("code_noted", text="`a.py:1` `f()`", key="build/x")
+    _write_pack_lessons(flow_repo, LESSON_ONE)
+    prompt = _prompt(flow_repo)
+    assert prompt.index("Code this run has mapped") < prompt.index("Lessons from earlier runs") < prompt.index("## The step")
+
+
+def test_lesson_braces_go_in_verbatim(flow_repo, no_engine_lessons):
+    flow_repo.new_run()
+    _write_pack_lessons(flow_repo, "## L-0001 Braces\nUse {step_id} and {run} as they are.\n")
+    prompt = _prompt(flow_repo)
+    assert "- **L-0001** Braces: Use {step_id} and {run} as they are." in prompt
+
+
+def test_expired_lesson_leaves_the_prompt(flow_repo, no_engine_lessons):
+    flow_repo.new_run()
+    _write_pack_lessons(flow_repo, "## L-0001 Old\n- review_by: 2020-01-01\nStale advice.\n")
+    prompt = _prompt(flow_repo)
+    assert "Stale advice" not in prompt and "Lessons from earlier runs" not in prompt
+
+
+def test_the_engine_lessons_are_in_the_prompt_unless_turned_off(flow_repo):
+    flow_repo.new_run()
+    assert "Lessons from earlier runs" not in _prompt(flow_repo)  # the suite's pack turns lessons off
+    flow_repo.cfg.memory.lessons_max_tokens = 1500
+    assert "**E-0001**" in _prompt(flow_repo)
+    flow_repo.cfg.memory.lessons_max_tokens = 0
+    assert "Lessons from earlier runs" not in _prompt(flow_repo)
+
+
+def test_lessons_for_another_phase_are_left_out(flow_repo, no_engine_lessons):
+    run = flow_repo.new_run()
+    _write_pack_lessons(flow_repo, "## L-0001 Build only\n- applies: build\nA build rule.\n"
+                                   "## L-0002 Review only\n- applies: review\nA review rule.\n")
+    ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
+    prompt = build_prompt(flow_repo.cfg, make_step(), ctx, {"sized": True, "agent": "claude", "role": "build"},
+                          {"phase": "build"}, "normal")
+    assert "A build rule." in prompt and "A review rule." not in prompt
+
+
+def test_a_fresh_session_records_lessons_injected_and_citations(flow_repo, no_engine_lessons):
+    run = flow_repo.new_run()
+    _write_pack_lessons(flow_repo, LESSON_ONE)
+    result = {"status": "done", "summary": "did it", "lessons_cited": ["L-0001", "L-0042"]}
+    flow_repo.script({KEY: [{"result": result}]})
+    assert run_step(flow_repo) == "done"
+    injected = flow_repo.events(run, "lessons_injected")
+    assert [(e["key"], e["ids"]) for e in injected] == [(KEY, ["L-0001"])]
+    assert re.fullmatch(r"[0-9a-f]{12}", injected[0]["digest"])
+    assert [(e["key"], e["id"]) for e in flow_repo.events(run, "lesson_cited")] == [(KEY, "L-0001")]
+    assert flow_repo.events(run, "memory_truncated") == []
+
+
+def test_a_resumed_session_records_no_second_injection(flow_repo, no_engine_lessons):
+    run = flow_repo.new_run()
+    _write_pack_lessons(flow_repo, LESSON_ONE)
+    flow_repo.script({KEY: [{}, {"result": DONE}]})  # no result file the first time: the runner resumes the session
+    assert run_step(flow_repo) == "done"
+    assert len(flow_repo.calls()) == 2
+    assert len(flow_repo.events(run, "lessons_injected")) == 1
+
+
+def test_citing_without_an_injection_records_nothing(flow_repo, no_engine_lessons):
+    run = flow_repo.new_run()
+    result = {"status": "done", "summary": "did it", "lessons_cited": ["L-0001"]}
+    flow_repo.script({KEY: [{"result": result}]})
+    assert run_step(flow_repo) == "done"
+    assert flow_repo.events(run, "lessons_injected") == [] and flow_repo.events(run, "lesson_cited") == []
+
+
+def test_lessons_that_do_not_fit_are_reported_as_truncated(flow_repo, no_engine_lessons):
+    run = flow_repo.new_run()
+    _write_pack_lessons(flow_repo, "## L-0001 One\nFirst rule " + "x" * 200 + "\n## L-0002 Two\nSecond rule.\n")
+    flow_repo.cfg.memory.lessons_max_tokens = 60
+    flow_repo.script({KEY: [{"result": DONE}]})
+    assert run_step(flow_repo) == "done"
+    assert [(e["key"], e["tier"], e["dropped"]) for e in flow_repo.events(run, "memory_truncated")] == \
+        [(KEY, "lessons", ["L-0001"])]
+    assert flow_repo.events(run, "lessons_injected")[0]["ids"] == ["L-0002"]

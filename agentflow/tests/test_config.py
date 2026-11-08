@@ -1251,7 +1251,8 @@ def test_validate_refuses_an_agent_check_the_agent_cannot_run_as_written(tmp_cfg
 # --------------------------------------------------------------------------- the memory section
 
 
-def test_memory_defaults(cfg):
+def test_memory_defaults(tmp_cfg):
+    cfg = load_config(tmp_cfg({"memory": {"lessons_max_tokens": None}}))  # the suite's pack sets it to 0; deleted, the default shows
     assert (cfg.memory.lessons_max_tokens, cfg.memory.digest_tokens, cfg.memory.retro_every_days) == (1500, 15000, 7)
 
 

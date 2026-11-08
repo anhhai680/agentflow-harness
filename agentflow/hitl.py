@@ -33,6 +33,8 @@ ANSWER_LINE = re.compile(r"^Answer:[ \t]*(.*)$", re.MULTILINE)
 FACT_MAX = 300  # characters of one `facts` entry
 FACTS_PER_RESULT = 5
 CODE_MAP_PER_RESULT = 8  # lines of one `code_map`: existing code the step found, kept for the run
+LESSONS_CITED_PER_RESULT = 10  # ids in one `lessons_cited`
+LESSON_ID = re.compile(r"[LE]-\d{4}\Z")
 _INVISIBLE_CATEGORIES = ("Cc", "Cf")  # control characters, and format ones: bidi overrides, zero-width, BOM
 DEFAULT_TITLE = "agentflow: {run} needs you"
 NOTIFY_TIMEOUT_S = 10
@@ -84,6 +86,7 @@ class StepResult:
     risks: list = field(default_factory=list)
     facts: list[str] = field(default_factory=list)
     code_map: list[str] = field(default_factory=list)
+    lessons_cited: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- result.json
@@ -110,6 +113,14 @@ def _parse_lines(raw: Any, name: str, cap: int) -> list[str]:
     if not isinstance(raw, list) or not all(isinstance(f, str) for f in raw):
         raise ResultError(f"{name} must be a list of strings")
     return [line for line in (clean_fact(f) for f in raw[:cap]) if line]
+
+
+def _parse_lesson_ids(raw: Any) -> list[str]:
+    """The `lessons_cited` field of a result: a list of lesson ids (`L-0007`, `E-0003`), the first
+    `LESSONS_CITED_PER_RESULT` of them kept. Anything else is refused: the ids are only looked up, never trusted."""
+    if not isinstance(raw, list) or not all(isinstance(i, str) and LESSON_ID.match(i) for i in raw):
+        raise ResultError("lessons_cited must be a list of lesson ids such as L-0007 or E-0003")
+    return raw[:LESSONS_CITED_PER_RESULT]
 
 
 def _parse_question(raw: Any, index: int) -> Question:
@@ -176,6 +187,7 @@ def read_result(path: Path, refine: bool = False) -> StepResult:
         raise ResultError("signals must be an object; findings and risks must be lists")
     facts = _parse_lines(raw.get("facts", []), "facts", FACTS_PER_RESULT)
     code_map = _parse_lines(raw.get("code_map", []), "code_map", CODE_MAP_PER_RESULT)
+    lessons_cited = _parse_lesson_ids(raw.get("lessons_cited", []))
     return StepResult(
         status=status,
         summary=nfc(summary),
@@ -189,6 +201,7 @@ def read_result(path: Path, refine: bool = False) -> StepResult:
         risks=nfc(risks),
         facts=facts,
         code_map=code_map,
+        lessons_cited=lessons_cited,
     )
 
 
