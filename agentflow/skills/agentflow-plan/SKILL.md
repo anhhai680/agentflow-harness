@@ -31,9 +31,9 @@ Each task is a level-3 heading `### Task N: <title>` with N counting from 1. Und
 - Test: `tests/names_test.py`
 
 **Interfaces:**
-- Uses: `app/names.py:12` `normalise(name: str) -> str`
-- From earlier tasks: none
-- Produces: `app/greet.py` `greet(name: str) -> str`
+- Uses: `app/errors.py:4` `class AppError(ValueError)`
+- From earlier tasks: `app/names.py` `normalise(name: str) -> str` (Task 1)
+- Produces: `app/names.py` `normalise(name: str) -> str` now raises `AppError` on an empty name
 
 - [ ] **Step 1: Write the failing test** for an empty name, and run it. Expected: it fails.
 - [ ] **Step 2: Reject the empty name**, then run the test. Expected: it passes.
