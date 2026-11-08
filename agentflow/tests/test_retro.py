@@ -248,7 +248,9 @@ def test_corrupt_and_odd_runs_never_raise(tmp_git, cfg):
     weird = _finished(tmp_git, extra=odd)
     d = build_digest(tmp_git, cfg, None, NOW)
     assert good in d.run_ids and "junk" not in d.text and "empty" not in d.text
-    assert weird in d.run_ids or weird not in d.text
+    assert weird in d.run_ids
+    assert f"- {weird}#3 guard_tripped: b" in d.text and f"- {weird}#7 gate_result: ? gate ? failed" in d.text
+    assert f"- {weird}#4 hitl_answered: ? by x" in d.text and f"{weird}#5" not in d.text  # blocking "two" is none
 
 
 def test_a_folder_that_is_no_run_id_is_left_out(tmp_git, cfg):
@@ -274,3 +276,54 @@ def test_last_retro_is_the_newest_retro_run_finished_or_not(tmp_git):
 def test_finished_runs_are_oldest_first(tmp_git, since):
     ids = [_finished(tmp_git, start=START + timedelta(hours=h)) for h in (3, 1, 2)]
     assert [r.id for r in finished_runs(tmp_git, since)] == sorted(ids)
+
+
+_LONG = "a" * 400 + "\u202e\u200b\x07" + "b" * 400
+_LONG_LINES = "\n".join([_LONG] * 15)
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "gate_result", "key": _LONG, "gate": _LONG, "passed": False, "skipped": False, "reason": _LONG,
+     "tail": _LONG_LINES},
+    {"type": "fix_attempt", "key": _LONG, "attempt": _LONG, "gates": [_LONG] * 15},
+    {"type": "guard_tripped", "key": _LONG, "violations": [{"kind": _LONG, "detail": _LONG}] * 15},
+    {"type": "permission_denied", "key": _LONG, "tool": _LONG, "input": {"command": _LONG, _LONG: [_LONG]}},
+    {"type": "hitl_raised", "kind": _LONG, "key": _LONG, "summary": _LONG, "extra": _LONG_LINES},
+    {"type": "phase_rejected", "by": _LONG, "phase": _LONG, "round": _LONG, "note": _LONG_LINES},
+    {"type": "hitl_answered", "by": _LONG, "key": _LONG, "answers": {_LONG: _LONG, "q2": _LONG_LINES}},
+    {"type": "review_result", "key": _LONG, "round": _LONG, "blocking": 3,
+     "blocking_findings": [{"title": _LONG, "severity": _LONG}, {"text": _LONG}, _LONG] * 5},
+    {"type": "ci_round", "key": _LONG, "action": _LONG, "round": _LONG, "failed": [_LONG] * 15, "tail": _LONG_LINES},
+    {"type": "step_retry", "key": _LONG, "reason": _LONG},
+    {"type": "runner_error", "error": _LONG, "exception": _LONG},
+    {"type": "budget_soft_reached", "spend_usd": _LONG, "soft_usd": 1.0, "hard_usd": 2.0},
+    {"type": "budget_estimate_over_hard", "estimate": _LONG, "hard": _LONG},
+    {"type": "rolled_over", "key": _LONG, "context_pct": _LONG},
+    {"type": "progress_not_updated", "key": _LONG},
+], ids=lambda ev: ev["type"])
+def test_every_quoted_line_of_every_event_type_is_cleaned_and_cut(tmp_git, cfg, event):
+    import unicodedata
+
+    a = _finished(tmp_git, extra=[event])
+    text = build_digest(tmp_git, cfg, None, NOW).text
+    assert not [ch for ch in text if ch != "\n" and unicodedata.category(ch) in ("Cc", "Cf")]
+    evidence = [line for line in _section(text, "## Evidence").splitlines() if line]
+    entry = f"- {a}#3 {event['type']}: "
+    assert evidence and evidence[0].startswith(entry)
+    for line in evidence:
+        if line.startswith("- "):
+            assert line.startswith(entry) and len(line) <= len(entry) + DIGEST_LINE_MAX, line
+        else:
+            assert line.startswith("    > ") and len(line) <= len("    > ") + DIGEST_LINE_MAX, line
+    assert len(evidence) <= 1 + DIGEST_TAIL_LINES
+
+
+def test_a_boolean_seq_is_never_a_pointer(tmp_git, cfg):
+    a = _finished(tmp_git, gate_fail="unit")
+    log = runs_root(tmp_git) / a / "events.jsonl"
+    lines = log.read_text(encoding="utf-8").splitlines()
+    forged = json.dumps({"seq": True, "ts": json.loads(lines[-2])["ts"], "type": "runner_error", "by": "runner",
+                         "error": "forged", "exception": "X"})
+    log.write_text("\n".join(lines[:-1] + [forged, lines[-1]]) + "\n", encoding="utf-8")
+    text = build_digest(tmp_git, cfg, None, NOW).text
+    assert f"{a}#3 gate_result" in text and "#True" not in text and "forged" not in text

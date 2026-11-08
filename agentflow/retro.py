@@ -168,7 +168,7 @@ def _evidence(ev: dict) -> tuple[str, list[str]] | None:
     if etype == "guard_tripped":
         found = ev.get("violations")
         violations = [v for v in found if isinstance(v, dict)] if isinstance(found, list) else []
-        return key, [f"{_q(v.get('kind'))}: {_q(v.get('detail'))}" for v in violations[:DIGEST_TAIL_LINES]]
+        return key, [_q(f"{_q(v.get('kind'))}: {_q(v.get('detail'))}") for v in violations[:DIGEST_TAIL_LINES]]
     if etype == "permission_denied":
         return f"{key} tool {_q(ev.get('tool')) or '?'}", [q for q in (_q(ev.get("input")),) if q]
     if etype == "hitl_raised":
@@ -216,6 +216,8 @@ def _entries(run_id: str, events: list[dict]) -> list[str]:
     """The run's evidence entries, in log order: `- <run>#<seq> <type>: <detail>`, then its quoted lines."""
     out = []
     for ev in events:
+        if isinstance(ev.get("seq"), bool):  # `true` is an int to Python: never a `#True` pointer
+            continue
         try:
             found = _evidence(ev)
         except RUN_ERRORS:
@@ -223,8 +225,10 @@ def _entries(run_id: str, events: list[dict]) -> list[str]:
         if found is None:
             continue
         detail, quoted = found
+        # each quoted line is cut once more here, so no event type's joined pieces can pass the line cap
+        lines = [line for line in (_q(q) for q in quoted) if line]
         out.append("\n".join([f"- {run_id}#{ev['seq']} {ev['type']}: {_q(detail)}"]
-                             + [QUOTE + line for line in quoted]))
+                             + [QUOTE + line for line in lines]))
     return out
 
 
