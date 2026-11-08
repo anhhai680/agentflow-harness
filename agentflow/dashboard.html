@@ -157,6 +157,7 @@ td.wrap { white-space: normal; min-width: 200px; }
 <body>
 <header>
   <h1>agentflow</h1>
+  <span id="version" class="pill" hidden></span>
   <div id="summary">loading…</div>
   <button id="new-task" type="button" class="primary" hidden>+ New task</button>
   <button id="tab-board" type="button" aria-pressed="true">Board</button>
@@ -1369,7 +1370,17 @@ for (const name of VIEWS) $("tab-" + name).addEventListener("click", () => show(
 $("new-task").addEventListener("click", newTaskDialog);
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("dlg").open) closeDrawer(); });
 try { const saved = localStorage.getItem("agentflow-view"); show(VIEWS.includes(saved) ? saved : "board"); } catch (err) { show("board"); }
+async function loadVersion() {
+  try {
+    const info = await api("/api/info");
+    $("version").textContent = "v" + info.version;
+    $("version").title = info.name + " " + info.version;
+    $("version").hidden = false;
+  } catch (err) { console.warn("agentflow: version unavailable", err); }  // the badge is optional
+}
+
 if (TOKEN) {
+  loadVersion();
   refresh();
   connect();
   setInterval(refresh, 30000);  // ages and idle markers move on even without new events
