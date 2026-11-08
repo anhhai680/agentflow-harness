@@ -119,6 +119,27 @@ def test_since_filters_by_last_event(tmp_git, cfg):
     assert build_digest(tmp_git, cfg, START + timedelta(days=30), NOW).run_ids == ()
 
 
+def test_archiving_an_ended_run_does_not_bring_it_back_into_a_retro(tmp_git, tmp_cfg):
+    from agentflow import run_control
+    from agentflow.retro import due
+    from agentflow.state import Run
+
+    cfg = load_config(tmp_cfg({"memory": {"retro_every_days": 7}}))
+    old = _finished(tmp_git, gate_fail="unit", start=START)
+    _finished(tmp_git, lane=RETRO_PIPELINE, start=START + timedelta(hours=1))  # the last finished retro: the anchor
+    anchor, later = START + timedelta(hours=1), START + timedelta(days=8)
+    assert finished_runs(tmp_git, anchor) == [] and due(tmp_git, cfg, later) is None
+    run_control.archive(Run.load(tmp_git, old), "me")  # `run_archived`, at the real clock: long after the anchor
+    assert Run.load(tmp_git, old).events.read()[-1]["type"] == "run_archived"
+    assert finished_runs(tmp_git, anchor) == []
+    assert build_digest(tmp_git, cfg, anchor, NOW).run_ids == ()
+    assert due(tmp_git, cfg, later) is None
+    fresh = _finished(tmp_git, start=START + timedelta(hours=2))  # never archived, ended after the anchor
+    assert [r.id for r in finished_runs(tmp_git, anchor)] == [fresh]
+    assert build_digest(tmp_git, cfg, anchor, NOW).run_ids == (fresh,)
+    assert due(tmp_git, cfg, later) == "1 finished runs since 2026-11-01"
+
+
 def test_quoted_text_is_cleaned_and_cut(tmp_git, cfg):
     long = "x" * 500 + "‮" + "y" * 500
     stop = {"type": "hitl_raised", "kind": "blocked", "key": "build/build", "phase": "build",

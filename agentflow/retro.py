@@ -3,8 +3,9 @@
 This part builds the retro's input, the **digest**: Markdown, computed by the runner from run logs alone, that a
 retro session reads. Nothing in it comes from a model's judgement.
 
-- `finished_runs(repo, since)`: the ended (done, failed or cancelled), non-retro runs whose last event comes after
-  `since`, oldest first. Retro runs are never evidence, so a retro never learns from retros.
+- `finished_runs(repo, since)`: the ended (done, failed or cancelled), non-retro runs whose terminal event comes
+  after `since`, oldest first (never their last event: archiving an ended run appends one). Retro runs are never
+  evidence, so a retro never learns from retros.
 - `last_retro(repo)`: the newest retro run, finished or not.
 - `build_digest(repo, cfg, since, now)`: the digest of `finished_runs(repo, since)`, in this order: `# Retro digest`
   and the sentence that says the rest is data (`LEAD`); `## Runs`, one line a run; `## Evidence`, one entry a signal
@@ -113,6 +114,18 @@ def _aware(moment: datetime) -> datetime:
     return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
 
 
+_ENDS = ("run_finished", "run_failed", "run_cancelled")  # the events that end a run (`state.TERMINAL`)
+
+
+def _ended_at(events: list[dict]) -> datetime | None:
+    """When the run ended: the time of its last terminal event. Never its last event, which can come later (an
+    `archive` appends `run_archived` to an ended run, and that must not bring the run back into a retro)."""
+    for ev in reversed(events):
+        if ev.get("type") in _ENDS:
+            return parse_iso(ev.get("ts"))
+    return None
+
+
 def _finished(repo: Path, since: datetime | None) -> list[tuple[Run, list[dict]]]:
     cutoff = _aware(since) if since is not None else None
     out = []
@@ -120,15 +133,16 @@ def _finished(repo: Path, since: datetime | None) -> list[tuple[Run, list[dict]]
         if run.state.get("status") not in TERMINAL or run.state.get("pipeline") == RETRO_PIPELINE:
             continue
         if cutoff is not None:
-            last = parse_iso(events[-1].get("ts"))
-            if last is None or last <= cutoff:
+            ended = _ended_at(events)
+            if ended is None or ended <= cutoff:
                 continue
         out.append((run, events))
     return out
 
 
 def finished_runs(repo: Path, since: datetime | None) -> list[Run]:
-    """The ended, non-retro runs whose last event comes after `since` (every one for None), oldest first."""
+    """The ended, non-retro runs that ended (their last terminal event) after `since` (every one for None), oldest
+    first."""
     return [run for run, _events in _finished(repo, since)]
 
 
@@ -332,7 +346,7 @@ def _cut(head: list[str], entries: list[str], tail: list[str], max_tokens: int) 
 
 
 def build_digest(repo: Path, cfg: Config, since: datetime | None, now: datetime) -> Digest:
-    """The digest of the ended, non-retro runs whose last event comes after `since` (see the module doc)."""
+    """The digest of the ended, non-retro runs whose terminal event comes after `since` (see the module doc)."""
     runs = _finished(repo, since)
     run_lines: list[str] = []
     entries: list[str] = []
