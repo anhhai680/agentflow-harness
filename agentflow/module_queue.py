@@ -862,6 +862,30 @@ def queue_lock(repo: Path) -> Iterator[None]:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+def _retro_if_due(cfg: Config, repo: Path, say: Callable[[str], None]) -> bool:
+    """Run the retro when one is due, before the next module starts; True when it did not settle (it stopped for a
+    human, found nothing, or raised), so the queue does not try again. It says one line and never raises: a retro
+    that cannot finish must not stop the modules."""
+    from agentflow import retro
+    from agentflow.state import Run
+
+    now = datetime.now(UTC)
+    if retro.due_or_none(repo, cfg, now) is None:
+        return False
+    try:
+        outcome = retro.run_retro(repo, cfg, None, False, now)
+        say(f"retro: {_first_line(outcome.message)}" + (f" {outcome.pr_url}" if outcome.pr_url else ""))
+        if outcome.pr_url:
+            return False
+        try:
+            return not (outcome.run_id and Run.load(repo, outcome.run_id).state["status"] == "done")
+        except Exception:  # noqa: BLE001 - a run that cannot be read did not settle
+            return True
+    except Exception as exc:  # noqa: BLE001 - whatever went wrong, the queue goes on with its modules
+        say(f"retro failed: {type(exc).__name__}: {_first_line(str(exc))}")
+        return True
+
+
 def run_queue(
     cfg: Config, repo: Path, max_parallel: int, start: Callable[[str], str], *,
     once: bool = False, interval: float = INTERVAL_S, sleep: Callable[[float], None] = time.sleep,
@@ -875,10 +899,13 @@ def run_queue(
     if cfg.work_source is None:
         raise ValueError("this pack has no work_source: the queue has no modules to start")
     say = log or print
+    retro_gave_up = False  # one failed retro per queue: the next tick would fail the same way
     with queue_lock(repo):
         try:
             while True:
                 gitops.fetch_remote_branch(repo, cfg.project.fork_from)  # where a merged plan lands (see _plan_finished)
+                if not retro_gave_up:
+                    retro_gave_up = _retro_if_due(cfg, repo, say)
                 for module in queue_tick(cfg, repo, max_parallel, start, log=say):
                     say(f"started {module}")
                 hitl.remind_due(cfg, repo, datetime.now(UTC))  # waits past `hitl.remind_after_h` are notified again

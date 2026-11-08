@@ -1135,3 +1135,21 @@ def test_the_lessons_tab_links_evidence_to_the_run_drawer_and_escapes_text():
     assert "openDrawer(src.run_id)" in block and "data.note" in block
     assert "innerHTML" not in block  # titles and bodies are model text: every text goes through el()'s textContent
     assert 'api("/api/lessons")' in source
+
+
+def test_board_carries_retro_due(dash):
+    from datetime import UTC, timedelta
+
+    from test_retro import _finished
+
+    _, _, body = dash.get("/api/board")
+    assert payload(body)["retro_due"] is None
+    _finished(dash.flow.root, start=datetime.now(UTC) - timedelta(days=10))
+    _, _, body = dash.get("/api/board")
+    assert payload(body)["retro_due"] == "1 finished runs since the start"
+
+
+def test_the_page_shows_the_retro_banner_from_safe_text_only():
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    assert 'id="retro-due"' in source and "data.retro_due" in source and '"agentflow retro"' in source
+    assert "innerHTML" not in source

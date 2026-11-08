@@ -860,6 +860,31 @@ def _since_default(repo: Path) -> datetime | None:
     return None
 
 
+def due(repo: Path, cfg: Config, now: datetime) -> str | None:
+    """Why a retro is due, or None. Due needs both new work and time: a run ended since the last retro that
+    finished started (a retro that stopped, failed or was cancelled read its runs for nothing, so it is no anchor),
+    and `memory.retro_every_days` days have passed since then (or there never was one). 0 days means manual only."""
+    days = cfg.memory.retro_every_days
+    if days <= 0:
+        return None
+    anchor = _since_default(repo)
+    fresh = finished_runs(repo, anchor)
+    if not fresh:
+        return None
+    if anchor is not None and _aware(now) - _aware(anchor) < timedelta(days=days):
+        return None
+    since = f"{_aware(anchor):%Y-%m-%d}" if anchor is not None else "the start"
+    return f"{len(fresh)} finished runs since {since}"
+
+
+def due_or_none(repo: Path, cfg: Config, now: datetime) -> str | None:
+    """`due`, for a hint on a screen that must never fail because of it (`next`, `status`, the board)."""
+    try:
+        return due(repo, cfg, now)
+    except Exception:  # noqa: BLE001 - a reminder is never worth an error
+        return None
+
+
 def _dry_prompt(cfg: Config, repo: Path, step: Step) -> str:
     ctx = make_ctx(cfg, repo, RETRO_PIPELINE, {})
     ctx.base_ref = f"origin/{cfg.project.base_branch}"
@@ -1094,5 +1119,6 @@ class _Retro:
 __all__ = [
     "DIGEST_LINE_MAX", "DIGEST_TAIL_LINES", "KEY", "MAX_ADDS", "REVIEW_DEFAULT_DAYS", "REVIEW_MAX_DAYS", "TITLE_MAX",
     "Checked", "Digest", "Note", "Proposals", "RetroOutcome", "apply_proposals", "build_digest", "check_proposals",
-    "finished_runs", "last_finished_retro", "last_retro", "parse_proposals", "pr_body", "resolve_source", "run_retro",
+    "due", "due_or_none", "finished_runs", "last_finished_retro", "last_retro", "parse_proposals", "pr_body",
+    "resolve_source", "run_retro",
 ]

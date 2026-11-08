@@ -1341,3 +1341,117 @@ def test_a_clean_filter_on_the_lessons_path_stops_blocked(flow_repo, gh_log, cle
     _script_one_add(flow_repo)
     out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
     _blocked_without_push(flow_repo, gh_log, out, words)
+
+
+# --------------------------------------------------------------------------- triggers: due, `agentflow retro`
+
+
+def _every(tmp_cfg, days: int):
+    return load_config(tmp_cfg({"memory": {"retro_every_days": days}}))
+
+
+def test_due_needs_both_time_and_new_runs(tmp_git, tmp_cfg):
+    from agentflow.retro import due
+
+    cfg = _every(tmp_cfg, 7)
+    last = START  # the last finished retro started on 2026-11-01 08:00
+    retro = _finished(tmp_git, lane=RETRO_PIPELINE, start=last)
+    assert due(tmp_git, cfg, last + timedelta(days=8)) is None  # 8 days, but no run finished since
+    _finished(tmp_git, start=last + timedelta(hours=1))
+    assert due(tmp_git, cfg, last + timedelta(days=8)) == "1 finished runs since 2026-11-01"
+    assert due(tmp_git, cfg, last + timedelta(days=3)) is None  # a run, but only 3 days
+    for hour in range(2, 6):
+        _finished(tmp_git, start=last + timedelta(hours=hour))
+    assert due(tmp_git, cfg, last + timedelta(days=3)) is None  # 5 runs, still 3 days
+    assert due(tmp_git, cfg, last + timedelta(days=7, minutes=1)) == "5 finished runs since 2026-11-01"
+    assert last_retro(tmp_git).id == retro
+
+
+def test_zero_days_means_manual_only(tmp_git, tmp_cfg):
+    from agentflow.retro import due
+
+    _finished(tmp_git)
+    assert due(tmp_git, _every(tmp_cfg, 0), NOW + timedelta(days=400)) is None
+
+
+def test_never_retroed_is_due_once_a_run_finished(tmp_git, tmp_cfg):
+    from agentflow.retro import due
+
+    cfg = _every(tmp_cfg, 7)
+    assert due(tmp_git, cfg, NOW) is None  # nothing finished
+    _finished(tmp_git, end=None)  # a live run is not a finished one
+    assert due(tmp_git, cfg, NOW) is None
+    _finished(tmp_git)
+    _finished(tmp_git)
+    assert due(tmp_git, cfg, NOW) == "2 finished runs since the start"
+    assert due(tmp_git, cfg, NOW.replace(tzinfo=None)) == "2 finished runs since the start"  # naive now is fine
+
+
+def test_a_retro_that_did_not_finish_does_not_hide_a_due_retro(tmp_git, tmp_cfg):
+    from agentflow.retro import due
+
+    cfg = _every(tmp_cfg, 7)
+    _finished(tmp_git, lane=RETRO_PIPELINE, start=START)
+    _finished(tmp_git, start=START + timedelta(hours=1))
+    _finished(tmp_git, lane=RETRO_PIPELINE, end="run_cancelled", start=START + timedelta(days=7))  # cancelled
+    _finished(tmp_git, lane=RETRO_PIPELINE, end=None, start=START + timedelta(days=7, hours=1))  # stopped, live
+    assert due(tmp_git, cfg, START + timedelta(days=8)) == "1 finished runs since 2026-11-01"
+
+
+def test_cli_retro_dry_run_prints_the_digest_and_creates_nothing(flow_repo, capsys):
+    from agentflow.flow import main
+
+    a, _b = _two_runs_failing(flow_repo, "unit")
+    assert main(["retro", "--dry-run", "--config", str(flow_repo.cfg.path)]) == 0
+    printed = capsys.readouterr().out
+    assert "# Retro digest" in printed and f"{a}#{SEQ}" in printed and "dry run" in printed
+    assert not _retro_runs(flow_repo) and "retro" not in run_git(flow_repo.root, "branch", "--list")
+    assert not flow_repo.calls()
+
+
+def test_cli_retro_prints_the_outcome_and_the_pr(flow_repo, gh_log, capsys):
+    from agentflow.flow import main
+
+    a, _b = _two_runs_failing(flow_repo, "unit")
+    flow_repo.fake.script({KEY: [_retro_result(add=[_add(sources=[f"{a}#{SEQ}"])])]})
+    assert main(["retro", "--since", "2020-01-01", "--config", str(flow_repo.cfg.path)]) == 0
+    printed = capsys.readouterr().out
+    assert PR_URL in printed
+    (run_id,) = _retro_runs(flow_repo)
+    assert Run.load(flow_repo.root, run_id).state["params"]["since"].startswith("2020-01-01")
+
+
+def test_cli_retro_with_nothing_to_learn_is_a_clean_zero(flow_repo, capsys):
+    from agentflow.flow import main
+
+    assert main(["retro", "--config", str(flow_repo.cfg.path)]) == 0
+    assert "nothing to learn" in capsys.readouterr().out and not _retro_runs(flow_repo)
+
+
+def test_cli_retro_that_stops_exits_nonzero(flow_repo, failing_gh, capsys):
+    from agentflow.flow import main
+
+    a, _b = _two_runs_failing(flow_repo, "unit")
+    flow_repo.fake.script({KEY: [_retro_result(add=[_add(sources=[f"{a}#{SEQ}"])])]})
+    assert main(["retro", "--config", str(flow_repo.cfg.path)]) == 1
+    assert capsys.readouterr().out.strip()
+    (run_id,) = _retro_runs(flow_repo)
+    assert Run.load(flow_repo.root, run_id).state["waiting"]["kind"] == "blocked"
+
+
+@pytest.mark.parametrize("since", ["yesterday", "2026-13-01", "2026-11-1", "20261101", ""])
+def test_cli_retro_refuses_a_bad_since_cleanly(flow_repo, capsys, since):
+    from agentflow.flow import main
+
+    _two_runs_failing(flow_repo, "unit")
+    with pytest.raises(SystemExit) as exc:
+        main(["retro", "--since", since, "--dry-run", "--config", str(flow_repo.cfg.path)])
+    assert exc.value.code == 2
+    assert "--since" in capsys.readouterr().err and not _retro_runs(flow_repo)
+
+
+def test_board_carries_retro_due(flow_repo):
+    old = datetime.now(UTC) - timedelta(days=10)
+    assert views.board(flow_repo.root, flow_repo.cfg)["retro_due"] is None
+    _finished(flow_repo.root, start=old)
+    assert views.board(flow_repo.root, flow_repo.cfg)["retro_due"] == "1 finished runs since the start"

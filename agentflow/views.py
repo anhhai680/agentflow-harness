@@ -279,6 +279,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
     from agentflow import work_source
     from agentflow.backlog import snapshot
     from agentflow.module_queue import module_lane
+    from agentflow.retro import due_or_none
 
     pile = snapshot(cfg, repo)
     cards, counts, spend_today = [], Counter(), 0.0
@@ -318,6 +319,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
         "backlog_skipped": pile["skipped"],
         "work_source_kind": work_source.kind(cfg),
         "needs_human": needs,
+        "retro_due": due_or_none(repo, cfg, now),
         "counts": dict(counts),
         "agents_running": {"total": sum(by_agent.values()), "by_agent": dict(by_agent), "by_model": dict(by_model)},
         "spend_today": round(spend_today, 2),

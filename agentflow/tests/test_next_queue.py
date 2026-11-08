@@ -1153,3 +1153,115 @@ def test_a_corrupt_marks_file_lets_origin_evidence_make_no_new_done(dq, tmp_path
     assert entries["crm"]["status"] == "backlog"  # the veto can't be read: origin evidence makes nothing done
     assert entries["platform"]["done_reason"] == finished.SPEC_SAYS  # an earlier Done stays
     assert [m for m in messages if finished.MARKS in m and "unreadable" in m]
+
+
+# --------------------------------------------------------------------------- retro due
+
+
+def _old_run(fr) -> str:
+    """A run that ended ten days ago, so a retro is due under the default `memory.retro_every_days: 7`."""
+    from datetime import UTC, datetime, timedelta
+
+    from test_retro import _finished
+
+    return _finished(fr.root, start=datetime.now(UTC) - timedelta(days=10))
+
+
+def test_next_names_a_due_retro(fr, capsys):
+    fr.install_pack()
+    write(fr.root, "docs/idea.md", "# idea\n")
+    assert main(["next"]) == 0
+    assert "Retro due" not in capsys.readouterr().out
+    _old_run(fr)
+    assert main(["next"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "Lane: design-doc · Stage: Define"
+    assert out[-1] == "Retro due: 1 finished runs since the start → agentflow retro"
+
+
+def test_status_names_a_due_retro(fr, capsys):
+    fr.install_pack()
+    _old_run(fr)
+    assert main(["status"]) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "Retro due: 1 finished runs since the start → agentflow retro"
+
+
+def test_status_of_one_run_does_not_name_a_retro(fr, capsys):
+    fr.install_pack()
+    run = fr.new_run()
+    _old_run(fr)
+    assert main(["status", run.id]) == 0
+    assert "Retro due" not in capsys.readouterr().out
+
+
+def _retro_queue(qrepo, monkeypatch, outcome=None, error=None):
+    """The queue with `run_retro` replaced by a recorder; returns the list of its calls."""
+    from agentflow import retro
+
+    calls: list[tuple] = []
+
+    def fake(repo, cfg, since, dry_run, now, out=None):
+        calls.append((repo, since, dry_run))
+        if error is not None:
+            raise error
+        return outcome or retro.RetroOutcome(None, None, "nothing to learn")
+
+    monkeypatch.setattr(retro, "run_retro", fake)
+    return calls
+
+
+def test_queue_runs_a_due_retro_between_modules(qrepo, monkeypatch):
+    from agentflow.retro import RetroOutcome
+
+    _old_run(qrepo)
+    calls = _retro_queue(qrepo, monkeypatch, RetroOutcome("r", "https://example.test/pr/1", "opened"))
+    messages: list[str] = []
+    go = Starter(qrepo)
+    assert module_queue.run_queue(qrepo.cfg, qrepo.root, 2, go, once=True, log=messages.append) == 0
+    assert len(calls) == 1 and calls[0][0] == qrepo.root and calls[0][2] is False
+    assert go.started == ["platform"]
+    assert any("retro" in m and "https://example.test/pr/1" in m for m in messages)
+
+
+def test_queue_does_not_retro_when_none_is_due(qrepo, monkeypatch):
+    calls = _retro_queue(qrepo, monkeypatch)
+    assert module_queue.run_queue(qrepo.cfg, qrepo.root, 2, Starter(qrepo), once=True, log=lambda m: None) == 0
+    assert calls == []
+
+
+@pytest.mark.parametrize("failure", ["stopped", "raised"])
+def test_a_failed_retro_never_stops_the_queue_and_is_tried_once(qrepo, monkeypatch, failure):
+    from agentflow.retro import RetroOutcome
+
+    _old_run(qrepo)
+    stopped = RetroOutcome("r-1", None, "the retro session stopped: see `agentflow inbox` (r-1)")
+    calls = _retro_queue(qrepo, monkeypatch, outcome=stopped if failure == "stopped" else None,
+                         error=RuntimeError("boom") if failure == "raised" else None)
+    messages: list[str] = []
+    ticks: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        ticks.append(seconds)
+        if len(ticks) == 3:
+            raise KeyboardInterrupt
+
+    go = Starter(qrepo)
+    assert module_queue.run_queue(qrepo.cfg, qrepo.root, 3, go, interval=1.0, sleep=sleep, log=messages.append) == 0
+    assert len(calls) == 1  # three ticks, one attempt
+    assert go.started[0] == "platform"  # the next module still started
+    retro_lines = [m for m in messages if "retro" in m.lower()]
+    assert len(retro_lines) == 1 and "\n" not in retro_lines[0]
+
+
+def test_queue_opens_the_retro_pr_then_starts_the_module(qrepo, monkeypatch, tmp_path):
+    from test_retro import KEY, PR_URL, SEQ, _add, _created, _retro_result, _retro_runs, _two_runs_failing
+
+    monkeypatch.setenv("FAKE_GH_URL", PR_URL)
+    a, _b = _two_runs_failing(qrepo, "unit")
+    qrepo.fake.script({KEY: [_retro_result(add=[_add(sources=[f"{a}#{SEQ}"])])]})
+    messages: list[str] = []
+    go = Starter(qrepo)
+    assert module_queue.run_queue(qrepo.cfg, qrepo.root, 2, go, once=True, log=messages.append) == 0
+    assert len(_retro_runs(qrepo)) == 1 and go.started == ["platform"]
+    assert len(_created(tmp_path / "gh.log")) == 1
+    assert any(PR_URL in m for m in messages)

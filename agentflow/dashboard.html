@@ -52,7 +52,7 @@ main { padding: 12px 16px 40px; }
 .badge.p { color: var(--ok); border: 1px solid var(--ok); font-weight: 700; }
 .badge.lock { color: var(--muted); border: 1px solid var(--line); }
 .badge.ready-mark { border: 1px solid var(--line); }
-#sync-note { margin-bottom: 8px; }
+#sync-note, #retro-due { margin-bottom: 8px; }
 .card a { color: var(--accent); font-size: 12px; }
 .moves { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .moves button { font-size: 12px; padding: 2px 8px; }
@@ -173,6 +173,7 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
 <main>
   <section id="board-view">
     <div id="sync-note" class="muted" role="status" hidden></div>
+    <div id="retro-due" class="muted" role="status" hidden></div>
     <div id="columns" class="columns"></div>
     <h2 class="lane">Needs human</h2>
     <div id="needs"></div>
@@ -579,6 +580,8 @@ function renderBoard(data) {
   $("new-task").hidden = !Object.keys(data.new_task).length;
   $("sync-note").hidden = !data.sync_note;
   $("sync-note").textContent = data.sync_note ? "Base branch not updated: " + data.sync_note : "";
+  $("retro-due").hidden = !data.retro_due;
+  $("retro-due").replaceChildren(...(data.retro_due ? [document.createTextNode("Retro due: " + data.retro_due + " → run "), el("code", { text: "agentflow retro" })] : []));
   if (!ui.dragging) $("columns").replaceChildren(...columns);  // new columns would lose the drop highlights mid-drag
   $("needs").replaceChildren(...(data.needs_human.length ? data.needs_human.map(needNode) : [el("p", { class: "muted", text: "Nothing is waiting on you." })]));
 }
