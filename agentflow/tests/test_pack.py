@@ -108,7 +108,7 @@ def test_version_1_pack_is_refused(tmp_cfg):
 
 
 def test_engine_range_that_excludes_this_engine_is_refused(tmp_cfg):
-    with pytest.raises(ConfigError, match=r"engine: '>=3' .* this engine is 2\.0"):
+    with pytest.raises(ConfigError, match=rf"engine: '>=3' .* this engine is {re.escape(pack.ENGINE_VERSION)}"):
         load_config(tmp_cfg({"engine": ">=3"}))
 
 
