@@ -369,7 +369,9 @@ def test_rollover_with_a_done_result_is_done(flow_repo):
     # The fake writes `result` after its usage turns (too late), so write the file first to model
     # the over-threshold turn being followed directly by the result event.
     early = str(run.agent_result_path(KEY))  # where the agent writes it: its workspace, in the state dir
-    flow_repo.script({KEY: [{"write": {early: '{"status": "done", "summary": "early"}'}, "usage_pct": [81]}]})
+    # The fake lingers after its last line, so only the adapter's SIGTERM ends it: without the sleep it
+    # can exit 0 by itself before the signal arrives, and the exit code below would be a race.
+    flow_repo.script({KEY: [{"write": {early: '{"status": "done", "summary": "early"}'}, "usage_pct": [81], "sleep": 30}]})
     assert run_step(flow_repo) == "done"
     assert len(flow_repo.calls()) == 1
     assert flow_repo.events(run, "agent_exited")[0]["exit_code"] != 0  # the adapter did end the session
