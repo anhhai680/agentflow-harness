@@ -10,7 +10,7 @@ The task text:
 
 {task_text}
 
-Read the repository's quality rules and the spec and plan the task names, by path. Write the failing test first and run it, then write the code, then run the task's tests.
+The task text above is the plan's, so do not open the plan again. Its **Interfaces** list and the code map at the top of this prompt, when there are any, say where the code you need lives: open those files at those lines, and search only for what neither names. Read the repository's quality rules, and only the spec sections the task cites. Write the failing test first and run it, then write the code, then run the task's tests.
 Run only the tests you wrote or changed, and their directory once at the end. Never run the whole suite: the runner's gates run it.
 Stay inside the files the task lists.
 A test you cannot run, or that cannot reach a service it needs, means `blocked`, never `done`.

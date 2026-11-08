@@ -10,6 +10,8 @@ The task text:
 
 {earlier_findings}
 
+The task's **Interfaces** list and the code map at the top of this prompt, when there are any, say where existing code lives: use them before you search.
+
 Judge the code on its own. Do not open or append to `{progress}`, whatever the rules above say about it: it holds the implementer's account of this work.
 
 Check, in order: does it do what the task says and no more; are the tests real (they fail without the change); do the repository's quality rules and the repository's agent instructions still hold (no suppressions, no stubs, no skipped tests); are errors, security and edge cases handled; for a task that builds a screen, does it follow the design the task names.

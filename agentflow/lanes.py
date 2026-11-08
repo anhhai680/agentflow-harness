@@ -65,7 +65,9 @@ RESULT = "_result.md"
 DEFAULT_TEMPLATE = "step.md"
 DEFAULT_REFINE = "refine.md"
 DEFAULT_ROLE = "build"
-RUN_FACTS_LINE = re.compile(r"^\{run_facts\}\n\n", re.MULTILINE)  # the preamble's slot, dropped whole when empty
+EMPTY_SLOT = re.compile(r"^\{(run_facts|code_map)\}\n\n", re.MULTILINE)  # a preamble slot, dropped whole when empty
+CODE_MAP_LEAD = ("Earlier sessions of this run found where this code lives. Open it at the line given instead of "
+                 "searching for it, and check a signature before you rely on it.")
 RESOLVER_FINDINGS_SHOWN = 3
 RESOLVER_FINDING_MAX = 600
 EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n?", re.DOTALL)
@@ -129,6 +131,7 @@ def _values(cfg: Config, step: Step, ctx: Ctx, extra: dict) -> dict[str, str]:
     values["handoff"] = str(agent_dir / "handoff.md")
     values["questions"] = str(agent_dir / "questions.md")
     values["run_facts"] = _run_facts(run)
+    values["code_map"] = _code_map(run)
     worktree = Path(run.state.get("worktree") or ctx.repo) if run is not None else ctx.repo
     values["self_checks"] = _self_checks(cfg, step, worktree)
     values.update({name: str(value) for name, value in extra.items()})
@@ -143,6 +146,14 @@ def _run_facts(run: Run | None) -> str:
     lines = "\n".join(f"- {fact}" for fact in facts)
     return ("## What this run already found\n\nEarlier sessions of this run established these. Check one before "
             f"relying on it; do not diagnose it again.\n\n{lines}")
+
+
+def _code_map(run: Run | None) -> str:
+    """The code earlier sessions of the run mapped, as a section of the prompt; "" when there is nothing."""
+    notes = [str(c.get("text")) for c in (run.state.get("code_map") or []) if c.get("text")] if run is not None else []
+    if not notes:
+        return ""
+    return "## Code this run has mapped\n\n" + CODE_MAP_LEAD + "\n\n" + "\n".join(f"- {note}" for note in notes)
 
 
 def _refine_values(ctx: Ctx, rec: dict) -> dict[str, str]:
@@ -207,8 +218,7 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     """
     values = _values(cfg, step, ctx, {})
     preamble = EFFORT_BLOCK.sub("" if rec.get("sized") else r"\1", _template(cfg, PREAMBLE))
-    if not values["run_facts"]:
-        preamble = RUN_FACTS_LINE.sub("", preamble)
+    preamble = EMPTY_SLOT.sub(lambda m: "" if not values[m.group(1)] else m.group(0), preamble)
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
     files = list(dict.fromkeys([*step.brief, *step.task_brief]))
     # A step with no configured `brief:` whose skill resolves has the skill's text as its brief, and its first

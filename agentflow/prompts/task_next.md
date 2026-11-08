@@ -6,6 +6,6 @@ The task text:
 
 {task_text}
 
-Read the spec and plan sections this task names, by path, if you have not yet. Write the failing test first and run it, then write the code, then run the task's tests.
+The task text above is the plan's, so do not open the plan again. Use its **Interfaces** list and the code map, and read only the spec sections it cites that you have not read yet. Write the failing test first and run it, then write the code, then run the task's tests.
 Before you finish, format what you changed if the repository has a formatter. {self_checks}
 If the task conflicts with the code or the spec, stop and say so instead of improvising.

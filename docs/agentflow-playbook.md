@@ -298,6 +298,8 @@ The last two end in an `agent_unavailable` stop. `pause` and `cancel` still work
 
 A resolver session may also record what it found. Its result can carry `facts`, short statements that hold for the whole run (for example, a gate that fails for a reason outside the task). The runner keeps each new one as a `run_fact` event, and every later agent session of the run sees them under "What this run already found" in its prompt, so it checks them instead of diagnosing the same thing again.
 
+Any step's result may carry `code_map`: up to 8 one-line entries naming existing code the step had to search for (`path:line`, signature, use). The runner keeps them as `code_noted` events (the newest 40, deduplicated), and every later session of the run sees them under "Code this run has mapped" in its prompt, so it opens that code at the line given instead of searching for it again.
+
 The runner fixes what a review finds by itself: `plan_fixes` makes the plan, `fix_findings` makes the change and runs its gates, then fresh review sessions check the branch again. If you stop at `review_approved` because findings outlasted those rounds, reject with a note to send it round again.
 
 The dashboard's Workflow tab shows every phase with its steps, skills, model and gates, from `config.yaml`, with a badge only on a step that one kind of work runs. To see exactly which steps a run walks, open its drawer. The Board's Backlog column is not a phase: it holds capability-map modules the queue hasn't started, so they have no run yet. Dragging only works on ready cards.

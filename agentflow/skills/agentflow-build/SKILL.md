@@ -9,7 +9,7 @@ You are one implementer in a headless session. The runner hands you a task, runs
 
 ## Steps
 
-1. Read the task, the files it lists, and the spec or plan sections it names. Read only what you need.
+1. Read the task and the files it lists. Its **Interfaces** list and the run's code map, when there are any, say where the code it uses lives: open those at the line given, and search only for what neither names. Read only the spec sections the task cites.
 2. When the repository has tests, work test first. Write the failing test, run it and see it fail for the right reason. Then write the code that makes it pass, and run it again.
 3. Run only the tests you wrote or changed, and their own directory once at the end. Never run the whole suite.
 4. Format what you changed if the repository has a formatter, then run the checks the prompt lists for you, if it lists any.

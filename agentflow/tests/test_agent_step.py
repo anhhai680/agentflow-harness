@@ -1116,6 +1116,66 @@ def test_facts_go_into_the_preamble_before_the_step(flow_repo):
     assert prompt.replace(block, "## The step") == plain
 
 
+# --------------------------------------------------------------------------- the run's code map
+
+
+def test_without_a_code_map_the_preamble_is_unchanged(flow_repo):
+    flow_repo.new_run()
+    prompt = _prompt(flow_repo)
+    assert "Code this run has mapped" not in prompt and "{code_map}" not in prompt
+    assert "\n\n\n" not in prompt.split("## The step")[0]
+    assert re.search(r"stop as `blocked` and name the exact command\.\n\n## The step\n\n", prompt)
+
+
+def test_a_run_with_no_code_map_key_builds_the_same_prompt(flow_repo):
+    run = flow_repo.new_run()
+    plain = _prompt(flow_repo)
+    del run.state["code_map"]  # a state written before the code map existed
+    assert _prompt(flow_repo) == plain
+    assert lanes._code_map(None) == ""
+
+
+def test_the_code_map_follows_the_facts_before_the_step(flow_repo):
+    run = flow_repo.new_run()
+    plain = _prompt(flow_repo)
+    run.emit("run_fact", text="a cause", key="build/x/resolve-1")
+    run.emit("code_noted", text="`app/names.py:12` `f() {step_id}`", key="build/x")
+    prompt = _prompt(flow_repo)
+    block = ("- a cause\n\n## Code this run has mapped\n\n" + lanes.CODE_MAP_LEAD
+             + "\n\n- `app/names.py:12` `f() {step_id}`\n\n## The step")  # braces in an entry go in verbatim
+    assert block in prompt
+    assert prompt.count("Code this run has mapped") == 1
+    run.emit("code_noted", text="`app/other.py:3` `g()`", key="build/y")
+    assert "- `app/names.py:12` `f() {step_id}`\n- `app/other.py:3` `g()`\n\n## The step" in _prompt(flow_repo)
+
+
+def test_a_code_map_with_no_facts_drops_only_the_facts_slot(flow_repo):
+    run = flow_repo.new_run()
+    plain = _prompt(flow_repo)
+    run.emit("code_noted", text="`a.py:1` `f()`", key="build/x")
+    prompt = _prompt(flow_repo)
+    assert "What this run already found" not in prompt and "{run_facts}" not in prompt
+    block = "## Code this run has mapped\n\n" + lanes.CODE_MAP_LEAD + "\n\n- `a.py:1` `f()`\n\n## The step"
+    assert block in prompt
+    assert prompt.replace(block, "## The step") == plain
+
+
+def test_task_prompts_point_at_interfaces_and_the_map_not_the_plan():
+    for name in TASK_TEMPLATES:
+        text = (ENGINE / "prompts" / name).read_text(encoding="utf-8")
+        assert "do not open the plan again" in text, name
+        assert "**Interfaces**" in text, name
+        assert "code map" in text, name
+    assert "code map" in (ENGINE / "prompts" / "task_review.md").read_text(encoding="utf-8")
+    skill = (ENGINE / "skills" / "agentflow-build" / "SKILL.md").read_text(encoding="utf-8")
+    assert "run's code map" in skill and "**Interfaces**" in skill
+
+
+def test_the_result_instructions_describe_code_map():
+    text = (ENGINE / "prompts" / "_result.md").read_text(encoding="utf-8")
+    assert "`code_map`" in text and "Up to 8" in text
+
+
 # --------------------------------------------------------------------------- {self_checks}
 
 OLD_LINT_LINE = ("Do not run the linters, type checkers or other quality gates yourself: the runner's build gates "
