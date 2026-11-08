@@ -148,10 +148,12 @@ PROMPT_PLACEHOLDERS = frozenset(
         "stop_summary",
         "stop_report",
         "run_facts",
+        "code_map",
         "ci_report",
         "sync_report",
         "skill",
         "base_ref",
+        "self_checks",
     }
 )
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
@@ -284,6 +286,7 @@ class Gate:
     cwd: str | None = None
     when_exists: str | None = None
     baseline: str | None = None  # `red`: it failed on the base branch when the pack was set up (a human fixes or deletes it)
+    agent_check: bool = False  # the build prompt lists it as a check the implementer runs itself (`{self_checks}`)
 
 
 @dataclass
@@ -681,6 +684,7 @@ def _build_gates(data: dict) -> dict[str, Gate]:
             cwd=_optional(raw, "cwd", path, str, None),
             when_exists=_optional(raw, "when_exists", path, str, None),
             baseline=raw.get("baseline"),  # kept as written: `validate` refuses anything but red or green
+            agent_check=_optional(raw, "agent_check", path, bool, False),
         )
     return out
 
@@ -1372,6 +1376,9 @@ class _Validator:
             path = f"gates.{name}"
             if gate.cwd is not None and (posixpath.isabs(gate.cwd) or ".." in gate.cwd.split("/")):
                 self.error(_join(path, "cwd"), "cwd must be a path inside the repository: relative, with no `..` part")
+            if gate.agent_check and (gate.cwd is not None or "\n" in gate.run.strip() or "`" in gate.run):
+                self.error(_join(path, "agent_check"), "an agent check runs from the worktree root as one line, exactly "
+                           "as written: drop `cwd` and keep `run` to one line with no backtick, or turn agent_check off")
             if gate.baseline is None:
                 continue
             if gate.baseline not in BASELINES:

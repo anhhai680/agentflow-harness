@@ -44,7 +44,7 @@ from agentflow.flow_control import (
     refine_subject,
     writes_questions,
 )
-from agentflow.gates import GateResult, gates_ok, run_doc_checks, run_gates
+from agentflow.gates import GateResult, agent_checks, gates_ok, run_doc_checks, run_gates
 from agentflow.gitops import CommitRejected, GitError, NothingToCommit, changed_since, commit, commits_between, head
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, notify_run, park_hitl, raise_hitl, read_result
@@ -65,7 +65,9 @@ RESULT = "_result.md"
 DEFAULT_TEMPLATE = "step.md"
 DEFAULT_REFINE = "refine.md"
 DEFAULT_ROLE = "build"
-RUN_FACTS_LINE = re.compile(r"^\{run_facts\}\n\n", re.MULTILINE)  # the preamble's slot, dropped whole when empty
+EMPTY_SLOT = re.compile(r"^\{(run_facts|code_map)\}\n\n", re.MULTILINE)  # a preamble slot, dropped whole when empty
+CODE_MAP_LEAD = ("Earlier sessions of this run found where this code lives. Open it at the line given instead of "
+                 "searching for it, and check a signature before you rely on it.")
 RESOLVER_FINDINGS_SHOWN = 3
 RESOLVER_FINDING_MAX = 600
 EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n?", re.DOTALL)
@@ -75,6 +77,14 @@ SKILL_BLOCK = ("## The `{skill}` skill\n\nIts full text follows, so you already 
 RESUMABLE = ("running", "waiting_human")
 UNSTARTED_STEP = (None, "pending")
 FOOTER = re.compile(r"^\s*Next:\s*`?([\w.:/-]+)`?\s+(?:—|–|--?)\s", re.MULTILINE)
+SELF_CHECKS_NONE = ("Do not run the linters, type checkers or other quality gates yourself: the runner's build gates "
+                    "run them right after you, and a failure comes back to this session with its output.")
+SELF_CHECKS = ("Before you write the result, run each of these checks once, after your last edit. They are the runner's "
+               "own build gates for this step: run them from the worktree root exactly as written, one Bash call per "
+               "line.\n\n```sh\n{commands}\n```\n\nFix what they report and run the failing one again. If one is "
+               "denied, skip it and say so in your summary: do not stop as `blocked` for it. Do not run any other gate "
+               "or the whole suite: the runner runs every build gate right after you, and a failure comes back to this "
+               "session with its output.")
 HANDOFF_LINE = "Read the handoff from the earlier phases first: `{handoff}`."
 
 
@@ -92,6 +102,15 @@ def _template(cfg: Config, name: str) -> str:
     if file is None:
         raise FileNotFoundError(f"prompt '{name}' is not in the pack's prompts/ or the engine's")
     return file.read_text(encoding="utf-8")
+
+
+def _self_checks(cfg: Config, step: Step, worktree: Path) -> str:
+    """The build prompts' `{self_checks}`: the step's `agent_check` gates for the implementer to run, or today's
+    "run none" sentence when it has none."""
+    gates = agent_checks(cfg, step.gates, worktree)
+    if not gates:
+        return SELF_CHECKS_NONE
+    return SELF_CHECKS.format(commands="\n".join(gate.run.strip() for gate in gates))
 
 
 def _values(cfg: Config, step: Step, ctx: Ctx, extra: dict) -> dict[str, str]:
@@ -112,6 +131,9 @@ def _values(cfg: Config, step: Step, ctx: Ctx, extra: dict) -> dict[str, str]:
     values["handoff"] = str(agent_dir / "handoff.md")
     values["questions"] = str(agent_dir / "questions.md")
     values["run_facts"] = _run_facts(run)
+    values["code_map"] = _code_map(run)
+    worktree = Path(run.state.get("worktree") or ctx.repo) if run is not None else ctx.repo
+    values["self_checks"] = _self_checks(cfg, step, worktree)
     values.update({name: str(value) for name, value in extra.items()})
     return values
 
@@ -124,6 +146,14 @@ def _run_facts(run: Run | None) -> str:
     lines = "\n".join(f"- {fact}" for fact in facts)
     return ("## What this run already found\n\nEarlier sessions of this run established these. Check one before "
             f"relying on it; do not diagnose it again.\n\n{lines}")
+
+
+def _code_map(run: Run | None) -> str:
+    """The code earlier sessions of the run mapped, as a section of the prompt; "" when there is nothing."""
+    notes = [str(c.get("text")) for c in (run.state.get("code_map") or []) if c.get("text")] if run is not None else []
+    if not notes:
+        return ""
+    return "## Code this run has mapped\n\n" + CODE_MAP_LEAD + "\n\n" + "\n".join(f"- {note}" for note in notes)
 
 
 def _refine_values(ctx: Ctx, rec: dict) -> dict[str, str]:
@@ -188,8 +218,7 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     """
     values = _values(cfg, step, ctx, {})
     preamble = EFFORT_BLOCK.sub("" if rec.get("sized") else r"\1", _template(cfg, PREAMBLE))
-    if not values["run_facts"]:
-        preamble = RUN_FACTS_LINE.sub("", preamble)
+    preamble = EMPTY_SLOT.sub(lambda m: "" if not values[m.group(1)] else m.group(0), preamble)
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
     files = list(dict.fromkeys([*step.brief, *step.task_brief]))
     # A step with no configured `brief:` whose skill resolves has the skill's text as its brief, and its first
@@ -833,8 +862,17 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             if sha:
                 self.run.emit("step_committed", key=sr.key, sha=sha, summary=result.summary)
         extra = {"tree": tree} if tree else {}
+        self._remember_code_map(sr, result)
         self.run.emit("step_finished", key=sr.key, status="done", summary=result.summary, sha=sha, **extra)
         return "done"
+
+    def _remember_code_map(self, sr: _StepRun, result: StepResult) -> None:
+        """Keep the code map a finished step reported, once per entry (any case). A stopped step never gets here."""
+        known = {str(c.get("text")).casefold() for c in self.run.state.get("code_map") or []}
+        for entry in result.code_map:
+            if entry.casefold() not in known:
+                known.add(entry.casefold())
+                self.run.emit("code_noted", text=entry, key=sr.key)
 
     def _soft_noted(self, soft: float) -> bool:
         """The run already said it passed this soft budget: a soft limit notifies once per value, and plan sizing

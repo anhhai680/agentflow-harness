@@ -68,6 +68,27 @@ def resolve(cfg: Config, names: str | list[str]) -> list[Gate]:
     return _resolve(cfg, names)
 
 
+def agent_checks(cfg: Config, names: str | list[str] | None, worktree: Path) -> list[Gate]:
+    """The gates a step's `gates:` names that the implementer may run itself: flagged `agent_check`, and not
+    ones the runner would skip for a missing `when_exists` path in `worktree`. In order, each name once."""
+    if not names:
+        return []
+    try:
+        gates = _resolve(cfg, names)
+    except KeyError:
+        return []
+    seen: set[str] = set()
+    out: list[Gate] = []
+    for gate in gates:
+        if not gate.agent_check or gate.name in seen:
+            continue
+        if gate.when_exists and not (worktree / gate.when_exists).exists():
+            continue
+        seen.add(gate.name)
+        out.append(gate)
+    return out
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError):  # it may have ended on its own meanwhile
         os.killpg(proc.pid, signal.SIGKILL)

@@ -309,6 +309,29 @@ def test_blocked_result_raises_hitl(flow_repo):
     assert raised[0]["summary"] == "the spec is missing"
 
 
+def test_a_done_step_records_its_code_map_once(flow_repo):
+    run = flow_repo.new_run()
+    entry = "`app/names.py:12` `normalise(name: str) -> str`: trims {braces}"
+    result = {"status": "done", "summary": "did it", "code_map": [entry]}
+    flow_repo.script({KEY: [{"result": result}], "build/other": [{"result": result}]})
+    assert run_step(flow_repo) == "done"
+    noted = flow_repo.events(run, "code_noted")
+    assert [(e["text"], e["key"]) for e in noted] == [(entry, KEY)]
+    assert run.state["code_map"] == [{"text": entry, "key": KEY}]
+    other = make_step(id="other")
+    assert flow_repo.executor(run).run_agent_step(make_phase(other), other, "build/other") == "done"
+    assert len(flow_repo.events(run, "code_noted")) == 1  # the same entry again: no second event
+
+
+def test_a_stopped_step_records_no_code_map(flow_repo):
+    run = flow_repo.new_run()
+    result = {"status": "blocked", "summary": "the spec is missing", "code_map": ["`app/names.py:12` `f()`: x"]}
+    flow_repo.script({KEY: [{"result": result}]})
+    assert run_step(flow_repo) == "stopped"
+    assert flow_repo.events(run, "code_noted") == []
+    assert run.state["code_map"] == []
+
+
 def test_needs_human_then_answer_resumes_same_session(flow_repo):
     run = flow_repo.new_run()
     question = {"id": "q1", "question": "Cache the token across conversations?",
@@ -1091,3 +1114,161 @@ def test_facts_go_into_the_preamble_before_the_step(flow_repo):
              "relying on it; do not diagnose it again.\n\n- a tool quirk {step_id}\n- an environment cause\n\n## The step")
     assert block in prompt  # braces in a fact go in verbatim
     assert prompt.replace(block, "## The step") == plain
+
+
+# --------------------------------------------------------------------------- the run's code map
+
+
+def test_without_a_code_map_the_preamble_is_unchanged(flow_repo):
+    flow_repo.new_run()
+    prompt = _prompt(flow_repo)
+    assert "Code this run has mapped" not in prompt and "{code_map}" not in prompt
+    assert "\n\n\n" not in prompt.split("## The step")[0]
+    assert re.search(r"stop as `blocked` and name the exact command\.\n\n## The step\n\n", prompt)
+
+
+def test_a_run_with_no_code_map_key_builds_the_same_prompt(flow_repo):
+    run = flow_repo.new_run()
+    plain = _prompt(flow_repo)
+    del run.state["code_map"]  # a state written before the code map existed
+    assert _prompt(flow_repo) == plain
+    assert lanes._code_map(None) == ""
+
+
+def test_the_code_map_follows_the_facts_before_the_step(flow_repo):
+    run = flow_repo.new_run()
+    run.emit("run_fact", text="a cause", key="build/x/resolve-1")
+    run.emit("code_noted", text="`app/names.py:12` `f() {step_id}`", key="build/x")
+    prompt = _prompt(flow_repo)
+    block = ("- a cause\n\n## Code this run has mapped\n\n" + lanes.CODE_MAP_LEAD
+             + "\n\n- `app/names.py:12` `f() {step_id}`\n\n## The step")  # braces in an entry go in verbatim
+    assert block in prompt
+    assert prompt.count("Code this run has mapped") == 1
+    run.emit("code_noted", text="`app/other.py:3` `g()`", key="build/y")
+    assert "- `app/names.py:12` `f() {step_id}`\n- `app/other.py:3` `g()`\n\n## The step" in _prompt(flow_repo)
+
+
+def test_a_code_map_with_no_facts_drops_only_the_facts_slot(flow_repo):
+    run = flow_repo.new_run()
+    plain = _prompt(flow_repo)
+    run.emit("code_noted", text="`a.py:1` `f()`", key="build/x")
+    prompt = _prompt(flow_repo)
+    assert "What this run already found" not in prompt and "{run_facts}" not in prompt
+    block = "## Code this run has mapped\n\n" + lanes.CODE_MAP_LEAD + "\n\n- `a.py:1` `f()`\n\n## The step"
+    assert block in prompt
+    assert prompt.replace(block, "## The step") == plain
+
+
+def test_task_prompts_point_at_interfaces_and_the_map_not_the_plan():
+    for name in TASK_TEMPLATES:
+        text = (ENGINE / "prompts" / name).read_text(encoding="utf-8")
+        assert "do not open the plan again" in text, name
+        assert "**Interfaces**" in text, name
+        assert "code map" in text, name
+    assert "code map" in (ENGINE / "prompts" / "task_review.md").read_text(encoding="utf-8")
+    skill = (ENGINE / "skills" / "agentflow-build" / "SKILL.md").read_text(encoding="utf-8")
+    assert "run's code map" in skill and "**Interfaces**" in skill
+
+
+def test_the_plan_skill_and_prompt_ask_for_interfaces_and_a_code_map():
+    skill = (ENGINE / "skills" / "agentflow-plan" / "SKILL.md").read_text(encoding="utf-8")
+    for needle in ("**Interfaces:**", "Uses:", "From earlier tasks:", "Produces:", "path:line"):
+        assert needle in skill, needle
+    prompt = (ENGINE / "prompts" / "plan.md").read_text(encoding="utf-8")
+    assert "`code_map`" in prompt and "**Interfaces**" in prompt
+
+
+def test_the_result_instructions_describe_code_map():
+    text = (ENGINE / "prompts" / "_result.md").read_text(encoding="utf-8")
+    assert "`code_map`" in text and "Up to 8" in text
+
+
+# --------------------------------------------------------------------------- {self_checks}
+
+OLD_LINT_LINE = ("Do not run the linters, type checkers or other quality gates yourself: the runner's build gates "
+                 "run them right after you, and a failure comes back to this session with its output.")
+TASK_TEMPLATES = ("task.md", "task_next.md")
+AGENT_CHECK_GATES = {
+    "py_lint": {"run": "lint .", "agent_check": True, "when_exists": None},
+    "py_types": {"run": "types", "agent_check": True, "when_exists": None},
+    "floor": {"run": "true"},
+}
+
+
+def self_checks_prompt(flow_repo, template: str, gates: dict | None = None, gate_sets: dict | None = None) -> str:
+    if gates is not None or gate_sets is not None:
+        patch: dict = {}
+        if gates is not None:
+            patch["gates"] = gates
+        if gate_sets is not None:
+            patch["gate_sets"] = gate_sets
+        flow_repo.configure(patch)
+    step = make_step(prompt=template, gates="build", skill="x", brief=[])
+    return skill_prompt(flow_repo, step, {"task_title": "Task 1: A", "task_text": "do a"})
+
+
+@pytest.mark.parametrize("template", TASK_TEMPLATES)
+def test_with_no_agent_check_the_task_prompt_says_what_it_says_today(flow_repo, template):
+    prompt = self_checks_prompt(flow_repo, template)
+    assert "format what you changed if the repository has a formatter. " + OLD_LINT_LINE in prompt
+    assert "{self_checks}" not in prompt
+
+
+@pytest.mark.parametrize("template", TASK_TEMPLATES)
+def test_agent_checks_are_listed_in_gate_order_as_one_fenced_block(flow_repo, template):
+    prompt = self_checks_prompt(flow_repo, template, AGENT_CHECK_GATES,
+                                {"build": ["floor", "py_lint", "py_types"]})
+    assert "format what you changed if the repository has a formatter. Before you write the result" in prompt
+    assert "```sh\nlint .\ntypes\n```" in prompt
+    assert "floor" not in prompt.split("```sh")[1].split("```")[0]
+    assert OLD_LINT_LINE not in prompt
+    assert "the runner runs every build gate right after you" in prompt
+    assert "{self_checks}" not in prompt
+
+
+def test_an_agent_check_the_runner_would_skip_or_another_step_owns_is_not_listed(flow_repo):
+    gates = {
+        "py_lint": {"run": "lint .", "agent_check": True, "when_exists": None},
+        "py_types": {"run": "types", "agent_check": True, "when_exists": "missing.txt"},  # the runner skips it
+        "py_unit": {"run": "unit", "agent_check": True, "when_exists": None},            # in gate_sets.verify only
+    }
+    prompt = self_checks_prompt(flow_repo, "task.md", gates,
+                                {"build": ["py_lint", "py_types"], "verify": ["floor", "py_unit"]})
+    assert "```sh\nlint .\n```" in prompt
+    assert "types" not in prompt.split("```sh")[1].split("```")[0]
+    assert "unit" not in prompt.split("```sh")[1].split("```")[0]
+
+
+def test_an_agent_check_whose_when_exists_file_is_there_is_listed(flow_repo):
+    (flow_repo.root / "present.txt").write_text("x\n", encoding="utf-8")
+    gates = {"py_lint": {"run": "lint .", "agent_check": True, "when_exists": "present.txt"}}
+    prompt = self_checks_prompt(flow_repo, "task.md", gates, {"build": ["py_lint"]})
+    assert "```sh\nlint .\n```" in prompt
+
+
+def test_a_gate_named_twice_is_listed_once(flow_repo):
+    gates = {"py_lint": {"run": "lint .", "agent_check": True, "when_exists": None}}
+    prompt = self_checks_prompt(flow_repo, "task.md", gates, {"build": ["py_lint", "py_lint"]})
+    assert prompt.count("lint .") == 1
+
+
+def test_a_denied_self_check_is_reported_not_a_stop(flow_repo):
+    gates = {"py_lint": {"run": "lint .", "agent_check": True, "when_exists": None}}
+    prompt = self_checks_prompt(flow_repo, "task.md", gates, {"build": ["py_lint"]})
+    assert "If one is denied, skip it and say so in your summary" in prompt
+
+
+def test_a_step_with_no_gates_gets_the_old_line(flow_repo):
+    flow_repo.configure({"gates": {"py_lint": {"run": "lint .", "agent_check": True, "when_exists": None}}})
+    step = make_step(prompt="task.md", skill="x", brief=[], gates=None)
+    prompt = skill_prompt(flow_repo, step, {"task_title": "Task 1: A", "task_text": "do a"})
+    assert OLD_LINT_LINE in prompt
+
+
+def test_a_pack_override_without_the_placeholder_still_renders(flow_repo):
+    override = ENGINE / "tests" / "fixtures" / "packs" / "python" / ".agentflow" / "prompts" / "task.md"
+    (flow_repo.cfg.path.parent / "prompts" / "task.md").write_text(override.read_text(encoding="utf-8"), encoding="utf-8")
+    gates = {"py_lint": {"run": "lint .", "agent_check": True, "when_exists": None}}
+    prompt = self_checks_prompt(flow_repo, "task.md", gates, {"build": ["py_lint"]})
+    assert OLD_LINT_LINE in prompt
+    assert "{self_checks}" not in prompt and "lint ." not in prompt

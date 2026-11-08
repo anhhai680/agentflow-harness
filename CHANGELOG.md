@@ -7,12 +7,22 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [2.1] - 2026-11-08
+
 ### Added
 
+- A step's result may carry `code_map`: up to 8 lines naming existing code (`path:line`, signature, use). The run keeps the newest 40 for every later session.
+- `gates.<name>.agent_check`: a gate the implementer runs itself before it finishes, so a lint failure is fixed in the same session instead of in a gate-fix round.
 - `context.max_compactions` (default 3): a session that has auto-compacted that often is replaced by a fresh one seeded from `progress.md`. `validate` now checks the `context` limits.
 - `agentflow init` finds a `docs/specs` folder (so the Backlog and "+ New task" are written for it), and sets `project.docs.spec_file` when most of its files are named `PREFIX-<module>.md`.
 - The dashboard header shows the engine version (`v2.0`), served by the new `GET /api/info` route.
 - This changelog, with a test that it has an entry for the current version.
+
+### Changed
+
+- The build prompts list a step's `agent_check` gates for the implementer to run before it finishes; with none, they read as before.
+- Every session's prompt shows the run's code map, and the build prompts stop sending a fresh session back to the plan.
+- The bundled plan skill asks for an `**Interfaces:**` list per task, naming the existing code the task calls by `path:line` and signature.
 
 ### Fixed
 

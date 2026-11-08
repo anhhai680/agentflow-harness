@@ -28,4 +28,6 @@ This session cannot ask for approval, so anything outside the allow rules is den
 
 {run_facts}
 
+{code_map}
+
 ## The step

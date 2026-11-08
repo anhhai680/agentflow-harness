@@ -1221,3 +1221,28 @@ def test_human_question_kinds_may_be_empty_or_name_any_question_kind(tmp_cfg, va
 def test_answer_recommended_must_be_a_bool(tmp_cfg):
     found = errors(issues_for(tmp_cfg, {"autonomy": {"answer_recommended": "sometimes"}}))
     assert ("error", "autonomy.answer_recommended") in found
+
+
+def test_a_gate_is_no_agent_check_unless_it_says_so(tmp_cfg):
+    assert load_config(tmp_cfg()).gates["floor"].agent_check is False
+    cfg = load_config(tmp_cfg({"gates": {"floor": {"run": "true", "agent_check": True}}}))
+    assert cfg.gates["floor"].agent_check is True
+
+
+def test_agent_check_must_be_a_bool(tmp_cfg):
+    with pytest.raises(ConfigError) as e:
+        load_config(tmp_cfg({"gates": {"floor": {"run": "true", "agent_check": "yes"}}}))
+    assert "gates.floor.agent_check" in str(e.value)
+
+
+@pytest.mark.parametrize("gate", [
+    {"run": "true", "cwd": "web", "agent_check": True},
+    {"run": "a\nb", "agent_check": True},
+    {"run": "echo `x`", "agent_check": True},
+])
+def test_validate_refuses_an_agent_check_the_agent_cannot_run_as_written(tmp_cfg, gate):
+    found = issues_for(tmp_cfg, {"gates": {"floor": gate}})
+    assert [i.message for i in found if i.level == "error" and i.path == "gates.floor.agent_check"
+            and "worktree root" in i.message]
+    off = issues_for(tmp_cfg, {"gates": {"floor": {**gate, "agent_check": False}}})
+    assert ("error", "gates.floor.agent_check") not in errors(off)
