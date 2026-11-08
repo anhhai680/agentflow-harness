@@ -19,23 +19,47 @@ entry's line or stands on an indented line of its own (`QUOTE`), so it can never
 or a table row. A run folder whose name is not a run id is left out. The text is deterministic: it depends on the
 logs, the lessons files and `now` (which only the lesson effects and the metrics of a run read), never on the order
 the file system lists things in.
+
+The rest runs the retro (`run_retro`): a run of the engine's `retro` pipeline (never a lane), a worktree on a fresh
+`project.branch` (lane `retro`, slug `YYYYMMDD`) forked from `project.fork_from`, the digest at
+`runs/<run>/retro/digest.md` (the workspace gets a copy, `workspace.prepare`), and one session of `retro_step` run as
+`retro/retro` the way the resolver runs its own. The session changes no file: any change it leaves stops the run.
+Its result proposes lessons to add, expire and renew, config notes and engine issues (`parse_proposals`); the runner
+checks each one (`check_proposals`, `apply_proposals`, `resolve_source`) and drops what fails with a line that says
+why. Only then does it render `.agentflow/lessons.md`, commit it with `gitops.commit_lessons` (that file and nothing
+else), push, and open a draft pull request a human merges; the runner never merges. Every string the model wrote
+reaches the file through `lessons.render` and the pull request body inside a code span (`_code`), so it can start no
+heading, list, link, mention or HTML there. A stop at any point is `blocked` on `retro/retro`, in the inbox, and a
+retro run is never resumed (`pipeline.advance` refuses it): a human cancels it and starts another.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import re
+import sys
+import unicodedata
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
-from .config import RETRO_PIPELINE, Config
-from .events import parse_iso
-from .hitl import clean_fact
-from .lessons import CORRELATION_NOTE, RUN_ERRORS, SOURCE, effects, load, run_logs
+from . import pack, safeio, views, workspace
+from .agents import make_agents
+from .conditions import make_ctx
+from .config import RETRO_PIPELINE, Config, Phase, Step, worktrees_root
+from .events import EventLog, nfc, parse_iso
+from .gitops import (CommitRejected, GhError, GitError, NothingToCommit, add_worktree, branch_exists, commit_lessons,
+                     create_draft_pr, dirty_paths, head, push)
+from .hitl import FACT_MAX, ResultError, clean_fact, raise_hitl
+from .lanes import Executor, build_prompt
+from .lessons import (_LEADING, BODY_MAX, CORRELATION_NOTE, ENGINE_PREFIX, FILE_MAX, RUN_ERRORS, SOURCE, Lesson, effects,
+                      load, parse, read, render, run_logs, split_header)
 from .metrics import run_metrics
-from .signals import RUNNER, aggregate_signals, run_signals
-from .state import TERMINAL, Run, replay
+from .pipeline import _ctx, _free_branch
+from .signals import COUNT_FAMILIES, RUNNER, aggregate_signals, parse_target, run_signals
+from .state import TERMINAL, Run, replay, runs_root
 
 DIGEST_TAIL_LINES = 10  # quoted lines kept from one tail, extra, note or list
 DIGEST_LINE_MAX = 200  # characters of one quoted line
@@ -316,4 +340,686 @@ def build_digest(repo: Path, cfg: Config, since: datetime | None, now: datetime)
     return Digest("\n".join(head + evidence + tail) + "\n", tuple(run.id for run, _events in runs), truncated)
 
 
-__all__ = ["DIGEST_LINE_MAX", "DIGEST_TAIL_LINES", "Digest", "build_digest", "finished_runs", "last_retro"]
+# =========================================================================== the retro session
+
+MAX_ADDS = 5  # new lessons one retro may add
+TITLE_MAX = 80  # characters of a lesson's title, after cleaning
+REVIEW_DEFAULT_DAYS = 90  # a new lesson's `review_by`, from today
+REVIEW_MAX_DAYS = 180  # the latest `review_by` a renew may set, from today
+KEY = f"{RETRO_PIPELINE}/{RETRO_PIPELINE}"  # the retro session's step key
+PROPOSALS_MAX = 50  # entries of one proposal list that are looked at; the rest are dropped with one line
+SOURCES_MAX = 10  # sources of one proposal
+APPLIES_MAX = 20  # phases of one lesson's `applies`
+REF_MAX = 120  # characters of a source reference: a run id and a seq are far shorter
+REASON_MAX = 200  # characters of an expire's or a renew's reason
+SHOWN_MAX = 120  # characters of model text a `Dropped` line quotes
+PR_FILE = "pr.md"  # the pull request body, beside the digest in `runs/<run>/retro/`
+COMMIT_MESSAGE = "Update lessons from the retro of {n} runs."
+PR_TITLE = "Lessons from {n} runs ({date})"
+DEFAULT_HEADER = ("# Lessons\n\nThis project's lessons from earlier agentflow runs, read into the prompt of every step "
+                  "after the engine's own. Only a merged retro pull request or a human edits this file.\n")
+LAST_LINE = (f"This PR changes only `{pack.LESSONS_FILE}`. Merge it to teach future runs; the runner never merges.")
+_TARGET_PARAM = re.compile(r"[A-Za-z0-9_.:/-]{1,80}\Z")  # a gate, phase, tool or kind: no space, `#` or markup
+_PACK_ID = re.compile(r"L-(\d{4})\Z", re.ASCII)
+_ENGINE_ID = re.compile(rf"{ENGINE_PREFIX}-\d{{4}}\Z", re.ASCII)
+_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z", re.ASCII)
+_SCAN = 64 * 1024  # characters of one model string looked at before it is cleaned and cut
+_INVISIBLE = ("Cc", "Cf")
+_LESSONS_KEYS = ("add", "expire", "renew")
+_ADD_FIELDS = {"title": (str, True), "body": (str, True), "sources": (list, True), "applies": (list, False),
+               "target": (str, False), "engine_candidate": (bool, False)}
+_EXPIRE_FIELDS = {"id": (str, True), "reason": (str, False)}
+_RENEW_FIELDS = {"id": (str, True), "review_by": (str, True), "reason": (str, False)}
+_NOTE_FIELDS = {"text": (str, True), "sources": (list, True)}
+
+
+@dataclass(frozen=True)
+class Proposals:
+    adds: list[dict]
+    expires: list[dict]
+    renews: list[dict]
+    config_notes: list[dict]
+    engine_issues: list[dict]
+
+
+@dataclass(frozen=True)
+class Note:
+    text: str
+    sources: tuple[str, ...]
+
+
+@dataclass
+class Checked:
+    """What the runner keeps of a retro's proposals (`check_proposals`)."""
+
+    lessons: list[Lesson]  # the pack's lessons after the change
+    added: list[tuple[Lesson, bool]]  # each new lesson, with its engine-candidate flag
+    expired: list[tuple[Lesson, str]]  # each removed lesson, with the reason given
+    renewed: list[tuple[Lesson, str]]  # each lesson with its new `review_by`, with the reason given
+    config_notes: list[Note]
+    engine_issues: list[Note]
+    dropped: list[str]  # one Markdown list line per proposal left out, saying why
+
+
+@dataclass(frozen=True)
+class RetroOutcome:
+    run_id: str | None
+    pr_url: str | None
+    message: str
+
+
+# --------------------------------------------------------------------------- the result's proposals
+
+
+def _check_items(value: Any, name: str, fields: dict[str, tuple[type, bool]]) -> list[dict]:
+    """A list of objects with `fields` (`name: (type, required)`); a field that is null counts as absent. Other keys
+    are kept as they are and never read."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ResultError(f"{name} must be a list")
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ResultError(f"{name}[{i}] must be an object")
+        for field, (kind, required) in fields.items():
+            found = item.get(field)
+            if found is None:
+                if required:
+                    raise ResultError(f"{name}[{i}] needs `{field}`")
+                continue
+            if kind is list:
+                ok = isinstance(found, list) and all(isinstance(entry, str) for entry in found)
+            else:
+                ok = isinstance(found, kind)
+            if not ok:
+                wanted = {list: "a list of strings", bool: "true or false", str: "a string"}[kind]
+                raise ResultError(f"{name}[{i}].{field} must be {wanted}")
+    return [dict(item) for item in value]
+
+
+def parse_proposals(raw: dict) -> Proposals:
+    """The proposals of a retro's result (`lessons.add`, `lessons.expire`, `lessons.renew`, `config_notes`,
+    `engine_issues`, each optional). A wrong shape raises `ResultError`; what the values say is checked later
+    (`check_proposals`)."""
+    if not isinstance(raw, dict):
+        raise ResultError("result must be a JSON object")
+    found = raw.get("lessons")
+    if found is None:
+        found = {}
+    if not isinstance(found, dict):
+        raise ResultError("lessons must be an object with `add`, `expire` and `renew` lists")
+    unknown = [key for key in found if key not in _LESSONS_KEYS]
+    if unknown:
+        raise ResultError(f"lessons has an unknown key {clean_fact(str(unknown[0]))[:40]!r}; known: add, expire, renew")
+    return Proposals(
+        adds=_check_items(found.get("add"), "lessons.add", _ADD_FIELDS),
+        expires=_check_items(found.get("expire"), "lessons.expire", _EXPIRE_FIELDS),
+        renews=_check_items(found.get("renew"), "lessons.renew", _RENEW_FIELDS),
+        config_notes=_check_items(raw.get("config_notes"), "config_notes", _NOTE_FIELDS),
+        engine_issues=_check_items(raw.get("engine_issues"), "engine_issues", _NOTE_FIELDS),
+    )
+
+
+# --------------------------------------------------------------------------- evidence
+
+
+def _run_events(repo: Path, run_id: str) -> list[dict] | None:
+    """The events of run `run_id` when it is evidence: a real directory directly under the runs root named exactly
+    the id (no symlink, no `..`), with a log that is no symlink, of a run that is no retro. Else None."""
+    root = runs_root(Path(repo))
+    folder = root / run_id
+    try:
+        if folder.name != run_id or folder.is_symlink() or not folder.is_dir():
+            return None
+        if folder.resolve(strict=True).parent != root.resolve(strict=True):
+            return None
+        log = folder / "events.jsonl"
+        if log.is_symlink() or not log.is_file():
+            return None
+        events = EventLog(log).read()
+        if replay(events).get("pipeline") == RETRO_PIPELINE:
+            return None
+    except RUN_ERRORS:
+        return None
+    return events
+
+
+def _resolve(repo: Path, ref: Any, cache: dict[str, list[dict] | None]) -> dict | None:
+    if not isinstance(ref, str) or len(ref) > REF_MAX or not ref.isascii():
+        return None
+    match = SOURCE.match(ref)
+    if match is None:
+        return None
+    run_id, seq = match.group(1), int(match.group(2))
+    if run_id not in cache:
+        cache[run_id] = _run_events(repo, run_id)
+    for ev in cache[run_id] or ():
+        found = ev.get("seq")
+        if isinstance(found, int) and not isinstance(found, bool) and found == seq:
+            return ev
+    return None
+
+
+def resolve_source(repo: Path, ref: Any) -> dict | None:
+    """The event `ref` (`<run id>#<seq>`) points at, or None: a ref that does not match `lessons.SOURCE` (ASCII
+    digits only, at most `REF_MAX` characters), a run folder that is not a real directory directly under the runs
+    root (no symlink, no `..`, named exactly the id), a log that is a symlink or missing, a retro run, or a seq no
+    event of the log has (a boolean `seq` is never one)."""
+    return _resolve(repo, ref, {})
+
+
+def _sources(repo: Path, refs: list[str], digest: Digest,
+             cache: dict[str, list[dict] | None]) -> tuple[list[str], list[str]]:
+    """`(good, bad)`: each ref as `<run id>#<seq>` when it resolves to an event of a run the digest read, else as
+    given. `cache` keeps each run's events for the next ref."""
+    good: list[str] = []
+    bad: list[str] = []
+    for ref in refs:
+        event = _resolve(repo, ref, cache)
+        match = SOURCE.match(ref) if event is not None else None
+        if event is None or match is None or match.group(1) not in digest.run_ids:
+            bad.append(ref)
+            continue
+        canonical = f"{match.group(1)}#{event['seq']}"
+        if canonical not in good:
+            good.append(canonical)
+    return good, bad
+
+
+# --------------------------------------------------------------------------- model text
+
+
+def _clean(value: Any, limit: int) -> str:
+    """Model text as one line a lessons file or a PR body may hold: control and format characters (bidi overrides,
+    zero-width ones) dropped, whitespace collapsed, leading heading marks, list dashes and spaces stripped, and only
+    then cut to `limit` characters, so neither invisible text nor a stripped `#` costs length."""
+    text = "".join(ch for ch in str(value)[:_SCAN] if ch.isspace() or unicodedata.category(ch) not in _INVISIBLE)
+    text = _LEADING.sub("", nfc(" ".join(text.split())))
+    return clean_fact(text[:limit])
+
+
+def _code(value: Any) -> str:
+    """Text as a Markdown code span, fenced by more backticks than it holds: nothing in it renders as a heading, a
+    link, a mention, an image or HTML."""
+    text = clean_fact(str(value))
+    if not text:
+        return "(empty)"
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest + 1)
+    return f"{fence} {text} {fence}"
+
+
+def _shown(value: Any) -> str:
+    return _code(clean_fact(str(value))[:SHOWN_MAX])
+
+
+def _refs(refs: list[str]) -> str:
+    return ", ".join(_shown(ref[:REF_MAX]) for ref in refs)
+
+
+# --------------------------------------------------------------------------- checking the proposals
+
+
+def _digest_signals(repo: Path, digest: Digest, today: date) -> list[dict[str, float]]:
+    """The signals of each run the digest read, from their logs."""
+    wanted = set(digest.run_ids)
+    now = datetime.combine(today, time.max, UTC)
+    out: list[dict[str, float]] = []
+    for name, events in run_logs(repo):
+        if name not in wanted:
+            continue
+        try:
+            out.append(run_signals(events, run_metrics(events, now)))
+        except RUN_ERRORS:
+            out.append({})
+    return out
+
+
+def _baseline(target: str, per_run: list[dict[str, float]], today: date) -> str | None:
+    """`<mean> over <n> runs to <today>` of `target` over the digest's runs (a count is 0 in a run without it)."""
+    family = target.partition(":")[0]
+    rows = [{target: s[target]} if target in s else ({target: 0.0} if family in COUNT_FAMILIES else {})
+            for s in per_run]
+    row = aggregate_signals(rows).get(target)
+    if row is None:
+        return None
+    return f"{row['mean']:.2f} over {row['runs']} runs to {today.isoformat()}"
+
+
+def _next_number(repo: Path, current: list[Lesson]) -> int:
+    """The next pack lesson number: above every current `L-` id and every one a run ever carried or cited, so an
+    expired lesson's id is never given to a new one (its effect would read the old lesson's runs)."""
+    highest = max((int(m.group(1)) for lesson in current if (m := _PACK_ID.match(lesson.id))), default=0)
+    for _name, events in run_logs(repo):
+        for ev in events:
+            if ev.get("type") == "lessons_injected" and isinstance(ev.get("ids"), list):
+                ids = ev["ids"]
+            elif ev.get("type") == "lesson_cited":
+                ids = [ev.get("id")]
+            else:
+                continue
+            for found in ids:
+                match = _PACK_ID.match(found) if isinstance(found, str) else None
+                if match:
+                    highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
+def _engine_titles() -> set[str]:
+    engine = read(pack.ENGINE_LESSONS, ENGINE_PREFIX)[0]
+    return {lesson.title.casefold() for lesson in engine}
+
+
+def _target(raw: Any) -> str | None:
+    """`raw` as a signal key in the vocabulary (`family` or `family:param`), or None."""
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    parsed = parse_target(text)
+    if parsed is None:
+        return None
+    family, param = parsed
+    if param is None:
+        return family
+    param = param.strip()
+    return f"{family}:{param}" if _TARGET_PARAM.match(param) else None
+
+
+def _reads_back(lesson: Lesson) -> bool:
+    return parse(render("", [lesson]), "L") == ([lesson], [])
+
+
+def check_proposals(current: list[Lesson], p: Proposals, repo: Path, cfg: Config, digest: Digest,
+                    today: date) -> Checked:
+    """What the runner keeps of `p`, checked against the run logs; see `apply_proposals` for the rules."""
+    repo = Path(repo)
+    dropped: list[str] = []
+
+    def over(items: list[dict], what: str) -> list[dict]:
+        if len(items) > PROPOSALS_MAX:
+            dropped.append(f"- {len(items) - PROPOSALS_MAX} more {what} were not read: a retro reads at most "
+                           f"{PROPOSALS_MAX}")
+        return items[:PROPOSALS_MAX]
+
+    by_id = {lesson.id: lesson for lesson in current}
+    titles = {lesson.title.casefold() for lesson in current} | _engine_titles()
+    number = _next_number(repo, current)
+    cache: dict[str, list[dict] | None] = {}
+    per_run: list[dict[str, float]] | None = None
+    added: list[tuple[Lesson, bool]] = []
+    for add in over(p.adds, "lessons to add"):
+        label = f"- add {_shown(add.get('title'))}"
+        if len(added) >= MAX_ADDS:
+            dropped.append(f"{label}: over the limit of {MAX_ADDS} new lessons a retro")
+            continue
+        title, body = _clean(add["title"], TITLE_MAX), _clean(add["body"], BODY_MAX)
+        if not title or not body:
+            dropped.append(f"{label}: its title or its body is empty once cleaned")
+            continue
+        if title.casefold() in titles:
+            dropped.append(f"{label}: a lesson with this title exists")
+            continue
+        target = _target(add.get("target"))
+        if target is None:
+            dropped.append(f"{label}: target {_shown(add.get('target'))} is not a signal key of the digest's vocabulary")
+            continue
+        applies = list(dict.fromkeys(add.get("applies") or []))
+        unknown = [phase for phase in applies if phase not in cfg.phases]
+        if len(applies) > APPLIES_MAX or unknown:
+            dropped.append(f"{label}: applies names {_refs(unknown) or 'too many phases'}, not phases of this pack")
+            continue
+        refs = add["sources"]
+        if not refs:
+            dropped.append(f"{label}: it cites no source")
+            continue
+        if len(refs) > SOURCES_MAX:
+            dropped.append(f"{label}: it cites {len(refs)} sources, over the limit of {SOURCES_MAX}")
+            continue
+        good, bad = _sources(repo, refs, digest, cache)
+        if bad:
+            dropped.append(f"{label}: source {_refs(bad)} is no event of a finished run this retro read")
+            continue
+        if number > 9999:
+            dropped.append(f"{label}: no lesson id is left (L-9999 is taken)")
+            continue
+        if per_run is None:
+            per_run = _digest_signals(repo, digest, today)
+        lesson = Lesson(f"L-{number:04d}", title, body, tuple(applies), tuple(good),
+                        today + timedelta(days=REVIEW_DEFAULT_DAYS), target, _baseline(target, per_run, today))
+        if not _reads_back(lesson):
+            dropped.append(f"{label}: it would not read back the same from the lessons file")
+            continue
+        number += 1
+        titles.add(title.casefold())
+        added.append((lesson, add.get("engine_candidate") is True))
+
+    gone: dict[str, str] = {}
+    for item in over(p.expires, "lessons to expire"):
+        lid, reason = item["id"], _clean(item.get("reason") or "", REASON_MAX)
+        label = f"- expire {_shown(lid)}" + (f" ({_code(reason)})" if reason else "")
+        if _ENGINE_ID.match(lid):
+            dropped.append(f"{label}: an engine lesson; only a human edits the engine's lessons")
+        elif lid not in by_id:
+            dropped.append(f"{label}: no such lesson in {pack.LESSONS_FILE}")
+        elif lid in gone:
+            dropped.append(f"{label}: expired above already")
+        else:
+            gone[lid] = reason
+
+    latest = today + timedelta(days=REVIEW_MAX_DAYS)
+    renewed: dict[str, tuple[date, str]] = {}
+    for item in over(p.renews, "lessons to renew"):
+        lid, raw, reason = item["id"], item["review_by"], _clean(item.get("reason") or "", REASON_MAX)
+        label = f"- renew {_shown(lid)} to {_shown(raw)}" + (f" ({_code(reason)})" if reason else "")
+        if _ENGINE_ID.match(lid):
+            dropped.append(f"{label}: an engine lesson; only a human edits the engine's lessons")
+            continue
+        if lid not in by_id:
+            dropped.append(f"{label}: no such lesson in {pack.LESSONS_FILE}")
+            continue
+        if lid in gone or lid in renewed:
+            dropped.append(f"{label}: {'expired' if lid in gone else 'renewed'} above already")
+            continue
+        try:
+            when = date.fromisoformat(raw) if _DATE.match(raw) else None
+        except ValueError:
+            when = None
+        if when is None:
+            dropped.append(f"{label}: review_by is not a date (YYYY-MM-DD)")
+        elif not today < when <= latest:
+            dropped.append(f"{label}: review_by must fall after {today.isoformat()} and on or before "
+                           f"{latest.isoformat()}")
+        else:
+            renewed[lid] = (when, reason)
+
+    def notes(items: list[dict], what: str) -> list[Note]:
+        kept: list[Note] = []
+        for item in over(items, f"{what}s"):
+            text = _clean(item["text"], FACT_MAX)
+            if not text:
+                dropped.append(f"- a {what} with no text")
+                continue
+            good, _bad = _sources(repo, item["sources"][:SOURCES_MAX], digest, cache)
+            if not good:
+                dropped.append(f"- {what} {_code(text)}: no source {_refs(item['sources'][:SOURCES_MAX])} is an "
+                               "event of a finished run this retro read")
+                continue
+            kept.append(Note(text, tuple(good)))
+        return kept
+
+    config_notes = notes(p.config_notes, "config note")
+    engine_issues = notes(p.engine_issues, "engine issue")
+    lessons = [dataclasses.replace(lesson, review_by=renewed[lesson.id][0]) if lesson.id in renewed else lesson
+               for lesson in current if lesson.id not in gone] + [lesson for lesson, _flag in added]
+    return Checked(
+        lessons=lessons,
+        added=added,
+        expired=[(by_id[lid], reason) for lid, reason in gone.items()],
+        renewed=[(dataclasses.replace(by_id[lid], review_by=when), reason) for lid, (when, reason) in renewed.items()],
+        config_notes=config_notes,
+        engine_issues=engine_issues,
+        dropped=dropped,
+    )
+
+
+def apply_proposals(current: list[Lesson], p: Proposals, repo: Path, cfg: Config, digest: Digest,
+                    today: date) -> tuple[list[Lesson], list[str]]:
+    """The pack's lessons after `p`, and one `Dropped` line per proposal left out. The rules:
+
+    - An add cites 1 to `SOURCES_MAX` sources, and every one must resolve (`resolve_source`) to an event of a run the
+      digest read (`digest.run_ids`). Its `target` is a signal key (`signals.parse_target`, a plain parameter), and
+      each of its `applies` is a phase of the pack. Title and body are cleaned, then cut to `TITLE_MAX` and
+      `BODY_MAX`; one that is empty then, or a title a lesson already has (either layer, any case), is dropped. The
+      first `MAX_ADDS` adds that pass are kept. New ids go on from the highest `L-` number the file or any run has
+      used; `review_by` is today plus `REVIEW_DEFAULT_DAYS`; the runner writes `baseline` from the digest's runs.
+      An add that would not read back the same from the rendered file is dropped.
+    - An expire names an existing `L-` lesson, never an `E-` one; the lesson leaves the file.
+    - A renew names an existing `L-` lesson and a date after today, at most `REVIEW_MAX_DAYS` ahead.
+    - A config note or an engine issue keeps the sources that resolve, and is dropped with none."""
+    checked = check_proposals(current, p, repo, cfg, digest, today)
+    return checked.lessons, checked.dropped
+
+
+# --------------------------------------------------------------------------- the pull request body
+
+
+def _fenced(text: str) -> list[str]:
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return [fence, text.rstrip("\n"), fence]
+
+
+def _lesson_line(lesson: Lesson, candidate: bool) -> str:
+    applies = ", ".join(lesson.applies) or "every phase"
+    return (f"- Added {_code(lesson.id)} {_code(lesson.title)}: {_code(lesson.body)} Target {_code(lesson.target)}, "
+            f"baseline {lesson.baseline or 'none'}, applies to {applies}, review by "
+            f"{lesson.review_by.isoformat() if lesson.review_by else '-'}. Sources: {_refs(list(lesson.sources))}. "
+            f"engine candidate: {'yes' if candidate else 'no'}")
+
+
+def _because(reason: str) -> str:
+    return _code(reason) if reason else "no reason given"
+
+
+def pr_body(repo: Path, cfg: Config, digest: Digest, checked: Checked, today: date) -> str:
+    """The retro pull request's body: what the runs since the last retro showed, what changed in the lessons file
+    and why, the advice nothing applies, and what was dropped. Model text is in code spans only."""
+    n = len(digest.run_ids)
+    lead = (f"The retro of {n} finished run{'s' if n != 1 else ''} ({_code(digest.run_ids[0])} to "
+            f"{_code(digest.run_ids[-1])}) proposes the changes below. The runner checked every source against "
+            "the run logs; the numbers show correlation, not cause.")
+    lines = [lead]
+    if digest.truncated:
+        lines += ["", f"The digest left out {digest.truncated} evidence entries to fit `memory.digest_tokens`."]
+    table = views.lessons_table(views.lessons_view(repo, cfg, today))
+    changes = [_lesson_line(lesson, flag) for lesson, flag in checked.added]
+    for lesson, reason in checked.expired:
+        sources = f" Sources: {_refs(list(lesson.sources))}." if lesson.sources else ""
+        changes.append(f"- Expired {_code(lesson.id)} {_code(lesson.title)}: {_because(reason)}.{sources}")
+    for lesson, reason in checked.renewed:
+        sources = f" Sources: {_refs(list(lesson.sources))}." if lesson.sources else ""
+        changes.append(f"- Renewed {_code(lesson.id)} {_code(lesson.title)} to "
+                       f"{lesson.review_by.isoformat() if lesson.review_by else '-'}: {_because(reason)}.{sources}")
+
+    def advice(notes: list[Note]) -> list[str]:
+        return [f"- {_code(note.text)} Sources: {_refs(list(note.sources))}." for note in notes] or ["(none)"]
+
+    lines += ["", "## Effect of previous lessons", "", *_fenced(table),
+              "", "## Lessons", "", *(changes or ["(none)"]),
+              "", "## Config notes", "", *advice(checked.config_notes),
+              "", "## Engine issues seen", "", *advice(checked.engine_issues),
+              "", "## Dropped", "", *(checked.dropped or ["(none)"]),
+              "", LAST_LINE]
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------- run_retro
+
+
+def _since_default(repo: Path) -> datetime | None:
+    """When the last retro started (its first event with a time), or None before the first retro."""
+    last = last_retro(repo)
+    if last is None:
+        return None
+    for ev in last.events.read():
+        moment = parse_iso(ev.get("ts"))
+        if moment is not None:
+            return moment
+    return None
+
+
+def _dry_prompt(cfg: Config, repo: Path, step: Step) -> str:
+    ctx = make_ctx(cfg, repo, RETRO_PIPELINE, {})
+    ctx.base_ref = f"origin/{cfg.project.base_branch}"
+    extra = {"result_file": "(the run's result file)", "phase": RETRO_PIPELINE, "run_dir": "(the run's workspace)",
+             "progress": "(the run's workspace)/progress.md"}
+    return build_prompt(cfg, step, ctx, {"sized": False, "role": step.role}, extra, "first")
+
+
+def run_retro(repo: Path, cfg: Config, since: datetime | None, dry_run: bool, now: datetime,
+              out: TextIO | None = None) -> RetroOutcome:
+    """Run a retro over the runs that ended since `since` (None: since the last retro started). With no such run it
+    creates nothing; `dry_run` prints the digest and the session's prompt to `out` and creates nothing. Otherwise it
+    runs the retro (see the module doc) and returns the run, the pull request (None when none opened) and a line
+    that says what happened. A stop is in the inbox; an error before the session ends the run as failed."""
+    repo = Path(repo).resolve()
+    if since is None:
+        since = _since_default(repo)
+    digest = build_digest(repo, cfg, since, now)
+    if not digest.run_ids:
+        when = since.isoformat(timespec="minutes") if since is not None else "the first run"
+        return RetroOutcome(None, None, f"nothing to learn: no finished runs since {when}")
+    step = cfg.retro_step
+    if step is None:
+        raise ValueError("this pack sets `retro_step: null`, so it has no retro session: remove that line")
+    if dry_run:
+        print(digest.text, file=out or sys.stdout)
+        print(_dry_prompt(cfg, repo, step), file=out or sys.stdout)
+        return RetroOutcome(None, None, f"dry run: a retro of {len(digest.run_ids)} runs; nothing was created")
+    if not branch_exists(repo, cfg.project.fork_from):
+        raise GitError(f"project.fork_from {cfg.project.fork_from!r} is not a local branch of {repo}")
+    params = {"since": since.isoformat() if since is not None else None, "runs": list(digest.run_ids)}
+    run = Run.create(cfg, repo, RETRO_PIPELINE, params, engine_pipeline=True)
+    lock = run.lock()
+    if not lock.acquire():
+        raise RuntimeError(f"another runner holds the lock of the new run {run.id}")
+    try:
+        return _Retro(cfg, repo, run, step, digest, now).go()
+    except Exception as exc:
+        run.refresh()
+        if run.state["status"] not in TERMINAL and run.state["waiting"] is None:
+            run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}"[:2000])
+        raise
+    finally:
+        lock.release()
+
+
+class _Retro:
+    """One retro run, from its worktree to its pull request (`run_retro`)."""
+
+    def __init__(self, cfg: Config, repo: Path, run: Run, step: Step, digest: Digest, now: datetime) -> None:
+        self.cfg = cfg
+        self.repo = repo
+        self.run = run
+        self.step = step
+        self.digest = digest
+        self.today = now.date()
+        self.now = now
+
+    def stop(self, summary: str) -> RetroOutcome:
+        """Stop the run for a human (`blocked` on the retro's step) and open no pull request."""
+        summary = clean_fact(summary)
+        raise_hitl(self.cfg, self.run, "blocked", KEY, summary)
+        return RetroOutcome(self.run.id, None, summary)
+
+    def go(self) -> RetroOutcome:
+        cfg, run = self.cfg, self.run
+        slug = f"{self.now:%Y%m%d}"
+        branch = _free_branch(self.repo, cfg.project.branch.replace("{lane}", RETRO_PIPELINE).replace("{slug}", slug))
+        worktree = (worktrees_root(cfg, self.repo) / run.id).resolve()
+        add_worktree(self.repo, worktree, branch, cfg.project.fork_from)
+        run.emit("run_updated", branch=branch, worktree=str(worktree), base_sha=head(worktree))
+        safeio.write_text(run.dir.joinpath(*workspace.RETRO_DIGEST), self.digest.text)
+
+        executor = Executor(cfg, run, make_agents(cfg), _ctx(cfg, run, worktree), {})
+        plain = Phase(name=RETRO_PIPELINE, agent=None, model=None, skip_if=None, steps=[])
+        if executor.run_agent_step(plain, self.step, KEY, role=self.step.role) != "done":
+            return RetroOutcome(run.id, None, f"the retro session stopped: see `agentflow inbox` ({run.id})")
+
+        changed = dirty_paths(worktree)
+        if changed:
+            shown = ", ".join(changed[:10]) + (f" and {len(changed) - 10} more" if len(changed) > 10 else "")
+            return self.stop(f"the retro session changed files: {shown}. A retro session changes no file.")
+        try:
+            proposals = parse_proposals(self.result())
+        except ResultError as exc:
+            return self.stop(f"the retro result cannot be read: {exc}")
+        found = self.current(worktree)
+        if isinstance(found, str):
+            return self.stop(found)
+        header, current = found
+        checked = check_proposals(current, proposals, self.repo, cfg, self.digest, self.today)
+        if checked.lessons == current:
+            run.emit("run_finished", summary="nothing to learn")
+            return RetroOutcome(run.id, None, f"nothing to learn: the retro of {len(self.digest.run_ids)} runs "
+                                f"changes no lesson ({len(checked.dropped)} proposals dropped)")
+        return self.publish(worktree, branch, header, checked)
+
+    def result(self) -> dict:
+        """The session's raw result: `read_result` checked the common fields; the proposals are read here."""
+        try:
+            data = safeio.read_bytes(self.run.result_path(KEY), workspace.RESULT_LIMIT)
+        except (OSError, ValueError) as exc:
+            raise ResultError(f"the result file cannot be read: {exc}") from None
+        if data is None:
+            raise ResultError("the result file is missing")
+        try:
+            raw = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ResultError(f"result file is not valid JSON: {exc}") from None
+        return raw
+
+    def current(self, worktree: Path) -> tuple[str, list[Lesson]] | str:
+        """`(header, lessons)` of the lessons file on the branch the retro forked from, or why it cannot be used."""
+        path = worktree / pack.LESSONS_FILE
+        if path.parent.is_symlink():
+            return f"{pack.LESSONS_FILE}'s folder is a symlink on {self.cfg.project.fork_from}"
+        try:
+            data = safeio.read_bytes(path, FILE_MAX)
+        except (OSError, ValueError) as exc:
+            return f"{pack.LESSONS_FILE} on {self.cfg.project.fork_from} cannot be read: {exc}"
+        if data is None:
+            return DEFAULT_HEADER, []
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return f"{pack.LESSONS_FILE} on {self.cfg.project.fork_from} is not UTF-8 text"
+        current, problems = parse(text, "L")
+        if problems:
+            more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
+            return (f"{pack.LESSONS_FILE} on {self.cfg.project.fork_from} has a malformed entry, which a retro would "
+                    f"drop: {problems[0]}{more}. Fix it (`agentflow validate` lists them), then run the retro again.")
+        return split_header(text), current
+
+    def publish(self, worktree: Path, branch: str, header: str, checked: Checked) -> RetroOutcome:
+        cfg, run, n = self.cfg, self.run, len(self.digest.run_ids)
+        text = render(header, checked.lessons)
+        if parse(text, "L") != (checked.lessons, []):
+            return self.stop(f"the new {pack.LESSONS_FILE} would not read back as the runner wrote it")
+        base = run.state.get("base_sha")
+        if head(worktree) != base:
+            return self.stop(f"HEAD of {branch} is no longer the {str(base)[:12]} the retro forked from")
+        safeio.write_text(worktree / pack.LESSONS_FILE, text)
+        try:
+            sha = commit_lessons(worktree, COMMIT_MESSAGE.format(n=n), cfg)
+        except CommitRejected as exc:  # terminal: nothing is pushed after a refused commit
+            return self.stop(f"the lessons commit was refused: {exc}")
+        except NothingToCommit:
+            return self.stop(f"{pack.LESSONS_FILE} was written but git has nothing to commit: is it ignored "
+                             "(`.gitignore`) on the branch the retro forked from?")
+        except GitError as exc:
+            return self.stop(f"{pack.LESSONS_FILE} could not be committed: {exc}")
+        run.emit("lessons_committed", key=KEY, sha=sha, added=[lesson.id for lesson, _flag in checked.added],
+                 expired=[lesson.id for lesson, _reason in checked.expired],
+                 renewed=[lesson.id for lesson, _reason in checked.renewed])
+        try:
+            push(worktree, branch)
+        except GitError as exc:
+            return self.stop(f"committed {sha[:12]} on {branch} but could not push it: {exc}")
+        body_file = run.dir / workspace.RETRO_DIGEST[0] / PR_FILE
+        safeio.write_text(body_file, pr_body(self.repo, cfg, self.digest, checked, self.today))
+        title = PR_TITLE.format(n=n, date=self.today.isoformat())
+        try:
+            url = create_draft_pr(worktree, cfg.project.fork_from, branch, title, body_file)
+        except GhError as exc:
+            return self.stop(f"pushed {branch} but could not open the PR: {exc}")
+        run.emit("pr_opened", url=url)
+        run.emit("run_finished", summary=f"opened {url}")
+        return RetroOutcome(run.id, url, f"opened {url}")
+
+
+__all__ = [
+    "DIGEST_LINE_MAX", "DIGEST_TAIL_LINES", "KEY", "MAX_ADDS", "REVIEW_DEFAULT_DAYS", "REVIEW_MAX_DAYS", "TITLE_MAX",
+    "Checked", "Digest", "Note", "Proposals", "RetroOutcome", "apply_proposals", "build_digest", "check_proposals",
+    "finished_runs", "last_retro", "parse_proposals", "pr_body", "resolve_source", "run_retro",
+]

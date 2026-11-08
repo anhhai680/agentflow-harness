@@ -29,7 +29,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from agentflow.config import Config, Phase, Step, check_lane, for_lane, resolve_model
+from agentflow.config import RETRO_PIPELINE, Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.events import parse_iso
 from agentflow import lessons as lessons_mod
 from agentflow.hitl import inbox_items
@@ -160,7 +160,10 @@ def _walks(steps: list[Step], lane: str) -> bool:
 
 
 def lane_phases(cfg: Config, lane: str) -> list[str]:
-    """The phases a run of `lane` walks, in order (a phase with nothing to run for the lane is left out)."""
+    """The phases a run of `lane` walks, in order (a phase with nothing to run for the lane is left out). A retro
+    run walks no phase of the workflow: its one session is its own phase, `retro`."""
+    if lane == RETRO_PIPELINE:
+        return [RETRO_PIPELINE]
     return [name for name, phase in cfg.phases.items() if _walks(phase.steps, lane)]
 
 

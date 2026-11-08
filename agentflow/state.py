@@ -22,12 +22,13 @@ from pathlib import Path
 from typing import Any
 
 from . import pack
-from .config import KNOWN_EFFORT_LEVELS, Config, check_lane
+from .config import KNOWN_EFFORT_LEVELS, RETRO_PIPELINE, Config, check_lane
 from .events import EventError, EventLog, RunLock, lock_state, nfc, now_iso
 
 TERMINAL = ("done", "failed", "cancelled")
 SLUG_PARAMS = ("slug", "module", "issue", "topic", "task", "log")  # an explicit slug (an issue's) wins
 SLUG_MAX = 40
+ENGINE_PIPELINES = (RETRO_PIPELINE,)  # pipelines the engine runs itself (`Run.create(..., engine_pipeline=True)`)
 CODE_MAP_MAX = 40  # existing code a step reported that the run keeps for every later session (the newest)
 RUN_FACTS_MAX = 8  # what a resolver found that the run keeps for every later session (the newest)
 
@@ -900,8 +901,14 @@ class Run:
     # -- construction
 
     @classmethod
-    def create(cls, cfg: Config, repo: Path, pipeline: str, params: dict) -> Run:
-        check_lane(cfg, pipeline)
+    def create(cls, cfg: Config, repo: Path, pipeline: str, params: dict, *, engine_pipeline: bool = False) -> Run:
+        """A new run of `pipeline`: a lane of the pack's, or with `engine_pipeline` one of `ENGINE_PIPELINES` (the
+        retro), which no `lanes:` lists, so `agentflow run <it>` still says it is no lane."""
+        if engine_pipeline:
+            if pipeline not in ENGINE_PIPELINES:
+                raise ValueError(f"{pipeline!r} is not an engine pipeline; known: {', '.join(ENGINE_PIPELINES)}")
+        else:
+            check_lane(cfg, pipeline)
         root = runs_root(repo)
         root.mkdir(parents=True, exist_ok=True)
         base = f"{datetime.now():%Y%m%d-%H%M}-{pipeline}-{_slug_for(pipeline, params)}"
