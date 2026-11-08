@@ -718,6 +718,9 @@ def cmd_retro(args: argparse.Namespace) -> int:
 
     try:
         cfg, repo = _load_cfg(args), _find_repo()
+        if cfg.retro_step is None:
+            print("error: this pack has no retro step (`retro_step: null`): remove that line to use `agentflow retro`")
+            return 1
         if not args.dry_run:
             problem = _preflight(cfg)
             if problem:
@@ -727,6 +730,8 @@ def cmd_retro(args: argparse.Namespace) -> int:
         print(outcome.message)
         if outcome.pr_url:
             print(f"Pull request: {outcome.pr_url}")
+        if outcome.refused:
+            return 1
         if outcome.run_id is None:
             return 0
         return 0 if Run.load(repo, outcome.run_id).state["status"] == "done" else 1

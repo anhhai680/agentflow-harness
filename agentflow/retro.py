@@ -36,6 +36,7 @@ retro run is never resumed (`pipeline.advance` refuses it): a human cancels it a
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import json
 import os
 import re
@@ -43,6 +44,8 @@ import stat
 import subprocess
 import sys
 import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -418,6 +421,7 @@ class RetroOutcome:
     run_id: str | None
     pr_url: str | None
     message: str
+    refused: bool = False  # another retro is still open: nothing was started
 
 
 # --------------------------------------------------------------------------- the result's proposals
@@ -860,12 +864,26 @@ def _since_default(repo: Path) -> datetime | None:
     return None
 
 
-def due(repo: Path, cfg: Config, now: datetime) -> str | None:
-    """Why a retro is due, or None. Due needs both new work and time: a run ended since the last retro that
-    finished started (a retro that stopped, failed or was cancelled read its runs for nothing, so it is no anchor),
-    and `memory.retro_every_days` days have passed since then (or there never was one). 0 days means manual only."""
+def open_retro(repo: Path) -> Run | None:
+    """The newest retro run that has not ended (running, waiting for a human, or stopped on an error), or None.
+    A person cancels it to let another retro start."""
+    open_ = [run for run, _events in _runs(repo)
+             if run.state.get("pipeline") == RETRO_PIPELINE and run.state.get("status") not in TERMINAL]
+    return open_[-1] if open_ else None
+
+
+def already_open(run: Run) -> str:
+    return (f"a retro is already {run.state.get('status')} ({run.id}): see `agentflow inbox`, or cancel it and run "
+            "`agentflow retro` again")
+
+
+def due_reason(repo: Path, cfg: Config, now: datetime) -> str | None:
+    """Why a retro is due, ignoring a retro that is still open (`due` counts that). Due needs both new work and
+    time: a run ended since the last retro that finished started (a retro that stopped, failed or was cancelled
+    read its runs for nothing, so it is no anchor), and `memory.retro_every_days` days have passed since then (or
+    there never was one). 0 days means manual only, and a pack with no retro step is never due."""
     days = cfg.memory.retro_every_days
-    if days <= 0:
+    if days <= 0 or cfg.retro_step is None:
         return None
     anchor = _since_default(repo)
     fresh = finished_runs(repo, anchor)
@@ -875,6 +893,11 @@ def due(repo: Path, cfg: Config, now: datetime) -> str | None:
         return None
     since = f"{_aware(anchor):%Y-%m-%d}" if anchor is not None else "the start"
     return f"{len(fresh)} finished runs since {since}"
+
+
+def due(repo: Path, cfg: Config, now: datetime) -> str | None:
+    """`due_reason`, or None while a retro is open: it is already doing the work."""
+    return None if open_retro(repo) is not None else due_reason(repo, cfg, now)
 
 
 def due_or_none(repo: Path, cfg: Config, now: datetime) -> str | None:
@@ -891,6 +914,19 @@ def _dry_prompt(cfg: Config, repo: Path, step: Step) -> str:
     extra = {"result_file": "(the run's result file)", "phase": RETRO_PIPELINE, "run_dir": "(the run's workspace)",
              "progress": "(the run's workspace)/progress.md"}
     return build_prompt(cfg, step, ctx, {"sized": False, "role": step.role}, extra, "first")
+
+
+@contextmanager
+def _creating(repo: Path) -> Iterator[None]:
+    """Hold `runs/retro.lock` while a retro run is checked for and created (a moment, not the whole retro)."""
+    path = runs_root(repo) / "retro.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def run_retro(repo: Path, cfg: Config, since: datetime | None, dry_run: bool, now: datetime,
@@ -916,7 +952,11 @@ def run_retro(repo: Path, cfg: Config, since: datetime | None, dry_run: bool, no
     if not branch_exists(repo, cfg.project.fork_from):
         raise GitError(f"project.fork_from {cfg.project.fork_from!r} is not a local branch of {repo}")
     params = {"since": since.isoformat() if since is not None else None, "runs": list(digest.run_ids)}
-    run = Run.create(cfg, repo, RETRO_PIPELINE, params, engine_pipeline=True)
+    with _creating(repo):  # the check and the new run are one step: two starters cannot both pass the check
+        live = open_retro(repo)
+        if live is not None:
+            return RetroOutcome(None, None, already_open(live), refused=True)
+        run = Run.create(cfg, repo, RETRO_PIPELINE, params, engine_pipeline=True)
     lock = run.lock()
     if not lock.acquire():
         raise RuntimeError(f"another runner holds the lock of the new run {run.id}")
@@ -1119,6 +1159,6 @@ class _Retro:
 __all__ = [
     "DIGEST_LINE_MAX", "DIGEST_TAIL_LINES", "KEY", "MAX_ADDS", "REVIEW_DEFAULT_DAYS", "REVIEW_MAX_DAYS", "TITLE_MAX",
     "Checked", "Digest", "Note", "Proposals", "RetroOutcome", "apply_proposals", "build_digest", "check_proposals",
-    "due", "due_or_none", "finished_runs", "last_finished_retro", "last_retro", "parse_proposals", "pr_body",
+    "already_open", "due", "due_or_none", "due_reason", "open_retro", "finished_runs", "last_finished_retro", "last_retro", "parse_proposals", "pr_body",
     "resolve_source", "run_retro",
 ]

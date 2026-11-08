@@ -870,6 +870,14 @@ def _retro_if_due(cfg: Config, repo: Path, say: Callable[[str], None]) -> bool:
     from agentflow.state import Run
 
     now = datetime.now(UTC)
+    try:
+        live = retro.open_retro(repo)
+        if live is not None:  # a cron run finds the retro of an earlier one still waiting: say so, start nothing
+            if retro.due_reason(repo, cfg, now) is not None:
+                say(f"retro: {retro.already_open(live)}")
+            return False
+    except Exception:  # noqa: BLE001 - a reminder is never worth an error
+        return False
     if retro.due_or_none(repo, cfg, now) is None:
         return False
     try:

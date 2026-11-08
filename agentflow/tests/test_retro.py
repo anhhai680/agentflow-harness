@@ -1394,7 +1394,7 @@ def test_a_retro_that_did_not_finish_does_not_hide_a_due_retro(tmp_git, tmp_cfg)
     _finished(tmp_git, lane=RETRO_PIPELINE, start=START)
     _finished(tmp_git, start=START + timedelta(hours=1))
     _finished(tmp_git, lane=RETRO_PIPELINE, end="run_cancelled", start=START + timedelta(days=7))  # cancelled
-    _finished(tmp_git, lane=RETRO_PIPELINE, end=None, start=START + timedelta(days=7, hours=1))  # stopped, live
+    _finished(tmp_git, lane=RETRO_PIPELINE, end="run_failed", start=START + timedelta(days=7, hours=1))  # failed
     assert due(tmp_git, cfg, START + timedelta(days=8)) == "1 finished runs since 2026-11-01"
 
 
@@ -1455,3 +1455,64 @@ def test_board_carries_retro_due(flow_repo):
     assert views.board(flow_repo.root, flow_repo.cfg)["retro_due"] is None
     _finished(flow_repo.root, start=old)
     assert views.board(flow_repo.root, flow_repo.cfg)["retro_due"] == "1 finished runs since the start"
+
+
+# --------------------------------------------------------------------------- one open retro at a time
+
+
+def _open_retro(flow_repo, failing_gh) -> Run:
+    return _blocked_retro(flow_repo, failing_gh)
+
+
+def test_due_is_none_while_a_retro_is_open_and_due_again_after_it_is_cancelled(flow_repo, failing_gh):
+    from agentflow import run_control
+    from agentflow.retro import due
+
+    run = _open_retro(flow_repo, failing_gh)
+    later = NOW + timedelta(days=30)
+    assert due(flow_repo.root, flow_repo.cfg, later) is None
+    run_control.cancel(run, "me")
+    assert due(flow_repo.root, flow_repo.cfg, later) == "2 finished runs since the start"
+
+
+def test_a_live_retro_also_holds_off_due_and_a_second_retro(tmp_git, tmp_cfg):
+    from agentflow.retro import due
+
+    cfg = _every(tmp_cfg, 7)
+    _finished(tmp_git)
+    live = _finished(tmp_git, lane=RETRO_PIPELINE, end=None)
+    assert due(tmp_git, cfg, NOW + timedelta(days=30)) is None
+    out = run_retro(tmp_git, cfg, None, False, NOW)
+    assert out.run_id is None and out.refused and f"a retro is already running ({live})" in out.message
+    assert "cancel it and run `agentflow retro` again" in out.message
+
+
+def test_a_manual_retro_while_one_waits_is_refused_and_creates_nothing(flow_repo, failing_gh, capsys):
+    from agentflow.flow import main
+
+    run = _open_retro(flow_repo, failing_gh)
+    before = _retro_runs(flow_repo)
+    branches = run_git(flow_repo.origin, "branch", "--list", "flow/retro*")
+    calls = len(flow_repo.calls())
+    out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    assert out.run_id is None and out.pr_url is None and out.refused
+    assert f"a retro is already waiting_human ({run.id}): see `agentflow inbox`" in out.message
+    assert main(["retro", "--config", str(flow_repo.cfg.path)]) == 1
+    assert "already" in capsys.readouterr().out
+    assert _retro_runs(flow_repo) == before and len(flow_repo.calls()) == calls
+    assert run_git(flow_repo.origin, "branch", "--list", "flow/retro*") == branches
+    buf = io.StringIO()  # a dry run is still allowed
+    assert not run_retro(flow_repo.root, flow_repo.cfg, None, True, NOW, out=buf).refused and "# Retro digest" in buf.getvalue()
+
+
+def test_a_pack_without_a_retro_step_is_never_due_and_the_command_says_so(flow_repo, tmp_cfg, capsys):
+    from agentflow.flow import main
+    from agentflow.retro import due
+
+    path = tmp_cfg(lambda data: data.__setitem__("retro_step", None))
+    cfg = load_config(path)
+    assert cfg.retro_step is None
+    _finished(flow_repo.root)
+    assert due(flow_repo.root, cfg, NOW + timedelta(days=30)) is None
+    assert main(["retro", "--config", str(path)]) == 1
+    assert "this pack has no retro step" in capsys.readouterr().out

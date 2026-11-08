@@ -1265,3 +1265,24 @@ def test_queue_opens_the_retro_pr_then_starts_the_module(qrepo, monkeypatch, tmp
     assert len(_retro_runs(qrepo)) == 1 and go.started == ["platform"]
     assert len(_created(tmp_path / "gh.log")) == 1
     assert any(PR_URL in m for m in messages)
+
+
+def test_a_retro_that_stays_open_is_not_started_again_by_each_cron_run(qrepo, monkeypatch, tmp_path):
+    import subprocess as sp
+
+    from test_retro import KEY, SEQ, _add, _retro_result, _retro_runs, _two_runs_failing
+
+    monkeypatch.setenv("FAKE_GH_FAIL", "1")  # the PR cannot open: the retro stops blocked
+    a, _b = _two_runs_failing(qrepo, "unit")
+    qrepo.fake.script({KEY: [_retro_result(add=[_add(sources=[f"{a}#{SEQ}"])])]})
+    logs: list[list[str]] = []
+    for _ in range(3):
+        messages: list[str] = []
+        assert module_queue.run_queue(qrepo.cfg, qrepo.root, 2, Starter(qrepo), once=True, log=messages.append) == 0
+        logs.append([m for m in messages if "retro" in m.lower()])
+    assert len(_retro_runs(qrepo)) == 1 and len(qrepo.calls()) == 1
+    pushed = sp.run(["git", "branch", "--list", "flow/retro*"], cwd=qrepo.origin, capture_output=True, text=True).stdout
+    assert len(pushed.split()) == 1
+    assert len(logs[0]) == 1 and "already" not in logs[0][0]
+    for later in logs[1:]:
+        assert len(later) == 1 and "a retro is already waiting_human" in later[0] and "\n" not in later[0]
