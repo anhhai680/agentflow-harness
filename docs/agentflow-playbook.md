@@ -509,7 +509,7 @@ The session is an agent with a shell, and "change no file" is only a request in 
 
 The retro also stops before its session when the lessons file on `project.fork_from` has a malformed entry (`agentflow validate` lists them), and after its session when that file is ignored by `.gitignore`, when the result cannot be read, or when `gh` cannot open the PR. In that last case the stop names the branch it already pushed.
 
-**A stopped retro is cancelled and run again.** It shows in the inbox as `blocked` on `retro/retro`, with the reason. It cannot be approved, answered, rejected, retried or resumed, from the CLI or the dashboard. Read the reason, fix the cause (for example the malformed entry, or a hook or setting the stop names), then `agentflow cancel <run>` and `agentflow retro`. The new retro reads the same runs, because the stopped one never finished.
+**A stopped retro is cancelled and run again.** It shows in the inbox as `blocked` on `retro/retro`, with the reason. It cannot be approved, answered, rejected, retried or resumed, from the CLI or the dashboard. Read the reason, fix the cause (for example the malformed entry, or a hook or setting the stop names), then `agentflow cancel <run>` and `agentflow retro`. The new retro reads the same runs, because the stopped one never finished. After a stop that says it already pushed the branch (`gh` could not open the PR), cancelling it and running `agentflow retro` again pushes a new branch (with a `-2` suffix on the same day): delete the old remote branch by hand.
 
 ### Reviewing a lessons PR
 
@@ -531,7 +531,7 @@ Merging makes the lesson live for every session that starts after it reaches the
 
 ### Reading `agentflow lessons`
 
-`agentflow lessons` prints one row per lesson of both layers. The columns are `ID`, `VERDICT`, `TARGET`, `BASELINE`, `AFTER`, `CITED` and `TITLE`, and the title of a lesson past its `review_by` ends `(past review_by)`. A note under the table says that before/after shows correlation, not cause. `--json` gives the same data, plus each lesson's body, phases, sources and the `baseline` recorded in the file. The dashboard's Lessons tab shows it as a table, and each source opens its run.
+`agentflow lessons` prints one row per lesson of both layers. The columns are `ID`, `VERDICT`, `TARGET`, `BASELINE`, `AFTER`, `CITED` and `TITLE`, and the title of a lesson past its `review_by` ends `(past review_by)`. A note under the table says that before/after shows correlation, not cause. `--json` gives the same data, plus each lesson's body, phases and sources. In it, `baseline` is the computed mean (the BASELINE column), and the `baseline` line recorded in the file is under `recorded_baseline`. The dashboard's Lessons tab shows it as a table, and each source opens its run.
 - **AFTER** is the mean of the target signal over the ended, non-retro runs that carried the lesson.
 - **BASELINE** is the mean over the ended runs without it that started before the first run that carried it. Each value has its count of runs.
 - A run counts only when it has the target's key, such as `gate_first_pass:unit` for a run where gate `unit` ran. A count signal (`fix_attempts`, `guard_trips`, `permission_denied`, `stop`, `human_rejections`, `ci_rounds`, `rollovers` and `progress_not_updated`) reads 0 in a run that has none.
