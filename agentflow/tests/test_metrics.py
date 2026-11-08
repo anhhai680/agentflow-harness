@@ -239,3 +239,15 @@ def test_aggregate_sums_runs_and_ranks_steps():
     assert out["models"] == [{"phase": "build", "model": "claude-opus-5-5·high", "sessions": 3, "agent_s": 3600.0,
                               "cost_usd": 6.0}]
     assert out["bucket_pct"]["agent"] == 100.0
+
+
+def test_metrics_view_carries_signal_totals(flow_repo):
+    from agentflow.views import metrics_table, metrics_view
+
+    run = flow_repo.new_run()
+    run.emit("gate_result", key="build/build/task-1/implement", gate="unit", passed=False, skipped=False, duration_s=0.0)
+    run.emit("run_finished")
+    view = metrics_view(flow_repo.root, flow_repo.cfg)
+    assert view["signals"]["gate_first_pass:unit"] == {"runs": 1, "mean": 0.0}
+    assert view["runs"][0]["signals"]["gate_first_pass:unit"] == 0.0
+    assert "gate_first_pass:unit" in metrics_table(view)

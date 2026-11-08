@@ -33,6 +33,7 @@ from agentflow.config import Config, Phase, Step, check_lane, for_lane, resolve_
 from agentflow.events import parse_iso
 from agentflow.hitl import inbox_items
 from agentflow.metrics import BUCKETS, aggregate, run_metrics
+from agentflow.signals import aggregate_signals, run_signals
 from agentflow.state import TERMINAL, Run, cost_added, display_status, list_runs, runs_root
 
 ARROWS = {"up": "↑", "down": "↓"}
@@ -698,6 +699,7 @@ def metrics_view(repo: Path, cfg: Config, lane: str | None = None, date_from: da
             "pr_link": _pr_link(state),
             "started_on": day.isoformat() if day else None,
             "metrics": metrics,
+            "signals": run_signals(run.events.read(), metrics),
         })
     rows.sort(key=lambda r: r["metrics"].get("started_at") or r["run_id"], reverse=True)
     return {
@@ -710,6 +712,7 @@ def metrics_view(repo: Path, cfg: Config, lane: str | None = None, date_from: da
         "all_time": all_time,
         "runs": rows,
         "totals": aggregate(rows),
+        "signals": aggregate_signals([r["signals"] for r in rows]),
         "generated_at": now.isoformat(timespec="seconds"),
     }
 
@@ -805,6 +808,9 @@ def _money(value: float, estimated: bool = False) -> str:
     return f"{'~' if estimated else ''}${value:.2f}"
 
 
+SIGNAL_ROWS = 20
+
+
 def metrics_table(view: dict) -> str:
     """`agentflow metrics`: one block per run (a row per phase: wall, each bucket, cost, models), then totals."""
     shown = [b for b in view["buckets"] if any(r["metrics"]["buckets"].get(b) for r in view["runs"])]
@@ -832,6 +838,14 @@ def metrics_table(view: dict) -> str:
         share = " · ".join(f"{b} {totals['bucket_pct'][b]:g}%" for b in view["buckets"] if totals["bucket_pct"][b])
         lines.append(f"total {_money(totals['cost_usd'])} · rework {totals['rework_pct']:g}% · "
                      f"median run {_short(totals['wall_s']['median'])} · {share}")
+    signals = view.get("signals") or {}
+    if signals:
+        lines += ["", "Signals (mean over the runs that have each)"]
+        for key in sorted(signals)[:SIGNAL_ROWS]:
+            lines.append(f"  {key}  {signals[key]['mean']:.4g}  ({signals[key]['runs']} run"
+                         f"{'' if signals[key]['runs'] == 1 else 's'})")
+        if len(signals) > SIGNAL_ROWS:
+            lines.append(f"  … {len(signals) - SIGNAL_ROWS} more")
     return "\n".join(lines)
 
 
