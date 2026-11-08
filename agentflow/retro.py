@@ -948,7 +948,8 @@ def run_retro(repo: Path, cfg: Config, since: datetime | None, dry_run: bool, no
     """Run a retro over the runs that ended since `since` (None: since the last retro started). With no such run it
     creates nothing; `dry_run` prints the digest and the session's prompt to `out` and creates nothing. Otherwise it
     runs the retro (see the module doc) and returns the run, the pull request (None when none opened) and a line
-    that says what happened. A stop is in the inbox; an error before the session ends the run as failed."""
+    that says what happened. A stop is in the inbox; an error before the session ends the run as failed, and an
+    interrupt (`KeyboardInterrupt`, `SystemExit`) ends it as cancelled before it goes on to the caller."""
     repo = Path(repo).resolve()
     if since is None:
         since = _since_default(repo)
@@ -976,10 +977,13 @@ def run_retro(repo: Path, cfg: Config, since: datetime | None, dry_run: bool, no
         raise RuntimeError(f"another runner holds the lock of the new run {run.id}")
     try:
         return _Retro(cfg, repo, run, step, digest, now).go()
-    except Exception as exc:
+    except BaseException as exc:  # an interrupt too: a retro left `running` would block every later one
         run.refresh()
         if run.state["status"] not in TERMINAL and run.state["waiting"] is None:
-            run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}"[:2000])
+            if isinstance(exc, Exception):
+                run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}"[:2000])
+            else:  # Ctrl-C, SIGTERM or an exit: the retro ends cancelled, and the next one reads the same runs
+                run.emit("run_cancelled", reason=f"interrupted: {type(exc).__name__} {exc}".rstrip()[:2000])
         raise
     finally:
         lock.release()

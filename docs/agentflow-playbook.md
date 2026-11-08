@@ -497,7 +497,7 @@ A step gets the lessons for every phase plus those whose `applies` names its pha
    The PR body's "Dropped" section lists every proposal the runner left out, with the reason.
 5. **The pull request.** If nothing changed, the run ends `done` with `nothing to learn` and opens no PR. Otherwise the runner renders `.agentflow/lessons.md` and commits that file alone (`Update lessons from the retro of <n> runs.`). It pushes the commit by its sha to the same-named branch on `origin`, with no hooks, then opens a draft PR titled `Lessons from <n> runs (<date>)` against `project.fork_from`. The exit code is 0 when the retro run ended `done`, and 1 when it stopped, failed or was refused.
 
-Only one retro is open at a time. While one is running, waiting on you or stopped on an error, `agentflow retro` is refused, the queue starts none, and no `Retro due` line shows.
+Only one retro is open at a time. While one is running, waiting on you or stopped on an error, `agentflow retro` is refused, the queue starts none, and no `Retro due` line shows. A retro interrupted by Ctrl-C or SIGTERM ends `cancelled`, so it blocks no later one.
 
 ### What the runner refuses after the session, and why
 

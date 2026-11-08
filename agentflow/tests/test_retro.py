@@ -987,6 +987,27 @@ def _during_session(monkeypatch, action) -> None:
     monkeypatch.setattr(lanes.Executor, "run_agent_step", wrapped)
 
 
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_an_interrupted_retro_ends_cancelled_and_blocks_no_later_retro(flow_repo, gh_log, monkeypatch, interrupt):
+    from agentflow.retro import due, open_retro
+
+    _script_one_add(flow_repo)
+
+    def agent(worktree, run):  # Ctrl-C or SIGTERM while the session runs
+        raise interrupt()
+
+    _during_session(monkeypatch, agent)
+    with pytest.raises(interrupt):
+        run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    (name,) = _retro_runs(flow_repo)
+    run = Run.load(flow_repo.root, name)
+    assert run.state["status"] == "cancelled" and run.state["waiting"] is None
+    assert open_retro(flow_repo.root) is None
+    assert due(flow_repo.root, flow_repo.cfg, NOW) == "2 finished runs since the start"  # "Retro due" shows again
+    assert run.lock().acquire()  # the lock was released
+    assert not _created(gh_log)
+
+
 def _blocked_without_push(flow_repo, gh_log, out, *words) -> dict:
     run = _run(flow_repo, out)
     assert out.pr_url is None and not _created(gh_log)
