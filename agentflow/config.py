@@ -270,6 +270,7 @@ class ContextPolicy:
     autocompact_env: str
     rollover_pct: int
     max_rollovers: int
+    max_compactions: int
     context_window_tokens: int | str
     default_window_tokens: int
     progress_file: str
@@ -863,7 +864,8 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
             autocompact_env=_optional(context, "autocompact_env", "context", str, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
             rollover_pct=_require(context, "rollover_pct", "context", int),
             max_rollovers=_require(context, "max_rollovers", "context", int),
-            context_window_tokens=_optional(context, "context_window_tokens", "context", (int, str), "auto"),
+            max_compactions=_optional(context, "max_compactions", "context", int, 3),
+            context_window_tokens=_optional(context, "context_window_tokens", "context", (int, str), 200000),
             default_window_tokens=_optional(context, "default_window_tokens", "context", int, 200000),
             progress_file=_require(context, "progress_file", "context", str),
             gate_output_lines=_require(context, "gate_output_lines", "context", int),
@@ -1459,6 +1461,20 @@ class _Validator:
         if effort.default not in effort.allowed:
             self.error("effort.default", f"default '{effort.default}' is not in effort.allowed")
 
+    def context(self) -> None:
+        ctx = self.cfg.context
+        window = ctx.context_window_tokens
+        if isinstance(window, bool) or not (window == "auto" or isinstance(window, int) and 100_000 <= window <= 1_000_000):
+            self.error("context.context_window_tokens", "must be `auto` or a number of tokens from 100000 to 1000000 (Claude Code's auto-compact window)")
+        if ctx.max_compactions < 1:
+            self.error("context.max_compactions", "must be at least 1: a session that compacted this often is replaced by a fresh one")
+        if not 1 <= ctx.autocompact_pct <= 100:
+            self.error("context.autocompact_pct", "must be a percentage from 1 to 100")
+        if not 1 <= ctx.rollover_pct <= 100:
+            self.error("context.rollover_pct", "must be a percentage from 1 to 100")
+        elif ctx.rollover_pct <= ctx.autocompact_pct:
+            self.error("context.rollover_pct", f"must be above autocompact_pct ({ctx.autocompact_pct}): the rollover is the safety net behind the auto-compact")
+
     def approval(self) -> None:
         cfg = self.cfg
         for key in cfg.phase_approval:
@@ -1635,6 +1651,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.conditions()
     v.phases()
     v.effort()
+    v.context()
     v.approval()
     v.autonomy()
     v.overlays()

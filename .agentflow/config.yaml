@@ -79,8 +79,9 @@ context:
   autocompact_env: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
   rollover_pct: 80               # runner safety net
   max_rollovers: 2               # then HITL: split the task
-  context_window_tokens: auto    # from stream-json model info; set a number to override
-  default_window_tokens: 1000000 # used until a result event reports the model's window
+  context_window_tokens: 200000  # the window the percentages mean; it also caps Claude Code's auto-compact window (the models report 1M)
+  max_compactions: 3             # a session that compacted this often is replaced by a fresh one seeded from progress.md
+  default_window_tokens: 200000  # used when context_window_tokens is `auto` and no result event has reported the window
   progress_file: "runs/{run}/progress.md"
   gate_output_lines: 200
 

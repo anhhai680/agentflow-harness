@@ -360,6 +360,25 @@ def test_effort_outside_known_levels(tmp_cfg, patch, bad_path):
     assert ("error", bad_path) in errors(issues_for(tmp_cfg, patch))
 
 
+@pytest.mark.parametrize(
+    "patch, bad_path",
+    [
+        ({"context": {"max_compactions": 0}}, "context.max_compactions"),
+        ({"context": {"context_window_tokens": 50000}}, "context.context_window_tokens"),
+        ({"context": {"context_window_tokens": 2000000}}, "context.context_window_tokens"),
+        ({"context": {"rollover_pct": 60}}, "context.rollover_pct"),  # not above autocompact_pct (60)
+        ({"context": {"autocompact_pct": 0}}, "context.autocompact_pct"),
+    ],
+)
+def test_context_limits(tmp_cfg, patch, bad_path):
+    assert ("error", bad_path) in errors(issues_for(tmp_cfg, patch))
+
+
+def test_context_defaults_are_valid(tmp_cfg):
+    assert not [e for e in errors(issues_for(tmp_cfg, {"context": {"context_window_tokens": 200000, "max_compactions": 3}}))
+                if e[1].startswith("context.")]
+
+
 def test_dashboard_must_bind_loopback(tmp_cfg):
     issues = issues_for(tmp_cfg, {"dashboard": {"host": "0.0.0.0"}})
     assert ("error", "dashboard.host") in errors(issues)

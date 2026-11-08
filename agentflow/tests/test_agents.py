@@ -238,6 +238,27 @@ def test_codex_env_includes_autocompact_override(codex, call):
     assert set(env) == {"AGENTFLOW_RUN", "AGENTFLOW_STEP", "AGENTFLOW_RESULT", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"}
 
 
+def test_env_caps_the_autocompact_window_only_for_a_number(claude, call):
+    claude.context.context_window_tokens = "auto"
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in claude.env(call)
+    claude.context.context_window_tokens = 200000  # the percentages mean 200k, not the model's 1M
+    assert claude.env(call)["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+
+
+def test_parse_rolls_over_once_a_session_spent_its_compactions():
+    acc = StreamAccumulator(default_window=200000, rollover_pct=80, max_compactions=2)
+    boundary = json.dumps({"type": "system", "subtype": "compact_boundary"})
+    low = {"type": "assistant", "parent_tool_use_id": None, "message": {"content": [], "usage": {"input_tokens": 1000}}}
+    parse_claude_line(boundary, acc)
+    assert not acc.over_threshold  # one of two
+    parse_claude_line(json.dumps(low), acc)
+    assert not acc.over_threshold  # far below rollover_pct
+    parse_claude_line(boundary, acc)
+    assert acc.over_threshold  # the second compaction ends the session
+    parse_claude_line(json.dumps(low), acc)
+    assert acc.over_threshold  # and a low context reading does not undo it
+
+
 def test_make_agents_only_enabled(cfg):
     agents = make_agents(cfg)
     assert list(agents) == ["claude"] and agents["claude"].name == "claude"

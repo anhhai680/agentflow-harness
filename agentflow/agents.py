@@ -23,6 +23,7 @@ from .config import AgentSpec, Config, ContextPolicy
 
 KILL_GRACE_S = 10
 SUBAGENT_TOOLS = ("Agent", "Task")
+AUTOCOMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"  # Claude Code's own cap on the window `autocompact_pct` is read against
 SYNTHETIC_MODEL = "<synthetic>"  # Claude Code's own error messages, shown as assistant turns: no model replied
 
 EventCallback = Callable[[str, dict], None]
@@ -99,6 +100,7 @@ class StreamAccumulator:
     default_window: int
     window_override: int | None = None
     rollover_pct: float | None = None
+    max_compactions: int | None = None  # a session that has compacted this often is replaced by a fresh one
     window: int | None = None
     session_id: str | None = None
     model: str | None = None
@@ -118,6 +120,10 @@ class StreamAccumulator:
     limit: dict | None = None  # the latest `rate_limit_event`'s `rate_limit_info`
     reached_model: bool = False
     result_error: bool = False
+
+    @property
+    def compactions_spent(self) -> bool:
+        return self.max_compactions is not None and self.compactions >= self.max_compactions
 
     @property
     def effective_window(self) -> int:
@@ -238,7 +244,7 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
             out.append(("agent_session", {"session_id": acc.session_id, "model": acc.model}))
         elif subtype == "compact_boundary":
             acc.compactions += 1
-            acc.over_threshold = False
+            acc.over_threshold = acc.compactions_spent
             meta = event.get("compact_metadata") or {}
             out.append(("compacted", {
                 "session_id": acc.session_id,
@@ -288,7 +294,8 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
             acc.line_type = "assistant"
             if tokens is not None:
                 acc.context_pct = acc.context_pct_of(tokens)
-                acc.over_threshold = acc.rollover_pct is not None and acc.context_pct >= acc.rollover_pct
+                acc.over_threshold = acc.compactions_spent or (
+                    acc.rollover_pct is not None and acc.context_pct >= acc.rollover_pct)
                 out.append(("agent_turn", {
                     "session_id": acc.session_id,
                     "tokens": tokens,
@@ -408,11 +415,16 @@ class _CliAgent(abc.ABC):
         """The full command line for `call`."""
 
     def env(self, call: AgentCall) -> dict[str, str]:
+        window = self.context.context_window_tokens
+        # Without this cap Claude reads `autocompact_pct` against the model's whole window (1M tokens for the
+        # current models), so "60%" would mean 600k tokens. A number in config says which window the percentages mean.
+        capped = {AUTOCOMPACT_WINDOW_ENV: str(window)} if isinstance(window, int) and not isinstance(window, bool) else {}
         return {
             **call.env,
             "AGENTFLOW_RUN": call.run_id,
             "AGENTFLOW_STEP": call.step_key,
             "AGENTFLOW_RESULT": str(call.result_path),
+            **capped,
             self.context.autocompact_env: str(self.context.autocompact_pct),
         }
 
@@ -428,6 +440,7 @@ class _CliAgent(abc.ABC):
             default_window=call.context_window or self.context.default_window_tokens,
             window_override=window if isinstance(window, int) and not isinstance(window, bool) else None,
             rollover_pct=self.context.rollover_pct if self.rollover_enabled else None,
+            max_compactions=self.context.max_compactions if self.rollover_enabled else None,
         )
 
     def run(self, call: AgentCall, on_event: EventCallback) -> AgentOutcome:
