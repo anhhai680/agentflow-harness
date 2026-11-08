@@ -1,7 +1,8 @@
 """The agent step lifecycle: run one config step through an agent until it is done or needs a human.
 
-`Executor.run_agent_step` goes round one loop per agent call, in this order: budget check, then
-model and effort (from state; `effort.default` for a new step), prompt, tree snapshot, the call
+`Executor.run_agent_step` goes round one loop per agent call, in this order: budget check (the soft
+budget notifies once, the hard one stops), then model and effort (from state; `effort.default` for a
+new step), prompt, tree snapshot, the call
 (`agent_started` ... `agent_exited`, spend, one `permission_denied` per denial), guards, the
 `result.json`, gates and doc checks (`checks:`, which always have the fix loop) with the fix loop,
 rollover; and once the result is `done` and the gates pass: the progress check, the commit
@@ -26,9 +27,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, TextIO
 
-from agentflow import overlays, pack, workspace
+from agentflow import overlays, pack, run_env, workspace
 from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
-from agentflow.autonomy import AUTO_BY, eligible
+from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
 from agentflow.commit_checks import RUNNER_COMMITS, runner_head
@@ -64,6 +65,9 @@ RESULT = "_result.md"
 DEFAULT_TEMPLATE = "step.md"
 DEFAULT_REFINE = "refine.md"
 DEFAULT_ROLE = "build"
+RUN_FACTS_LINE = re.compile(r"^\{run_facts\}\n\n", re.MULTILINE)  # the preamble's slot, dropped whole when empty
+RESOLVER_FINDINGS_SHOWN = 3
+RESOLVER_FINDING_MAX = 600
 EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n?", re.DOTALL)
 SKILL_LINE = re.compile(r"\b([Uu])se the `([\w.:-]+)` skill")
 SKILL_HEADING = re.compile(r"#{1,6}[ \t]+.*`\{skill\}`")
@@ -107,8 +111,19 @@ def _values(cfg: Config, step: Step, ctx: Ctx, extra: dict) -> dict[str, str]:
     values["progress"] = str(agent_dir / "progress.md")
     values["handoff"] = str(agent_dir / "handoff.md")
     values["questions"] = str(agent_dir / "questions.md")
+    values["run_facts"] = _run_facts(run)
     values.update({name: str(value) for name, value in extra.items()})
     return values
+
+
+def _run_facts(run: Run | None) -> str:
+    """What earlier resolver sessions of the run found, as a section of the prompt; "" when there is nothing."""
+    facts = [str(f.get("text")) for f in (run.state.get("facts") or []) if f.get("text")] if run is not None else []
+    if not facts:
+        return ""
+    lines = "\n".join(f"- {fact}" for fact in facts)
+    return ("## What this run already found\n\nEarlier sessions of this run established these. Check one before "
+            f"relying on it; do not diagnose it again.\n\n{lines}")
 
 
 def _refine_values(ctx: Ctx, rec: dict) -> dict[str, str]:
@@ -171,7 +186,10 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     The preamble's effort check is kept only while `rec["sized"]` is false. Placeholders are
     filled in one pass over the joined text, so values that hold braces go in verbatim.
     """
+    values = _values(cfg, step, ctx, {})
     preamble = EFFORT_BLOCK.sub("" if rec.get("sized") else r"\1", _template(cfg, PREAMBLE))
+    if not values["run_facts"]:
+        preamble = RUN_FACTS_LINE.sub("", preamble)
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
     files = list(dict.fromkeys([*step.brief, *step.task_brief]))
     # A step with no configured `brief:` whose skill resolves has the skill's text as its brief, and its first
@@ -201,7 +219,6 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
         body = f"{body}\n\n{extra_skills}"
     if extra.get("gate_evidence") and "{gate_evidence}" not in body:  # a `gates_first` template that has no slot
         body = f"{body}\n\n{{gate_evidence}}"
-    values = _values(cfg, step, ctx, {})
     values["brief"] = "\n\n".join(briefs)
     values["skill"] = step.skill or ""
     values["base_ref"] = ctx.base_ref
@@ -497,8 +514,14 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         while True:
             budget = self.run.state.get("budget_usd") or self.cfg.defaults.run_budget_usd
             spend = float(self.run.state.get("spend_usd") or 0.0)
+            soft = self.run.state.get("soft_budget_usd")
+            if soft and spend >= soft and not self._soft_noted(soft):
+                self.run.emit("budget_soft_reached", spend_usd=spend, soft_usd=soft, hard_usd=budget)
+                notify_run(self.cfg, self.run, f"spent ${spend:.2f}: past the soft budget ${soft:.2f}; "
+                                               f"it goes on and stops at ${budget:.2f}")
             if budget and spend >= budget:
-                return self._stop(sr, "budget_exceeded", f"The run has spent ${spend:.2f} of its ${budget:.2f} budget.")
+                which = "hard budget" if soft is not None else "budget"  # a run from before the soft budget has one
+                return self._stop(sr, "budget_exceeded", f"The run has spent ${spend:.2f} of its ${budget:.2f} {which}.")
 
             called = self._call(sr, turn)
             if self.run.refresh()["status"] in TERMINAL:
@@ -542,8 +565,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
                 continue
             if result.status == "needs_human" and not writes_questions(sr.step):  # a grill's questions are its output
                 questions = [asdict(q) for q in result.questions]
+                # A set the runner answers itself is never parked: it is raised quietly, `Resolver.take_over` (the one
+                # place the runner answers) takes the recommended options, and the step resumes after any `record_step`.
                 if (result.can_continue_without and self.may_park(sr.key)
-                        and not eligible(self.cfg, "needs_human", sr.key, questions)):
+                        and not runner_settles(self.cfg, self.run, "needs_human", sr.key, questions)):
                     held = changed_paths(self.worktree, sr.start_tree, called.after)
                     park_hitl(self.cfg, self.run, "needs_human", sr.key, result.summary, result.questions, held)
                     return "stopped"
@@ -603,6 +628,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             agent_profile=sr.agent_profile,
             context_window=self.context_window_for(sr.key, sr.model),
             env=self.cfg.defaults.env,
+            env_base=run_env.base(self.cfg),
             forbidden_paths=[*self.cfg.guardrails.forbidden_paths, *sr.step.forbid],
         )
 
@@ -810,6 +836,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         self.run.emit("step_finished", key=sr.key, status="done", summary=result.summary, sha=sha, **extra)
         return "done"
 
+    def _soft_noted(self, soft: float) -> bool:
+        """The run already said it passed this soft budget: a soft limit notifies once per value, and plan sizing
+        raising it is a new value."""
+        return any(e["type"] == "budget_soft_reached" and e.get("soft_usd") == soft for e in self.run.events.read())
+
     def _stop(self, sr: _StepRun, kind: str, summary: str, extra: str = "") -> Outcome:
         raise_hitl(self.cfg, self.run, kind, sr.key, summary, extra=extra)
         return "stopped"
@@ -886,7 +917,17 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
     def stop_report(self, key: str) -> str:
         """What the resolver is told beyond the stop's summary: the inbox page a human would have read."""
         path = self.run.inbox_path(key)
-        return path.read_text(encoding="utf-8") if path.is_file() else "(no report)"
+        report = path.read_text(encoding="utf-8") if path.is_file() else "(no report)"
+        earlier = self._earlier_resolver_findings(key)
+        return f"{report.rstrip()}\n\n{earlier}" if earlier else report
+
+    def _earlier_resolver_findings(self, key: str) -> str:
+        """The last few resolver summaries the run has for steps other than `key`, so a second resolver does not
+        start from nothing. A summary is model text: one line, cut."""
+        found = [(e.get("key"), " ".join(str(e.get("summary") or "").split())[:RESOLVER_FINDING_MAX])
+                 for e in self.run.events.read() if e["type"] == "resolve_finished" and e.get("key") != key]
+        shown = [f"- `{k}`: {summary}" for k, summary in found if summary][-RESOLVER_FINDINGS_SHOWN:]
+        return "### Earlier resolver findings in this run\n\n" + "\n".join(shown) if shown else ""
 
     def _denied_report(self, key: str) -> str:
         """The inbox section naming what was denied since the last approval, each once, so one fix covers it."""

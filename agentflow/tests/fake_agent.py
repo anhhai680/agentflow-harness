@@ -94,6 +94,7 @@ def main() -> int:
                 for k, v in os.environ.items()
                 if k.startswith("AGENTFLOW_") and not k.startswith("AGENTFLOW_FAKE_")
                 or k == "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+                or k in os.environ.get("AGENTFLOW_FAKE_ENV", "").split(",")  # names a test asks to see
             },
             "stdin_devnull": stdin_is_devnull(),
             "step": step,

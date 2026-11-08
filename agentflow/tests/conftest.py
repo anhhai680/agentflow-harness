@@ -248,7 +248,7 @@ class FlowRepo:
 
     def configure(self, patch: dict | None = None, autopilot: bool = False, batch: bool = False):
         """`autopilot=False` (the default) keeps a human at every phase and no `ci` step, so a test pins one
-        stop or approval at a time. `autopilot=True` is the workflow as shipped. `batch=False` (the default)
+        stop or approval at a time: no phase resolves its stops and the runner takes no recommended answer. `autopilot=True` is the workflow as shipped. `batch=False` (the default)
         drops the build step's `batch`, so a test's file-less plan tasks each get a session and a review."""
         from agentflow.config import load_config
 
@@ -266,6 +266,7 @@ class FlowRepo:
                     phase["needs_approval"] = name != list(data["phases"])[-1]
                     phase.pop("resolve", None)
                     phase["steps"] = [step for step in phase["steps"] if step.get("type") != "ci"]
+                data.setdefault("autonomy", {})["answer_recommended"] = False
             if not batch:
                 for phase in data["phases"].values():
                     for step in phase["steps"]:

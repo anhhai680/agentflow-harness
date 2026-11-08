@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -661,3 +663,34 @@ def test_a_synthetic_error_message_is_not_a_model_reply(cfg):
 def test_a_codex_call_that_exits_cleanly_is_no_interruption():
     acc = StreamAccumulator(default_window=1000)
     assert acc.to_outcome(0).interruption is None  # codex sends no `result` event
+
+
+def test_a_run_agent_does_not_inherit_a_dropped_variable(fake, fake_claude, call, cfg, monkeypatch):
+    from agentflow import run_env
+    from agentflow.config import EnvInherit
+
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", "LEAKED_URL,KEPT_URL,FROM_PACK")
+    monkeypatch.setenv("LEAKED_URL", "leak-sentinel-7f3a")
+    monkeypatch.setenv("KEPT_URL", "kept-value")
+    cfg = dataclasses.replace(cfg, defaults=dataclasses.replace(
+        cfg.defaults, env_inherit=EnvInherit(drop=["LEAKED_*"], drop_dotenv=[])))
+    fake_claude.run(dataclasses.replace(call, env_base=run_env.base(cfg), env={"FROM_PACK": "1"}), collect()[1])
+    recorded = fake.calls()[0]["env"]
+    assert "LEAKED_URL" not in recorded and recorded["KEPT_URL"] == "kept-value"
+    assert recorded["AGENTFLOW_RUN"] == call.run_id and recorded["FROM_PACK"] == "1"
+
+
+def test_the_process_environment_reaches_the_agent_only_when_the_call_has_no_base(fake, fake_claude, call, monkeypatch):
+    seen: dict[str, dict] = {}
+    real = subprocess.Popen
+
+    def spy(argv, **kwargs):
+        seen[kwargs["env"].get("AGENTFLOW_STEP", "")] = kwargs["env"]
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    monkeypatch.setenv("LEAKED_URL", "leak-sentinel-7f3a")
+    fake_claude.run(call, collect()[1])
+    assert seen[STEP]["LEAKED_URL"] == "leak-sentinel-7f3a"  # no env_base: this process's environment, as before
+    fake_claude.run(dataclasses.replace(call, env_base={"PATH": os.environ["PATH"]}), collect()[1])
+    assert "LEAKED_URL" not in seen[STEP] and seen[STEP]["AGENTFLOW_RUN"] == call.run_id

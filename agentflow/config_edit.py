@@ -36,7 +36,7 @@ import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from agentflow import layers
-from agentflow.config import KNOWN_EFFORT_LEVELS, ConfigError, Issue, load_config, validate
+from agentflow.config import KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ConfigError, Issue, load_config, validate
 from agentflow.layers import PHASE_FREE_KEYS
 
 __all__ = ["Conflict", "EditError", "Proposal", "Refused", "form_fields", "propose", "read", "save"]
@@ -46,7 +46,7 @@ MERGE_TAG = "tag:yaml.org,2002:merge"
 AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices")  # what a page may change in an `agents.<name>` block
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
     "version", "engine", "gates", "gates_confirmed", "gate_sets", "guardrails", "conditions", "overlays", "project",
-    "phase_approval", "record_step", "resolve_step", "paths", "defaults.env", "context.autocompact_env", "context.progress_file",
+    "phase_approval", "record_step", "resolve_step", "paths", "defaults.env", "defaults.env_inherit", "context.autocompact_env", "context.progress_file",
     "hitl.notify", "dashboard.host", "work_source", "skills", "starter",
 )
 PROTECTED = (
@@ -112,12 +112,15 @@ _NUM = {"kind": "number", "min": 0}
 _PCT = {"kind": "int", "min": 1, "max": 100}
 
 _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
-    ("Run defaults", "A running run picks these up when its next phase starts; the budget is set when a run starts.", [
+    ("Run defaults", "A running run picks these up when its next phase starts; the budgets are set when a run starts.", [
         (("defaults", "agent"), "Default agent", {"kind": "enum", "options": "@agents"}),
         (("defaults", "step_timeout_min"), "Step timeout (min)", _POS),
         (("defaults", "gate_timeout_min"), "Gate timeout (min)", {"kind": "number", "min": 0, "exclusive_min": True}),
         (("defaults", "fix_attempts"), "Fix attempts per gate failure", _INT),
-        (("defaults", "run_budget_usd"), "Run budget (USD, new runs)", {"kind": "number", "min": 0, "exclusive_min": True}),
+        (("defaults", "run_budget_usd"), "Soft budget (USD, new runs): notify only",
+         {"kind": "number", "min": 0, "exclusive_min": True}),
+        (("defaults", "run_budget_hard_usd"), "Hard budget (USD, new runs): the run stops for approval",
+         {"kind": "number", "min": 0, "exclusive_min": True}),
         (("defaults", "task_budget_usd"), "Budget per plan task (USD, 0 = off)", {"kind": "number", "min": 0}),
     ]),
     ("Recovery", "How long the runner keeps trying on its own after an outage or a failed call.", [
@@ -139,6 +142,8 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("autonomy", "non_blocking_severities"), "Non-blocking severities", {"kind": "list"}),
         (("autonomy", "finding_rounds"), "Finding rounds", _INT),
         (("autonomy", "answer_recommended"), "Take recommended answers", {"kind": "bool"}),
+        (("autonomy", "human_question_kinds"), "Question kinds only a human answers",
+         {"kind": "list", "options": list(QUESTION_KINDS)}),
         (("autonomy", "revert_forbidden"), "Forbidden-path reverts per step", _INT),
         (("autonomy", "resolve_kinds"), "Resolver sessions per stop kind", {"kind": "map", "value_kind": "int", "min": 1}),
     ]),

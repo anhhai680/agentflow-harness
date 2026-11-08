@@ -28,6 +28,7 @@ from .events import EventError, EventLog, RunLock, lock_state, nfc, now_iso
 TERMINAL = ("done", "failed", "cancelled")
 SLUG_PARAMS = ("slug", "module", "issue", "topic", "task", "log")  # an explicit slug (an issue's) wins
 SLUG_MAX = 40
+RUN_FACTS_MAX = 8  # what a resolver found that the run keeps for every later session (the newest)
 
 
 class RunNotFound(Exception):
@@ -65,8 +66,11 @@ def initial_state() -> dict:
         "spend_usd": 0.0,
         "session_costs": {},
         "hold": None,
-        "budget_usd": None,
+        "budget_usd": None,  # the hard limit: the run stops when its spend crosses it
+        "soft_budget_usd": None,  # the soft limit: crossing it only notifies; None for a run started before it
         "context_windows": {},
+        "env_dropped": [],
+        "facts": [],
         "gates": {},
         "reviews": {},
         "effort_changes": [],
@@ -171,8 +175,9 @@ def _on_run_started(state: dict, ev: dict) -> None:
     for field in ("branch", "worktree", "base_sha"):
         if ev.get(field) is not None:
             state[field] = ev[field]
-    if ev.get("budget_usd") is not None:
-        state["budget_usd"] = ev["budget_usd"]
+    for field in ("budget_usd", "soft_budget_usd"):
+        if ev.get(field) is not None:
+            state[field] = ev[field]
     state["status"] = "running"
 
 
@@ -181,7 +186,7 @@ def _on_run_options(state: dict, ev: dict) -> None:
 
 
 def _on_run_updated(state: dict, ev: dict) -> None:
-    for field in ("branch", "worktree", "base_sha", "pr_url", "budget_usd"):
+    for field in ("branch", "worktree", "base_sha", "pr_url", "budget_usd", "soft_budget_usd"):
         if ev.get(field) is not None:
             state[field] = ev[field]
 
@@ -397,6 +402,11 @@ def _on_context_window(state: dict, ev: dict) -> None:
     state["context_windows"][ev["model"]] = int(ev["tokens"])
 
 
+def _on_env_dropped(state: dict, ev: dict) -> None:
+    """The inherited variables the run does not pass on: names only, never a value."""
+    state["env_dropped"] = sorted({str(name) for name in ev.get("names") or []})
+
+
 def _on_gate_result(state: dict, ev: dict) -> None:
     key = ev.get("key") or state["step"] or "run"
     state["gates"].setdefault(key, []).append({
@@ -407,6 +417,14 @@ def _on_gate_result(state: dict, ev: dict) -> None:
 def _on_review_result(state: dict, ev: dict) -> None:
     key = ev.get("key") or state["step"] or "run"
     state["reviews"][key] = {k: v for k, v in ev.items() if k not in ("seq", "ts", "type", "by", "key")}
+
+
+def _on_review_skipped(state: dict, ev: dict) -> None:
+    """A refine round's implementer changed nothing, so its task was not reviewed again; a later review replaces it."""
+    state["reviews"][ev["key"]] = {"skipped": True, "reason": ev.get("reason"), "round": ev.get("round")}
+    row = _step_row(state, ev["key"])
+    row["status"] = "skipped"  # settled: the round leaves nothing pending
+    row["skip_reason"] = ev.get("reason")
 
 
 def _on_hitl_raised(state: dict, ev: dict) -> None:
@@ -455,6 +473,13 @@ def _on_resolve_started(state: dict, ev: dict) -> None:
                           "attempt": ev.get("attempt"), "since": ev.get("ts")}
     if state["waiting"] is not None and state["waiting"].get("key") == ev["key"]:
         _clear_wait(state)
+
+
+def _on_run_fact(state: dict, ev: dict) -> None:
+    """A fact a resolver session found, kept for every later session. A repeat (any case) moves to the newest place."""
+    text = str(ev["text"])
+    kept = [f for f in state.get("facts") or [] if str(f.get("text")).casefold() != text.casefold()]
+    state["facts"] = [*kept, {"text": text, "key": ev["key"]}][-RUN_FACTS_MAX:]
 
 
 def _on_resolve_finished(state: dict, ev: dict) -> None:
@@ -571,19 +596,28 @@ def _on_run_archived(state: dict, ev: dict) -> None:
     state["archived"] = {"by": ev.get("by"), "at": ev.get("ts")}
 
 
+def _in_scope(key: str, scope: str | None) -> bool:
+    """Whether a rejection scoped to one plan task (`<phase>/<step>/task-<n>`) sends `key` back: the task's
+    own steps, and the steps that hold it (the `foreach` step), or the phase would never reach the task."""
+    return not scope or key == scope or key.startswith(scope + "/") or scope.startswith(key + "/")
+
+
 def _on_phase_rejected(state: dict, ev: dict) -> None:
     phase, round_ = ev["phase"], ev.get("round", 1)
+    scope = ev.get("scope") or None
     row = _phase_row(state, phase)
     row["status"] = "refining"
     row["round"] = round_
-    for step in state["steps"].values():
-        if step["phase"] == phase:
+    for key, step in state["steps"].items():
+        if step["phase"] == phase and _in_scope(key, scope):  # a step outside the scope keeps its status
             step["status"] = "refine_pending"
             step["round"] = round_
     state["refine"] = {"phase": phase, "round": round_, "note": ev.get("note", "")}
+    if scope:
+        state["refine"]["scope"] = scope
     state["resolving"] = None
     parked = state.setdefault("parked", {})
-    for key in [k for k, item in parked.items() if item.get("phase") == phase]:
+    for key in [k for k, item in parked.items() if item.get("phase") == phase and _in_scope(k, scope)]:
         parked.pop(key)  # its step runs again in the refine round
     state["waiting"] = None
     if state["status"] not in TERMINAL:
@@ -687,8 +721,10 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "subagent_started": _on_subagent_started,
     "subagent_finished": _on_subagent_finished,
     "context_window": _on_context_window,
+    "env_dropped": _on_env_dropped,
     "gate_result": _on_gate_result,
     "review_result": _on_review_result,
+    "review_skipped": _on_review_skipped,
     "hitl_raised": _on_hitl_raised,
     "run_held": _on_run_held,
     "run_hold_ended": _on_run_hold_ended,
@@ -696,6 +732,7 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "step_reopened": _on_step_reopened,
     "resolve_started": _on_resolve_started,
     "resolve_finished": _on_resolve_finished,
+    "run_fact": _on_run_fact,
     "ci_watching": _on_ci_watching,
     "pr_marked_ready": _on_pr_marked_ready,
     "hitl_answered": _on_hitl_answered,
@@ -739,6 +776,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "step_reopened": ("key",),
     "resolve_started": ("key",),
     "resolve_finished": ("key",),
+    "run_fact": ("text", "key"),
     "agent_started": (("session_id", "pid"),),
     "agent_session": ("session_id",),
     "context_window": ("model", "tokens"),
@@ -866,7 +904,8 @@ class Run:
                 run_id = f"{base}-{n}"
         run = cls(repo, run_id)
         run.agent_dir.mkdir(parents=True, exist_ok=True)
-        run.emit("run_started", run_id=run_id, pipeline=pipeline, params=params, budget_usd=cfg.defaults.run_budget_usd)
+        run.emit("run_started", run_id=run_id, pipeline=pipeline, params=params,
+                 budget_usd=cfg.defaults.run_budget_hard_usd, soft_budget_usd=cfg.defaults.run_budget_usd)
         return run
 
     @classmethod

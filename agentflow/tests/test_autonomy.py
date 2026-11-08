@@ -11,7 +11,7 @@ import pytest
 
 from agentflow.autonomy import blocking_of, eligible, phase_findings, recommended_answers
 from agentflow.config import load_config, validate
-from agentflow.hitl import approve, reject
+from agentflow.hitl import answer, approve, reject
 from agentflow.pipeline import RunOptions, advance, approval_text, start
 from agentflow.state import Run
 from conftest import PYTHON_CONFIG
@@ -267,6 +267,71 @@ def test_the_resolver_gets_the_stop_on_opus_and_the_step_keeps_its_session(auto)
     assert "--resume" in [c for c in auto.calls() if c["step"] == RED][-1]["argv"]
 
 
+FACT = "the runner's shell sets X_URL to an unreachable host"
+
+
+def resolver_done(*facts: str, summary: str = "đã rõ") -> dict:
+    return done(summary, facts=list(facts))
+
+
+def test_a_fact_a_resolver_finds_reaches_the_next_session(auto):
+    auto.script({RED: [BLOCKED, GOOD_TEST], RESOLVE: [resolver_done(FACT)], "build/fix": [FIXED]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "done"
+    assert [(e["text"], e["key"]) for e in auto.events(run, "run_fact")] == [(FACT, RESOLVE)]
+    assert run.state["facts"] == [{"text": FACT, "key": RESOLVE}]
+    prompt = next(c for c in auto.calls() if c["step"] == "build/fix")["argv"][-1]  # a step that starts after it
+    assert f"## What this run already found\n\nEarlier sessions of this run established these. Check one before relying on it; do not diagnose it again.\n\n- {FACT}\n\n## The step" in prompt
+
+
+def test_the_same_fact_from_a_second_resolver_is_not_added_twice(auto):
+    auto.script({RED: [BLOCKED, BLOCKED, GOOD_TEST], RESOLVE: [resolver_done(FACT)],
+                 f"{RED}/resolve-2": [resolver_done(FACT.upper(), "another thing", FACT)], "build/fix": [FIXED]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "done"
+    assert [e["text"] for e in auto.events(run, "run_fact")] == [FACT, "another thing"]
+    assert [f["text"] for f in run.state["facts"]] == [FACT, "another thing"]
+
+
+def test_facts_in_a_step_that_is_not_a_resolver_are_ignored(auto):
+    auto.script({RED: [{"result": {**GOOD_TEST["result"], "facts": [FACT]}}], "build/fix": [FIXED]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "done"
+    assert not auto.events(run, "run_fact") and run.state["facts"] == []
+    assert "What this run already found" not in next(c for c in auto.calls() if c["step"] == "build/fix")["argv"][-1]
+
+
+def test_a_resolver_that_names_no_facts_adds_none(auto):
+    auto.script({RED: [BLOCKED, GOOD_TEST], RESOLVE: [done("đã rõ")], "build/fix": [FIXED]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "done"
+    assert not auto.events(run, "run_fact") and run.state["facts"] == []
+    assert "What this run already found" not in next(c for c in auto.calls() if c["step"] == "build/fix")["argv"][-1]
+
+
+def test_a_second_resolver_is_told_what_the_first_found_for_another_step(auto):
+    auto.script({RED: [BLOCKED, GOOD_TEST], RESOLVE: [done("x" * 700)],
+                 "build/fix": [BLOCKED, FIXED], "build/fix/resolve-1": [done("thứ hai")]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "done"
+    first = next(c for c in auto.calls() if c["step"] == RESOLVE)["argv"][-1]
+    second = next(c for c in auto.calls() if c["step"] == "build/fix/resolve-1")["argv"][-1]
+    assert "Earlier resolver findings in this run" not in first  # nothing earlier, and it is not its own
+    assert "### Earlier resolver findings in this run" in second
+    assert f"- `{RED}`: " + "x" * 600 + "\n" in second and "x" * 601 not in second  # cut to 600 characters
+
+
+def test_the_report_keeps_the_last_three_findings_of_other_steps(auto):
+    run = auto.new_run()
+    for n in range(5):
+        run.emit("resolve_finished", key=f"build/step-{n}", stop_kind="blocked", summary=f"finding {n}")
+    run.emit("resolve_finished", key="build/mine", stop_kind="blocked", summary="my own")
+    report = auto.executor(run).stop_report("build/mine")
+    assert "### Earlier resolver findings in this run" in report
+    assert [n for n in range(5) if f"finding {n}" in report] == [2, 3, 4] and "my own" not in report
+    assert "### Earlier resolver findings" not in auto.executor(auto.new_run()).stop_report("build/mine")
+
+
 def test_a_step_that_stays_blocked_stops_for_a_human_after_its_attempts(auto, notified):
     auto.script({RED: [BLOCKED] * 3, f"{RED}/resolve-2": [done("vẫn chưa")]})
     run = begin_bug(auto, to="build")
@@ -313,12 +378,23 @@ def test_stops_outside_a_resolve_phase_are_a_humans(auto, notified):
 
 
 def test_a_budget_stop_is_never_settled(flow_repo, notified):
-    flow_repo.configure({**PIPE, "defaults": {"run_budget_usd": 0.0001}}, autopilot=True)
+    flow_repo.configure({**PIPE, "defaults": {"run_budget_usd": 0.0001, "run_budget_hard_usd": 0.0001}}, autopilot=True)
     flow_repo.script({"define/debug": [{**done("ok"), "cost": 1.0}]})
     run = begin_bug(flow_repo)
     assert go(flow_repo, run) == "waiting_human"
     assert run.state["waiting"]["kind"] == "budget_exceeded"
     assert not flow_repo.events(run, "resolve_started")
+
+
+def test_crossing_the_soft_budget_is_never_a_stop(flow_repo, notified):
+    flow_repo.configure({**PIPE, "defaults": {"run_budget_usd": 0.0001, "run_budget_hard_usd": 100}}, autopilot=True)
+    flow_repo.script({"define/debug": [{**done("ok"), "cost": 1.0}]})
+    run = begin_bug(flow_repo)
+    go(flow_repo, run)  # the bug lane walks on to whatever stops it next, never the soft budget
+    assert (run.state["waiting"] or {}).get("kind") != "budget_exceeded"
+    assert len(flow_repo.events(run, "budget_soft_reached")) == 1
+    assert not [e for e in flow_repo.events(run, "hitl_raised") if e["kind"] == "budget_exceeded"]
+    assert sum("soft budget" in text for text in notified) == 1
 
 
 # --------------------------------------------------------------------------- questions
@@ -365,6 +441,100 @@ def test_a_parkable_question_with_a_recommendation_is_answered_not_parked(auto):
     script_more(auto, {IMPL: [needs, {"write": {"src/one.py": "x = 1\n"}, **done("xong")}]})
     assert go(auto, run) == "done"
     assert not auto.events(run, "step_parked")
+
+
+# --------------------------------------------------------------------------- questions in every phase
+
+
+def begin_plan(flow, plan_acts: list[dict]) -> Run:
+    """A feature run at `plan`, with the spec written and `define` approved."""
+    flow.script({"define/draft": [{"write": {SPEC: SPEC_TEXT}, **done("drafted")}], "plan/plan": plan_acts})
+    run = start(flow.cfg, flow.root, "feature", {"module": "demo"}, RunOptions(to_phase="plan"))
+    assert go(flow, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    return run
+
+
+def asks(*questions: dict, park: bool = False) -> dict:
+    return {"result": {"status": "needs_human", "summary": "cần quyết định", "questions": list(questions),
+                       **({"can_continue_without": True} if park else {})}}
+
+
+PLANNED = {"write": {PLAN: PLAN_TEXT}, **done("planned")}
+
+
+def test_a_plan_question_with_a_recommended_option_is_answered_by_the_runner(auto, notified):
+    run = begin_plan(auto, [asks(question()), PLANNED])
+    assert go(auto, run) == "awaiting_approval"
+    assert run.state["waiting"]["phase"] == "plan"  # the plan step resumed and finished
+    answered = auto.events(run, "hitl_answered")
+    assert [(e["key"], e["by"], e["answers"]) for e in answered] == [("plan/plan", "runner", {"q1": "A"})]
+    assert called(auto).count("plan/plan") == 2
+    assert "plan/plan/record-q1" in called(auto)  # a spec gap is filed in the spec, as a human's answer is
+    assert "took the recommended answer(s) q1=A in plan/plan; the decision is recorded" in notified
+    assert not any("cần quyết định" in text for text in notified)
+
+
+@pytest.mark.parametrize("kinds", [["boundary"], ["ambiguity", "boundary"]])
+def test_a_boundary_question_stops_for_a_human_in_any_phase(auto, notified, kinds):
+    questions = [{**question(kind), "id": f"q{n}"} for n, kind in enumerate(kinds, 1)]
+    run = begin_plan(auto, [asks(*questions)])
+    assert go(auto, run) == "waiting_human"
+    assert run.state["waiting"]["key"] == "plan/plan"
+    assert not auto.events(run, "hitl_answered")
+    assert any("cần quyết định" in text for text in notified)
+
+
+def test_a_boundary_question_in_a_resolve_phase_stops_for_a_human(auto, notified):
+    run = begin_feature(auto)
+    script_more(auto, {IMPL: [asks(question("boundary"))]})
+    assert go(auto, run) == "waiting_human"
+    assert run.state["waiting"]["key"] == IMPL
+    assert not auto.events(run, "hitl_answered")
+    assert any("cần quyết định" in text for text in notified)
+
+
+def test_a_parked_boundary_question_still_waits_for_a_human(auto, notified):
+    run = begin_feature(auto)
+    script_more(auto, {IMPL: [asks(question("boundary"), park=True)]})
+    assert go(auto, run) == "waiting_human"
+    assert [e["key"] for e in auto.events(run, "step_parked")] == [IMPL]
+    assert not auto.events(run, "hitl_answered")
+    assert any("parked: cần quyết định" in text for text in notified)
+
+
+def test_no_human_question_kinds_lets_the_runner_answer_a_boundary(flow_repo, notified):
+    flow_repo.configure({**PIPE, "autonomy": {"human_question_kinds": []}}, autopilot=True)
+    run = begin_plan(flow_repo, [asks(question("boundary")), PLANNED])
+    assert go(flow_repo, run) == "awaiting_approval"
+    assert [e["by"] for e in flow_repo.events(run, "hitl_answered")] == ["runner"]
+
+
+def test_answer_recommended_off_stops_for_a_human_as_before(flow_repo, notified):
+    flow_repo.configure({**PIPE, "autonomy": {"answer_recommended": False}}, autopilot=True)
+    run = begin_plan(flow_repo, [asks(question("ambiguity"))])
+    assert go(flow_repo, run) == "waiting_human"
+    assert not flow_repo.events(run, "hitl_answered")
+    assert any("cần quyết định" in text for text in notified)
+
+
+def test_a_parked_task_question_outside_a_resolve_phase_is_answered_not_parked(flow_repo, notified):
+    flow_repo.configure({**PIPE, "phases": {"build": {"resolve": False}}}, autopilot=True)
+    run = begin_feature(flow_repo)
+    script_more(flow_repo, {IMPL: [asks(question("ambiguity"), park=True), {"write": {"src/one.py": "x = 1\n"},
+                                                                             **done("xong")}]})
+    assert go(flow_repo, run) == "done"
+    assert not flow_repo.events(run, "step_parked")
+    assert [(e["key"], e["by"]) for e in flow_repo.events(run, "hitl_answered")] == [(IMPL, "runner")]
+
+
+def test_a_question_asked_again_after_the_runner_answered_it_goes_to_a_human(auto, notified):
+    run = begin_plan(auto, [asks(question("ambiguity")), asks(question("ambiguity"))])
+    assert go(auto, run) == "waiting_human"
+    assert run.state["waiting"]["key"] == "plan/plan"
+    assert [e["by"] for e in auto.events(run, "hitl_answered")] == ["runner"]
+    assert any("cần quyết định" in text for text in notified)
+    assert answer(run, "plan/plan", {"q1": "B"}, by="me")  # a human's answer goes on as usual
 
 
 @pytest.mark.parametrize(("questions", "want"), [
@@ -475,6 +645,22 @@ def test_eligible_reads_the_phase_never_a_name(flow_repo):
     assert not eligible(cfg, "blocked", "plan/plan", [])
     assert not eligible(cfg, "blocked", "define/debug/resolve-1", [])
     assert not eligible(cfg, "budget_exceeded", "define/debug", [])
+
+
+def test_a_question_is_eligible_in_every_phase_unless_a_human_must_answer_it(flow_repo):
+    """A recommended answer no longer needs a `resolve: true` phase; every other kind still does."""
+    cfg = flow_repo.configure({"phases": {"define": {"resolve": True}}}, autopilot=True)
+    assert not cfg.phases["plan"].resolve
+    assert eligible(cfg, "needs_human", "plan/plan", [question()])
+    assert eligible(cfg, "needs_human", "define/debug", [question("ambiguity")])
+    assert not eligible(cfg, "needs_human", "plan/plan", [question(recommended=False)])
+    assert not eligible(cfg, "needs_human", "plan/plan", [question("boundary")])
+    assert not eligible(cfg, "needs_human", "plan/plan", [question(), {**question("boundary"), "id": "q2"}])
+    assert not eligible(cfg, "needs_human", "plan/plan/resolve-1", [question()])  # a resolver's own stop
+    open_ = flow_repo.configure({"autonomy": {"human_question_kinds": []}}, autopilot=True)
+    assert eligible(open_, "needs_human", "plan/plan", [question("boundary")])
+    off = flow_repo.configure({"autonomy": {"answer_recommended": False}}, autopilot=True)
+    assert not eligible(off, "needs_human", "build/build/task-1/implement", [question()])
 
 
 def test_the_doubt_offer_is_on_the_plan_page_and_build_does_not_stop(flow_repo):

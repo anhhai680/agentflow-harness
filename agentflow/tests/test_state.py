@@ -15,6 +15,7 @@ from agentflow import pack
 from agentflow.events import EventError, EventLog, RunLock, lock_state
 from agentflow.flow import _human_errors, main
 from agentflow.state import (
+    RUN_FACTS_MAX,
     Run,
     RunNotFound,
     display_status,
@@ -87,6 +88,26 @@ def test_reduce_is_pure():
     assert out is not state
     assert out["pipeline"] == "feature" and out["params"] == {"module": "crm"} and out["status"] == "running"
     assert reduce(state, event) == out
+
+
+def test_the_soft_budget_is_carried_by_run_started_and_run_updated():
+    state = initial_state()
+    assert state["soft_budget_usd"] is None
+    started = {"seq": 1, "ts": "2026-10-29T10:00:00.000+00:00", "type": "run_started", "pipeline": "feature",
+               "params": {}, "run_id": "r1", "budget_usd": 65, "soft_budget_usd": 25}
+    state = reduce(state, started)
+    assert (state["budget_usd"], state["soft_budget_usd"]) == (65, 25)
+    state = reduce(state, {"seq": 2, "ts": started["ts"], "type": "run_updated", "soft_budget_usd": 31.5})
+    assert (state["budget_usd"], state["soft_budget_usd"]) == (65, 31.5)
+    old = reduce(initial_state(), {**started, "soft_budget_usd": None})  # a run started before the soft budget
+    assert (old["budget_usd"], old["soft_budget_usd"]) == (65, None)
+
+
+def test_status_spend_shows_the_soft_and_the_hard_budget():
+    from agentflow.flow import _spend
+
+    state = {"budget_usd": 65, "soft_budget_usd": 25, "spend_usd": 1.0, "agents": {}}
+    assert _spend(state) == "$1.00 / $25.00 · $65.00"
 
 
 def test_agent_rows(run):
@@ -372,7 +393,10 @@ def test_run_create_and_paths(run, repo, cfg):
     assert runs_root(repo) == pack.state_dir(repo) / "runs" and not runs_root(repo).is_relative_to(repo.resolve())
     started = run.events.read()[0]
     assert started["type"] == "run_started" and started["params"] == {"module": "crm"}
-    assert run.state["run_id"] == run.id and run.state["budget_usd"] == cfg.defaults.run_budget_usd
+    assert run.state["run_id"] == run.id and run.state["budget_usd"] == cfg.defaults.run_budget_hard_usd
+    assert run.state["soft_budget_usd"] == cfg.defaults.run_budget_usd
+    assert (started["budget_usd"], started["soft_budget_usd"]) == (cfg.defaults.run_budget_hard_usd,
+                                                                   cfg.defaults.run_budget_usd)
     assert run.state["pipeline"] == "feature"
     key = "build/implement/task-3/implement"
     assert run.result_path(key) == run.dir / "results" / "build__implement__task-3__implement.json"
@@ -650,6 +674,36 @@ def test_reopened_step_is_resumable_and_rejection_drops_parked(run):
     assert run.state["steps"]["build/b/task-2/implement"]["status"] == "refine_pending"
 
 
+def test_a_scoped_rejection_refines_only_its_task(run):
+    for key in ("build/setup", "build/b", "build/b/task-1/implement", "build/b/task-2/implement",
+                "build/b/task-2/review", "build/b/task-20/implement"):
+        run.emit("step_finished", key=key, status="done", summary="ok")
+    run.emit("step_parked", kind="needs_human", key="build/b/task-2/implement", phase="build", summary="", questions=[])
+    run.emit("step_parked", kind="needs_human", key="build/b/task-3/implement", phase="build", summary="", questions=[])
+    run.emit("phase_rejected", phase="build", round=1, note="redo two", key="build/b/task-2/implement",
+             scope="build/b/task-2")
+    assert run.state["refine"] == {"phase": "build", "round": 1, "note": "redo two", "scope": "build/b/task-2"}
+    steps = run.state["steps"]
+    for key in ("build/b/task-2/implement", "build/b/task-2/review", "build/b"):  # and the foreach that holds it
+        assert steps[key]["status"] == "refine_pending" and steps[key]["round"] == 1
+    for key in ("build/setup", "build/b/task-1/implement", "build/b/task-20/implement"):
+        assert steps[key]["status"] == "done"
+    assert steps["build/b/task-3/implement"]["status"] == "parked"
+    assert list(run.state["parked"]) == ["build/b/task-3/implement"]  # only the task's own park is dropped
+    assert state_json(run) == replay(run.events.read())
+
+
+def test_a_skipped_review_is_recorded_until_a_review_runs(run):
+    run.emit("step_finished", key="build/b/task-1/review", status="done", summary="ok")
+    run.emit("phase_rejected", phase="build", round=1, note="redo")
+    run.emit("review_skipped", key="build/b/task-1/review", reason="unchanged", round=1)
+    assert run.state["reviews"]["build/b/task-1/review"] == {"skipped": True, "reason": "unchanged", "round": 1}
+    row = run.state["steps"]["build/b/task-1/review"]  # settled, so the round leaves nothing pending
+    assert row["status"] == "skipped" and row["skip_reason"] == "unchanged"
+    run.emit("review_result", key="build/b/task-1/review", round=1, findings=[], blocking=0, blocking_findings=[])
+    assert "skipped" not in run.state["reviews"]["build/b/task-1/review"]
+
+
 def test_status_spend_includes_a_session_still_running():
     from agentflow.flow import _spend
 
@@ -706,3 +760,30 @@ def test_sessions_add_up_separately(run):
     run.emit("agent_exited", session_id="s-2", exit_code=0, cost=0.25)
     run.emit("agent_exited", session_id=None, exit_code=1, cost=0.25, cost_estimated=True)
     assert run.state["spend_usd"] == 1.0
+
+
+# --------------------------------------------------------------------------- run facts
+
+
+def test_run_facts_start_empty_and_old_states_still_replay(run):
+    assert initial_state()["facts"] == []
+    assert run.state["facts"] == []
+    assert replay([])["facts"] == []
+
+
+def test_run_fact_appends_dedupes_and_keeps_the_newest(run):
+    run.emit("run_fact", text="Shell sets a URL", key="build/x/resolve-1")
+    run.emit("run_fact", text="second", key="build/x/resolve-1")
+    assert run.state["facts"] == [{"text": "Shell sets a URL", "key": "build/x/resolve-1"},
+                                  {"text": "second", "key": "build/x/resolve-1"}]
+    run.emit("run_fact", text="SHELL sets a url", key="build/y/resolve-1")  # the same fact again: once, as the newest
+    assert [f["text"] for f in run.state["facts"]] == ["second", "SHELL sets a url"]
+    for n in range(RUN_FACTS_MAX + 3):
+        run.emit("run_fact", text=f"fact {n}", key="build/x/resolve-2")
+    assert [f["text"] for f in run.state["facts"]] == [f"fact {n}" for n in range(3, RUN_FACTS_MAX + 3)]
+    assert state_json(run) == replay(run.events.read()) == run.state
+
+
+def test_run_fact_needs_its_text_and_key(run):
+    with pytest.raises(EventError):
+        run.emit("run_fact", text="no key")

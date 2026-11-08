@@ -142,7 +142,7 @@ def _approve(run: Run, body: dict, cfg: Config) -> tuple[dict, bool]:
                                or not math.isfinite(budget)):
         raise BadRequest("budget must be a finite number")
     rested = hitl.approve(run, _text(body, "target") or _default_target(run), BY, budget=budget, hold=_rests(run, cfg),
-                          note=_text(body, "note"))
+                          note=_text(body, "note"), budget_step=cfg.defaults.run_budget_usd)
     return {}, not rested
 
 

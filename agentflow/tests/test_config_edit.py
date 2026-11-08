@@ -187,6 +187,19 @@ def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
 
 
+def test_the_inherited_environment_settings_are_protected(shipped):
+    _, sha = config_edit.read(shipped)
+    old = '    POSTGRES_HOST_PORT: "55432"\n'
+    assert old in SHIPPED
+    for added in ('  env_inherit: {drop: ["*_URL"]}\n', "  env_inherit: {drop_dotenv: []}\n"):  # a run's agents see the leak again
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=SHIPPED.replace(old, old + added, 1), repo=REPO)
+    for key, value in ((["defaults", "env_inherit", "drop"], ["X"]), (["defaults", "env_inherit", "drop_dotenv"], [])):
+        with pytest.raises(Refused):  # the form has no field for it
+            form(shipped, (key, value))
+    assert "defaults.env_inherit" in config_edit.PROTECTED
+
+
 def test_yaml_text_may_not_switch_the_work_source_to_specs(shipped):
     _, sha = config_edit.read(shipped)
     lines = SHIPPED.splitlines(keepends=True)
@@ -394,7 +407,10 @@ def test_form_shows_the_effective_value_its_layer_and_its_help(sparse_repo):
     fields = _fields(path)
     timeout = fields[("defaults", "step_timeout_min")]
     assert (timeout["value"], timeout["source"], timeout["present"]) == (45, "engine", False)
-    assert fields[("defaults", "task_budget_usd")]["help"].startswith("0: a feature run's budget")  # the engine's comment
+    assert fields[("defaults", "task_budget_usd")]["help"] == "the soft budget grows to fit the plan"  # the engine's comment
+    hard = fields[("defaults", "run_budget_hard_usd")]
+    assert (hard["value"], hard["source"], hard["present"]) == (65, "engine", False)
+    assert hard["help"].startswith("hard: the run stops")
     models = fields[("agents", "claude", "models")]
     assert models["source"] == "engine" and models["value"]["plan"] == "opus" and not models.get("readonly")
     assert fields[("phases", "build", "resolve")]["value"] is True
@@ -462,6 +478,51 @@ def test_a_field_set_in_the_user_file_is_refused_on_save(sparse_repo):
         _sparse_form(path, (["defaults", "run_budget_usd"], 10))
     assert path.read_text(encoding="utf-8") == text
     assert not _sparse_form(path, (["defaults", "step_timeout_min"], 50)).errors  # the rest of the form still saves
+
+
+def test_the_settings_form_has_a_soft_and_a_hard_budget(shipped):
+    fields = _fields(shipped)
+    soft, hard = fields[("defaults", "run_budget_usd")], fields[("defaults", "run_budget_hard_usd")]
+    assert soft["label"] == "Soft budget (USD, new runs): notify only"
+    assert hard["label"] == "Hard budget (USD, new runs): the run stops for approval"
+    assert (hard["kind"], hard["min"], hard["exclusive_min"]) == ("number", 0, True)
+    proposal = form(shipped, (["defaults", "run_budget_hard_usd"], 80))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).defaults.run_budget_hard_usd == 80
+    below = form(shipped, (["defaults", "run_budget_hard_usd"], 10))  # under the pack's soft budget of 25
+    assert "defaults.run_budget_hard_usd" in [i.path for i in below.errors]
+    with pytest.raises(EditError):
+        form(shipped, (["defaults", "run_budget_hard_usd"], 0))
+
+
+def test_the_settings_form_has_the_question_kinds_only_a_human_answers(shipped, sparse_repo):
+    from agentflow.config import QUESTION_KINDS
+
+    fields = _fields(shipped)
+    kinds = fields[("autonomy", "human_question_kinds")]
+    assert kinds["label"] == "Question kinds only a human answers"
+    assert (kinds["kind"], kinds["options"], kinds["value"]) == ("list", list(QUESTION_KINDS), ["boundary"])
+    assert "boundary" in QUESTION_KINDS
+    proposal = form(shipped, (["autonomy", "human_question_kinds"], ["boundary", "spec_gap"]))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).autonomy["human_question_kinds"] == ["boundary", "spec_gap"]
+    with pytest.raises(EditError):
+        form(shipped, (["autonomy", "human_question_kinds"], ["taste"]))  # not a question kind
+    sparse = _fields(_sparse(sparse_repo))
+    assert sparse[("autonomy", "human_question_kinds")]["help"] == "never answered by the runner"  # the engine's comment
+    assert sparse[("autonomy", "answer_recommended")]["help"] == "in every phase, except kinds in human_question_kinds"
+
+
+def test_a_hard_budget_set_in_the_user_file_is_read_only(sparse_repo):
+    path = _sparse(sparse_repo)
+    user = _user_file({"defaults": {"run_budget_hard_usd": 90}})
+    hard = _fields(path)[("defaults", "run_budget_hard_usd")]
+    assert (hard["value"], hard["source"]) == (90, "user")
+    assert hard["readonly"] == f"set in your user config ({user}), which overrides the pack"
+    with pytest.raises(Refused, match="user config"):
+        _sparse_form(path, (["defaults", "run_budget_hard_usd"], 100))
 
 
 def test_a_map_with_a_user_entry_is_refused_on_save(sparse_repo):

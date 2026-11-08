@@ -516,6 +516,50 @@ def test_a_negative_task_budget_is_refused(tmp_cfg):
     assert ("error", "defaults.task_budget_usd") in errors(issues_for(tmp_cfg, {"defaults": {"task_budget_usd": -1}}))
 
 
+def test_the_budgets_default_to_a_soft_and_a_hard_limit(tmp_cfg):
+    defaults = load_config(tmp_cfg({"defaults": {"run_budget_usd": None, "run_budget_hard_usd": None,
+                                                  "task_budget_usd": None}})).defaults
+    assert (defaults.run_budget_usd, defaults.run_budget_hard_usd, defaults.task_budget_usd) == (25, 65, 2)
+
+
+@pytest.mark.parametrize("patch, key", [
+    ({"run_budget_usd": 30, "run_budget_hard_usd": 20}, "defaults.run_budget_hard_usd"),  # hard below soft
+    ({"run_budget_usd": 0}, "defaults.run_budget_usd"),
+    ({"run_budget_usd": -1}, "defaults.run_budget_usd"),
+    ({"run_budget_usd": float("inf"), "run_budget_hard_usd": float("inf")}, "defaults.run_budget_usd"),
+    ({"run_budget_hard_usd": 0}, "defaults.run_budget_hard_usd"),
+    ({"run_budget_hard_usd": -5}, "defaults.run_budget_hard_usd"),
+    ({"run_budget_hard_usd": float("nan")}, "defaults.run_budget_hard_usd"),
+])
+def test_the_budgets_must_be_positive_and_the_hard_one_not_below_the_soft(tmp_cfg, patch, key):
+    assert (("error", key)) in errors(issues_for(tmp_cfg, {"defaults": patch}))
+
+
+def test_a_hard_budget_equal_to_the_soft_one_is_allowed(tmp_cfg):
+    found = errors(issues_for(tmp_cfg, {"defaults": {"run_budget_usd": 10, "run_budget_hard_usd": 10}}))
+    assert not [path for _, path in found if "budget" in path]
+
+
+def test_env_inherit_defaults_to_dropping_the_dotenv_twins(tmp_cfg):
+    inherit = load_config(tmp_cfg()).defaults.env_inherit
+    assert inherit.drop == [] and inherit.drop_dotenv == [".env"]
+
+
+@pytest.mark.parametrize("patch", [
+    {"drop": ["has space"]}, {"drop": ["a;b"]}, {"drop": [""]}, {"drop": ["X" * 129]},
+    {"drop_dotenv": ["../.env"]}, {"drop_dotenv": ["a/../../.env"]}, {"drop_dotenv": ["/etc/env"]}, {"drop_dotenv": [""]},
+])
+def test_a_bad_env_inherit_is_refused(tmp_cfg, patch):
+    got = errors(issues_for(tmp_cfg, {"defaults": {"env_inherit": patch}}))
+    assert any(path.startswith("defaults.env_inherit.") for _, path in got)
+
+
+def test_a_good_env_inherit_validates(tmp_cfg):
+    patch = {"drop": ["*_URL", "A_B", "X[12]"], "drop_dotenv": [".env", "web/.env.local"]}
+    assert [p for _, p in errors(issues_for(tmp_cfg, {"defaults": {"env_inherit": patch}}))
+            if p.startswith("defaults.env_inherit")] == []
+
+
 def test_batch_is_checked(tmp_cfg):
     def patch(data):
         phase_step(data, "build", "build")["batch"] = {"max_tasks": 1, "max_files": -1, "prompt": "nope.md"}
@@ -1130,3 +1174,31 @@ def test_a_pack_without_the_bug_lane_needs_no_allow_rule(sparse_repo):
     raw["lanes"] = ["feature"]
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     assert _bug_lane_warnings(validate(load_config(path), sparse_repo)) == []
+
+
+def test_human_question_kinds_default_to_boundary(tmp_cfg):
+    from agentflow.autonomy import human_kinds
+
+    engine = yaml.safe_load((Path(pack.__file__).parent / "defaults" / "config.yaml").read_text(encoding="utf-8"))
+    assert engine["autonomy"]["human_question_kinds"] == ["boundary"]
+    patch = {"autonomy": {"human_question_kinds": None}}  # a pack that writes the whole workflow and leaves it out
+    cfg = load_config(tmp_cfg(patch))
+    assert "human_question_kinds" not in cfg.autonomy and human_kinds(cfg) == ("boundary",)
+    assert not [path for _, path in errors(issues_for(tmp_cfg, patch)) if path.startswith("autonomy")]
+
+
+@pytest.mark.parametrize("value", [["boundary", "taste"], "boundary", [1], {"boundary": True}])
+def test_human_question_kinds_must_be_a_list_of_known_kinds(tmp_cfg, value):
+    found = errors(issues_for(tmp_cfg, {"autonomy": {"human_question_kinds": value}}))
+    assert ("error", "autonomy.human_question_kinds") in found
+
+
+@pytest.mark.parametrize("value", [[], ["boundary", "spec_gap"]])
+def test_human_question_kinds_may_be_empty_or_name_any_question_kind(tmp_cfg, value):
+    found = errors(issues_for(tmp_cfg, {"autonomy": {"human_question_kinds": value}}))
+    assert not [path for _, path in found if path.startswith("autonomy")]
+
+
+def test_answer_recommended_must_be_a_bool(tmp_cfg):
+    found = errors(issues_for(tmp_cfg, {"autonomy": {"answer_recommended": "sometimes"}}))
+    assert ("error", "autonomy.answer_recommended") in found

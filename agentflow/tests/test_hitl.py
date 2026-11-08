@@ -10,6 +10,8 @@ import pytest
 from agentflow import hitl
 from agentflow.flow import main
 from agentflow.hitl import (
+    FACT_MAX,
+    FACTS_PER_RESULT,
     NotWaiting,
     Option,
     Question,
@@ -80,6 +82,31 @@ def macos_calls(monkeypatch):
 # ------------------------------------------------------------------ result schema
 
 
+def test_result_facts_are_cleaned_cut_and_capped(tmp_path):
+    p = tmp_path / "r.json"
+    assert read_result(write_result(p, {"status": "done", "summary": "x"})).facts == []
+    raw = ["  the shell sets a URL\n\tto a dead host\x00\x1b[31m  ", "e\u0301 is one letter", "x" * 500, "", "   "]
+    facts = read_result(write_result(p, {"status": "done", "summary": "x", "facts": raw})).facts
+    assert facts[0] == "the shell sets a URL to a dead host[31m"  # whitespace collapsed, control characters gone
+    assert facts[1] == "\u00e9 is one letter"  # NFC
+    assert facts[2] == "x" * FACT_MAX
+    many = [f"fact {n}" for n in range(9)]
+    assert read_result(write_result(p, {"status": "done", "summary": "x", "facts": many})).facts == many[:FACTS_PER_RESULT]
+
+
+def test_clean_fact_drops_format_characters():
+    # a bidi override, a zero-width space and a byte-order mark are invisible, and can reorder or hide what a
+    # reviewer reads in a prompt, a notification or a pull request body
+    assert hitl.clean_fact("﻿use ‮evil‬ the​ cache⁦ here⁩") == "use evil the cache here"
+    assert hitl.clean_fact("a​b") == "ab"
+
+
+@pytest.mark.parametrize("facts", ["one fact", {"a": "b"}, [1], [["nested"]], [None]])
+def test_result_facts_must_be_a_list_of_strings(tmp_path, facts):
+    with pytest.raises(ResultError):
+        read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x", "facts": facts}))
+
+
 def test_result_schema(tmp_path):
     p = tmp_path / "r.json"
     ok = read_result(write_result(p, {"status": "done", "summary": "wrote the spec", "next": "plan"}))
@@ -129,6 +156,16 @@ def test_result_reads_questions_and_extras(tmp_path):
     assert q.id == "q1" and q.question == QUESTION and q.kind == "spec_gap" and q.evidence == ["a.md#1"]
     assert q.options == [Option("A", "Theo tiến trình", True), Option("B", "x", False)]
     assert res.can_continue_without is True and res.signals == {"answer": "yes"} and res.risks == ["r1"]
+
+
+def test_result_accepts_a_boundary_question_and_refuses_an_unknown_kind(tmp_path):
+    asked = {"id": "q1", "question": "Đổi lược đồ có cần hỏi trước không?", "kind": "boundary",
+             "options": [{"key": "A", "label": "Hỏi trước", "recommended": True}]}
+    res = read_result(write_result(tmp_path / "r.json", {"status": "needs_human", "summary": "x", "questions": [asked]}))
+    assert [q.kind for q in res.questions] == ["boundary"]
+    with pytest.raises(ResultError, match="boundary"):  # the error lists the kinds there are
+        read_result(write_result(tmp_path / "r.json", {"status": "needs_human", "summary": "x",
+                                                       "questions": [{**asked, "kind": "taste"}]}))
 
 
 @pytest.mark.parametrize("bad", [
@@ -196,7 +233,8 @@ def test_inbox_title_and_question_stay_on_one_line(tmp_path):
 
 
 def test_raise_hitl_notifies(run, cfg, macos_calls, capsys):
-    path = raise_hitl(cfg, run, "needs_human", "plan/task-1/implement", "Task 1 needs a TTL", [one_question()])
+    asked = dataclasses.replace(one_question(), kind="boundary")  # one only a human answers, in any phase
+    path = raise_hitl(cfg, run, "needs_human", "plan/task-1/implement", "Task 1 needs a TTL", [asked])
     assert path == run.inbox_path("plan/task-1/implement") and path.exists()
     assert "\a" in capsys.readouterr().err
     (argv,) = macos_calls
@@ -211,6 +249,12 @@ def test_raise_hitl_notifies(run, cfg, macos_calls, capsys):
     assert run.state["status"] == "waiting_human"
     assert parse_answers(path) == {"q1": ""}
     assert f"agentflow answer {run.id}" in path.read_text(encoding="utf-8")
+
+
+def test_a_question_the_runner_takes_is_raised_without_a_notification(run, cfg, macos_calls, capsys):
+    raise_hitl(cfg, run, "needs_human", "plan/task-1/implement", "Task 1 needs a TTL", [one_question()])
+    assert run.state["waiting"]["key"] == "plan/task-1/implement"  # the resolver answers it next
+    assert macos_calls == [] and "\a" not in capsys.readouterr().err
 
 
 def test_notify_failures_are_events_not_exceptions(run, cfg, monkeypatch, capsys):
@@ -423,6 +467,26 @@ def test_reject_an_inner_checkpoint_refines_its_phase(run, cfg, macos_calls):
     reject(run, "plan/doubt_offer", "me", "not yet")
     assert run.state["refine"] == {"phase": "plan", "round": 1, "note": "not yet"}
     assert run.state["waiting"] is None
+
+
+@pytest.mark.parametrize("key", ["build/build/task-2/implement", "build/build/task-2/commit"])
+def test_rejecting_a_task_stop_refines_only_that_task(run, cfg, macos_calls, key):
+    path = raise_hitl(cfg, run, "blocked", key, "cannot go on")
+    assert "sends task 2 back for a refine round" in path.read_text(encoding="utf-8")
+    reject(run, key, "me", "redo task two")
+    assert run.state["refine"] == {"phase": "build", "round": 1, "note": "redo task two",
+                                   "scope": "build/build/task-2"}
+    ev = [e for e in run.events.read() if e["type"] == "phase_rejected"][-1]
+    assert ev["scope"] == "build/build/task-2" and ev["key"] == key
+
+
+@pytest.mark.parametrize("key", ["build/build", "build/setup", "build/build/task-x/implement"])
+def test_rejecting_a_stop_outside_a_task_refines_the_phase(run, cfg, macos_calls, key):
+    path = raise_hitl(cfg, run, "blocked", key, "cannot go on")
+    assert "sends the phase back for a refine round" in path.read_text(encoding="utf-8")
+    reject(run, key, "me", "redo")
+    assert "scope" not in run.state["refine"]
+    assert "scope" not in [e for e in run.events.read() if e["type"] == "phase_rejected"][-1]
 
 
 # ------------------------------------------------------------------ inbox listing and CLI

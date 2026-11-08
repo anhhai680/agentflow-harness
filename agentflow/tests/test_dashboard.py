@@ -258,6 +258,25 @@ def test_spend_today_counts_a_resumed_session_once(dash):
     assert payload(dash.get("/api/board")[2])["spend_today"] == 2.37
 
 
+def test_a_card_shows_the_soft_and_the_hard_budget(dash):
+    from agentflow.views import board_table, metrics_view
+
+    defaults = dash.flow.cfg.defaults
+    run = dash.flow.new_run()
+    data = payload(dash.get("/api/board")[2])
+    (card,) = data["cards"]
+    assert (card["soft_budget"], card["budget"]) == (defaults.run_budget_usd, defaults.run_budget_hard_usd)
+    assert (data["run_budget_usd"], data["run_budget_hard_usd"]) == (defaults.run_budget_usd, defaults.run_budget_hard_usd)
+    assert f"$0.00/${defaults.run_budget_usd:.0f}·${defaults.run_budget_hard_usd:.0f}" in board_table(data)
+    detail = payload(dash.get(f"/api/runs/{run.id}")[2])
+    assert detail["state"]["soft_budget_usd"] == defaults.run_budget_usd
+    (row,) = metrics_view(dash.flow.root, dash.flow.cfg)["runs"]
+    assert (row["soft_budget"], row["budget"]) == (defaults.run_budget_usd, defaults.run_budget_hard_usd)
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    for needle in ("card.soft_budget", "st.soft_budget_usd", "r.soft_budget", "data.run_budget_hard_usd"):
+        assert needle in source
+
+
 def test_board_and_run_detail(dash):
     planning = awaiting(dash.flow, "staff-auth")
     run_dir = planning.dir
@@ -276,6 +295,19 @@ def test_board_and_run_detail(dash):
     assert len(detail["transcript"]) <= 16 * 1024 and detail["transcript"].endswith('{"type": "result"}\n')
     assert [e["type"] for e in detail["timeline"]][-1] == "phase_approval_raised"
     assert detail["attach"] == f"agentflow attach {planning.id}"
+
+
+def test_a_card_shows_a_review_a_refine_round_skipped(dash):
+    run = dash.flow.new_run({"module": "crm"})
+    run.emit("phase_started", phase="build")
+    run.emit("step_started", key="build/build/task-2/implement", phase="build", task={"n": 2, "of": 3})
+    run.emit("review_skipped", key="build/build/task-2/review", reason="unchanged", round=1)
+    run.emit("review_skipped", key="plan/plan/task-1/review", reason="unchanged", round=1)  # not this phase's
+    assert card_of(dash)["review_skipped"] == [{"key": "build/build/task-2/review", "task": 2, "reason": "unchanged"}]
+    run.emit("review_result", key="build/build/task-2/review", round=1, findings=[], blocking=0, blocking_findings=[])
+    assert card_of(dash)["review_skipped"] == []  # a review that ran replaces the skip
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    assert re.search(r"review_skipped[^\n]*gate-skip", source)  # drawn in the existing skipped style
 
 
 def test_tails_never_follow_symlinks_out_of_the_run(dash, tmp_path):

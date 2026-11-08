@@ -196,6 +196,15 @@ def test_the_user_layer_overrides_the_pack_for_personal_keys():
     check_user({}, lower, USER_FILE)  # an empty file is fine
 
 
+def test_the_hard_budget_is_a_personal_setting():
+    assert "defaults.run_budget_hard_usd" in layers.USER_KEYS
+    user = {"defaults": {"run_budget_hard_usd": 40}}
+    check_user(user, {"defaults": {"run_budget_usd": 5}}, USER_FILE)
+    merged, origins = merge([L("project", {"defaults": {"run_budget_usd": 5}}), L("user", user)])
+    assert merged["defaults"] == {"run_budget_usd": 5, "run_budget_hard_usd": 40}
+    assert origins[("defaults", "run_budget_hard_usd")] == "user"
+
+
 def test_a_user_model_for_one_role_is_personal():
     check_user({"agents": {"claude": {"models": {"build": "sonnet"}}}}, pack_with_agents(), USER_FILE)
     merged, origins = merge([L("project", pack_with_agents()),

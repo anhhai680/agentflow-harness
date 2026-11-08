@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from agentflow import layers, pack
+from agentflow import layers, pack, run_env
 from agentflow.config import Config, ConfigError, load_config
 
 TIMEOUT_S = 20  # each external command
@@ -171,6 +171,29 @@ def _state_dir_check(repo: Path) -> Check:
     return Check("state dir", "ok", f"{directory} is writable")
 
 
+MAX_LISTED_NAMES = 12
+
+
+def _environment_check(cfg: Config) -> Check:
+    """The inherited variables a run does not pass on, by name and reason; never a value."""
+    rows = run_env.dropped(cfg)
+    if not rows:
+        return Check("inherited environment", "ok", "nothing is dropped from the environment a run inherits")
+    by_reason: dict[str, list[str]] = {}
+    for name, reason in rows:
+        by_reason.setdefault(reason, []).append(name[:64])
+    remaining = MAX_LISTED_NAMES
+    parts: list[str] = []
+    for reason, names in by_reason.items():
+        shown = names[:remaining]
+        remaining -= len(shown)
+        extra = len(names) - len(shown)
+        text = ", ".join(shown) + (f"{' and ' if shown else ''}{extra} more" if extra else "")
+        parts.append(f"{text} ({reason})")
+    return Check("inherited environment", "warn", f"{len(rows)} dropped: " + "; ".join(parts),
+                 "they are dropped from runs; to keep one, set it in `defaults.env`")
+
+
 def gate_path(cfg: Config) -> str:
     """The PATH a gate's programs are looked up on: `defaults.env.PATH`, else this process's."""
     return cfg.defaults.env.get("PATH") or os.environ.get("PATH", os.defpath)
@@ -260,6 +283,7 @@ def run_checks(cfg: Config, repo: Path) -> list[Check]:
     if uses_docker:
         checks.append(_docker_check(repo))
     checks.append(_state_dir_check(repo))
+    checks.append(_environment_check(cfg))
     return [*checks, *gate_checks]
 
 

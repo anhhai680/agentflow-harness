@@ -15,21 +15,24 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .config import Config
+from .config import QUESTION_KINDS, Config
 from .events import nfc, parse_iso
 from .state import TERMINAL, Run, list_runs
 
 RESULT_STATUSES = ("done", "blocked", "needs_human", "effort_change", "unchanged")
-QUESTION_KINDS = ("spec_gap", "ambiguity", "conflict", "review_dispute", "other")
 QUESTION_ID = re.compile(r"^[\w.\-]+$")
 HEADING = re.compile(r"^### (\S+) — (.*)$", re.MULTILINE)
 ANSWER_LINE = re.compile(r"^Answer:[ \t]*(.*)$", re.MULTILINE)
+FACT_MAX = 300  # characters of one `facts` entry
+FACTS_PER_RESULT = 5
+_INVISIBLE_CATEGORIES = ("Cc", "Cf")  # control characters, and format ones: bidi overrides, zero-width, BOM
 DEFAULT_TITLE = "agentflow: {run} needs you"
 NOTIFY_TIMEOUT_S = 10
 MESSAGE_MAX = 240
@@ -78,6 +81,7 @@ class StepResult:
     signals: dict = field(default_factory=dict)
     findings: list = field(default_factory=list)
     risks: list = field(default_factory=list)
+    facts: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- result.json
@@ -87,6 +91,22 @@ def _text(value: Any, name: str) -> str:
     if isinstance(value, str) and value.strip():
         return nfc(value)
     raise ResultError(f"{name} must be a non-empty string")
+
+
+def clean_fact(text: str) -> str:
+    """One `facts` entry as the run keeps it: NFC, control and format characters dropped (a bidi override or a
+    zero-width character could reorder or hide what a reader sees), whitespace collapsed to single spaces, and cut
+    to `FACT_MAX`. It is model text, so it is cut before anything reads it further. Any one line of model text
+    shown to a human (a notification, the pull request body) goes through it too."""
+    text = "".join(ch for ch in text[: FACT_MAX * 4]
+                   if ch.isspace() or unicodedata.category(ch) not in _INVISIBLE_CATEGORIES)
+    return nfc(" ".join(text.split()))[:FACT_MAX].rstrip()
+
+
+def _parse_facts(raw: Any) -> list[str]:
+    if not isinstance(raw, list) or not all(isinstance(f, str) for f in raw):
+        raise ResultError("facts must be a list of strings")
+    return [fact for fact in (clean_fact(f) for f in raw[:FACTS_PER_RESULT]) if fact]
 
 
 def _parse_question(raw: Any, index: int) -> Question:
@@ -151,6 +171,7 @@ def read_result(path: Path, refine: bool = False) -> StepResult:
     signals, findings, risks = raw.get("signals", {}), raw.get("findings", []), raw.get("risks", [])
     if not isinstance(signals, dict) or not isinstance(findings, list) or not isinstance(risks, list):
         raise ResultError("signals must be an object; findings and risks must be lists")
+    facts = _parse_facts(raw.get("facts", []))
     return StepResult(
         status=status,
         summary=nfc(summary),
@@ -162,6 +183,7 @@ def read_result(path: Path, refine: bool = False) -> StepResult:
         signals=nfc(signals),
         findings=nfc(findings),
         risks=nfc(risks),
+        facts=facts,
     )
 
 
@@ -307,14 +329,14 @@ def _title_for(cfg: Config, run: Run) -> str:
 def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questions: list[Question] | tuple = (), extra: str = "") -> Path:
     """Stop the run for a human: write the inbox file, record `hitl_raised`, notify. Returns the inbox path."""
     questions = list(questions)
-    how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).", _how_to_go_on(run, kind, key, bool(questions))]
+    how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).", _how_to_go_on(run, kind, key, bool(questions), cfg)]
     path = run.inbox_path(key)
     render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
     run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
              questions=[asdict(q) for q in questions], inbox=str(path))
-    from agentflow.autonomy import eligible  # the runner tries this stop first; it notifies if it cannot settle it
+    from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
 
-    if not eligible(cfg, kind, key, [asdict(q) for q in questions]):
+    if not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions]):
         notify(cfg, _title_for(cfg, run), summary or f"{key} needs a decision", run=run)
     return path
 
@@ -337,13 +359,21 @@ def park_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, question
     return path
 
 
-def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool) -> str:
+def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config) -> str:
     """The inbox line that says what each way out of this stop does."""
-    reject = f"`agentflow reject {run.id} {key} --note \"...\"` sends the phase back for a refine round."
+    scoped = rejected_scope(run, key.split("/")[0], key)
+    back = f"task {scoped[1]}" if scoped else "the phase"
+    reject = f"`agentflow reject {run.id} {key} --note \"...\"` sends {back} back for a refine round."
     if has_questions:
         return f"Fill in the `Answer:` lines below, or run `agentflow answer {run.id}`."
     if kind in CLEARED_BY_APPROVE:
         return f"`agentflow approve {run.id} {key}` accepts it and the run goes on; {reject}"
+    if kind == "budget_exceeded" and run.state.get("soft_budget_usd") is not None:
+        hard = float(run.state.get("budget_usd") or 0.0)
+        return (f"The run stopped at its hard budget of ${hard:.2f}. `agentflow approve {run.id} {key}` sets the hard "
+                f"budget to the spend so far plus ${cfg.defaults.run_budget_usd:.2f} (one soft budget, "
+                f"`defaults.run_budget_usd`) and goes on, then asks again (add `--budget <usd>` to set the hard budget "
+                f"yourself); {reject}")
     if kind == "budget_exceeded":
         return (f"`agentflow approve {run.id} {key}` goes on with one more budget's worth of spend, then asks again "
                 f"(add `--budget <usd>` to set the limit yourself); {reject}")
@@ -444,7 +474,7 @@ def answer(run: Run, key: str, answers: dict[str, str], by: str, record: bool = 
 
 
 def approve(run: Run, target: str, by: str, budget: float | None = None, hold: bool = False,
-            note: str | None = None) -> bool:
+            note: str | None = None, budget_step: float | None = None) -> bool:
     """Approve a phase (`plan` or `plan_approved`), clear an inner checkpoint, or resume a runner stop.
 
     `hold` rests an approved phase as ready (`phase_ready`) instead of leaving the run to go on, and True is
@@ -452,8 +482,11 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
     A `type: checkpoint` step or a repeat group past `max_rounds` is cleared (`checkpoint_cleared`).
     Any other stop is one the runner raised on an unfinished step (blocked, fix attempts exhausted,
     timeout, ...): `hitl_approved` puts that step back to resumable, so the runner resumes its session
-    and still verifies and commits it. A `budget_exceeded` stop is a request for approval: with no `budget`,
-    the approval allows one more budget's worth of spend, so the run goes on and asks again after that.
+    and still verifies and commits it. A `budget_exceeded` stop (the hard budget) is a request for approval:
+    `budget` sets the hard budget exactly; with none, the hard budget becomes the spend so far plus
+    `budget_step` (the callers pass the pack's `defaults.run_budget_usd`, the soft budget), else plus the
+    run's own soft budget, so the run goes on and asks again after that. The soft budget is left alone. A run
+    started before the soft budget existed allows one more of its one budget's worth, as it always did.
 
     `note` goes to the agent that the approval resumes. A `blocked_repeat` stop needs one: the session already
     blocked again with nothing changed, so a plain approval would only repeat that.
@@ -486,7 +519,13 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
             raise NotWaiting(f"{name!r} is waiting for answers, not an approval; use `agentflow answer {run.id}`")
         if waiting["kind"] == "budget_exceeded" and budget is None:
             spend = float(run.state["spend_usd"] or 0.0)
-            budget = spend + float(run.state["budget_usd"] or spend)
+            soft = run.state.get("soft_budget_usd")
+            if soft is None:  # a run started before the soft budget: one more of its one budget
+                budget = spend + float(run.state["budget_usd"] or spend)
+            else:
+                sound = budget_step is not None and math.isfinite(budget_step) and budget_step > 0
+                step = budget_step if sound else soft
+                budget = spend + float(step)
         if budget is not None:
             run.emit("run_updated", by=by, budget_usd=budget)
         if waiting["kind"] in CLEARED_BY_APPROVE:
@@ -497,25 +536,52 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
         return False
 
 
+def task_scope(phase: str, key: str) -> tuple[str, int] | None:
+    """`("<phase>/<step>/task-<n>", n)` when `key` is a stop inside plan task n of `phase`, else None."""
+    match = re.match(rf"^{re.escape(phase)}/[^/]+/task-(\d+)(?=/|$)", key)
+    return (match.group(0), int(match.group(1))) if match else None
+
+
+def rejected_scope(run: Run, phase: str, key: str) -> tuple[str, int] | None:
+    """`task_scope`, unless the task was one of a batch of several (`plan_batched`): the batch's members before
+    its last were committed without a review of their own, so a stop in the batch sends the whole phase back."""
+    scoped = task_scope(phase, key)
+    if scoped is None:
+        return None
+    prefix = scoped[0].rsplit("/", 1)[0]
+    batched = [e for e in run.events.read() if e["type"] == "plan_batched" and e.get("key") == prefix]
+    batches = (batched[-1].get("batches") or []) if batched else []
+    if any(isinstance(b, list) and len(b) > 1 and scoped[1] in b for b in batches):
+        return None
+    return scoped
+
+
 def reject(run: Run, target: str, by: str, note: str) -> None:
-    """Reject a phase (or the phase an inner checkpoint belongs to): record the note and start a refine round."""
+    """Reject a phase (or the phase an inner checkpoint belongs to): record the note and start a refine round.
+    A stop inside a plan task sends only that task back (`scope`), unless the task was batched with others;
+    any other target refines the whole phase."""
     note = nfc(note).strip()
     if not note:
         raise ValueError("a rejection needs a note")
     with run.locked():
         kind, name = _resolve(run, target)
         phase = name if kind == "phase" else (run.state["waiting"]["phase"] or name.split("/")[0])
-        open_refine(run, phase, by, note, {"key": name} if kind == "checkpoint" else {})
+        scoped = rejected_scope(run, phase, name) if kind == "checkpoint" else None
+        open_refine(run, phase, by, note, {"key": name} if kind == "checkpoint" else {},
+                    scope=scoped[0] if scoped else None)
 
 
-def open_refine(run: Run, phase: str, by: str, note: str, extra: dict | None = None) -> None:
-    """Send `phase` back for a refine round: what a rejection does, and what the runner does with findings."""
+def open_refine(run: Run, phase: str, by: str, note: str, extra: dict | None = None,
+                scope: str | None = None) -> None:
+    """Send `phase` back for a refine round: what a rejection does, and what the runner does with findings.
+    With `scope` (`<phase>/<step>/task-<n>`) only that plan task's steps are refined."""
     note = nfc(note).strip()
     round_ = run.state["phases"].get(phase, {}).get("round", 0) + 1
     note_path = run.refine_note_path(phase, round_)
     note_path.parent.mkdir(parents=True, exist_ok=True)
     note_path.write_text(nfc(f"# Refine round {round_} of {phase}\n\nRejected by {by}.\n\n{note}\n"), encoding="utf-8")
-    run.emit("phase_rejected", by=by, phase=phase, round=round_, note=note, **(extra or {}))
+    scoped = {"scope": scope} if scope else {}
+    run.emit("phase_rejected", by=by, phase=phase, round=round_, note=note, **(extra or {}), **scoped)
 
 
 def remind_due(cfg: Config, repo: Path, now: datetime | None = None) -> list[str]:

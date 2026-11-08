@@ -33,7 +33,7 @@ You stay in charge of three things: answering the questions in `define` and `pla
 | The repo's skills at `.claude/skills/<name>/SKILL.md` | `ls .claude/skills` |
 | A clean working tree on the fork branch (design runs require it) | `git status`, `git branch --show-current` |
 
-Agent runs spend real money. `defaults.run_budget_usd` (25 here) stops a run when its summed cost crosses it. The runner checks before each agent call, so a call already running can go past the budget. Claude's cost is what Claude reports, or an estimate from `agents.claude.prices` for a session that ended without a report (a context rollover, a timeout). Codex steps are recorded as 0, so the budget does not count them.
+Agent runs spend real money, and a run has two budgets. `defaults.run_budget_usd` (25 here) is the soft one: when the run's summed cost crosses it, the runner sends one notification (`budget_soft_reached`) and the run goes on. `defaults.run_budget_hard_usd` (65 by default) is the hard one: crossing it stops the run with `budget_exceeded` for a human's approval. A plain `approve` of that stop sets the hard budget to the spend so far plus one soft budget, and `--budget <usd>` sets it exactly. A feature run's soft budget grows to fit its plan when `build` starts (`defaults.task_budget_usd` per open task), while the hard one never does: if the estimate is above it, you get one notification and the run goes on. A run started before the soft budget existed keeps its one budget, which stops it. The runner checks before each agent call, so a call already running can go past either budget. Claude's cost is what Claude reports, or an estimate from `agents.claude.prices` for a session that ended without a report (a context rollover, a timeout). Codex steps are recorded as 0, so the budget does not count them. The hard budget now defaults to 65, and `validate` refuses a hard budget below the soft one: if you set `run_budget_usd` above 65 (in the pack or the user file), also set `run_budget_hard_usd`, because it must be at least the soft budget.
 
 ## 3. One-time setup
 
@@ -140,6 +140,8 @@ agentflow approve <run> plan          # next phase starts in a fresh session
 agentflow reject  <run> plan --note "Split task 3 into two tasks"   # refine round; note is required
 ```
 
+Rejecting a stop inside one plan task (`build/build/task-2/implement`, `…/review` or `…/commit`) sends only that task back for a refine round; the other tasks keep their commits and start no session. Rejecting the phase still refines every task. In any refine round of `build`, a task whose implementer answers `unchanged` and leaves the tree alone gets no review and no gate run (while the run is in `build`, its card shows `– review task N (unchanged)`).
+
 `approve`, `reject`, `answer` and `retry` record the action and then **continue the run in the foreground**. Add `--detach` to continue in the background, or `--no-continue` to only record. Wherever a command takes `<run>`, any part of the id that matches one run is enough.
 
 On the dashboard, approving `plan` starts `build`, because `build` needs no human. Approving `define` doesn't start `plan`: when the next phase also needs you, the card rests as **ready** in its column, and you choose:
@@ -215,7 +217,7 @@ What differs when Codex is the agent:
 | Skills | loaded natively from `.claude/skills/` | the prompt says to read `.claude/skills/<skill>/SKILL.md`, and `AGENTS.md` at the repo root carries the rules |
 | Tool permissions | `.claude/settings*.json` allow, ask, deny | the `agentflow` profile's sandbox. `.claude/settings.json` does **not** apply to Codex |
 | Effort | `--effort <level>` | `-c model_reasoning_effort=<level>` |
-| Cost in `status` and the budget | recorded, or estimated from `agents.claude.prices` | recorded as 0, so `run_budget_usd` does not stop a Codex-heavy run |
+| Cost in `status` and the budget | recorded, or estimated from `agents.claude.prices` | recorded as 0, so neither budget (`run_budget_usd`, `run_budget_hard_usd`) counts a Codex-heavy run |
 | Resume | `--resume <session>` | `codex exec resume <id>`, with the writable folders passed as `-c sandbox_workspace_write.writable_roots=…` (unverified end to end) |
 | Security review profile | `--agent security-auditor` | not used |
 | Usage limits | waits for the reset time | not detected: a failed call counts as an outage, and it retries until `recovery.give_up_h` |
@@ -269,10 +271,10 @@ Decides open questions in the idea doc. Like every lane it works in its own work
 | Stop | Meaning | Do |
 |---|---|---|
 | `<phase>_approved` | `define` or `plan` finished, or findings in a later phase outlasted the fix rounds | read the handoff, diff and findings, then `approve` or `reject --note`. Approving a later phase ships its open findings |
-| questions in the inbox | the agent cannot settle something from the docs (`needs_human`), or the runner cannot decide a condition (`condition`, a yes or no under the id `answer`) | answer, then the run continues |
+| questions in the inbox | the agent cannot settle something from the docs (`needs_human`) and the runner did not take its recommended answers (a `boundary` question, no single recommended option, a question asked again, or `answer_recommended: false`), or the runner cannot decide a condition (`condition`, a yes or no under the id `answer`) | answer, then the run continues |
 | `fix_attempts_exhausted`, `blocked`, `step_timeout`, `max_rollovers` | the runner gave up on the step | fix the cause, then `approve <run> <step-key>`: the step's session resumes and is still verified and committed. `retry` starts it fresh |
 | `agent_unavailable` | calls kept dying after reaching the model, or an outage outlasted `recovery.give_up_h` | check the step's transcript, then `approve <run> <step-key>`: the step's session resumes |
-| `budget_exceeded` | the summed cost crossed `run_budget_usd` | `approve <run> <step-key> --budget <usd>` with a number above the spend so far |
+| `budget_exceeded` | the summed cost crossed the hard budget, `run_budget_hard_usd` (the soft `run_budget_usd` only notifies) | `approve <run> <step-key>` allows the spend so far plus one soft budget; `--budget <usd>` sets the hard budget to a number above the spend so far |
 | `guard_violation` | a step touched a forbidden path twice (the runner puts the first back), moved `HEAD` or used a user-only skill | undo the change, then `approve <run> <step-key>`: the runner checks the tree again and restarts the step in a fresh session. Approving does not let the change through |
 | `review_unresolved` | blocking review findings remain after the fix round and the resolver | fix by hand if you want, then approve: the reviewer looks once more, then the task commits, with any open finding in the commit body. Only your approval can do that |
 | `ci_failed` | CI still fails after `ci.fix_rounds`, reports no checks, or never settles | read the logs in the inbox, fix the cause, then `approve <run> ship/ci` for fresh rounds |
@@ -288,7 +290,11 @@ Decides open questions in the idea doc. Like every lane it works in its own work
 
 The last two end in an `agent_unavailable` stop. `pause` and `cancel` still work during a hold. If the runner itself dies during a hold, nothing restarts it: run `agentflow resume <run>`.
 
+**Most questions never reach you.** A question's `kind` is `spec_gap`, `ambiguity`, `conflict`, `review_dispute`, `boundary` or `other`, and the agent marks one option of each as recommended. In every phase the runner takes those options itself (`autonomy.answer_recommended`), records them as answered `by: runner`, notifies you with one line, files a `spec_gap` answer in the spec as its own `Decide …` commit, and lists each decision under "Decisions the runner took" in the pull request, so you review them there. A `boundary` question is one the repository's docs reserve for a human (an "ask first" or "never" rule): it is in `autonomy.human_question_kinds`, so it always stops for you, parked or not, and your answer goes in the task's commit body, as an `ambiguity` or `review_dispute` answer does. A question with no single recommended option, or one the step asks again after the runner answered it, also comes to you.
+
 **Parked questions are not stops either.** When a plan task asks a question that later tasks can go on without, the run parks that task and carries on with the tasks that do not depend on it. It stops only when no runnable task remains. `agentflow inbox` lists the task as `parked`, and `agentflow answer <run> --key <step-key>` answers it.
+
+A resolver session may also record what it found. Its result can carry `facts`, short statements that hold for the whole run (for example, a gate that fails for a reason outside the task). The runner keeps each new one as a `run_fact` event, and every later agent session of the run sees them under "What this run already found" in its prompt, so it checks them instead of diagnosing the same thing again.
 
 The runner fixes what a review finds by itself: `plan_fixes` makes the plan, `fix_findings` makes the change and runs its gates, then fresh review sessions check the branch again. If you stop at `review_approved` because findings outlasted those rounds, reject with a note to send it round again.
 
@@ -311,7 +317,8 @@ A module is done when its plan is fully checked and its PR is merged. The queue 
 
 ```bash
 agentflow init [--starter NAME] [--baseline]        # write a sparse pack for this repository (section 13)
-agentflow doctor                                    # agent CLIs and logins, gh, origin, Docker, state dir, gate tools
+agentflow doctor                                    # agent CLIs and logins, gh, origin, Docker, state dir, gate tools,
+                                                    #   and the inherited variables a run drops (names only)
 agentflow validate                                  # after every config edit; 0 warnings
 agentflow config show                               # the pack file as written
 agentflow config show --effective [PREFIX]          # every value after the layers merge, with its layer
@@ -322,8 +329,9 @@ agentflow run <lane> … --dry-run                    # the commands, creates no
 agentflow run <lane> --module X [--from P] [--to P] [--model P=m] [--detach]
 agentflow inbox | status | agents                   # what is waiting, running, spent
 agentflow answer <run> --set q1="…"                 # ids as the inbox shows them; --key for a parked step
-agentflow approve <run> <phase|step-key> [--budget N]
-agentflow reject <run> <phase> --note "…"
+agentflow approve <run> <phase|step-key> [--budget N]   # soft budget notifies, hard budget stops; --budget sets the hard one
+agentflow reject <run> <phase|step-key> --note "…"     # a stop inside a plan task refines only that task
+                                                       #   (`reject <run> <task-stop-key>`); a batched task's stop is rejected phase-level
 agentflow retry <run> <step-key>                    # a fresh session
 agentflow pause | resume | cancel <run>
 agentflow resume <run> --mark-done                  # a ready run: skip to ship, open the draft PR
@@ -347,7 +355,8 @@ agentflow backlog undone <module> [--by NAME]       # remove that hand mark; wit
 
 | Symptom | Cause and fix |
 |---|---|
-| A run fails on a missing tool or a login, or you are setting up a new machine | `agentflow doctor` checks, in order, each enabled agent's CLI and login (`claude auth status`, `codex login status`), `gh auth status` (needs the network), the `origin` remote, Docker (only when a gate runs `docker`), that the state dir is writable, and that each gate's programs are on `PATH` (`defaults.env.PATH` when set). It prints `ok`, `warn` or `fail` with a fix for each, and exits 1 on any `fail`. A gate program that `gate_sets.setup` may install is a warning, not a failure. A broken user file is reported as a `user config` failure and the checks go on without it |
+| A run fails on a missing tool or a login, or you are setting up a new machine | `agentflow doctor` checks, in order, each enabled agent's CLI and login (`claude auth status`, `codex login status`), `gh auth status` (needs the network), the `origin` remote, Docker (only when a gate runs `docker`), that the state dir is writable, the variables a run does not inherit (`inherited environment`, a warning that names them), and that each gate's programs are on `PATH` (`defaults.env.PATH` when set). It prints `ok`, `warn` or `fail` with a fix for each, and exits 1 on any `fail`. A gate program that `gate_sets.setup` may install is a warning, not a failure. A broken user file is reported as a `user config` failure and the checks go on without it |
+| A gate or an agent step fails only inside a run, and passes in your own shell | a variable your shell or IDE loaded from `.env` may have been dropped from the run, or one that leaked in may differ from the pack's. `agentflow doctor` has an `inherited environment` check that names the variables a run drops and the file they match (never their values). To keep one, set it in `defaults.env`. `defaults.env_inherit` (playbook section 14) says what is dropped |
 | `agentflow validate` prints warnings or errors | the message names the YAML path (`phases.build.model`, `phases.define.steps[4].when`). Fix that line and re-run |
 | `run` says the agent command is not found | the preflight checks the `command` of each enabled agent. Install it or fix `agents.<name>.command` |
 | A run shows `held` | a usage limit or an outage. It carries on by itself (section 8); `pause` or `cancel` if you don't want it to |
@@ -358,7 +367,7 @@ agentflow backlog undone <module> [--by NAME]       # remove that hand mark; wit
 | A step ends `blocked` and its events show `permission_denied` | a command is not covered by an `allow` rule. Add the narrowest rule to `.claude/settings.json` (or your `settings.local.json`), then `agentflow approve <run> <step-key>` |
 | `ship` stops with `dirty_tree` | uncommitted files in the worktree: commit or discard, then approve |
 | The queue prints `blocked — could not tell whether … is merged` | `gh` failed. Run `gh auth status` |
-| Codex steps show 0 cost | expected. Codex cost is not reported; set a stricter `run_budget_usd` or watch the Codex dashboard |
+| Codex steps show 0 cost | expected. Codex cost is not reported; set a stricter `run_budget_hard_usd` or watch the Codex dashboard |
 | A run is stuck and nothing helps | `agentflow status <run>` for the step, the run's `events.jsonl` (read-only) for the timeline, `agentflow attach <run>` to look at the session. Last resort: `agentflow cancel <run>` and start again |
 
 ## 13. Using agentflow in another repository
@@ -395,7 +404,7 @@ The pack is the repository's `.agentflow/` directory in the main checkout: `conf
 - `guardrails` (empty lists), `hitl` (empty) and `dashboard` (`127.0.0.1`, port 7788). `gates` and `gate_sets` are empty: a pack names its own gates.
 - **The workflow:** `lanes` (`feature`, `bug`), `phases`, `conditions`, `record_step`, `resolve_step`, `phase_approval`, `checkpoints`, `autonomy`, `ci` and `skills`. Every step's skill is a `@skills.map.<key>` reference to one of the bundled skills, and its text is the step's brief. A pack that writes `phases:` with `steps` writes the whole workflow (and `lanes`), and the defaults' workflow is dropped. A pack that writes only a phase's `needs_approval`, `resolve`, `model` or `agent` adjusts the defaults' workflow.
 
-The user file holds personal settings only: `agents.<name>.models` for an agent a lower layer defines, `defaults.run_budget_usd`, `defaults.task_budget_usd`, `hitl.notify`, `hitl.remind_after_h` and `dashboard.port`. Any other key, a key that is not text, or a file that is not a mapping is an error naming the file and the key. Nothing in it can set a command, a gate, a guardrail or the workflow.
+The user file holds personal settings only: `agents.<name>.models` for an agent a lower layer defines, `defaults.run_budget_usd`, `defaults.run_budget_hard_usd`, `defaults.task_budget_usd`, `hitl.notify`, `hitl.remind_after_h` and `dashboard.port`. Any other key, a key that is not text, or a file that is not a mapping is an error naming the file and the key. Nothing in it can set a command, a gate, a guardrail or the workflow.
 
 `agentflow config show --effective [PREFIX]` prints every value with the layer it came from. The Settings page shows the same values, marks one that is not the pack's with `from engine`, `from starter:<name>` or `from user`, and saves into the pack only what the pack must state: for a mapping, the entries that differ from the layers below it or that the pack already states (an inherited entry is removed with `<name>: null` in the YAML tab). A value your user file sets is read-only on the page, so a personal value never lands in the committed pack.
 
@@ -416,7 +425,11 @@ A live run sees a change to any layer file between its phases: the runner takes 
   - `specs` takes no `path`: the directory is `project.docs.specs`, and each file there whose name fits `project.docs.spec_file` is one module. Its dependencies come from the `Depends on:` lines before the spec's first `## ` heading (`**Depends on:** a, b`, `- Depends on: a`), with the bullets or comma list that follow one ending in `,` or nothing; only `none`, `none.` or `none (…)` means none, and an unknown dependency blocks. A `Depends on:` with no value blocks too, as does a spec over 8 KB with no `## ` heading in its first 8 KB, since its header may go on past what is read. Under the bare `{module}.md`, `index`, `readme`, `template` and `changelog` are not modules. A name that is not a lowercase slug, a symlink, a directory and an unreadable file are skipped and shown on the Backlog. `{capability_map}` is empty, a new module is a new spec (no row is written), and `agentflow queue` needs `--include-specs`. `validate` reports a `path`, a `project.docs.specs` that is not a directory inside the repository, and a missing `dashboard.backlog.module_lane`.
 - `skills`: `skills.map` names the skill `agentflow next` suggests for each kind of next step: `decide`, `define`, `design_doc`, `plan`, `build`, `build_small`, `verify`, `ship`, `review`, `debug` and `review_feedback`. Another key is an error. `review` and `debug` name the skill for a review and for a bug fix, and `review_feedback` the skill sent with blocking per-task findings. Each must be a skill in `project.skills_dir` or one of the engine's bundled skills (a name that is not a skill name is an error). Optional: a step with no entry is named by its stage (`Build stage`). Protected.
 - `agents.<name>`: the command line and arguments of an agent CLI, its models, `max_turns` and prices. Protected, except `enabled`, `models`, `max_turns` and `prices`.
-- `defaults`: the default agent, timeouts, `fix_attempts` and budgets. Not protected, except `defaults.env`.
+- `defaults`: the default agent, timeouts, `fix_attempts` and budgets. Not protected, except `defaults.env` and `defaults.env_inherit`.
+- `defaults.run_budget_usd`: the soft budget in USD, 25 by default, recorded when a run starts (`soft_budget_usd`). Crossing it sends one notification (`budget_soft_reached`, once per soft value) and never stops the run. A plain approve of a `budget_exceeded` stop adds this much to the spend so far as the new hard budget. A finite number above 0, or `validate` refuses it. If you set it above 65, also set `run_budget_hard_usd`, because that must be at least this. Not protected; the user file may set it.
+- `defaults.run_budget_hard_usd`: the hard budget in USD, 65 by default, recorded when a run starts (`budget_usd`). Crossing it stops the run with `budget_exceeded` for a human's approval; it is the only budget stop. A finite number above 0 and at least `run_budget_usd`, or `validate` refuses it (so a `run_budget_usd` above this default needs its own `run_budget_hard_usd`). Plan sizing never raises it. Not protected; the user file may set it.
+- `defaults.task_budget_usd`: USD per open plan task, 2 by default; 0 turns sizing off. When a feature run's `build` starts, the soft budget grows once to the spend so far plus this for each unticked task plus a quarter of `run_budget_usd` (`budget_scaled`, with `soft: true`). It never lowers a budget, never raises the hard one, and a budget a human set is kept; an estimate above the hard budget sends one notification (`budget_estimate_over_hard`) and the run goes on. Negative is a `validate` error. Not protected; the user file may set it.
+- `defaults.env_inherit`: which variables of the process that started agentflow a run's agent sessions and gates do not inherit. `drop` is a list of variable names or `fnmatch` globs (`*_URL`), empty by default. `drop_dotenv` is a list of repository-relative files, `[".env"]` by default, with no leading `/` and no `..`: a variable with the same name **and** the same value as a line of such a file in the main checkout was almost certainly loaded by an IDE or shell and is dropped, while one with another value is kept because you set it on purpose. `validate` refuses a bad glob or path. `defaults.env` always wins over a drop, and `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_*` and `TERM` are never dropped. The dotenv files are read without following a symlink, up to 256 KB. A run records the dropped names (never a value) as an `env_dropped` event, again only when the set changes on a resume. Protected, so the Settings page and the user file cannot change it.
 - `recovery`: how long an outage may last and how many failed attempts a step gets. Not protected.
 - `effort`: the level a session starts at and the levels an agent may pick. Not protected.
 - `context`: auto-compact, rollover and the context window. Not protected, except `context.autocompact_env` and `context.progress_file`.
@@ -431,6 +444,8 @@ A live run sees a change to any layer file between its phases: the runner takes 
 - `lanes`: the kinds of work. Not protected. When it includes `bug` and `.claude/settings*.json` in the main checkout holds no `Bash(...)` allow rule at all, `validate` warns at `lanes`: the bug lane's red/green check runs the regression test only when a Bash allow rule covers it, whatever `permission_mode` says. Add a narrow rule such as `Bash(<verify gate's program> *)`.
 - `record_step`, `resolve_step`: the steps that file a spec-gap answer and resolve a stop. Protected.
 - `autonomy`: what the runner decides by itself. Not protected.
+- `autonomy.answer_recommended`: `true` (the default) lets the runner take a `needs_human` result's recommended answers in **every** phase, `resolve: true` or not, parked or not, when each question has exactly one recommended option and none has a kind in `human_question_kinds`. It records them as `hitl_answered` with `by: runner`, notifies one line ("took the recommended answer(s) q1=A in plan/plan; the decision is recorded"), files a `spec_gap` answer in the spec through `record_step` as a human's answer is, and lists each one under "Decisions the runner took" in the pull request. A step that asks a question the runner already answered on it goes to a human. `false` sends every question to a human. A value that is not a bool is a `validate` error. Not protected.
+- `autonomy.human_question_kinds`: the question kinds only a human answers, `[boundary]` by default (`boundary`: the repository's docs reserve the decision for a human, such as an "ask first" or "never" rule). One such question makes its whole set a human's in any phase, parked or not. `[]` lets the runner answer every kind. A list of the kinds `spec_gap`, `ambiguity`, `conflict`, `review_dispute`, `boundary` and `other`, or `validate` refuses it. Not protected.
 - `ci`: polling and fix rounds of the `ci` step. Not protected.
 - `phases.<name>`: the workflow. Protected, except `needs_approval`, `resolve`, `model` and `agent`.
 - `phase_approval`: the refine prompt and what an approval page shows. Protected.

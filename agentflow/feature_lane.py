@@ -25,6 +25,12 @@ fresh session over the refine diff (from the task's previous commit),
 with blocking findings, the fix round and `review_unresolved` as above counted within the round, and
 the task is committed on top as `Refine Task N: <title>` with the note in the body. A reviewer cannot
 answer `unchanged`. A task parked in the round holds back only the tasks that depend on it.
+A rejected stop inside one task (`refine.scope`, `<step>/task-<n>`) refines only that task: the other
+committed tasks are passed over as if committed in the round, unless a step of theirs still waits on an
+earlier round's refine. A stop inside a batch of several tasks refines the whole phase. An implementer
+that answers `unchanged`, leaves the tree as its round started, and started from the task's committed
+work gets no review (`review_skipped`) and no gate run: the task is recorded as committed in the round
+with no commit (`sha: null`).
 
 A small plan has no per-task review. A `needs_human` result with `can_continue_without` (and
 `hitl.park_independent`) parks the task: the question is asked without stopping, and tasks that do
@@ -35,7 +41,8 @@ so a resumed run picks every task up where it stopped.
 
 `record_decisions` runs before an answered step resumes: an answer to a `spec_gap` question (or one
 given with `--record`) runs `record_step` and commits its `message` (default `Decide <question> in the
-<module> spec`) with only the files that step changed. `ambiguity`/`review_dispute` answers go in the task's commit body.
+<module> spec`) with only the files that step changed. `ambiguity`/`review_dispute`/`boundary` answers go in the task's
+commit body. The pull request lists every answer the runner took itself (`by: runner`) under "Decisions the runner took".
 
 `run_finish` first brings the latest `origin/<fork_from>` into the branch (`sync_lane`), then refuses
 uncommitted changes, pushes the branch (never forced) and opens a draft pull request against `fork_from` whose
@@ -68,7 +75,7 @@ from agentflow.gitops import (
     push,
 )
 from agentflow.guards import changed_paths, snapshot
-from agentflow.hitl import ResultError, notify_run, raise_hitl, read_result
+from agentflow.hitl import ResultError, clean_fact, notify_run, raise_hitl, read_result
 
 if TYPE_CHECKING:
     from agentflow.state import Run
@@ -79,7 +86,8 @@ TASK_KEY = re.compile(r"/task-\d+/(implement|review)$")
 TASK_N = re.compile(r"/task-(\d+)/")
 DONE_STATUSES = ("done", "unchanged")
 SUMMARY_MAX = 60
-DEFAULT_RECORD = {"spec_gap": "record_step", "ambiguity": "commit_body", "review_dispute": "commit_body"}
+DEFAULT_RECORD = {"spec_gap": "record_step", "ambiguity": "commit_body", "review_dispute": "commit_body",
+                  "boundary": "commit_body"}
 
 
 def question_summary(text: str, limit: int = SUMMARY_MAX) -> str:
@@ -168,9 +176,11 @@ class FeatureLane:
                 return "stopped"
 
     def _scale_budget(self, plan: Path) -> None:
-        """Once per run, raise the budget to fit the plan: `task_budget_usd` per unticked task on top of the
-        spend so far, plus a quarter of `run_budget_usd` for verify, review and ship. It never lowers the
-        budget, and a budget a human set stays as they set it."""
+        """Once per run, raise the soft budget to fit the plan: `task_budget_usd` per unticked task on top of
+        the spend so far, plus a quarter of `run_budget_usd` for verify, review and ship. It never lowers the
+        budget, never raises the hard one (an estimate above it notifies once, and the run goes on), and a
+        budget a human set stays as they set it. A run started before the soft budget (no `soft_budget_usd`)
+        raises its one budget, as it always did."""
         per_task = float(self.cfg.defaults.task_budget_usd)
         if per_task <= 0:
             return
@@ -183,13 +193,27 @@ class FeatureLane:
         unticked = sum(1 for task in sources.parse_plan(plan) if task.open)
         state = self.run.state
         spend = float(state.get("spend_usd") or 0.0)
-        current = float(state.get("budget_usd") or self.cfg.defaults.run_budget_usd)
         target = round(spend + per_task * unticked + 0.25 * self.cfg.defaults.run_budget_usd, 2)
+        soft = state.get("soft_budget_usd")
+        if soft is None:
+            current = float(state.get("budget_usd") or self.cfg.defaults.run_budget_usd)
+            raised = target > current
+            if raised:
+                self.run.emit("run_updated", budget_usd=target)
+            self.run.emit("budget_scaled", budget_usd=max(target, current), previous=current, tasks=unticked,
+                          per_task=per_task, raised=raised)
+            return
+        current = float(soft)
         raised = target > current
         if raised:
-            self.run.emit("run_updated", budget_usd=target)
+            self.run.emit("run_updated", soft_budget_usd=target)
         self.run.emit("budget_scaled", budget_usd=max(target, current), previous=current, tasks=unticked,
-                      per_task=per_task, raised=raised)
+                      per_task=per_task, raised=raised, soft=True)
+        hard = state.get("budget_usd")
+        if hard and target > float(hard):
+            self.run.emit("budget_estimate_over_hard", estimate=target, hard=float(hard))
+            notify_run(self.cfg, self.run, f"the plan's estimate ${target:.2f} is above the hard budget "
+                                           f"${float(hard):.2f}; the run goes on and stops there for approval")
 
     def _needs_human_files(self, plan: Path, prefix: str) -> bool:
         """Stop before the first task when an open task names a forbidden path: the guards would fail that task
@@ -228,7 +252,7 @@ class FeatureLane:
             if not task.open and impl_key not in self.run.state["steps"]:
                 continue
             if self._committed(tkey):
-                if refine and not self._committed(tkey, refine):
+                if refine and not self._committed(tkey, refine) and self._sent_back(tkey):
                     if self._parked(tkey) or any(dep in held for dep in task.depends_on):
                         held.add(task.n)
                         continue
@@ -300,6 +324,32 @@ class FeatureLane:
                 return events[index + 1 :]
         return events
 
+    def _sent_back(self, tkey: str) -> bool:
+        """Whether this refine round refines committed task `tkey`: every task in a phase-level round. A round
+        scoped to one task (a rejected stop inside it) passes over the others as if already committed in the
+        round, unless a step of theirs still waits on an earlier round's refine (`refine_pending`)."""
+        scope = (self.run.state.get("refine") or {}).get("scope")
+        if not scope or tkey == scope:
+            return True
+        steps = self.run.state["steps"]  # the task's own steps only: a resolver's row (`…/resolve-N`) is never settled
+        return any((steps.get(f"{tkey}/{part}") or {}).get("status") == "refine_pending"
+                   for part in ("implement", "review", "commit"))
+
+    def _changed_nothing(self, tkey: str) -> bool:
+        """The implementer answered `unchanged`, the tree is the one its last `step_started` recorded, and that
+        tree held nothing uncommitted of this task's (an earlier round's edits left by a stop are still to review)."""
+        impl_key = f"{tkey}/implement"
+        if (self.run.state["steps"].get(impl_key) or {}).get("status") != "unchanged":
+            return False
+        started = [e for e in self.run.events.read() if e["type"] == "step_started" and e.get("key") == impl_key]
+        if not started:
+            return False
+        start_tree, start_head = str(started[-1].get("start_tree") or ""), str(started[-1].get("start_head") or "")
+        if not start_tree or not start_head or start_tree != snapshot(self.worktree):
+            return False
+        held = self._held_paths(tkey)  # other parked tasks' files are theirs, not this task's
+        return not [p for p in changed_paths(self.worktree, f"{start_head}^{{tree}}", start_tree) if p not in held]
+
     def _committed(self, tkey: str, round_: int = 0) -> bool:
         return any(e["type"] == "task_committed" and e.get("key") == tkey and int(e.get("round") or 0) == round_
                    for e in self.run.events.read())
@@ -368,7 +418,16 @@ class FeatureLane:
         open_findings: list[dict] = []
         review = step.review if not small.get("active") or small.get("review") else None
         last = not batch or task.n == batch[-1].n
+        if round_ and self._changed_nothing(tkey):  # nothing to review or gate: the tree passed before
+            review_key = f"{tkey}/review"
+            if review is not None and not any(e["type"] == "review_skipped" and e.get("key") == review_key
+                                              for e in self._round_events(phase)):
+                self.run.emit("review_skipped", key=review_key, reason="unchanged", round=round_)
+            return self._commit_task(plan, task, tkey, [], round_, gates=None, phase=phase)
         if review is not None and last:
+            if (self.run.state["steps"].get(f"{tkey}/review") or {}).get("status") == "skipped":
+                # skipped earlier in the round, but the tree changed since (a human edited at a stop): review it
+                self.run.emit("step_retry", key=f"{tkey}/review", reason="the tree changed since the review was skipped")
             start = None
             rextra = extra
             if batch and len(batch) > 1:
@@ -611,7 +670,7 @@ class FeatureLane:
         return {**DEFAULT_RECORD, **(self.cfg.hitl.get("record_decisions") or {})}
 
     def _body_answers(self, tkey: str) -> list[str]:
-        """Answers to the task's questions whose kind goes in the commit body (`ambiguity`, `review_dispute`)."""
+        """Answers to the task's questions whose kind goes in the commit body (`ambiguity`, `review_dispute`, `boundary`)."""
         mode = self._record_mode()
         events = self.run.events.read()
         lines = []
@@ -805,7 +864,9 @@ def _skipped_lines(state: dict) -> list[str]:
 
 
 def _runner_decisions(events: list[dict]) -> list[str]:
-    """Every question the runner answered with the asker's recommended option."""
+    """Every question the runner answered with the asker's recommended option: step key, question id, option, so a
+    reviewer of the pull request checks each one. The question, its id, the option and its label are model text, so
+    each is one clean line (`clean_fact`): a newline cannot break the list and a bidi override cannot reorder it."""
     lines = []
     for event in events:
         if event["type"] != "hitl_answered" or event.get("by") != AUTO_BY:
@@ -814,8 +875,9 @@ def _runner_decisions(events: list[dict]) -> list[str]:
         for question in _questions_for(events, event):
             option = chosen.get(question["id"])
             labels = [o.get("label") for o in question.get("options") or [] if o.get("key") == option]
-            text = " ".join(str(question.get("question", "")).split())
-            lines.append(f"- `{event.get('key')}`: {text} → {labels[0] if labels else option}")
+            qid, text = clean_fact(str(question["id"])), clean_fact(str(question.get("question", "")))
+            label = clean_fact(str(labels[0] if labels else option))
+            lines.append(f"- `{event.get('key')}` {qid} (option {clean_fact(str(option))}): {text} → {label}")
     return lines
 
 
@@ -859,8 +921,11 @@ def render_pr_body(run: Run, plan: str | None = None) -> str:
     branch = state.get("branch") or "?"
     plan = plan or str((state.get("params") or {}).get("plan") or "")
     spend = float(state.get("spend_usd") or 0.0)
-    budget = state.get("budget_usd")
-    spend_line = f"Spend: ${spend:.2f}" + (f" of ${float(budget):.2f} budget" if budget else " (no budget set)")
+    budget, soft = state.get("budget_usd"), state.get("soft_budget_usd")
+    if budget and soft:
+        spend_line = f"Spend: ${spend:.2f} of ${float(soft):.2f} soft · ${float(budget):.2f} hard budget"
+    else:
+        spend_line = f"Spend: ${spend:.2f}" + (f" of ${float(budget):.2f} budget" if budget else " (no budget set)")
     efforts = [f"- `{c.get('key')}`: {c.get('from')} → {c.get('to')} ({c.get('reason') or 'no reason given'})"
                for c in state.get("effort_changes", [])]
     footers = [f"- after `{m.get('phase')}`: the skill footer named `{m.get('got')}`, the route went to "

@@ -329,6 +329,8 @@ function ago(seconds) {
 }
 
 const money = (value) => (typeof value === "number" ? "$" + value.toFixed(2) : "-");
+// " / soft · hard" for a run with a soft budget, " / budget" for one started before it, "" for none.
+const limits = (soft, hard) => (hard ? " / " + (soft ? money(soft) + " · " : "") + money(hard) : "");
 const arrow = (direction) => (direction === "up" ? " ↑" : direction === "down" ? " ↓" : "");
 
 // ------------------------------------------------------------------ board
@@ -413,14 +415,17 @@ function cardNode(card) {
   const where = card.task ? "Task " + card.task + " ▸ " + (card.step || "").split("/").pop() : (card.step || "not started");
   const gates = el("div", { class: "sub" }, card.gates.map((g) =>
     el("span", { class: g.skipped ? "gate-skip" : g.passed ? "gate-ok" : "gate-bad", text: (g.skipped ? "– " : g.passed ? "✓ " : "✗ ") + g.gate + " " })));
+  // A refine round's implementer changed nothing, so its task was not reviewed again.
+  const skips = (card.review_skipped || []).map((r) => el("span", { class: "gate-skip", title: "review skipped: " + r.reason, text: "– review task " + r.task + " (" + r.reason + ") " }));
   const node = el("article", { class: "card " + card.status, tabindex: "0", role: "button", draggable: card.ready ? "true" : null, onclick: () => openDrawer(card.run_id) },
     el("div", { class: "title", text: card.module }),
     el("div", { class: "sub", text: where }),
     el("span", { class: "badge", text: card.badge }),
     card.refine_round ? el("span", { class: "badge", text: "refine " + card.refine_round }) : null,
     agent,
-    el("div", { class: "sub", text: "ctx " + (typeof card.context_pct === "number" ? Math.round(card.context_pct) + "%" : "-") + " · " + money(card.spend) + (card.budget ? " / " + money(card.budget) : "") }),
+    el("div", { class: "sub", text: "ctx " + (typeof card.context_pct === "number" ? Math.round(card.context_pct) + "%" : "-") + " · " + money(card.spend) + limits(card.soft_budget, card.budget) }),
     card.gates.length ? gates : null,
+    skips.length ? el("div", { class: "sub" }, skips) : null,
     el("div", { class: "sub", text: "in phase " + ago(card.time_in_phase_s) + " · total " + dur(card.wall_s) }),
     card.pr_link ? prNode(card) : null,
     card.ready ? movesNode(card) : null);
@@ -551,7 +556,7 @@ function renderBoard(data) {
   const counts = Object.entries(data.counts).map(([k, v]) => k.replace("_", " ") + " " + v).join(" · ") || "no runs";
   const byModel = Object.entries(data.agents_running.by_model).map(([k, v]) => k + " " + v).join(" · ");
   $("summary").textContent = counts + " | agents running " + data.agents_running.total + (byModel ? " (" + byModel + ")" : "") +
-    " | today " + money(data.spend_today) + " (budget per run " + money(data.run_budget_usd) + ")";
+    " | today " + money(data.spend_today) + " (budget per run: soft " + money(data.run_budget_usd) + " · hard " + money(data.run_budget_hard_usd) + ")";
   const columns = data.columns.map((name) => {
     const cards = name === "Backlog" ? [] : data.cards.filter((c) => c.column === name);
     const col = el("div", { class: "col" }, el("h2", {}, el("span", { text: name }), el("span", { text: String(name === "Backlog" ? data.backlog.length : cards.length) })));
@@ -689,7 +694,7 @@ async function openDrawer(runId) {
   const records = Object.entries(st.steps || {}).map(([key, row]) => key + "  " + row.status + (row.skip_reason ? "  (" + row.skip_reason + ")" : "") + (row.result ? "  — " + row.result : ""));
   const gates = detail.gates.map((g) => (g.skipped ? "– " : g.passed ? "✓ " : "✗ ") + g.key + " " + g.gate + (g.log_tail ? "\n" + g.log_tail : "")).join("\n\n");
   const facts = [["status", detail.status], ["work", workLabel(st.pipeline)], ["phase", st.phase], ["step", st.step],
-    ["branch", st.branch], ["worktree", st.worktree], ["pull request", st.pr_url], ["spend", money(st.spend_usd) + (st.budget_usd ? " / " + money(st.budget_usd) : "")],
+    ["branch", st.branch], ["worktree", st.worktree], ["pull request", st.pr_url], ["spend", money(st.spend_usd) + limits(st.soft_budget_usd, st.budget_usd)],
     ["refine", st.refine ? "round " + st.refine.round + ": " + st.refine.note : null], ["failure", st.failure]]
     .filter(([, v]) => v).map(([k, v]) => el("div", {}, el("span", { class: "muted", text: k + ": " }), String(v)));
   drawer.replaceChildren(
@@ -1012,7 +1017,7 @@ function renderMetrics() {
       el("td", { text: r.started_on || "-" }), el("td", { text: r.module }), el("td", { text: workLabel(r.lane) }),
       el("td", { text: r.status + (r.archived ? " (archived)" : "") + (m.stalled ? " · stalled" : "") }),
       el("td", { class: "num", text: dur(m.wall_s) }), el("td", { class: "stack-cell" }, stackNode(m.buckets, m.wall_s / widest)),
-      el("td", { class: "num", text: cost(m.cost_usd, m.cost_estimated) + (r.budget ? " / " + money(r.budget) : "") }),
+      el("td", { class: "num", text: cost(m.cost_usd, m.cost_estimated) + limits(r.soft_budget, r.budget) }),
       el("td", { class: "wrap" }, runPhaseChips(m)));
   }), [4, 6]));
   const stepHead = ["Run", "Step", "Time", "Cost", "Calls", "Review rounds", "Fixes", "Model · effort"];

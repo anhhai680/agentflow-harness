@@ -369,7 +369,9 @@ def test_rollover_with_a_done_result_is_done(flow_repo):
     # The fake writes `result` after its usage turns (too late), so write the file first to model
     # the over-threshold turn being followed directly by the result event.
     early = str(run.agent_result_path(KEY))  # where the agent writes it: its workspace, in the state dir
-    flow_repo.script({KEY: [{"write": {early: '{"status": "done", "summary": "early"}'}, "usage_pct": [81]}]})
+    # The fake lingers after its last line, so only the adapter's SIGTERM ends it: without the sleep it
+    # can exit 0 by itself before the signal arrives, and the exit code below would be a race.
+    flow_repo.script({KEY: [{"write": {early: '{"status": "done", "summary": "early"}'}, "usage_pct": [81], "sleep": 30}]})
     assert run_step(flow_repo) == "done"
     assert len(flow_repo.calls()) == 1
     assert flow_repo.events(run, "agent_exited")[0]["exit_code"] != 0  # the adapter did end the session
@@ -377,12 +379,29 @@ def test_rollover_with_a_done_result_is_done(flow_repo):
 
 
 def test_budget_exceeded_stops(flow_repo):
-    flow_repo.configure({"defaults": {"run_budget_usd": 0.015}})
+    flow_repo.configure({"defaults": {"run_budget_usd": 0.015, "run_budget_hard_usd": 0.015}})
     run = flow_repo.new_run()
     assert run_step(flow_repo, make_step(gates=["fail"], fix_loop=True)) == "stopped"
     assert len(flow_repo.calls()) == 2
     assert hitl_kinds(flow_repo, run) == ["budget_exceeded"]
     assert run.state["spend_usd"] == pytest.approx(0.02)
+    assert "hard budget" in run.state["waiting"]["summary"]
+
+
+def test_the_soft_budget_only_notifies(flow_repo, monkeypatch):
+    sent = []
+    monkeypatch.setattr(lanes, "notify_run", lambda cfg, run, message: sent.append(message))
+    flow_repo.configure({"defaults": {"run_budget_usd": 0.015, "run_budget_hard_usd": 1}})
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"result_raw": "not json", "cost": 0.02}, {"result": DONE}, {"result": DONE}]})
+    assert run_step(flow_repo) == "done"
+    assert len(flow_repo.calls()) >= 2  # the spend crossed the soft limit before a later call
+    [soft] = flow_repo.events(run, "budget_soft_reached")
+    assert soft["soft_usd"] == 0.015 and soft["hard_usd"] == 1 and soft["spend_usd"] >= 0.015
+    assert len([m for m in sent if "soft budget" in m]) == 1
+    assert "stops at $1.00" in sent[0]  # names the hard limit that does stop it
+    assert hitl_kinds(flow_repo, run) == [] and run.state["waiting"] is None
+    assert run.state["steps"][KEY]["status"] == "done"
 
 
 def test_timeout_escalates(flow_repo, monkeypatch):
@@ -1035,3 +1054,40 @@ def test_engine_prompts_inline_the_bundled_skills_over_a_sparse_pack(sparse_repo
             assert "## The `` skill" not in text, step.id
             assert not [p for p in ("{skill}", "{brief}", "{base_ref}") if p in text], step.id
     assert seen >= 5
+
+
+# --------------------------------------------------------------------------- what the run already found
+
+
+def _prompt(flow_repo, sized: bool = False) -> str:
+    run = flow_repo.run if flow_repo.run is not None else flow_repo.new_run()
+    ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
+    return build_prompt(flow_repo.cfg, make_step(), ctx, {"sized": sized, "agent": "claude", "role": "build"}, {}, "normal")
+
+
+def test_without_facts_the_prompt_has_no_heading_and_no_stray_blank_lines(flow_repo):
+    flow_repo.new_run()
+    prompt = _prompt(flow_repo)
+    assert "What this run already found" not in prompt and "{run_facts}" not in prompt
+    assert "\n\n\n" not in prompt.split("## The step")[0]  # (the skill's own text further down has some)
+    # the last bullet of the preamble's shell rules runs straight into the step's own text, one blank line between
+    assert re.search(r"stop as `blocked` and name the exact command\.\n\n## The step\n\n", prompt)
+
+
+def test_a_run_with_no_facts_key_in_its_state_builds_the_same_prompt(flow_repo):
+    run = flow_repo.new_run()
+    plain = _prompt(flow_repo)
+    del run.state["facts"]  # a state written before facts existed
+    assert _prompt(flow_repo) == plain
+
+
+def test_facts_go_into_the_preamble_before_the_step(flow_repo):
+    run = flow_repo.new_run()
+    plain = _prompt(flow_repo)
+    run.emit("run_fact", text="a tool quirk {step_id}", key="build/x/resolve-1")
+    run.emit("run_fact", text="an environment cause", key="build/x/resolve-1")
+    prompt = _prompt(flow_repo)
+    block = ("## What this run already found\n\nEarlier sessions of this run established these. Check one before "
+             "relying on it; do not diagnose it again.\n\n- a tool quirk {step_id}\n- an environment cause\n\n## The step")
+    assert block in prompt  # braces in a fact go in verbatim
+    assert prompt.replace(block, "## The step") == plain

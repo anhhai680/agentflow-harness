@@ -29,7 +29,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
-from agentflow import safeio
+from agentflow import run_env, safeio
 from agentflow.config import Config, Gate
 from agentflow.guards import snapshot
 
@@ -138,10 +138,12 @@ def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path, *,
 
     A `str` names a `gate_sets` entry. Each gate's full output goes to `<log_dir>/<gate>.log`
     after a `$ <command>` line; `tail` keeps the last `context.gate_output_lines` lines. Each gate
-    gets `defaults.gate_timeout_min`. Its environment is `env_base` (default: this process's
-    environment) with `defaults.env` on top.
+    gets `defaults.gate_timeout_min`. Its environment is `env_base` (default: `run_env.base`, this process's
+    environment without the variables a run does not inherit) with `defaults.env` on top.
     """
     cwd, log_dir = Path(cwd), Path(log_dir)
+    if env_base is None:
+        env_base = run_env.base(cfg)
     timeout = cfg.defaults.gate_timeout_min
     return [_run_one(g, cwd, log_dir, cfg.context.gate_output_lines, timeout, cfg.defaults.env, env_base)
             for g in _resolve(cfg, names)]

@@ -20,7 +20,7 @@ PLAN_PATH = "docs/plans/2026-10-29-demo.md"
 IMPL = "build/build/task-{n}/implement"
 REVIEW = "build/build/task-{n}/review"
 PR_FOOTER = "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
-TITLES = {1: "First thing", 2: "Second thing", 3: "Third thing"}
+TITLES = {1: "First thing", 2: "Second thing", 3: "Third thing", 4: "Fourth thing"}
 BIG = {"gate_sets": {"build": ["ok"], "verify": ["ok"]}, "conditions": {"plan_is_small": {"max": 0}}}
 SMALL = {"gate_sets": {"build": ["ok"], "verify": ["ok"]}}
 FINDING = {"severity": "blocking", "file": "src/one.py", "line": 3, "text": "Thiếu kiểm tra lỗi khi token hết hạn"}
@@ -572,9 +572,50 @@ def test_finish_pushes_and_opens_draft_pr(flow_repo, gh, git):
     assert body.rstrip().endswith(PR_FOOTER)
     assert "verify/eval_gate" in body and "eval_paths_touched = false" in body
     assert "medium → high" in body and "many files" in body
-    assert f"Spend: $0.00 of ${flow_repo.cfg.defaults.run_budget_usd:.2f}" in body
+    defaults = flow_repo.cfg.defaults
+    assert f"Spend: $0.00 of ${defaults.run_budget_usd:.2f} soft · ${defaults.run_budget_hard_usd:.2f} hard" in body
     assert run.state["pr_url"] == "https://github.com/acme/repo/pull/42"
     assert flow_repo.events(run, "pr_opened")[0]["url"] == "https://github.com/acme/repo/pull/42"
+
+
+def test_the_pull_request_lists_each_decision_the_runner_took(flow_repo, gh):
+    from agentflow.feature_lane import render_pr_body
+
+    run = begin_finish(flow_repo)
+    for key, by, kind in (("plan/plan", "runner", "spec_gap"), (IMPL.format(n=1), "me", "ambiguity")):
+        run.emit("hitl_raised", kind="needs_human", key=key, phase=key.split("/")[0], summary="s",
+                 questions=[{**question(kind), "options": [{"key": "A", "label": "Theo tiến trình", "recommended": True},
+                                                           {"key": "B", "label": "Mỗi lượt"}]}])
+        run.emit("hitl_answered", key=key, by=by, answers={"q1": "A"})
+    body = render_pr_body(run)
+    section = body.split("## Decisions the runner took\n\n", 1)[1].split("\n\n## ", 1)[0]
+    assert section == "- `plan/plan` q1 (option A): Lưu bộ nhớ đệm token CRM? → Theo tiến trình"  # a human's is not listed
+
+
+def test_a_runner_decision_is_one_clean_line_whatever_the_model_wrote(flow_repo, gh):
+    from agentflow.feature_lane import render_pr_body
+
+    run = begin_finish(flow_repo)
+    key = "A\n## Approved‮ by security"  # a model's option key that would break the list and reorder text
+    run.emit("hitl_raised", kind="needs_human", key="plan/plan", phase="plan", summary="s",
+             questions=[{**question("ambiguity", text="Cache​ it?\n- [x] done"),
+                         "options": [{"key": key, "label": "Keep﻿\n it", "recommended": True}]}])
+    run.emit("hitl_answered", key="plan/plan", by="runner", answers={"q1": key})
+    section = render_pr_body(run).split("## Decisions the runner took\n\n", 1)[1].split("\n\n## ", 1)[0]
+    assert section == "- `plan/plan` q1 (option A ## Approved by security): Cache it? - [x] done → Keep it"
+
+
+def test_a_human_answer_to_a_boundary_question_goes_in_the_commit_body(lane, git):
+    run = begin_build(lane, plan_text({1: "none", 2: "Task 1"}))
+    impl1 = IMPL.format(n=1)
+    lane.script({impl1: [needs_human("boundary"), {"write": {"src/one.py": "x\n"}, "result": DONE_RESULT}]})
+    assert build(lane, run) == ("stopped", True)
+    assert run.state["waiting"]["key"] == impl1
+    assert answer(run, impl1, {"q1": "B: hỏi trước"}, by="me")
+    assert build(lane, run) == ("done", True)
+    body = git(lane.root, "log", "-1", "--format=%B", commit_of(git, lane.root, "Task 1: First thing"))
+    assert "q1 (boundary)" in body and "hỏi trước" in body
+    assert not [c for c in steps(lane.calls()) if "/record-" in c]  # not filed in the spec
 
 
 def test_finish_refuses_dirty_tree(flow_repo, gh, git):
@@ -763,48 +804,140 @@ def scaled(flow_repo, run) -> list[dict]:
 
 
 def test_the_budget_grows_to_fit_the_plan_once(flow_repo):
-    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2}})
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2, "run_budget_hard_usd": 50}})
     run = begin_build(flow_repo, plan_text())
     assert build(flow_repo, run) == ("done", True)
     [event] = scaled(flow_repo, run)
-    assert event["raised"] and event["tasks"] == 2 and event["previous"] == 2
-    assert run.state["budget_usd"] == event["budget_usd"] >= 1.5 * 2 + 0.25 * 2
+    assert event["raised"] and event["soft"] is True and event["tasks"] == 2 and event["previous"] == 2
+    assert run.state["soft_budget_usd"] == event["budget_usd"] >= 1.5 * 2 + 0.25 * 2  # the soft limit grows
+    assert run.state["budget_usd"] == 50  # the hard limit never does
+    assert flow_repo.events(run, "budget_estimate_over_hard") == []
     build(flow_repo, run)
     assert len(scaled(flow_repo, run)) == 1
 
 
 def test_ticked_tasks_do_not_count_toward_the_budget(flow_repo):
-    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2}})
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2, "run_budget_hard_usd": 50}})
     run = begin_build(flow_repo, plan_text(ticked=(1,)))
     build(flow_repo, run)
     assert scaled(flow_repo, run)[0]["tasks"] == 1
 
 
 def test_the_budget_is_never_lowered(flow_repo):
-    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 100}})
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 100, "run_budget_hard_usd": 200}})
     run = begin_build(flow_repo, plan_text())
     build(flow_repo, run)
     [event] = scaled(flow_repo, run)
     assert not event["raised"]
-    assert run.state["budget_usd"] == 100
-    assert not [e for e in flow_repo.events(run, "run_updated") if e.get("budget_usd") is not None]
+    assert (run.state["soft_budget_usd"], run.state["budget_usd"]) == (100, 200)
+    assert not [e for e in flow_repo.events(run, "run_updated")
+                if e.get("budget_usd") is not None or e.get("soft_budget_usd") is not None]
 
 
 def test_a_budget_a_human_set_is_kept(flow_repo):
-    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2}})
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2, "run_budget_hard_usd": 50}})
     run = begin_build(flow_repo, plan_text())
     run.emit("run_updated", by="human", budget_usd=2.5)
     build(flow_repo, run)
     assert scaled(flow_repo, run) == []
-    assert run.state["budget_usd"] == 2.5
+    assert (run.state["budget_usd"], run.state["soft_budget_usd"]) == (2.5, 2)
 
 
 def test_no_per_task_budget_leaves_the_budget_alone(flow_repo):
-    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 0, "run_budget_usd": 2}})
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 0, "run_budget_usd": 2, "run_budget_hard_usd": 50}})
     run = begin_build(flow_repo, plan_text())
     build(flow_repo, run)
     assert scaled(flow_repo, run) == []
-    assert run.state["budget_usd"] == 2
+    assert (run.state["soft_budget_usd"], run.state["budget_usd"]) == (2, 50)
+
+
+def test_an_estimate_above_the_hard_budget_notifies_once_and_goes_on(flow_repo, monkeypatch):
+    from agentflow import feature_lane
+
+    sent = []
+    monkeypatch.setattr(feature_lane, "notify_run", lambda cfg, run, message: sent.append(message))
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2, "run_budget_hard_usd": 3}})
+    run = begin_build(flow_repo, plan_text())
+    assert build(flow_repo, run) == ("done", True)  # no stop: the hard limit is not reached, only estimated past
+    [over] = flow_repo.events(run, "budget_estimate_over_hard")
+    assert over["estimate"] >= 1.5 * 2 + 0.25 * 2 and over["hard"] == 3
+    assert run.state["budget_usd"] == 3 and run.state["soft_budget_usd"] == over["estimate"]
+    assert len(sent) == 1 and "$3.00" in sent[0]
+    assert flow_repo.events(run, "hitl_raised") == []
+    build(flow_repo, run)
+    assert len(flow_repo.events(run, "budget_estimate_over_hard")) == 1 and len(sent) == 1
+
+
+def test_a_run_from_before_the_soft_budget_scales_as_before(flow_repo):
+    from agentflow.state import Run, runs_root
+
+    flow_repo.configure({**BIG, "defaults": {"task_budget_usd": 1.5, "run_budget_usd": 2, "run_budget_hard_usd": 3}})
+    begin_build(flow_repo, plan_text())
+    run_id = "20260101-0000-feature-old"
+    (runs_root(flow_repo.root) / run_id).mkdir(parents=True)
+    run = flow_repo.run = Run(flow_repo.root, run_id)
+    run.agent_dir.mkdir(parents=True)
+    run.emit("run_started", run_id=run_id, pipeline="feature", params={"module": "demo"}, budget_usd=2)
+    assert build(flow_repo, run) == ("done", True)
+    [event] = scaled(flow_repo, run)
+    assert event["raised"] and "soft" not in event
+    assert run.state["budget_usd"] == event["budget_usd"] >= 1.5 * 2 + 0.25 * 2 and run.state["soft_budget_usd"] is None
+    assert flow_repo.events(run, "budget_estimate_over_hard") == []
+
+
+# --------------------------------------------------------------------------- the observed run, replayed
+
+
+SPEC_PATH = "docs/specs/SPEC-demo.md"
+APPROVED_SPEC = "# Spec: `demo`\n\n**Status: approved** 2026-10-01\n\n## M5\n\nToken handling.\n\n## Open Questions\n\nNone.\n"
+LEAKED = "bad-host-7f3a"  # the "bad" database URL a shell loaded from `.env`; distinctive, so a leak is findable
+
+
+def test_a_run_replaying_the_observed_failures_gets_through_build_without_a_human(flow_repo, monkeypatch):
+    """The run that took 3 h 54 min, in small: a leaked `.env` URL that broke the gates, a plan question with a
+    recommended option that waited for a human, and a budget that stopped a run that was going fine."""
+    from agentflow.feature_lane import render_pr_body
+
+    notified: list[str] = []
+    monkeypatch.setattr("agentflow.hitl.notify", lambda cfg, title, message, run=None: notified.append(message))
+    flow_repo.configure({
+        **BIG,
+        "gates": {"no_leak": {"run": f'test "$X_URL" != {LEAKED}'}},  # fails exactly when the leaked URL gets in
+        "gate_sets": {"setup": [], "build": ["no_leak"], "verify": ["no_leak"]},
+        "defaults": {"run_budget_usd": 0.01, "run_budget_hard_usd": 10},  # the fake's 0.01 a call crosses the soft
+        # `define` and `plan` are a human's approvals by design, not stops this slice removes: off, so the run walks
+        "phases": {"define": {"needs_approval": False}, "plan": {"needs_approval": False}},
+    }, autopilot=True)
+    # the main checkout's `.env` (the pack's parent), whose line the shell that starts the run also exported
+    (Path(flow_repo.cfg.path).parent.parent / ".env").write_text(f"X_URL={LEAKED}\n", encoding="utf-8")
+    monkeypatch.setenv("X_URL", LEAKED)
+    asks = {"result": {"status": "needs_human", "summary": "cần quyết định",
+                       "questions": [{**question("ambiguity"), "options": [
+                           {"key": "A", "label": "Theo tiến trình", "recommended": True}, {"key": "B", "label": "Mỗi lượt"}]}]}}
+    flow_repo.script({"define/draft": [{"write": {SPEC_PATH: APPROVED_SPEC}, "result": DONE_RESULT}],
+                      "plan/plan": [asks, {"write": {PLAN_PATH: plan_text(count=4)}, "result": DONE_RESULT}],
+                      **{IMPL.format(n=n): [{"write": {f"src/t{n}.py": f"x = {n}\n"}, "result": DONE_RESULT}]
+                         for n in range(1, 5)}})
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(to_phase="build"))
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+
+    # no stop for a human: the one question raised is the plan's, the runner answered it, and nobody was asked
+    assert run.state["waiting"] is None and not flow_repo.events(run, "phase_approval_raised")
+    assert [(e["key"], e["kind"]) for e in flow_repo.events(run, "hitl_raised")] == [("plan/plan", "needs_human")]
+    assert not any("cần quyết định" in text for text in notified)
+    assert [e["key"] for e in flow_repo.events(run, "task_committed")] == [f"build/build/task-{n}" for n in range(1, 5)]
+    gates = flow_repo.events(run, "gate_result")
+    assert {e["key"] for e in gates} == {IMPL.format(n=n) for n in range(1, 5)}  # every task's gate ran
+    assert all(e["passed"] and e["gate"] == "no_leak" for e in gates)  # and the leaked URL never reached one
+    assert [e["names"] for e in flow_repo.events(run, "env_dropped")] == [["X_URL"]]
+    assert len(flow_repo.events(run, "budget_soft_reached")) == 1
+    assert sum("soft budget" in text for text in notified) == 1
+    answered = flow_repo.events(run, "hitl_answered")
+    assert [(e["key"], e["by"], e["answers"]) for e in answered] == [("plan/plan", "runner", {"q1": "A"})]
+    section = render_pr_body(run).split("## Decisions the runner took\n\n", 1)[1].split("\n\n## ", 1)[0]
+    assert section == "- `plan/plan` q1 (option A): Lưu bộ nhớ đệm token CRM? → Theo tiến trình"
+    for name in ("events.jsonl", "state.json"):
+        assert LEAKED not in (run.dir / name).read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- batches of small tasks
