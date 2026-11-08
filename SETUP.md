@@ -2,6 +2,8 @@
 
 This file is for an AI coding agent (Claude Code, Codex, or similar). A user hands it to you with something like *"Follow SETUP.md and set up agentflow"*. Your job is to install the agentflow engine on this machine, configure it for one target repository, and prove that it works. Run it as one guided session:
 
+**Already installed, and the user wants to update or upgrade it?** Skip the six steps below and follow [Updating an existing install](#updating-an-existing-install) near the end of this file. It's a shorter session with the same rules.
+
 1. **Discover** what you can find out without asking (Step 1).
 2. **Ask** short questions, **one at a time**, only where you couldn't find the answer (Step 2).
 3. **Show the full plan once** and get one "yes" (Step 3).
@@ -39,7 +41,7 @@ Run these checks quietly and keep the results for the plan. None of them changes
 | GitHub CLI and login | `gh --version`, `gh auth status` | needed by `ship`, `--issue` and `queue` |
 | Claude Code and login | `claude --version`, `claude auth status` | the default agent |
 | Codex CLI (optional) | `codex --version`, `codex login status` | only if the user wants Codex |
-| Is `agentflow` installed already? | `command -v agentflow`, `agentflow --help` | if it is, the install step becomes a reinstall |
+| Is `agentflow` installed already? | `command -v agentflow`, `agentflow --help` | if it is, the install step becomes a reinstall, and a request to *update* means the [update flow](#updating-an-existing-install) |
 | `~/.local/bin` on `PATH` | `echo $PATH` | `uv tool install` puts the command there |
 | **Where the harness checkout is** | the directory holding this `SETUP.md`, `pyproject.toml` and `agentflow/flow.py` | this is `<harness>` below |
 | **The target repository** | the current directory if it's a git repo and isn't `<harness>`; otherwise unknown | this is `<repo>` below |
@@ -287,7 +289,9 @@ uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_port
 | Symptom | What to do |
 |---|---|
 | `agentflow: command not found` after the install | `~/.local/bin` isn't on `PATH`: run `uv tool update-shell` and open a new shell, or use the full path |
-| The install serves old code | `uv tool install --reinstall --from <harness> agentflow` |
+| The install serves old code | `uv tool install --reinstall --from <harness> agentflow`. A plain `uv tool install` on an existing install does nothing, and a `git pull` alone never reaches the installed copy |
+| After a `git pull`, `validate` or `doctor` fails on a key the pack uses (for example `work_source.path: missing`) | The installed engine is older than the checkout. Reinstall (above), then run `validate` again |
+| `git pull --ff-only` refuses | The checkout has local commits or has diverged. Stop and ask: never `reset --hard`, `stash` or rebase on your own |
 | `init`: *this repository already has a pack* | Go back to Q2. Delete `.agentflow/` only with the user's yes |
 | `init`: *unknown starter* | Use one of `python-uv`, `node-pnpm`, `go`, `docs-only` |
 | `doctor` fails on a login | The user runs `! claude`, `! gh auth login` or `! codex login`, then you run `doctor` again |
@@ -296,3 +300,98 @@ uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_port
 | The baseline says every verify gate fails | Report it. The user fixes the base branch or the gate commands. Runs can't pass verify until then |
 
 Anything else: see playbook §12.
+
+---
+
+## Updating an existing install
+
+Use this when the user says *"update agentflow"*, *"upgrade the harness"*, or *"I pulled and something broke"*, and `agentflow` is already installed. It brings the engine on this machine up to the harness checkout's current code, and checks each repository that uses it. It doesn't touch any repository's pack, so don't run `init`.
+
+Two things make an update different from a fresh install, and both are easy to miss:
+
+- **Pulling the checkout does not update the installed tool.** A `uv tool` install is a copy of the engine, built from the checkout at install time. Until you reinstall, `agentflow` keeps running the old code, and it can then reject a newer config (for example `work_source.path: missing`). The symlink install (`bin/agentflow`) runs the checkout directly, so it has no copy to refresh.
+- **A plain `uv tool install` on an existing install does nothing.** Only `--reinstall` rebuilds it.
+
+The session rules above apply: one question per message, one plan, no commits, no weakened gates.
+
+### U1. Discover (no questions)
+
+| What | How | Note |
+|---|---|---|
+| How it's installed | `ls -l "$(command -v agentflow)"` and `uv tool list` | a link into `.../uv/tools/agentflow/` is the `uv` tool; a link to `<harness>/bin/agentflow` is the symlink install |
+| Installed version | `uv tool list` (`agentflow vX.Y`) | compare with `version` in `<harness>/pyproject.toml` |
+| Is the installed copy stale? | see the `diff` below | no output means it matches the checkout |
+| The checkout's state | `git -C <harness> status --short`, `git -C <harness> branch --show-current` | |
+| Is the checkout behind? | `git -C <harness> fetch origin`, then `git -C <harness> rev-list --count HEAD..origin/main` and `git -C <harness> log --oneline HEAD..origin/main` | `fetch` only reads. The log is the release notes: show it to the user |
+| Runs in flight | `agentflow status` from each repository you'll check | a live run sees engine changes between its phases (playbook §14, "Pack reference"), so prefer to update when nothing is running |
+| Repositories to check | the current directory if it has `.agentflow/config.yaml`; otherwise ask (see U2) | |
+
+The staleness check compares the installed package with the checkout's. The `-x` options skip caches, dotfiles, git-ignored run output and the tests, which aren't installed:
+
+```bash
+SP=$(echo "$(uv tool dir)"/agentflow/lib/python*/site-packages/agentflow)
+diff -rq "$SP" <harness>/agentflow -x __pycache__ -x tests -x '.*' -x runs
+```
+
+### U2. Ask, only what you couldn't find out
+
+Skip every question whose answer U1 gave you.
+
+**U-Q1.** Ask only if the checkout is behind `origin/main`.
+> The harness checkout is N commits behind `origin/main` (list shown above). Pull them with `git pull --ff-only`? 1) Yes (recommended), 2) No, just reinstall what's checked out.
+
+If the checkout has uncommitted changes or isn't on `main`, don't pull. Say so, and offer option 2 instead. Never stash, reset or switch branches on your own.
+
+**U-Q2.** Ask only if you found no repository in U1.
+> Which repositories use agentflow on this machine? Give me their paths, or say "none" to update the engine only.
+
+### U3. Show the plan once
+
+```
+Here's the update plan. Nothing has changed yet.
+
+Engine <harness> (installed: <vX.Y, uv tool | symlink>, checkout: <vX.Y> at <short sha>)
+  1. [Behind] git pull --ff-only          → N commits (listed above)
+  2. [uv tool] uv tool install --reinstall --from <harness> agentflow
+     [symlink] nothing to reinstall: bin/agentflow runs the checkout directly
+  3. Confirm the installed copy matches the checkout
+
+Repositories: <repo>, <repo>
+  4. agentflow doctor · agentflow validate · agentflow explain feature --module setup-check · agentflow run feature --module setup-check --dry-run
+
+Changes no pack, user config or settings file. No commits.
+Reply "go", or tell me what to change.
+```
+
+### U4. Do it
+
+1. **Pull** (if U-Q1 = 1): `git -C <harness> pull --ff-only`. If it refuses, stop and ask.
+2. **Reinstall** (`uv tool` install only): `uv tool install --reinstall --from <harness> agentflow`. If the tool was installed from a different path than `<harness>`, say so and ask which checkout the user wants.
+3. **Confirm the install:** run the `diff` from U1 again. It must print nothing. Then `agentflow --help` must list the subcommands.
+4. **For each repository** (run from its root), in this order:
+
+   ```bash
+   agentflow doctor                                       # 0 failed
+   agentflow validate                                     # must end with "0 warnings"
+   agentflow explain feature --module setup-check         # no agent calls
+   agentflow run feature --module setup-check --dry-run   # creates nothing
+   ```
+
+   If a repository's pack has no `feature` lane, use a lane it does have (`agentflow explain nosuchlane --module x` prints the known lanes).
+
+How to read the results:
+
+- A `validate` **error** after the reinstall means the pack and the engine disagree. Read the message (it names the YAML path) and the pulled commits' log, fix the line if the fix is obvious, and otherwise report it. Don't delete the key or weaken a gate to pass.
+- A new `validate` **warning** is usually something the update introduced. Fix it if the message says how, or report it.
+- A `gates_confirmed` warning after an update is **not** expected, because `validate` doesn't ask again when an engine upgrade changes a starter's gates (playbook §14, `gates_confirmed`). So check the pulled log for a commit that changes a starter or `defaults/config.yaml`, and if there is one, show the user the new effective gates (`agentflow config show --effective gates`) so they can decide whether they still trust them. Don't change `gates_confirmed` yourself.
+- A `doctor` **fail** on a login or a missing program is the user's or the machine's to fix (see Quick troubleshooting). A **warn** is acceptable, but list it in the report.
+- Optionally, if `<harness>` itself is among the repositories, run the fast portability gate from Step 5. The full suite takes 25–60 minutes, so don't start it unless the user asks.
+
+### U5. Report
+
+One short message:
+
+- the engine before and after (`uv tool list`) and the commits pulled, if any;
+- whether the installed copy now matches the checkout;
+- for each repository, the `doctor` result (any warns), whether `validate` printed 0 warnings, and whether `explain` and `--dry-run` worked;
+- anything left for the user: a stale in-flight run to `resume`, a gate to re-confirm, a login, a pack key to fix.
