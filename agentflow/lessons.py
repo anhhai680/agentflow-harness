@@ -380,7 +380,9 @@ def _mean(values: list[float]) -> float | None:
 
 
 def _verdict(direction: str, baseline: float, after: float) -> str:
-    rel = (after - baseline) / max(abs(baseline), 1.0)
+    # Rounded before the band test, so a change of exactly NO_CHANGE_BAND lands on the band's edge whatever the float
+    # error (1.0 -> 0.9 is -0.09999999999999998 unrounded).
+    rel = round((after - baseline) / max(abs(baseline), 1.0), 9)
     if direction == "higher":
         rel = -rel
     if rel <= -NO_CHANGE_BAND:
@@ -422,8 +424,11 @@ def _effect(lesson: Lesson, runs: list[_RunFacts]) -> LessonEffect:
 
 def effects(repo: Path, lessons: list[Lesson], now: datetime) -> list[LessonEffect]:
     """Each lesson's target signal over the ended, non-retro runs: the mean over the runs that carried it (after)
-    against the mean over the runs without it that started before the first run that carried it (baseline). Only
-    runs that have the target's key count, except a count family's, where a missing key is 0. Fewer than
-    `MIN_AFTER_RUNS` after-runs or no baseline is `too few runs`; a missing or unknown target is `not measured`."""
+    against the mean over the runs without it that started before the first run that carried it (baseline). That
+    first run is the earliest start among every non-retro run that carried the lesson, live ones included: a live
+    run moves the cutoff (a run started beside it ran with the lesson in play, so it is no baseline) but is never an
+    after-run itself. Only runs that have the target's key count, except a count family's, where a missing key is 0.
+    Fewer than `MIN_AFTER_RUNS` after-runs or no baseline is `too few runs`; a missing or unknown target is
+    `not measured`."""
     runs = _all_runs(repo, now)
     return [_effect(lesson, runs) for lesson in lessons]

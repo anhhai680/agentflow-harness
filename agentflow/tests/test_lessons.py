@@ -490,3 +490,24 @@ def test_lessons_cli_table_and_json_with_config(tmp_cfg, monkeypatch, capsys):
     data = json.loads(capsys.readouterr().out)
     assert {r["verdict"] for r in data["lessons"]} == {"not measured"} and data["note"] == lessons.CORRELATION_NOTE
     assert main(["lessons", "--config", str(path.parent / "missing.yaml")]) == 1
+
+
+@pytest.mark.parametrize("direction,baseline,after,verdict", [
+    ("lower", 1.0, 0.9, "improved"), ("lower", 1.0, 1.1, "worse"),            # exactly -10% / +10%
+    ("lower", 1.0, 0.91, "no change"), ("lower", 1.0, 1.09, "no change"),     # just inside the band
+    ("lower", 2.0, 1.8, "improved"), ("lower", 2.0, 2.2, "worse"),            # relative to |baseline| when it is > 1
+    ("higher", 0.4, 0.5, "improved"), ("higher", 0.6, 0.7, "improved"), ("higher", 0.5, 0.4, "worse"),
+    ("higher", 0.4, 0.49, "no change"), ("higher", 0.5, 0.41, "no change"),
+])
+def test_verdict_band_edges_classify_exactly(direction, baseline, after, verdict):
+    assert lessons._verdict(direction, baseline, after) == verdict
+
+
+def test_a_live_run_that_carried_the_lesson_trims_the_baseline_but_is_no_after_run(tmp_git):
+    _write_run(tmp_git, 0, gates=[("lint", False)])
+    _write_run(tmp_git, 1, gates=[("lint", False)], injected=["L-0001"], end=None)  # live: the lesson came in here
+    _write_run(tmp_git, 2, gates=[("lint", True)])  # no lesson, but it started after the live run that had it
+    for n in (3, 4, 5):
+        _write_run(tmp_git, n, gates=[("lint", True)], injected=["L-0001"])
+    (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
+    assert (eff.baseline_runs, eff.baseline, eff.after_runs, eff.after, eff.verdict) == (1, 0.0, 3, 1.0, "improved")
