@@ -27,6 +27,7 @@ Anything before the first `## ` heading is the file's header and is not read.
 - `select(lessons, phase, today, max_tokens)`: what a step's prompt carries, as one Markdown section.
 - `effects(repo, lessons, now)`: each lesson's target signal before and after the runs that carried it, with a
   verdict. It compares runs, so it shows correlation, not cause (`CORRELATION_NOTE`).
+- `run_logs(repo)`: every run's events, read without the lock or a write (the retro digest reads runs this way too).
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -309,7 +311,7 @@ NO_CHANGE_BAND = 0.10  # a relative change smaller than this either way is `no c
 VERDICTS = ("improved", "no change", "worse", "too few runs", "not measured")
 CORRELATION_NOTE = "Before/after compares runs; it shows correlation, not cause."
 # What reading one run's log may raise on a corrupt or hand-edited file: that run is left out, never fatal.
-_RUN_ERRORS = (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, EventError)
+RUN_ERRORS = (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, EventError)
 
 
 @dataclass(frozen=True)
@@ -335,11 +337,28 @@ class _RunFacts:
     signals: dict[str, float]
 
 
-def _run_facts(path: Path, now: datetime) -> _RunFacts | None:
-    """What `effects` needs from one run's log, or None for a retro run or a log with no events."""
-    events = EventLog(path).read()
-    if not events:
-        return None
+def run_logs(repo: Path) -> Iterator[tuple[str, list[dict]]]:
+    """`(folder name, events)` for every run under the runs root, in name order (oldest first: ids start with the
+    date). The logs are read without the lock and nothing is written, so a reader never disturbs a live run (a torn
+    last line is skipped). A symlinked folder or log, a folder with no log, an empty log and a log that cannot be
+    read are left out."""
+    root = runs_root(repo)
+    if not root.is_dir():
+        return
+    for folder in sorted(root.iterdir()):
+        log = folder / "events.jsonl"
+        if folder.is_symlink() or log.is_symlink() or not log.is_file():
+            continue
+        try:
+            events = EventLog(log).read()
+        except RUN_ERRORS:
+            continue
+        if events:
+            yield folder.name, events
+
+
+def _run_facts(events: list[dict], now: datetime) -> _RunFacts | None:
+    """What `effects` needs from one run's events, or None for a retro run."""
     state = replay(events)
     if state.get("pipeline") == RETRO_PIPELINE:
         return None
@@ -358,17 +377,11 @@ def _run_facts(path: Path, now: datetime) -> _RunFacts | None:
 
 def _all_runs(repo: Path, now: datetime) -> list[_RunFacts]:
     """Every non-retro run's facts; a run whose log cannot be read is left out."""
-    root = runs_root(repo)
-    if not root.is_dir():
-        return []
     runs = []
-    for folder in sorted(root.iterdir()):
-        log = folder / "events.jsonl"
-        if folder.is_symlink() or log.is_symlink() or not log.is_file():
-            continue
+    for _name, events in run_logs(repo):
         try:
-            facts = _run_facts(log, now)
-        except _RUN_ERRORS:
+            facts = _run_facts(events, now)
+        except RUN_ERRORS:
             continue
         if facts is not None:
             runs.append(facts)
