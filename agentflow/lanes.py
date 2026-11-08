@@ -44,7 +44,7 @@ from agentflow.flow_control import (
     refine_subject,
     writes_questions,
 )
-from agentflow.gates import GateResult, gates_ok, run_doc_checks, run_gates
+from agentflow.gates import GateResult, agent_checks, gates_ok, run_doc_checks, run_gates
 from agentflow.gitops import CommitRejected, GitError, NothingToCommit, changed_since, commit, commits_between, head
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, notify_run, park_hitl, raise_hitl, read_result
@@ -75,6 +75,14 @@ SKILL_BLOCK = ("## The `{skill}` skill\n\nIts full text follows, so you already 
 RESUMABLE = ("running", "waiting_human")
 UNSTARTED_STEP = (None, "pending")
 FOOTER = re.compile(r"^\s*Next:\s*`?([\w.:/-]+)`?\s+(?:—|–|--?)\s", re.MULTILINE)
+SELF_CHECKS_NONE = ("Do not run the linters, type checkers or other quality gates yourself: the runner's build gates "
+                    "run them right after you, and a failure comes back to this session with its output.")
+SELF_CHECKS = ("Before you write the result, run each of these checks once, after your last edit. They are the runner's "
+               "own build gates for this step: run them from the worktree root exactly as written, one Bash call per "
+               "line.\n\n```sh\n{commands}\n```\n\nFix what they report and run the failing one again. If one is "
+               "denied, skip it and say so in your summary: do not stop as `blocked` for it. Do not run any other gate "
+               "or the whole suite: the runner runs every build gate right after you, and a failure comes back to this "
+               "session with its output.")
 HANDOFF_LINE = "Read the handoff from the earlier phases first: `{handoff}`."
 
 
@@ -92,6 +100,15 @@ def _template(cfg: Config, name: str) -> str:
     if file is None:
         raise FileNotFoundError(f"prompt '{name}' is not in the pack's prompts/ or the engine's")
     return file.read_text(encoding="utf-8")
+
+
+def _self_checks(cfg: Config, step: Step, worktree: Path) -> str:
+    """The build prompts' `{self_checks}`: the step's `agent_check` gates for the implementer to run, or today's
+    "run none" sentence when it has none."""
+    gates = agent_checks(cfg, step.gates, worktree)
+    if not gates:
+        return SELF_CHECKS_NONE
+    return SELF_CHECKS.format(commands="\n".join(gate.run.strip() for gate in gates))
 
 
 def _values(cfg: Config, step: Step, ctx: Ctx, extra: dict) -> dict[str, str]:
@@ -112,6 +129,8 @@ def _values(cfg: Config, step: Step, ctx: Ctx, extra: dict) -> dict[str, str]:
     values["handoff"] = str(agent_dir / "handoff.md")
     values["questions"] = str(agent_dir / "questions.md")
     values["run_facts"] = _run_facts(run)
+    worktree = Path(run.state.get("worktree") or ctx.repo) if run is not None else ctx.repo
+    values["self_checks"] = _self_checks(cfg, step, worktree)
     values.update({name: str(value) for name, value in extra.items()})
     return values
 

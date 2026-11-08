@@ -15,6 +15,10 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 - The dashboard header shows the engine version (`v2.0`), served by the new `GET /api/info` route.
 - This changelog, with a test that it has an entry for the current version.
 
+### Changed
+
+- The build prompts list a step's `agent_check` gates for the implementer to run before it finishes; with none, they read as before.
+
 ### Fixed
 
 - Auto-compact now fires at 60% of a 200k window instead of 60% of the models' 1M window (600k tokens, so it never fired before the runner's 80% rollover). The runner sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from `context.context_window_tokens`, whose default is now 200000 instead of `auto`.
