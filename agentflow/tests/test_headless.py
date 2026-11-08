@@ -8,6 +8,7 @@ import json
 
 import pytest
 
+from agentflow import lanes
 from agentflow.agents import RUNNER_ONLY_DENY
 from agentflow.layers import user_config_path
 from agentflow.config import ConfigError, Gate, Phase, Step, load_config, resolve_model
@@ -314,11 +315,15 @@ def test_the_preamble_gives_the_shell_rules(shipped, line):
 @pytest.mark.parametrize("line", ["format what you changed", "the runner's build gates run them", "`blocked`"])
 def test_the_task_prompt_names_what_to_run(shipped, line):
     text = (ENGINE_PROMPTS / "task.md").read_text(encoding="utf-8")
-    assert line in text
+    if line == "the runner's build gates run them":  # the sentence moved into `{self_checks}` (what a step with no agent check gets)
+        assert "{self_checks}" in text and line in lanes.SELF_CHECKS_NONE
+    else:
+        assert line in text
 
 
 @pytest.mark.parametrize("prompt", ["task.md", "task_next.md"])
 def test_implementers_format_and_leave_lint_types_and_the_floor_to_the_build_gates(shipped, prompt):
     text = (ENGINE_PROMPTS / prompt).read_text(encoding="utf-8")
-    assert "format what you changed" in text and "the runner's build gates run them" in text
+    assert "format what you changed" in text and "{self_checks}" in text
+    assert "the runner's build gates run them" in lanes.SELF_CHECKS_NONE
     assert "floor_guard" not in text  # the floor is a pack's gate, run after the session; no prompt names it
