@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- `agentflow init` finds a `docs/specs` folder (so the Backlog and "+ New task" are written for it), and sets `project.docs.spec_file` when most of its files are named `PREFIX-<module>.md`.
 - The dashboard header shows the engine version (`v2.0`), served by the new `GET /api/info` route.
 - This changelog, with a test that it has an entry for the current version.
 
