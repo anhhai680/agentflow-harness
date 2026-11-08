@@ -862,10 +862,25 @@ def queue_lock(repo: Path) -> Iterator[None]:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def _retro_if_due(cfg: Config, repo: Path, say: Callable[[str], None]) -> bool:
+def _once(say: Callable[[str], None]) -> Callable[[str], None]:
+    """`say`, but only the first time: later calls say nothing."""
+    said: list[str] = []
+
+    def first(line: str) -> None:
+        if not said:
+            said.append(line)
+            say(line)
+
+    return first
+
+
+def _retro_if_due(cfg: Config, repo: Path, say: Callable[[str], None],
+                  say_first: Callable[[str], None] | None = None) -> bool:
     """Run the retro when one is due, before the next module starts; True when it did not settle (it stopped for a
     human, found nothing, or raised), so the queue does not try again. It says one line and never raises: a retro
-    that cannot finish must not stop the modules."""
+    that cannot finish must not stop the modules. The first retro of a repository is never started here (a paid
+    session over every past run, a pushed branch and a pull request nobody asked for): until one has finished, a
+    due retro is only named, through `say_first`, with the command that runs it by hand."""
     from agentflow import retro
     from agentflow.state import Run
 
@@ -878,7 +893,15 @@ def _retro_if_due(cfg: Config, repo: Path, say: Callable[[str], None]) -> bool:
             return False
     except Exception:  # noqa: BLE001 - a reminder is never worth an error
         return False
-    if retro.due_or_none(repo, cfg, now) is None:
+    reason = retro.due_or_none(repo, cfg, now)
+    if reason is None:
+        return False
+    try:
+        first = retro.last_finished_retro(repo) is None
+    except Exception:  # noqa: BLE001 - a retro history that cannot be read starts nothing
+        first = True
+    if first:
+        (say_first or say)(f"retro due ({reason}): run `agentflow retro` for the first one; the queue starts later ones")
         return False
     try:
         outcome = retro.run_retro(repo, cfg, None, False, now)
@@ -908,12 +931,13 @@ def run_queue(
         raise ValueError("this pack has no work_source: the queue has no modules to start")
     say = log or print
     retro_gave_up = False  # one failed retro per queue: the next tick would fail the same way
+    say_first = _once(say)  # "run the first retro by hand" is said once per queue, not once per tick
     with queue_lock(repo):
         try:
             while True:
                 gitops.fetch_remote_branch(repo, cfg.project.fork_from)  # where a merged plan lands (see _plan_finished)
                 if not retro_gave_up:
-                    retro_gave_up = _retro_if_due(cfg, repo, say)
+                    retro_gave_up = _retro_if_due(cfg, repo, say, say_first)
                 for module in queue_tick(cfg, repo, max_parallel, start, log=say):
                     say(f"started {module}")
                 hitl.remind_due(cfg, repo, datetime.now(UTC))  # waits past `hitl.remind_after_h` are notified again
