@@ -135,6 +135,8 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("context", "autocompact_pct"), "Auto-compact at (%)", _PCT),
         (("context", "rollover_pct"), "Roll over at (%)", _PCT),
         (("context", "max_rollovers"), "Max rollovers", _INT),
+        (("context", "max_compactions"), "Max compactions per session", _POS),
+        (("context", "context_window_tokens"), "Context window (tokens)", {"kind": "int", "min": 100000}),
         (("context", "default_window_tokens"), "Default window (tokens)", _POS),
         (("context", "gate_output_lines"), "Gate output lines", _POS),
     ]),

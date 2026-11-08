@@ -111,6 +111,8 @@ def test_values_that_need_quoting_are_quoted(shipped):
     (["defaults", "step_timeout_min"], 0, EditError),                  # its bounds
     (["defaults", "push"], False, Refused),                          # removed: `finish` always pushes
     (["context", "rollover_pct"], True, EditError),
+    (["context", "max_compactions"], 0, EditError),                    # at least one
+    (["context", "context_window_tokens"], 50000, EditError),          # below Claude Code's smallest auto-compact window
     (["effort", "allowed"], ["low", "turbo"], EditError),
     (["defaults", "agent"], "nobody", EditError),
     (["autonomy", "resolve_kinds"], {"blocked": 0}, EditError),
