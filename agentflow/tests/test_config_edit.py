@@ -156,6 +156,7 @@ def test_yaml_text_may_change_anything_but_the_protected_settings(shipped):
     assert proposal.changed and not proposal.errors
     for old, new in [
         ('floor:        {run: "true"}', 'floor:        {run: "false"}'),
+        ('floor:        {run: "true"}', 'floor:        {run: "true", agent_check: true}'),  # a gate the agent runs
         ("    - CONSTRAINTS.md\n", ""),                                                  # guardrails
         ("    command: [claude]", "    command: [sh, -c, claude]"),                     # an agent's command line
         ('    POSTGRES_HOST_PORT: "55432"', '    POSTGRES_HOST_PORT: "55432"\n    BASH_ENV: /tmp/x'),  # defaults.env
