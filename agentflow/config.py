@@ -280,6 +280,13 @@ class ContextPolicy:
 
 
 @dataclass
+class MemoryPolicy:
+    lessons_max_tokens: int  # the most tokens of lessons a prompt carries; 0 turns lessons off
+    digest_tokens: int  # the size a retro's digest of recent runs is cut to
+    retro_every_days: int  # days between retros the runner proposes; 0 means manual only
+
+
+@dataclass
 class Gate:
     name: str
     run: str
@@ -358,6 +365,7 @@ class Config:
     defaults: Defaults
     effort: EffortPolicy
     context: ContextPolicy
+    memory: MemoryPolicy
     gates: dict[str, Gate]
     gate_sets: dict[str, list[str]]
     guardrails: Guardrails
@@ -827,6 +835,7 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
     defaults = _require(raw, "defaults", "", dict)
     effort = _require(raw, "effort", "", dict)
     context = _require(raw, "context", "", dict)
+    memory = _optional(raw, "memory", "", dict, {})
     guardrails = _require(raw, "guardrails", "", dict)
     recovery = _optional(raw, "recovery", "", dict, {})
     agents = _require(raw, "agents", "", dict)
@@ -873,6 +882,11 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
             default_window_tokens=_optional(context, "default_window_tokens", "context", int, 200000),
             progress_file=_require(context, "progress_file", "context", str),
             gate_output_lines=_require(context, "gate_output_lines", "context", int),
+        ),
+        memory=MemoryPolicy(
+            lessons_max_tokens=_optional(memory, "lessons_max_tokens", "memory", int, 1500),
+            digest_tokens=_optional(memory, "digest_tokens", "memory", int, 15000),
+            retro_every_days=_optional(memory, "retro_every_days", "memory", int, 7),
         ),
         gates=_build_gates(_require(raw, "gates", "", dict)),
         gate_sets={name: _string_list(members, f"gate_sets.{name}") for name, members in gate_sets.items()},
@@ -1482,6 +1496,15 @@ class _Validator:
         elif ctx.rollover_pct <= ctx.autocompact_pct:
             self.error("context.rollover_pct", f"must be above autocompact_pct ({ctx.autocompact_pct}): the rollover is the safety net behind the auto-compact")
 
+    def memory(self) -> None:
+        mem = self.cfg.memory
+        for key, low, high, note in (("lessons_max_tokens", 0, 4000, " (0 turns lessons off)"),
+                                     ("digest_tokens", 1000, 50000, ""),
+                                     ("retro_every_days", 0, 90, " (0 means manual only)")):
+            value = getattr(mem, key)
+            if isinstance(value, bool) or not low <= value <= high:
+                self.error(f"memory.{key}", f"must be from {low} to {high}{note}")
+
     def approval(self) -> None:
         cfg = self.cfg
         for key in cfg.phase_approval:
@@ -1659,6 +1682,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.phases()
     v.effort()
     v.context()
+    v.memory()
     v.approval()
     v.autonomy()
     v.overlays()

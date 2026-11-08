@@ -89,6 +89,16 @@ def test_a_missing_key_is_added_under_its_block(shipped):
     assert cfg.phases["ship"].steps[-1].type == "ci"  # the new line landed in `ship`, not in a step
 
 
+def test_the_memory_section_saves_a_zero_and_keeps_the_comments(shipped):
+    proposal = form(shipped, (["memory", "retro_every_days"], 0))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    text = shipped.read_text(encoding="utf-8")
+    assert load_config(shipped).memory.retro_every_days == 0
+    assert "retro_every_days: 0" in text
+    assert all(line in text for line in SHIPPED.splitlines() if "#" in line)  # every comment survives
+
+
 def test_an_optional_text_field_set_to_null_removes_the_key(shipped):
     proposal = form(shipped, (["phases", "verify", "model"], None))
     assert changed_lines(proposal.diff) == ["-    model: sonnet"]
@@ -113,6 +123,7 @@ def test_values_that_need_quoting_are_quoted(shipped):
     (["context", "rollover_pct"], True, EditError),
     (["context", "max_compactions"], 0, EditError),                    # at least one
     (["context", "context_window_tokens"], 50000, EditError),          # below Claude Code's smallest auto-compact window
+    (["memory", "lessons_max_tokens"], 5000, EditError),               # above the range
     (["effort", "allowed"], ["low", "turbo"], EditError),
     (["defaults", "agent"], "nobody", EditError),
     (["autonomy", "resolve_kinds"], {"blocked": 0}, EditError),

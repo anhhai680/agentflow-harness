@@ -140,6 +140,11 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("context", "default_window_tokens"), "Default window (tokens)", _POS),
         (("context", "gate_output_lines"), "Gate output lines", _POS),
     ]),
+    ("Memory", "What runs learn from earlier runs.", [
+        (("memory", "lessons_max_tokens"), "Lessons per prompt (tokens, 0 = off)", {"kind": "int", "min": 0, "max": 4000}),
+        (("memory", "digest_tokens"), "Retro digest size (tokens)", {"kind": "int", "min": 1000, "max": 50000}),
+        (("memory", "retro_every_days"), "Days between retros (0 = manual only)", {"kind": "int", "min": 0, "max": 90}),
+    ]),
     ("Autonomy", "What the runner settles by itself before a human hears of it.", [
         (("autonomy", "non_blocking_severities"), "Non-blocking severities", {"kind": "list"}),
         (("autonomy", "finding_rounds"), "Finding rounds", _INT),
