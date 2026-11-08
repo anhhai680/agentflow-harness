@@ -13,6 +13,12 @@ Each task is a level-3 heading `### Task N: <title>` with N counting from 1. Und
 
 - A line `**Depends on:** Task k, Task m` or `**Depends on:** none`. Give every task one: without it, the runner assumes the task depends on the one before.
 - A `**Files:**` list, one line per file, each starting `- Create:`, `- Modify:` or `- Test:` and naming the path in backticks.
+- An `**Interfaces:**` list:
+  - `Uses:` each piece of existing code the task calls, as `path:line` and its signature, for example `` `app/names.py:12` `normalise(name: str) -> str` ``. You read this code while planning, so writing it down saves every later session from searching for it.
+  - `From earlier tasks:` the names and signatures it takes from tasks before it.
+  - `Produces:` the names and signatures later tasks rely on.
+
+  Write `none` for an empty line.
 - Checkbox steps, each `- [ ] **Step k: <what to do>**`, followed by the details: the test to write, the command to run, the expected result.
 
 ```
@@ -21,8 +27,13 @@ Each task is a level-3 heading `### Task N: <title>` with N counting from 1. Und
 **Depends on:** Task 1
 
 **Files:**
-- Modify: `app/names`
-- Test: `tests/names_test`
+- Modify: `app/names.py`
+- Test: `tests/names_test.py`
+
+**Interfaces:**
+- Uses: `app/names.py:12` `normalise(name: str) -> str`
+- From earlier tasks: none
+- Produces: `app/greet.py` `greet(name: str) -> str`
 
 - [ ] **Step 1: Write the failing test** for an empty name, and run it. Expected: it fails.
 - [ ] **Step 2: Reject the empty name**, then run the test. Expected: it passes.
@@ -31,6 +42,7 @@ Each task is a level-3 heading `### Task N: <title>` with N counting from 1. Und
 ## Limits
 
 - At most 8 steps and at most 8 files per task. Past that, split the task.
+- Keep the Interfaces list to what the task really calls: at most 10 lines.
 - A task ends with a result that can be tested on its own, with the exact test command and the expected output.
 - Order the tasks so each depends only on earlier ones. Name every real dependency.
 - A task that cannot be built until something outside this plan lands stays in the plan with no checkboxes. Its body starts with `> **Deferred (<reason>).**`.
@@ -38,7 +50,7 @@ Each task is a level-3 heading `### Task N: <title>` with N counting from 1. Und
 ## Rules
 
 - Test first: a task's first step writes the failing test, and the next makes it pass.
-- Say what each task changes and why, not how to type the code. Include a snippet only where a signature or exact text matters.
+- Say what each task changes and why, not how to type the code. Give a signature wherever a task calls or defines one, in its Interfaces list, and a snippet only where exact text matters.
 - Name tests by the runner's real command for the repository. Run only the tests a task touches. The runner's gates run everything else.
 - If the spec is silent on a decision the design needs, do not invent it. Stop and ask.
 - Write no code in this step.

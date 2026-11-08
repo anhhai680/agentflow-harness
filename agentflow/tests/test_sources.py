@@ -279,3 +279,43 @@ def test_plan_spec_is_the_basename_of_the_header_spec_path():
     assert sources.plan_spec("# P\n\n```\n**Spec:** `a/SPEC-x.md`\n```\n") is None  # a fenced example
     assert sources.plan_spec("# P\n\n### Task 1: x\n\n**Spec:** `a/SPEC-x.md`\n") is None  # below the header
     assert sources.plan_spec("# P\n\n**Spec:** " + "x" * 600 + " `a/SPEC-x.md`\n") is None  # past the cut
+
+
+INTERFACES = ("**Interfaces:**\n- Uses: `app/names.py:12` `normalise(name: str) -> str`\n"
+              "- From earlier tasks: none\n- Produces: `app/greet.py` `greet(name: str) -> str`\n")
+
+
+def _three_task_plan(interfaces: str) -> str:
+    def task(n: int, deps: str) -> str:
+        return (f"### Task {n}: T{n}\n\n**Depends on:** {deps}\n\n**Files:**\n- Create: `app/f{n}.py`\n"
+                f"- Test: `tests/f{n}_test.py`\n\n{interfaces}\n"
+                f"- [ ] **Step 1: Write the failing test**\n- [ ] **Step 2: Make it pass**\n")
+
+    return "# Plan\n\n" + "\n".join([task(1, "none"), task(2, "Task 1"), task(3, "Task 1, Task 2")])
+
+
+def test_an_interfaces_list_names_no_files_and_changes_no_batch():
+    from agentflow.sources import parse_plan_text, plan_batches, task_size
+
+    plain = parse_plan_text(_three_task_plan(""))
+    with_interfaces = parse_plan_text(_three_task_plan(INTERFACES))
+    assert "**Interfaces:**" in with_interfaces[0].text and "**Interfaces:**" not in plain[0].text
+    assert [task_files(t) for t in with_interfaces] == [task_files(t) for t in plain]
+    assert task_files(with_interfaces[0]) == ["app/f1.py", "tests/f1_test.py"]  # not app/names.py or app/greet.py
+    assert [task_size(t) for t in with_interfaces] == [task_size(t) for t in plain] == [(2, 2)] * 3
+    assert plan_batches(with_interfaces, 3, 3) == plan_batches(plain, 3, 3) == [[1, 2, 3]]
+    assert [t.depends_on for t in with_interfaces] == [t.depends_on for t in plain] == [[], [1], [1, 2]]
+
+
+def test_the_plan_skill_example_parses_as_one_task_with_its_two_files():
+    import re
+
+    from agentflow.sources import parse_plan_text, task_size
+
+    skill = (Path(__file__).resolve().parents[1] / "skills" / "agentflow-plan" / "SKILL.md").read_text(encoding="utf-8")
+    example = re.search(r"^```\n(### Task 2:.*?)^```", skill, re.DOTALL | re.MULTILINE).group(1)
+    (task,) = parse_plan_text(example)
+    assert (task.n, task.depends_on) == (2, [1])
+    assert task_files(task) == ["app/names.py", "tests/names_test.py"]
+    assert task_size(task) == (2, 2)
+    assert "**Interfaces:**" in task.text

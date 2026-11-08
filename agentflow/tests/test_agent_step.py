@@ -1171,6 +1171,14 @@ def test_task_prompts_point_at_interfaces_and_the_map_not_the_plan():
     assert "run's code map" in skill and "**Interfaces**" in skill
 
 
+def test_the_plan_skill_and_prompt_ask_for_interfaces_and_a_code_map():
+    skill = (ENGINE / "skills" / "agentflow-plan" / "SKILL.md").read_text(encoding="utf-8")
+    for needle in ("**Interfaces:**", "Uses:", "From earlier tasks:", "Produces:", "path:line"):
+        assert needle in skill, needle
+    prompt = (ENGINE / "prompts" / "plan.md").read_text(encoding="utf-8")
+    assert "`code_map`" in prompt and "**Interfaces**" in prompt
+
+
 def test_the_result_instructions_describe_code_map():
     text = (ENGINE / "prompts" / "_result.md").read_text(encoding="utf-8")
     assert "`code_map`" in text and "Up to 8" in text

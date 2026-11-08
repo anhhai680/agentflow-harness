@@ -20,6 +20,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 - The build prompts list a step's `agent_check` gates for the implementer to run before it finishes; with none, they read as before.
 - Every session's prompt shows the run's code map, and the build prompts stop sending a fresh session back to the plan.
+- The bundled plan skill asks for an `**Interfaces:**` list per task, naming the existing code the task calls by `path:line` and signature.
 
 ### Fixed
 
