@@ -44,6 +44,8 @@ uv tool install --from /path/to/agentflow-harness agentflow     # first install
 uv tool install --reinstall --from /path/to/agentflow-harness agentflow   # after pulling engine changes
 ```
 
+A `git pull` of the checkout does not change the installed tool, and a plain `uv tool install` on an existing install does nothing: after pulling, always reinstall with `--reinstall`. The guided update flow (an agent can run it for you) is "Updating an existing install" in `SETUP.md`.
+
 `pyproject.toml` lists the files under `agentflow/` as `cache-keys`, so uv rebuilds its cached wheel when one changes. If an install still serves stale code, `--reinstall` is the fallback. `bin/agentflow` stays for working on the engine itself: it runs `agentflow/flow.py` straight from the checkout, so an edit takes effect with no reinstall.
 
 Then run these from the repo root of the project you drive.
@@ -357,6 +359,7 @@ agentflow backlog undone <module> [--by NAME]       # remove that hand mark; wit
 |---|---|
 | A run fails on a missing tool or a login, or you are setting up a new machine | `agentflow doctor` checks, in order, each enabled agent's CLI and login (`claude auth status`, `codex login status`), `gh auth status` (needs the network), the `origin` remote, Docker (only when a gate runs `docker`), that the state dir is writable, the variables a run does not inherit (`inherited environment`, a warning that names them), and that each gate's programs are on `PATH` (`defaults.env.PATH` when set). It prints `ok`, `warn` or `fail` with a fix for each, and exits 1 on any `fail`. A gate program that `gate_sets.setup` may install is a warning, not a failure. A broken user file is reported as a `user config` failure and the checks go on without it |
 | A gate or an agent step fails only inside a run, and passes in your own shell | a variable your shell or IDE loaded from `.env` may have been dropped from the run, or one that leaked in may differ from the pack's. `agentflow doctor` has an `inherited environment` check that names the variables a run drops and the file they match (never their values). To keep one, set it in `defaults.env`. `defaults.env_inherit` (playbook section 14) says what is dropped |
+| `validate` or `doctor` fails on a key the pack uses right after you pulled the harness (for example `work_source.path: missing`) | the installed engine is older than the checkout. Run `uv tool install --reinstall --from /path/to/agentflow-harness agentflow` (section 3), then `validate` again |
 | `agentflow validate` prints warnings or errors | the message names the YAML path (`phases.build.model`, `phases.define.steps[4].when`). Fix that line and re-run |
 | `run` says the agent command is not found | the preflight checks the `command` of each enabled agent. Install it or fix `agents.<name>.command` |
 | A run shows `held` | a usage limit or an outage. It carries on by itself (section 8); `pause` or `cancel` if you don't want it to |
