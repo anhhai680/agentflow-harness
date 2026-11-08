@@ -81,6 +81,12 @@ def test_pyproject_version_is_the_engine_version():
     assert tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"] == pack.ENGINE_VERSION
 
 
+def test_changelog_has_an_entry_for_the_current_version():
+    text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "## [Unreleased]" in text
+    assert f"## [{pack.ENGINE_VERSION}]" in text
+
+
 def test_wheel_holds_every_engine_file_and_no_tests(tmp_path):
     wheel = _build_wheel_or_skip(tmp_path)
     names = set(zipfile.ZipFile(wheel).namelist())

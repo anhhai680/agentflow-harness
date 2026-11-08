@@ -5,7 +5,8 @@ Routes:
 - `GET /` (exactly `/`) is the page shell: it holds no run data, so it needs no token. `agentflow dashboard`
   prints `http://127.0.0.1:<port>/#token=<token>`; the fragment never reaches the server or its log, and
   the page keeps the token in `sessionStorage`, so a reload works. Every other route needs the token.
-- `GET /api/board` (every lane, or `?lane=<name>`), `GET /api/workflow`, `GET /api/agents`,
+- `GET /api/info` (the harness name and the engine version the page shows in its header),
+  `GET /api/board` (every lane, or `?lane=<name>`), `GET /api/workflow`, `GET /api/agents`,
   `GET /api/runs/<id>` (the card detail, its time and cost included), `GET /api/metrics` (time and cost over
   the runs started in `?from=YYYY-MM-DD&to=YYYY-MM-DD`, this month by default, or `?all=1`; `&lane=<name>`
   narrows it; a bad date is a 400); `GET /api/events` (SSE: every run's new events, runs created
@@ -59,7 +60,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from agentflow import backlog, config_edit, hitl, module_queue
+from agentflow import backlog, config_edit, hitl, module_queue, pack
 from agentflow.config import Config, ConfigError, for_lane, load_config
 from agentflow.events import EventError, lock_state
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
@@ -397,6 +398,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._error(404, f"unknown lane {lane!r}")
                 return
             self._json(200, board(self.server.repo, self.server.cfg, lane))
+        elif path == "/api/info":
+            self._json(200, {"name": "agentflow-harness", "version": pack.ENGINE_VERSION})
         elif path == "/api/workflow":
             self._json(200, workflow_view(self.server.cfg))
         elif path == "/api/agents":

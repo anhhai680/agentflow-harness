@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from agentflow import hitl
+from agentflow import hitl, pack
 from agentflow.dashboard import make_server
 from agentflow.state import Run, runs_root
 from agentflow.views import _badge
@@ -114,6 +114,15 @@ def new_events(run: Run, after: int) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- the token and the request checks
+
+
+def test_info_names_the_engine_version(dash):
+    status, headers, body = dash.get("/api/info")
+    assert status == 200 and headers["content-type"].startswith("application/json")
+    assert json.loads(body) == {"name": "agentflow-harness", "version": pack.ENGINE_VERSION}
+    assert dash.get("/api/info", token=None)[0] == 403
+    page = dash.get("/", token=None)[2].decode("utf-8")
+    assert 'id="version"' in page and "/api/info" in page
 
 
 def test_api_rejects_without_token(dash):
