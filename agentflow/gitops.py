@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from agentflow.guards import check_message, path_matches
+from agentflow.pack import LESSONS_FILE
 
 if TYPE_CHECKING:
     from agentflow.config import Config
@@ -219,6 +220,116 @@ def commit(worktree: Path, message: str, cfg: Config, paths: list[str] | None = 
         raise CommitRejected(f"commit {sha[:12]} was created, but {why}; it is left in place for a human to "
                              "inspect (nothing was rolled back)", kind="rejected_trailer" if rejected else "agent_commit")
     return sha
+
+
+def _status_entries(worktree: Path) -> list[tuple[str, str]]:
+    """`(XY, path)` for every changed, staged or untracked path, read from `git status --porcelain -z`.
+
+    Renames are turned off, and should git still report one (`R` or `C`), its source path is kept as an entry
+    of its own, so no path a change touches goes unseen. Paths are raw bytes decoded as git printed them: no
+    quoting, so spaces, newlines and a leading `-` arrive as they are."""
+    out = _git_or_raise(worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
+                        "--ignore-submodules=none")
+    fields = out.split("\0")
+    entries: list[tuple[str, str]] = []
+    i = 0
+    while i < len(fields):
+        item = fields[i]
+        i += 1
+        if not item:
+            continue
+        xy, path = item[:2], item[3:]
+        entries.append((xy, path))
+        if "R" in xy or "C" in xy:
+            if i < len(fields):
+                entries.append((xy, fields[i]))
+            i += 1
+    return entries
+
+
+def _lessons_refused(worktree: Path, why: str) -> CommitRejected:
+    """Put the index back at `HEAD` (the working tree is untouched) and name the refusal, as `commit` does."""
+    _git(worktree, "reset", "-q")
+    return CommitRejected(f"the lessons commit was refused: {why}", kind="forbidden_path")
+
+
+def commit_lessons(worktree: Path, message: str, cfg: Config) -> str:
+    """Commit `pack.LESSONS_FILE`, and nothing else, with `project.commit_trailer` appended; return the new sha.
+
+    This is the one runner commit that may touch the pack: `commit` refuses every `.agentflow/**` path, and
+    this one allows exactly the lessons file, as a regular file (mode 100644) inside the worktree.
+
+    In order: the message is checked against `guardrails.reject_trailers` before anything is staged (a rejected
+    trailer raises `CommitRejected` and changes nothing). Any other changed, staged or untracked path, a type
+    change, a symlink at the lessons file or at its directory, or a lessons path that is not a regular file
+    inside the worktree raises `CommitRejected` (kind `forbidden_path`) after the index is reset to `HEAD`.
+    An unchanged or absent lessons file raises `NothingToCommit`. The commit runs with no hooks
+    (`core.hooksPath=/dev/null`, `--no-verify`) and is limited to the lessons path. The commit actually created
+    is checked again: one parent, the old `HEAD`; exactly the lessons file changed, as a regular file; no
+    rejected trailer. A failure raises `CommitRejected` naming the commit, which is left in place for a human
+    (never rolled back silently)."""
+    worktree = Path(worktree)
+    before = head(worktree)
+    text = message.strip()
+    trailer = cfg.project.commit_trailer.strip()
+    if trailer and not text.endswith(trailer):
+        text = f"{text}\n\n{trailer}"
+    rejected = check_message(cfg, text)
+    if rejected:
+        raise CommitRejected("commit message carries a rejected trailer: " + ", ".join(v.detail for v in rejected))
+
+    entries = _status_entries(worktree)
+    others = sorted({path for _, path in entries if path != LESSONS_FILE})
+    if others:
+        raise _lessons_refused(worktree, "it may change only " + LESSONS_FILE + ", and these changed too: "
+                               + ", ".join(repr(p) for p in others))
+    if any("T" in xy or "U" in xy for xy, _ in entries):
+        raise _lessons_refused(worktree, f"{LESSONS_FILE} changed type or is unmerged")
+    lessons = worktree / LESSONS_FILE
+    if lessons.parent.is_symlink() or lessons.is_symlink():
+        raise _lessons_refused(worktree, f"{LESSONS_FILE} or its directory is a symlink")
+    if not entries or not os.path.lexists(lessons):
+        raise NothingToCommit(f"{LESSONS_FILE} is unchanged or absent in {worktree}")
+    if not lessons.is_file() or lessons.resolve() != worktree.resolve() / LESSONS_FILE:
+        raise _lessons_refused(worktree, f"{LESSONS_FILE} is not a regular file inside the worktree")
+
+    _git_or_raise(worktree, "add", "--", LESSONS_FILE)
+    raw = [f for f in _git(worktree, "diff", "--cached", "--raw", "-z", "--no-renames", "--no-abbrev").split("\0") if f]
+    staged = raw[1::2]
+    if not staged:
+        raise NothingToCommit(f"{LESSONS_FILE} is unchanged in {worktree}")
+    if staged != [LESSONS_FILE]:
+        raise _lessons_refused(worktree, "the index holds other paths: " + ", ".join(repr(p) for p in staged))
+    if raw[0].split()[1] != "100644":
+        raise _lessons_refused(worktree, f"{LESSONS_FILE} would be committed with mode {raw[0].split()[1]}, "
+                               "not as a regular file (100644)")
+
+    proc = subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "commit", "--no-verify", "-q", "-F", "-", "--", LESSONS_FILE],
+        cwd=worktree, input=text + "\n", capture_output=True, text=True, encoding="utf-8", check=False,
+    )
+    if proc.returncode != 0:
+        raise GitError(proc.stderr.strip() or f"git commit exited {proc.returncode}")
+
+    sha = head(worktree)
+    parents = _git_or_raise(worktree, "rev-list", "--parents", "-n", "1", sha).split()[1:]
+    changed = [p for p in _git_or_raise(worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames",
+                                        sha).split("\0") if p]
+    entry = _git_or_raise(worktree, "ls-tree", "-z", sha, "--", LESSONS_FILE).split()
+    created = _git_or_raise(worktree, "log", "-1", "--format=%B", sha)
+    rejected = check_message(cfg, created)
+    if rejected:
+        why, kind = "its message carries a rejected trailer: " + ", ".join(v.detail for v in rejected), "rejected_trailer"
+    elif parents != [before]:
+        why, kind = f"its parents are {', '.join(p[:12] for p in parents) or 'none'}, not {before[:12]}", "agent_commit"
+    elif changed != [LESSONS_FILE]:
+        why, kind = "it changes " + ", ".join(repr(p) for p in changed) + f", not only {LESSONS_FILE}", "forbidden_path"
+    elif not entry or entry[0] != "100644":
+        why, kind = f"it records {LESSONS_FILE} with mode {entry[0] if entry else 'none'}, not 100644", "forbidden_path"
+    else:
+        return sha
+    raise CommitRejected(f"commit {sha[:12]} was created, but {why}; it is left in place for a human to inspect "
+                         "(nothing was rolled back)", kind=kind)
 
 
 def commits_between(worktree: Path, base: str, tip: str = "HEAD", exclude: Sequence[str] = ()) -> list[str]:
