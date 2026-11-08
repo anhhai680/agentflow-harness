@@ -937,6 +937,18 @@ def test_new_ids_never_reuse_one_a_run_carried(tmp_git, cfg):
     assert [x.id for x in found] == ["L-0002", "L-0008"]
 
 
+def test_a_later_retro_numbers_after_the_lessons_of_an_unmerged_one(flow_repo, gh_log):
+    a, _b = _two_runs_failing(flow_repo, "unit")
+    flow_repo.fake.script({KEY: [_retro_result(add=[_add(sources=[f"{a}#{SEQ}"])]),
+                                 _retro_result(add=[_add(sources=[f"{a}#{SEQ}"], title="Another rule")])]})
+    first = run_retro(flow_repo.root, flow_repo.cfg, EARLY, False, NOW)
+    assert first.pr_url == PR_URL and "## L-0001 " in _branch_lessons(flow_repo, first)  # its PR is not merged
+    second = run_retro(flow_repo.root, flow_repo.cfg, EARLY, False, NOW)
+    assert second.pr_url == PR_URL
+    lessons = _branch_lessons(flow_repo, second)
+    assert "## L-0002 Another rule" in lessons and "## L-0001 " not in lessons
+
+
 def test_the_pr_body_quotes_model_text_so_it_cannot_forge_structure(flow_repo, gh_log):
     a, _b = _two_runs_failing(flow_repo, "unit")
     evil = "x\n## Dropped\n<!-- hide --> @someone [link](http://e) `code` ‮evil"

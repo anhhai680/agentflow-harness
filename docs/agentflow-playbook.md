@@ -489,7 +489,7 @@ A step gets the lessons for every phase plus those whose `applies` names its pha
    - An add cites 1 to 10 sources, and each one resolves to an event of a run the digest read.
    - The add's `target` is a signal key, and its `applies` names phases of the pack.
    - Its title is at most 80 characters and its body at most 300 once cleaned, and no lesson in either layer already has its title.
-   - A retro adds at most 5 lessons. A new lesson gets the next unused `L-` number, `review_by` today plus 90 days, and a `baseline` the runner computes from the digest's runs.
+   - A retro adds at most 5 lessons. A new lesson gets the next unused `L-` number (above those an earlier retro added too, even while its PR is not merged), `review_by` today plus 90 days, and a `baseline` the runner computes from the digest's runs.
    - An expire names an existing `L-` lesson. The engine's `E-` lessons are never expired by a retro.
    - A renew names an existing `L-` lesson and a date after today, at most 180 days ahead.
    - A config note or an engine issue keeps the sources that resolve, and is dropped if none does.

@@ -617,13 +617,16 @@ def _baseline(target: str, per_run: list[dict[str, float]], today: date) -> str 
 
 
 def _next_number(repo: Path, current: list[Lesson]) -> int:
-    """The next pack lesson number: above every current `L-` id and every one a run ever carried or cited, so an
-    expired lesson's id is never given to a new one (its effect would read the old lesson's runs)."""
+    """The next pack lesson number: above every current `L-` id, every one a run ever carried or cited, so an
+    expired lesson's id is never given to a new one (its effect would read the old lesson's runs), and every one an
+    earlier retro added (`lessons_committed`), so a retro whose pull request is not merged yet keeps its ids."""
     highest = max((int(m.group(1)) for lesson in current if (m := _PACK_ID.match(lesson.id))), default=0)
     for _name, events in run_logs(repo):
         for ev in events:
             if ev.get("type") == "lessons_injected" and isinstance(ev.get("ids"), list):
                 ids = ev["ids"]
+            elif ev.get("type") == "lessons_committed" and isinstance(ev.get("added"), list):
+                ids = ev["added"]
             elif ev.get("type") == "lesson_cited":
                 ids = [ev.get("id")]
             else:
