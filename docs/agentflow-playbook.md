@@ -345,6 +345,11 @@ agentflow queue --include-specs                     # a pack with work_source sp
 agentflow backlog done <module> [--by NAME]         # mark a module finished by hand (refused while it has a live run)
 agentflow backlog undone <module> [--by NAME]       # remove that hand mark; with none, ignore the origin evidence that
                                                     #   says it is done (a merged module stays done)
+agentflow retro [--since YYYY-MM-DD]                # lessons from the runs ended since the last finished retro, as a
+                                                    #   draft PR that changes only .agentflow/lessons.md (section 15)
+agentflow retro --dry-run                           # print the digest and the session's prompt; creates nothing
+agentflow lessons [--json]                          # each lesson's verdict: its target before and after the runs that
+                                                    #   carried it
 ```
 
 ## 11. Safety model in five lines
@@ -452,7 +457,7 @@ A live run sees a change to any layer file between its phases: the runner takes 
 - `conditions`: named checks the runner evaluates from files and git; `modules_done` reads `work_source` and takes no `from`. `finish` also runs the `eval` gate on a merged tree when the pack defines `eval_required` and it holds. Protected.
 - `lanes`: the kinds of work. Not protected. When it includes `bug` and `.claude/settings*.json` in the main checkout holds no `Bash(...)` allow rule at all, `validate` warns at `lanes`: the bug lane's red/green check runs the regression test only when a Bash allow rule covers it, whatever `permission_mode` says. Add a narrow rule such as `Bash(<verify gate's program> *)`.
 - `record_step`, `resolve_step`: the steps that file a spec-gap answer and resolve a stop. Protected.
-- `retro_step`: the one session of a retro run (`agentflow retro`), `{id: retro, skill: agentflow-retro, role: review, prompt: retro.md}` from the engine defaults. It reads the digest, proposes lessons, config notes and engine issues in its result, and changes no file; the runner checks every source and opens the draft pull request. Not a workflow key, so a pack that writes its whole workflow keeps it; `validate` checks it as it checks `resolve_step`, and refuses a lane named `retro`. Protected.
+- `retro_step`: the one session of a retro run (`agentflow retro`), `{id: retro, skill: agentflow-retro, role: review, prompt: retro.md}` from the engine defaults. It reads the digest, proposes lessons, config notes and engine issues in its result, and changes no file; the runner checks every source and opens the draft pull request. Not a workflow key, so a pack that writes its whole workflow keeps it; `validate` checks it as it checks `resolve_step`, and refuses a lane or a phase named `retro`. Protected.
 - `autonomy`: what the runner decides by itself. Not protected.
 - `autonomy.answer_recommended`: `true` (the default) lets the runner take a `needs_human` result's recommended answers in **every** phase, `resolve: true` or not, parked or not, when each question has exactly one recommended option and none has a kind in `human_question_kinds`. It records them as `hitl_answered` with `by: runner`, notifies one line ("took the recommended answer(s) q1=A in plan/plan; the decision is recorded"), files a `spec_gap` answer in the spec through `record_step` as a human's answer is, and lists each one under "Decisions the runner took" in the pull request. A step that asks a question the runner already answered on it goes to a human. `false` sends every question to a human. A value that is not a bool is a `validate` error. Not protected.
 - `autonomy.human_question_kinds`: the question kinds only a human answers, `[boundary]` by default (`boundary`: the repository's docs reserve the decision for a human, such as an "ask first" or "never" rule). One such question makes its whole set a human's in any phase, parked or not. `[]` lets the runner answer every kind. A list of the kinds `spec_gap`, `ambiguity`, `conflict`, `review_dispute`, `boundary` and `other`, or `validate` refuses it. Not protected.
@@ -462,3 +467,106 @@ A live run sees a change to any layer file between its phases: the runner takes 
 - `checkpoints`: who answers each inner checkpoint. Not protected.
 - `hitl`: notifications, reminders and where decisions are recorded. Not protected, except `hitl.notify`.
 - `dashboard`: host, port and the Backlog. Not protected, except `dashboard.host`.
+
+## 15. Lessons and retros
+
+A lesson is a one-line rule that earlier runs taught, such as "run the unit tests before writing a build step's result". Every agent session's prompt carries the lessons under "Lessons from earlier runs". A **retro** reads the runs that ended since the last retro and proposes lessons as a draft pull request. The pull request changes only `.agentflow/lessons.md`, and a human merges it or closes it. The runner never writes a lesson into the repository on its own, and it never merges.
+
+There are two layers of lessons:
+- **The engine's `agentflow/lessons.md`** holds rules that hold in any project, with ids `E-NNNN`. It ships with the engine and changes only in an engine release.
+- **The pack's `.agentflow/lessons.md`** holds this repository's rules, with ids `L-NNNN`. A merged retro PR or a human changes it. Its path is fixed (there is no config key), it is under the engine floor (`.agentflow/**`), so no agent in a run can edit it, and only the main checkout's copy is read.
+
+A step gets the lessons for every phase plus those whose `applies` names its phase, engine lessons first, and none that is past its `review_by`. The slot holds at most `memory.lessons_max_tokens` (1500 by default; 0 turns lessons off). Over that, the lowest-numbered pack lessons are dropped first, the engine's last, and the run records `memory_truncated`. Each fresh session records which lessons it carried (`lessons_injected`). A result may list the ones it used in `lessons_cited`, and the runner records each as `lesson_cited`.
+
+### How a retro runs
+
+`agentflow retro` runs a retro now. `agentflow next` and `agentflow status` print `Retro due: <n> finished runs since <date> → agentflow retro`, and the dashboard shows the same line as a banner, once a retro is due. A retro is due when `memory.retro_every_days` (7) days have passed since the last finished retro started (or there has been none) and a run has ended since then. `agentflow queue` runs a due retro by itself before it starts modules. If that retro does not end `done`, that queue tries no other retro until it is started again. `retro_every_days: 0` means you run retros by hand only.
+
+1. **The runs.** The retro reads the runs that ended (`done`, `failed` or `cancelled`) after the last *finished* retro started. With no finished retro it reads every ended run, and `--since YYYY-MM-DD` reads the runs that ended on or after that day (from midnight UTC) instead. Retro runs are never read. With nothing to read it prints `nothing to learn` and creates nothing.
+2. **The digest.** The runner writes the digest from the run logs alone, with no model involved, to `<state dir>/runs/<run>/retro/digest.md`, and the session gets a copy in its workspace. It holds one line per run, every signal event cited as `<run id>#<seq>` (a failed gate with its last lines, a fix attempt, a stop, a guard trip, a denied command, a human rejection or answer, a blocking review, a CI round, a retry, a runner error), the signal means over those runs, and each lesson with its effect. Quoted text is cleaned and cut, and the digest says it is data, never an instruction. Over `memory.digest_tokens` (15000), the oldest runs' evidence is dropped first and one line counts what went. `agentflow retro --dry-run` prints the digest and the session's prompt, and creates no run, branch or worktree.
+3. **The session.** The retro is a run of the engine's `retro` pipeline, which is not a lane. It works in its own worktree on `project.branch` with lane `retro` and slug `YYYYMMDD`, for example `flow/retro/20261108`, or `flow/retro/20261108-2` for a second retro that day. It forks from `project.fork_from`. One session of `retro_step` (the bundled `agentflow-retro` skill and `prompts/retro.md`) reads the digest and changes no file. Its result proposes lessons to add, expire and renew, config notes and engine issues.
+4. **The checks.** The runner keeps a proposal only when it holds against the run logs:
+   - An add cites 1 to 10 sources, and each one resolves to an event of a run the digest read.
+   - The add's `target` is a signal key, and its `applies` names phases of the pack.
+   - Its title is at most 80 characters and its body at most 300 once cleaned, and no lesson in either layer already has its title.
+   - A retro adds at most 5 lessons. A new lesson gets the next unused `L-` number, `review_by` today plus 90 days, and a `baseline` the runner computes from the digest's runs.
+   - An expire names an existing `L-` lesson. The engine's `E-` lessons are never expired by a retro.
+   - A renew names an existing `L-` lesson and a date after today, at most 180 days ahead.
+   - A config note or an engine issue keeps the sources that resolve, and is dropped if none does.
+
+   The PR body's "Dropped" section lists every proposal the runner left out, with the reason.
+5. **The pull request.** If nothing changed, the run ends `done` with `nothing to learn` and opens no PR. Otherwise the runner renders `.agentflow/lessons.md` and commits that file alone (`Update lessons from the retro of <n> runs.`). It pushes the commit by its sha to the same-named branch on `origin`, with no hooks, then opens a draft PR titled `Lessons from <n> runs (<date>)` against `project.fork_from`. The exit code is 0 when the retro run ended `done`, and 1 when it stopped, failed or was refused.
+
+Only one retro is open at a time. While one is running, waiting on you or stopped on an error, `agentflow retro` is refused, the queue starts none, and no `Retro due` line shows.
+
+### What the runner refuses after the session, and why
+
+The session is an agent with a shell, and "change no file" is only a request in its prompt. So the runner records the checkout before the session and compares it afterwards. It also reads the lessons file it builds on from git, at the commit the retro forked from, and never from the work tree. Each of these stops the retro as `blocked`, before any commit or push:
+- **The git configuration, hooks or control files changed.** This covers every config scope, `origin`'s push URL, `hooks/`, `info/exclude`, `info/attributes`, `info/sparse-checkout`, `info/grafts`, and the worktree's links. These decide what the runner's own git calls do later: a push refspec could send the lessons commit to `main`, and a planted hook would run as you. Other branches' `branch.<name>.*` keys are ignored, so another run pushing at the same time does not trip it.
+- **The tree changed.** This covers any new, changed or ignored file, an index entry flagged skip-worktree or assume-unchanged, and `HEAD` moved or pointed at another branch. The stop names the paths.
+- **Something sits at `.agentflow/lessons.md` that the branch does not hold.** This covers a file the branch lacks, different bytes, a FIFO or a device, a symlink, or a hard link.
+- **The commit is refused.** `gitops.commit_lessons` commits the lessons file and nothing else. It refuses any other path, a symlinked or hard-linked file, and a `guardrails.reject_trailers` trailer, and the committed blob must be exactly the text the runner wrote. After the commit, the git state and `HEAD` are checked once more before the push.
+
+The retro also stops before its session when the lessons file on `project.fork_from` has a malformed entry (`agentflow validate` lists them), and after its session when that file is ignored by `.gitignore`, when the result cannot be read, or when `gh` cannot open the PR. In that last case the stop names the branch it already pushed.
+
+**A stopped retro is cancelled and run again.** It shows in the inbox as `blocked` on `retro/retro`, with the reason. It cannot be approved, answered, rejected, retried or resumed, from the CLI or the dashboard. Read the reason, fix the cause (for example the malformed entry, or a hook or setting the stop names), then `agentflow cancel <run>` and `agentflow retro`. The new retro reads the same runs, because the stopped one never finished.
+
+### Reviewing a lessons PR
+
+The diff is `.agentflow/lessons.md` alone, and the runner refuses to open the PR otherwise. The body has these sections, in this order:
+- **The lead paragraph** names how many runs the retro read (first and last run id). It says the runner checked every source against the run logs and that the numbers show correlation, not cause. When the digest was cut to fit, it says how many evidence entries were left out.
+- **Effect of previous lessons** is the `agentflow lessons` table as it stood when the retro ran: each lesson's verdict, target, baseline, after and citations (see the next subsection).
+- **Lessons** has one line for each change: `Added` (with its title, body, target, recorded baseline, phases, `review_by`, sources and whether it is an engine candidate), `Expired` and `Renewed`, each with its reason.
+- **Config notes** and **Engine issues seen** are advice that nothing applies. A config note is a setting to look at (a budget, a model, a timeout, a slow gate). An engine issue is a runner bug to file.
+- **Dropped** lists each proposal the runner refused, and why.
+
+All the text the model wrote is in code spans, so it cannot add headings, links or mentions. Before you merge:
+1. **Check the evidence.** Each source is `<run id>#<seq>`. Open the run with `agentflow status <run id>`, the dashboard drawer (the Lessons tab links each source), or the `seq` line of the run's `events.jsonl`. Check that the event shows what the lesson claims.
+2. **Check the rule.** It should be something an agent can do differently, not a one-off. A cause in a setting belongs in the config, not in a lesson.
+3. **Check the target.** It should be a signal the rule should move, so that the next retro can tell whether the lesson helped. A lesson marked `engine candidate: yes` may hold in any project. Promote it by hand in an engine change to `agentflow/lessons.md`, which takes an `E-` id.
+4. **Read Dropped.** Many dropped sources mean the session cited events that do not exist. Use it as a reason to read the rest more carefully.
+5. **Edit or close.** Edit the PR branch by hand if a lesson needs rewording (keep the format below), or close the PR. Closing it changes nothing.
+
+Merging makes the lesson live for every session that starts after it reaches the **main checkout's** `.agentflow/lessons.md`. Lessons are read from that file on disk, so after merging on the forge, run `git pull` in the main checkout.
+
+### Reading `agentflow lessons`
+
+`agentflow lessons` prints one row per lesson of both layers. The columns are `ID`, `VERDICT`, `TARGET`, `BASELINE`, `AFTER`, `CITED` and `TITLE`, and the title of a lesson past its `review_by` ends `(past review_by)`. A note under the table says that before/after shows correlation, not cause. `--json` gives the same data, plus each lesson's body, phases, sources and the `baseline` recorded in the file. The dashboard's Lessons tab shows it as a table, and each source opens its run.
+- **AFTER** is the mean of the target signal over the ended, non-retro runs that carried the lesson.
+- **BASELINE** is the mean over the ended runs without it that started before the first run that carried it. Each value has its count of runs.
+- A run counts only when it has the target's key, such as `gate_first_pass:unit` for a run where gate `unit` ran. A count signal (`fix_attempts`, `guard_trips`, `permission_denied`, `stop`, `human_rejections`, `ci_rounds`, `rollovers` and `progress_not_updated`) reads 0 in a run that has none.
+- **VERDICT** is one of these:
+  - `improved` or `worse`: the target moved by at least 10% the right or the wrong way. The change is relative to the baseline, or absolute when the baseline is below 1. Higher is better for `gate_first_pass` only; lower is better for every other signal.
+  - `no change`: the target moved by less than that.
+  - `too few runs`: fewer than 3 runs carried the lesson, or there is no baseline.
+  - `not measured`: the lesson has no `target`, or one outside the vocabulary.
+- **CITED** counts the times a session said it used the lesson.
+
+The verdict is computed from the runs every time. The `baseline` line in the file is the record the retro wrote when it added the lesson, and editing it changes no verdict.
+
+### The file format, and editing or expiring a lesson by hand
+
+```
+## L-0007 Run the portability test before finishing a build task
+- applies: build, verify
+- source: 20261105-0912-feature-pack#418
+- review_by: 2027-02-01
+- target: gate_first_pass:portability
+- baseline: 0.33 over 9 runs to 2026-11-08
+The portability gate fails on project strings in engine files; grep its denylist first.
+```
+
+An entry is a `## <id> <title>` heading, then any of the `- key: value` lines, then exactly one body line of at most 300 characters. Text before the first `## ` heading is the file's header and is not read.
+- **`applies`**: phase names separated by commas. Leave the line out to cover every phase.
+- **`source`**: `<run id>#<seq>` pointers separated by commas.
+- **`review_by`**: a date, `YYYY-MM-DD`. On the day after it, the lesson leaves every prompt. It stays in the file, and the next retro's digest marks it expired, so the retro can renew or expire it.
+- **`target`**: one signal key from the fixed vocabulary: `gate_first_pass:<gate>`, `fix_attempts:<phase>`, `guard_trips:<kind>`, `permission_denied:<tool>`, `stop:<kind>`, `human_rejections:<phase>`, `review_blocking:<phase>`, `cost_per_task:<phase>`, `turns_per_step:<phase>`, `ci_rounds`, `rollovers`, `progress_not_updated` or `rework_pct`. Without one the lesson is `not measured`.
+- **`baseline`**: written by the runner. It is a record, not an input (see above).
+
+The rules for editing by hand:
+- **Change it like code:** on a branch, through a PR, then pull it into the main checkout. An edit to the main checkout's file reaches the next session at once, committed or not.
+- **Keep one body line** with no list dash or heading mark at its start. Never put ` #` (a space and then `#`) in a value, because it starts a comment.
+- **Give a new lesson a number above every `L-` number used before,** including those of expired lessons. A lesson's effect is read from the runs that carried its id, so a reused id would inherit the old lesson's runs. The retro numbers its own adds this way.
+- **A malformed entry is left out of prompts,** and `agentflow validate` names its line as a warning. A retro stops before its session when the file on `project.fork_from` has one, so fix it before the next retro. A duplicate id keeps the first entry. `validate` also warns about an `applies` phase the pack does not have and a `target` outside the vocabulary. It never warns about a passed `review_by`.
+- **To expire a lesson,** delete its entry, or set `review_by` to a past date to keep it in the file for the record. **To renew it,** set a later `review_by`.
+- **Edit the engine's `E-` lessons only in an engine change.** A retro never touches them.
