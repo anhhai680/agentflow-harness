@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import threading
 from collections.abc import Callable, Sequence
@@ -17,6 +19,11 @@ from agentflow.pack import LESSONS_FILE
 
 if TYPE_CHECKING:
     from agentflow.config import Config
+
+
+# Run first on every git call the runner makes after an agent may have touched the repository's shared git state:
+# no hook and no fsmonitor command runs (the agent could have planted either), and nothing is hidden from status.
+HARDENED = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
 
 
 class GitError(Exception):
@@ -228,7 +235,7 @@ def _status_entries(worktree: Path) -> list[tuple[str, str]]:
     Renames are turned off, and should git still report one (`R` or `C`), its source path is kept as an entry
     of its own, so no path a change touches goes unseen. Paths are raw bytes decoded as git printed them: no
     quoting, so spaces, newlines and a leading `-` arrive as they are."""
-    out = _git_or_raise(worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
+    out = _git_or_raise(worktree, *HARDENED, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
                         "--ignore-submodules=none")
     fields = out.split("\0")
     entries: list[tuple[str, str]] = []
@@ -253,7 +260,7 @@ def _lessons_refused(worktree: Path, why: str) -> CommitRejected:
     return CommitRejected(f"the lessons commit was refused: {why}", kind="forbidden_path")
 
 
-def commit_lessons(worktree: Path, message: str, cfg: Config) -> str:
+def commit_lessons(worktree: Path, message: str, cfg: Config, expected_text: str | None = None) -> str:
     """Commit `pack.LESSONS_FILE`, and nothing else, with `project.commit_trailer` appended; return the new sha.
 
     This is the one runner commit that may touch the pack: `commit` refuses every `.agentflow/**` path, and
@@ -269,7 +276,11 @@ def commit_lessons(worktree: Path, message: str, cfg: Config) -> str:
     is checked again: one parent, the old `HEAD`; exactly the lessons file changed, as a regular file whose blob
     is the one checked and staged (`git commit -- <path>` reads the file again, so a swap in between shows here);
     no rejected trailer. A failure raises `CommitRejected` naming the commit, which is left in place for a human
-    (never rolled back silently)."""
+    (never rolled back silently).
+
+    With `expected_text` (the text the caller wrote), the staged blob must be that text exactly (`git hash-object
+    --no-filters` of its UTF-8 bytes), so a process that rewrote the file between the caller's write and the
+    staging is refused (`forbidden_path`, the index reset). Every git call here runs with `HARDENED`."""
     worktree = Path(worktree)
     before = head(worktree)
     text = message.strip()
@@ -297,8 +308,9 @@ def commit_lessons(worktree: Path, message: str, cfg: Config) -> str:
     if os.lstat(lessons).st_nlink != 1:
         raise _lessons_refused(worktree, f"{LESSONS_FILE} is a hard link (it has other names, maybe outside the worktree)")
 
-    _git_or_raise(worktree, "add", "--", LESSONS_FILE)
-    raw = [f for f in _git(worktree, "diff", "--cached", "--raw", "-z", "--no-renames", "--no-abbrev").split("\0") if f]
+    _git_or_raise(worktree, *HARDENED, "add", "--", LESSONS_FILE)
+    raw = [f for f in _git(worktree, *HARDENED, "diff", "--cached", "--raw", "-z", "--no-renames",
+                           "--no-abbrev").split("\0") if f]
     staged = raw[1::2]
     if not staged:
         raise NothingToCommit(f"{LESSONS_FILE} is unchanged in {worktree}")
@@ -308,9 +320,15 @@ def commit_lessons(worktree: Path, message: str, cfg: Config) -> str:
     if mode != "100644":
         raise _lessons_refused(worktree, f"{LESSONS_FILE} would be committed with mode {mode}, "
                                "not as a regular file (100644)")
+    if expected_text is not None:
+        wanted = subprocess.run(["git", "hash-object", "--no-filters", "--stdin"], cwd=worktree,
+                                input=expected_text.encode("utf-8"), capture_output=True, check=True).stdout.decode().strip()
+        if blob != wanted:
+            raise _lessons_refused(worktree, f"the staged {LESSONS_FILE} (blob {blob[:12]}) is not the text the runner "
+                                   f"wrote (blob {wanted[:12]}): something changed the file after it was written")
 
     proc = subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", "commit", "--no-verify", "-q", "-F", "-", "--", LESSONS_FILE],
+        ["git", *HARDENED, "commit", "--no-verify", "-q", "-F", "-", "--", LESSONS_FILE],
         cwd=worktree, input=text + "\n", capture_output=True, text=True, encoding="utf-8", check=False,
     )
     if proc.returncode != 0:
@@ -669,8 +687,11 @@ def diff_stat(worktree: Path, sha: str) -> str:
 
 
 def push(worktree: Path, branch: str) -> None:
-    """Push `branch` to `origin` and track it. Never forced."""
-    _git_or_raise(Path(worktree), "push", "-q", "-u", "origin", branch)
+    """Push `branch` to the branch of the same name on `origin` and track it. Never forced, and with an explicit
+    `refs/heads/<branch>:refs/heads/<branch>` refspec, so a `remote.origin.push` (or `mirror`) setting cannot send it
+    anywhere else; no hook runs (`HARDENED`, `--no-verify`), so a planted `pre-push` never runs as the runner."""
+    ref = f"refs/heads/{branch}"
+    _git_or_raise(Path(worktree), *HARDENED, "push", "--no-verify", "-q", "-u", "origin", f"{ref}:{ref}")
 
 
 def restore_paths(worktree: Path, paths: list[str], sha: str) -> None:
@@ -708,6 +729,87 @@ def uncommitted_paths(worktree: Path) -> list[str]:
             paths.add(parts[i])  # the original name of a rename or copy follows as its own item
             i += 1
     return sorted(paths)
+
+
+def _file_mark(path: Path) -> tuple:
+    """What a git control file is, for `git_state`: its type and the hash of its bytes (a link: its target)."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return ("absent",)
+    except OSError as exc:
+        return ("unreadable", str(exc))
+    if stat.S_ISLNK(info.st_mode):
+        return ("symlink", os.readlink(path))
+    if stat.S_ISDIR(info.st_mode):
+        return ("dir", tuple((child.name, _file_mark(child)) for child in sorted(path.iterdir())))
+    if not stat.S_ISREG(info.st_mode):
+        return ("special", stat.S_IFMT(info.st_mode))
+    with open(path, "rb") as handle:  # a regular file (lstat): no FIFO can block this open
+        return ("file", info.st_mode & 0o777, hashlib.sha256(handle.read()).hexdigest())
+
+
+def git_state(worktree: Path) -> dict[str, Any]:
+    """The git state an agent could change to make a later runner git call do something else: the effective config of
+    every scope (`git config --list --show-origin`), the push URL of `origin`, and the control files of the checkout
+    and of the repository it shares (`config`, `config.worktree`, `info/`, `hooks/`, the worktree's `.git` file). Two
+    equal values mean nothing of it changed. Read with `HARDENED`; nothing it reads runs a command."""
+    worktree = Path(worktree)
+
+    def where(what: str) -> Path:
+        found = Path(_git_or_raise(worktree, *HARDENED, "rev-parse", what).strip())
+        return found if found.is_absolute() else (worktree / found)
+
+    git_dir, common = where("--git-dir"), where("--git-common-dir")
+    files = {"dot_git": worktree / ".git"}
+    for name, base in (("git_dir", git_dir), ("common", common)):
+        for rel in ("config", "config.worktree", "info", "hooks", "commondir", "gitdir"):
+            files[f"{name}/{rel}"] = base / rel
+    config = subprocess.run(["git", *HARDENED, "config", "--list", "--show-origin", "-z"], cwd=worktree,
+                            capture_output=True, check=False).stdout
+    url = subprocess.run(["git", *HARDENED, "remote", "get-url", "--push", "origin"], cwd=worktree,
+                         capture_output=True, text=True, check=False).stdout.strip()
+    return {"config": hashlib.sha256(config).hexdigest(), "push_url": url,
+            "files": {name: _file_mark(path) for name, path in files.items()}}
+
+
+def tree_state(worktree: Path) -> dict[str, Any]:
+    """What the checkout at `worktree` holds besides `HEAD`, read so no setting can hide a change: every untracked
+    and every ignored path (`status` with `showUntrackedFiles=all`, `ignoreStat=false`, no untracked cache), each
+    index entry flagged skip-worktree or assume-unchanged (`ls-files -v`), whether the work tree and the index
+    differ from `HEAD`, and `HEAD` itself. Two equal values mean nothing git can see changed."""
+    worktree = Path(worktree)
+    strict = (*HARDENED, "-c", "status.showUntrackedFiles=all", "-c", "core.ignoreStat=false",
+              "-c", "core.untrackedCache=false")
+    status = _git_or_raise(worktree, *strict, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                           "--ignored=matching", "--no-renames", "--ignore-submodules=none")
+    flagged = [entry for entry in _git_or_raise(worktree, *strict, "ls-files", "-v", "-z").split("\0")
+               if entry and (entry[0] == "S" or entry[0].islower())]
+
+    def differs(*args: str) -> bool:
+        return subprocess.run(["git", *strict, "diff", "--quiet", *args], cwd=worktree, capture_output=True,
+                              check=False).returncode != 0
+
+    return {"status": sorted(e for e in status.split("\0") if e), "flagged": sorted(flagged),
+            "worktree_differs": differs("HEAD"), "index_differs": differs("--cached", "HEAD"),
+            "head": _git_or_raise(worktree, *strict, "rev-parse", "HEAD").strip()}
+
+
+def blob_at(repo: Path, ref: str, path: str, limit: int) -> bytes | None:
+    """The bytes of `path` at commit `ref`, or None when `ref` has no such path. `ValueError` when it is not a regular
+    file there (mode 100644 or 100755: no link, no tree, no submodule) or is larger than `limit` bytes."""
+    repo = Path(repo)
+    entry = _git_or_raise(repo, *HARDENED, "ls-tree", "-l", "-z", ref, "--", path).split("\0")[0]
+    if not entry:
+        return None
+    meta, _tab, _name = entry.partition("\t")
+    mode, kind, blob, size = (meta.split() + ["", "", "", ""])[:4]
+    if kind != "blob" or mode not in ("100644", "100755"):
+        raise ValueError(f"{path} at {ref[:12]} is not a regular file (mode {mode} {kind})")
+    if not size.isdigit() or int(size) > limit:
+        raise ValueError(f"{path} at {ref[:12]} is larger than {limit} bytes")
+    return subprocess.run(["git", *HARDENED, "cat-file", "blob", blob], cwd=repo, capture_output=True,
+                          check=True).stdout
 
 
 def create_draft_pr(worktree: Path, base: str, branch: str, title: str, body_file: Path) -> str:
