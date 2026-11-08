@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
 from agentflow import lessons, pack
 from agentflow.config import load_config, validate
-from agentflow.lessons import LESSONS_HEADING, SOURCE, Lesson, Selection, estimate_tokens, load, parse, render, select
+from agentflow.lessons import (LESSONS_HEADING, SOURCE, Lesson, Selection, effects, estimate_tokens, load, parse, render,
+                               select)
+from agentflow.state import runs_root
 
 TODAY = date(2026, 11, 8)
 
@@ -284,3 +287,206 @@ def test_validate_warns_on_an_unknown_target_and_phase(tmp_cfg):
 
 def test_validate_gives_no_warning_for_a_passed_review_date(tmp_cfg):
     assert _lesson_warnings(tmp_cfg, "## L-0001 t\n- review_by: 2000-01-01\n- target: ci_rounds\nb\n") == []
+
+
+# --------------------------------------------------------------------------- effects: before and after a lesson
+
+NOW = datetime(2026, 11, 9, 12, 0, tzinfo=UTC)
+START = datetime(2026, 11, 1, 8, 0, tzinfo=UTC)
+LINT_LESSON = Lesson("L-0001", "Run lint", "Run the linter first.", ("build",), (), None, "gate_first_pass:lint", None)
+
+
+def _write_run(repo, n: int, *, gates=(), injected=(), cited=(), lane: str = "feature", end: str | None = "run_finished",
+               extra=(), start: datetime | None = None) -> str:
+    """A run on disk with only an `events.jsonl`: started `n` hours after START unless `start` is given."""
+    start = start or START + timedelta(hours=n)
+    run_id = f"{start:%Y%m%d-%H%M}-{lane}-r{n}"
+    events: list[dict] = [{"type": "run_started", "run_id": run_id, "pipeline": lane, "params": {"module": "m"}},
+                          {"type": "phase_started", "phase": "build"}]
+    if injected:
+        events.append({"type": "lessons_injected", "key": "build/build", "ids": list(injected), "digest": "d"})
+    events += [{"type": "gate_result", "key": "build/build", "gate": gate, "passed": passed, "skipped": False,
+                "duration_s": 0.0} for gate, passed in gates]
+    events += [{"type": "lesson_cited", "key": "build/build", "id": lid} for lid in cited]
+    events += list(extra)
+    if end:
+        events.append({"type": end})
+    folder = runs_root(repo) / run_id
+    folder.mkdir(parents=True)
+    lines = [json.dumps({"seq": i, "ts": (start + timedelta(seconds=i)).isoformat(), "by": "runner", **ev})
+             for i, ev in enumerate(events, 1)]
+    (folder / "events.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return run_id
+
+
+def _runs(repo, before, after, lesson: str, first: int = 0) -> int:
+    """`before` runs with no lesson, then `after` runs that carried `lesson`; each item is one run's `(gate, passed)`."""
+    n = first
+    for gate in before:
+        _write_run(repo, n, gates=[gate])
+        n += 1
+    for gate in after:
+        _write_run(repo, n, gates=[gate], injected=[lesson])
+        n += 1
+    return n
+
+
+def test_improved_when_first_pass_rises(tmp_git):
+    _runs(tmp_git, before=[("lint", False)] * 3 + [("lint", True)], after=[("lint", True)] * 3, lesson="L-0001")
+    (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
+    assert (eff.verdict, eff.baseline, eff.after, eff.after_runs) == ("improved", 0.25, 1.0, 3)
+    assert (eff.id, eff.title, eff.target, eff.baseline_runs, eff.cited) == ("L-0001", "Run lint", "gate_first_pass:lint", 4, 0)
+
+
+def test_worse_when_it_falls(tmp_git):
+    _runs(tmp_git, before=[("lint", True)] * 3, after=[("lint", False)] * 3, lesson="L-0001")
+    (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
+    assert (eff.verdict, eff.baseline, eff.after) == ("worse", 1.0, 0.0)
+
+
+def test_no_change_inside_the_band(tmp_git):
+    _runs(tmp_git, before=[("lint", True)] * 3, after=[("lint", True)] * 3, lesson="L-0001")
+    assert effects(tmp_git, [LINT_LESSON], NOW)[0].verdict == "no change"
+    assert lessons.NO_CHANGE_BAND == 0.10 and lessons.MIN_AFTER_RUNS == 3
+
+
+def test_too_few_after_runs(tmp_git):
+    _runs(tmp_git, before=[("lint", False)] * 3, after=[("lint", True)] * 2, lesson="L-0001")
+    (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
+    assert (eff.verdict, eff.after_runs, eff.after, eff.baseline_runs) == ("too few runs", 2, 1.0, 3)
+
+
+def test_too_few_runs_without_a_baseline(tmp_git):
+    _runs(tmp_git, before=[], after=[("lint", True)] * 3, lesson="L-0001")
+    (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
+    assert (eff.verdict, eff.baseline_runs, eff.baseline, eff.after_runs) == ("too few runs", 0, None, 3)
+
+
+def test_run_started_before_merge_counts_as_baseline(tmp_git):
+    n = _runs(tmp_git, before=[("lint", False)] * 2, after=[("lint", True)] * 3, lesson="L-0001")
+    _write_run(tmp_git, n, gates=[("lint", True)])  # no lesson, but it started after the first run that had it
+    (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
+    assert (eff.baseline_runs, eff.baseline, eff.after_runs, eff.verdict) == (2, 0.0, 3, "improved")
+
+
+def test_retro_and_live_runs_are_ignored(tmp_git):
+    from agentflow.config import RETRO_PIPELINE
+
+    assert RETRO_PIPELINE == "retro"
+    n = _runs(tmp_git, before=[("lint", False)] * 3, after=[("lint", True)] * 3, lesson="L-0001")
+    _write_run(tmp_git, n, gates=[("lint", False)], injected=["L-0001"], end=None)  # live: no end yet
+    _write_run(tmp_git, n + 1, gates=[("lint", False)], injected=["L-0001"], lane=RETRO_PIPELINE)
+    _write_run(tmp_git, -1, gates=[("lint", True)], lane=RETRO_PIPELINE)  # a retro run before: not a baseline
+    (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
+    assert (eff.baseline_runs, eff.baseline, eff.after_runs, eff.after) == (3, 0.0, 3, 1.0)
+
+
+def test_failed_and_cancelled_runs_count(tmp_git):
+    _write_run(tmp_git, 0, gates=[("lint", False)], end="run_failed")
+    _write_run(tmp_git, 1, gates=[("lint", False)], end="run_cancelled")
+    for n in (2, 3, 4):
+        _write_run(tmp_git, n, gates=[("lint", True)], injected=["L-0001"])
+    (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
+    assert (eff.baseline_runs, eff.after_runs, eff.verdict) == (2, 3, "improved")
+
+
+@pytest.mark.parametrize("target", [None, "not_a_signal:x", "gate_first_pass", "ci_rounds:x", "", "{target}"])
+def test_no_target_is_not_measured(tmp_git, target):
+    _runs(tmp_git, before=[("lint", False)] * 3, after=[("lint", True)] * 3, lesson="L-0001")
+    lesson = Lesson("L-0001", "t", "b", (), (), None, target, None)
+    (eff,) = effects(tmp_git, [lesson], NOW)
+    assert (eff.verdict, eff.baseline, eff.after, eff.baseline_runs, eff.after_runs) == ("not measured", None, None, 0, 0)
+
+
+def test_a_run_without_the_key_does_not_count(tmp_git):
+    _runs(tmp_git, before=[("lint", False)] * 3, after=[("tests", True)] * 3, lesson="L-0001")
+    (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
+    assert (eff.after_runs, eff.after, eff.verdict) == (0, None, "too few runs")
+
+
+def test_a_count_family_reads_an_absent_key_as_zero(tmp_git):
+    trip = {"type": "guard_tripped", "key": "build/build", "violations": [{"kind": "forbidden_path"}]}
+    for n in range(3):
+        _write_run(tmp_git, n, extra=[trip, trip])
+    for n in range(3, 6):
+        _write_run(tmp_git, n, injected=["L-0002"])  # no trip at all: a true 0
+    lesson = Lesson("L-0002", "t", "b", (), (), None, "guard_trips:forbidden_path", None)
+    (eff,) = effects(tmp_git, [lesson], NOW)
+    assert (eff.baseline_runs, eff.baseline, eff.after_runs, eff.after, eff.verdict) == (3, 2.0, 3, 0.0, "improved")
+
+
+def test_cited_counts_the_lesson_cited_events(tmp_git):
+    _runs(tmp_git, before=[("lint", False)] * 3, after=[], lesson="L-0001")
+    for n in (3, 4, 5):
+        _write_run(tmp_git, n, gates=[("lint", True)], injected=["L-0001", "E-0001"], cited=["L-0001"] * (n - 3))
+    (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
+    assert eff.cited == 3
+
+
+def test_effects_with_no_runs_and_corrupt_runs_never_raises(tmp_git):
+    assert effects(tmp_git, [LINT_LESSON], NOW)[0].verdict == "too few runs"  # no runs root at all
+    n = _runs(tmp_git, before=[("lint", False)] * 3, after=[("lint", True)] * 3, lesson="L-0001")
+    root = runs_root(tmp_git)
+    (root / "20261101-0100-feature-junk").mkdir()
+    (root / "20261101-0100-feature-junk" / "events.jsonl").write_bytes(b"\xff\xfe not json\n{\"seq\": \"x\"}\n")
+    (root / "20261101-0200-feature-empty").mkdir()  # no events.jsonl
+    bad = {"type": "guard_tripped", "violations": 7}  # not a list: run_signals cannot read it
+    _write_run(tmp_git, n, gates=[("lint", True)], injected=["L-0001"], extra=[bad])
+    _write_run(tmp_git, n + 1, gates=[("lint", True)], injected=["L-0001"],
+               extra=[{"type": "lessons_injected", "key": "x", "ids": "L-0001"}])
+    (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
+    assert (eff.baseline_runs, eff.after_runs, eff.verdict) == (3, 4, "improved")  # the unreadable run is left out
+
+
+# --------------------------------------------------------------------------- lessons_view, lessons_table and the CLI
+
+
+def _pack_repo(tmp_cfg):
+    from conftest import run_git
+
+    path = tmp_cfg()
+    root = path.parent.parent
+    run_git(root, "init", "-q", "-b", "main")
+    return path, root
+
+
+def test_lessons_view_lists_every_lesson_with_its_effect_and_sources(tmp_cfg):
+    from agentflow.views import lessons_table, lessons_view
+
+    path, root = _pack_repo(tmp_cfg)
+    (path.parent / "lessons.md").write_text(
+        "## L-0001 Run lint <b>first</b>\n- source: 20261101-0800-feature-r0#3, 20261101-0900-feature-r1#7\n"
+        "- target: gate_first_pass:lint\n- baseline: 1/4 runs\nRun the linter first.\n", encoding="utf-8")
+    view = lessons_view(root, load_config(path), today=date(2026, 11, 9))
+    rows = {r["id"]: r for r in view["lessons"]}
+    assert rows.keys() >= {"E-0001", "L-0001"} and rows["E-0001"]["verdict"] == "not measured"
+    lint = rows["L-0001"]
+    assert lint["title"] == "Run lint <b>first</b>" and lint["target"] == "gate_first_pass:lint"
+    assert lint["sources"] == [{"ref": "20261101-0800-feature-r0#3", "run_id": "20261101-0800-feature-r0", "seq": 3},
+                               {"ref": "20261101-0900-feature-r1#7", "run_id": "20261101-0900-feature-r1", "seq": 7}]
+    assert lint["verdict"] == "too few runs" and lint["recorded_baseline"] == "1/4 runs" and not lint["expired"]
+    assert view["note"] == "Before/after compares runs; it shows correlation, not cause."
+    text = lessons_table(view)
+    assert text.rstrip().endswith("Before/after compares runs; it shows correlation, not cause.")
+    assert "E-0001" in text and "not measured" in text and "too few runs" in text
+
+
+def test_lessons_table_prints_the_footer_with_no_lessons():
+    from agentflow.views import lessons_table
+
+    text = lessons_table({"lessons": [], "note": lessons.CORRELATION_NOTE, "enabled": True})
+    assert "Before/after compares runs; it shows correlation, not cause." in text
+
+
+def test_lessons_cli_table_and_json_with_config(tmp_cfg, monkeypatch, capsys):
+    from agentflow.flow import main
+
+    path, root = _pack_repo(tmp_cfg)
+    monkeypatch.chdir(root)
+    assert main(["lessons", "--config", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "E-0001" in out and "not measured" in out and "correlation, not cause" in out
+    assert main(["lessons", "--json", "--config", str(path)]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert {r["verdict"] for r in data["lessons"]} == {"not measured"} and data["note"] == lessons.CORRELATION_NOTE
+    assert main(["lessons", "--config", str(path.parent / "missing.yaml")]) == 1

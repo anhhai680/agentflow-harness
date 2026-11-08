@@ -31,6 +31,7 @@ from typing import Any
 
 from agentflow.config import Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.events import parse_iso
+from agentflow import lessons as lessons_mod
 from agentflow.hitl import inbox_items
 from agentflow.metrics import BUCKETS, aggregate, run_metrics
 from agentflow.signals import aggregate_signals, run_signals
@@ -868,6 +869,72 @@ def metrics_csv(view: dict) -> str:
                         if model else ["", "", 0, 0, 0])
                 writer.writerow(head + tail)
     return out.getvalue()
+
+
+# --------------------------------------------------------------------------- lessons
+
+
+def _source(ref: str) -> dict:
+    """An evidence reference `<run id>#<event seq>` with its run id, so a page can open that run."""
+    match = lessons_mod.SOURCE.match(ref)
+    return {"ref": ref, "run_id": match.group(1) if match else None, "seq": int(match.group(2)) if match else None}
+
+
+def lessons_view(repo: Path, cfg: Config, today: date | None = None) -> dict:
+    """Every lesson both layers hold (`lessons.load`), with its evidence and its effect on its target
+    (`lessons.effects`). `today` decides which lessons are past their `review_by`."""
+    now = datetime.now(UTC)
+    today = today or now.astimezone().date()
+    found = lessons_mod.load(repo)
+    rows = []
+    for lesson, effect in zip(found, lessons_mod.effects(repo, found, now), strict=True):
+        rows.append({
+            "id": lesson.id,
+            "title": lesson.title,
+            "body": lesson.body,
+            "applies": list(lesson.applies),
+            "sources": [_source(ref) for ref in lesson.sources],
+            "review_by": lesson.review_by.isoformat() if lesson.review_by else None,
+            "expired": lesson.review_by is not None and lesson.review_by < today,
+            "target": lesson.target,
+            "recorded_baseline": lesson.baseline,
+            "baseline_runs": effect.baseline_runs,
+            "baseline": effect.baseline,
+            "after_runs": effect.after_runs,
+            "after": effect.after,
+            "verdict": effect.verdict,
+            "cited": effect.cited,
+        })
+    return {
+        "lessons": rows,
+        "enabled": cfg.memory.lessons_max_tokens > 0,
+        "note": lessons_mod.CORRELATION_NOTE,
+        "generated_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _measure(value: float | None, runs: int) -> str:
+    return "-" if value is None else f"{value:.4g} ({runs} run{'' if runs == 1 else 's'})"
+
+
+def lessons_table(view: dict) -> str:
+    """`agentflow lessons`: one row per lesson (its verdict, target, before and after, citations), then the note
+    that a before/after comparison is no proof."""
+    lines = []
+    if not view.get("enabled", True):
+        lines += ["Lessons are off (memory.lessons_max_tokens is 0): no step carries them.", ""]
+    rows = view["lessons"]
+    if rows:
+        table = [["ID", "VERDICT", "TARGET", "BASELINE", "AFTER", "CITED", "TITLE"]]
+        for r in rows:
+            title = r["title"] + (" (past review_by)" if r.get("expired") else "")
+            table.append([r["id"], r["verdict"], r["target"] or "-", _measure(r["baseline"], r["baseline_runs"]),
+                          _measure(r["after"], r["after_runs"]), str(r["cited"]), title])
+        lines += _table(table)
+    else:
+        lines.append("No lessons.")
+    lines += ["", view["note"]]
+    return "\n".join(lines)
 
 
 def runs_signature(repo: Path) -> tuple:

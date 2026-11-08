@@ -1106,3 +1106,32 @@ def test_the_page_shows_the_done_modules_in_a_details_that_keeps_its_open_state(
     assert "innerHTML" not in block  # every text goes through el()'s textContent
     assert "data.done_note" in source and "doneNode(data.backlog_done" in source
     assert "ontoggle" in source[source.index("function el("):source.index("function toast")]
+
+
+# --------------------------------------------------------------------------- the Lessons tab
+
+
+def test_lessons_api_needs_the_token(dash):
+    assert dash.get("/api/lessons", token=None)[0] == 403
+
+
+def test_lessons_api_lists_the_lessons_and_their_effects(dash):
+    (dash.flow.install_pack().parent / "lessons.md").write_text(
+        "## L-0001 Run lint\n- source: 20261101-0800-feature-r0#3\n- target: gate_first_pass:lint\nRun it.\n",
+        encoding="utf-8")
+    status, headers, body = dash.get("/api/lessons")
+    data = payload(body)
+    assert status == 200 and headers["content-type"].startswith("application/json")
+    rows = {r["id"]: r for r in data["lessons"]}
+    assert rows["E-0001"]["verdict"] == "not measured" and rows["L-0001"]["verdict"] == "too few runs"
+    assert rows["L-0001"]["sources"][0]["run_id"] == "20261101-0800-feature-r0"
+    assert data["note"] == "Before/after compares runs; it shows correlation, not cause."
+
+
+def test_the_lessons_tab_links_evidence_to_the_run_drawer_and_escapes_text():
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    assert 'id="tab-lessons"' in source and 'id="lessons-view"' in source and '"lessons"' in source
+    block = source[source.index("function sourceNodes"):source.index("async function loadLessons")]
+    assert "openDrawer(src.run_id)" in block and "data.note" in block
+    assert "innerHTML" not in block  # titles and bodies are model text: every text goes through el()'s textContent
+    assert 'api("/api/lessons")' in source

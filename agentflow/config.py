@@ -22,6 +22,7 @@ import yaml
 from agentflow import layers, pack
 
 KNOWN_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+RETRO_PIPELINE = "retro"  # the retro run's pipeline name: its runs never count as evidence for or against a lesson
 BUILTIN_CHECKS = (
     "file_exists",
     "grep",

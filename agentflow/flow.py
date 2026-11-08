@@ -761,6 +761,22 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lessons(args: argparse.Namespace) -> int:
+    """Every lesson, with its target signal before and after the runs that carried it."""
+    import json as _json
+
+    from agentflow.views import lessons_table, lessons_view
+
+    try:
+        repo, cfg = _find_repo(), _load_cfg(args)
+        view = lessons_view(repo, cfg)
+    except _human_errors() as exc:
+        print(f"error: {exc}")
+        return 1
+    print(_json.dumps(view, indent=2) if args.json else lessons_table(view))
+    return 0
+
+
 def cmd_pause(args: argparse.Namespace) -> int:
     from agentflow.run_control import pause
     from agentflow.state import find_run
@@ -1009,6 +1025,11 @@ def build_parser() -> argparse.ArgumentParser:
     shape.add_argument("--csv", action="store_true", help="one row per run, phase, model and effort")
     met.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     met.set_defaults(func=cmd_metrics)
+
+    les = sub.add_parser("lessons", help="each lesson's target signal before and after the runs that carried it")
+    les.add_argument("--json", action="store_true", help="the full data as JSON")
+    les.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+    les.set_defaults(func=cmd_lessons)
 
     pau = sub.add_parser("pause", help="stop a run before its next step (a live agent finishes its step)")
     pau.add_argument("run")

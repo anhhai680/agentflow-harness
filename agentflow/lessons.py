@@ -25,18 +25,26 @@ Anything before the first `## ` heading is the file's header and is not read.
   list dashes, so it cannot forge an entry or a key. Braces are kept as they are.
 - `read(path, prefix)` / `load(repo)`: a file (a missing one is empty, a symlink is refused), and both layers.
 - `select(lessons, phase, today, max_tokens)`: what a step's prompt carries, as one Markdown section.
+- `effects(repo, lessons, now)`: each lesson's target signal before and after the runs that carried it, with a
+  verdict. It compares runs, so it shows correlation, not cause (`CORRELATION_NOTE`).
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from . import pack, safeio
+from .config import RETRO_PIPELINE
+from .events import EventError, EventLog, parse_iso
 from .hitl import FACT_MAX, clean_fact
+from .metrics import run_metrics
+from .signals import COUNT_FAMILIES, FAMILIES, parse_target, run_signals
+from .state import TERMINAL, replay, runs_root
 
 LESSONS_HEADING = "## Lessons from earlier runs"
 LEAD = ("Earlier runs of this project taught these. Follow them unless this step's own instructions or the rules above "
@@ -292,3 +300,130 @@ def select(lessons: list[Lesson], phase: str | None, today: date, max_tokens: in
         return Selection("", (), tuple(dropped), "")
     digest = hashlib.sha256("\n".join(_line(lesson) for lesson in kept).encode("utf-8")).hexdigest()[:12]
     return Selection(_text(kept), tuple(lesson.id for lesson in kept), tuple(dropped), digest)
+
+
+# --------------------------------------------------------------------------- effects
+
+MIN_AFTER_RUNS = 3  # runs that carried a lesson before its effect gets a verdict
+NO_CHANGE_BAND = 0.10  # a relative change smaller than this either way is `no change`
+VERDICTS = ("improved", "no change", "worse", "too few runs", "not measured")
+CORRELATION_NOTE = "Before/after compares runs; it shows correlation, not cause."
+# What reading one run's log may raise on a corrupt or hand-edited file: that run is left out, never fatal.
+_RUN_ERRORS = (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, EventError)
+
+
+@dataclass(frozen=True)
+class LessonEffect:
+    id: str
+    title: str
+    target: str | None
+    review_by: date | None
+    baseline_runs: int
+    baseline: float | None
+    after_runs: int
+    after: float | None
+    verdict: str
+    cited: int
+
+
+@dataclass(frozen=True)
+class _RunFacts:
+    started: datetime | None
+    counted: bool  # ended (done, failed or cancelled): only those are evidence
+    injected: frozenset[str]
+    cited: Counter
+    signals: dict[str, float]
+
+
+def _run_facts(path: Path, now: datetime) -> _RunFacts | None:
+    """What `effects` needs from one run's log, or None for a retro run or a log with no events."""
+    events = EventLog(path).read()
+    if not events:
+        return None
+    state = replay(events)
+    if state.get("pipeline") == RETRO_PIPELINE:
+        return None
+    started = next((parse_iso(ev.get("ts")) for ev in events if ev.get("type") == "run_started"), None)
+    injected: set[str] = set()
+    cited: Counter = Counter()
+    for ev in events:
+        if ev.get("type") == "lessons_injected" and isinstance(ev.get("ids"), list):
+            injected.update(i for i in ev["ids"] if isinstance(i, str))
+        elif ev.get("type") == "lesson_cited" and isinstance(ev.get("id"), str):
+            cited[ev["id"]] += 1
+    counted = state.get("status") in TERMINAL
+    signals = run_signals(events, run_metrics(events, now)) if counted else {}
+    return _RunFacts(started, counted, frozenset(injected), cited, signals)
+
+
+def _all_runs(repo: Path, now: datetime) -> list[_RunFacts]:
+    """Every non-retro run's facts; a run whose log cannot be read is left out."""
+    root = runs_root(repo)
+    if not root.is_dir():
+        return []
+    runs = []
+    for folder in sorted(root.iterdir()):
+        log = folder / "events.jsonl"
+        if folder.is_symlink() or log.is_symlink() or not log.is_file():
+            continue
+        try:
+            facts = _run_facts(log, now)
+        except _RUN_ERRORS:
+            continue
+        if facts is not None:
+            runs.append(facts)
+    return runs
+
+
+def _mean(values: list[float]) -> float | None:
+    return round(sum(values) / len(values), 6) if values else None
+
+
+def _verdict(direction: str, baseline: float, after: float) -> str:
+    rel = (after - baseline) / max(abs(baseline), 1.0)
+    if direction == "higher":
+        rel = -rel
+    if rel <= -NO_CHANGE_BAND:
+        return "improved"
+    return "worse" if rel >= NO_CHANGE_BAND else "no change"
+
+
+def _effect(lesson: Lesson, runs: list[_RunFacts]) -> LessonEffect:
+    counted = [r for r in runs if r.counted]
+    cited = sum(r.cited[lesson.id] for r in counted)
+    parsed = parse_target(lesson.target) if lesson.target else None
+    if parsed is None:
+        return LessonEffect(lesson.id, lesson.title, lesson.target, lesson.review_by, 0, None, 0, None,
+                            "not measured", cited)
+    family, param = parsed
+    key = family if param is None else f"{family}:{param.strip()}"
+    absent = 0.0 if family in COUNT_FAMILIES else None  # a count family's absent key is a true 0
+
+    def value(run: _RunFacts) -> float | None:
+        found = run.signals.get(key, absent)
+        return None if found is None else float(found)
+
+    # The lesson came in with the first run that carried it, live ones included: a run started later without it
+    # ran beside the lesson, not before it, so it is no baseline.
+    starts = [r.started for r in runs if lesson.id in r.injected and r.started is not None]
+    first = min(starts) if starts else None
+    after = [v for r in counted if lesson.id in r.injected and (v := value(r)) is not None]
+    before = [v for r in counted
+              if lesson.id not in r.injected and r.started is not None and (first is None or r.started < first)
+              and (v := value(r)) is not None]
+    baseline, after_mean = _mean(before), _mean(after)
+    if len(after) < MIN_AFTER_RUNS or baseline is None or after_mean is None:
+        verdict = "too few runs"
+    else:
+        verdict = _verdict(FAMILIES[family][0], baseline, after_mean)
+    return LessonEffect(lesson.id, lesson.title, lesson.target, lesson.review_by, len(before), baseline, len(after),
+                        after_mean, verdict, cited)
+
+
+def effects(repo: Path, lessons: list[Lesson], now: datetime) -> list[LessonEffect]:
+    """Each lesson's target signal over the ended, non-retro runs: the mean over the runs that carried it (after)
+    against the mean over the runs without it that started before the first run that carried it (baseline). Only
+    runs that have the target's key count, except a count family's, where a missing key is 0. Fewer than
+    `MIN_AFTER_RUNS` after-runs or no baseline is `too few runs`; a missing or unknown target is `not measured`."""
+    runs = _all_runs(repo, now)
+    return [_effect(lesson, runs) for lesson in lessons]
