@@ -42,19 +42,30 @@ def ensure_dir(path: Path) -> Path:
 
 
 def _open(path: Path, flags: int) -> int:
+    """`os.open` without following a symlink, and without blocking: a FIFO planted at `path` would otherwise hang
+    the open until someone opened its other end (`O_NONBLOCK` means nothing for a regular file)."""
     try:
-        return os.open(path, flags | os.O_NOFOLLOW, FILE_MODE)
+        return os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, FILE_MODE)
     except OSError as exc:
         if exc.errno == errno.ELOOP or path.is_symlink():
             raise _refused(path, exc) from exc
         raise
 
 
+def _regular(fd: int, path: Path) -> None:
+    """Close `fd` and raise `ValueError` unless it is a regular file (not a FIFO, a device or a socket)."""
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ValueError(f"{path} is not a regular file")
+
+
 def write_text(path: Path, text: str) -> Path:
-    """Write `text` to `path` from scratch (truncating), refusing a symlink at `path` or its folder."""
+    """Write `text` to `path` from scratch (truncating), refusing a symlink at `path` or its folder, and anything at
+    `path` that is not a regular file (`ValueError`; a FIFO with no reader is an `OSError`, never a hang)."""
     path = Path(path)
     ensure_dir(path.parent)
     fd = _open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    _regular(fd, path)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
     return path

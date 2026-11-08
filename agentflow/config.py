@@ -1460,11 +1460,14 @@ class _Validator:
 
     def lanes(self) -> None:
         """`retro` is the engine's own pipeline (`RETRO_PIPELINE`): a lane of that name would make its runs read as
-        retros, which no digest reads and no lesson counts."""
+        retros, which no digest reads and no lesson counts, and a phase of that name would own the retro's stops."""
         for i, lane in enumerate(self.cfg.lanes):
             if lane == RETRO_PIPELINE:
                 self.error(f"lanes[{i}]", f"`{RETRO_PIPELINE}` is the engine's retro pipeline, not a lane: "
                            "give this lane another name")
+        if RETRO_PIPELINE in self.cfg.phases:  # the retro's step key is `retro/retro`: it would read as this phase's
+            self.error(f"phases.{RETRO_PIPELINE}", f"`{RETRO_PIPELINE}` is the engine's retro pipeline, so no phase "
+                       "may take its name: give this phase another name")
 
     def approval_note(self, phase: Phase, path: str) -> None:
         note = phase.approval_note

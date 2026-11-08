@@ -536,3 +536,30 @@ def test_a_header_cannot_smuggle_an_entry_into_the_rendered_file():
     assert parse(render(header, []), "L") == ([], [])
     kept = Lesson("L-0001", "Kept", "Body.", (), (), None, None, None)
     assert parse(render(header, [kept]), "L")[0] == [kept]
+
+
+def test_a_long_run_of_spaces_in_a_heading_parses_in_linear_time():
+    import time
+
+    spaces = " " * 200_000
+    text = f"## L-0001 a{spaces}b\nBody.\n##{spaces}\n## L-0002{spaces}\nBody.\n"
+    started = time.perf_counter()
+    found, problems = parse(text, "L")
+    assert time.perf_counter() - started < 1.0
+    assert [x.id for x in found] == ["L-0001"] and found[0].title.startswith("a")  # cleaning reads its first 1200
+    assert any("L-0002 has no title" in p for p in problems)
+
+
+@pytest.mark.parametrize("line, lid, title", [
+    ("## L-0001 Title here", "L-0001", "Title here"),
+    ("##\tL-0001\t Title  with  gaps \t", "L-0001", "Title  with  gaps"),
+    ("##   L-0001", "L-0001", ""),
+    ("##", "", ""),
+    ("##  ", "", ""),
+])
+def test_heading_split_matches_the_old_regex(line, lid, title):
+    import re
+
+    old = re.compile(r"^##(?:\s+(\S+))?(?:\s+(.*?))?\s*$").match(line.strip())
+    assert ((old.group(1) or ""), (old.group(2) or "")) == (lid, title)
+    assert lessons._heading(line.strip()) == (lid, title)

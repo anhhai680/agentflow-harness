@@ -61,7 +61,6 @@ SOURCE = re.compile(r"^(\d{8}-\d{4}-(?!.*\.\.)[A-Za-z0-9._-]+)#(\d+)\Z")
 KEYS = ("applies", "source", "review_by", "target", "baseline")
 ENGINE_PREFIX = "E"
 
-_HEADING = re.compile(r"^##(?:\s+(\S+))?(?:\s+(.*?))?\s*$")
 _KEY_LINE = re.compile(r"^-\s+([A-Za-z_]+)\s*:(.*)$")
 _COMMENT = re.compile(r"\s#")  # where a comment starts on a key line
 _HASHES = re.compile(r"\s+#+")  # a run of spaces then of `#`s: what render collapses so no comment can start
@@ -110,6 +109,13 @@ def _clean_value(text: str) -> str:
 
 
 # --------------------------------------------------------------------------- parse
+
+
+def _heading(line: str) -> tuple[str, str]:
+    """`(id, title)` of a stripped heading line `## <id> <title>`, either "" when absent. Split on whitespace, not a
+    regex, so a long run of spaces costs linear time."""
+    parts = line[2:].split(None, 1)
+    return (parts[0] if parts else "", parts[1].strip() if len(parts) > 1 else "")
 
 
 def _is_heading(raw: str) -> bool:
@@ -185,8 +191,7 @@ def parse(text: str, prefix: str) -> tuple[list[Lesson], list[str]]:
     for n, raw in enumerate(text.lstrip("﻿").splitlines(), 1):
         line = raw.strip()
         if _is_heading(raw):
-            match = _HEADING.match(line)
-            entry = _Entry(n, (match.group(1) or "") if match else "", (match.group(2) or "") if match else "")
+            entry = _Entry(n, *_heading(line))
             entries.append(entry)
             continue
         if entry is None or not line:

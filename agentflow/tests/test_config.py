@@ -1296,3 +1296,11 @@ def test_a_broken_retro_step_is_an_error(tmp_cfg):
     issues = issues_for(tmp_cfg, {"retro_step": {"id": "retro", "skill": "no-such-skill", "role": "review",
                                                  "prompt": "retro.md"}})
     assert ("error", "retro_step.skill") in errors(issues)
+
+
+def test_a_phase_named_retro_is_refused(tmp_cfg):
+    def patch(data):
+        data["phases"]["retro"] = {"needs_approval": False, "steps": [{"id": "x", "type": "gate", "gates": ["ok"]}]}
+        data.setdefault("gates", {})["ok"] = {"run": "true"}
+
+    assert ("error", "phases.retro") in errors(issues_for(tmp_cfg, patch))
