@@ -6,7 +6,9 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
 
 - `run_signals(events, metrics)`: the signals of one run. A key appears only when the run gives evidence for it
   (a run that never ran gate `lint` has no `gate_first_pass:lint`), so a mean over runs is a mean over the runs it
-  applies to. `rework_pct` is the one key every run has.
+  applies to. The counts in `COUNT_FAMILIES` are the exception: `ci_rounds`, `rollovers`, `progress_not_updated`
+  and `rework_pct` are always present (0 when nothing happened), `fix_attempts:<p>` and `human_rejections:<p>`
+  are present for every phase of the run, and a key of the open-parameter count families that is absent is 0.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
 
@@ -35,6 +37,12 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "progress_not_updated": ("lower", False),
     "rework_pct": ("lower", False),
 }
+# Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
+# The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
+# `human_rejections` are present for every phase of the run; the open-parameter ones (`guard_trips`,
+# `permission_denied`, `stop`) are present only for a parameter that occurred.
+COUNT_FAMILIES = frozenset({"fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections",
+                            "ci_rounds", "rollovers", "progress_not_updated"})
 RUNNER = "runner"  # `phase_rejected.by` for what the runner settles itself; a person's name is never this
 
 
@@ -131,7 +139,10 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
             plain[{"ci_round": "ci_rounds", "rolled_over": "rollovers"}.get(etype, etype)] += 1
     for family, found in counts.items():
         out.update({f"{family}:{param}": n for param, n in found.items()})
-    out.update(plain)
+    out.update({name: plain[name] for name in ("ci_rounds", "rollovers", "progress_not_updated")})
+    for phase in metrics.get("phases") or []:
+        for family in ("fix_attempts", "human_rejections"):
+            out.setdefault(f"{family}:{phase['phase']}", 0)
     out.update(_turns(events))
     for phase in metrics.get("phases") or []:
         called = sum(1 for s in phase.get("steps") or [] if s.get("attempts"))

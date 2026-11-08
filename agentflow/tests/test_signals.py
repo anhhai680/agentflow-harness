@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from agentflow.signals import FAMILIES, aggregate_signals, parse_target, run_signals
+from agentflow.signals import COUNT_FAMILIES, FAMILIES, aggregate_signals, parse_target, run_signals
 
 EMPTY_METRICS = {"cost_usd": 0.0, "rework_cost_usd": 0.0, "phases": []}
 
@@ -69,8 +69,28 @@ def test_stops_and_plain_counters():
     assert (out["ci_rounds"], out["rollovers"], out["progress_not_updated"]) == (2, 1, 1)
 
 
-def test_a_run_with_nothing_to_report_has_only_rework_pct():
-    assert run_signals([], EMPTY_METRICS) == {"rework_pct": 0}
+def test_a_run_with_nothing_to_report_has_only_the_always_present_counts():
+    assert run_signals([], EMPTY_METRICS) == {"ci_rounds": 0, "rollovers": 0, "progress_not_updated": 0, "rework_pct": 0}
+
+
+def test_a_run_with_a_gate_failure_but_no_ci_rounds_reports_zero_ci_rounds():
+    out = run_signals([_gate("build/t1", "unit", False)], EMPTY_METRICS)
+    assert out["ci_rounds"] == 0 and out["gate_first_pass:unit"] == 0.0
+
+
+def test_a_phase_that_ran_reports_zero_fixes_and_rejections():
+    phases = [{"phase": "build", "cost_usd": 0.0, "steps": []}, {"phase": "verify", "cost_usd": 0.0, "steps": []}]
+    evs = [_ev("fix_attempt", key="build/x", attempt=1)]
+    out = run_signals(evs, _metrics(phases))
+    assert (out["fix_attempts:build"], out["fix_attempts:verify"]) == (1, 0)
+    assert (out["human_rejections:build"], out["human_rejections:verify"]) == (0, 0)
+
+
+def test_open_parameter_counts_stay_absent_and_count_families_are_lower_is_better():
+    out = run_signals([], EMPTY_METRICS)
+    assert not [k for k in out if k.split(":")[0] in ("guard_trips", "permission_denied", "stop")]
+    assert COUNT_FAMILIES <= set(FAMILIES) and all(FAMILIES[f][0] == "lower" for f in COUNT_FAMILIES)
+    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 8
 
 
 def test_cost_per_task_divides_by_the_steps_that_called_an_agent():
@@ -99,7 +119,8 @@ def test_turns_per_step_follow_a_turn_to_its_step_through_the_session():
 def test_signals_survive_events_without_the_new_fields():
     evs = [_ev("guard_tripped", key="build/x"), _ev("review_result", key="build/x"), _ev("hitl_raised", key="build/x"),
            _ev("phase_rejected", by="human")]
-    assert run_signals(evs, EMPTY_METRICS) == {"rework_pct": 0, "review_blocking:build": 0}
+    assert run_signals(evs, EMPTY_METRICS) == {"ci_rounds": 0, "rollovers": 0, "progress_not_updated": 0, "rework_pct": 0,
+                                           "review_blocking:build": 0}
 
 
 def test_parse_target_accepts_only_the_vocabulary():

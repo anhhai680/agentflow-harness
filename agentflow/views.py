@@ -840,7 +840,7 @@ def metrics_table(view: dict) -> str:
                      f"median run {_short(totals['wall_s']['median'])} · {share}")
     signals = view.get("signals") or {}
     if signals:
-        lines += ["", "Signals (mean over the runs that have each)"]
+        lines += ["", "Signals (mean per run; a key counts the runs it applies to)"]
         for key in sorted(signals)[:SIGNAL_ROWS]:
             lines.append(f"  {key}  {signals[key]['mean']:.4g}  ({signals[key]['runs']} run"
                          f"{'' if signals[key]['runs'] == 1 else 's'})")
