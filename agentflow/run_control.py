@@ -31,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-from agentflow.config import Config, ConfigError, load_config
+from agentflow.config import RETRO_PIPELINE, Config, ConfigError, load_config
 from agentflow.config_trust import run_config_path
 from agentflow import pack, safeio
 from agentflow.events import lock_state, parse_iso
@@ -65,6 +65,14 @@ def _refuse_terminal(run: Run, action: str) -> None:
         raise ControlError(f"{run.id} is {status}; there is nothing to {action}")
 
 
+def _refuse_retro(run: Run) -> None:
+    """A retro run is never resumed (`pipeline.advance` refuses it): a retry or a resume would record a step or a run
+    put back that no runner then takes. Refused before any event."""
+    if run.state.get("pipeline") == RETRO_PIPELINE:
+        raise ControlError(f"{run.id} is a retro run, which cannot be resumed; cancel it and run `agentflow retro` "
+                           "again")
+
+
 # --------------------------------------------------------------------------- pause and resume
 
 
@@ -82,6 +90,7 @@ def resume(run: Run, by: str) -> bool:
     """Record who resumed a paused or ready run (`run_resumed`); True if it was. The caller starts the runner."""
     with run.locked():
         _refuse_terminal(run, "resume")
+        _refuse_retro(run)
         if run.state["status"] not in ("paused", "ready"):
             return False
         run.emit("run_resumed", by=by)
@@ -304,6 +313,7 @@ def retry(run: Run, key: str | None, by: str, reason: str | None = None) -> str:
     """Put `key` (default: the run's failed step) back to pending; returns the key. The caller resumes."""
     with run.locked():
         _refuse_terminal(run, "retry")
+        _refuse_retro(run)
         _refuse_ready(run, "retry")
         steps = run.state["steps"]
         if key is None:

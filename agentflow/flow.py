@@ -262,7 +262,9 @@ def cmd_inbox(args: argparse.Namespace) -> int:
             print(f"  {q['id']}: {q['question']}")
         if item["inbox_path"]:
             print(f"  file: {item['inbox_path']}")
-        if item["kind"] == "phase_approval":
+        if item.get("pipeline") == "retro":  # a retro is never resumed: cancel it and run another
+            print(f"  agentflow cancel {item['run_id']}    then    agentflow retro")
+        elif item["kind"] == "phase_approval":
             print(f"  agentflow approve {item['run_id']} {item['phase']}    |    agentflow reject {item['run_id']} {item['phase']} --note \"...\"")
         elif item["kind"] == "parked":
             print(f"  agentflow answer {item['run_id']} --key {item['key']}")
@@ -573,11 +575,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    from agentflow.hitl import refuse_retro
     from agentflow.run_control import mark_done
     from agentflow.state import find_run
 
     try:
         run = find_run(_find_repo(), args.run)
+        refuse_retro(run)
         if args.mark_done:
             mark_done(run, _by(args))
         return _continue(run, args)

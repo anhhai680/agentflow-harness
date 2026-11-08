@@ -213,7 +213,7 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
     An unexpected exception is recorded as `runner_error` (the run's status becomes `error`, which a
     `resume` goes on from) before the lock is released and the exception goes on to the caller."""
     if run.refresh().get("pipeline") == RETRO_PIPELINE:  # it walks no phase: resuming one would run the whole workflow
-        raise ValueError(f"{run.id} is a retro run, which is never resumed: cancel it and start a new retro")
+        raise ValueError(f"{run.id} is a retro run, which cannot be resumed; cancel it and run `agentflow retro` again")
     lock = run.lock()
     if not lock.acquire():
         raise RunLocked(f"another runner is working on {run.id}; see `agentflow status {run.id}`")

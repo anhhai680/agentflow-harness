@@ -37,7 +37,10 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
+import stat
+import subprocess
 import sys
 import unicodedata
 from dataclasses import dataclass
@@ -50,8 +53,8 @@ from .agents import make_agents
 from .conditions import make_ctx
 from .config import RETRO_PIPELINE, Config, Phase, Step, worktrees_root
 from .events import EventLog, nfc, parse_iso
-from .gitops import (CommitRejected, GhError, GitError, NothingToCommit, add_worktree, branch_exists, commit_lessons,
-                     create_draft_pr, dirty_paths, head, push)
+from .gitops import (CommitRejected, GhError, GitError, NothingToCommit, add_worktree, blob_at, branch_exists,
+                     commit_lessons, create_draft_pr, git_state, head, push, tree_state)
 from .hitl import FACT_MAX, ResultError, clean_fact, raise_hitl
 from .lanes import Executor, build_prompt
 from .lessons import (_LEADING, BODY_MAX, CORRELATION_NOTE, ENGINE_PREFIX, FILE_MAX, RUN_ERRORS, SOURCE, Lesson, effects,
@@ -129,6 +132,15 @@ def finished_runs(repo: Path, since: datetime | None) -> list[Run]:
 def last_retro(repo: Path) -> Run | None:
     """The newest retro run, whether or not it finished; None before the first."""
     retros = [run for run, _events in _runs(repo) if run.state.get("pipeline") == RETRO_PIPELINE]
+    return retros[-1] if retros else None
+
+
+def last_finished_retro(repo: Path) -> Run | None:
+    """The newest retro run that finished (`done`: it opened its pull request, or found nothing to learn); None
+    before the first. A retro that stopped, failed or was cancelled read its runs for nothing, so the next one reads
+    them again: the default `since` of `run_retro` starts here."""
+    retros = [run for run, _events in _runs(repo)
+              if run.state.get("pipeline") == RETRO_PIPELINE and run.state.get("status") == "done"]
     return retros[-1] if retros else None
 
 
@@ -837,8 +849,8 @@ def pr_body(repo: Path, cfg: Config, digest: Digest, checked: Checked, today: da
 
 
 def _since_default(repo: Path) -> datetime | None:
-    """When the last retro started (its first event with a time), or None before the first retro."""
-    last = last_retro(repo)
+    """When the last finished retro started (its first event with a time), or None before the first one."""
+    last = last_finished_retro(repo)
     if last is None:
         return None
     for ev in last.events.read():
@@ -918,32 +930,66 @@ class _Retro:
         branch = _free_branch(self.repo, cfg.project.branch.replace("{lane}", RETRO_PIPELINE).replace("{slug}", slug))
         worktree = (worktrees_root(cfg, self.repo) / run.id).resolve()
         add_worktree(self.repo, worktree, branch, cfg.project.fork_from)
-        run.emit("run_updated", branch=branch, worktree=str(worktree), base_sha=head(worktree))
+        base = head(worktree)
+        run.emit("run_updated", branch=branch, worktree=str(worktree), base_sha=base)
         safeio.write_text(run.dir.joinpath(*workspace.RETRO_DIGEST), self.digest.text)
+        # Everything the runner trusts later is read now, before the session: the session is an agent with a shell,
+        # and "change no file" is only what its prompt asks.
+        found = self.base_lessons(worktree, base)
+        if isinstance(found, str):
+            return self.stop(found)
+        header, current, base_bytes = found
+        shared, tree = git_state(worktree), tree_state(worktree)
 
         executor = Executor(cfg, run, make_agents(cfg), _ctx(cfg, run, worktree), {})
         plain = Phase(name=RETRO_PIPELINE, agent=None, model=None, skip_if=None, steps=[])
         if executor.run_agent_step(plain, self.step, KEY, role=self.step.role) != "done":
             return RetroOutcome(run.id, None, f"the retro session stopped: see `agentflow inbox` ({run.id})")
 
-        changed = dirty_paths(worktree)
-        if changed:
-            shown = ", ".join(changed[:10]) + (f" and {len(changed) - 10} more" if len(changed) > 10 else "")
-            return self.stop(f"the retro session changed files: {shown}. A retro session changes no file.")
+        why = self.untouched(worktree, shared, tree, base_bytes)
+        if why:
+            return self.stop(why)
         try:
             proposals = parse_proposals(self.result())
         except ResultError as exc:
             return self.stop(f"the retro result cannot be read: {exc}")
-        found = self.current(worktree)
-        if isinstance(found, str):
-            return self.stop(found)
-        header, current = found
         checked = check_proposals(current, proposals, self.repo, cfg, self.digest, self.today)
         if checked.lessons == current:
             run.emit("run_finished", summary="nothing to learn")
             return RetroOutcome(run.id, None, f"nothing to learn: the retro of {len(self.digest.run_ids)} runs "
                                 f"changes no lesson ({len(checked.dropped)} proposals dropped)")
-        return self.publish(worktree, branch, header, checked)
+        return self.publish(worktree, branch, header, checked, shared)
+
+    def untouched(self, worktree: Path, shared: dict, tree: dict, base_bytes: bytes | None) -> str:
+        """Why the checkout is not as it was before the session, or "": the shared git state first (its config and
+        hooks decide what every later git call does, so nothing else runs git before it is checked), then what git
+        sees in the tree, then the lessons path itself (a FIFO or a device is invisible to git)."""
+        if git_state(worktree) != shared:
+            return ("the retro session changed the git configuration, hooks or control files of the checkout; "
+                    "nothing was committed or pushed. A retro session changes no file.")
+        now = tree_state(worktree)
+        if now != tree:
+            changed = sorted(set(now["status"]) - set(tree["status"]))
+            paths = [entry[3:] for entry in changed]
+            if now["flagged"] != tree["flagged"]:
+                paths += [f"{entry[2:]} (hidden from git status)" for entry in sorted(set(now["flagged"]) - set(tree["flagged"]))]
+            if not paths and now["head"] != tree["head"]:
+                paths = [f"HEAD (now {now['head'][:12]})"]
+            shown = ", ".join(paths[:10]) + (f" and {len(paths) - 10} more" if len(paths) > 10 else "")
+            return f"the retro session changed files: {shown or 'tracked files'}. A retro session changes no file."
+        path = worktree / pack.LESSONS_FILE
+        if base_bytes is None:
+            if os.path.lexists(path) or path.parent.is_symlink():
+                return f"the retro session left something at {pack.LESSONS_FILE}, which the branch does not have"
+            return ""
+        try:
+            info = os.lstat(path)
+            data = safeio.read_bytes(path, FILE_MAX) if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 else None
+        except (OSError, ValueError):
+            data = None
+        if path.parent.is_symlink() or data != base_bytes:
+            return f"{pack.LESSONS_FILE} in the worktree is not what the branch holds: the retro session changed it"
+        return ""
 
     def result(self) -> dict:
         """The session's raw result: `read_result` checked the common fields; the proposals are read here."""
@@ -959,29 +1005,28 @@ class _Retro:
             raise ResultError(f"result file is not valid JSON: {exc}") from None
         return raw
 
-    def current(self, worktree: Path) -> tuple[str, list[Lesson]] | str:
-        """`(header, lessons)` of the lessons file on the branch the retro forked from, or why it cannot be used."""
-        path = worktree / pack.LESSONS_FILE
-        if path.parent.is_symlink():
-            return f"{pack.LESSONS_FILE}'s folder is a symlink on {self.cfg.project.fork_from}"
+    def base_lessons(self, worktree: Path, base: str) -> tuple[str, list[Lesson], bytes | None] | str:
+        """`(header, lessons, bytes)` of the lessons file at `base`, the commit the retro forked from, read from git
+        (never from the work tree, which the session can write); or why it cannot be used. None bytes: no file."""
+        fork = self.cfg.project.fork_from
         try:
-            data = safeio.read_bytes(path, FILE_MAX)
-        except (OSError, ValueError) as exc:
-            return f"{pack.LESSONS_FILE} on {self.cfg.project.fork_from} cannot be read: {exc}"
+            data = blob_at(worktree, base, pack.LESSONS_FILE, FILE_MAX)
+        except (GitError, ValueError, subprocess.CalledProcessError) as exc:
+            return f"{pack.LESSONS_FILE} on {fork} cannot be read: {exc}"
         if data is None:
-            return DEFAULT_HEADER, []
+            return DEFAULT_HEADER, [], None
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
-            return f"{pack.LESSONS_FILE} on {self.cfg.project.fork_from} is not UTF-8 text"
+            return f"{pack.LESSONS_FILE} on {fork} is not UTF-8 text"
         current, problems = parse(text, "L")
         if problems:
             more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
-            return (f"{pack.LESSONS_FILE} on {self.cfg.project.fork_from} has a malformed entry, which a retro would "
-                    f"drop: {problems[0]}{more}. Fix it (`agentflow validate` lists them), then run the retro again.")
-        return split_header(text), current
+            return (f"{pack.LESSONS_FILE} on {fork} has a malformed entry, which a retro would drop: "
+                    f"{problems[0]}{more}. Fix it (`agentflow validate` lists them), then run the retro again.")
+        return split_header(text), current, data
 
-    def publish(self, worktree: Path, branch: str, header: str, checked: Checked) -> RetroOutcome:
+    def publish(self, worktree: Path, branch: str, header: str, checked: Checked, shared: dict) -> RetroOutcome:
         cfg, run, n = self.cfg, self.run, len(self.digest.run_ids)
         text = render(header, checked.lessons)
         if parse(text, "L") != (checked.lessons, []):
@@ -989,9 +1034,15 @@ class _Retro:
         base = run.state.get("base_sha")
         if head(worktree) != base:
             return self.stop(f"HEAD of {branch} is no longer the {str(base)[:12]} the retro forked from")
-        safeio.write_text(worktree / pack.LESSONS_FILE, text)
         try:
-            sha = commit_lessons(worktree, COMMIT_MESSAGE.format(n=n), cfg)
+            safeio.write_text(worktree / pack.LESSONS_FILE, text)
+        except (OSError, ValueError) as exc:
+            return self.stop(f"{pack.LESSONS_FILE} could not be written: {exc}")
+        # `expected_text`: the commit holds exactly what the runner wrote. Residual: a process the session left
+        # behind (in a session of its own, out of the agent's process group) can still act on the checkout after
+        # these checks; the git state is checked once more before the push, and the commit is checked blob by blob.
+        try:
+            sha = commit_lessons(worktree, COMMIT_MESSAGE.format(n=n), cfg, expected_text=text)
         except CommitRejected as exc:  # terminal: nothing is pushed after a refused commit
             return self.stop(f"the lessons commit was refused: {exc}")
         except NothingToCommit:
@@ -1002,6 +1053,9 @@ class _Retro:
         run.emit("lessons_committed", key=KEY, sha=sha, added=[lesson.id for lesson, _flag in checked.added],
                  expired=[lesson.id for lesson, _reason in checked.expired],
                  renewed=[lesson.id for lesson, _reason in checked.renewed])
+        if git_state(worktree) != shared:
+            return self.stop(f"committed {sha[:12]} on {branch}, but the git configuration or hooks of the checkout "
+                             "changed since the session ended, so nothing was pushed")
         try:
             push(worktree, branch)
         except GitError as exc:
@@ -1021,5 +1075,5 @@ class _Retro:
 __all__ = [
     "DIGEST_LINE_MAX", "DIGEST_TAIL_LINES", "KEY", "MAX_ADDS", "REVIEW_DEFAULT_DAYS", "REVIEW_MAX_DAYS", "TITLE_MAX",
     "Checked", "Digest", "Note", "Proposals", "RetroOutcome", "apply_proposals", "build_digest", "check_proposals",
-    "finished_runs", "last_retro", "parse_proposals", "pr_body", "resolve_source", "run_retro",
+    "finished_runs", "last_finished_retro", "last_retro", "parse_proposals", "pr_body", "resolve_source", "run_retro",
 ]

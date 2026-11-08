@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .config import QUESTION_KINDS, Config
+from .config import QUESTION_KINDS, RETRO_PIPELINE, Config
 from .events import nfc, parse_iso
 from .state import TERMINAL, Run, list_runs
 
@@ -42,6 +42,8 @@ MESSAGE_MAX = 240
 # Stops that `approve` settles for good (the row becomes done). Every other stop without questions is
 # one the runner raised on a step that has not finished, so `approve` makes that step resumable.
 CLEARED_BY_APPROVE = ("checkpoint", "max_rounds")
+# A retro run walks no phase and is never resumed (`pipeline.advance` refuses it), so a stop of one has one way out.
+RETRO_WAY_OUT = "cancel it and run `agentflow retro` again"
 
 
 class ResultError(Exception):
@@ -382,6 +384,9 @@ def park_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, question
 
 def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config) -> str:
     """The inbox line that says what each way out of this stop does."""
+    if run.state.get("pipeline") == RETRO_PIPELINE:
+        return (f"A retro run cannot be resumed, approved or answered: `agentflow cancel {run.id}`, then run "
+                "`agentflow retro` again (it reads the same runs, since this retro did not finish).")
     scoped = rejected_scope(run, key.split("/")[0], key)
     back = f"task {scoped[1]}" if scoped else "the phase"
     reject = f"`agentflow reject {run.id} {key} --note \"...\"` sends {back} back for a refine round."
@@ -435,6 +440,14 @@ def _refuse_ended(run: Run) -> None:
     status = run.state["status"]
     if status in TERMINAL:
         raise NotWaiting(f"{run.id} is {status}; there is nothing to approve, reject or answer")
+    refuse_retro(run)
+
+
+def refuse_retro(run: Run) -> None:
+    """`NotWaiting` for a retro run: approving, rejecting, answering or retrying one would record a way on that no
+    runner takes (a retro is never resumed), leaving it running with nothing behind it. Checked before any event."""
+    if run.state.get("pipeline") == RETRO_PIPELINE:
+        raise NotWaiting(f"{run.id} is a retro run, which cannot be resumed; {RETRO_WAY_OUT}")
 
 
 def _resolve(run: Run, target: str) -> tuple[str, str]:
