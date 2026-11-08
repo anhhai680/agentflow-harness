@@ -88,7 +88,7 @@ context:
 gates_confirmed: true         # a human has checked `gates` and `gate_sets` (the page cannot change this)
 gates:                          # names to commands
   engine_tests: {run: "uv run --no-project --with pyyaml --with pytest pytest agentflow/tests --import-mode=prepend -q"}
-  portability:  {run: "uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_portability.py --import-mode=prepend -q"}
+  portability:  {run: "uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_portability.py --import-mode=prepend -q", agent_check: true}
 gate_sets:
   setup:  [portability]         # the environment, before an agent needs it
   build:  [portability]
