@@ -1504,6 +1504,23 @@ class _Validator:
             value = getattr(mem, key)
             if isinstance(value, bool) or not low <= value <= high:
                 self.error(f"memory.{key}", f"must be from {low} to {high}{note}")
+        self.lessons()
+
+    def lessons(self) -> None:
+        """The pack's lessons file (beside the config): each malformed entry, unknown phase and unknown target is
+        a warning, since a bad entry is only left out of prompts. A passed `review_by` is never one, so the date
+        cannot turn a clean `validate` red."""
+        from agentflow import lessons, signals  # lessons -> hitl -> config: imported here, not at the top
+        where = pack.LESSONS_FILE
+        found, problems = lessons.read(self.cfg.path.parent / posixpath.basename(where), "L")
+        for problem in problems:
+            self.add("warning", "lessons", f"{where}: {problem}")
+        for lesson in found:
+            for phase in lesson.applies:
+                if phase not in self.cfg.phases:
+                    self.add("warning", "lessons", f"{where}: {lesson.id} applies to {phase!r}, which is not a phase")
+            if lesson.target is not None and signals.parse_target(lesson.target) is None:
+                self.add("warning", "lessons", f"{where}: {lesson.id} target {lesson.target!r} is not a signal key")
 
     def approval(self) -> None:
         cfg = self.cfg

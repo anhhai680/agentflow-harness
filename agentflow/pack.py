@@ -25,6 +25,8 @@ PACK_VERSION = 2  # the pack format this engine reads (`version:`)
 ENGINE_VERSION = "2.1"  # what a pack's `engine:` range is checked against
 ENGINE_FORBIDDEN = (".agentflow/**",)  # forbidden paths every pack gets, whatever it lists itself
 STATE_HOME = "~/.local/state"  # where the default state dir goes when `XDG_STATE_HOME` is unset
+ENGINE_LESSONS: Path = Path(__file__).resolve().parent / "lessons.md"  # the engine's own lessons, for any project
+LESSONS_FILE = ".agentflow/lessons.md"  # the pack's lessons: a fixed path under the engine floor, never a config key
 
 _CLAUSE = re.compile(r"(>=|<=|==|>|<)\s*(\d+(?:\.\d+)*)")
 
@@ -49,6 +51,12 @@ def main_checkout(start: Path) -> Path:
 def pack_config_path(repo: Path) -> Path:
     """Where the pack's config of the checkout holding `repo` is, whether or not it exists."""
     return main_checkout(repo) / PACK_DIR / "config.yaml"
+
+
+def lessons_paths(repo: Path) -> tuple[Path, Path]:
+    """The two lessons files, engine first: the engine's, then the pack's of the main checkout holding `repo`
+    (never a linked worktree's copy, which is on another branch). Either may not exist."""
+    return ENGINE_LESSONS, pack_config_path(repo).parent / PurePosixPath(LESSONS_FILE).name
 
 
 def pack_config(repo: Path) -> Path:

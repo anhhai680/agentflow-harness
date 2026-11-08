@@ -436,3 +436,16 @@ def test_a_plan_written_as_the_bundled_skill_says_parses(tmp_path):
     first, second = sources.parse_plan(plan)
     assert (first.n, first.title, first.depends_on, sources.task_size(first)) == (1, "First", [], (2, 3))
     assert (second.n, second.depends_on, sources.task_size(second)) == (2, [1], (1, 1))
+
+
+# --------------------------------------------------------------------------- the lessons files
+
+
+def test_lessons_paths_read_the_main_checkout_not_a_worktree(tmp_git, git):
+    write_pack(tmp_git, {})
+    wt = make_worktree(tmp_git, git)
+    (wt / ".agentflow" / "lessons.md").write_text("## L-0001 forged in a worktree\nb\n", encoding="utf-8")
+    engine, pack_file = pack.lessons_paths(wt)
+    assert engine == pack.ENGINE_LESSONS and engine.is_file()
+    assert pack_file == (tmp_git / pack.LESSONS_FILE).resolve()
+    assert pack.lessons_paths(wt / "src") == (engine, pack_file)
