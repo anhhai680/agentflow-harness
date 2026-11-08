@@ -321,8 +321,13 @@ def commit_lessons(worktree: Path, message: str, cfg: Config, expected_text: str
         raise _lessons_refused(worktree, f"{LESSONS_FILE} would be committed with mode {mode}, "
                                "not as a regular file (100644)")
     if expected_text is not None:
-        wanted = subprocess.run(["git", "hash-object", "--no-filters", "--stdin"], cwd=worktree,
-                                input=expected_text.encode("utf-8"), capture_output=True, check=True).stdout.decode().strip()
+        hashed = subprocess.run(["git", "hash-object", "--no-filters", "--stdin"], cwd=worktree,
+                                input=expected_text.encode("utf-8"), capture_output=True, check=False)
+        if hashed.returncode != 0:
+            _git(worktree, "reset", "-q")  # the index back at `HEAD`, as a refusal leaves it
+            detail = hashed.stderr.decode("utf-8", "replace").strip() or f"exit {hashed.returncode}"
+            raise GitError(f"git hash-object failed: {detail}")
+        wanted = hashed.stdout.decode().strip()
         if blob != wanted:
             raise _lessons_refused(worktree, f"the staged {LESSONS_FILE} (blob {blob[:12]}) is not the text the runner "
                                    f"wrote (blob {wanted[:12]}): something changed the file after it was written")
@@ -686,11 +691,16 @@ def diff_stat(worktree: Path, sha: str) -> str:
     return _git_or_raise(Path(worktree), "diff", "--stat", sha).rstrip()
 
 
-def push(worktree: Path, branch: str) -> None:
+def push(worktree: Path, branch: str, sha: str | None = None) -> None:
     """Push `branch` to the branch of the same name on `origin` and track it. Never forced, and with an explicit
     `refs/heads/<branch>:refs/heads/<branch>` refspec, so a `remote.origin.push` (or `mirror`) setting cannot send it
-    anywhere else; no hook runs (`HARDENED`, `--no-verify`), so a planted `pre-push` never runs as the runner."""
+    anywhere else; no hook runs (`HARDENED`, `--no-verify`), so a planted `pre-push` never runs as the runner.
+    With `sha`, that commit is pushed (`<sha>:refs/heads/<branch>`, no upstream set), whatever the local branch
+    points at by then."""
     ref = f"refs/heads/{branch}"
+    if sha is not None:
+        _git_or_raise(Path(worktree), *HARDENED, "push", "--no-verify", "-q", "origin", f"{sha}:{ref}")
+        return
     _git_or_raise(Path(worktree), *HARDENED, "push", "--no-verify", "-q", "-u", "origin", f"{ref}:{ref}")
 
 
@@ -731,8 +741,20 @@ def uncommitted_paths(worktree: Path) -> list[str]:
     return sorted(paths)
 
 
-def _file_mark(path: Path) -> tuple:
-    """What a git control file is, for `git_state`: its type and the hash of its bytes (a link: its target)."""
+MARK_BYTES = 4 * 1024 * 1024  # bytes of one git control file `git_state` reads; a bigger one always reads as changed
+MARK_ENTRIES = 512  # entries of a control folder (`hooks/`) it lists; more always read as changed
+_INFO_FILES = ("exclude", "attributes", "sparse-checkout", "grafts")  # what of `info/` git reads (not `info/refs`)
+
+
+def _changed() -> tuple:
+    """A mark no other mark equals: what cannot be read in full cannot be vouched for, so it reads as changed."""
+    return ("unbounded", os.urandom(16).hex())
+
+
+def _file_mark(path: Path, depth: int = 0) -> tuple:
+    """What a git control file is, for `git_state`: its type and the hash of its bytes (a link: its target; a folder:
+    its entries). Opened without following a link and without blocking (a FIFO swapped in after the `lstat` cannot
+    hang it), checked as a regular file on the open descriptor, and read in chunks up to `MARK_BYTES`."""
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -742,17 +764,61 @@ def _file_mark(path: Path) -> tuple:
     if stat.S_ISLNK(info.st_mode):
         return ("symlink", os.readlink(path))
     if stat.S_ISDIR(info.st_mode):
-        return ("dir", tuple((child.name, _file_mark(child)) for child in sorted(path.iterdir())))
+        if depth >= 2:
+            return _changed()
+        try:
+            children = sorted(path.iterdir())
+        except OSError as exc:
+            return ("unreadable", str(exc))
+        if len(children) > MARK_ENTRIES:
+            return _changed()
+        return ("dir", tuple((child.name, _file_mark(child, depth + 1)) for child in children))
     if not stat.S_ISREG(info.st_mode):
         return ("special", stat.S_IFMT(info.st_mode))
-    with open(path, "rb") as handle:  # a regular file (lstat): no FIFO can block this open
-        return ("file", info.st_mode & 0o777, hashlib.sha256(handle.read()).hexdigest())
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        return ("unreadable", str(exc))
+    with os.fdopen(fd, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            return ("special", stat.S_IFMT(opened.st_mode))
+        if opened.st_size > MARK_BYTES:
+            return _changed()
+        digest = hashlib.sha256()
+        total = 0
+        while chunk := handle.read(64 * 1024):
+            total += len(chunk)
+            if total > MARK_BYTES:
+                return _changed()
+            digest.update(chunk)
+    return ("file", opened.st_mode & 0o777, digest.hexdigest())
 
 
-def git_state(worktree: Path) -> dict[str, Any]:
+def _config_listing(worktree: Path, branch: str | None) -> bytes:
+    """`git config --list --show-origin -z` of every scope, less the `branch.<name>.*` keys of every branch but
+    `branch` (other runs push with `-u` and tools record merge bases there; none of it reaches a push of `branch`)."""
+    out = subprocess.run(["git", *HARDENED, "config", "--list", "--show-origin", "-z"], cwd=worktree,
+                         capture_output=True, check=False).stdout
+    fields = out.split(b"\0")
+    kept: list[bytes] = []
+    for origin, entry in zip(fields[0::2], fields[1::2], strict=False):
+        key = entry.split(b"\n", 1)[0].decode("utf-8", "surrogateescape")
+        if branch is not None and key.startswith("branch.") and key.count(".") >= 2:
+            name = key[len("branch."):key.rindex(".")]
+            if name != branch:
+                continue
+        kept += [origin, entry]
+    return b"\0".join(kept)
+
+
+def git_state(worktree: Path, branch: str | None = None) -> dict[str, Any]:
     """The git state an agent could change to make a later runner git call do something else: the effective config of
-    every scope (`git config --list --show-origin`), the push URL of `origin`, and the control files of the checkout
-    and of the repository it shares (`config`, `config.worktree`, `info/`, `hooks/`, the worktree's `.git` file). Two
+    every scope (`git config --list --show-origin`; with `branch`, other branches' `branch.<name>.*` keys left out),
+    the push URL of `origin`, and the control files of the checkout and of the repository it shares (`info/exclude`,
+    `info/attributes`, `info/sparse-checkout`, `info/grafts`, `hooks/`, `commondir`, `gitdir`, the worktree's `.git`
+    file). The config files themselves are read only through the listing, which holds every value they set (and
+    every value they include), so another branch's keys written to the shared `config` change nothing here. Two
     equal values mean nothing of it changed. Read with `HARDENED`; nothing it reads runs a command."""
     worktree = Path(worktree)
 
@@ -763,21 +829,22 @@ def git_state(worktree: Path) -> dict[str, Any]:
     git_dir, common = where("--git-dir"), where("--git-common-dir")
     files = {"dot_git": worktree / ".git"}
     for name, base in (("git_dir", git_dir), ("common", common)):
-        for rel in ("config", "config.worktree", "info", "hooks", "commondir", "gitdir"):
+        for rel in ("hooks", "commondir", "gitdir", *(f"info/{i}" for i in _INFO_FILES)):
             files[f"{name}/{rel}"] = base / rel
-    config = subprocess.run(["git", *HARDENED, "config", "--list", "--show-origin", "-z"], cwd=worktree,
-                            capture_output=True, check=False).stdout
     url = subprocess.run(["git", *HARDENED, "remote", "get-url", "--push", "origin"], cwd=worktree,
                          capture_output=True, text=True, check=False).stdout.strip()
-    return {"config": hashlib.sha256(config).hexdigest(), "push_url": url,
-            "files": {name: _file_mark(path) for name, path in files.items()}}
+    marks = {name: _file_mark(path) for name, path in files.items() if name != "dot_git"}
+    dot_git = files["dot_git"]  # a linked worktree's `.git` file; a main checkout's folder is read file by file above
+    marks["dot_git"] = ("dir",) if dot_git.is_dir() and not dot_git.is_symlink() else _file_mark(dot_git)
+    return {"config": hashlib.sha256(_config_listing(worktree, branch)).hexdigest(), "push_url": url, "files": marks}
 
 
 def tree_state(worktree: Path) -> dict[str, Any]:
     """What the checkout at `worktree` holds besides `HEAD`, read so no setting can hide a change: every untracked
     and every ignored path (`status` with `showUntrackedFiles=all`, `ignoreStat=false`, no untracked cache), each
     index entry flagged skip-worktree or assume-unchanged (`ls-files -v`), whether the work tree and the index
-    differ from `HEAD`, and `HEAD` itself. Two equal values mean nothing git can see changed."""
+    differ from `HEAD`, and `HEAD` itself: its commit and the branch it names. Two equal values mean nothing git can
+    see changed."""
     worktree = Path(worktree)
     strict = (*HARDENED, "-c", "status.showUntrackedFiles=all", "-c", "core.ignoreStat=false",
               "-c", "core.untrackedCache=false")
@@ -792,7 +859,9 @@ def tree_state(worktree: Path) -> dict[str, Any]:
 
     return {"status": sorted(e for e in status.split("\0") if e), "flagged": sorted(flagged),
             "worktree_differs": differs("HEAD"), "index_differs": differs("--cached", "HEAD"),
-            "head": _git_or_raise(worktree, *strict, "rev-parse", "HEAD").strip()}
+            "head": _git_or_raise(worktree, *strict, "rev-parse", "HEAD").strip(),
+            "symbolic_head": subprocess.run(["git", *strict, "symbolic-ref", "-q", "HEAD"], cwd=worktree,
+                                            capture_output=True, text=True, check=False).stdout.strip()}
 
 
 def blob_at(repo: Path, ref: str, path: str, limit: int) -> bytes | None:

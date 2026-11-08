@@ -542,3 +542,59 @@ def test_blob_at_reads_a_regular_file_at_a_commit(tmp_git):
         gitops.blob_at(tmp_git, _head(tmp_git), "link.md", 1000)
     with pytest.raises(ValueError, match="regular file"):
         gitops.blob_at(tmp_git, _head(tmp_git), "src", 1000)  # a tree
+
+
+def test_git_state_ignores_other_branches_settings_and_info_refs(tmp_git):
+    before = gitops.git_state(tmp_git, "work")
+    run_git(tmp_git, "config", "branch.other.remote", "origin")
+    (tmp_git / ".git" / "info").mkdir(exist_ok=True)
+    (tmp_git / ".git" / "info" / "refs").write_text("x\trefs/heads/main\n", encoding="utf-8")
+    assert gitops.git_state(tmp_git, "work") == before
+    run_git(tmp_git, "config", "branch.work.remote", "/elsewhere")
+    assert gitops.git_state(tmp_git, "work") != before
+
+
+def test_git_state_never_blocks_on_a_fifo_and_caps_what_it_reads(tmp_git):
+    import threading
+
+    hooks = tmp_git / ".git" / "hooks"
+    os.mkfifo(hooks / "pre-push")
+    big = hooks / "post-commit"
+    with open(big, "wb") as handle:
+        handle.truncate(2 * 1024 ** 3)  # sparse: 2 GiB of nothing
+    box: dict = {}
+    thread = threading.Thread(target=lambda: box.update(a=gitops.git_state(tmp_git), b=gitops.git_state(tmp_git)),
+                              daemon=True)
+    thread.start()
+    thread.join(20)
+    if thread.is_alive():
+        os.close(os.open(hooks / "pre-push", os.O_RDWR))
+        pytest.fail("git_state blocked on a FIFO or read a huge file")
+    assert box["a"] != box["b"]  # a file over the cap cannot be vouched for: it always reads as changed
+
+
+def test_push_can_pin_the_commit_it_pushes(tmp_git, tmp_path):
+    origin = _with_origin(tmp_path, tmp_git)
+    run_git(tmp_git, "checkout", "-q", "-b", "work")
+    _write(tmp_git, "x.txt", "x\n")
+    _commit(tmp_git, "one")
+    pinned = _head(tmp_git)
+    _write(tmp_git, "y.txt", "y\n")
+    _commit(tmp_git, "two")
+    gitops.push(tmp_git, "work", sha=pinned)
+    assert run_git(origin, "rev-parse", "work").strip() == pinned
+
+
+def test_commit_lessons_turns_a_failing_hash_object_into_a_git_error(tmp_git, cfg, monkeypatch):
+    _write_lessons(tmp_git)
+    real = gitops.subprocess.run
+
+    def run(args, *a, **kw):
+        if isinstance(args, list) and "hash-object" in args:
+            return real(["git", "hash-object", "--no-such-flag"], *a, **{**kw, "check": False})
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitops.subprocess, "run", run)
+    with pytest.raises(gitops.GitError, match="hash-object"):
+        commit_lessons(tmp_git, "Add lessons.", cfg, expected_text="# Lessons\n\n- keep it small\n")
+    assert _staged(tmp_git) == []
