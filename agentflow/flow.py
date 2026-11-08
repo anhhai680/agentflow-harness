@@ -244,6 +244,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_inbox(args: argparse.Namespace) -> int:
+    from agentflow.config import RETRO_PIPELINE
     from agentflow.hitl import inbox_items
 
     try:
@@ -262,7 +263,7 @@ def cmd_inbox(args: argparse.Namespace) -> int:
             print(f"  {q['id']}: {q['question']}")
         if item["inbox_path"]:
             print(f"  file: {item['inbox_path']}")
-        if item.get("pipeline") == "retro":  # a retro is never resumed: cancel it and run another
+        if item.get("pipeline") == RETRO_PIPELINE:  # a retro is never resumed: cancel it and run another
             print(f"  agentflow cancel {item['run_id']}    then    agentflow retro")
         elif item["kind"] == "phase_approval":
             print(f"  agentflow approve {item['run_id']} {item['phase']}    |    agentflow reject {item['run_id']} {item['phase']} --note \"...\"")

@@ -939,14 +939,14 @@ class _Retro:
         if isinstance(found, str):
             return self.stop(found)
         header, current, base_bytes = found
-        shared, tree = git_state(worktree), tree_state(worktree)
+        shared, tree = git_state(worktree, branch), tree_state(worktree)
 
         executor = Executor(cfg, run, make_agents(cfg), _ctx(cfg, run, worktree), {})
         plain = Phase(name=RETRO_PIPELINE, agent=None, model=None, skip_if=None, steps=[])
         if executor.run_agent_step(plain, self.step, KEY, role=self.step.role) != "done":
             return RetroOutcome(run.id, None, f"the retro session stopped: see `agentflow inbox` ({run.id})")
 
-        why = self.untouched(worktree, shared, tree, base_bytes)
+        why = self.untouched(worktree, branch, shared, tree, base_bytes)
         if why:
             return self.stop(why)
         try:
@@ -960,21 +960,22 @@ class _Retro:
                                 f"changes no lesson ({len(checked.dropped)} proposals dropped)")
         return self.publish(worktree, branch, header, checked, shared)
 
-    def untouched(self, worktree: Path, shared: dict, tree: dict, base_bytes: bytes | None) -> str:
+    def untouched(self, worktree: Path, branch: str, shared: dict, tree: dict, base_bytes: bytes | None) -> str:
         """Why the checkout is not as it was before the session, or "": the shared git state first (its config and
         hooks decide what every later git call does, so nothing else runs git before it is checked), then what git
         sees in the tree, then the lessons path itself (a FIFO or a device is invisible to git)."""
-        if git_state(worktree) != shared:
-            return ("the retro session changed the git configuration, hooks or control files of the checkout; "
-                    "nothing was committed or pushed. A retro session changes no file.")
+        if git_state(worktree, branch) != shared:
+            return ("the git configuration, hooks or control files of the checkout changed (by the session or another "
+                    "process) while the retro session ran; nothing was committed or pushed. A retro session changes "
+                    "no file: check them, cancel this run and run `agentflow retro` again.")
         now = tree_state(worktree)
         if now != tree:
             changed = sorted(set(now["status"]) - set(tree["status"]))
             paths = [entry[3:] for entry in changed]
             if now["flagged"] != tree["flagged"]:
                 paths += [f"{entry[2:]} (hidden from git status)" for entry in sorted(set(now["flagged"]) - set(tree["flagged"]))]
-            if not paths and now["head"] != tree["head"]:
-                paths = [f"HEAD (now {now['head'][:12]})"]
+            if not paths and (now["head"], now["symbolic_head"]) != (tree["head"], tree["symbolic_head"]):
+                paths = [f"HEAD (now {clean_fact(now['symbolic_head']) or 'detached'} at {now['head'][:12]})"]
             shown = ", ".join(paths[:10]) + (f" and {len(paths) - 10} more" if len(paths) > 10 else "")
             return f"the retro session changed files: {shown or 'tracked files'}. A retro session changes no file."
         path = worktree / pack.LESSONS_FILE
@@ -1005,6 +1006,16 @@ class _Retro:
             raise ResultError(f"result file is not valid JSON: {exc}") from None
         return raw
 
+    def head_moved(self, worktree: Path, branch: str, sha: str | None) -> str:
+        """Why `HEAD` is not branch `branch` at `sha`, or "": the lessons commit must land on the retro's own branch,
+        never on one the session pointed `HEAD` at (the same commit on another branch passes every tree check)."""
+        found = tree_state(worktree)
+        if found["symbolic_head"] != f"refs/heads/{branch}":
+            return f"HEAD names {clean_fact(found['symbolic_head']) or 'no branch'}, not refs/heads/{branch}"
+        if found["head"] != sha:
+            return f"HEAD of {branch} is {found['head'][:12]}, not the {str(sha)[:12]} the runner expects"
+        return ""
+
     def base_lessons(self, worktree: Path, base: str) -> tuple[str, list[Lesson], bytes | None] | str:
         """`(header, lessons, bytes)` of the lessons file at `base`, the commit the retro forked from, read from git
         (never from the work tree, which the session can write); or why it cannot be used. None bytes: no file."""
@@ -1032,8 +1043,9 @@ class _Retro:
         if parse(text, "L") != (checked.lessons, []):
             return self.stop(f"the new {pack.LESSONS_FILE} would not read back as the runner wrote it")
         base = run.state.get("base_sha")
-        if head(worktree) != base:
-            return self.stop(f"HEAD of {branch} is no longer the {str(base)[:12]} the retro forked from")
+        moved = self.head_moved(worktree, branch, base)
+        if moved:
+            return self.stop(moved)
         try:
             safeio.write_text(worktree / pack.LESSONS_FILE, text)
         except (OSError, ValueError) as exc:
@@ -1053,11 +1065,18 @@ class _Retro:
         run.emit("lessons_committed", key=KEY, sha=sha, added=[lesson.id for lesson, _flag in checked.added],
                  expired=[lesson.id for lesson, _reason in checked.expired],
                  renewed=[lesson.id for lesson, _reason in checked.renewed])
-        if git_state(worktree) != shared:
+        if git_state(worktree, branch) != shared:
             return self.stop(f"committed {sha[:12]} on {branch}, but the git configuration or hooks of the checkout "
-                             "changed since the session ended, so nothing was pushed")
+                             "changed (by the session or another process) since the session ended, so nothing was "
+                             "pushed")
+        moved = self.head_moved(worktree, branch, sha)
+        if moved:
+            return self.stop(f"committed {sha[:12]}, but {moved}, so nothing was pushed")
+        # The commit is pushed by its sha, so a process that moves the branch after this point changes nothing that
+        # is pushed. Residual: one that changes a setting the push reads (`remote.origin.receivepack`, a credential
+        # helper) between the last check above and the push itself is not caught; the window is this one call.
         try:
-            push(worktree, branch)
+            push(worktree, branch, sha=sha)
         except GitError as exc:
             return self.stop(f"committed {sha[:12]} on {branch} but could not push it: {exc}")
         body_file = run.dir / workspace.RETRO_DIGEST[0] / PR_FILE

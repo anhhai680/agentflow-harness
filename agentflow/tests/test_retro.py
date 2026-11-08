@@ -1251,3 +1251,93 @@ def test_a_file_the_branch_already_ignores_is_still_seen(flow_repo, gh_log, monk
     _during_session(monkeypatch, agent)
     out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
     _blocked_without_push(flow_repo, gh_log, out, "__pycache__/")
+
+
+# --------------------------------------------------------------------------- fix round 2: what is not the session's
+
+
+_BENIGN = {  # what other runs and tools do in the shared repository while a retro session runs
+    "another_runs_push": lambda root: (run_git(root, "branch", "other-run", "HEAD"), gitops.push(root, "other-run")),
+    "another_runs_worktree": lambda root: gitops.add_worktree(root, root.parent / "wt-other", "flow/x", "main"),
+    "a_fetch": lambda root: run_git(root, "fetch", "-q", "origin"),
+    "git_gc": lambda root: run_git(root, "gc", "-q"),
+    "another_branchs_config": lambda root: run_git(root, "config", "branch.other.gh-merge-base", "main"),
+}
+
+
+@pytest.mark.parametrize("name", list(_BENIGN))
+def test_benign_activity_elsewhere_in_the_repository_does_not_stop_a_retro(flow_repo, gh_log, monkeypatch, name):
+    _script_one_add(flow_repo)
+    _during_session(monkeypatch, lambda worktree, run: _BENIGN[name](flow_repo.root))
+    out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    assert out.pr_url == PR_URL, out.message
+
+
+@pytest.mark.parametrize("key, value", [("branch.{branch}.pushRemote", "/elsewhere.git"),
+                                        ("branch.{branch}.remote", "/elsewhere.git"),
+                                        ("remote.origin.receivepack", "touch /tmp/x; git-receive-pack"),
+                                        ("credential.helper", "!touch /tmp/x"),
+                                        ("include.path", "/tmp/agentflow-included.cfg")])
+def test_settings_that_reach_the_retro_push_still_stop_it(flow_repo, gh_log, monkeypatch, key, value):
+    _script_one_add(flow_repo)
+
+    def agent(worktree, run):
+        branch = run_git(worktree, "branch", "--show-current").strip()
+        run_git(worktree, "config", key.replace("{branch}", branch), value)
+
+    _during_session(monkeypatch, agent)
+    out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    waiting = _blocked_without_push(flow_repo, gh_log, out, "git configuration")
+    assert "by the session or another process" in waiting["summary"]
+
+
+@pytest.mark.parametrize("target", ["hijack", "main", "next"])
+def test_head_moved_to_another_branch_at_the_same_commit_is_refused(flow_repo, gh_log, monkeypatch, target):
+    _script_one_add(flow_repo)
+
+    def agent(worktree, run):
+        if target == "hijack":
+            run_git(worktree, "branch", "hijack", "HEAD")
+        run_git(worktree, "symbolic-ref", "HEAD", f"refs/heads/{target}")
+
+    _during_session(monkeypatch, agent)
+    tips = {b: run_git(flow_repo.root, "rev-parse", b).strip() for b in ("main", "next")}
+    out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    _blocked_without_push(flow_repo, gh_log, out)
+    assert {b: run_git(flow_repo.root, "rev-parse", b).strip() for b in ("main", "next")} == tips
+    if target == "hijack":
+        assert run_git(flow_repo.root, "rev-parse", "hijack").strip() == tips["next"]  # no lessons commit landed
+
+
+def test_the_pushed_tip_is_the_lessons_commit(flow_repo, gh_log, monkeypatch):
+    import agentflow.retro as retro_mod
+
+    _script_one_add(flow_repo)
+    committed = {}
+    real_commit, real_push = retro_mod.commit_lessons, retro_mod.push
+
+    def commit(*a, **kw):
+        committed["sha"] = real_commit(*a, **kw)
+        return committed["sha"]
+
+    def push(worktree, branch, *a, **kw):  # a lingering process moves the branch between the commit and the push
+        run_git(worktree, "update-ref", f"refs/heads/{branch}", "HEAD~1")
+        return real_push(worktree, branch, *a, **kw)
+
+    monkeypatch.setattr(retro_mod, "commit_lessons", commit)
+    monkeypatch.setattr(retro_mod, "push", push)
+    out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    assert out.pr_url == PR_URL
+    branch = _run(flow_repo, out).state["branch"]
+    assert run_git(flow_repo.origin, "rev-parse", branch).strip() == committed["sha"]
+
+
+@pytest.mark.parametrize("clean, words", [("false", "could not be committed"),
+                                          ("sed s/unit/UNIT/", "not the text the runner wrote")])
+def test_a_clean_filter_on_the_lessons_path_stops_blocked(flow_repo, gh_log, clean, words):
+    _commit_on_base(flow_repo, {".gitattributes": f"{pack.LESSONS_FILE} filter=lessons\n"})
+    run_git(flow_repo.root, "config", "filter.lessons.clean", clean)
+    run_git(flow_repo.root, "config", "filter.lessons.required", "true")
+    _script_one_add(flow_repo)
+    out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    _blocked_without_push(flow_repo, gh_log, out, words)
