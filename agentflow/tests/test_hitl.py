@@ -10,6 +10,7 @@ import pytest
 from agentflow import hitl
 from agentflow.flow import main
 from agentflow.hitl import (
+    CODE_MAP_PER_RESULT,
     FACT_MAX,
     FACTS_PER_RESULT,
     NotWaiting,
@@ -105,6 +106,29 @@ def test_clean_fact_drops_format_characters():
 def test_result_facts_must_be_a_list_of_strings(tmp_path, facts):
     with pytest.raises(ResultError):
         read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x", "facts": facts}))
+
+
+def test_result_code_map_is_cleaned_cut_and_capped(tmp_path):
+    p = tmp_path / "r.json"
+    raw = [f"`app/m{n}.py:{n}` `f{n}()`: does {n}" for n in range(12)]
+    raw[1] = "`app/a.py:1` evil \u202e name"
+    raw[2] = "x" * 2000
+    code_map = read_result(write_result(p, {"status": "done", "summary": "x", "code_map": raw})).code_map
+    assert len(code_map) == CODE_MAP_PER_RESULT == 8
+    assert code_map[0] == raw[0] and code_map[3:] == raw[3:CODE_MAP_PER_RESULT]
+    assert all("\u202e" not in c and len(c) <= FACT_MAX for c in code_map)
+    assert code_map[1] == "`app/a.py:1` evil name"
+    assert code_map[2] == "x" * FACT_MAX
+
+
+@pytest.mark.parametrize("code_map", ["x", {"a": "b"}, [1], [["nested"]], [None]])
+def test_result_code_map_must_be_a_list_of_strings(tmp_path, code_map):
+    with pytest.raises(ResultError, match="code_map must be a list of strings"):
+        read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x", "code_map": code_map}))
+
+
+def test_a_result_with_no_code_map_has_an_empty_one(tmp_path):
+    assert read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x"})).code_map == []
 
 
 def test_result_schema(tmp_path):

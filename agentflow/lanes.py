@@ -852,8 +852,17 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             if sha:
                 self.run.emit("step_committed", key=sr.key, sha=sha, summary=result.summary)
         extra = {"tree": tree} if tree else {}
+        self._remember_code_map(sr, result)
         self.run.emit("step_finished", key=sr.key, status="done", summary=result.summary, sha=sha, **extra)
         return "done"
+
+    def _remember_code_map(self, sr: _StepRun, result: StepResult) -> None:
+        """Keep the code map a finished step reported, once per entry (any case). A stopped step never gets here."""
+        known = {str(c.get("text")).casefold() for c in self.run.state.get("code_map") or []}
+        for entry in result.code_map:
+            if entry.casefold() not in known:
+                known.add(entry.casefold())
+                self.run.emit("code_noted", text=entry, key=sr.key)
 
     def _soft_noted(self, soft: float) -> bool:
         """The run already said it passed this soft budget: a soft limit notifies once per value, and plan sizing

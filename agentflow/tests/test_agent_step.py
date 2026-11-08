@@ -309,6 +309,29 @@ def test_blocked_result_raises_hitl(flow_repo):
     assert raised[0]["summary"] == "the spec is missing"
 
 
+def test_a_done_step_records_its_code_map_once(flow_repo):
+    run = flow_repo.new_run()
+    entry = "`app/names.py:12` `normalise(name: str) -> str`: trims {braces}"
+    result = {"status": "done", "summary": "did it", "code_map": [entry]}
+    flow_repo.script({KEY: [{"result": result}], "build/other": [{"result": result}]})
+    assert run_step(flow_repo) == "done"
+    noted = flow_repo.events(run, "code_noted")
+    assert [(e["text"], e["key"]) for e in noted] == [(entry, KEY)]
+    assert run.state["code_map"] == [{"text": entry, "key": KEY}]
+    other = make_step(id="other")
+    assert flow_repo.executor(run).run_agent_step(make_phase(other), other, "build/other") == "done"
+    assert len(flow_repo.events(run, "code_noted")) == 1  # the same entry again: no second event
+
+
+def test_a_stopped_step_records_no_code_map(flow_repo):
+    run = flow_repo.new_run()
+    result = {"status": "blocked", "summary": "the spec is missing", "code_map": ["`app/names.py:12` `f()`: x"]}
+    flow_repo.script({KEY: [{"result": result}]})
+    assert run_step(flow_repo) == "stopped"
+    assert flow_repo.events(run, "code_noted") == []
+    assert run.state["code_map"] == []
+
+
 def test_needs_human_then_answer_resumes_same_session(flow_repo):
     run = flow_repo.new_run()
     question = {"id": "q1", "question": "Cache the token across conversations?",

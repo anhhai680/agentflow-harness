@@ -15,6 +15,7 @@ from agentflow import pack
 from agentflow.events import EventError, EventLog, RunLock, lock_state
 from agentflow.flow import _human_errors, main
 from agentflow.state import (
+    CODE_MAP_MAX,
     RUN_FACTS_MAX,
     Run,
     RunNotFound,
@@ -787,3 +788,36 @@ def test_run_fact_appends_dedupes_and_keeps_the_newest(run):
 def test_run_fact_needs_its_text_and_key(run):
     with pytest.raises(EventError):
         run.emit("run_fact", text="no key")
+
+
+# --------------------------------------------------------------------------- code map
+
+
+def test_code_map_starts_empty_and_old_states_still_replay(run):
+    assert initial_state()["code_map"] == []
+    assert run.state["code_map"] == []
+    assert replay([])["code_map"] == []
+    old = copy.deepcopy(run.state)
+    del old["code_map"]  # a state written before the code map existed
+    after = reduce(old, {"type": "code_noted", "text": "`a.py:1` f()", "key": "build/x", "seq": 99})
+    assert after["code_map"] == [{"text": "`a.py:1` f()", "key": "build/x"}]
+
+
+def test_code_noted_appends_dedupes_by_casefold_and_keeps_the_newest(run):
+    run.emit("code_noted", text="`a.py:1` Normalise()", key="build/x")
+    run.emit("code_noted", text="second", key="build/x")
+    assert run.state["code_map"] == [{"text": "`a.py:1` Normalise()", "key": "build/x"},
+                                     {"text": "second", "key": "build/x"}]
+    run.emit("code_noted", text="`A.PY:1` normalise()", key="build/y")  # the same note in other case: once, newest
+    assert [c["text"] for c in run.state["code_map"]] == ["second", "`A.PY:1` normalise()"]
+    for n in range(CODE_MAP_MAX + 3):
+        run.emit("code_noted", text=f"note {n}", key="build/x")
+    assert [c["text"] for c in run.state["code_map"]] == [f"note {n}" for n in range(3, CODE_MAP_MAX + 3)]
+    assert state_json(run) == replay(run.events.read()) == run.state
+
+
+def test_code_noted_needs_its_text_and_key(run):
+    with pytest.raises(EventError):
+        run.emit("code_noted", text="no key")
+    with pytest.raises(EventError):
+        run.emit("code_noted", key="build/x")

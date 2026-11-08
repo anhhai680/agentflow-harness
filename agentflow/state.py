@@ -28,6 +28,7 @@ from .events import EventError, EventLog, RunLock, lock_state, nfc, now_iso
 TERMINAL = ("done", "failed", "cancelled")
 SLUG_PARAMS = ("slug", "module", "issue", "topic", "task", "log")  # an explicit slug (an issue's) wins
 SLUG_MAX = 40
+CODE_MAP_MAX = 40  # existing code a step reported that the run keeps for every later session (the newest)
 RUN_FACTS_MAX = 8  # what a resolver found that the run keeps for every later session (the newest)
 
 
@@ -71,6 +72,7 @@ def initial_state() -> dict:
         "context_windows": {},
         "env_dropped": [],
         "facts": [],
+        "code_map": [],
         "gates": {},
         "reviews": {},
         "effort_changes": [],
@@ -482,6 +484,13 @@ def _on_run_fact(state: dict, ev: dict) -> None:
     state["facts"] = [*kept, {"text": text, "key": ev["key"]}][-RUN_FACTS_MAX:]
 
 
+def _on_code_noted(state: dict, ev: dict) -> None:
+    """A line of code map a step reported, kept for every later session. A repeat (any case) moves to the newest place."""
+    text = str(ev["text"])
+    kept = [c for c in state.get("code_map") or [] if str(c.get("text")).casefold() != text.casefold()]
+    state["code_map"] = [*kept, {"text": text, "key": ev["key"]}][-CODE_MAP_MAX:]
+
+
 def _on_resolve_finished(state: dict, ev: dict) -> None:
     state["resolving"] = None
 
@@ -733,6 +742,7 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "resolve_started": _on_resolve_started,
     "resolve_finished": _on_resolve_finished,
     "run_fact": _on_run_fact,
+    "code_noted": _on_code_noted,
     "ci_watching": _on_ci_watching,
     "pr_marked_ready": _on_pr_marked_ready,
     "hitl_answered": _on_hitl_answered,
@@ -777,6 +787,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "resolve_started": ("key",),
     "resolve_finished": ("key",),
     "run_fact": ("text", "key"),
+    "code_noted": ("text", "key"),
     "agent_started": (("session_id", "pid"),),
     "agent_session": ("session_id",),
     "context_window": ("model", "tokens"),
