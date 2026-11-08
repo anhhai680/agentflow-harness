@@ -227,7 +227,13 @@ def test_nothing_left_is_empty():
 def test_engine_seed_parses_clean():
     found, problems = parse(pack.ENGINE_LESSONS.read_text(encoding="utf-8"), "E")
     assert problems == [] and 3 <= len(found) <= 6
-    assert all(x.sources == () and x.target is None and x.review_by == date(2027, 11, 8) for x in found)
+    assert all(x.sources == () and x.target is None and x.review_by is None for x in found)
+
+
+def test_the_engine_seed_lessons_never_expire():
+    found, _problems = parse(pack.ENGINE_LESSONS.read_text(encoding="utf-8"), "E")
+    for today in (TODAY, date(2027, 11, 9), date(2100, 1, 1)):  # a retro cannot renew them, so no date may drop them
+        assert select(found, None, today, 1_000_000).ids == tuple(sorted(x.id for x in found))
 
 
 def test_this_repos_pack_lessons_parse_clean(repo_root):
