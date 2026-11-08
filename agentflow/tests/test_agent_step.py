@@ -1137,7 +1137,6 @@ def test_a_run_with_no_code_map_key_builds_the_same_prompt(flow_repo):
 
 def test_the_code_map_follows_the_facts_before_the_step(flow_repo):
     run = flow_repo.new_run()
-    plain = _prompt(flow_repo)
     run.emit("run_fact", text="a cause", key="build/x/resolve-1")
     run.emit("code_noted", text="`app/names.py:12` `f() {step_id}`", key="build/x")
     prompt = _prompt(flow_repo)
