@@ -51,7 +51,8 @@ ENGINE_PREFIX = "E"
 
 _HEADING = re.compile(r"^##(?:\s+(\S+))?(?:\s+(.*?))?\s*$")
 _KEY_LINE = re.compile(r"^-\s+([A-Za-z_]+)\s*:(.*)$")
-_COMMENT = re.compile(r"\s#")
+_COMMENT = re.compile(r"\s#")  # where a comment starts on a key line
+_HASHES = re.compile(r"\s+#+")  # a run of spaces then of `#`s: what render collapses so no comment can start
 _PHASE = re.compile(r"^[A-Za-z0-9_-]+$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _LEADING = re.compile(r"^(?:#|-(?=\s|$)|\s)+")  # leading heading marks, list dashes and spaces
@@ -78,8 +79,8 @@ class Selection:
 
 
 def estimate_tokens(text: str) -> int:
-    """A rough token count: four characters a token, rounded up."""
-    return (len(text) + 3) // 4
+    """A rough token count: four characters a token, the estimate used everywhere in the engine."""
+    return len(text) // 4
 
 
 def _clean_text(text: str) -> str:
@@ -90,7 +91,10 @@ def _clean_text(text: str) -> str:
 
 def _clean_value(text: str) -> str:
     """A key's value as it may stand after `- key: `: one line, and no ` #`, which would start a comment."""
-    return " ".join(_COMMENT.sub(" ", clean_fact(text)).split())
+    text = clean_fact(text)
+    while _COMMENT.search(text):  # one pass leaves none; the loop makes sure, whatever the input
+        text = _HASHES.sub(" ", text)
+    return " ".join(text.split())
 
 
 # --------------------------------------------------------------------------- parse

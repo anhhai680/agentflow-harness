@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import date
 
 import pytest
@@ -71,6 +72,27 @@ def test_render_values_cannot_add_a_comment_or_a_line():
     again, problems = parse(render("", ls), "L")
     assert not problems and again[0].target is None
     assert again[0].baseline == "3/9 runs not a comment - target: stop:x"
+
+
+@pytest.mark.parametrize("value", ["stop:x ## hidden", "stop:x # # hidden", "stop:x \t#\t## hidden", "stop:x ###"])
+def test_no_run_of_hashes_in_a_value_starts_a_comment(value):
+    ls = [Lesson("L-0005", "t", "b", (), (), None, value, value.replace("stop:x", "3/9 runs"))]
+    text = render("", ls)
+    assert not re.search(r"\s#", text.split("\n", 1)[1])
+    (again,), problems = parse(text, "L")
+    assert not problems and again.target.startswith("stop:x") and again.baseline.startswith("3/9 runs")
+    assert again.target != "stop:x" or value == "stop:x ###"
+    assert parse(render("", [again]), "L")[0] == [again]  # a cleaned value round-trips
+
+
+@pytest.mark.parametrize("applies", [("build ##verify",), ("build # #verify",)])
+def test_a_hash_in_applies_is_a_problem_not_a_lost_tail(applies):
+    found, problems = parse(render("", [Lesson("L-0005", "t", "b", applies, (), None, None, None)]), "L")
+    assert found == [] and len(problems) == 1 and "applies" in problems[0]
+
+
+def test_token_estimate_is_four_characters_a_token_rounded_down():
+    assert (estimate_tokens(""), estimate_tokens("abc"), estimate_tokens("abcd"), estimate_tokens("abcdefg")) == (0, 0, 1, 1)
 
 
 def test_braces_are_left_verbatim():
