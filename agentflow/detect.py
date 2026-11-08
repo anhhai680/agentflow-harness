@@ -48,8 +48,11 @@ _ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _MAKE_TARGET = re.compile(r"^(test|lint|check)\s*:(?!=)", re.MULTILINE)
 _SCRIPTS = ("test", "lint", "typecheck", "check")
 _SPEC_DIR = "spec" + "s"  # spelled in two parts: the portability scan refuses the project's own path in engine code
-_DOC_DIRS = {"specs": (_SPEC_DIR, "docs/rfcs", "docs/proposals"), "plans": ("docs/plans", "plans"),
+_DOC_DIRS = {"specs": (_SPEC_DIR, f"docs/{_SPEC_DIR}", "docs/rfcs", "docs/proposals"), "plans": ("docs/plans", "plans"),
              "decisions": ("docs/adr", "docs/decisions")}
+_PREFIXED_SPEC = re.compile(r"([A-Za-z][A-Za-z0-9]{0,15})-([a-z0-9][a-z0-9_-]*)\.md")  # `PREFIX-<module>.md`
+_PLAIN_SPEC = re.compile(r"([a-z0-9][a-z0-9_-]*)\.md")  # `<module>.md`, the default `project.docs.spec_file`
+_NOT_MODULES = frozenset({"index", "readme", "template", "changelog"})  # the bare names a specs directory skips
 
 
 @dataclass
@@ -595,10 +598,27 @@ def _gate_sets(names: list[str], gates: dict[str, dict], notes: list[str]) -> di
 
 # --- docs and skills ------------------------------------------------------------------------------------------------
 
+def _spec_file(names: list[str]) -> str | None:
+    """`PREFIX-{module}.md` when most of a specs directory's files are named that way, else None (the default
+    `{module}.md` stands). The prefix is repository text, so only a short letters-and-digits word is taken."""
+    prefixes: dict[str, int] = {}
+    for name in names:
+        match = _PREFIXED_SPEC.fullmatch(name)
+        if match:
+            prefixes[match.group(1)] = prefixes.get(match.group(1), 0) + 1
+    if not prefixes:
+        return None
+    prefix, count = max(prefixes.items(), key=lambda item: (item[1], item[0]))
+    plain = sum(1 for n in names if (m := _PLAIN_SPEC.fullmatch(n)) and m.group(1) not in _NOT_MODULES)
+    return f"{prefix}-{{module}}.md" if count >= 2 and count > plain else None
+
+
 def _docs(src: _Source, notes: list[str]) -> dict[str, str]:
     docs = {key: found for key, options in _DOC_DIRS.items() if (found := next((d for d in options if src.ls(d)), ""))}
-    if _SPEC_DIR in src.ls("docs"):
-        notes.append("set `project.docs.specs` to that directory")
+    if "specs" in docs:
+        spec_file = _spec_file(src.ls(docs["specs"]))
+        if spec_file:
+            docs["spec_file"] = spec_file
     return docs
 
 

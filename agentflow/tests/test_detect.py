@@ -517,12 +517,33 @@ def test_docs_skills_and_agent_docs_are_found(make):
     assert found.agent_docs == ["CLAUDE.md", "AGENTS.md"]
 
 
-def test_docs_alternatives_and_the_default_specs_directory_note(make):
+def test_docs_alternatives(make):
     found = detect.detect(make({"plans/a.md": "", "docs/decisions/a.md": "", "docs/proposals/a.md": ""}))
     assert found.docs == {"specs": "docs/proposals", "plans": "plans", "decisions": "docs/decisions"}
+
+
+def test_a_specs_directory_under_docs_is_found(make):
     found = detect.detect(make({f"docs/{SPEC_DIR}/a.md": ""}))
-    assert "set `project.docs.specs` to that directory" in notes_text(found)
-    assert found.docs == {}
+    assert found.docs == {"specs": f"docs/{SPEC_DIR}"}
+    found = detect.detect(make({f"{SPEC_DIR}/a.md": "", f"docs/{SPEC_DIR}/b.md": ""}))
+    assert found.docs == {"specs": SPEC_DIR}  # the top-level directory still wins
+
+
+def test_a_common_file_prefix_in_the_specs_directory_becomes_spec_file(make):
+    files = {f"docs/{SPEC_DIR}/{name}": "" for name in ("AA-one.md", "AA-two_x.md", "AA-three.md", "OTHER-MAP.md")}
+    assert detect.detect(make(files)).docs == {"specs": f"docs/{SPEC_DIR}", "spec_file": "AA-{module}.md"}
+
+
+@pytest.mark.parametrize("names", [
+    ["AA-one.md"],                                  # one file is not a convention
+    ["AA-one.md", "AA-two.md", "three.md", "four.md"],  # plain names outnumber the prefixed ones
+    ["one.md", "two.md"],                           # the default `{module}.md` already fits
+    ["A.B-one.md", "A.B-two.md", "AA-One.md", "AA-Two.md"],  # a prefix with a dot, and uppercase module names
+    ["AAAAAAAAAAAAAAAAA-one.md", "AAAAAAAAAAAAAAAAA-two.md"],  # a prefix over 16 characters
+])
+def test_no_spec_file_is_proposed_without_a_clear_prefix(make, names):
+    found = detect.detect(make({f"docs/{SPEC_DIR}/{n}": "" for n in names}))
+    assert "spec_file" not in found.docs
 
 
 def test_a_tag_named_like_the_base_branch_does_not_shadow_it(make):

@@ -213,6 +213,15 @@ def test_a_found_specs_directory_adds_a_specs_work_source_and_a_feature_backlog(
     assert yaml.safe_load(text) == data
 
 
+def test_a_detected_spec_file_pattern_is_written_beside_the_specs_directory():
+    found = _detected(specs="docs/proposals", spec_file="AA-{module}.md")
+    base = init.base_of(found.starter)
+    data = init.pack_data(found, base=base)
+    assert data["project"]["docs"] == {"specs": "docs/proposals", "spec_file": "AA-{module}.md"}
+    assert data["work_source"] == {"kind": "specs"}
+    assert yaml.safe_load(init.render_pack(found, base=base)) == data
+
+
 def test_no_specs_directory_means_no_work_source_or_backlog():
     found = _detected(plans="docs/plans")
     base = init.base_of(found.starter)
