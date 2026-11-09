@@ -1062,9 +1062,13 @@ def test_a_message_raised_while_the_dialog_is_open_shows_inside_it():
     assert markup.index('id="dlg-msg"') < markup.index('class="dlg-buttons"')  # under the fields, above OK
     css = source[:source.index("</style>")]
     assert re.search(r"#dlg-msg\s*\{[^}]*overflow-wrap:\s*anywhere", css)
-    block = source[source.index("function toast(text)"):source.index("async function api(")]
-    assert 'if ($("dlg").open)' in block and '$("dlg-msg")' in block
-    assert "textContent = text" in block and "innerHTML" not in block
+    helpers = source[source.index("function clearDialogMessage()"):source.index("async function api(")]
+    assert "function showDialogMessage(text)" in helpers and '$("dlg-msg")' in helpers
+    assert "textContent = text" in helpers and "innerHTML" not in helpers
+    toast = helpers[helpers.index("function toast(text)"):]
+    # only the open dialog's own OK collects a message, unseen until it knows the outcome: a success is never red
+    assert "if (dialogSaid !== null) { dialogSaid = text; return; }" in toast
+    assert '$("dlg").open' not in toast  # an unrelated toast never lands in the dialog
 
 
 def test_the_dialog_clears_its_message_and_floats_a_success_message_once_closed():
@@ -1074,7 +1078,19 @@ def test_the_dialog_clears_its_message_and_floats_a_success_message_once_closed(
     assert block.index("clearDialogMessage()") < block.index("dlg.showModal()")
     ok = block[block.index('ok.addEventListener("click"'):block.index('cancel.addEventListener')]
     assert "clearDialogMessage()" in ok
+    assert re.search(r'dialogSaid = "";[^}]*try \{ done = await onOk\(\); \} finally \{[^}]*dialogSaid = null;', ok)
     assert re.search(r"dlg\.close\(\);\s*if \(said\) toast\(said\)", ok)  # a success message floats after close
+    assert "else if (said) showDialogMessage(said)" in ok  # a failure's message stays in the dialog
+
+
+def test_a_submit_that_outlives_its_dialog_neither_closes_nor_writes_into_the_next():
+    """OK, then Escape (or another dialog) before the answer: the late answer floats and closes nothing."""
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    block = source[source.index("function dialog(title"):source.index("function rejectDialog")]
+    assert "const run = ++dialogRun;" in block
+    ok = block[block.index('ok.addEventListener("click"'):block.index('cancel.addEventListener')]
+    late = "if (run !== dialogRun || !dlg.open) { if (said) toast(said); return; }"
+    assert late in ok and ok.index(late) < ok.index("dlg.close()")
 
 
 # --------------------------------------------------------------------------- time and cost

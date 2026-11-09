@@ -287,16 +287,18 @@ function el(tag, props, ...children) {
   return node;
 }
 
+// A modal dialog sits in the top layer, above any z-index, so a #toast raised by its OK would be hidden under
+// it. While that OK runs, `dialogSaid` collects the message instead: a failure shows it in the dialog's own line,
+// a success floats it once the dialog has closed. `dialogRun` counts opens, so a late answer touches no newer one.
+let dialogSaid = null;
+let dialogRun = 0;
+
 function clearDialogMessage() { const msg = $("dlg-msg"); msg.textContent = ""; msg.hidden = true; }
 
-// A modal dialog sits in the top layer, above any z-index: while one is open, its own line carries the message.
+function showDialogMessage(text) { const msg = $("dlg-msg"); msg.textContent = text; msg.hidden = false; }
+
 function toast(text) {
-  if ($("dlg").open) {
-    const msg = $("dlg-msg");
-    msg.textContent = text;
-    msg.hidden = false;
-    return;
-  }
+  if (dialogSaid !== null) { dialogSaid = text; return; }
   const box = $("toast");
   box.textContent = text;
   box.classList.add("show");
@@ -637,13 +639,18 @@ function dialog(title, body, onOk, okText, wide) {
   $("dlg-ok").replaceWith(ok);
   $("dlg-cancel").replaceWith(cancel);
   ok.textContent = okText || "OK";
+  const run = ++dialogRun;
   ok.addEventListener("click", async () => {
     clearDialogMessage();
-    if (await onOk()) {
-      const said = $("dlg-msg").textContent;
+    let done = false;
+    let said = "";
+    dialogSaid = "";
+    try { done = await onOk(); } finally { said = dialogSaid; dialogSaid = null; }
+    if (run !== dialogRun || !dlg.open) { if (said) toast(said); return; }  // closed meanwhile: float, close nothing
+    if (done) {
       dlg.close();
       if (said) toast(said);
-    }
+    } else if (said) showDialogMessage(said);
   });
   cancel.addEventListener("click", () => dlg.close());
   clearDialogMessage();
