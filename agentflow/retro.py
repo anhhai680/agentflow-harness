@@ -41,6 +41,7 @@ import fcntl
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -946,6 +947,27 @@ def _creating(repo: Path) -> Iterator[None]:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+@contextmanager
+def _signals_interrupt() -> Iterator[None]:
+    """While inside, SIGTERM and SIGHUP raise `KeyboardInterrupt` like Ctrl-C does, so a killed retro ends cancelled
+    instead of staying `running` (which would block every later retro); the previous handlers come back on the
+    way out. Off the main thread, where signal handlers cannot be set, the signals stay as they are."""
+    def raise_interrupt(signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    previous: dict[int, Any] = {}
+    try:
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            previous[signum] = signal.signal(signum, raise_interrupt)
+    except ValueError:
+        pass
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
 def run_retro(repo: Path, cfg: Config, since: datetime | None, dry_run: bool, now: datetime,
               out: TextIO | None = None) -> RetroOutcome:
     """Run a retro over the runs that ended since `since` (None: since the last retro started). With no such run it
@@ -969,27 +991,28 @@ def run_retro(repo: Path, cfg: Config, since: datetime | None, dry_run: bool, no
         return RetroOutcome(None, None, f"dry run: a retro of {len(digest.run_ids)} runs; nothing was created")
     if not branch_exists(repo, cfg.project.fork_from):
         raise GitError(f"project.fork_from {cfg.project.fork_from!r} is not a local branch of {repo}")
-    params = {"since": since.isoformat() if since is not None else None, "runs": list(digest.run_ids)}
-    with _creating(repo):  # the check and the new run are one step: two starters cannot both pass the check
-        live = open_retro(repo)
-        if live is not None:
-            return RetroOutcome(None, None, already_open(live), refused=True)
-        run = Run.create(cfg, repo, RETRO_PIPELINE, params, engine_pipeline=True)
-    lock = run.lock()
-    if not lock.acquire():
-        raise RuntimeError(f"another runner holds the lock of the new run {run.id}")
-    try:
-        return _Retro(cfg, repo, run, step, digest, now).go()
-    except BaseException as exc:  # an interrupt too: a retro left `running` would block every later one
-        run.refresh()
-        if run.state["status"] not in TERMINAL and run.state["waiting"] is None:
-            if isinstance(exc, Exception):
-                run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}"[:2000])
-            else:  # Ctrl-C, SIGTERM or an exit: the retro ends cancelled, and the next one reads the same runs
-                run.emit("run_cancelled", reason=f"interrupted: {type(exc).__name__} {exc}".rstrip()[:2000])
-        raise
-    finally:
-        lock.release()
+    with _signals_interrupt():
+        params = {"since": since.isoformat() if since is not None else None, "runs": list(digest.run_ids)}
+        with _creating(repo):  # the check and the new run are one step: two starters cannot both pass the check
+            live = open_retro(repo)
+            if live is not None:
+                return RetroOutcome(None, None, already_open(live), refused=True)
+            run = Run.create(cfg, repo, RETRO_PIPELINE, params, engine_pipeline=True)
+        lock = run.lock()
+        if not lock.acquire():
+            raise RuntimeError(f"another runner holds the lock of the new run {run.id}")
+        try:
+            return _Retro(cfg, repo, run, step, digest, now).go()
+        except BaseException as exc:  # an interrupt too: a retro left `running` would block every later one
+            run.refresh()
+            if run.state["status"] not in TERMINAL and run.state["waiting"] is None:
+                if isinstance(exc, Exception):
+                    run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}"[:2000])
+                else:  # Ctrl-C, SIGTERM, SIGHUP or an exit: the retro ends cancelled, and the next one reads the same runs
+                    run.emit("run_cancelled", reason=f"interrupted: {type(exc).__name__} {exc}".rstrip()[:2000])
+            raise
+        finally:
+            lock.release()
 
 
 class _Retro:

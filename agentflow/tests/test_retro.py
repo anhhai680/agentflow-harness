@@ -1020,6 +1020,34 @@ def test_an_interrupted_retro_ends_cancelled_and_blocks_no_later_retro(flow_repo
     assert not _created(gh_log)
 
 
+@pytest.mark.parametrize("name", ["SIGTERM", "SIGHUP"])
+def test_a_killed_retro_ends_cancelled_and_blocks_no_later_retro(flow_repo, gh_log, monkeypatch, name):
+    import os
+    import signal
+
+    from agentflow.retro import open_retro
+
+    signum = getattr(signal, name)
+
+    def unhandled(_signum, _frame):  # what would happen to the process without the retro's handler
+        raise RuntimeError(f"{name} was not turned into an interrupt")
+
+    before = signal.signal(signum, unhandled)
+    try:
+        _script_one_add(flow_repo)
+        _during_session(monkeypatch, lambda worktree, run: os.kill(os.getpid(), signum))
+        with pytest.raises(KeyboardInterrupt):
+            run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+        assert signal.getsignal(signum) is unhandled  # the previous handler is back
+    finally:
+        signal.signal(signum, before)
+    (retro_name,) = _retro_runs(flow_repo)
+    run = Run.load(flow_repo.root, retro_name)
+    assert run.state["status"] == "cancelled" and run.state["waiting"] is None
+    assert open_retro(flow_repo.root) is None
+    assert not _created(gh_log)
+
+
 def _blocked_without_push(flow_repo, gh_log, out, *words) -> dict:
     run = _run(flow_repo, out)
     assert out.pr_url is None and not _created(gh_log)
