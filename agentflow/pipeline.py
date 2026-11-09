@@ -51,7 +51,8 @@ from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
 from agentflow.config import (
-    Config, ConfigError, Phase, Step, check_lane, for_lane, layer_files, load_config, validate, worktrees_root,
+    RETRO_PIPELINE, Config, ConfigError, Phase, Step, check_lane, for_lane, layer_files, load_config, validate,
+    worktrees_root,
 )
 from agentflow.flow_control import condition_label, halted, read_json
 from agentflow.gitops import (
@@ -211,6 +212,8 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
 
     An unexpected exception is recorded as `runner_error` (the run's status becomes `error`, which a
     `resume` goes on from) before the lock is released and the exception goes on to the caller."""
+    if run.refresh().get("pipeline") == RETRO_PIPELINE:  # it walks no phase: resuming one would run the whole workflow
+        raise ValueError(f"{run.id} is a retro run, which cannot be resumed; cancel it and run `agentflow retro` again")
     lock = run.lock()
     if not lock.acquire():
         raise RunLocked(f"another runner is working on {run.id}; see `agentflow status {run.id}`")

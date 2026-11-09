@@ -14,6 +14,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -150,6 +151,17 @@ def _load_cfg(args: argparse.Namespace):
     return load_config(Path(args.config) if getattr(args, "config", None) else _pack_config())
 
 
+def _print_retro_due(cfg, repo: Path) -> None:
+    """One line when a retro is due (`retro.due`); nothing otherwise, and never an error."""
+    from datetime import UTC, datetime
+
+    from agentflow.retro import due_or_none
+
+    reason = due_or_none(repo, cfg, datetime.now(UTC))
+    if reason:
+        print(f"Retro due: {reason} → agentflow retro")
+
+
 def _by(args: argparse.Namespace) -> str:
     return args.by or getpass.getuser()
 
@@ -240,10 +252,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         st = run.state
         rows.append([run.id, str(st["pipeline"]), st["phase"] or "-", st["step"] or "-", display_status(run), _spend(st)])
     print("\n".join(_table(rows)))
+    try:
+        _print_retro_due(_load_cfg(args), repo)
+    except _human_errors():  # status needs no pack: with none there is no reminder
+        pass
     return 0
 
 
 def cmd_inbox(args: argparse.Namespace) -> int:
+    from agentflow.config import RETRO_PIPELINE
     from agentflow.hitl import inbox_items
 
     try:
@@ -262,7 +279,9 @@ def cmd_inbox(args: argparse.Namespace) -> int:
             print(f"  {q['id']}: {q['question']}")
         if item["inbox_path"]:
             print(f"  file: {item['inbox_path']}")
-        if item["kind"] == "phase_approval":
+        if item.get("pipeline") == RETRO_PIPELINE:  # a retro is never resumed: cancel it and run another
+            print(f"  agentflow cancel {item['run_id']}    then    agentflow retro")
+        elif item["kind"] == "phase_approval":
             print(f"  agentflow approve {item['run_id']} {item['phase']}    |    agentflow reject {item['run_id']} {item['phase']} --note \"...\"")
         elif item["kind"] == "parked":
             print(f"  agentflow answer {item['run_id']} --key {item['key']}")
@@ -573,11 +592,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    from agentflow.hitl import refuse_retro
     from agentflow.run_control import mark_done
     from agentflow.state import find_run
 
     try:
         run = find_run(_find_repo(), args.run)
+        refuse_retro(run)
         if args.mark_done:
             mark_done(run, _by(args))
         return _continue(run, args)
@@ -641,7 +662,9 @@ def cmd_next(args: argparse.Namespace) -> int:
     from agentflow.module_queue import format_answer, next_step
 
     try:
-        print(format_answer(next_step(_load_cfg(args), _find_repo())))
+        cfg, repo = _load_cfg(args), _find_repo()
+        print(format_answer(next_step(cfg, repo)))
+        _print_retro_due(cfg, repo)
     except _human_errors() as exc:
         print(f"error: {exc}")
         return 1
@@ -679,6 +702,39 @@ def cmd_queue(args: argparse.Namespace) -> int:
     except QueueBusy as exc:
         print(f"error: {exc}")
         return 1
+    except _human_errors() as exc:
+        print(f"error: {exc}")
+        return 1
+
+
+def cmd_retro(args: argparse.Namespace) -> int:
+    """Learn from the runs that ended since the last retro (or `--since`): one agent session over a digest, then a
+    draft pull request that changes only the lessons file. `--dry-run` prints the digest and the prompt and creates
+    nothing. The exit code is 1 when the retro stopped for a human (or failed), 0 otherwise."""
+    from datetime import UTC, datetime
+
+    from agentflow.retro import run_retro
+    from agentflow.state import Run
+
+    try:
+        cfg, repo = _load_cfg(args), _find_repo()
+        if cfg.retro_step is None:
+            print("error: this pack has no retro step (`retro_step: null`): remove that line to use `agentflow retro`")
+            return 1
+        if not args.dry_run:
+            problem = _preflight(cfg)
+            if problem:
+                print(f"error: {problem}")
+                return 1
+        outcome = run_retro(repo, cfg, args.since, args.dry_run, datetime.now(UTC))
+        print(outcome.message)
+        if outcome.pr_url:
+            print(f"Pull request: {outcome.pr_url}")
+        if outcome.refused:
+            return 1
+        if outcome.run_id is None:
+            return 0
+        return 0 if Run.load(repo, outcome.run_id).state["status"] == "done" else 1
     except _human_errors() as exc:
         print(f"error: {exc}")
         return 1
@@ -761,6 +817,22 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lessons(args: argparse.Namespace) -> int:
+    """Every lesson, with its target signal before and after the runs that carried it."""
+    import json as _json
+
+    from agentflow.views import lessons_table, lessons_view
+
+    try:
+        repo, cfg = _find_repo(), _load_cfg(args)
+        view = lessons_view(repo, cfg)
+    except _human_errors() as exc:
+        print(f"error: {exc}")
+        return 1
+    print(_json.dumps(view, indent=2) if args.json else lessons_table(view))
+    return 0
+
+
 def cmd_pause(args: argparse.Namespace) -> int:
     from agentflow.run_control import pause
     from agentflow.state import find_run
@@ -825,7 +897,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
 
     try:
         run = find_run(_find_repo(), args.run)
-        key = retry(run, args.key, _by(args))
+        key = retry(run, args.key, _by(args), reason=args.reason)
         print(f"retrying {key} for {run.id}.")
         return _continue(run, args)
     except _human_errors() as exc:
@@ -869,6 +941,18 @@ def _continue_flags(parser: argparse.ArgumentParser) -> None:
                         help="only record (an approved phase rests as ready); continue later with `agentflow resume`")
     parser.add_argument("--detach", action="store_true", help="continue the run in the background")
     parser.add_argument("--config", help="path to a config.yaml (default: the one the run started with)")
+
+
+def _since_date(text: str):
+    """`--since YYYY-MM-DD` as midnight UTC of that day."""
+    from datetime import UTC, datetime
+
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a date: use YYYY-MM-DD")
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a date: {exc}") from None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1010,6 +1094,19 @@ def build_parser() -> argparse.ArgumentParser:
     met.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     met.set_defaults(func=cmd_metrics)
 
+    les = sub.add_parser("lessons", help="each lesson's target signal before and after the runs that carried it")
+    les.add_argument("--json", action="store_true", help="the full data as JSON")
+    les.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+    les.set_defaults(func=cmd_lessons)
+
+    ret_o = sub.add_parser("retro", help="learn from the runs that ended since the last retro: a draft PR that "
+                                         "changes only the lessons file")
+    ret_o.add_argument("--since", type=_since_date, metavar="YYYY-MM-DD",
+                       help="read the runs that ended after this day (default: since the last retro that finished)")
+    ret_o.add_argument("--dry-run", action="store_true", help="print the digest and the prompt; create nothing")
+    ret_o.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+    ret_o.set_defaults(func=cmd_retro)
+
     pau = sub.add_parser("pause", help="stop a run before its next step (a live agent finishes its step)")
     pau.add_argument("run")
     pau.add_argument("--by", help="who is pausing (default: the current user)")
@@ -1030,6 +1127,7 @@ def build_parser() -> argparse.ArgumentParser:
     ret.add_argument("run")
     ret.add_argument("key", nargs="?", help="the step key to retry (default: the run's failed step)")
     ret.add_argument("--by", help="who is retrying (default: the current user)")
+    ret.add_argument("--reason", metavar="TEXT", help="why the step is retried; recorded for the run's lessons")
     _continue_flags(ret)
     ret.set_defaults(func=cmd_retry)
 

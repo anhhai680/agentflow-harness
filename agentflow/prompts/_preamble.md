@@ -30,4 +30,6 @@ This session cannot ask for approval, so anything outside the allow rules is den
 
 {code_map}
 
+{lessons}
+
 ## The step

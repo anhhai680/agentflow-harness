@@ -12,4 +12,5 @@ Write your result as JSON to `{result_file}`, then stop. Use this exact path. Th
 - `can_continue_without`: `true` when later independent tasks can go on while your question waits.
 - Optional: `signals` (an object), `findings` and `risks` (lists).
 - `facts`: only in a resolver session: up to 5 one-line statements that hold for the whole run (an environment cause, a tool quirk), so later sessions do not rediscover them.
+- `lessons_cited`: optional. The ids of the lessons (`L-0007`, `E-0003`) that changed what you did in this step, at most 10. List only a lesson that the prompt carried and that you used.
 - `code_map`: optional, in any step that read code. Up to 8 one-line entries for existing code you had to search for and that a later task will likely need, each as `path:line` `signature`: what it is for. Leave out what the plan's Interfaces list already names. Later sessions of this run see these at the top of their prompt.

@@ -118,6 +118,24 @@ def test_a_failure_is_fixed_committed_pushed_and_checked_again(flow_repo, gh, gi
     assert gh.did("pr", "ready", URL)
 
 
+def test_ci_fix_round_names_the_failed_checks(flow_repo, gh):
+    two = {"checks": [{"name": "unit", "state": "FAILURE", "bucket": "fail", "link": LINK},
+                      {"name": "lint", "state": "FAILURE", "bucket": "fail", "link": LINK}]}
+    gh.play(two, PASS)
+    run = to_ship(flow_repo, acts={FIX: [change()]})
+    assert go(flow_repo, run) == "done"
+    ev = flow_repo.events(run, "ci_round")[0]
+    assert ev["action"] == "fix" and ev["failed"] == ["lint", "unit"] and "### lint" in ev["tail"]
+
+
+def test_ci_rerun_round_names_the_failed_checks(flow_repo, gh):
+    gh.play(FAIL, PASS)
+    run = to_ship(flow_repo)
+    assert go(flow_repo, run) == "done"
+    ev = flow_repo.events(run, "ci_round")[0]
+    assert ev["action"] == "rerun" and ev["failed"] == ["backend"] and "tail" not in ev
+
+
 def test_the_fix_session_is_told_the_failed_job_on_opus(flow_repo, gh):
     gh.play(FAIL, PASS)
     run = to_ship(flow_repo, acts={FIX: [change()]})

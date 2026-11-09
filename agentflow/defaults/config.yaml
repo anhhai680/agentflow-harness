@@ -69,6 +69,11 @@ context:
   progress_file: "runs/{run}/progress.md"
   gate_output_lines: 200
 
+memory:
+  lessons_max_tokens: 1500   # the most tokens of lessons a step's prompt carries (0 turns lessons off)
+  digest_tokens: 15000       # the size a retro's digest of recent runs is cut to
+  retro_every_days: 7        # days between the retros the runner proposes (0 means manual only)
+
 hitl: {}
 
 dashboard:
@@ -124,6 +129,9 @@ record_step:                   # a spec gap settled during a run: it files the a
 
 resolve_step:                  # a stop in a `resolve: true` phase, run before a human hears of it
   {id: resolve, skill: "@skills.map.debug", role: plan, prompt: resolve.md}
+
+retro_step:                    # the one session of a retro run (`agentflow retro`): it proposes lessons and changes no file
+  {id: retro, skill: agentflow-retro, role: review, prompt: retro.md}
 
 autonomy:
   non_blocking_severities: [minor, low, info, nit]

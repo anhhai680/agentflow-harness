@@ -23,10 +23,11 @@ import shlex
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Literal, TextIO
 
+from agentflow import lessons as lessons_mod
 from agentflow import overlays, pack, run_env, workspace
 from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
 from agentflow.autonomy import AUTO_BY, runner_settles
@@ -65,7 +66,7 @@ RESULT = "_result.md"
 DEFAULT_TEMPLATE = "step.md"
 DEFAULT_REFINE = "refine.md"
 DEFAULT_ROLE = "build"
-EMPTY_SLOT = re.compile(r"^\{(run_facts|code_map)\}\n\n", re.MULTILINE)  # a preamble slot, dropped whole when empty
+EMPTY_SLOT = re.compile(r"^\{(run_facts|code_map|lessons)\}\n\n", re.MULTILINE)  # a preamble slot, dropped whole when empty
 CODE_MAP_LEAD = ("Earlier sessions of this run found where this code lives. Open it at the line given instead of "
                  "searching for it, and check a signature before you rely on it.")
 RESOLVER_FINDINGS_SHOWN = 3
@@ -156,6 +157,14 @@ def _code_map(run: Run | None) -> str:
     return "## Code this run has mapped\n\n" + CODE_MAP_LEAD + "\n\n" + "\n".join(f"- {note}" for note in notes)
 
 
+def _lessons(cfg: Config, repo: Path, phase: str | None, today: date) -> lessons_mod.Selection:
+    """The lessons a step of `phase` carries (engine lessons, then the pack's from the main checkout holding
+    `repo`). With `memory.lessons_max_tokens` at 0 nothing is read."""
+    if cfg.memory.lessons_max_tokens <= 0:
+        return lessons_mod.select([], phase, today, 0)
+    return lessons_mod.select(lessons_mod.load(repo), phase, today, cfg.memory.lessons_max_tokens)
+
+
 def _refine_values(ctx: Ctx, rec: dict) -> dict[str, str]:
     refine = (ctx.run.state.get("refine") if ctx.run is not None else None) or {}
     return {
@@ -218,6 +227,7 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     """
     values = _values(cfg, step, ctx, {})
     preamble = EFFORT_BLOCK.sub("" if rec.get("sized") else r"\1", _template(cfg, PREAMBLE))
+    values["lessons"] = _lessons(cfg, ctx.repo, extra.get("phase"), date.today()).text.rstrip("\n")
     preamble = EMPTY_SLOT.sub(lambda m: "" if not values[m.group(1)] else m.group(0), preamble)
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
     files = list(dict.fromkeys([*step.brief, *step.task_brief]))
@@ -691,6 +701,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
                 data["key"] = sr.key
             self.run.emit(name, **data)
 
+        if turn.resume is None:
+            self._record_lessons(sr, turn)
         outcome = sr.agent.run(call, on_event)
         sr.session = outcome.session_id or turn.resume or sr.session
         window = outcome.context_window
@@ -708,6 +720,15 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
                 input=denial.get("tool_input", denial.get("input")),
             )
         return _Called(outcome, turn.sizing, before, snapshot(self.worktree))
+
+    def _record_lessons(self, sr: _StepRun, turn: _Turn) -> None:
+        """A fresh session's prompt carries the lessons: record which ones (and their digest), and which a size
+        limit dropped. Only a prompt that really holds the selected text counts, so the record is what the agent saw."""
+        picked = _lessons(self.cfg, self.ctx.repo, sr.key.split("/")[0], date.today())
+        if picked.dropped:
+            self.run.emit("memory_truncated", key=sr.key, tier="lessons", dropped=list(picked.dropped))
+        if picked.ids and picked.text.rstrip("\n") in turn.prompt:
+            self.run.emit("lessons_injected", key=sr.key, ids=list(picked.ids), digest=picked.digest)
 
     def _read_result(self, sr: _StepRun) -> tuple[StepResult | None, str]:
         """The agent's result, read from the workspace into the run directory's copy and checked there."""
@@ -831,7 +852,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         for r in results:
             self.run.emit("gate_result", key=sr.key, gate=r.name, passed=r.passed, skipped=r.skipped,
                           reason=r.reason, log=str(r.log_path) if r.log_path else None,
-                          duration_s=r.duration_s)
+                          duration_s=r.duration_s, tail="" if (r.passed or r.skipped) else r.tail)
         return [] if gates_ok(results) else [r for r in results if not (r.passed or r.skipped)]
 
     def _prerun_still_holds(self, sr: _StepRun) -> bool:
@@ -863,6 +884,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
                 self.run.emit("step_committed", key=sr.key, sha=sha, summary=result.summary)
         extra = {"tree": tree} if tree else {}
         self._remember_code_map(sr, result)
+        self._remember_lessons_cited(sr, result)
         self.run.emit("step_finished", key=sr.key, status="done", summary=result.summary, sha=sha, **extra)
         return "done"
 
@@ -873,6 +895,17 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             if entry.casefold() not in known:
                 known.add(entry.casefold())
                 self.run.emit("code_noted", text=entry, key=sr.key)
+
+    def _remember_lessons_cited(self, sr: _StepRun, result: StepResult) -> None:
+        """One `lesson_cited` per lesson a finished step cites that the step's latest `lessons_injected` carried;
+        an id that was not injected is ignored. A stopped step never gets here."""
+        if not result.lessons_cited:
+            return
+        injected = [e for e in self.run.events.read() if e["type"] == "lessons_injected" and e.get("key") == sr.key]
+        carried = set(injected[-1].get("ids") or []) if injected else set()
+        for lesson_id in dict.fromkeys(result.lessons_cited):
+            if lesson_id in carried:
+                self.run.emit("lesson_cited", key=sr.key, id=lesson_id)
 
     def _soft_noted(self, soft: float) -> bool:
         """The run already said it passed this soft budget: a soft limit notifies once per value, and plan sizing

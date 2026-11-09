@@ -275,6 +275,17 @@ def test_raise_hitl_notifies(run, cfg, macos_calls, capsys):
     assert f"agentflow answer {run.id}" in path.read_text(encoding="utf-8")
 
 
+def test_hitl_raised_keeps_the_extra_text_capped(run, cfg, macos_calls):
+    raise_hitl(cfg, run, "gate_failed", "build/x", "s", extra="x" * 5000 + "END")
+    ev = [e for e in run.events.read() if e["type"] == "hitl_raised"][-1]
+    assert len(ev["extra"]) == hitl.EVENT_EXTRA_MAX == 4000 and ev["extra"].endswith("END")
+
+
+def test_hitl_raised_without_extra_records_an_empty_one(run, cfg, macos_calls):
+    raise_hitl(cfg, run, "gate_failed", "build/x", "s")
+    assert [e for e in run.events.read() if e["type"] == "hitl_raised"][-1]["extra"] == ""
+
+
 def test_a_question_the_runner_takes_is_raised_without_a_notification(run, cfg, macos_calls, capsys):
     raise_hitl(cfg, run, "needs_human", "plan/task-1/implement", "Task 1 needs a TTL", [one_question()])
     assert run.state["waiting"]["key"] == "plan/task-1/implement"  # the resolver answers it next
@@ -609,3 +620,18 @@ def test_stray_events_cannot_clear_a_phase_approval_but_approve_can(run):
     assert run.state["waiting"]["key"] == "plan_approved" and run.state["status"] == "awaiting_approval"
     approve(run, "plan", "me")
     assert run.state["waiting"] is None and run.state["phases"]["plan"]["status"] == "approved"
+
+
+def test_lessons_cited_must_be_lesson_ids(tmp_path):
+    for bad in (["drop table"], ["L-1"], ["L-00001"], ["X-0001"], ["L-0001\n"], "L-0001", [1], [["L-0001"]], {"a": "L-0001"}):
+        with pytest.raises(ResultError, match="lessons_cited"):
+            read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x", "lessons_cited": bad}))
+
+
+def test_lessons_cited_keeps_the_first_ten(tmp_path):
+    ids = [f"L-{n:04d}" for n in range(1, 13)] + ["E-0001"]
+    got = read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x", "lessons_cited": ids}))
+    assert got.lessons_cited == ids[:10]
+    assert read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x"})).lessons_cited == []
+    assert read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x",
+                                                          "lessons_cited": ["E-0003"]})).lessons_cited == ["E-0003"]

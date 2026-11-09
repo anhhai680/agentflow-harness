@@ -9,7 +9,8 @@ Routes:
   `GET /api/board` (every lane, or `?lane=<name>`), `GET /api/workflow`, `GET /api/agents`,
   `GET /api/runs/<id>` (the card detail, its time and cost included), `GET /api/metrics` (time and cost over
   the runs started in `?from=YYYY-MM-DD&to=YYYY-MM-DD`, this month by default, or `?all=1`; `&lane=<name>`
-  narrows it; a bad date is a 400); `GET /api/events` (SSE: every run's new events, runs created
+  narrows it; a bad date is a 400); `GET /api/lessons` (every lesson with its evidence and its target signal before
+  and after the runs that carried it); `GET /api/events` (SSE: every run's new events, runs created
   later included).
 - `POST /api/runs/<id>/{approve,reject,answer,pause,resume,done,cancel,retry}` with a JSON body. Each action
   calls the same function as the CLI with `by="dashboard"`; reject, a complete answer, resume, done, retry and
@@ -65,7 +66,7 @@ from agentflow.config import Config, ConfigError, for_lane, load_config
 from agentflow.events import EventError, lock_state
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
 from agentflow.state import Run, runs_root
-from agentflow.views import agents_view, board, metrics_view, run_detail, workflow_view
+from agentflow.views import agents_view, board, lessons_view, metrics_view, run_detail, workflow_view
 
 PAGE = Path(__file__).resolve().with_name("dashboard.html")
 MAX_BODY = 64 * 1024
@@ -410,6 +411,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, config_edit.form_fields(self.server.cfg.path))
         elif path == "/api/metrics":
             self._metrics(query)
+        elif path == "/api/lessons":
+            self._json(200, lessons_view(self.server.repo, self.server.cfg))
         elif match := RUN_ROUTE.match(path):
             run = self._run(match.group(1))
             if run is None:

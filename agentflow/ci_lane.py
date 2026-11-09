@@ -35,7 +35,7 @@ from agentflow.gitops import (
     rerun_failed,
     update_pr_body,
 )
-from agentflow.hitl import raise_hitl
+from agentflow.hitl import EVENT_EXTRA_MAX, raise_hitl
 
 if TYPE_CHECKING:
     from agentflow.state import Run
@@ -52,6 +52,11 @@ def failed_checks(checks: list[dict]) -> list[dict]:
     return [c for c in checks if c.get("bucket") not in (*GOOD, *PENDING)]
 
 
+def _failed_names(checks: list[dict]) -> list[str]:
+    """The sorted names of the failed checks."""
+    return sorted({str(c.get("name")) for c in failed_checks(checks)})
+
+
 class CILane:
     """`run_ci` for `lanes.Executor`; relies on its `cfg`, `run`, `worktree`, `run_agent_step` and
     `runner_commits_only` and `write_pr_body`."""
@@ -59,6 +64,7 @@ class CILane:
     cfg: Config
     run: Run
     worktree: Path
+    _ci_report: str = ""  # the last fix round's failed-job report, for its `ci_round` event
 
     def run_ci(self, phase: Phase, step: Step, key: str) -> Outcome:
         self.run.refresh()
@@ -86,7 +92,7 @@ class CILane:
             if self._fix(phase, step, key, self._next_session(key, step), checks) != "done":
                 return "stopped"
             if head(self.worktree) != before:
-                if not self._push(key, fixes + 1):
+                if not self._push(key, fixes + 1, checks):
                     return "stopped"
             elif reruns < int(self.cfg.ci["rerun_rounds"]):
                 if not self._rerun(key, checks, reruns + 1):
@@ -141,7 +147,7 @@ class CILane:
             if checks and not failed and not pending:
                 return "pass", "", checks
             if checks and failed and not pending:
-                return "fail", ", ".join(sorted({str(c.get("name")) for c in failed})), checks
+                return "fail", ", ".join(_failed_names(checks)), checks
             if waited >= float(settings["timeout_min"]):
                 why = error or f"{len(pending)} check(s) still pending"
                 self._ci_stop(key, f"CI did not settle within {settings['timeout_min']} minutes: {why}.")
@@ -181,10 +187,11 @@ class CILane:
         if fix is None:
             raise ValueError(f"step {key}: a ci step needs `fix` (agentflow validate checks this)")
         plain = Phase(name=phase.name, agent=phase.agent, model=None, skip_if=None, steps=[])
+        self._ci_report = self._report(key, checks)  # kept for this round's `ci_round` event
         return self.run_agent_step(plain, fix, f"{key}/{fix.id}-{round_}",
-                                   extra={"ci_report": self._report(key, checks)}, role=fix.role)
+                                   extra={"ci_report": self._ci_report}, role=fix.role)
 
-    def _push(self, key: str, round_: int) -> bool:
+    def _push(self, key: str, round_: int, checks: list[dict]) -> bool:
         if not self.runner_commits_only(key):
             return False
         branch = str(self.run.state.get("branch") or "")
@@ -193,7 +200,8 @@ class CILane:
         except GitError as exc:
             self._ci_raise("blocked", key, f"Could not push the CI fix to {branch}: {exc}")
             return False
-        self.run.emit("ci_round", key=key, action="fix", round=round_, sha=head(self.worktree), note="fixed and pushed")
+        self.run.emit("ci_round", key=key, action="fix", round=round_, sha=head(self.worktree), note="fixed and pushed",
+                      failed=_failed_names(checks), tail=self._ci_report[-EVENT_EXTRA_MAX:])
         return True
 
     def _rerun(self, key: str, checks: list[dict], round_: int) -> bool:
@@ -205,7 +213,8 @@ class CILane:
         except GhError as exc:
             self._ci_raise("blocked", key, f"Could not run the failed CI jobs again: {exc}")
             return False
-        self.run.emit("ci_round", key=key, action="rerun", round=round_, note="no code change: failed jobs run again")
+        self.run.emit("ci_round", key=key, action="rerun", round=round_, note="no code change: failed jobs run again",
+                      failed=_failed_names(checks))
         return True
 
     def _ready(self, key: str, url: str) -> Outcome:

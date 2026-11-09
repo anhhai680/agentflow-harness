@@ -79,6 +79,40 @@ def test_prepare_replaces_planted_symlinks_without_writing_through(flow_repo):
     assert (run.dir / "events.jsonl").exists() and (run.dir / "state.json").exists()
 
 
+def test_prepare_copies_the_retro_digest(flow_repo, tmp_path):
+    run = flow_repo.new_run()
+    ws = run.agent_dir
+    workspace.prepare(run)
+    assert not (ws / "digest.md").exists()  # a run with no digest gets none
+    (run.dir / "retro").mkdir()
+    (run.dir / "retro" / "digest.md").write_text("# Retro digest\n", encoding="utf-8")
+    secret = tmp_path / "outside.md"
+    secret.write_text("outside\n", encoding="utf-8")
+    (ws / "digest.md").symlink_to(secret)  # planted by an agent: replaced, never written through
+    workspace.prepare(run)
+    assert not (ws / "digest.md").is_symlink() and (ws / "digest.md").read_text() == "# Retro digest\n"
+    assert secret.read_text() == "outside\n"
+    (ws / "digest.md").write_text("edited by the agent", encoding="utf-8")
+    workspace.prepare(run)
+    assert (ws / "digest.md").read_text() == "# Retro digest\n"  # refreshed from the run's copy every call
+
+
+def test_a_symlinked_retro_digest_is_not_copied(flow_repo, tmp_path):
+    run = flow_repo.new_run()
+    secret = tmp_path / "secret.md"
+    secret.write_text("secret\n", encoding="utf-8")
+    (run.dir / "retro").mkdir()
+    (run.dir / "retro" / "digest.md").symlink_to(secret)
+    workspace.prepare(run)
+    assert not (run.agent_dir / "digest.md").exists()
+    (run.dir / "retro" / "digest.md").unlink()
+    (run.dir / "retro").rmdir()
+    (run.dir / "retro").symlink_to(tmp_path, target_is_directory=True)  # a symlinked folder is not read through
+    (tmp_path / "digest.md").write_text("through a folder link\n", encoding="utf-8")
+    workspace.prepare(run)
+    assert not (run.agent_dir / "digest.md").exists()
+
+
 def test_result_is_read_into_the_runners_copy(flow_repo):
     run = flow_repo.new_run()
     assert run_step(flow_repo) == "done"
@@ -131,6 +165,8 @@ def test_every_workspace_path_a_prompt_names_exists_after_prepare(flow_repo):
         (run.dir / name).write_text(f"{name}\n", encoding="utf-8")
     (run.dir / "results").mkdir()
     (run.dir / "results" / "bug__debug.json").write_text(json.dumps(DONE), encoding="utf-8")
+    (run.dir / "retro").mkdir()
+    (run.dir / "retro" / "digest.md").write_text("# Retro digest\n", encoding="utf-8")
     workspace.prepare(run)
     executor = flow_repo.executor(run)
     root = str(run.agent_dir)

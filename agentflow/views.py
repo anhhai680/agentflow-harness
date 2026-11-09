@@ -29,10 +29,12 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from agentflow.config import Config, Phase, Step, check_lane, for_lane, resolve_model
+from agentflow.config import RETRO_PIPELINE, Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.events import parse_iso
+from agentflow import lessons as lessons_mod
 from agentflow.hitl import inbox_items
 from agentflow.metrics import BUCKETS, aggregate, run_metrics
+from agentflow.signals import aggregate_signals, run_signals
 from agentflow.state import TERMINAL, Run, cost_added, display_status, list_runs, runs_root
 
 ARROWS = {"up": "↑", "down": "↓"}
@@ -158,7 +160,10 @@ def _walks(steps: list[Step], lane: str) -> bool:
 
 
 def lane_phases(cfg: Config, lane: str) -> list[str]:
-    """The phases a run of `lane` walks, in order (a phase with nothing to run for the lane is left out)."""
+    """The phases a run of `lane` walks, in order (a phase with nothing to run for the lane is left out). A retro
+    run walks no phase of the workflow: its one session is its own phase, `retro`."""
+    if lane == RETRO_PIPELINE:
+        return [RETRO_PIPELINE]
     return [name for name, phase in cfg.phases.items() if _walks(phase.steps, lane)]
 
 
@@ -274,6 +279,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
     from agentflow import work_source
     from agentflow.backlog import snapshot
     from agentflow.module_queue import module_lane
+    from agentflow.retro import due_or_none
 
     pile = snapshot(cfg, repo)
     cards, counts, spend_today = [], Counter(), 0.0
@@ -313,6 +319,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
         "backlog_skipped": pile["skipped"],
         "work_source_kind": work_source.kind(cfg),
         "needs_human": needs,
+        "retro_due": due_or_none(repo, cfg, now),
         "counts": dict(counts),
         "agents_running": {"total": sum(by_agent.values()), "by_agent": dict(by_agent), "by_model": dict(by_model)},
         "spend_today": round(spend_today, 2),
@@ -698,6 +705,7 @@ def metrics_view(repo: Path, cfg: Config, lane: str | None = None, date_from: da
             "pr_link": _pr_link(state),
             "started_on": day.isoformat() if day else None,
             "metrics": metrics,
+            "signals": run_signals(run.events.read(), metrics),
         })
     rows.sort(key=lambda r: r["metrics"].get("started_at") or r["run_id"], reverse=True)
     return {
@@ -710,6 +718,7 @@ def metrics_view(repo: Path, cfg: Config, lane: str | None = None, date_from: da
         "all_time": all_time,
         "runs": rows,
         "totals": aggregate(rows),
+        "signals": aggregate_signals([r["signals"] for r in rows]),
         "generated_at": now.isoformat(timespec="seconds"),
     }
 
@@ -805,6 +814,9 @@ def _money(value: float, estimated: bool = False) -> str:
     return f"{'~' if estimated else ''}${value:.2f}"
 
 
+SIGNAL_ROWS = 20
+
+
 def metrics_table(view: dict) -> str:
     """`agentflow metrics`: one block per run (a row per phase: wall, each bucket, cost, models), then totals."""
     shown = [b for b in view["buckets"] if any(r["metrics"]["buckets"].get(b) for r in view["runs"])]
@@ -832,6 +844,14 @@ def metrics_table(view: dict) -> str:
         share = " · ".join(f"{b} {totals['bucket_pct'][b]:g}%" for b in view["buckets"] if totals["bucket_pct"][b])
         lines.append(f"total {_money(totals['cost_usd'])} · rework {totals['rework_pct']:g}% · "
                      f"median run {_short(totals['wall_s']['median'])} · {share}")
+    signals = view.get("signals") or {}
+    if signals:
+        lines += ["", "Signals (mean per run; a key counts the runs it applies to)"]
+        for key in sorted(signals)[:SIGNAL_ROWS]:
+            lines.append(f"  {key}  {signals[key]['mean']:.4g}  ({signals[key]['runs']} run"
+                         f"{'' if signals[key]['runs'] == 1 else 's'})")
+        if len(signals) > SIGNAL_ROWS:
+            lines.append(f"  … {len(signals) - SIGNAL_ROWS} more")
     return "\n".join(lines)
 
 
@@ -854,6 +874,72 @@ def metrics_csv(view: dict) -> str:
                         if model else ["", "", 0, 0, 0])
                 writer.writerow(head + tail)
     return out.getvalue()
+
+
+# --------------------------------------------------------------------------- lessons
+
+
+def _source(ref: str) -> dict:
+    """An evidence reference `<run id>#<event seq>` with its run id, so a page can open that run."""
+    match = lessons_mod.SOURCE.match(ref)
+    return {"ref": ref, "run_id": match.group(1) if match else None, "seq": int(match.group(2)) if match else None}
+
+
+def lessons_view(repo: Path, cfg: Config, today: date | None = None) -> dict:
+    """Every lesson both layers hold (`lessons.load`), with its evidence and its effect on its target
+    (`lessons.effects`). `today` decides which lessons are past their `review_by`."""
+    now = datetime.now(UTC)
+    today = today or now.astimezone().date()
+    found = lessons_mod.load(repo)
+    rows = []
+    for lesson, effect in zip(found, lessons_mod.effects(repo, found, now), strict=True):
+        rows.append({
+            "id": lesson.id,
+            "title": lesson.title,
+            "body": lesson.body,
+            "applies": list(lesson.applies),
+            "sources": [_source(ref) for ref in lesson.sources],
+            "review_by": lesson.review_by.isoformat() if lesson.review_by else None,
+            "expired": lesson.review_by is not None and lesson.review_by < today,
+            "target": lesson.target,
+            "recorded_baseline": lesson.baseline,
+            "baseline_runs": effect.baseline_runs,
+            "baseline": effect.baseline,
+            "after_runs": effect.after_runs,
+            "after": effect.after,
+            "verdict": effect.verdict,
+            "cited": effect.cited,
+        })
+    return {
+        "lessons": rows,
+        "enabled": cfg.memory.lessons_max_tokens > 0,
+        "note": lessons_mod.CORRELATION_NOTE,
+        "generated_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _measure(value: float | None, runs: int) -> str:
+    return "-" if value is None else f"{value:.4g} ({runs} run{'' if runs == 1 else 's'})"
+
+
+def lessons_table(view: dict) -> str:
+    """`agentflow lessons`: one row per lesson (its verdict, target, before and after, citations), then the note
+    that a before/after comparison is no proof."""
+    lines = []
+    if not view.get("enabled", True):
+        lines += ["Lessons are off (memory.lessons_max_tokens is 0): no step carries them.", ""]
+    rows = view["lessons"]
+    if rows:
+        table = [["ID", "VERDICT", "TARGET", "BASELINE", "AFTER", "CITED", "TITLE"]]
+        for r in rows:
+            title = r["title"] + (" (past review_by)" if r.get("expired") else "")
+            table.append([r["id"], r["verdict"], r["target"] or "-", _measure(r["baseline"], r["baseline_runs"]),
+                          _measure(r["after"], r["after_runs"]), str(r["cited"]), title])
+        lines += _table(table)
+    else:
+        lines.append("No lessons.")
+    lines += ["", view["note"]]
+    return "\n".join(lines)
 
 
 def runs_signature(repo: Path) -> tuple:

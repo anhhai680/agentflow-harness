@@ -46,7 +46,7 @@ MERGE_TAG = "tag:yaml.org,2002:merge"
 AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices")  # what a page may change in an `agents.<name>` block
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
     "version", "engine", "gates", "gates_confirmed", "gate_sets", "guardrails", "conditions", "overlays", "project",
-    "phase_approval", "record_step", "resolve_step", "paths", "defaults.env", "defaults.env_inherit", "context.autocompact_env", "context.progress_file",
+    "phase_approval", "record_step", "resolve_step", "retro_step", "paths", "defaults.env", "defaults.env_inherit", "context.autocompact_env", "context.progress_file",
     "hitl.notify", "dashboard.host", "work_source", "skills", "starter",
 )
 PROTECTED = (
@@ -139,6 +139,11 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("context", "context_window_tokens"), "Context window (tokens)", {"kind": "int", "min": 100000}),
         (("context", "default_window_tokens"), "Default window (tokens)", _POS),
         (("context", "gate_output_lines"), "Gate output lines", _POS),
+    ]),
+    ("Memory", "What runs learn from earlier runs.", [
+        (("memory", "lessons_max_tokens"), "Lessons per prompt (tokens, 0 = off)", {"kind": "int", "min": 0, "max": 4000}),
+        (("memory", "digest_tokens"), "Retro digest size (tokens)", {"kind": "int", "min": 1000, "max": 50000}),
+        (("memory", "retro_every_days"), "Days between retros (0 = manual only)", {"kind": "int", "min": 0, "max": 90}),
     ]),
     ("Autonomy", "What the runner settles by itself before a human hears of it.", [
         (("autonomy", "non_blocking_severities"), "Non-blocking severities", {"kind": "list"}),

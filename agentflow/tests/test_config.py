@@ -653,13 +653,15 @@ FULL_PACKS = {"python": PYTHON_CONFIG, "node": PACKS / "node" / ".agentflow" / "
 # Where a full pack's loaded config differs from the same file loaded alone (`layered=False`), and why. A full pack
 # writes its whole workflow, so the engine's workflow never applies to it; only keys outside the workflow it left
 # unset can come from the engine defaults.
+_RETRO_STEP = "the engine's retro step: a retro is the engine's pipeline, so no pack needs to state it"
 INHERITED = {
-    "python": {},
+    "python": {"retro_step": _RETRO_STEP},
     "node": {
         "agents.codex": "the engine's codex agent, disabled: it runs no step unless the pack enables it",
         "agents.claude.prices": "the engine's price table: it prices only a session Claude reported no cost for",
+        "retro_step": _RETRO_STEP,
     },
-    "this repo": {},
+    "this repo": {"retro_step": _RETRO_STEP},
 }
 # The keys of `defaults`, `context`, `effort` and `recovery` that load_config requires (no code fallback). The engine
 # defaults hold the values the engine's minimum fixture pack (`node`) writes for them.
@@ -1246,3 +1248,59 @@ def test_validate_refuses_an_agent_check_the_agent_cannot_run_as_written(tmp_cfg
             and "worktree root" in i.message]
     off = issues_for(tmp_cfg, {"gates": {"floor": {**gate, "agent_check": False}}})
     assert ("error", "gates.floor.agent_check") not in errors(off)
+
+
+# --------------------------------------------------------------------------- the memory section
+
+
+def test_memory_defaults(tmp_cfg):
+    cfg = load_config(tmp_cfg({"memory": {"lessons_max_tokens": None}}))  # the suite's pack sets it to 0; deleted, the default shows
+    assert (cfg.memory.lessons_max_tokens, cfg.memory.digest_tokens, cfg.memory.retro_every_days) == (1500, 15000, 7)
+
+
+@pytest.mark.parametrize("key,value", [("lessons_max_tokens", 4001), ("lessons_max_tokens", -1),
+                                       ("digest_tokens", 999), ("digest_tokens", 50001), ("retro_every_days", 91),
+                                       ("retro_every_days", -1)])
+def test_memory_bounds_are_validated(tmp_cfg, key, value):
+    assert ("error", f"memory.{key}") in errors(issues_for(tmp_cfg, {"memory": {key: value}}))
+
+
+@pytest.mark.parametrize("key,value", [("lessons_max_tokens", 0), ("lessons_max_tokens", 4000), ("digest_tokens", 1000),
+                                       ("digest_tokens", 50000), ("retro_every_days", 0), ("retro_every_days", 90)])
+def test_memory_bounds_are_inclusive(tmp_cfg, key, value):
+    assert not [i for i in issues_for(tmp_cfg, {"memory": {key: value}}) if i.path.startswith("memory")]
+
+
+# --------------------------------------------------------------------------- the retro step
+
+
+def test_the_retro_step_comes_from_the_engine_defaults(cfg):
+    step = cfg.retro_step
+    assert step is not None
+    assert (step.id, step.skill, step.role, step.prompt, step.commit) == ("retro", "agentflow-retro", "review",
+                                                                          "retro.md", False)
+    assert DEFAULTS["retro_step"] == {"id": "retro", "skill": "agentflow-retro", "role": "review", "prompt": "retro.md"}
+    assert "retro_step" not in layers.WORKFLOW_KEYS  # a pack that writes its whole workflow keeps it
+
+
+def test_a_pack_lane_named_retro_is_refused(tmp_cfg):
+    def patch(data):
+        data["lanes"] = [*data["lanes"], "retro"]
+
+    issues = issues_for(tmp_cfg, patch)
+    [issue] = [i for i in issues if i.level == "error" and i.path.startswith("lanes")]
+    assert issue.path == "lanes[4]" and "retro" in issue.message
+
+
+def test_a_broken_retro_step_is_an_error(tmp_cfg):
+    issues = issues_for(tmp_cfg, {"retro_step": {"id": "retro", "skill": "no-such-skill", "role": "review",
+                                                 "prompt": "retro.md"}})
+    assert ("error", "retro_step.skill") in errors(issues)
+
+
+def test_a_phase_named_retro_is_refused(tmp_cfg):
+    def patch(data):
+        data["phases"]["retro"] = {"needs_approval": False, "steps": [{"id": "x", "type": "gate", "gates": ["ok"]}]}
+        data.setdefault("gates", {})["ok"] = {"run": "true"}
+
+    assert ("error", "phases.retro") in errors(issues_for(tmp_cfg, patch))

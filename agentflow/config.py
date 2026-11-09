@@ -22,6 +22,7 @@ import yaml
 from agentflow import layers, pack
 
 KNOWN_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+RETRO_PIPELINE = "retro"  # the retro run's pipeline name: its runs never count as evidence for or against a lesson
 BUILTIN_CHECKS = (
     "file_exists",
     "grep",
@@ -148,6 +149,7 @@ PROMPT_PLACEHOLDERS = frozenset(
         "stop_summary",
         "stop_report",
         "run_facts",
+        "lessons",
         "code_map",
         "ci_report",
         "sync_report",
@@ -280,6 +282,13 @@ class ContextPolicy:
 
 
 @dataclass
+class MemoryPolicy:
+    lessons_max_tokens: int  # the most tokens of lessons a prompt carries; 0 turns lessons off
+    digest_tokens: int  # the size a retro's digest of recent runs is cut to
+    retro_every_days: int  # days between retros the runner proposes; 0 means manual only
+
+
+@dataclass
 class Gate:
     name: str
     run: str
@@ -358,6 +367,7 @@ class Config:
     defaults: Defaults
     effort: EffortPolicy
     context: ContextPolicy
+    memory: MemoryPolicy
     gates: dict[str, Gate]
     gate_sets: dict[str, list[str]]
     guardrails: Guardrails
@@ -375,6 +385,7 @@ class Config:
     recovery: Recovery = field(default_factory=Recovery)
     autonomy: dict = field(default_factory=dict)
     resolve_step: Step | None = None
+    retro_step: Step | None = None  # the one session of a retro run (`retro.run_retro`); not part of any lane
     ci: dict = field(default_factory=dict)
     work_source: WorkSource | None = None  # None: no modules to queue; `next` and the Backlog go on without them
     skills_map: dict[str, str] = field(default_factory=dict)  # the skill `next` names per kind of step (`skills.map`)
@@ -827,6 +838,7 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
     defaults = _require(raw, "defaults", "", dict)
     effort = _require(raw, "effort", "", dict)
     context = _require(raw, "context", "", dict)
+    memory = _optional(raw, "memory", "", dict, {})
     guardrails = _require(raw, "guardrails", "", dict)
     recovery = _optional(raw, "recovery", "", dict, {})
     agents = _require(raw, "agents", "", dict)
@@ -874,6 +886,11 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
             progress_file=_require(context, "progress_file", "context", str),
             gate_output_lines=_require(context, "gate_output_lines", "context", int),
         ),
+        memory=MemoryPolicy(
+            lessons_max_tokens=_optional(memory, "lessons_max_tokens", "memory", int, 1500),
+            digest_tokens=_optional(memory, "digest_tokens", "memory", int, 15000),
+            retro_every_days=_optional(memory, "retro_every_days", "memory", int, 7),
+        ),
         gates=_build_gates(_require(raw, "gates", "", dict)),
         gate_sets={name: _string_list(members, f"gate_sets.{name}") for name, members in gate_sets.items()},
         guardrails=Guardrails(
@@ -901,6 +918,7 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
         ),
         autonomy=_optional(raw, "autonomy", "", dict, {}),
         resolve_step=builder.step(raw["resolve_step"], "resolve_step") if raw.get("resolve_step") else None,
+        retro_step=builder.step(raw["retro_step"], "retro_step") if raw.get("retro_step") else None,
         ci=_optional(raw, "ci", "", dict, {}),
         work_source=_work_source(raw),
         skills_map=_skills_map(raw),
@@ -1437,6 +1455,19 @@ class _Validator:
             self.step(cfg.record_step, {cfg.record_step.id})
         if cfg.resolve_step is not None:
             self.step(cfg.resolve_step, {cfg.resolve_step.id})
+        if cfg.retro_step is not None:
+            self.step(cfg.retro_step, {cfg.retro_step.id})
+
+    def lanes(self) -> None:
+        """`retro` is the engine's own pipeline (`RETRO_PIPELINE`): a lane of that name would make its runs read as
+        retros, which no digest reads and no lesson counts, and a phase of that name would own the retro's stops."""
+        for i, lane in enumerate(self.cfg.lanes):
+            if lane == RETRO_PIPELINE:
+                self.error(f"lanes[{i}]", f"`{RETRO_PIPELINE}` is the engine's retro pipeline, not a lane: "
+                           "give this lane another name")
+        if RETRO_PIPELINE in self.cfg.phases:  # the retro's step key is `retro/retro`: it would read as this phase's
+            self.error(f"phases.{RETRO_PIPELINE}", f"`{RETRO_PIPELINE}` is the engine's retro pipeline, so no phase "
+                       "may take its name: give this phase another name")
 
     def approval_note(self, phase: Phase, path: str) -> None:
         note = phase.approval_note
@@ -1481,6 +1512,32 @@ class _Validator:
             self.error("context.rollover_pct", "must be a percentage from 1 to 100")
         elif ctx.rollover_pct <= ctx.autocompact_pct:
             self.error("context.rollover_pct", f"must be above autocompact_pct ({ctx.autocompact_pct}): the rollover is the safety net behind the auto-compact")
+
+    def memory(self) -> None:
+        mem = self.cfg.memory
+        for key, low, high, note in (("lessons_max_tokens", 0, 4000, " (0 turns lessons off)"),
+                                     ("digest_tokens", 1000, 50000, ""),
+                                     ("retro_every_days", 0, 90, " (0 means manual only)")):
+            value = getattr(mem, key)
+            if isinstance(value, bool) or not low <= value <= high:
+                self.error(f"memory.{key}", f"must be from {low} to {high}{note}")
+        self.lessons()
+
+    def lessons(self) -> None:
+        """The pack's lessons file (beside the config): each malformed entry, unknown phase and unknown target is
+        a warning, since a bad entry is only left out of prompts. A passed `review_by` is never one, so the date
+        cannot turn a clean `validate` red."""
+        from agentflow import lessons, signals  # lessons -> hitl -> config: imported here, not at the top
+        where = pack.LESSONS_FILE
+        found, problems = lessons.read(self.cfg.path.parent / posixpath.basename(where), "L")
+        for problem in problems:
+            self.add("warning", "lessons", f"{where}: {problem}")
+        for lesson in found:
+            for phase in lesson.applies:
+                if phase not in self.cfg.phases:
+                    self.add("warning", "lessons", f"{where}: {lesson.id} applies to {phase!r}, which is not a phase")
+            if lesson.target is not None and signals.parse_target(lesson.target) is None:
+                self.add("warning", "lessons", f"{where}: {lesson.id} target {lesson.target!r} is not a signal key")
 
     def approval(self) -> None:
         cfg = self.cfg
@@ -1655,10 +1712,12 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.agents()
     v.gate_definitions()
     v.bug_lane()
+    v.lanes()
     v.conditions()
     v.phases()
     v.effort()
     v.context()
+    v.memory()
     v.approval()
     v.autonomy()
     v.overlays()

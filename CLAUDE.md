@@ -11,8 +11,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `AGENTS.md` holds the rules for non-Claude agents (Codex) in a run: follow this file, read skills from `.claude/skills/`, never commit.
 
 Design docs (read them by section, using `grep -n '^## '`):
-- `docs/agentflow-harness-proposal.md`: **the current design**, status `proposed`. §1b covers the engine/pack split, §1c plug and play, and §5 the rollout slices. Slice P (engine/pack separation) and slice PnP (plug and play: the installable tool, config layers, starters, bundled skills, `init` and `doctor`) have shipped.
-- `docs/agentflow-playbook.md`: how to operate runs. §10 is the cheat sheet, §13 covers using agentflow in another repository, and §14 is the pack reference, with one line per config key.
+- `docs/agentflow-harness-proposal.md`: **the current design**, status `proposed`. §1b covers the engine/pack split, §1c plug and play, and §5 the rollout slices. Slice P (engine/pack separation) and slice PnP (plug and play: the installable tool, config layers, starters, bundled skills, `init` and `doctor`) have shipped, and so has slice LR (lessons and retros, §3.10 tier 5 and step 3b of §5).
+- `docs/agentflow-playbook.md`: how to operate runs. §10 is the cheat sheet, §13 covers using agentflow in another repository, §14 is the pack reference, with one line per config key, and §15 covers lessons and retros.
 - `docs/plans/`: implementation plans (`YYYY-MM-DD-agentflow-harness-<slice>.md`). Completed plans are records and aren't edited afterwards.
 
 The quality bar is the pack's `gate_sets` plus the invariants below. A module's spec is its proposal, `docs/agentflow-<module>-proposal.md`.
@@ -35,6 +35,8 @@ bin/agentflow validate                         # run after every config edit; it
 bin/agentflow explain <lane> --module <id>     # what a lane would run, with no agent calls
 bin/agentflow run <lane> ... --dry-run         # prints the commands and creates nothing
 bin/agentflow next | status | inbox | dashboard
+bin/agentflow retro [--since YYYY-MM-DD] [--dry-run] # lessons from the finished runs as a draft PR (--dry-run: digest and prompt only)
+bin/agentflow lessons [--json]                 # each lesson's target signal before and after the runs that carried it
 bin/agentflow doctor                           # agent CLIs and logins, gh, origin, Docker, the state dir, each gate's programs
 bin/agentflow config show --effective [PREFIX] # every value after the layers merge, with the layer it came from
 agentflow init [--starter NAME] [--baseline]   # in another repository: write a sparse pack (playbook §13)
@@ -72,6 +74,11 @@ State and the pack:
   So a pack states only what differs, and `config show --effective` prints each value's layer.
 - **A step's skill is its brief.** A step with no `brief:` of its own gets its skill's `SKILL.md` as its first brief, read from the main checkout and never from a run's worktree. `skills/agentflow-<stage>/SKILL.md` are the bundled generic skills (define, plan, build, debug, verify, review, respond), so a repository with no skills dir still works.
 - `conditions.py` holds the named condition checks (`file_exists`, `grep`, `section_items`, `status_line`, `changed_paths`, `plan_tasks`, …), the prompt placeholders, and `agentflow explain`. `sources.py` reads plans and specs. `work_source.py` and `module_queue.py` handle `next` and `queue`.
+
+Lessons and retros (playbook §15):
+- `signals.py` turns one run's events and metrics into signals keyed in a fixed vocabulary (`gate_first_pass:<gate>`, `fix_attempts:<phase>`, `ci_rounds`, …). A lesson's `target` is one of these keys. Pure functions: it reads no file and no clock.
+- `lessons.py` parses and renders the two lessons files: the engine's `lessons.md` (`E-NNNN`, edited by hand) and the pack's `.agentflow/lessons.md` (`L-NNNN`). The pack file has a fixed path, sits under the engine floor, and is read only from the main checkout. `select` fills a step prompt's `{lessons}` slot, dropping lessons past `review_by` and cutting to `memory.lessons_max_tokens`. `effects` compares each lesson's target before and after the runs that carried it (`lessons_injected`) and gives a verdict.
+- `retro.py` runs `agentflow retro` as the engine's `retro` pipeline, which is never a lane. It builds a deterministic digest of the runs that finished since the last finished retro, runs one read-only `retro_step` session, and checks every proposal against the run logs. It then commits only the lessons file (`gitops.commit_lessons`), pushes that commit by its sha and opens a draft PR. The checkout's git state and tree are compared with how they were before the session (`gitops.git_state`, `tree_state`), so a session that changed anything stops `blocked` before any commit or push. A retro run is never resumed: a stopped one is cancelled and run again.
 
 Setting up a repository (these commands run with no pack, or before one exists):
 - `detect.py` reads a repository **from its base branch** through git and never reads its working tree. The exception is a repository with no commits, which it reads from the working tree, with a note. It proposes the base branch, the starter, gates (CI workflow steps first, then `package.json` scripts, `pyproject.toml` tool sections and `Makefile` targets), docs folders and skills. The repository is untrusted input: nothing in it is run, and a malformed file becomes a note.
