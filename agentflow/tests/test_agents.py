@@ -715,3 +715,60 @@ def test_the_process_environment_reaches_the_agent_only_when_the_call_has_no_bas
     assert seen[STEP]["LEAKED_URL"] == "leak-sentinel-7f3a"  # no env_base: this process's environment, as before
     fake_claude.run(dataclasses.replace(call, env_base={"PATH": os.environ["PATH"]}), collect()[1])
     assert "LEAKED_URL" not in seen[STEP] and seen[STEP]["AGENTFLOW_RUN"] == call.run_id
+
+
+def _spy_env(monkeypatch) -> dict[str, dict]:
+    seen: dict[str, dict] = {}
+    real = subprocess.Popen
+
+    def spy(argv, **kwargs):
+        seen[kwargs["env"].get("AGENTFLOW_STEP", "")] = kwargs["env"]
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    return seen
+
+
+def _sourced_path(env_file: str, start_path: str = "/usr/local/bin:/usr/bin:/bin") -> str:
+    """The PATH a shell has after it sources `env_file`, starting from a login shell's reordered PATH."""
+    out = subprocess.run(["/bin/sh", "-c", '. "$1"; printf %s "$PATH"', "sh", env_file],
+                         env={"PATH": start_path}, capture_output=True, text=True, check=True)
+    return out.stdout
+
+
+def test_a_claude_session_keeps_the_runners_path_through_its_login_shell(fake, fake_claude, call, monkeypatch):
+    # Claude Code's Bash tool starts a login shell, and macOS's path_helper then moves /usr/local/bin first: an
+    # agent saw an old Node there while the gates, under the runner's PATH, saw the new one.
+    seen = _spy_env(monkeypatch)
+    path = "/opt/it's here/bin:/usr/local/bin:/usr/bin:/bin"
+    fake_claude.run(dataclasses.replace(call, env_base={"PATH": path}), collect()[1])
+    env_file = seen[STEP]["CLAUDE_ENV_FILE"]
+    assert Path(env_file).parent == call.transcript_path.parent  # in the runner's state, where no agent edits
+    assert _sourced_path(env_file) == path
+
+
+def test_the_pack_env_path_wins_in_the_claude_shell(fake, fake_claude, call, monkeypatch):
+    seen = _spy_env(monkeypatch)
+    fake_claude.run(dataclasses.replace(call, env_base={"PATH": "/usr/bin:/bin"}, env={"PATH": "/pack/bin:/usr/bin:/bin"}),
+                    collect()[1])
+    assert _sourced_path(seen[STEP]["CLAUDE_ENV_FILE"]) == "/pack/bin:/usr/bin:/bin"
+
+
+def test_an_inherited_claude_env_file_is_still_sourced_after_the_path(fake, fake_claude, call, monkeypatch, tmp_path):
+    seen = _spy_env(monkeypatch)
+    own = tmp_path / "own env.sh"
+    own.write_text('export PATH="/venv/bin:$PATH"\n')
+    fake_claude.run(dataclasses.replace(call, env_base={"PATH": "/usr/bin:/bin", "CLAUDE_ENV_FILE": str(own)}),
+                    collect()[1])
+    env_file = seen[STEP]["CLAUDE_ENV_FILE"]
+    assert env_file != str(own)
+    assert _sourced_path(env_file) == "/venv/bin:/usr/bin:/bin"
+    own.unlink()  # a file that is gone by the time the shell starts is skipped, not an error
+    assert _sourced_path(env_file) == "/usr/bin:/bin"
+
+
+def test_a_codex_session_gets_no_claude_env_file(fake, cfg, call, monkeypatch):
+    seen = _spy_env(monkeypatch)
+    codex = CodexAgent(dataclasses.replace(cfg.agents["codex"], command=fake.command), cfg.context)
+    codex.run(dataclasses.replace(call, env_base={"PATH": os.environ["PATH"]}), collect()[1])
+    assert "CLAUDE_ENV_FILE" not in seen[STEP]
