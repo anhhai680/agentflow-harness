@@ -10,6 +10,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 ### Fixed
 
 - The dashboard's dialogs show why a request was refused: a New task the server rejects (a 400 or 409) now names the bad field inside the open dialog, where before the message was hidden under the modal and only the browser console showed `400 (Bad Request)`.
+- The dashboard's terminal log names the reason for every refused request (`POST /api/backlog -> 400: <reason>`), not only its status.
 
 ## [2.2] - 2026-11-09
 

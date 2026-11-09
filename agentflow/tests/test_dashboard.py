@@ -828,6 +828,31 @@ def test_a_bad_card_is_a_400_and_a_duplicate_a_409(bdash):
     assert code == 409 and "7" in payload(body)["error"]
 
 
+def test_a_refused_request_logs_its_reason_with_its_status(bdash, capsys):
+    assert bdash.post("/api/backlog", {"lane": "bug", "fields": {"issue": "x; rm"}})[0] == 400
+    err = capsys.readouterr().err
+    assert "dashboard: POST /api/backlog -> 400: --issue takes an issue number such as 42" in err
+    assert TOKEN not in err
+
+
+def test_a_reason_is_logged_once_and_never_against_the_next_request_on_the_connection(bdash, capsys):
+    conn = http.client.HTTPConnection("127.0.0.1", bdash.port, timeout=5)  # one connection, two requests
+    bad = json.dumps({"lane": "bug", "fields": {"issue": "x; rm"}})
+    try:
+        statuses = []
+        for headers in ({"X-Agentflow-Token": TOKEN}, {}):  # the second has no token: a 403 with no reason
+            conn.request("POST", "/api/backlog", body=bad, headers={"Content-Type": "application/json", **headers})
+            response = conn.getresponse()
+            response.read()
+            statuses.append(response.status)
+        assert statuses == [400, 403]
+    finally:
+        conn.close()
+    lines = [line for line in capsys.readouterr().err.splitlines() if "/api/backlog ->" in line]
+    assert lines[0].startswith("dashboard: POST /api/backlog -> 400: --issue takes")
+    assert lines[1] == "dashboard: POST /api/backlog -> 403"
+
+
 def test_starting_a_ready_module_answers_202_and_the_run_appears(bdash):
     code, _, body = bdash.post("/api/backlog/start", {"module": "c"})
     assert code == 202 and payload(body)["starting"] is True

@@ -40,7 +40,9 @@ It can approve checkpoints and start agents, so it is locked down:
   an existing run directory, and files are read only through the run's own paths, size-capped;
 - every response is `no-store`, `nosniff`, `no-referrer`, not frameable, with a strict CSP (the page's one
   script and style carry a fresh nonce); JSON escapes `<`, `>` and `&`, and the page renders all run text
-  with `textContent`.
+  with `textContent`;
+- the terminal log names each refused request's status and, when it has one, its `error` text on one line,
+  cut to `LOG_REASON_MAX` characters; the token never appears in it.
 """
 
 from __future__ import annotations
@@ -70,6 +72,7 @@ from agentflow.views import agents_view, board, lessons_view, metrics_view, run_
 
 PAGE = Path(__file__).resolve().with_name("dashboard.html")
 MAX_BODY = 64 * 1024
+LOG_REASON_MAX = 200  # the characters of a refused request's `error` its log line keeps
 MIN_TOKEN_CHARS = 22  # 128 bits of token_urlsafe
 RUN_ID = re.compile(r"^[0-9]{8}-[0-9]{4}-[a-z0-9]+(?:-[a-z0-9]+)*$")
 RUN_ID_MAX = 120
@@ -302,8 +305,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- logging: never the token
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        reason = self.__dict__.pop("_log_reason", None)  # always taken: a keep-alive connection reuses this handler
         if isinstance(code, int) and code >= 400:
-            self.log_message("%s %s -> %s", self.command, urlsplit(getattr(self, "path", "")).path, code)
+            said = ""
+            if reason:
+                line = " ".join(reason.split())
+                said = ": " + (line if len(line) <= LOG_REASON_MAX else line[: LOG_REASON_MAX - 1] + "…")
+            self.log_message("%s %s -> %s%s", self.command, urlsplit(getattr(self, "path", "")).path, code, said)
 
     def log_message(self, format: str, *args: Any) -> None:
         sys.stderr.write("dashboard: " + (format % args).replace(self.server.token, "<token>") + "\n")
@@ -331,6 +339,8 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(code, b"", "text/plain; charset=utf-8")
 
     def _json(self, status: int, data: Any) -> None:
+        if status >= 400 and isinstance(data, dict) and isinstance(data.get("error"), str):
+            self._log_reason = data["error"]  # `send_response` logs the line; `log_request` takes it from there
         self._send(status, _json_bytes(data), "application/json; charset=utf-8")
 
     def _error(self, status: int, message: str) -> None:
