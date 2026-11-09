@@ -630,9 +630,12 @@ def test_a_new_feature_card_with_no_dependencies_says_none(sbk):
 
 
 def test_a_new_feature_card_cannot_reuse_an_existing_spec_module_id(sbk):
-    with pytest.raises(backlog.Invalid, match="already a module"):
+    write(sbk.root, "docs/specs/SPEC-b.md", "# B\n\n**Depends on:** none\n")  # `a` is merged (done); `b` is not
+    run_git(sbk.root, "add", "-A")
+    run_git(sbk.root, "commit", "-q", "-m", "spec b")
+    with pytest.raises(backlog.Invalid, match="already a module in the spec files: start module:b instead"):
         backlog.add(sbk.cfg, sbk.root, "feature",
-                    {"new_module": {"module": "a", "responsibility": "Again", "deps": []}})
+                    {"new_module": {"module": "b", "responsibility": "Again", "deps": []}})
 
 
 def test_a_new_feature_card_whose_spec_appeared_since_is_refused_at_start(sbk):
