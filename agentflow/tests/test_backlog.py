@@ -477,6 +477,22 @@ def test_an_issue_with_a_live_run_cannot_be_added_again(bk):
         backlog.add(bk.cfg, bk.root, "bug", {"issue": "30"})
 
 
+@pytest.mark.parametrize("reason, says", [
+    ("plan complete on main", "add unticked `- [ ]` steps for the new work to its plan on main"),
+    ("spec says done", "run `agentflow backlog undone a`"),
+    ("done by hand", "run `agentflow backlog undone a`"),
+    ("merged", None),
+])
+def test_a_new_task_named_after_a_done_module_says_it_is_done_and_how_to_add_work(sbk, monkeypatch, reason, says):
+    monkeypatch.setattr(backlog.finished, "recorded", lambda repo: {"a": reason})
+    with pytest.raises(Invalid) as caught:
+        backlog.add(sbk.cfg, sbk.root, "feature", {"new_module": {"module": "a", "responsibility": "more", "deps": []}})
+    message = str(caught.value)
+    assert message.startswith(f"a is already done ({reason}). Give the new work its own module id")
+    assert "start module:a" not in message  # a done module has no Start button
+    assert (says in message) if says else ", or reopen a:" not in message
+
+
 def test_a_new_module_needs_a_fresh_id_and_dependencies_already_in_the_map(bk):
     fields = {"new_module": {"module": "e", "responsibility": "eee", "deps": ["a"]}}
     bk.refresh()
@@ -614,9 +630,12 @@ def test_a_new_feature_card_with_no_dependencies_says_none(sbk):
 
 
 def test_a_new_feature_card_cannot_reuse_an_existing_spec_module_id(sbk):
-    with pytest.raises(backlog.Invalid, match="already a module"):
+    write(sbk.root, "docs/specs/SPEC-b.md", "# B\n\n**Depends on:** none\n")  # `a` is merged (done); `b` is not
+    run_git(sbk.root, "add", "-A")
+    run_git(sbk.root, "commit", "-q", "-m", "spec b")
+    with pytest.raises(backlog.Invalid, match="already a module in the spec files: start module:b instead"):
         backlog.add(sbk.cfg, sbk.root, "feature",
-                    {"new_module": {"module": "a", "responsibility": "Again", "deps": []}})
+                    {"new_module": {"module": "b", "responsibility": "Again", "deps": []}})
 
 
 def test_a_new_feature_card_whose_spec_appeared_since_is_refused_at_start(sbk):

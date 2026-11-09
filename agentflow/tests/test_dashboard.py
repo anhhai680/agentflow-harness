@@ -828,6 +828,31 @@ def test_a_bad_card_is_a_400_and_a_duplicate_a_409(bdash):
     assert code == 409 and "7" in payload(body)["error"]
 
 
+def test_a_refused_request_logs_its_reason_with_its_status(bdash, capsys):
+    assert bdash.post("/api/backlog", {"lane": "bug", "fields": {"issue": "x; rm"}})[0] == 400
+    err = capsys.readouterr().err
+    assert "dashboard: POST /api/backlog -> 400: --issue takes an issue number such as 42" in err
+    assert TOKEN not in err
+
+
+def test_a_reason_is_logged_once_and_never_against_the_next_request_on_the_connection(bdash, capsys):
+    conn = http.client.HTTPConnection("127.0.0.1", bdash.port, timeout=5)  # one connection, two requests
+    bad = json.dumps({"lane": "bug", "fields": {"issue": "x; rm"}})
+    try:
+        statuses = []
+        for headers in ({"X-Agentflow-Token": TOKEN}, {}):  # the second has no token: a 403 with no reason
+            conn.request("POST", "/api/backlog", body=bad, headers={"Content-Type": "application/json", **headers})
+            response = conn.getresponse()
+            response.read()
+            statuses.append(response.status)
+        assert statuses == [400, 403]
+    finally:
+        conn.close()
+    lines = [line for line in capsys.readouterr().err.splitlines() if "/api/backlog ->" in line]
+    assert lines[0].startswith("dashboard: POST /api/backlog -> 400: --issue takes")
+    assert lines[1] == "dashboard: POST /api/backlog -> 403"
+
+
 def test_starting_a_ready_module_answers_202_and_the_run_appears(bdash):
     code, _, body = bdash.post("/api/backlog/start", {"module": "c"})
     assert code == 202 and payload(body)["starting"] is True
@@ -1027,6 +1052,45 @@ def test_a_blocked_backlog_card_gets_no_start_button_or_drag_handle():
     block = source[source.index("function backlogNode"):source.index("function renderBoard")]
     assert 'const canStart = item.status === "parallel" || item.status === "ready"' in block  # not blocked, not starting
     assert "draggable: canStart" in block and "if (canStart) buttons.push" in block and "if (canStart) dragFrom" in block
+
+
+def test_a_message_raised_while_the_dialog_is_open_shows_inside_it():
+    """`showModal()` puts the dialog in the top layer, above any z-index: a #toast there is hidden under it."""
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    markup = source[source.index('<dialog id="dlg">'):source.index("</dialog>")]
+    assert '<p id="dlg-msg" class="gate-bad" role="alert" hidden></p>' in markup
+    assert markup.index('id="dlg-msg"') < markup.index('class="dlg-buttons"')  # under the fields, above OK
+    css = source[:source.index("</style>")]
+    assert re.search(r"#dlg-msg\s*\{[^}]*overflow-wrap:\s*anywhere", css)
+    helpers = source[source.index("function clearDialogMessage()"):source.index("async function api(")]
+    assert "function showDialogMessage(text)" in helpers and '$("dlg-msg")' in helpers
+    assert "textContent = text" in helpers and "innerHTML" not in helpers
+    toast = helpers[helpers.index("function toast(text)"):]
+    # only the open dialog's own OK collects a message, unseen until it knows the outcome: a success is never red
+    assert "if (dialogSaid !== null) { dialogSaid = text; return; }" in toast
+    assert '$("dlg").open' not in toast  # an unrelated toast never lands in the dialog
+
+
+def test_the_dialog_clears_its_message_and_floats_a_success_message_once_closed():
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    block = source[source.index("function dialog(title"):source.index("function rejectDialog")]
+    assert block.count("clearDialogMessage()") >= 2  # on open, and again before each OK
+    assert block.index("clearDialogMessage()") < block.index("dlg.showModal()")
+    ok = block[block.index('ok.addEventListener("click"'):block.index('cancel.addEventListener')]
+    assert "clearDialogMessage()" in ok
+    assert re.search(r'dialogSaid = "";[^}]*try \{ done = await onOk\(\); \} finally \{[^}]*dialogSaid = null;', ok)
+    assert re.search(r"dlg\.close\(\);\s*if \(said\) toast\(said\)", ok)  # a success message floats after close
+    assert "else if (said) showDialogMessage(said)" in ok  # a failure's message stays in the dialog
+
+
+def test_a_submit_that_outlives_its_dialog_neither_closes_nor_writes_into_the_next():
+    """OK, then Escape (or another dialog) before the answer: the late answer floats and closes nothing."""
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    block = source[source.index("function dialog(title"):source.index("function rejectDialog")]
+    assert "const run = ++dialogRun;" in block
+    ok = block[block.index('ok.addEventListener("click"'):block.index('cancel.addEventListener')]
+    late = "if (run !== dialogRun || !dlg.open) { if (said) toast(said); return; }"
+    assert late in ok and ok.index(late) < ok.index("dlg.close()")
 
 
 # --------------------------------------------------------------------------- time and cost

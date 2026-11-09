@@ -227,8 +227,19 @@ def unremovable(cfg: Config) -> str:
     return f"a module from the {noun} lives there; it cannot be removed here"
 
 
+def _reopen_hint(module: str, reason: str) -> str | None:
+    """How to add work to a module that is done for `reason`; None when only a new module id will do (merged)."""
+    done_on = finished.plan_complete("")
+    if reason.startswith(done_on):
+        return (f"add unticked `- [ ]` steps for the new work to its plan on {reason[len(done_on):]}, "
+                "and it comes back to Backlog")
+    if reason in (finished.SPEC_SAYS, finished.BY_HAND):
+        return f"run `agentflow backlog undone {module}`"
+    return None
+
+
 def _new_module_fields(value: Any, nodes: list[sources.ModuleNode], book: Backlog,
-                       noun: str = "capability map") -> dict:
+                       noun: str = "capability map", done: dict[str, str] | None = None) -> dict:
     if not isinstance(value, dict):
         raise Invalid("new_module must have a module id, a responsibility and dependencies")
     module = str(value.get("module") or "")
@@ -239,6 +250,11 @@ def _new_module_fields(value: Any, nodes: list[sources.ModuleNode], book: Backlo
     if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
         raise Invalid("deps must be a list of module ids")
     in_map = {n.id for n in nodes}
+    if module in in_map and module in (done or {}):  # a done module has no Start button to point at
+        reason = (done or {})[module]
+        hint = _reopen_hint(module, reason)
+        message = f"{module} is already done ({reason}). Give the new work its own module id"
+        raise Invalid(message + (f", or reopen {module}: {hint}" if hint else ""))
     if module in in_map:
         if noun == "capability map":
             raise Invalid(f"{module} is already in the {noun}")
@@ -294,7 +310,8 @@ def add(cfg: Config, repo: Path, lane: str, fields: dict, after: Any = (), to_ph
             elif name in ("task", "topic"):
                 params[name] = _text(fields[name], name)
             else:
-                new_module = _new_module_fields(fields["new_module"], nodes, book, work_source.noun(cfg))
+                new_module = _new_module_fields(fields["new_module"], nodes, book, work_source.noun(cfg),
+                                                finished.recorded(repo))
                 params["module"], kind = new_module["module"], "module"
         refs = _check_after(cfg, repo, after, nodes, book)
         if "issue" in params:
