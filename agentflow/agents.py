@@ -10,6 +10,7 @@ from __future__ import annotations
 import abc
 import json
 import os
+import shlex
 import signal
 import subprocess
 import threading
@@ -18,12 +19,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import layers
+from . import layers, safeio
 from .config import AgentSpec, Config, ContextPolicy
 
 KILL_GRACE_S = 10
 SUBAGENT_TOOLS = ("Agent", "Task")
 AUTOCOMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"  # Claude Code's own cap on the window `autocompact_pct` is read against
+SHELL_ENV_FILE_ENV = "CLAUDE_ENV_FILE"  # a script Claude Code sources in its Bash tool's shell before each command
 SYNTHETIC_MODEL = "<synthetic>"  # Claude Code's own error messages, shown as assistant turns: no model replied
 
 EventCallback = Callable[[str, dict], None]
@@ -431,6 +433,10 @@ class _CliAgent(abc.ABC):
     def _effort_args(self, call: AgentCall) -> list[str]:
         return [part.replace("{effort}", call.effort) for part in self.spec.effort_arg]
 
+    def _shell_env(self, call: AgentCall, env: Mapping[str, str]) -> dict[str, str]:
+        """Variables added once the process environment `env` is known, for the agent's own shell tool."""
+        return {}
+
     def _accumulator(self, call: AgentCall) -> StreamAccumulator:
         """Window precedence: a number in config, then the stream's result event, then the window the
         runner already knows for the model (`call.context_window`), then `default_window_tokens`."""
@@ -451,10 +457,12 @@ class _CliAgent(abc.ABC):
         state = {"timed_out": False}
         rolled_over = False
         with open(call.transcript_path, "a", encoding="utf-8") as transcript, open(stderr_path, "a", encoding="utf-8") as stderr:
+            env = {**(os.environ if call.env_base is None else call.env_base), **self.env(call)}
+            env.update(self._shell_env(call, env))
             proc = subprocess.Popen(
                 argv,
                 cwd=call.cwd,
-                env={**(os.environ if call.env_base is None else call.env_base), **self.env(call)},
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=stderr,
@@ -542,6 +550,25 @@ class ClaudeAgent(_CliAgent):
             argv += ["--resume", call.resume_session]
         argv.append(call.prompt)
         return argv
+
+    def _shell_env(self, call: AgentCall, env: Mapping[str, str]) -> dict[str, str]:
+        """Pin the Bash tool's PATH to the one the gates get. Claude Code's Bash tool runs a login shell, and on
+        macOS a login shell's `path_helper` moves the system folders (`/usr/local/bin`, ...) ahead of the rest, so
+        the agent could run another `node` or `python` than the gates. The script is written next to the
+        transcript, in the runner's state, where no agent edits. A `CLAUDE_ENV_FILE` the runner inherited is
+        sourced after it, so the user's own script still runs and may still change PATH."""
+        path = env.get("PATH")
+        if not path:
+            return {}
+        lines = ["# written by agentflow: the runner's PATH, which a login shell may have reordered",
+                 f"export PATH={shlex.quote(path)}"]
+        own = env.get(SHELL_ENV_FILE_ENV)
+        if own:
+            quoted = shlex.quote(own)
+            lines.append(f"if [ -f {quoted} ]; then . {quoted}; fi")
+        script = call.transcript_path.with_name(call.transcript_path.name + ".env.sh")
+        safeio.write_text(script, "\n".join(lines) + "\n")
+        return {SHELL_ENV_FILE_ENV: str(script)}
 
 
 class CodexAgent(_CliAgent):
