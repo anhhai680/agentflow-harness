@@ -1029,6 +1029,29 @@ def test_a_blocked_backlog_card_gets_no_start_button_or_drag_handle():
     assert "draggable: canStart" in block and "if (canStart) buttons.push" in block and "if (canStart) dragFrom" in block
 
 
+def test_a_message_raised_while_the_dialog_is_open_shows_inside_it():
+    """`showModal()` puts the dialog in the top layer, above any z-index: a #toast there is hidden under it."""
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    markup = source[source.index('<dialog id="dlg">'):source.index("</dialog>")]
+    assert '<p id="dlg-msg" class="gate-bad" role="alert" hidden></p>' in markup
+    assert markup.index('id="dlg-msg"') < markup.index('class="dlg-buttons"')  # under the fields, above OK
+    css = source[:source.index("</style>")]
+    assert re.search(r"#dlg-msg\s*\{[^}]*overflow-wrap:\s*anywhere", css)
+    block = source[source.index("function toast(text)"):source.index("async function api(")]
+    assert 'if ($("dlg").open)' in block and '$("dlg-msg")' in block
+    assert "textContent = text" in block and "innerHTML" not in block
+
+
+def test_the_dialog_clears_its_message_and_floats_a_success_message_once_closed():
+    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    block = source[source.index("function dialog(title"):source.index("function rejectDialog")]
+    assert block.count("clearDialogMessage()") >= 2  # on open, and again before each OK
+    assert block.index("clearDialogMessage()") < block.index("dlg.showModal()")
+    ok = block[block.index('ok.addEventListener("click"'):block.index('cancel.addEventListener')]
+    assert "clearDialogMessage()" in ok
+    assert re.search(r"dlg\.close\(\);\s*if \(said\) toast\(said\)", ok)  # a success message floats after close
+
+
 # --------------------------------------------------------------------------- time and cost
 
 
