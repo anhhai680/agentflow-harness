@@ -27,7 +27,8 @@ USER_KEYS = (  # dotted patterns of the settings that are personal; `*` matches 
     "hitl.notify", "hitl.remind_after_h", "dashboard.port",
 )
 _WHOLE_ENTRIES = (("record_step",), ("resolve_step",))  # replaced whole, like each entry of `conditions`/`gates`
-_WHOLE_PARENTS = ("conditions", "gates")
+_WHOLE_PARENTS = ("conditions", "gates", "policy.obligations")  # dotted: each entry below one is replaced whole
+_WHOLE_PARENT_KEYS = tuple(tuple(dotted.split(".")) for dotted in _WHOLE_PARENTS)
 _PHASES_MESSAGE = "a phase's steps, and the set of phases, are changed by writing the whole workflow"
 _NOT_PERSONAL = "not a personal setting; set it in the pack"
 
@@ -109,7 +110,7 @@ def owns_workflow(data: dict) -> bool:
 
 
 def _is_whole(key: Key) -> bool:
-    return key in _WHOLE_ENTRIES or (len(key) == 2 and key[0] in _WHOLE_PARENTS)
+    return key in _WHOLE_ENTRIES or key[:-1] in _WHOLE_PARENT_KEYS
 
 
 def _drop_origins(origins: dict[Key, str], prefix: Key) -> None:

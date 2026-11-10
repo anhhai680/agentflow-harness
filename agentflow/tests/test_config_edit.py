@@ -212,6 +212,17 @@ def test_retro_step_is_protected(shipped):
             config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)
 
 
+def test_policy_is_protected(shipped):
+    assert "policy" in config_edit.PROTECTED
+    for key in (["policy", "enforce"], ["policy", "obligations", "reviewed"]):
+        with pytest.raises(Refused):  # the form has no field for it
+            form(shipped, (key, "block"))
+    _, sha = config_edit.read(shipped)
+    for added in ("policy: {enforce: block}\n", "policy: {obligations: {reviewed: null}}\n"):  # a page cannot relax or tighten the bar
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)
+
+
 def test_the_inherited_environment_settings_are_protected(shipped):
     _, sha = config_edit.read(shipped)
     old = '    POSTGRES_HOST_PORT: "55432"\n'
@@ -451,12 +462,12 @@ def test_form_shows_the_effective_value_its_layer_and_its_help(sparse_repo):
 def test_form_saves_a_phase_knob_into_a_sparse_pack(sparse_repo):
     path = _sparse(sparse_repo)
     before = load_config(path)
-    proposal = _sparse_form(path, (["phases", "plan", "needs_approval"], False))
+    proposal = _sparse_form(path, (["phases", "define", "needs_approval"], False))  # not `plan`: `plan_approved` needs it
     assert not proposal.errors, proposal.errors
     config_edit.save(path, proposal)
-    assert yaml.safe_load(path.read_text(encoding="utf-8"))["phases"] == {"plan": {"needs_approval": False}}
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["phases"] == {"define": {"needs_approval": False}}
     after = load_config(path)
-    assert after.phases["plan"].needs_approval is False
+    assert after.phases["define"].needs_approval is False
     assert list(after.phases) == list(before.phases)
     assert {n: p.steps for n, p in after.phases.items()} == {n: p.steps for n, p in before.phases.items()}
 

@@ -224,7 +224,8 @@ def nested(dotted: str, value="x") -> dict:
 
 
 @pytest.mark.parametrize("key", ["gates.x.run", "agents.claude.command", "guardrails.forbidden_paths",
-                                 "phases.build.needs_approval", "dashboard"])
+                                 "phases.build.needs_approval", "dashboard", "policy.enforce",
+                                 "policy.obligations.verified"])
 def test_the_user_layer_refuses_anything_not_personal(key):
     lower = {**pack_with_agents(), "dashboard": {"port": 1}}
     with pytest.raises(LayerError) as err:
@@ -418,3 +419,27 @@ def test_the_docs_only_gate_passes_on_an_unborn_repo_and_a_markdown_line_break(t
     git("commit", "-q", "-m", "broken")
     proc = _gate(tmp_path)
     assert proc.returncode != 0 and "conflict marker" in proc.stdout + proc.stderr
+
+
+def test_policy_obligations_merge_by_id():
+    engine = L("engine", {"policy": {"enforce": "report", "obligations": {
+        "a": {"lanes": ["feature"], "require": ["step:verify"]},
+        "b": {"lanes": ["bug"], "when": "security_path", "require": ["step:verify"]}}}})
+    pack = L("project", {"policy": {"obligations": {
+        "b": {"require": ["step:x"]},
+        "c": {"require": ["gates:verify"]}}}})
+    merged, origins = merge([engine, pack])
+    obligations = merged["policy"]["obligations"]
+    assert obligations["a"] == {"lanes": ["feature"], "require": ["step:verify"]}
+    assert obligations["b"] == {"require": ["step:x"]}  # whole: nothing left of the engine's `b`
+    assert obligations["c"] == {"require": ["gates:verify"]}
+    assert merged["policy"]["enforce"] == "report"
+    assert origins[("policy", "obligations", "a")] == "engine"
+    assert origins[("policy", "obligations", "b")] == "project"
+    assert origins[("policy", "enforce")] == "engine"
+
+
+def test_a_null_obligation_switches_a_default_off():
+    engine = L("engine", {"policy": {"obligations": {"a": {"require": ["step:verify"]}}}})
+    merged, _ = merge([engine, L("project", {"policy": {"obligations": {"a": None}}})])
+    assert merged["policy"]["obligations"] == {}

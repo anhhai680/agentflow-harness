@@ -363,6 +363,10 @@ phase_approval:                  # raised after a phase with needs_approval: tru
 checkpoints:                     # inner checkpoints, inside a phase
   idea_answers:       human      # always: product questions
 
+policy:                         # the engine's four obligations apply as they are; this pack adds one more
+  obligations:
+    eval_gated: {when: eval_required, require: ["step:eval_gate"]}
+
 memory:
   lessons_max_tokens: 0         # the suite pins prompts without the engine's seed lessons; lesson tests turn them on
 

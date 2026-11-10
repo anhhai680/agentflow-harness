@@ -79,6 +79,14 @@ issues:
   comment: true                                # also post one comment when a run starts from an issue
   epic_labels: ["epic"]                        # an issue with one of these gets `Refs #N`, never `Closes #N`
 
+policy:                        # what a finished run must show before it counts as conformant; a pack's own entries merge by id
+  enforce: report              # report | block (`block` stops `finish` with `conformance_failed` when an obligation is missing)
+  obligations:                 # `null` switches an entry off (the engine floor, `gates:verify`, cannot be switched off)
+    verified:       {lanes: [feature, bug], require: ["step:verify"]}
+    reviewed:       {lanes: [feature, bug], require: ["step:branch_review"]}
+    plan_approved:  {lanes: [feature], require: ["approval:plan"]}
+    red_then_green: {lanes: [bug], require: ["expect:red_then_green"]}
+
 hitl: {}
 
 dashboard:

@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from agentflow import pack
-from agentflow.config import ConfigError, Issue, load_config, validate
+from agentflow.config import ConfigError, Evidence, Issue, load_config, parse_evidence, validate
 from agentflow.flow import main, repo_root
 from conftest import PYTHON_CONFIG
 
@@ -654,14 +654,16 @@ FULL_PACKS = {"python": PYTHON_CONFIG, "node": PACKS / "node" / ".agentflow" / "
 # writes its whole workflow, so the engine's workflow never applies to it; only keys outside the workflow it left
 # unset can come from the engine defaults.
 _RETRO_STEP = "the engine's retro step: a retro is the engine's pipeline, so no pack needs to state it"
+_POLICY = "the engine's default obligations (verified, reviewed, ...) and the engine floor, which a pack states only to add to"
 INHERITED = {
-    "python": {"retro_step": _RETRO_STEP},
+    "python": {"retro_step": _RETRO_STEP, "policy": _POLICY},
     "node": {
+        "policy": _POLICY,
         "agents.codex": "the engine's codex agent, disabled: it runs no step unless the pack enables it",
         "agents.claude.prices": "the engine's price table: it prices only a session Claude reported no cost for",
         "retro_step": _RETRO_STEP,
     },
-    "this repo": {"retro_step": _RETRO_STEP},
+    "this repo": {"retro_step": _RETRO_STEP, "policy": _POLICY},
 }
 # The keys of `defaults`, `context`, `effort` and `recovery` that load_config requires (no code fallback). The engine
 # defaults hold the values the engine's minimum fixture pack (`node`) writes for them.
@@ -687,7 +689,8 @@ def _leaves(data, prefix=()):
         if value is None:
             continue  # a null deletes; it states no value
         if isinstance(value, dict) and value and here not in _WHOLE and not (
-                len(here) == 2 and here[0] in ("conditions", "gates")):
+                len(here) == 2 and here[0] in ("conditions", "gates")) and not (
+                len(here) == 3 and here[:2] == ("policy", "obligations")):
             yield from _leaves(value, here)
         else:
             yield here, value
@@ -1304,3 +1307,114 @@ def test_a_phase_named_retro_is_refused(tmp_cfg):
         data.setdefault("gates", {})["ok"] = {"run": "true"}
 
     assert ("error", "phases.retro") in errors(issues_for(tmp_cfg, patch))
+
+
+# ---- policy: obligations merged by id, the engine floor
+
+PACKS_NODE = Path(__file__).parent / "fixtures" / "packs" / "node" / ".agentflow" / "config.yaml"
+
+
+def _policy(patch_policy: dict):
+    def patch(data: dict) -> None:
+        data["policy"] = patch_policy
+
+    return patch
+
+
+def _drop_step(phase: str, step_id: str):
+    def patch(data: dict) -> None:
+        steps = data["phases"][phase]["steps"]
+        steps[:] = [s for s in steps if s["id"] != step_id]
+
+    return patch
+
+
+def test_policy_defaults_and_floor():
+    cfg = load_config(CFG)
+    assert cfg.policy.enforce == "report"
+    assert list(cfg.policy.obligations)[-1] == "engine_floor"
+    assert cfg.policy.obligations["engine_floor"].require == (Evidence("gates", "verify"),)
+    assert set(cfg.policy.obligations) >= {"verified", "reviewed", "plan_approved", "red_then_green"}
+    verified = cfg.policy.obligations["verified"]
+    assert verified.lanes == ("feature", "bug") and verified.require == (Evidence("step", "verify"),)
+    assert str(Evidence("step", "verify")) == "step:verify"
+
+
+def test_a_pack_cannot_remove_the_floor(tmp_cfg):
+    path = tmp_cfg(_policy({"obligations": {"engine_floor": None}}))
+    cfg = load_config(path)
+    assert list(cfg.policy.obligations)[-1] == "engine_floor"
+    found = [i for i in validate(cfg, path.parent.parent) if i.path == "policy.obligations.engine_floor"]
+    assert [i.level for i in found] == ["warning"] and "cannot be removed" in found[0].message
+
+
+def test_a_pack_cannot_replace_the_floor(tmp_cfg):
+    path = tmp_cfg(_policy({"obligations": {"engine_floor": {"require": ["step:verify"]}}}))
+    cfg = load_config(path)
+    assert cfg.policy.obligations["engine_floor"].require == (Evidence("gates", "verify"),)
+    assert [i for i in validate(cfg, path.parent.parent) if i.path == "policy.obligations.engine_floor"]
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("gates:verify", Evidence("gates", "verify")),
+    ("step:branch_review", Evidence("step", "branch_review")),
+    ("approval:plan", Evidence("approval", "plan")),
+    ("expect:red_then_green", Evidence("expect", "red_then_green")),
+    ("step:", None),
+    ("expect:green", None),
+    ("merge:x", None),
+    ("verify", None),
+])
+def test_parse_evidence(text, expected):
+    assert parse_evidence(text) == expected
+
+
+@pytest.mark.parametrize("patch, level, path, text", [
+    (_policy({"enforce": "strict"}), "error", "policy.enforce", "report"),
+    (_policy({"obligations": {"x": {"require": ["step:verify"], "when": "nope"}}}),
+     "error", "policy.obligations.x.when", "nope"),
+    (_policy({"obligations": {"x": {"require": ["step:verify"], "lanes": ["nope"]}}}),
+     "error", "policy.obligations.x.lanes", "nope"),
+    (_policy({"obligations": {"x": {"require": ["gates:nope"]}}}),
+     "error", "policy.obligations.x.require[0]", "nope"),
+    (_policy({"obligations": {"x": {"require": ["step:nope"]}}}),
+     "error", "policy.obligations.x.require[0]", "nope"),
+    (_policy({"obligations": {"x": {"require": ["approval:build"]}}}),
+     "error", "policy.obligations.x.require[0]", "needs_approval"),
+    (_policy({"obligations": {"x": {"require": ["merge:x"]}}}),
+     "error", "policy.obligations.x.require[0]", "merge:x"),
+    (_policy({"obligations": {"x": {"require": []}}}),
+     "error", "policy.obligations.x.require", "at least one"),
+    (_drop_step("review", "branch_review"), "error", "policy.obligations.reviewed.require[0]",
+     "set policy.obligations.reviewed: null"),
+    (_policy({"obligations": {"reviewed": None}}), "warning", "policy.obligations.reviewed", "reviewed"),
+])
+def test_validate_policy_rules(tmp_cfg, patch, level, path, text):
+    found = [i for i in issues_for(tmp_cfg, patch) if i.path == path]
+    assert found, path
+    assert found[0].level == level and text in found[0].message
+
+
+def test_a_default_naming_a_lane_the_pack_lacks_never_applies(tmp_cfg):
+    def patch(data: dict) -> None:
+        data["lanes"] = ["feature"]
+
+    issues = issues_for(tmp_cfg, patch)
+    assert not [i for i in issues if i.path.startswith("policy")]
+
+
+def test_conformance_failed_is_never_resolved(tmp_cfg):
+    found = errors(issues_for(tmp_cfg, {"autonomy": {"resolve_kinds": {"conformance_failed": 1}}}))
+    assert ("error", "autonomy.resolve_kinds.conformance_failed") in found
+
+
+def test_every_pack_validates_clean(repo_root):
+    for path, root in ((repo_root / ".agentflow" / "config.yaml", repo_root), (PYTHON_CONFIG, repo_root),
+                       (PACKS_NODE, PACKS_NODE.parent.parent)):
+        assert validate(load_config(path), root) == [], path
+
+
+def test_turning_off_plan_approval_breaks_the_default_that_needs_it(tmp_cfg):
+    found = [i for i in issues_for(tmp_cfg, {"phases": {"plan": {"needs_approval": False}}}) if i.level == "error"]
+    assert [i.path for i in found] == ["policy.obligations.plan_approved.require[0]"]
+    assert "set policy.obligations.plan_approved: null" in found[0].message
