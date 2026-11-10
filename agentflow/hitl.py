@@ -432,14 +432,17 @@ def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Confi
 
 
 def _conformance_way_on(run: Run, key: str, cfg: Config) -> str:
-    """For a `conformance_failed` stop: the `agentflow retry` that would bring each missing step's evidence (it
-    runs the step again and clears this stop, so `key` audits again), and the retry of `key` itself."""
-    from agentflow.conformance import retry_keys  # it imports this module
+    """For a `conformance_failed` stop: the `agentflow retry` that runs each missing step the run walked again (it
+    clears this stop, so `key` audits again); for a step this run never walked, that no retry can bring it; and
+    the retry of `key` itself, which audits again."""
+    from agentflow.conformance import missing_steps  # it imports this module
 
     checks = [e for e in run.events.read() if e["type"] == "conformance_checked" and e.get("key") == key]
-    steps = retry_keys(cfg, run.state.get("steps") or {}, checks[-1] if checks else None)
+    walked, never = missing_steps(run.state.get("steps") or {}, checks[-1] if checks else None)
     lines = ["Nothing was pushed."]
-    lines += [f"`agentflow retry {run.id} {step}` runs `{step}` again, then `{key}` audits again." for step in steps]
+    lines += [f"`agentflow retry {run.id} {step}` runs `{step}` again, then `{key}` audits again." for step in walked]
+    lines += [f"This run's lane never ran `{step}`, so no retry can bring its evidence: change the pack's `policy` "
+              f"(or the lane's steps), then `agentflow retry {run.id} {key}` audits again." for step in never]
     lines.append(f"Once the evidence is there some other way, `agentflow retry {run.id} {key}` audits again. "
                  "An approval does not waive an obligation: the audit runs again and stops again.")
     return "\n".join(lines)

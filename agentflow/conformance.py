@@ -21,6 +21,7 @@ from agentflow.autonomy import AUTO_BY, blocking_of
 from agentflow.conditions import Ctx
 from agentflow.config import CONFORMANCE_FAILED, Config, Evidence, Obligation
 from agentflow.gates import failure_report, gates_ok, record_results, run_gates
+from agentflow.gitops import GitError, dirty_paths, merge_in_progress
 from agentflow.guards import snapshot
 from agentflow.hitl import clean_fact, raise_hitl
 from agentflow.policy import applicable, phase_where, step_phase
@@ -197,14 +198,34 @@ def missing_gates(cfg: Config, findings: list[Finding]) -> list[str]:
 # --------------------------------------------------------------------------- the audit at finish
 
 
+def clean_tree(cfg: Config, run: Run, worktree: Path, key: str, *, resume_merge: bool = False) -> bool:
+    """True when `worktree` has no uncommitted change (tracked or untracked, not ignored); else a stop on `key`:
+    `dirty_tree`, or `blocked` when git cannot say. `resume_merge`: a merge left half done counts as clean, so a
+    stopped sync picks it up (`finish`'s first check, before the sync)."""
+    try:
+        dirty = [] if resume_merge and merge_in_progress(worktree) else dirty_paths(worktree)
+    except GitError as exc:
+        raise_hitl(cfg, run, "blocked", key, f"Could not read the state of {worktree}: {exc}")
+        return False
+    if dirty:
+        shown = ", ".join(dirty[:5]) + (f" and {len(dirty) - 5} more" if len(dirty) > 5 else "")
+        raise_hitl(cfg, run, "dirty_tree", key,
+                   f"{worktree} has uncommitted changes ({shown}); finish pushes committed work only.")
+        return False
+    return True
+
+
 def audit(cfg: Config, run: Run, worktree: Path, ctx: Ctx, key: str) -> bool:
     """Check the obligations against the tree `finish` is about to push; True: go on, False: stopped.
 
-    The worktree is clean here, so its snapshot is the pushed tree. Gates with no passing result on that tree run
-    now, once, and are recorded on `key`; a failure is the usual `gate_failed` stop there, and approving it runs
-    the audit again. Then `conformance_checked` is written. In `block` mode a missing obligation stops the run
-    with `conformance_failed` before anything is pushed; in `report` mode the run goes on and the pull request
-    shows the gap."""
+    It first checks again that the worktree holds nothing uncommitted (the sync and its gates ran since `finish`
+    last looked), so the snapshot it audits is what the push sends; anything left over is a `dirty_tree` stop.
+    Gates with no passing result on that snapshot run now, once, and are recorded on `key`; a failure is the usual
+    `gate_failed` stop there, and approving it runs the audit again. Then `conformance_checked` is written. In
+    `block` mode a missing obligation stops the run with `conformance_failed` before anything is pushed; in
+    `report` mode the run goes on and the pull request shows the gap."""
+    if not clean_tree(cfg, run, worktree, key):
+        return False
     tree = snapshot(worktree)
     lane = str(ctx.values.get("lane") or run.state.get("pipeline") or "")
     applying = [obligation for obligation, _ in applicable(cfg, ctx, lane)]
@@ -232,10 +253,12 @@ def audit(cfg: Config, run: Run, worktree: Path, ctx: Ctx, key: str) -> bool:
     return True
 
 
-def retry_keys(cfg: Config, steps: dict, event: dict | None) -> list[str]:
-    """The step keys whose run would bring the evidence a `conformance_checked` event found missing, each once:
-    the run's own key for the step when it walked it, else `<phase>/<id>`. Steps no phase holds are left out."""
-    keys: list[str] = []
+def missing_steps(steps: dict, event: dict | None) -> tuple[list[str], list[str]]:
+    """The `step:` evidence a `conformance_checked` event found missing, split in two, each entry once: the run's own
+    keys for the steps it walked (`agentflow retry` runs those again), and the ids of steps it never walked, which
+    a retry cannot run (`run_control.retry` refuses a key the run has no row for)."""
+    walked: list[str] = []
+    never: list[str] = []
     for finding in (event or {}).get("obligations") or []:
         if finding.get("status") != "missing":
             continue
@@ -243,12 +266,12 @@ def retry_keys(cfg: Config, steps: dict, event: dict | None) -> list[str]:
             kind, _, step_id = str(item).partition(":")
             if kind != "step":
                 continue
-            walked = [k for k in steps if str(k).split("/")[-1] == step_id]
-            phase = step_phase(cfg, step_id)
-            key = walked[-1] if walked else (f"{phase}/{step_id}" if phase else None)
-            if key and key not in keys:
-                keys.append(key)
-    return keys
+            keys = [k for k in steps if str(k).split("/")[-1] == step_id]
+            if keys and keys[-1] not in walked:
+                walked.append(keys[-1])
+            elif not keys and step_id not in never:
+                never.append(step_id)
+    return walked, never
 
 
 def render_section(event: dict | None, run_id: str) -> list[str]:

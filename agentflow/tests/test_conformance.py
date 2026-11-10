@@ -352,8 +352,10 @@ def test_block_mode_stops_before_the_push(flow_repo, gh, git):
     assert "have no evidence on the tree to be pushed" in raised["summary"] and "reviewed" in raised["summary"]
     assert last(flow_repo, run, "conformance_checked")["passed"] is False
     assert not pushed(git, flow_repo, run) and gh_calls(gh) == []
-    inbox = Path(raised["inbox"]).read_text(encoding="utf-8")
-    assert f"agentflow retry {run.id} {BRANCH_REVIEW}" in inbox
+    inbox = " ".join(Path(raised["inbox"]).read_text(encoding="utf-8").split())
+    assert f"agentflow retry {run.id} {BRANCH_REVIEW}" not in inbox  # this run never walked it: retry would refuse it
+    assert "never ran `branch_review`, so no retry can bring its evidence" in inbox
+    assert f"`agentflow retry {run.id} {FINISH}` audits again" in inbox
 
 
 def test_retry_after_conformance_stop_audits_again_and_pushes(flow_repo, gh, git):
@@ -382,7 +384,10 @@ def test_retrying_the_missing_step_runs_it_again_then_finish_audits_and_pushes(f
     other_evidence(run)
     approve(run, "review", by="me")
     assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
-    assert last(flow_repo, run, "hitl_raised")["kind"] == "conformance_failed" and not pushed(git, flow_repo, run)
+    raised = last(flow_repo, run, "hitl_raised")
+    assert raised["kind"] == "conformance_failed" and not pushed(git, flow_repo, run)
+    inbox = " ".join(Path(raised["inbox"]).read_text(encoding="utf-8").split())
+    assert f"`agentflow retry {run.id} {BRANCH_REVIEW}` runs `{BRANCH_REVIEW}` again" in inbox and "never ran" not in inbox
 
     assert retry(run, BRANCH_REVIEW, "me") == BRANCH_REVIEW
     assert run.state["waiting"] is None
@@ -393,6 +398,48 @@ def test_retrying_the_missing_step_runs_it_again_then_finish_audits_and_pushes(f
     checks = flow_repo.events(run, "conformance_checked")
     assert len(checks) == 2 and checks[-1]["passed"] is True
     assert pushed(git, flow_repo, run) and len(created(gh)) == 1
+
+
+def test_retrying_a_task_the_walk_does_not_visit_settles_the_phase_once(flow_repo, gh, git):
+    """A retried key under a step that is already done (a committed task) is never walked again: the approved phase
+    settles once more, then stays approved. It does not reopen on every advance."""
+    flow_repo.configure(SMALL)
+    flow_repo.script({BRANCH_REVIEW: [review()]})
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="review"))
+    assert advance(run, flow_repo.cfg, RunOptions()) == "awaiting_approval"
+    approve(run, "review", by="me")
+    task = "review/branch_review/task-1/implement"  # a key nested under a done step: `run_step` never reaches it
+    run.emit("step_started", key=task, phase="review")
+    run.emit("step_finished", key=task, status="done", summary="")
+    run.emit("pr_opened", url="https://github.com/acme/repo/pull/42", key=FINISH)  # finish already pushed
+    retry(run, task, "me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "awaiting_approval"  # walked and settled again, once
+    approve(run, "review", by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"  # no fresh approval asked: the retry is settled
+    review_approvals = [e for e in flow_repo.events(run, "phase_approved") if e["phase"] == "review"]
+    assert [e["by"] for e in review_approvals] == ["me", "me"]  # the first approval, and the one the retry asked
+    assert len([e for e in flow_repo.events(run, "handoff_written") if e["phase"] == "review"]) == 1
+    assert len([e for e in flow_repo.events(run, "phase_approval_raised") if e.get("phase") == "review"]) == 2
+    assert [c["step"] for c in flow_repo.calls()].count(BRANCH_REVIEW) == 1
+
+
+def test_a_file_left_after_the_first_dirty_check_stops_the_audit(flow_repo, gh, git, monkeypatch):
+    """Something between `finish`'s first check and the audit (the sync's merge gates) leaves a file: the audit
+    refuses to snapshot a tree the push would not send."""
+    from agentflow.sync_lane import SyncLane
+
+    def sync_leaving_a_file(self, phase, step, key):
+        (self.worktree / "leftover.txt").write_text("from a gate\n", encoding="utf-8")
+        return "done"
+
+    monkeypatch.setattr(SyncLane, "run_sync", sync_leaving_a_file)
+    run = begin_finish(flow_repo)
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    raised = last(flow_repo, run, "hitl_raised")
+    assert raised["kind"] == "dirty_tree" and raised["key"] == FINISH and "leftover.txt" in raised["summary"]
+    assert "finish pushes committed work only" in raised["summary"]
+    assert flow_repo.events(run, "conformance_checked") == []
+    assert not pushed(git, flow_repo, run) and gh_calls(gh) == []
 
 
 def test_resumed_finish_after_pr_opened_does_not_audit_again(flow_repo, gh, git):

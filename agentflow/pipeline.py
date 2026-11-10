@@ -337,7 +337,7 @@ class _Loop:
             if self.walk(phase, executor)[0] == "stopped":
                 return self.status()
             return self.settle(names, index, executor)
-        if row.get("status") == "approved" and not retried(state, name):
+        if row.get("status") == "approved" and not retried(run.events.read(), name):
             if not row.get("handoff"):
                 self.hand_off(names, index, executor)
             return None
@@ -413,14 +413,16 @@ class _Loop:
         self.run.emit("handoff_written", phase=name, path=str(path))
 
 
-def retried(state: dict, phase: str) -> bool:
-    """Whether a human retried a step of `phase` (`agentflow retry`) that has not settled again: an approved phase
-    is walked once more for it, then settled again, so the step's run is real evidence and a phase that needs a
-    human asks again."""
+def retried(events: list[dict], phase: str) -> bool:
+    """Whether a human retried a step of `phase` (`agentflow retry`) since the phase was last approved: an approved
+    phase is then walked once more and settled again, so the step's run is real evidence and a phase that needs a
+    human asks again. Event order decides it, never a step row: a retried key the walk does not visit (a task that
+    already committed) would otherwise keep the phase reopening. The new `phase_approved` ends it."""
     prefix = f"{phase}/"
-    return any(key.startswith(prefix) and row.get("retry_of") is not None
-               and row.get("status") not in ("done", "unchanged", "skipped")
-               for key, row in state["steps"].items())
+    retry = max((e["seq"] for e in events if e.get("type") == "step_retry" and str(e.get("key") or "").startswith(prefix)),
+                default=0)
+    approved = max((e["seq"] for e in events if e.get("type") == "phase_approved" and e.get("phase") == phase), default=0)
+    return retry > approved
 
 
 def refining(state: dict, phase: str) -> bool:

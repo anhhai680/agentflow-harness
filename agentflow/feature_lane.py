@@ -61,7 +61,7 @@ from agentflow.autonomy import AUTO_BY, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
 from agentflow.config import Config, Phase, Step, brief_files
-from agentflow.conformance import audit, render_section
+from agentflow.conformance import audit, clean_tree, render_section
 from agentflow.flow_control import current_refine, refine_note_block, refine_subject
 from agentflow.gates import gates_ok, record_results, run_gates
 from agentflow.gitops import (
@@ -71,8 +71,6 @@ from agentflow.gitops import (
     NothingToCommit,
     commit,
     create_draft_pr,
-    dirty_paths,
-    merge_in_progress,
     push,
 )
 from agentflow.guards import changed_paths, snapshot
@@ -760,15 +758,7 @@ class FeatureLane:
             raise_hitl(self.cfg, self.run, "blocked", key,
                        f"{branch} is the base branch: finish pushes a run's own branch, never the pull request's target.")
             return "stopped"
-        try:
-            dirty = [] if merge_in_progress(self.worktree) else dirty_paths(self.worktree)  # a half-done sync resumes
-        except GitError as exc:
-            raise_hitl(self.cfg, self.run, "blocked", key, f"Could not read the state of {self.worktree}: {exc}")
-            return "stopped"
-        if dirty:
-            shown = ", ".join(dirty[:5]) + (f" and {len(dirty) - 5} more" if len(dirty) > 5 else "")
-            raise_hitl(self.cfg, self.run, "dirty_tree", key,
-                       f"{self.worktree} has uncommitted changes ({shown}); finish pushes committed work only.")
+        if not clean_tree(self.cfg, self.run, self.worktree, key, resume_merge=True):  # a half-done sync resumes
             return "stopped"
         if self.run_sync(phase, step, key) != "done":
             return "stopped"
