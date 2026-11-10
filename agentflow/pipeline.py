@@ -64,6 +64,7 @@ from agentflow.gitops import (
     diff_stat,
     head,
 )
+from agentflow.guards import snapshot
 from agentflow.hitl import notify_run, open_refine
 from agentflow.intake import gather, save
 from agentflow.issue_status import mark, release
@@ -386,8 +387,9 @@ class _Loop:
             raise_phase_approval(self.cfg, self.run, name)
             return "awaiting_approval"
         findings = phase_findings(self.cfg, self.run, name)
+        tree = snapshot(self.worktree) if findings else ""
         for key in dict.fromkeys(f["key"] for f in findings):  # for the pull request: this round's, kept per step
-            self.run.emit("step_findings", key=key, findings=[f for f in findings if f["key"] == key])
+            self.run.emit("step_findings", key=key, findings=[f for f in findings if f["key"] == key], tree=tree)
         blocking = blocking_of(self.cfg, findings)
         if not blocking:
             self.run.emit("phase_approved", by=AUTO_BY, phase=name, sha=head(self.worktree))

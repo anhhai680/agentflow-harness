@@ -678,3 +678,14 @@ def test_the_doubt_offer_is_on_the_plan_page_and_build_does_not_stop(flow_repo):
     approve(run, "plan", by="me")
     assert go(flow_repo, run) == "done"
     assert not [e for e in flow_repo.events(run, "hitl_raised") if e["kind"] == "checkpoint"]
+
+
+def test_a_bug_run_stamps_every_evidence_event_with_its_tree(auto):
+    auto.script({RED: [GOOD_TEST], "build/fix": [FIXED], "review/branch_review": [done("ổn", findings=[MINOR])]})
+    run = begin_bug(auto)
+    assert go(auto, run) == "done"
+    events = run.events.read()
+    for kind in ("gate_result", "expectation_checked", "step_findings"):
+        stamped = [e for e in events if e["type"] == kind]
+        assert stamped, f"the run wrote no {kind}"
+        assert all(e.get("tree") for e in stamped), kind

@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from agentflow.config import Config, Phase, Step
-from agentflow.gates import GateResult, gates_ok, run_gates
+from agentflow.gates import GateResult, gates_ok, record_results, run_gates
 from agentflow.gitops import (
     CommitRejected,
     GhError,
@@ -44,7 +44,7 @@ from agentflow.gitops import (
     push,
     unmerged_paths,
 )
-from agentflow.guards import path_matches
+from agentflow.guards import path_matches, snapshot
 from agentflow.hitl import ResultError, raise_hitl, read_result
 
 if TYPE_CHECKING:
@@ -205,15 +205,13 @@ class SyncLane:
 
     def _run_merge_gates(self, key: str, names: list[str], with_eval: bool) -> list[GateResult]:
         results: list[GateResult] = []
+        tree = snapshot(self.worktree)
         if names:
             results += run_gates(self.cfg, names if len(names) > 1 else names[0], self.worktree,
                                  self.run.gate_log_dir(key))
         if with_eval:
             results += run_gates(self.cfg, ["eval"], self.worktree, self.run.gate_log_dir(key))
-        for r in results:
-            self.run.emit("gate_result", key=key, gate=r.name, passed=r.passed, skipped=r.skipped, reason=r.reason,
-                          log=str(r.log_path) if r.log_path else None,
-                          duration_s=r.duration_s)
+        record_results(self.run, key, results, tree)
         return results
 
     def _merge_gates_line(self, key: str) -> str:

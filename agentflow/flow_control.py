@@ -34,7 +34,7 @@ from agentflow import sources
 from agentflow.conditions import Ctx, evaluate, fmt, paths_read
 from agentflow.commit_checks import runner_head
 from agentflow.config import Config, Phase, Step, for_lane
-from agentflow.gates import GateResult, gates_ok, resolve, run_gates, summarize
+from agentflow.gates import GateResult, gates_ok, record_results, resolve, run_gates, summarize
 from agentflow.guards import snapshot
 from agentflow.gitops import CommitRejected, NothingToCommit, commit
 from agentflow.hitl import (
@@ -394,7 +394,7 @@ class StepControl:
         session in its fix loop. The tree is recorded so the gates are not run again on it afterwards."""
         tree = snapshot(self.worktree)
         results = run_gates(self.cfg, step.gates or [], self.worktree, self.run.gate_log_dir(key))
-        self._emit_gates(key, results)
+        record_results(self.run, key, results, tree)
         failed = [r for r in results if not (r.passed or r.skipped)]
         self.run.emit("gates_prerun", key=key, tree=tree, passed=not failed)
         return gate_evidence(results, tree), failed or None
@@ -499,18 +499,13 @@ class StepControl:
 
     # ------------------------------------------------------------------ gates and commits
 
-    def _emit_gates(self, key: str, results: list[GateResult]) -> None:
-        for r in results:
-            self.run.emit("gate_result", key=key, gate=r.name, passed=r.passed, skipped=r.skipped,
-                          reason=r.reason, log=str(r.log_path) if r.log_path else None,
-                          duration_s=r.duration_s)
-
     def _run_gate_step(self, phase: Phase, step: Step, key: str) -> Outcome:
         """Run the step's gates; a failure stops for a human, and approving runs them again."""
         if self.run.state["waiting"] is not None:
             return "stopped"
+        tree = snapshot(self.worktree)
         results = run_gates(self.cfg, step.gates or [], self.worktree, self.run.gate_log_dir(key))
-        self._emit_gates(key, results)
+        record_results(self.run, key, results, tree)
         if gates_ok(results):
             self.run.emit("step_finished", key=key, status="done", summary=summarize(results))
             return "done"

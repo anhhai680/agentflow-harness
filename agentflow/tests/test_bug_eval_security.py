@@ -506,3 +506,28 @@ def test_tracked_settings_edit_in_the_main_checkout_is_a_guard_violation(flow_re
     stop = raised(flow_repo, run)
     assert stop["kind"] == "guard_violation" and ".claude/settings.json" in stop["summary"]
     assert not (flow_repo.root / "marker").exists() and not flow_repo.events(run, "expectation_checked")
+
+
+EVIDENCE_TYPES = ("gate_result", "review_result", "step_findings", "expectation_checked")
+
+
+def test_every_evidence_event_of_a_finished_run_has_a_tree(flow_repo, git, tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", f"{BIN}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(tmp_path / "gh.jsonl"))
+    gate = {"run": "grep -q good src/state.txt || { echo 'recall dropped'; exit 1; }", "when_exists": None}
+    flow_repo.configure({"gates": {"floor": {"run": "true"}, "eval": gate}})
+    flow_repo.script({
+        "build/change": [{"write": {"toy/agent/policy.py": "THRESHOLD = 0.6\n"}, **done("raised it")}],
+        EVAL: [{"write": {"src/state.txt": "good\n"}, **done("restored recall")}],
+    })
+    from agentflow.pipeline import advance
+
+    run = start(flow_repo.cfg, flow_repo.root, "eval", {"task": "Nâng ngưỡng"}, RunOptions())
+    for phase in ("build", "verify", "review"):
+        assert advance(run, flow_repo.cfg, RunOptions()) == "awaiting_approval"
+        approve(run, phase, by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+
+    evidence = [e for e in run.events.read() if e["type"] in EVIDENCE_TYPES]
+    assert {e["type"] for e in evidence} >= {"gate_result"}
+    assert all(e.get("tree") for e in evidence), [e for e in evidence if not e.get("tree")]

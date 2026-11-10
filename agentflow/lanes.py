@@ -45,7 +45,7 @@ from agentflow.flow_control import (
     refine_subject,
     writes_questions,
 )
-from agentflow.gates import GateResult, agent_checks, gates_ok, run_doc_checks, run_gates
+from agentflow.gates import GateResult, agent_checks, gates_ok, record_results, run_doc_checks, run_gates
 from agentflow.gitops import CommitRejected, GitError, NothingToCommit, changed_since, commit, commits_between, head
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, notify_run, park_hitl, raise_hitl, read_result
@@ -842,6 +842,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         A `gates_first` step whose gates passed before the session, on the tree it still has, does not run
         them again: those results are the evidence it was given."""
         results: list[GateResult] = []
+        tree = snapshot(self.worktree)
         if sr.step.gates and self._prerun_still_holds(sr):
             self.run.emit("gates_reused", key=sr.key)
         elif sr.step.gates:
@@ -849,10 +850,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         if sr.step.checks:
             docs = self.cfg.project.docs
             results += run_doc_checks(sr.step.checks, self.worktree, sr.start_head, docs["idea"], docs["decisions"])
-        for r in results:
-            self.run.emit("gate_result", key=sr.key, gate=r.name, passed=r.passed, skipped=r.skipped,
-                          reason=r.reason, log=str(r.log_path) if r.log_path else None,
-                          duration_s=r.duration_s, tail="" if (r.passed or r.skipped) else r.tail)
+        record_results(self.run, sr.key, results, tree, with_tail=True)
         return [] if gates_ok(results) else [r for r in results if not (r.passed or r.skipped)]
 
     def _prerun_still_holds(self, sr: _StepRun) -> bool:

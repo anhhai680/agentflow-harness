@@ -149,3 +149,28 @@ def test_an_explicit_env_base_still_wins_over_the_default(tmp_git, tmp_path, mon
     monkeypatch.setenv("LEAKED_URL", "leak-sentinel-7f3a")
     (g,) = run_gates(cfg_with({"show": "env"}), ["show"], tmp_git, tmp_path / "logs", env_base={"PATH": os.environ["PATH"]})
     assert "LEAKED_URL" not in g.log_path.read_text()
+
+
+def test_record_results_writes_tree_and_a_tail_only_when_asked(tmp_path):
+    from agentflow.gates import record_results
+
+    class FakeRun:
+        def __init__(self):
+            self.events = []
+
+        def emit(self, type, **data):
+            self.events.append({"type": type, **data})
+
+    ok = GateResult("ok", True, False, "", None, "")
+    bad = GateResult("bad", False, False, "exit 3", tmp_path / "bad.log", "boom")
+
+    plain, tailed = FakeRun(), FakeRun()
+    record_results(plain, "verify/verify", [ok, bad], "t1")
+    record_results(tailed, "verify/verify", [ok, bad], "t1", with_tail=True)
+
+    assert [e["type"] for e in plain.events] == ["gate_result", "gate_result"]
+    assert [e["tree"] for e in plain.events + tailed.events] == ["t1"] * 4
+    assert all("tail" not in e for e in plain.events)
+    assert tailed.events[0]["tail"] == "" and tailed.events[1]["tail"] == "boom"
+    assert tailed.events[1]["gate"] == "bad" and tailed.events[1]["passed"] is False
+    assert tailed.events[1]["log"] == str(tmp_path / "bad.log")

@@ -1038,3 +1038,11 @@ def test_only_a_batch_continuation_is_marked_as_one(batched, monkeypatch):
     assert build(batched, run) == ("done", True)
     flags = [continuation for step_id, continuation in seen if step_id == "build"]
     assert flags == [False, True, True]  # the first member's prompt carries the skill; the later ones' sessions have it
+
+
+def test_task_reviews_carry_the_tree(lane):
+    run = begin_build(lane, plan_text())
+    assert build(lane, run) == ("done", True)
+    reviews = lane.events(run, "review_result")
+    assert len(reviews) == 2
+    assert all(e.get("tree") for e in reviews)

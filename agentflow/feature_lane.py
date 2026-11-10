@@ -62,7 +62,7 @@ from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
 from agentflow.config import Config, Phase, Step, brief_files
 from agentflow.flow_control import current_refine, refine_note_block, refine_subject
-from agentflow.gates import gates_ok, run_gates
+from agentflow.gates import gates_ok, record_results, run_gates
 from agentflow.gitops import (
     CommitRejected,
     GhError,
@@ -526,7 +526,7 @@ class FeatureLane:
             return None
         blocking = blocking_of(self.cfg, findings)
         self.run.emit("review_result", key=key, round=round_, findings=findings, blocking=len(blocking),
-                      blocking_findings=blocking)
+                      blocking_findings=blocking, tree=snapshot(self.worktree))
         return blocking
 
     def _reviewer_started_since(self, key: str, result: dict) -> bool:
@@ -627,10 +627,7 @@ class FeatureLane:
         if finished and finished[-1].get("tree") == tree:
             return True
         results = run_gates(self.cfg, gates, self.worktree, self.run.gate_log_dir(commit_key))
-        for r in results:
-            self.run.emit("gate_result", key=commit_key, gate=r.name, passed=r.passed, skipped=r.skipped,
-                          reason=r.reason, log=str(r.log_path) if r.log_path else None,
-                          duration_s=r.duration_s)
+        record_results(self.run, commit_key, results, tree)
         if gates_ok(results):
             return True
         failed = [r for r in results if not (r.passed or r.skipped)]
