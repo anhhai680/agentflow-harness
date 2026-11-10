@@ -462,12 +462,12 @@ def test_form_shows_the_effective_value_its_layer_and_its_help(sparse_repo):
 def test_form_saves_a_phase_knob_into_a_sparse_pack(sparse_repo):
     path = _sparse(sparse_repo)
     before = load_config(path)
-    proposal = _sparse_form(path, (["phases", "define", "needs_approval"], False))  # not `plan`: `plan_approved` needs it
+    proposal = _sparse_form(path, (["phases", "plan", "needs_approval"], False))
     assert not proposal.errors, proposal.errors
     config_edit.save(path, proposal)
-    assert yaml.safe_load(path.read_text(encoding="utf-8"))["phases"] == {"define": {"needs_approval": False}}
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["phases"] == {"plan": {"needs_approval": False}}
     after = load_config(path)
-    assert after.phases["define"].needs_approval is False
+    assert after.phases["plan"].needs_approval is False
     assert list(after.phases) == list(before.phases)
     assert {n: p.steps for n, p in after.phases.items()} == {n: p.steps for n, p in before.phases.items()}
 

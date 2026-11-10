@@ -1414,7 +1414,27 @@ def test_every_pack_validates_clean(repo_root):
         assert validate(load_config(path), root) == [], path
 
 
-def test_turning_off_plan_approval_breaks_the_default_that_needs_it(tmp_cfg):
-    found = [i for i in issues_for(tmp_cfg, {"phases": {"plan": {"needs_approval": False}}}) if i.level == "error"]
-    assert [i.path for i in found] == ["policy.obligations.plan_approved.require[0]"]
+def test_turning_off_plan_approval_only_warns_for_the_default_that_needs_it(tmp_cfg):
+    found = [i for i in issues_for(tmp_cfg, {"phases": {"plan": {"needs_approval": False}}})
+             if i.path.startswith("policy")]
+    assert [(i.level, i.path) for i in found] == [("warning", "policy.obligations.plan_approved.require[0]")]
     assert "set policy.obligations.plan_approved: null" in found[0].message
+
+
+@pytest.mark.parametrize("patch", [{"policy": None}, {"policy": {"obligations": None}}])
+def test_a_null_policy_or_obligations_reports_every_default_it_switches_off(tmp_cfg, patch):
+    def apply(data: dict) -> None:
+        data.update(patch)
+
+    path = tmp_cfg(apply)
+    cfg = load_config(path)
+    assert list(cfg.policy.obligations) == ["engine_floor"]
+    assert cfg.policy.disabled == ("verified", "reviewed", "plan_approved", "red_then_green")
+    found = {i.path: i for i in validate(cfg, path.parent.parent) if i.level == "warning"}
+    for key in cfg.policy.disabled:
+        assert key in found[f"policy.obligations.{key}"].message
+
+
+def test_a_policy_that_is_not_a_mapping_is_a_config_error_not_a_crash(tmp_cfg):
+    with pytest.raises(ConfigError, match="policy"):
+        load_config(tmp_cfg(lambda data: data.update({"policy": 5})))

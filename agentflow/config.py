@@ -333,7 +333,7 @@ class Obligation:
 class Policy:
     enforce: str = "report"  # report | block
     obligations: dict[str, Obligation] = field(default_factory=dict)  # the floor is always last
-    disabled: tuple[str, ...] = ()  # ids the pack set to `null` (the layers merge drops them), for `validate` to report
+    disabled: tuple[str, ...] = ()  # engine default ids a layer switched off (and the floor, if nulled), for `validate`
 
 
 @dataclass
@@ -873,23 +873,30 @@ def load_config(path: Path, *, layered: bool = True, user: bool = True) -> Confi
     else:
         merged, origins = copy.deepcopy(project), {key: "project" for key in layers.leaf_keys(project)}
     try:
-        cfg = _build(merged, origins, path)
-        cfg.policy.disabled = _nulled_obligations(project)
-        return cfg
+        return _build(merged, origins, path, _switched_off(project, merged) if layered else ())
     except ConfigError as exc:
         if user_path is not None and exc.path and layers.origin_of(origins, exc.path) == "user":
             raise ConfigError(f"{user_path}: {exc.path}", exc.message) from exc
         raise
 
 
-def _nulled_obligations(project: dict) -> tuple[str, ...]:
-    """The obligation ids the pack file sets to `null`: the layers merge drops a null, so `validate` is told here."""
-    policy = project.get("policy")
-    entries = policy.get("obligations") if isinstance(policy, dict) else None
-    return tuple(str(key) for key, value in entries.items() if value is None) if isinstance(entries, dict) else ()
+def _switched_off(project: dict, merged: dict) -> tuple[str, ...]:
+    """The obligation ids a layer switched off, for `validate` to report (the merge drops a `null`, and a `null`
+    `policy` or `obligations` drops them all): each engine default missing from the merged obligations, then the
+    floor when the pack file sets it to `null`."""
+    def entries(data: Any) -> dict:
+        policy = data.get("policy") if isinstance(data, dict) else None
+        found = policy.get("obligations") if isinstance(policy, dict) else None
+        return found if isinstance(found, dict) else {}
+
+    engine, kept = entries(layers.base_layers(project.get("starter"))[0].data), entries(merged)
+    ids = [key for key in engine if key != FLOOR_ID and key not in kept]
+    if FLOOR_ID in entries(project) and entries(project)[FLOOR_ID] is None:
+        ids.append(FLOOR_ID)
+    return tuple(ids)
 
 
-def _build_policy(policy: dict) -> Policy:
+def _build_policy(policy: dict, disabled: tuple[str, ...]) -> Policy:
     """The obligations, in layer order, then the engine floor, whatever the layers say. An evidence item that does
     not parse is left out here and reported by `validate`, which reads the text."""
     entries = _optional(policy, "obligations", "policy", dict, {})
@@ -910,10 +917,10 @@ def _build_policy(policy: dict) -> Policy:
             lanes=tuple(_string_list(entry.get("lanes", []), f"{path}.lanes")),
         )
     out[FLOOR_ID] = Obligation(FLOOR_ID, (Evidence("gates", "verify"),))
-    return Policy(enforce=_optional(policy, "enforce", "policy", str, "report"), obligations=out)
+    return Policy(enforce=_optional(policy, "enforce", "policy", str, "report"), obligations=out, disabled=disabled)
 
 
-def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
+def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, ...] = ()) -> Config:
     origins: dict[str, str] = {}
     raw = _resolve(merged, "", merged, (), origins)
 
@@ -1014,7 +1021,7 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
         skills_map=_skills_map(raw),
         merged=merged,
         layer_origins=layer_origins,
-        policy=_build_policy(policy),
+        policy=_build_policy(policy, disabled),
     )
 
 
@@ -1684,7 +1691,10 @@ class _Validator:
                 elif evidence.kind == "approval":
                     phase = cfg.phases.get(evidence.arg)
                     if phase is None or not phase.needs_approval:
-                        self.error(at, f"'{evidence.arg}' is not a phase with needs_approval: true{off}")
+                        # an engine default only warns: Settings can turn a phase's approval off, and the pack can then
+                        # switch the obligation off in the file; a pack-written one is an error
+                        self.add("warning" if engine else "error", at,
+                                 f"'{evidence.arg}' is not a phase with needs_approval: true{off}")
 
     def lessons(self) -> None:
         """The pack's lessons file (beside the config): each malformed entry, unknown phase and unknown target is
