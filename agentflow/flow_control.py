@@ -127,6 +127,7 @@ class StepControl:
     ctx: Ctx
     dry_run: bool
     out: TextIO
+    last_decided_by: str = "runner"  # who settled the last `decide`: runner, agent or human
 
     # ------------------------------------------------------------------ walking steps
 
@@ -271,7 +272,10 @@ class StepControl:
         return fmt(str(step.output), self.ctx) in paths_read(self.cfg, failed, self.ctx)
 
     def decide(self, phase: Phase, cond: Any, cond_key: str) -> tuple[bool | None, str]:
-        """Evaluate `cond`; when it is unknown, follow its `on_unknown`. `(None, reason)` = stopped."""
+        """Evaluate `cond`; when it is unknown, follow its `on_unknown`. `(None, reason)` = stopped.
+
+        `last_decided_by` then says who decided it: `runner` (the files and git said), `agent` or `human`."""
+        self.last_decided_by = "runner"
         result = evaluate(self.cfg, cond, self.ctx)
         if result.value is not None:
             return result.value, result.reason
@@ -282,6 +286,7 @@ class StepControl:
                 return None, result.reason
             if isinstance(value, bool):
                 self._log_decision(cond_key, label, value, "agent", why)
+                self.last_decided_by = "agent"
                 return value, f"{result.reason}; an agent said {_word(value)}: {why}"
         return self._ask_human(cond_key, label, result.reason)
 
@@ -306,6 +311,7 @@ class StepControl:
             value = _yes_no(text)
             if value is not None:
                 self._log_decision(cond_key, label, value, "human", text)
+                self.last_decided_by = "human"
                 return value, f"{reason}; a human said {_word(value)}"
         if self._waiting_on(cond_key):
             return None, reason

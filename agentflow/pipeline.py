@@ -353,7 +353,7 @@ class _Loop:
                 if skip is None:
                     return self.status()
                 if skip:
-                    run.emit("phase_skipped", phase=name, reason=reason, via="skip_if")
+                    run.emit("phase_skipped", phase=name, reason=reason, via="skip_if", decided_by=executor.last_decided_by)
                     return None
             run.emit("phase_started", phase=name, start_sha=head(self.worktree))
         outcome, ran = self.walk(phase, executor)

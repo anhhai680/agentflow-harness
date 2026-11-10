@@ -1152,6 +1152,19 @@ def test_metrics_view_has_a_scorecard_section(dash):
     assert 'id="scorecard"' in metrics
 
 
+def test_the_scorecard_compares_with_runs_after_the_baseline_unless_the_range_is_custom(dash):
+    page = dash.get("/", token=None)[2].decode("utf-8")
+    scorecard = page[page.index('id="scorecard"'):]
+    assert scorecard.index("Scorecard</h2>") < scorecard.index('<p id="sc-range" class="muted"></p>') < scorecard.index('id="sc-body"')
+    query = page[page.index("function scorecardQuery()"):page.index("async function loadScorecard()")]
+    assert 'metricsUi.range === "custom"' in query and "metricsQuery" not in query
+    assert query.count('params.set("from"') == 1 and "custom && metricsUi.from" in query
+    assert '"Runs after the baseline"' in query and '"Runs that ended "' in query
+    assert '$("sc-range").textContent' in query and "innerHTML" not in query
+    load = page[page.index("async function loadScorecard()"):]
+    assert load[:400].count("scorecardQuery()") == 1 and "metricsQuery()" not in load[:400]
+
+
 def test_old_runs_stay_in_metrics_and_on_the_board(flow_repo):
     from datetime import UTC, timedelta
 

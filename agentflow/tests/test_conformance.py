@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from test_feature_lane import SMALL, begin_finish, created, gh, gh_calls, review  # noqa: F401  (`gh` is a fixture)
 
 from agentflow.conditions import Ctx
@@ -149,6 +151,15 @@ def test_all_steps_skipped_is_not_approval(cfg):
     assert evaluate(cfg, events, [planned], "t")[0].status == "missing"
 
 
+def test_a_skip_if_an_agent_decided_is_not_on_base(cfg):
+    planned = ob("plan_approved", "approval:plan")
+    agent = [ev(2, "phase_skipped", phase="plan", reason="r", via="skip_if", decided_by="agent")]
+    assert evaluate(cfg, agent, [planned], "t")[0].status == "missing"
+    for by in ("runner", "human"):
+        decided = [ev(2, "phase_skipped", phase="plan", reason="r", via="skip_if", decided_by=by)]
+        assert evaluate(cfg, decided, [planned], "t")[0].status == "satisfied"
+
+
 def test_skip_if_skip_without_via_is_not_on_base(cfg):
     planned = ob("plan_approved", "approval:plan")  # an older log: the skip has a reason but no `via`
     events = [ev(2, "phase_skipped", phase="plan", reason="plan exists on origin/main")]
@@ -186,12 +197,77 @@ def test_red_then_green(cfg):
     finding = evaluate(cfg, [red, fix, green], [rtg], "t")[0]
     assert finding.status == "satisfied" and finding.evidence == [3, 8]
     assert evaluate(cfg, [green], [rtg], "t")[0].status == "missing"
-    late_commit = ev(9, "step_committed", key="build/fix", sha="y")
+    late_commit = ev(9, "step_committed", key="build/other", sha="y")
     assert evaluate(cfg, [red, fix, green, late_commit], [rtg], "t")[0].status == "missing"
+    own_commit = ev(9, "step_committed", key="build/fix", sha="y")  # `build/fix` commits after its own green check
+    assert evaluate(cfg, [red, fix, green, own_commit], [rtg], "t")[0].status == "satisfied"
     failed_green = {**green, "ok": False}
     assert evaluate(cfg, [red, fix, failed_green], [rtg], "t")[0].status == "missing"
     green_before_red = {**green, "seq": 2}
     assert evaluate(cfg, [green_before_red, red], [rtg], "t")[0].status == "missing"
+
+
+def test_a_steps_own_commit_never_makes_its_evidence_stale(cfg):
+    verified = ob("verified", "step:verify")
+    own = [ev(5, "step_committed", key="verify/verify", sha="a"), finished(6, "verify/verify"),
+           ev(7, "step_committed", key="verify/verify", sha="b")]
+    assert evaluate(cfg, own, [verified], "t")[0].status == "satisfied"
+    other = own + [ev(8, "step_committed", key="build/other", sha="c")]
+    assert evaluate(cfg, other, [verified], "t")[0].status == "missing"
+
+
+def verify_gates(seq: int, cfg, key: str, **over) -> list[dict]:
+    fields = {"passed": True, "skipped": False, "reason": "", "tree": "x", **over}
+    return [ev(seq + i, "gate_result", key=key, gate=g, **fields) for i, g in enumerate(cfg.gate_sets["verify"])]
+
+
+def test_a_fix_that_ran_the_verify_gates_keeps_earlier_evidence(cfg):
+    """A refine-round fix (`review/fix_findings`) that ran the whole verify gate set under its own key: the earlier
+    verify step and red/green check still count, as they do in today's bar."""
+    obligations = [ob("verified", "step:verify"), ob("red_then_green", "expect:red_then_green")]
+    key = "review/fix_findings"
+    base = [ev(2, "expectation_checked", key="build/regression_test", expect="red", ok=True),
+            ev(3, "expectation_checked", key="build/fix", expect="green", ok=True), finished(4, "verify/verify")]
+    covered = base + verify_gates(10, cfg, key) + [ev(20, "step_committed", key=key, sha="f")]
+    assert [f.status for f in evaluate(cfg, covered, obligations, "t")] == ["satisfied", "satisfied"]
+    skipped = base + verify_gates(10, cfg, key, skipped=True, passed=False) + [ev(20, "step_committed", key=key, sha="f")]
+    assert [f.status for f in evaluate(cfg, skipped, obligations, "t")] == ["satisfied", "satisfied"]
+
+
+def test_a_commit_without_the_verify_gates_still_makes_evidence_stale(cfg):
+    obligations = [ob("verified", "step:verify"), ob("red_then_green", "expect:red_then_green")]
+    key = "review/fix_findings"
+    base = [ev(2, "expectation_checked", key="build/regression_test", expect="red", ok=True),
+            ev(3, "expectation_checked", key="build/fix", expect="green", ok=True), finished(4, "verify/verify")]
+    commit = [ev(20, "step_committed", key=key, sha="f")]
+    assert [f.status for f in evaluate(cfg, base + commit, obligations, "t")] == ["missing", "missing"]
+    other_key = verify_gates(10, cfg, "verify/verify")  # the gates ran, but not on this commit's step
+    assert [f.status for f in evaluate(cfg, base + other_key + commit, obligations, "t")] == ["missing", "missing"]
+    gates = verify_gates(10, cfg, key)
+    failed_last = gates + [{**gates[0], "seq": 15, "passed": False}]  # the last result of one gate failed
+    assert [f.status for f in evaluate(cfg, base + failed_last + commit, obligations, "t")] == ["missing", "missing"]
+    if len(cfg.gate_sets["verify"]) > 1:
+        partial = gates[:1]
+        assert evaluate(cfg, base + partial + commit, obligations, "t")[0].status == "missing"
+    conflicted = base + verify_gates(10, cfg, "ship/finish") + [ev(20, "base_synced", key="ship/finish", conflicts=["a"])]
+    assert [f.status for f in evaluate(cfg, conflicted, obligations, "t")] == ["missing", "missing"]
+
+
+def test_an_unrecognised_item_and_an_empty_require_are_missing(cfg):
+    from agentflow.config import UNRECOGNISED
+
+    typo = Obligation("typo", (UNRECOGNISED,))
+    empty = Obligation("empty", ())
+    events = [finished(2, "verify/verify")]
+    found = evaluate(cfg, events, [typo, empty], "t")
+    assert [(f.status, f.note) for f in found] == [("missing", "unrecognised evidence item"), ("missing", "no evidence items")]
+
+
+def test_an_unparseable_item_loads_as_unrecognised(tmp_cfg):
+    from agentflow.config import UNRECOGNISED, load_config
+
+    cfg = load_config(tmp_cfg({"policy": {"obligations": {"typo": {"require": ["stepp:verify", "step:verify"]}}}}))
+    assert cfg.policy.obligations["typo"].require == (UNRECOGNISED, Evidence("step", "verify"))
 
 
 # --------------------------------------------------------------------------- waived
@@ -505,3 +581,173 @@ def test_dry_run_lists_the_obligations_at_finish(flow_repo, capsys):
     assert "    obligation engine_floor: gates:verify (always)" in out
     assert "obligation reviewed: step:branch_review (always)" in out
     assert "red_then_green" not in out  # a bug-lane obligation
+
+
+# --------------------------------------------------------------------------- who decided a skip_if
+
+
+def skip_plan(flow_repo, git, condition: dict, script: dict | None = None):
+    """A run that starts at `plan`, whose `skip_if` is `condition`, on a `next` that holds a spec with no status line."""
+    flow_repo.configure({"phases": {"plan": {"skip_if": "plan_on_base"}}, "conditions": {"plan_on_base": condition}})
+    git(flow_repo.root, "checkout", "-q", "next")
+    spec = flow_repo.root / "docs" / "specs" / "SPEC-crm.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text("# Spec: `crm`\n\nNo status line here.\n", encoding="utf-8")
+    git(flow_repo.root, "add", "-A")
+    git(flow_repo.root, "commit", "-q", "-m", "spec")
+    git(flow_repo.root, "checkout", "-q", "main")
+    if script:
+        flow_repo.script(script)
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, RunOptions(from_phase="plan", to_phase="plan"))
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    (skipped,) = flow_repo.events(run, "phase_skipped")
+    assert skipped["phase"] == "plan" and skipped["via"] == "skip_if"
+    return run, skipped
+
+
+def test_a_skip_if_the_runner_decided_records_it_and_counts_as_on_base(flow_repo, git):
+    run, skipped = skip_plan(flow_repo, git, {"check": "file_exists", "path": "README.md"})
+    assert skipped["decided_by"] == "runner"
+    finding = evaluate(flow_repo.cfg, run.events.read(), [ob("plan_approved", "approval:plan")], "t")[0]
+    assert finding.status == "satisfied" and finding.note == "on base"
+
+
+def test_a_skip_if_an_agent_decided_records_it_and_is_not_approval(flow_repo, git):
+    condition = {"check": "status_line", "file": "docs/specs/SPEC-{module}.md", "approved": r"\*\*Status: approved",
+                 "pending": "pending approval", "on_unknown": "agent"}
+    answer = {"result": {"status": "done", "summary": "looks approved", "signals": {"answer": "yes"}}}
+    run, skipped = skip_plan(flow_repo, git, condition, {"plan/skip_if": [answer]})
+    assert skipped["decided_by"] == "agent"
+    assert evaluate(flow_repo.cfg, run.events.read(), [ob("plan_approved", "approval:plan")], "t")[0].status == "missing"
+
+
+# --------------------------------------------------------------------------- finish keeps what the audit checked
+
+
+def test_a_commit_made_during_the_audit_stops_before_the_push(flow_repo, gh, git):
+    run = begin_finish(flow_repo)
+    flow_repo.configure({"gates": {"sneaky": {"run": "git commit -q --allow-empty -m sneaky"}},
+                         "gate_sets": {"build": ["ok"], "verify": ["sneaky"]}})
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    raised = last(flow_repo, run, "hitl_raised")
+    assert raised["kind"] == "blocked" and raised["key"] == FINISH and "HEAD moved" in raised["summary"]
+    assert not pushed(git, flow_repo, run) and gh_calls(gh) == []
+
+
+def test_approving_a_gate_failed_stop_at_finish_runs_the_audit_again(flow_repo, gh, git):
+    run = begin_finish(flow_repo)
+    flow_repo.configure({"gate_sets": {"build": ["ok"], "verify": ["fail"]}})
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    assert last(flow_repo, run, "hitl_raised")["kind"] == "gate_failed"
+    flow_repo.configure(SMALL)  # the human fixed the cause: the verify set passes now
+    approve(run, FINISH, by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    (checked,) = flow_repo.events(run, "conformance_checked")
+    ran = [e for e in flow_repo.events(run, "gate_result") if e.get("key") == FINISH]
+    assert [(e["gate"], e["passed"]) for e in ran] == [("fail", False), ("ok", True)]
+    floor = next(o for o in checked["obligations"] if o["id"] == FLOOR_ID)
+    assert floor["status"] == "satisfied" and floor["evidence"] == [ran[-1]["seq"]]
+    assert pushed(git, flow_repo, run)
+
+
+# --------------------------------------------------------------------------- whole runs: today's bar is 100% met
+
+
+@pytest.fixture
+def ci_gh(monkeypatch, tmp_path):
+    from test_ci import BIN, URL, Gh
+
+    log, checks = tmp_path / "ci-gh.jsonl", tmp_path / "checks.json"
+    monkeypatch.setenv("PATH", f"{BIN}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(log))
+    monkeypatch.setenv("FAKE_GH_URL", URL)
+    monkeypatch.setenv("FAKE_GH_CHECKS", str(checks))
+    log.touch()
+    gh = Gh(log, checks)
+    gh.play({"checks": [{"name": "backend", "state": "SUCCESS", "bucket": "pass", "link": URL}]})
+    return gh
+
+
+def fully_met(flow_repo, run) -> dict:
+    (checked,) = flow_repo.events(run, "conformance_checked")
+    statuses = {o["id"]: o["status"] for o in checked["obligations"]}
+    assert checked["passed"] is True, checked["obligations"]
+    assert set(statuses.values()) <= {"satisfied", "not_applicable"}, statuses
+    return statuses
+
+
+def walk(flow_repo, run) -> list[str]:
+    asked = []
+    status = advance(run, flow_repo.cfg, RunOptions())
+    while status == "awaiting_approval":
+        asked.append(run.state["waiting"]["phase"])
+        approve(run, asked[-1], by="me")
+        status = advance(run, flow_repo.cfg, RunOptions())
+    assert status == "done", run.state["waiting"]
+    return asked
+
+
+def test_a_whole_feature_run_meets_every_obligation(flow_repo, ci_gh):
+    from test_ci import PIPE
+
+    spec, plan = "docs/specs/SPEC-demo.md", "docs/plans/2026-10-29-demo.md"
+    flow_repo.configure(PIPE, autopilot=True)
+    flow_repo.script({
+        "define/draft": [{"write": {spec: "# Spec: `demo`\n\n**Status: approved** 2026-10-01\n\n## Open Questions\n\n"
+                                          "None for this module.\n"}, "result": {"status": "done", "summary": "drafted"}}],
+        "plan/plan": [{"write": {plan: "# Plan: demo\n\n### Task 1: One\n\n**Depends on:** none\n\n- [ ] **Step 1: Do it**\n"},
+                       "result": {"status": "done", "summary": "planned"}}],
+    })
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions())
+    assert walk(flow_repo, run) == ["define", "plan"]
+    statuses = fully_met(flow_repo, run)
+    assert {k: v for k, v in statuses.items() if v == "satisfied"}.keys() >= {"verified", "reviewed", "plan_approved", FLOOR_ID}
+
+
+def begin_bug_to_finish(flow_repo, acts: dict):
+    from test_ci import FIXED, GOOD_TEST, PIPE, RED
+
+    flow_repo.configure(PIPE, autopilot=True)
+    flow_repo.script({RED: [GOOD_TEST], "build/fix": [FIXED], **acts})
+    return start(flow_repo.cfg, flow_repo.root, "bug", {"task": "đăng nhập lỗi"}, RunOptions())
+
+
+def test_a_plain_bug_run_meets_every_obligation(flow_repo, ci_gh):
+    run = begin_bug_to_finish(flow_repo, {})
+    assert walk(flow_repo, run) == ["define"]
+    statuses = fully_met(flow_repo, run)
+    assert {k for k, v in statuses.items() if v == "satisfied"} >= {"verified", "reviewed", "red_then_green", FLOOR_ID}
+
+
+def test_a_bug_run_with_a_review_refine_round_meets_every_obligation(flow_repo, ci_gh):
+    blocking = {"severity": "blocking", "file": "src/one.py", "line": 3, "text": "Thiếu kiểm tra quyền"}
+    run = begin_bug_to_finish(flow_repo, {
+        BRANCH_REVIEW: [{"result": {"status": "done", "summary": "x", "findings": [blocking]}},
+                        {"result": {"status": "done", "summary": "clean"}}],
+        "review/fix_findings": [{"write": {"src/one.py": "x = 2\n"}, "result": {"status": "done", "summary": "fixed"}}],
+    })
+    assert walk(flow_repo, run) == ["define"]
+    events = run.events.read()
+    assert [e["phase"] for e in events if e["type"] == "phase_rejected"] == ["review"]
+    fix = [e for e in events if e["type"] == "step_committed" and e["key"] == "review/fix_findings"]
+    verify = [e for e in events if e["type"] == "step_finished" and e["key"] == "verify/verify" and e["status"] == "done"]
+    assert fix and verify and verify[-1]["seq"] < fix[-1]["seq"]  # the verify step ran before the fix: still counts
+    statuses = fully_met(flow_repo, run)
+    assert {k for k, v in statuses.items() if v == "satisfied"} >= {"verified", "reviewed", "red_then_green", FLOOR_ID}
+
+
+def test_an_unknown_enforce_mode_fails_closed_as_block(flow_repo, gh, git):
+    run = begin_finish(flow_repo)
+    flow_repo.configure({**SMALL, "policy": {"enforce": "blok"}})
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    assert last(flow_repo, run, "hitl_raised")["kind"] == "conformance_failed"
+    assert last(flow_repo, run, "conformance_checked")["enforce"] == "block"
+    assert not pushed(git, flow_repo, run)
+
+
+def test_an_unparseable_obligation_is_missing_at_finish(flow_repo, gh, git):
+    run = begin_finish(flow_repo)
+    flow_repo.configure({**SMALL, "policy": {"obligations": {"typo": {"require": ["stepp:verify"]}}}})
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"  # report mode: the gap ships, shown
+    typo = next(o for o in last(flow_repo, run, "conformance_checked")["obligations"] if o["id"] == "typo")
+    assert typo["status"] == "missing" and typo["note"] == "unrecognised evidence item"

@@ -40,9 +40,6 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "rework_pct": ("lower", False),
     "conformance_missing": ("lower", False),  # obligations with no evidence at the last audit
     "conformance_waived": ("lower", False),   # obligations a person waived at the last audit
-    "cost_usd": ("lower", False),             # added by `scorecard.run_row`, not by `run_signals`
-    "wall_h": ("lower", False),
-    "human_wait_h": ("lower", False),
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and

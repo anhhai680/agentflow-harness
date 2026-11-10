@@ -216,6 +216,7 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
     <div id="met-body"></div>
     <div id="scorecard">
       <h2 class="lane">Scorecard</h2>
+      <p id="sc-range" class="muted"></p>
       <div id="sc-body"></div>
     </div>
   </section>
@@ -1090,10 +1091,23 @@ function renderScorecard(view) {
   $("sc-body").replaceChildren(...body);
 }
 
+// The scorecard compares with the runs after the baseline, as `agentflow scorecard` does, unless the range is custom:
+// the Metrics tab's presets (this month, ...) would include the baseline's own runs.
+function scorecardQuery() {
+  const params = new URLSearchParams();
+  const custom = metricsUi.range === "custom" && (metricsUi.from || metricsUi.to);
+  if (custom && metricsUi.from) params.set("from", metricsUi.from);
+  if (custom && metricsUi.to) params.set("to", metricsUi.to);
+  if (metricsUi.work) params.set("lane", metricsUi.work);
+  $("sc-range").textContent = custom
+    ? "Runs that ended " + (metricsUi.from || "at any time") + " to " + (metricsUi.to || "today")
+    : "Runs after the baseline";
+  return params.toString();
+}
+
 async function loadScorecard() {
   if (!TOKEN) return;
-  const params = new URLSearchParams(metricsQuery());
-  params.delete("all");
+  const params = new URLSearchParams(scorecardQuery());
   try {
     renderScorecard(await api("/api/scorecard?" + params.toString()));
   } catch (err) {

@@ -3,7 +3,8 @@
 `freeze` records, per lane, the mean of every signal over the finished runs of a date range, in
 `<runs root>/scorecard_baseline.json` (a file of this machine, never of the repository). `scorecard_view` compares
 the runs that ended after the baseline's `to` with it, signal by signal, and says for each whether it got `better`,
-`worse` or stayed the `same`: the direction of a signal is its family's in `signals.FAMILIES`. `conformance_missing`
+`worse` or stayed the `same`: the direction of a signal is its family's in `signals.FAMILIES`, or in `EFFICIENCY`
+for the three this module adds (they are not lesson targets: no run's signals carry them). `conformance_missing`
 is the one signal with a hard limit: an obligation with no evidence at the last audit, on any current run (an SLO
 breach), and its row comes first.
 
@@ -30,6 +31,9 @@ BASELINE = "scorecard_baseline.json"
 SLO_SIGNAL = "conformance_missing"
 BASELINE_LIMIT = 4 * 1024 * 1024
 NO_BASELINE = "No baseline yet: run `agentflow scorecard --freeze` first."
+# the signals `run_row` adds to a run's own, with the direction that is better (like `signals.FAMILIES`)
+EFFICIENCY: dict[str, tuple[str, bool]] = {"cost_usd": ("lower", False), "wall_h": ("lower", False),
+                                           "human_wait_h": ("lower", False)}
 
 
 def baseline_path(repo: Path) -> Path:
@@ -109,7 +113,8 @@ def freeze(repo: Path, lane: str | None, date_from: date | None, date_to: date |
 def _verdict(signal: str, delta: float | None) -> str:
     if delta is None or abs(delta) < 1e-9:
         return "same"
-    spec = FAMILIES.get(signal.partition(":")[0])
+    family = signal.partition(":")[0]
+    spec = FAMILIES.get(family) or EFFICIENCY.get(family)
     if spec is None:
         return "same"
     return "better" if (delta > 0) == (spec[0] == "higher") else "worse"

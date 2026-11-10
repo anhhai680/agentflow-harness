@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -71,6 +72,7 @@ from agentflow.gitops import (
     NothingToCommit,
     commit,
     create_draft_pr,
+    head,
     push,
 )
 from agentflow.guards import changed_paths, snapshot
@@ -764,11 +766,18 @@ class FeatureLane:
             return "stopped"
         if not self.runner_commits_only(key):
             return "stopped"
+        try:
+            sha = head(self.worktree)  # what the audit checks is exactly what gets pushed
+        except (GitError, subprocess.CalledProcessError) as exc:
+            raise_hitl(self.cfg, self.run, "blocked", key, f"Could not read HEAD of {self.worktree}: {exc}")
+            return "stopped"
         if not audit(self.cfg, self.run, self.worktree, self.ctx, key):  # on the tree to be pushed, before the push
+            return "stopped"
+        if not self._unmoved(key, sha) or not clean_tree(self.cfg, self.run, self.worktree, key):
             return "stopped"
         body = self.write_pr_body()
         try:
-            push(self.worktree, branch)
+            push(self.worktree, branch, sha=sha)
             url = create_draft_pr(self.worktree, target, branch, self._pr_title(), body)
         except (GitError, GhError) as exc:
             raise_hitl(self.cfg, self.run, "blocked", key, f"Could not push {branch} or open the pull request: {exc}")
@@ -779,6 +788,18 @@ class FeatureLane:
             return "stopped"
         self.run.emit("step_finished", key=key, status="done", summary=f"draft pull request {url}")
         return "done"
+
+    def _unmoved(self, key: str, sha: str) -> bool:
+        """HEAD is still `sha`, the commit the audit checked (a gate it ran could have committed); False = stopped."""
+        try:
+            now = head(self.worktree)
+        except (GitError, subprocess.CalledProcessError) as exc:
+            now = f"unreadable ({exc})"
+        if now == sha:
+            return True
+        raise_hitl(self.cfg, self.run, "blocked", key,
+                   f"HEAD moved from {sha[:12]} to {now[:40]} during the conformance audit; nothing was pushed.")
+        return False
 
     def write_pr_body(self) -> Path:
         body = self.run.dir / "pr.md"

@@ -322,6 +322,9 @@ def parse_evidence(text: str) -> Evidence | None:
     return Evidence(kind, arg)
 
 
+UNRECOGNISED = Evidence("unrecognised", "")  # stands in for an item that does not parse: never satisfied
+
+
 @dataclass(frozen=True)
 class Obligation:
     id: str
@@ -899,7 +902,8 @@ def _switched_off(project: dict, merged: dict) -> tuple[str, ...]:
 
 def _build_policy(policy: dict, disabled: tuple[str, ...]) -> Policy:
     """The obligations, in layer order, then the engine floor, whatever the layers say. An evidence item that does
-    not parse is left out here and reported by `validate`, which reads the text."""
+    not parse becomes `UNRECOGNISED`, which `conformance.evaluate` never counts as met, so a typo fails closed;
+    `validate` reports it from the text."""
     entries = _optional(policy, "obligations", "policy", dict, {})
     out: dict[str, Obligation] = {}
     for key, entry in entries.items():
@@ -913,7 +917,7 @@ def _build_policy(policy: dict, disabled: tuple[str, ...]) -> Policy:
         parsed = (parse_evidence(item) for item in _string_list(entry.get("require", []), f"{path}.require"))
         out[key] = Obligation(
             id=key,
-            require=tuple(item for item in parsed if item is not None),
+            require=tuple(UNRECOGNISED if item is None else item for item in parsed),
             when=_optional(entry, "when", path, str, None),
             lanes=tuple(_string_list(entry.get("lanes", []), f"{path}.lanes")),
         )
