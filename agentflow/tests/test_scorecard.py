@@ -63,7 +63,7 @@ def test_compare_marks_direction_and_slo(tmp_git, fake_runs):
                        {"gate_first_pass:lint": 1.0, "cost_usd": 5.0, "conformance_missing": 2})
     fake_runs["r4"] = ("bug", "2026-11-06T10:00:00+00:00", {"cost_usd": 1.0})
     view = scorecard.scorecard_view(tmp_git, None, None, None, NOW)
-    assert view["baseline"] is True and list(view["lanes"]) == ["feature"]
+    assert view["baseline"] is True and list(view["lanes"]) == ["feature", "bug"]
     rows = view["lanes"]["feature"]
     by = {r["signal"]: r for r in rows}
     assert rows[0]["signal"] == "conformance_missing" and rows[0]["slo"] is True
@@ -76,6 +76,25 @@ def test_compare_marks_direction_and_slo(tmp_git, fake_runs):
     assert by["cost_usd"]["current_n"] == 1
     table = scorecard.scorecard_table(view)
     assert "conformance_missing" in table and "worse" in table and "better" in table
+    # a lane with no baseline entry still shows its current runs, with no "before" and the same SLO rule
+    fake_runs["r4"] = ("bug", "2026-11-06T10:00:00+00:00", {"cost_usd": 1.0, "conformance_missing": 1})
+    bug = scorecard.scorecard_view(tmp_git, None, None, None, NOW)["lanes"]["bug"]
+    assert bug[0]["signal"] == "conformance_missing" and bug[0]["slo"] is True and bug[0]["baseline"] is None
+    assert (bug[0]["baseline_n"], bug[0]["delta"], bug[0]["verdict"], bug[0]["current"]) == (0, None, "same", 1.0)
+    assert bug[1]["signal"] == "cost_usd" and bug[1]["slo"] is False and bug[1]["current_n"] == 1
+    assert "bug" in scorecard.scorecard_table(scorecard.scorecard_view(tmp_git, None, None, None, NOW))
+    only = scorecard.scorecard_view(tmp_git, "feature", None, None, NOW)
+    assert list(only["lanes"]) == ["feature"]
+    assert list(scorecard.scorecard_view(tmp_git, "bug", None, None, NOW)["lanes"]) == ["bug"]
+
+
+def test_a_drop_in_a_higher_is_better_family_reads_worse(tmp_git, fake_runs):
+    _baseline_runs(fake_runs)
+    scorecard.freeze(tmp_git, None, None, None, False, NOW)
+    fake_runs["r3"] = ("feature", "2026-11-05T10:00:00+00:00", {"gate_first_pass:lint": 0.25})
+    rows = scorecard.scorecard_view(tmp_git, None, None, None, NOW)["lanes"]["feature"]
+    row = next(r for r in rows if r["signal"] == "gate_first_pass:lint")
+    assert (row["signal"], row["delta"], row["verdict"], row["slo"]) == ("gate_first_pass:lint", -0.25, "worse", False)
 
 
 def test_scorecard_without_baseline_says_how_to_freeze(tmp_git, fake_runs):
@@ -106,3 +125,21 @@ def test_cli_scorecard_json(flow_repo, capsys):
     assert json.loads(capsys.readouterr().out)["baseline"] is False
     assert main(["scorecard", "--config", str(flow_repo.cfg.path)]) == 0
     assert capsys.readouterr().out.strip() == "No baseline yet: run `agentflow scorecard --freeze` first."
+
+
+def test_cli_freeze_refuses_a_second_freeze_without_replace(flow_repo, fake_runs, capsys):
+    from agentflow.flow import main
+
+    _baseline_runs(fake_runs)
+    cfg = ["--config", str(flow_repo.cfg.path)]
+    path = runs_root(flow_repo.root) / scorecard.BASELINE
+    assert main(["scorecard", "--freeze", *cfg]) == 0 and path.is_file()
+    capsys.readouterr()
+    before = path.read_bytes()
+    fake_runs["r3"] = ("feature", "2026-11-03T10:00:00+00:00", {"cost_usd": 9.0})
+    assert main(["scorecard", "--freeze", *cfg]) != 0
+    message = capsys.readouterr().out.strip()
+    assert message.startswith("error:") and "--replace" in message and "\n" not in message
+    assert path.read_bytes() == before
+    assert main(["scorecard", "--freeze", "--replace", *cfg]) == 0
+    assert "r3" in path.read_text(encoding="utf-8")

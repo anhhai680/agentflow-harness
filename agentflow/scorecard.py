@@ -137,13 +137,21 @@ def scorecard_view(repo: Path, lane: str | None, date_from: date | None, date_to
     if base is None:
         return {"baseline": False, "lanes": {}}
     dated = date_from is not None or date_to is not None
+    frozen_lanes = base["lanes"]
     lanes: dict[str, list[dict]] = {}
-    for name, frozen in sorted(base["lanes"].items()):
+    for name, frozen in sorted(frozen_lanes.items()):
         if lane is not None and name != lane:
             continue
         since = None if dated else parse_iso(frozen.get("to"))
         current = [run_row(run, now) for _n, _e, run in _select(repo, name, date_from, date_to, since)]
         lanes[name] = _compare(frozen.get("signals") or {}, aggregate_signals(current))
+    # A lane the baseline never saw has no "before", but its conformance still counts: all its finished runs in range.
+    extra: dict[str, list[dict]] = {}
+    for name, _e, run in _select(repo, lane, date_from, date_to):
+        if name not in frozen_lanes:
+            extra.setdefault(name, []).append(run_row(run, now))
+    for name, rows in sorted(extra.items()):
+        lanes[name] = _compare({}, aggregate_signals(rows))
     return {"baseline": True, "lanes": lanes}
 
 
