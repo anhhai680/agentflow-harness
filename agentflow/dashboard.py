@@ -7,7 +7,7 @@ Routes:
   the page keeps the token in `sessionStorage`, so a reload works. Every other route needs the token.
 - `GET /api/info` (the harness name and the engine version the page shows in its header),
   `GET /api/board` (every lane, or `?lane=<name>`), `GET /api/workflow`, `GET /api/agents`,
-  `GET /api/runs/<id>` (the card detail, its time and cost included), `GET /api/metrics` (time and cost over
+  `GET /api/runs/<id>` (the card detail, its time and cost included), `GET /api/scorecard` (the Metrics tab's scorecard), `GET /api/metrics` (time and cost over
   the runs started in `?from=YYYY-MM-DD&to=YYYY-MM-DD`, this month by default, or `?all=1`; `&lane=<name>`
   narrows it; a bad date is a 400); `GET /api/lessons` (every lesson with its evidence and its target signal before
   and after the runs that carried it); `GET /api/events` (SSE: every run's new events, runs created
@@ -57,7 +57,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from datetime import date
+from datetime import UTC, date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -67,6 +67,7 @@ from agentflow import backlog, config_edit, hitl, module_queue, pack
 from agentflow.config import Config, ConfigError, for_lane, load_config
 from agentflow.events import EventError, lock_state
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
+from agentflow.scorecard import scorecard_view
 from agentflow.state import Run, runs_root
 from agentflow.views import agents_view, board, lessons_view, metrics_view, run_detail, workflow_view
 
@@ -421,6 +422,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, config_edit.form_fields(self.server.cfg.path))
         elif path == "/api/metrics":
             self._metrics(query)
+        elif path == "/api/scorecard":
+            self._scorecard(query)
         elif path == "/api/lessons":
             self._json(200, lessons_view(self.server.repo, self.server.cfg))
         elif match := RUN_ROUTE.match(path):
@@ -446,6 +449,21 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(400, f"bad date range: {exc}")
             return
         self._json(200, view)
+
+    def _scorecard(self, query: dict) -> None:
+        lane = (query.get("lane") or [None])[0] or None
+        if lane is not None and lane not in self.server.cfg.lanes:
+            self._error(404, f"unknown lane {lane!r}")
+            return
+        try:
+            days = {name: date.fromisoformat(v) if (v := (query.get(name) or [""])[0]) else None
+                    for name in ("from", "to")}
+            if days["from"] and days["to"] and days["from"] > days["to"]:
+                raise ValueError("from is after to")
+        except ValueError as exc:
+            self._error(400, f"bad date range: {exc}")
+            return
+        self._json(200, scorecard_view(self.server.repo, lane, days["from"], days["to"], datetime.now(UTC)))
 
     def _page(self) -> None:
         nonce = secrets.token_urlsafe(18)

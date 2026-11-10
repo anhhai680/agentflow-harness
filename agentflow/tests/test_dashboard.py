@@ -1135,6 +1135,36 @@ def test_metrics_route_filters_by_date_range_and_lane(dash):
     assert dash.get("/api/metrics", token=None)[0] == 403
 
 
+def test_scorecard_api_needs_the_token_and_returns_the_view(dash):
+    assert dash.get("/api/scorecard", token=None)[0] == 403
+    assert dash.get("/api/scorecard", token="wrong")[0] == 403
+    status, _, body = dash.get("/api/scorecard")
+    data = payload(body)
+    assert status == 200 and set(data) == {"baseline", "lanes"}
+    assert data["baseline"] is False and data["lanes"] == {}
+    assert dash.get("/api/scorecard?lane=nope")[0] == 404
+    assert dash.get("/api/scorecard?from=yesterday")[0] == 400
+
+
+def test_metrics_view_has_a_scorecard_section(dash):
+    page = dash.get("/", token=None)[2].decode("utf-8")
+    metrics = page[page.index('id="metrics-view"'):]
+    assert 'id="scorecard"' in metrics
+
+
+def test_the_scorecard_compares_with_runs_after_the_baseline_unless_the_range_is_custom(dash):
+    page = dash.get("/", token=None)[2].decode("utf-8")
+    scorecard = page[page.index('id="scorecard"'):]
+    assert scorecard.index("Scorecard</h2>") < scorecard.index('<p id="sc-range" class="muted"></p>') < scorecard.index('id="sc-body"')
+    query = page[page.index("function scorecardQuery()"):page.index("async function loadScorecard()")]
+    assert 'metricsUi.range === "custom"' in query and "metricsQuery" not in query
+    assert query.count('params.set("from"') == 1 and "custom && metricsUi.from" in query
+    assert '"Runs after the baseline"' in query and '"Runs that ended "' in query
+    assert '$("sc-range").textContent' in query and "innerHTML" not in query
+    load = page[page.index("async function loadScorecard()"):]
+    assert load[:400].count("scorecardQuery()") == 1 and "metricsQuery()" not in load[:400]
+
+
 def test_old_runs_stay_in_metrics_and_on_the_board(flow_repo):
     from datetime import UTC, timedelta
 

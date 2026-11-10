@@ -212,6 +212,17 @@ def test_retro_step_is_protected(shipped):
             config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)
 
 
+def test_policy_is_protected(shipped):
+    assert "policy" in config_edit.PROTECTED
+    for key in (["policy", "enforce"], ["policy", "obligations", "reviewed"]):
+        with pytest.raises(Refused):  # the form has no field for it
+            form(shipped, (key, "block"))
+    _, sha = config_edit.read(shipped)
+    for added in ("policy: {enforce: block}\n", "policy: {obligations: {reviewed: null}}\n"):  # a page cannot relax or tighten the bar
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)
+
+
 def test_the_inherited_environment_settings_are_protected(shipped):
     _, sha = config_edit.read(shipped)
     old = '    POSTGRES_HOST_PORT: "55432"\n'

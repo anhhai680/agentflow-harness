@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -61,8 +62,9 @@ from agentflow.autonomy import AUTO_BY, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
 from agentflow.config import Config, Phase, Step, brief_files
+from agentflow.conformance import audit, clean_tree, render_section
 from agentflow.flow_control import current_refine, refine_note_block, refine_subject
-from agentflow.gates import gates_ok, run_gates
+from agentflow.gates import gates_ok, record_results, run_gates
 from agentflow.gitops import (
     CommitRejected,
     GhError,
@@ -70,8 +72,7 @@ from agentflow.gitops import (
     NothingToCommit,
     commit,
     create_draft_pr,
-    dirty_paths,
-    merge_in_progress,
+    head,
     push,
 )
 from agentflow.guards import changed_paths, snapshot
@@ -526,7 +527,7 @@ class FeatureLane:
             return None
         blocking = blocking_of(self.cfg, findings)
         self.run.emit("review_result", key=key, round=round_, findings=findings, blocking=len(blocking),
-                      blocking_findings=blocking)
+                      blocking_findings=blocking, tree=snapshot(self.worktree))
         return blocking
 
     def _reviewer_started_since(self, key: str, result: dict) -> bool:
@@ -627,10 +628,7 @@ class FeatureLane:
         if finished and finished[-1].get("tree") == tree:
             return True
         results = run_gates(self.cfg, gates, self.worktree, self.run.gate_log_dir(commit_key))
-        for r in results:
-            self.run.emit("gate_result", key=commit_key, gate=r.name, passed=r.passed, skipped=r.skipped,
-                          reason=r.reason, log=str(r.log_path) if r.log_path else None,
-                          duration_s=r.duration_s)
+        record_results(self.run, commit_key, results, tree)
         if gates_ok(results):
             return True
         failed = [r for r in results if not (r.passed or r.skipped)]
@@ -762,23 +760,24 @@ class FeatureLane:
             raise_hitl(self.cfg, self.run, "blocked", key,
                        f"{branch} is the base branch: finish pushes a run's own branch, never the pull request's target.")
             return "stopped"
-        try:
-            dirty = [] if merge_in_progress(self.worktree) else dirty_paths(self.worktree)  # a half-done sync resumes
-        except GitError as exc:
-            raise_hitl(self.cfg, self.run, "blocked", key, f"Could not read the state of {self.worktree}: {exc}")
-            return "stopped"
-        if dirty:
-            shown = ", ".join(dirty[:5]) + (f" and {len(dirty) - 5} more" if len(dirty) > 5 else "")
-            raise_hitl(self.cfg, self.run, "dirty_tree", key,
-                       f"{self.worktree} has uncommitted changes ({shown}); finish pushes committed work only.")
+        if not clean_tree(self.cfg, self.run, self.worktree, key, resume_merge=True):  # a half-done sync resumes
             return "stopped"
         if self.run_sync(phase, step, key) != "done":
             return "stopped"
         if not self.runner_commits_only(key):
             return "stopped"
+        try:
+            sha = head(self.worktree)  # what the audit checks is exactly what gets pushed
+        except (GitError, subprocess.CalledProcessError) as exc:
+            raise_hitl(self.cfg, self.run, "blocked", key, f"Could not read HEAD of {self.worktree}: {exc}")
+            return "stopped"
+        if not audit(self.cfg, self.run, self.worktree, self.ctx, key):  # on the tree to be pushed, before the push
+            return "stopped"
+        if not self._unmoved(key, sha) or not clean_tree(self.cfg, self.run, self.worktree, key):
+            return "stopped"
         body = self.write_pr_body()
         try:
-            push(self.worktree, branch)
+            push(self.worktree, branch, sha=sha)
             url = create_draft_pr(self.worktree, target, branch, self._pr_title(), body)
         except (GitError, GhError) as exc:
             raise_hitl(self.cfg, self.run, "blocked", key, f"Could not push {branch} or open the pull request: {exc}")
@@ -789,6 +788,18 @@ class FeatureLane:
             return "stopped"
         self.run.emit("step_finished", key=key, status="done", summary=f"draft pull request {url}")
         return "done"
+
+    def _unmoved(self, key: str, sha: str) -> bool:
+        """HEAD is still `sha`, the commit the audit checked (a gate it ran could have committed); False = stopped."""
+        try:
+            now = head(self.worktree)
+        except (GitError, subprocess.CalledProcessError) as exc:
+            now = f"unreadable ({exc})"
+        if now == sha:
+            return True
+        raise_hitl(self.cfg, self.run, "blocked", key,
+                   f"HEAD moved from {sha[:12]} to {now[:40]} during the conformance audit; nothing was pushed.")
+        return False
 
     def write_pr_body(self) -> Path:
         body = self.run.dir / "pr.md"
@@ -916,6 +927,13 @@ def _open_findings(state: dict, events: list[dict]) -> list[str]:
     return [f"- `{key}`: {finding_line(as_finding(f))[2:]}" for key, findings in last.items() for f in findings]
 
 
+def _conformance(run: Run, events: list[dict]) -> str | None:
+    """The Conformance section from the run's last audit; None when no audit ran."""
+    checks = [e for e in events if e["type"] == "conformance_checked"]
+    lines = render_section(checks[-1] if checks else None, run.id)
+    return _section("Conformance", lines) if lines else None
+
+
 def issue_line(params: dict) -> str | None:
     """`Refs #N` for an epic, `Closes #N` for any other issue, else None. It depends on `params` alone."""
     if not params.get("issue"):
@@ -924,7 +942,7 @@ def issue_line(params: dict) -> str | None:
 
 
 def render_pr_body(run: Run, plan: str | None = None) -> str:
-    """The draft pull request's body: plan link, gate summary, spend vs budget, skipped steps and reasons,
+    """The draft pull request's body: plan link, spend vs budget, gate summary, the conformance audit, skipped steps and reasons,
     effort changes with reasons, footer mismatches, refine rounds, then the attribution line."""
     run.refresh()
     state = run.state
@@ -952,6 +970,7 @@ def render_pr_body(run: Run, plan: str | None = None) -> str:
         f"Plan: `{plan}`" if plan else "Plan: none",
         spend_line,
         _section("Gates", _gate_lines(state)),
+        _conformance(run, events),
         _section("Skipped steps", _skipped_lines(state)),
         _section("Effort changes", efforts),
         _section("Footer mismatches", footers),

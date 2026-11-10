@@ -34,7 +34,7 @@ from agentflow import sources
 from agentflow.conditions import Ctx, evaluate, fmt, paths_read
 from agentflow.commit_checks import runner_head
 from agentflow.config import Config, Phase, Step, for_lane
-from agentflow.gates import GateResult, gates_ok, resolve, run_gates, summarize
+from agentflow.gates import GateResult, gates_ok, record_results, resolve, run_gates, summarize
 from agentflow.guards import snapshot
 from agentflow.gitops import CommitRejected, NothingToCommit, commit
 from agentflow.hitl import (
@@ -48,6 +48,7 @@ from agentflow.hitl import (
     render_inbox,
     write_answers,
 )
+from agentflow.policy import applicable
 from agentflow.state import TERMINAL
 
 if TYPE_CHECKING:
@@ -126,6 +127,7 @@ class StepControl:
     ctx: Ctx
     dry_run: bool
     out: TextIO
+    last_decided_by: str = "runner"  # who settled the last `decide`: runner, agent or human
 
     # ------------------------------------------------------------------ walking steps
 
@@ -270,7 +272,10 @@ class StepControl:
         return fmt(str(step.output), self.ctx) in paths_read(self.cfg, failed, self.ctx)
 
     def decide(self, phase: Phase, cond: Any, cond_key: str) -> tuple[bool | None, str]:
-        """Evaluate `cond`; when it is unknown, follow its `on_unknown`. `(None, reason)` = stopped."""
+        """Evaluate `cond`; when it is unknown, follow its `on_unknown`. `(None, reason)` = stopped.
+
+        `last_decided_by` then says who decided it: `runner` (the files and git said), `agent` or `human`."""
+        self.last_decided_by = "runner"
         result = evaluate(self.cfg, cond, self.ctx)
         if result.value is not None:
             return result.value, result.reason
@@ -281,6 +286,7 @@ class StepControl:
                 return None, result.reason
             if isinstance(value, bool):
                 self._log_decision(cond_key, label, value, "agent", why)
+                self.last_decided_by = "agent"
                 return value, f"{result.reason}; an agent said {_word(value)}: {why}"
         return self._ask_human(cond_key, label, result.reason)
 
@@ -305,6 +311,7 @@ class StepControl:
             value = _yes_no(text)
             if value is not None:
                 self._log_decision(cond_key, label, value, "human", text)
+                self.last_decided_by = "human"
                 return value, f"{reason}; a human said {_word(value)}"
         if self._waiting_on(cond_key):
             return None, reason
@@ -394,7 +401,7 @@ class StepControl:
         session in its fix loop. The tree is recorded so the gates are not run again on it afterwards."""
         tree = snapshot(self.worktree)
         results = run_gates(self.cfg, step.gates or [], self.worktree, self.run.gate_log_dir(key))
-        self._emit_gates(key, results)
+        record_results(self.run, key, results, tree)
         failed = [r for r in results if not (r.passed or r.skipped)]
         self.run.emit("gates_prerun", key=key, tree=tree, passed=not failed)
         return gate_evidence(results, tree), failed or None
@@ -499,18 +506,13 @@ class StepControl:
 
     # ------------------------------------------------------------------ gates and commits
 
-    def _emit_gates(self, key: str, results: list[GateResult]) -> None:
-        for r in results:
-            self.run.emit("gate_result", key=key, gate=r.name, passed=r.passed, skipped=r.skipped,
-                          reason=r.reason, log=str(r.log_path) if r.log_path else None,
-                          duration_s=r.duration_s)
-
     def _run_gate_step(self, phase: Phase, step: Step, key: str) -> Outcome:
         """Run the step's gates; a failure stops for a human, and approving runs them again."""
         if self.run.state["waiting"] is not None:
             return "stopped"
+        tree = snapshot(self.worktree)
         results = run_gates(self.cfg, step.gates or [], self.worktree, self.run.gate_log_dir(key))
-        self._emit_gates(key, results)
+        record_results(self.run, key, results, tree)
         if gates_ok(results):
             self.run.emit("step_finished", key=key, status="done", summary=summarize(results))
             return "done"
@@ -617,6 +619,9 @@ class StepControl:
             if step.sync is not None:
                 self._say(f"{indent}  (conflicts, or a failing check on the merged tree, go to {key}/{step.sync.id}-N)")
                 self._dry_agent(phase, step.sync, f"{key}/{step.sync.id}-1", indent + "  ", {"sync_report": "(the conflicted files)"})
+            for obligation, why in applicable(self.cfg, self.ctx, self.ctx.values["lane"]):  # the audit before the push
+                require = ", ".join(str(item) for item in obligation.require)
+                self._say(f"{indent}  obligation {obligation.id}: {require} ({why})")
         elif step.type == "ci":
             self._say(f"{indent}{key}: gh pr checks <pr>; fix what fails and push; gh pr ready <pr>")
 

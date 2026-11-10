@@ -28,10 +28,14 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 from agentflow import run_env, safeio
 from agentflow.config import Config, Gate
 from agentflow.guards import snapshot
+
+if TYPE_CHECKING:
+    from agentflow.state import Run
 
 KILL_WAIT_S = 5
 
@@ -173,6 +177,28 @@ def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path, *,
 def gates_ok(results: list[GateResult]) -> bool:
     """True when no gate that actually ran failed (skipped gates do not count as failures)."""
     return all(r.passed or r.skipped for r in results)
+
+
+def record_results(run: Run, key: str, results: list[GateResult], tree: str, *, with_tail: bool = False) -> None:
+    """Write one `gate_result` per result, each stamped with the `tree` (a `guards.snapshot`) the gates ran on.
+
+    The caller snapshots the worktree before the gates run. `with_tail` adds a `tail` to every event: a failed
+    gate's output tail (the fix loop's and the retro's evidence), `""` for a gate that passed or was skipped."""
+    for r in results:
+        data = {"key": key, "gate": r.name, "passed": r.passed, "skipped": r.skipped, "reason": r.reason,
+                "log": str(r.log_path) if r.log_path else None, "duration_s": r.duration_s, "tree": tree}
+        if with_tail:  # "" for a gate that passed or was skipped
+            data["tail"] = "" if (r.passed or r.skipped) else r.tail
+        run.emit("gate_result", **data)
+
+
+def failure_report(failed: list[GateResult]) -> str:
+    """The stop report for failed gates: one `### <gate> (<reason>)` block each, with its log path and output tail."""
+    blocks = []
+    for r in failed:
+        log = f"Full log: {r.log_path}\n" if r.log_path else ""
+        blocks.append(f"### {r.name} ({r.reason})\n{log}```\n{r.tail}\n```")
+    return "\n\n".join(blocks)
 
 
 def summarize(results: list[GateResult]) -> str:

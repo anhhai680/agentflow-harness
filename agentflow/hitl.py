@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .config import QUESTION_KINDS, RETRO_PIPELINE, Config
+from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RETRO_PIPELINE, Config
 from .events import nfc, parse_iso
 from .state import TERMINAL, Run, list_runs
 
@@ -425,8 +425,27 @@ def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Confi
                 f"{reject}")
     if kind == "dirty_tree":
         return f"Commit or remove the changes yourself, then `agentflow approve {run.id} {key}` runs the step again; {reject}"
+    if kind == CONFORMANCE_FAILED:
+        return _conformance_way_on(run, key, cfg)
     return (f"Fix what the stop needs, then `agentflow approve {run.id} {key}` resumes the step's agent session where "
             f"it stopped (it is not marked done); {reject}")
+
+
+def _conformance_way_on(run: Run, key: str, cfg: Config) -> str:
+    """For a `conformance_failed` stop: the `agentflow retry` that runs each missing step the run walked again (it
+    clears this stop, so `key` audits again); for a step this run never walked, that no retry can bring it; and
+    the retry of `key` itself, which audits again."""
+    from agentflow.conformance import missing_steps  # it imports this module
+
+    checks = [e for e in run.events.read() if e["type"] == "conformance_checked" and e.get("key") == key]
+    walked, never = missing_steps(run.state.get("steps") or {}, checks[-1] if checks else None)
+    lines = ["Nothing was pushed."]
+    lines += [f"`agentflow retry {run.id} {step}` runs `{step}` again, then `{key}` audits again." for step in walked]
+    lines += [f"This run's lane never ran `{step}`, so no retry can bring its evidence: change the pack's `policy` "
+              f"(or the lane's steps), then `agentflow retry {run.id} {key}` audits again." for step in never]
+    lines.append(f"Once the evidence is there some other way, `agentflow retry {run.id} {key}` audits again. "
+                 "An approval does not waive an obligation: the audit runs again and stops again.")
+    return "\n".join(lines)
 
 
 def _not_waiting(run: Run, target: str) -> NotWaiting:

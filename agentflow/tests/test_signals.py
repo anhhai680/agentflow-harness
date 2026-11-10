@@ -89,7 +89,7 @@ def test_open_parameter_counts_stay_absent_and_count_families_are_lower_is_bette
     out = run_signals([], EMPTY_METRICS)
     assert not [k for k in out if k.split(":")[0] in ("guard_trips", "permission_denied", "stop")]
     assert COUNT_FAMILIES <= set(FAMILIES) and all(FAMILIES[f][0] == "lower" for f in COUNT_FAMILIES)
-    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 8
+    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 10
 
 
 def test_cost_per_task_divides_by_the_steps_that_called_an_agent():
@@ -132,8 +132,20 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 13
+    assert len(FAMILIES) == 15
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
     assert aggregate_signals([{"ci_rounds": 2}, {"ci_rounds": 0}, {}])["ci_rounds"] == {"runs": 2, "mean": 1.0}
+
+
+def test_conformance_counts_come_from_the_last_check():
+    first = _ev("conformance_checked", obligations=[{"id": "a", "status": "missing"}, {"id": "b", "status": "missing"}])
+    last = _ev("conformance_checked", obligations=[{"id": "a", "status": "missing"}, {"id": "b", "status": "waived"},
+                                                   {"id": "c", "status": "waived"}, {"id": "d", "status": "satisfied"}])
+    out = run_signals([first, last], EMPTY_METRICS)
+    assert (out["conformance_missing"], out["conformance_waived"]) == (1, 2)
+    bare = run_signals([_ev("conformance_checked")], EMPTY_METRICS)
+    assert (bare["conformance_missing"], bare["conformance_waived"]) == (0, 0)
+    none = run_signals([], EMPTY_METRICS)
+    assert "conformance_missing" not in none and "conformance_waived" not in none

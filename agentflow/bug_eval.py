@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from agentflow import safeio
-from agentflow.gates import GateResult, gates_ok, run_gates, summarize
+from agentflow.gates import GateResult, gates_ok, record_results, run_gates, summarize
 from agentflow.guards import Violation, changed_paths, command_allowed, path_matches, snapshot
 from agentflow.hitl import StepResult, raise_hitl
 
@@ -134,7 +134,7 @@ def run_test_command(argv: list[str], cwd: Path, log_path: Path, timeout_s: int,
 
 class BugEvalLane:
     """`check_expect` (for `lanes.Executor._loop`) and the fix-looping `_run_gate_step`; relies on the
-    executor's `cfg`, `run`, `worktree`, `run_agent_step`, `_stop`, `_fail`, `_gate_report` and `_emit_gates`."""
+    executor's `cfg`, `run`, `worktree`, `run_agent_step`, `_stop`, `_fail`, and `_gate_report`."""
 
     cfg: Config
     run: Run
@@ -173,7 +173,7 @@ class BugEvalLane:
                                    for path in touched])
         ok = not ran.timed_out and (ran.exit_code != 0 if expect == RED else ran.exit_code == 0)
         self.run.emit("expectation_checked", key=sr.key, expect=expect, command=command, exit_code=ran.exit_code,
-                      ok=ok, log=str(ran.log_path))
+                      ok=ok, log=str(ran.log_path), tree=before)
         report = self._command_report(ran)
         if expect == GREEN:
             return [] if ok else [GateResult(TEST_GATE, False, False, self._reason(ran), ran.log_path, ran.tail)]
@@ -222,8 +222,9 @@ class BugEvalLane:
                         message=step.message or f"Fix {step.id} gate failures")  # commits only what the fix changed
         if rec.get("status") in RESUMABLE and rec.get("session_id"):
             return self.run_agent_step(phase, fixer, key)  # its fix session was going: resume it (it runs the gates)
+        tree = snapshot(self.worktree)
         results = run_gates(self.cfg, step.gates or [], self.worktree, self.run.gate_log_dir(key))
-        self._emit_gates(key, results)
+        record_results(self.run, key, results, tree)
         if gates_ok(results):
             self.run.emit("step_finished", key=key, status="done", summary=summarize(results))
             return "done"

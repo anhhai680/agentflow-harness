@@ -163,7 +163,9 @@ PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "-
 PERMISSION_MODES = ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions")
 EXPECT_VALUES = ("red", "green")
 ON_FAIL_VALUES = ("block",)
-NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable")
+CONFORMANCE_FAILED = "conformance_failed"  # the audit at `finish` found an obligation with no evidence (`block` mode)
+NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable",
+                  CONFORMANCE_FAILED)
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -295,6 +297,49 @@ class IssuePolicy:
     epic_labels: tuple[str, ...] = ("epic",)  # an issue with one of these gets `Refs #N`, never `Closes #N`
 
 
+FLOOR_ID = "engine_floor"  # the obligation code adds after the layers merge: no layer can remove or replace it
+EVIDENCE_KINDS = ("gates", "step", "approval", "expect")
+ENFORCE_MODES = ("report", "block")
+EXPECT_EVIDENCE = ("red_then_green",)
+
+
+@dataclass(frozen=True)
+class Evidence:
+    kind: str  # one of EVIDENCE_KINDS
+    arg: str  # a gate set, a step id, a phase name, or `red_then_green`
+
+    def __str__(self) -> str:
+        return f"{self.kind}:{self.arg}"
+
+
+def parse_evidence(text: str) -> Evidence | None:
+    """`kind:arg` as an `Evidence`; None for an unknown kind, an empty arg, or an `expect:` other than `red_then_green`."""
+    kind, sep, arg = text.partition(":")
+    if not sep or kind not in EVIDENCE_KINDS or not arg.strip() or arg != arg.strip():
+        return None
+    if kind == "expect" and arg not in EXPECT_EVIDENCE:
+        return None
+    return Evidence(kind, arg)
+
+
+UNRECOGNISED = Evidence("unrecognised", "")  # stands in for an item that does not parse: never satisfied
+
+
+@dataclass(frozen=True)
+class Obligation:
+    id: str
+    require: tuple[Evidence, ...]
+    when: str | None = None  # a condition name; absent: the obligation always applies
+    lanes: tuple[str, ...] = ()  # absent: every lane
+
+
+@dataclass
+class Policy:
+    enforce: str = "report"  # report | block
+    obligations: dict[str, Obligation] = field(default_factory=dict)  # the floor is always last
+    disabled: tuple[str, ...] = ()  # engine default ids a layer switched off (and the floor, if nulled), for `validate`
+
+
 @dataclass
 class Gate:
     name: str
@@ -399,6 +444,7 @@ class Config:
     merged: dict = field(default_factory=dict)  # the layers merged, before `@` resolution (`raw` is after it)
     layer_origins: dict[tuple[str, ...], str] = field(default_factory=dict)  # each leaf of `merged`: its layer's name
     issues: IssuePolicy = field(default_factory=IssuePolicy)  # what a run started from an issue does on GitHub
+    policy: Policy = field(default_factory=Policy)  # the obligations a finished run must show evidence for
 
 
 def for_lane(steps: list[Step], lane: str) -> list[Step]:
@@ -831,14 +877,55 @@ def load_config(path: Path, *, layered: bool = True, user: bool = True) -> Confi
     else:
         merged, origins = copy.deepcopy(project), {key: "project" for key in layers.leaf_keys(project)}
     try:
-        return _build(merged, origins, path)
+        return _build(merged, origins, path, _switched_off(project, merged) if layered else ())
     except ConfigError as exc:
         if user_path is not None and exc.path and layers.origin_of(origins, exc.path) == "user":
             raise ConfigError(f"{user_path}: {exc.path}", exc.message) from exc
         raise
 
 
-def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
+def _switched_off(project: dict, merged: dict) -> tuple[str, ...]:
+    """The obligation ids a layer switched off, for `validate` to report (the merge drops a `null`, and a `null`
+    `policy` or `obligations` drops them all): each engine default missing from the merged obligations, then the
+    floor when the pack file sets it to `null`."""
+    def entries(data: Any) -> dict:
+        policy = data.get("policy") if isinstance(data, dict) else None
+        found = policy.get("obligations") if isinstance(policy, dict) else None
+        return found if isinstance(found, dict) else {}
+
+    engine, kept = entries(layers.base_layers(project.get("starter"))[0].data), entries(merged)
+    ids = [key for key in engine if key != FLOOR_ID and key not in kept]
+    if FLOOR_ID in entries(project) and entries(project)[FLOOR_ID] is None:
+        ids.append(FLOOR_ID)
+    return tuple(ids)
+
+
+def _build_policy(policy: dict, disabled: tuple[str, ...]) -> Policy:
+    """The obligations, in layer order, then the engine floor, whatever the layers say. An evidence item that does
+    not parse becomes `UNRECOGNISED`, which `conformance.evaluate` never counts as met, so a typo fails closed;
+    `validate` reports it from the text."""
+    entries = _optional(policy, "obligations", "policy", dict, {})
+    out: dict[str, Obligation] = {}
+    for key, entry in entries.items():
+        path = f"policy.obligations.{key}"
+        if not isinstance(key, str):
+            raise ConfigError("policy.obligations", f"an obligation id is text, got {key!r}")
+        if key == FLOOR_ID:
+            continue
+        if not isinstance(entry, dict):
+            raise ConfigError(path, "expected a mapping with `require` (and optionally `when` and `lanes`)")
+        parsed = (parse_evidence(item) for item in _string_list(entry.get("require", []), f"{path}.require"))
+        out[key] = Obligation(
+            id=key,
+            require=tuple(UNRECOGNISED if item is None else item for item in parsed),
+            when=_optional(entry, "when", path, str, None),
+            lanes=tuple(_string_list(entry.get("lanes", []), f"{path}.lanes")),
+        )
+    out[FLOOR_ID] = Obligation(FLOOR_ID, (Evidence("gates", "verify"),))
+    return Policy(enforce=_optional(policy, "enforce", "policy", str, "report"), obligations=out, disabled=disabled)
+
+
+def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, ...] = ()) -> Config:
     origins: dict[str, str] = {}
     raw = _resolve(merged, "", merged, (), origins)
 
@@ -848,6 +935,7 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
     context = _require(raw, "context", "", dict)
     memory = _optional(raw, "memory", "", dict, {})
     issues = _optional(raw, "issues", "", dict, {})
+    policy = _optional(raw, "policy", "", dict, {})
     guardrails = _require(raw, "guardrails", "", dict)
     recovery = _optional(raw, "recovery", "", dict, {})
     agents = _require(raw, "agents", "", dict)
@@ -938,6 +1026,7 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
         skills_map=_skills_map(raw),
         merged=merged,
         layer_origins=layer_origins,
+        policy=_build_policy(policy, disabled),
     )
 
 
@@ -1550,6 +1639,68 @@ class _Validator:
                 self.error("issues.epic_labels", f"entry {i} must be a non-empty one-line label of at most 50 characters "
                            "(`[]` means no issue is an epic)")
 
+    def policy(self) -> None:
+        """`policy`: the mode, and each obligation's `when`, `lanes` and evidence, read from the text of the config
+        (an item that does not parse is not in the dataclass). An engine default that cannot hold in this pack's
+        workflow is an error that says how to switch it off, since the pack, not the engine, owns the workflow."""
+        cfg = self.cfg
+        pol = cfg.policy
+        if pol.enforce not in ENFORCE_MODES:
+            self.error("policy.enforce", f"must be one of {', '.join(ENFORCE_MODES)}")
+        raw = cfg.raw.get("policy")
+        entries = raw.get("obligations") if isinstance(raw, dict) and isinstance(raw.get("obligations"), dict) else {}
+        for key in pol.disabled:
+            where = f"policy.obligations.{key}"
+            if key == FLOOR_ID:
+                self.add("warning", where, f"{FLOOR_ID} cannot be removed: it is the obligation `gates:verify`, and it stays")
+            else:
+                self.add("warning", where, f"the obligation '{key}' is switched off (`null`), so no run shows evidence for it")
+        if FLOOR_ID in entries:
+            self.add("warning", f"policy.obligations.{FLOOR_ID}",
+                     f"{FLOOR_ID} cannot be removed or changed: this entry is ignored")
+        lane_steps: dict[str, set[str]] = {}
+        for lane in cfg.lanes:
+            lane_steps[lane] = _lane_step_ids([s for phase in cfg.phases.values() for s in phase.steps], lane)
+        for key, ob in pol.obligations.items():
+            if key == FLOOR_ID:
+                continue
+            where = f"policy.obligations.{key}"
+            entry = entries.get(key)
+            if not isinstance(entry, dict):
+                continue
+            engine = cfg.layer_origins.get(("policy", "obligations", key)) == "engine"
+            off = f"; set policy.obligations.{key}: null to switch it off" if engine else ""
+            for unknown in entry:
+                if unknown not in ("require", "when", "lanes"):
+                    self.error(_join(where, str(unknown)), "unknown obligation key; an obligation has `require`, `when` and `lanes`")
+            if ob.when is not None:
+                self.condition(ob.when, _join(where, "when"))
+            if not engine:
+                for lane in ob.lanes:
+                    if lane not in cfg.lanes:
+                        self.error(_join(where, "lanes"), f"unknown lane '{lane}'; known: {', '.join(cfg.lanes)}")
+            applicable = [lane for lane in (ob.lanes or tuple(cfg.lanes)) if lane in cfg.lanes]
+            items = entry.get("require")
+            if not isinstance(items, list) or not items:
+                self.error(_join(where, "require"), "needs at least one evidence item such as `step:verify`")
+                continue
+            for i, text in enumerate(items):
+                at = f"{where}.require[{i}]"
+                evidence = parse_evidence(text) if isinstance(text, str) else None
+                if evidence is None:
+                    self.error(at, f"'{text}' is not evidence: use gates:<set>, step:<id>, approval:<phase> or expect:red_then_green")
+                elif evidence.kind == "gates" and evidence.arg not in cfg.gate_sets:
+                    self.error(at, f"'{evidence.arg}' is not a gate set{off}")
+                elif evidence.kind == "step" and applicable and not any(evidence.arg in lane_steps[lane] for lane in applicable):
+                    self.error(at, f"no step '{evidence.arg}' in the workflow of {', '.join(applicable)}{off}")
+                elif evidence.kind == "approval":
+                    phase = cfg.phases.get(evidence.arg)
+                    if phase is None or not phase.needs_approval:
+                        # an engine default only warns: Settings can turn a phase's approval off, and the pack can then
+                        # switch the obligation off in the file; a pack-written one is an error
+                        self.add("warning" if engine else "error", at,
+                                 f"'{evidence.arg}' is not a phase with needs_approval: true{off}")
+
     def lessons(self) -> None:
         """The pack's lessons file (beside the config): each malformed entry, unknown phase and unknown target is
         a warning, since a bad entry is only left out of prompts. A passed `review_by` is never one, so the date
@@ -1680,6 +1831,15 @@ class _Validator:
                 self.error(where, "`new_module` belongs to the module_lane and needs dashboard.backlog.module_row")
 
 
+def _lane_step_ids(steps: list[Step], lane: str) -> set[str]:
+    """The ids of the steps a run of `lane` walks, nested steps (a group's, a `repeat`'s) included."""
+    ids: set[str] = set()
+    for step in for_lane(steps, lane):
+        ids.add(step.id)
+        ids |= _lane_step_ids(step.steps, lane)
+    return ids
+
+
 def _all_step_ids(steps: list[Step]) -> set[str]:
     ids: set[str] = set()
     for step in steps:
@@ -1746,6 +1906,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.context()
     v.memory()
     v.issue_policy()
+    v.policy()
     v.approval()
     v.autonomy()
     v.overlays()

@@ -263,7 +263,7 @@ Decides open questions in the idea doc. Like every lane it works in its own work
 | Everything waiting on you | `agentflow inbox` |
 | Continue a paused, `stalled`, `error` or `ready` run | `agentflow resume <run>` (a stop waiting on you stays until you approve, answer or reject it) |
 | Finish a `ready` run here and open its draft PR | `agentflow resume <run> --mark-done` |
-| Run a step again in a fresh session | `agentflow retry <run> <step-key>` (with no key: the run's failed step, which only a `guard_violation` leaves) |
+| Run a step again in a fresh session | `agentflow retry <run> <step-key>` (with no key: the run's failed step, which only a `guard_violation` leaves). On a step of a phase that is already approved, the retry walks that phase again once; on a `conformance_failed` stop it also clears the stop, so `finish` audits again |
 | Pause (the running step finishes first) | `agentflow pause <run>` |
 | End a run and stop its agents (cannot be undone) | `agentflow cancel <run>` |
 | Open the waiting step's Claude session by hand (no runner may be live) | `agentflow attach <run>` (then `agentflow resume <run>`) |
@@ -339,6 +339,7 @@ agentflow approve <run> <phase|step-key> [--budget N]   # soft budget notifies, 
 agentflow reject <run> <phase|step-key> --note "…"     # a stop inside a plan task refines only that task
                                                        #   (`reject <run> <task-stop-key>`); a batched task's stop is rejected phase-level
 agentflow retry <run> <step-key>                    # a fresh session
+                                                    #   on a step of a phase that is already approved, the phase is walked again once
 agentflow pause | resume | cancel <run>
 agentflow resume <run> --mark-done                  # a ready run: skip to ship, open the draft PR
 agentflow dashboard                                 # token is in the URL fragment; keep it private
@@ -352,6 +353,8 @@ agentflow retro [--since YYYY-MM-DD]                # lessons from the runs ende
 agentflow retro --dry-run                           # print the digest and the session's prompt; creates nothing
 agentflow lessons [--json]                          # each lesson's verdict: its target before and after the runs that
                                                     #   carried it
+agentflow scorecard [--freeze]                      # the finished runs' signals against the baseline frozen on this machine,
+                                                    #   conformance first; also the dashboard's Metrics tab
 ```
 
 ## 11. Safety model in five lines
@@ -452,6 +455,16 @@ A live run sees a change to any layer file between its phases: the runner takes 
 - `issues.in_progress_label`: the label a run started from an issue puts on it, `agentflow:in-progress` by default; `validate` wants a string of at most 50 characters with no newline and no comma (`gh` splits `--add-label` on commas), not starting with `-`. `""` turns off the label and the start comment, but never the PR link. Not protected.
 - `issues.comment`: whether a run started from an issue also posts one comment on it when the run starts, `true` by default; `validate` wants a bool. Not protected.
 - `issues.epic_labels`: the labels that mark an issue as an epic, `["epic"]` by default; an issue with one of them gets `Refs #N` and never `Closes #N`. `validate` wants a list of non-empty one-line strings of at most 50 characters each, and `[]` means no issue is an epic. Not protected.
+- `policy.enforce`: `report` (the default) or `block`; `validate` wants one of the two, and the audit treats any other value as `block`. It is the mode of the conformance bar a finished run is held to. Protected: a Settings page that could relax the bar would defeat it, and it is never a user key.
+- `policy.obligations`: what a finished run must show evidence for, a mapping from a stable id to `{require: [...], when: <condition>, lanes: [...]}`. The layers merge it by id, and each entry replaces the entry of the same id whole. The engine ships `verified`, `reviewed`, `plan_approved` (feature lane) and `red_then_green` (bug lane); a pack adds its own, and `<id>: null` switches a default off, which `validate` reports as a warning. `engine_floor` (`gates:verify`) is added after the layers merge and no layer can remove or replace it. `when` names a condition, and an unknown result counts as holding. `lanes` filters like a step's `lanes`, and an absent one means every lane. `validate` checks that `when` is a known condition, that each `lanes` entry of an obligation the pack writes is a lane, that each `require` item parses, and that it names something this pack has; an engine default that names a step the pack's workflow lacks is an error that says to set it to `null`, and an engine default `approval:<phase>` naming a phase without `needs_approval: true` is a warning (set it to `null` to silence it). Protected. Each `require` item is one of:
+
+  | Evidence | Satisfied when |
+  |---|---|
+  | `gates:<set>` | every gate in `gate_sets.<set>` has a passing (or skipped) result on the final tree |
+  | `step:<id>` | the step finished after the last code change, with no blocking finding left (or a human approved the phase after them). A step's own commit is not a later change, nor is a commit whose step ran every gate of `gate_sets.verify` (a refine-round fix); a conflicted merge of the base branch always is |
+  | `approval:<phase>` | a human approved that phase (a phase with `needs_approval: true`), or its artifact was already on the base branch |
+  | `expect:red_then_green` | the bug lane's regression test was seen red, then green, after the last code change (the same exceptions as `step:`) |
+
 - `gates`: names to shell commands, with `cwd`, `when_exists`, `baseline` and `agent_check`. Protected.
 - `gates_confirmed`: `true` once a human has checked `gates` and `gate_sets`, whether the pack wrote them or inherited them from a starter or the engine. Anything but `true` (absent included) is a `validate` warning, "detected or inherited gates are a proposal"; a value that is not a bool is an error. It is a bool, not bound to the commands that were confirmed: when an engine upgrade changes a starter's gates, `validate` does not ask again, so the release notes of an engine that changes a starter must say so. Protected, so the Settings page cannot confirm for you.
 - `gates.<name>.baseline`: `red` records that the gate failed on `project.base_branch` when the pack was set up, and is a `validate` warning ("`<gate>` failed on `<base_branch>` when the pack was set up: fix it and remove `baseline`, or delete the gate"); `green` is allowed; any other value is an error. Protected, as `gates` is.
@@ -483,6 +496,10 @@ There are two layers of lessons:
 - **The pack's `.agentflow/lessons.md`** holds this repository's rules, with ids `L-NNNN`. A merged retro PR or a human changes it. Its path is fixed (there is no config key), it is under the engine floor (`.agentflow/**`), so no agent in a run can edit it, and only the main checkout's copy is read.
 
 A step gets the lessons for every phase plus those whose `applies` names its phase, engine lessons first, and none that is past its `review_by`. The slot holds at most `memory.lessons_max_tokens` (1500 by default; 0 turns lessons off). Over that, the lowest-numbered pack lessons are dropped first, the engine's last, and the run records `memory_truncated`. Each fresh session records which lessons it carried (`lessons_injected`). A result may list the ones it used in `lessons_cited`, and the runner records each as `lesson_cited`.
+
+The conformance audit at `finish` (section 14, `policy`) adds two signals, `conformance_missing` and `conformance_waived`: the obligations that had no evidence, or were waived, at the run's last audit. They reach the retro's digest like every other signal, and `agentflow scorecard` (and the dashboard's Metrics tab) compares them, with the gate and cost signals, against a baseline frozen with `agentflow scorecard --freeze`. A `conformance_missing` above 0 is an SLO breach, and the scorecard lists it first.
+
+`policy.enforce: block` is a process control, not a security boundary. A run's agent can still write outside its worktree: its shell reaches the run's `events.jsonl` and the main checkout's pack, so an agent set on it could forge evidence or loosen the policy. A pack that relies on `block` to keep unproven work from being pushed should also sandbox the agent, so it can write only its worktree and its workspace.
 
 ### How a retro runs
 

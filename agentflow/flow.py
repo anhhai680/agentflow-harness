@@ -817,6 +817,38 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scorecard(args: argparse.Namespace) -> int:
+    """The finished runs' signals against a frozen baseline; `--freeze` writes the baseline."""
+    import json as _json
+    from datetime import UTC, date, datetime
+
+    from agentflow.config import check_lane
+    from agentflow.scorecard import freeze, scorecard_table, scorecard_view
+
+    try:
+        repo, cfg = _find_repo(), _load_cfg(args)
+        if args.lane is not None:
+            check_lane(cfg, args.lane)
+        date_from = date.fromisoformat(args.date_from) if args.date_from else None
+        date_to = date.fromisoformat(args.date_to) if args.date_to else None
+        now = datetime.now(UTC)
+        if args.replace and not args.freeze:
+            raise ValueError("--replace goes with --freeze")
+        if args.freeze:
+            data = freeze(repo, args.lane, date_from, date_to, args.replace, now)
+            print(f"froze the baseline of {', '.join(data['lanes']) or 'no lanes'}")
+            return 0
+        view = scorecard_view(repo, args.lane, date_from, date_to, now)
+    except FileExistsError as exc:
+        print(f"error: {exc}")
+        return 1
+    except (*_human_errors(), OSError) as exc:
+        print(f"error: {exc}")
+        return 1
+    print(_json.dumps(view, indent=2) if args.json else scorecard_table(view))
+    return 0
+
+
 def cmd_lessons(args: argparse.Namespace) -> int:
     """Every lesson, with its target signal before and after the runs that carried it."""
     import json as _json
@@ -1093,6 +1125,16 @@ def build_parser() -> argparse.ArgumentParser:
     shape.add_argument("--csv", action="store_true", help="one row per run, phase, model and effort")
     met.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     met.set_defaults(func=cmd_metrics)
+
+    sco = sub.add_parser("scorecard", help="the finished runs' signals against a frozen baseline, conformance first")
+    sco.add_argument("--lane", help="only this lane")
+    sco.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD", help="runs that ended on or after")
+    sco.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD", help="runs that ended on or before")
+    sco.add_argument("--json", action="store_true", help="the full data as JSON")
+    sco.add_argument("--freeze", action="store_true", help="record the baseline from the finished runs in range")
+    sco.add_argument("--replace", action="store_true", help="with --freeze: replace a baseline that already exists")
+    sco.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+    sco.set_defaults(func=cmd_scorecard)
 
     les = sub.add_parser("lessons", help="each lesson's target signal before and after the runs that carried it")
     les.add_argument("--json", action="store_true", help="the full data as JSON")

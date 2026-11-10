@@ -311,6 +311,10 @@ phase_approval:                  # raised after a phase with needs_approval: tru
 checkpoints:                     # inner checkpoints, inside a phase
   idea_answers:       human      # always: product questions
 
+policy:                          # the engine's four obligations apply as they are; this pack adds one more
+  obligations:
+    security_reviewed: {when: security_path, require: ["step:security_review"]}
+
 hitl:
   notify:
     - {type: terminal_bell}

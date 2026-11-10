@@ -26,6 +26,7 @@ from .config import KNOWN_EFFORT_LEVELS, RETRO_PIPELINE, Config, check_lane
 from .events import EventError, EventLog, RunLock, lock_state, nfc, now_iso
 
 TERMINAL = ("done", "failed", "cancelled")
+MARKED_DONE_SKIP = "marked done after"  # the `reason` prefix of a `phase_skipped` that a mark-done caused
 SLUG_PARAMS = ("slug", "module", "issue", "topic", "task", "log")  # an explicit slug (an issue's) wins
 SLUG_MAX = 40
 ENGINE_PIPELINES = (RETRO_PIPELINE,)  # pipelines the engine runs itself (`Run.create(..., engine_pipeline=True)`)

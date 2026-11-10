@@ -64,11 +64,12 @@ from agentflow.gitops import (
     diff_stat,
     head,
 )
+from agentflow.guards import snapshot
 from agentflow.hitl import notify_run, open_refine
 from agentflow.intake import gather, save
 from agentflow.issue_status import mark, release
 from agentflow.lanes import Executor, Outcome, footer_next
-from agentflow.state import TERMINAL, Run
+from agentflow.state import MARKED_DONE_SKIP, TERMINAL, Run
 
 DEFAULT_SHOW = ["handoff", "diff", "step_results", "skipped_steps", "gates", "review_findings"]
 DONE_STEPS = ("done", "unchanged")
@@ -336,7 +337,7 @@ class _Loop:
             if self.walk(phase, executor)[0] == "stopped":
                 return self.status()
             return self.settle(names, index, executor)
-        if row.get("status") == "approved":
+        if row.get("status") == "approved" and not retried(run.events.read(), name):
             if not row.get("handoff"):
                 self.hand_off(names, index, executor)
             return None
@@ -344,7 +345,7 @@ class _Loop:
             return None
         marked = state["marked_done"]
         if marked and index < len(names) - 1 and row.get("status") in (None, "pending"):
-            run.emit("phase_skipped", phase=name, reason=f"marked done after {marked['phase']}")
+            run.emit("phase_skipped", phase=name, reason=f"{MARKED_DONE_SKIP} {marked['phase']}")
             return None
         if row.get("status") in (None, "pending"):
             if phase.skip_if is not None:
@@ -352,7 +353,7 @@ class _Loop:
                 if skip is None:
                     return self.status()
                 if skip:
-                    run.emit("phase_skipped", phase=name, reason=reason)
+                    run.emit("phase_skipped", phase=name, reason=reason, via="skip_if", decided_by=executor.last_decided_by)
                     return None
             run.emit("phase_started", phase=name, start_sha=head(self.worktree))
         outcome, ran = self.walk(phase, executor)
@@ -386,8 +387,9 @@ class _Loop:
             raise_phase_approval(self.cfg, self.run, name)
             return "awaiting_approval"
         findings = phase_findings(self.cfg, self.run, name)
+        tree = snapshot(self.worktree) if findings else ""
         for key in dict.fromkeys(f["key"] for f in findings):  # for the pull request: this round's, kept per step
-            self.run.emit("step_findings", key=key, findings=[f for f in findings if f["key"] == key])
+            self.run.emit("step_findings", key=key, findings=[f for f in findings if f["key"] == key], tree=tree)
         blocking = blocking_of(self.cfg, findings)
         if not blocking:
             self.run.emit("phase_approved", by=AUTO_BY, phase=name, sha=head(self.worktree))
@@ -409,6 +411,18 @@ class _Loop:
         if got and expected and got.lstrip("/") != expected.lstrip("/"):
             self.run.emit("footer_mismatch", phase=name, expected=expected, got=got)
         self.run.emit("handoff_written", phase=name, path=str(path))
+
+
+def retried(events: list[dict], phase: str) -> bool:
+    """Whether a human retried a step of `phase` (`agentflow retry`) since the phase was last approved: an approved
+    phase is then walked once more and settled again, so the step's run is real evidence and a phase that needs a
+    human asks again. Event order decides it, never a step row: a retried key the walk does not visit (a task that
+    already committed) would otherwise keep the phase reopening. The new `phase_approved` ends it."""
+    prefix = f"{phase}/"
+    retry = max((e["seq"] for e in events if e.get("type") == "step_retry" and str(e.get("key") or "").startswith(prefix)),
+                default=0)
+    approved = max((e["seq"] for e in events if e.get("type") == "phase_approved" and e.get("phase") == phase), default=0)
+    return retry > approved
 
 
 def refining(state: dict, phase: str) -> bool:

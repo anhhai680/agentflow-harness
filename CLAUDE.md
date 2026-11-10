@@ -37,6 +37,7 @@ bin/agentflow run <lane> ... --dry-run         # prints the commands and creates
 bin/agentflow next | status | inbox | dashboard
 bin/agentflow retro [--since YYYY-MM-DD] [--dry-run] # lessons from the finished runs as a draft PR (--dry-run: digest and prompt only)
 bin/agentflow lessons [--json]                 # each lesson's target signal before and after the runs that carried it
+bin/agentflow scorecard [--freeze]            # the finished runs' signals against a frozen baseline; conformance misses are the SLO
 bin/agentflow doctor                           # agent CLIs and logins, gh, origin, Docker, the state dir, each gate's programs
 bin/agentflow config show --effective [PREFIX] # every value after the layers merge, with the layer it came from
 agentflow init [--starter NAME] [--baseline]   # in another repository: write a sparse pack (playbook §13)
@@ -74,6 +75,7 @@ State and the pack:
   So a pack states only what differs, and `config show --effective` prints each value's layer.
 - **A step's skill is its brief.** A step with no `brief:` of its own gets its skill's `SKILL.md` as its first brief, read from the main checkout and never from a run's worktree. `skills/agentflow-<stage>/SKILL.md` are the bundled generic skills (define, plan, build, debug, verify, review, respond), so a repository with no skills dir still works.
 - `conditions.py` holds the named condition checks (`file_exists`, `grep`, `section_items`, `status_line`, `changed_paths`, `plan_tasks`, …), the prompt placeholders, and `agentflow explain`. `sources.py` reads plans and specs. `work_source.py` and `module_queue.py` handle `next` and `queue`.
+- `policy.py` merges the `policy.obligations` (the engine's `verified`, `reviewed`, `plan_approved` and `red_then_green`, plus the pack's; the `engine_floor` can't be removed) and reads `policy.enforce`. `conformance.py` audits them at `finish`, before the push, from the run's own `events.jsonl` and the tree about to be pushed; it runs a gate that has no passing result there, records `conformance_checked`, and in `block` mode stops the run with `conformance_failed`. `scorecard.py` freezes a baseline of the finished runs' signals (through `safeio`) and compares the later runs with it for `agentflow scorecard` and the dashboard's Metrics tab.
 
 Lessons and retros (playbook §15):
 - `signals.py` turns one run's events and metrics into signals keyed in a fixed vocabulary (`gate_first_pass:<gate>`, `fix_attempts:<phase>`, `ci_rounds`, …). A lesson's `target` is one of these keys. Pure functions: it reads no file and no clock.

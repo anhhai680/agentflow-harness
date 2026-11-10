@@ -607,6 +607,33 @@ Every later slice then lands in the engine already generic. The engine already l
 - Reuse: `conditions.evaluate`/`explain`, `guards.check_step`/`snapshot`, `autonomy.Resolver`, `module_queue.py`, `metrics.run_metrics`/`aggregate`
 - Docs: new `docs/agentflow-harness-proposal.md` (this proposal), then `docs/agentflow-playbook.md` and the CLAUDE.md engine sections once each slice ships
 
+## 6. Amendments (2026-11-10)
+
+These are decisions from a grilling session. Where they differ from sections 3 to 5 above, these win. The rest of the design stands as written.
+
+1. **Hybrid decisions (changes 3.3).** Runner heuristics from `stats.json` set each choice's default. The conductor overrides them only at its decision points. Each step keeps its sizing turn, which may still change its effort within `effort.allowed` (`lanes.py`, `effort_change`). A prior counts only once it has `conductor.min_samples` samples (default 5). Until then the heuristic falls back to today's configured model: `phases.<p>.model`, then `agents.<a>.models`. A new repository therefore behaves exactly as it does today.
+2. **L1 granularity (changes 3.8).** The model is chosen per plan task in build, and per step everywhere else. It comes only from `agents.<a>.models_allowed.<role>`, the pack's list of models a role may use with that agent. The conductor sets a step's *starting* effort. It never switches the agent CLI mid-run, because a run keeps `defaults.agent`.
+3. **The L2 set is fixed (changes 3.8).** The full set is:
+   - skip grilling
+   - skip the per-task review on a trivial task
+   - add a read-only spike
+   - split or merge plan tasks
+   - for a small `--task` with no spec, collapse `define` and `plan` into one short plan
+
+   A human still approves that plan. `approval:plan`, `gates:verify`, `branch_review` and the security overlay can't be skipped at any level.
+4. **Promotion threshold (changes 3.8).** `autonomy.promote_after_runs` (default 10) replaces the fixed "≥10 runs". Promotion stays a human edit, and demotion stays automatic.
+5. **Human view of a route (adds to 3.3).** The adopted route and its rationale appear in a dashboard Route view and in the PR body, next to the Conformance table. Nobody approves a route before it runs. `agentflow run ... --route reference` forces the reference route for that one run.
+6. **The route-eval suite starts small (changes 4.3).** It starts with the snapshots that exist: past runs plus hand-made cases from the fixture packs. It requires 100% obligation coverage from the first case and grows toward about 30.
+7. **Rollout (changes 5).** Step 0 folds into step 1, so a single slice adds `tree_sha`, the scorecard, the policy and the conformance audit. Steps 1, 2 and 3a are hard prerequisites before any conductor choice takes effect (step 4). L1 lands on `bug` first, then on `feature`.
+
+New config keys, each with its four companions (CLAUDE.md invariants):
+
+| Key | Settings | `validate` | `test_config_edit` case | Playbook §14 |
+|---|---|---|---|---|
+| `agents.<a>.models_allowed.<role>` | `_PROTECTED_KEYS` (it bounds the conductor) | a non-empty list per role that contains the role's fallback in `agents.<a>.models` | refused as protected | one line |
+| `conductor.min_samples` | Form, "Conductor" section (int) | an int ≥ 1 | round-trips through propose/save | one line |
+| `autonomy.promote_after_runs` | `_PROTECTED_KEYS` | an int ≥ 1; a level above L0 with fewer finished runs at the level below is refused | refused as protected | one line |
+
 ## Next step
 Each slice is planned with `writing-plans` (`docs/plans/YYYY-MM-DD-agentflow-harness-<slice>.md`), starting with slice P (engine/pack separation).
 
