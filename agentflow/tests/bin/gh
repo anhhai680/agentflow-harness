@@ -9,6 +9,16 @@ comma-separated `$FAKE_GH_MERGEABLE` (the last one repeating; default MERGEABLE;
 an issue titled `Issue N`); `pr checks` plays the next entry of the JSON list in the file `$FAKE_GH_CHECKS`
 (`{"checks": [...], "exit": 8, "stderr": "..."}`, the last one repeating; the place is kept in `<file>.cursor`);
 anything else prints `$FAKE_GH_JSON` (default `[]`). `$FAKE_GH_FAIL` makes every call fail with exit 1.
+`$FAKE_GH_FAIL_ON` is a space-separated argv prefix (`"issue edit"`): a call that starts with it fails with
+exit 1, after it is logged. `$FAKE_GH_NO_LABEL` makes the first `issue edit ... --add-label <l>` fail with
+"label not found" on stderr (the marker file `$FAKE_GH_LOG.nolabel` makes it fire once). `issue edit`,
+`issue comment` and `label create` otherwise print `[]` and exit 0. `pr view ... --json id,closingIssuesReferences`
+(or `--json closingIssuesReferences`) prints `{"id": ..., "closingIssuesReferences": [{"number": n}, ...]}`: the id
+is `$FAKE_GH_PR_ID` when that is set (even to ""), else `PR_fake`, and the numbers are those in the comma-separated
+`$FAKE_GH_CLOSING` plus each line of the file `$FAKE_GH_LOG.closing`. The default `issue view N` reply carries
+`"id": "I_fakeN"`. `api graphql` with `addCloseIssueReferences` in its `query=` argument appends the issue's number
+(from its `issue=I_fakeN` variable) to `$FAKE_GH_LOG.closing`, unless `$FAKE_GH_LINK_IGNORED` is set, and prints
+`{"data": {"addCloseIssueReferences": {"clientMutationId": null}}}`.
 """
 
 import json
@@ -23,6 +33,17 @@ if log:
 if os.environ.get("FAKE_GH_FAIL"):
     sys.stderr.write("fake gh: failing as asked\n")
     sys.exit(1)
+fail_on = os.environ.get("FAKE_GH_FAIL_ON", "").split()
+if fail_on and args[: len(fail_on)] == fail_on:
+    sys.stderr.write("fake gh: failing as asked\n")
+    sys.exit(1)
+if os.environ.get("FAKE_GH_NO_LABEL") and args[:2] == ["issue", "edit"] and "--add-label" in args:
+    marker = (log or "/tmp/fake_gh") + ".nolabel"
+    if not os.path.exists(marker):
+        open(marker, "w", encoding="utf-8").close()
+        label = args[args.index("--add-label") + 1]
+        sys.stderr.write(f"could not add label: '{label}' not found\n")
+        sys.exit(1)
 if args[:2] == ["pr", "create"]:
     print(os.environ.get("FAKE_GH_URL", "https://github.com/example/repo/pull/1"))
 elif args[:2] == ["pr", "checks"] and os.environ.get("FAKE_GH_CHECKS"):
@@ -39,6 +60,22 @@ elif args[:2] == ["pr", "checks"] and os.environ.get("FAKE_GH_CHECKS"):
     if entry.get("stderr"):
         sys.stderr.write(entry["stderr"] + "\n")
     sys.exit(entry.get("exit", 0))
+elif args[:2] == ["pr", "view"] and "--json" in args and args[args.index("--json") + 1:][:1] in (
+        ["id,closingIssuesReferences"], ["closingIssuesReferences"]):
+    numbers = [n for n in os.environ.get("FAKE_GH_CLOSING", "").split(",") if n.strip()]
+    closing = (log or "/tmp/fake_gh") + ".closing"
+    if os.path.exists(closing):
+        numbers += [line for line in open(closing, encoding="utf-8").read().splitlines() if line.strip()]
+    pr_id = os.environ["FAKE_GH_PR_ID"] if "FAKE_GH_PR_ID" in os.environ else "PR_fake"
+    refs = [{"number": int(n) if n.strip().isdigit() else n.strip()} for n in numbers]
+    print(json.dumps({"id": pr_id, "closingIssuesReferences": refs}))
+elif args[:2] == ["api", "graphql"]:
+    query = next((a[len("query="):] for a in args if a.startswith("query=")), "")
+    issue = next((a[len("issue="):] for a in args if a.startswith("issue=")), "")
+    if "addCloseIssueReferences" in query and issue.startswith("I_fake") and not os.environ.get("FAKE_GH_LINK_IGNORED"):
+        with open((log or "/tmp/fake_gh") + ".closing", "a", encoding="utf-8") as handle:
+            handle.write(issue[len("I_fake"):] + "\n")
+    print(json.dumps({"data": {"addCloseIssueReferences": {"clientMutationId": None}}}))
 elif args[:2] == ["pr", "view"] and "--json" in args and args[args.index("--json") + 1].startswith("mergeable"):
     verdicts = os.environ.get("FAKE_GH_MERGEABLE", "MERGEABLE").split(",")
     cursor = (log or "/tmp/fake_gh") + ".mergeable"
@@ -49,7 +86,8 @@ elif args[:2] == ["pr", "view"] and "--json" in args and args[args.index("--json
 elif args[:2] == ["pr", "view"] and "--json" in args and "state" in args[args.index("--json") + 1:][:1]:
     print(json.dumps({"state": os.environ.get("FAKE_GH_STATE", "OPEN")}))
 elif args[:2] == ["issue", "view"] and len(args) > 2:
-    default = {"title": f"Issue {args[2]}", "body": "", "url": f"https://github.com/example/repo/issues/{args[2]}"}
+    default = {"title": f"Issue {args[2]}", "body": "", "url": f"https://github.com/example/repo/issues/{args[2]}",
+               "id": f"I_fake{args[2]}"}
     print(os.environ.get("FAKE_GH_ISSUE") or json.dumps(default))
 else:
     print(os.environ.get("FAKE_GH_JSON", "[]"))

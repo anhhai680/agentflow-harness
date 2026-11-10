@@ -883,3 +883,34 @@ def test_a_starter_is_a_layer_below_the_pack_on_the_page(sparse_repo, monkeypatc
     assert sorted(changed_lines(proposal.diff)) == ["+autonomy: {resolve_kinds: {new_kind: 1}}"]
     config_edit.save(path, proposal)
     assert load_config(path).autonomy["resolve_kinds"] == changed
+
+
+# --------------------------------------------------------------------------- the Issues section
+
+
+def test_the_issues_section_edits_round_trip(sparse_repo):
+    path = _sparse(sparse_repo)
+    fields = _fields(path)
+    assert fields[("issues", "in_progress_label")]["source"] == "engine"
+    proposal = _sparse_form(path, (["issues", "in_progress_label"], ""), (["issues", "comment"], False),
+                            (["issues", "epic_labels"], ["epic", "initiative"]))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    cfg = load_config(path)
+    assert (cfg.issues.in_progress_label, cfg.issues.comment, cfg.issues.epic_labels) == ("", False, ("epic", "initiative"))
+
+
+@pytest.mark.parametrize("key, value", [
+    (["issues", "in_progress_label"], "a,b"),    # validate refuses it
+    (["issues", "in_progress_label"], "two\nlines"),  # allow_empty keeps the newline check
+    (["issues", "in_progress_label"], "x" * 501),      # and the length check
+    (["issues", "comment"], "no"),               # the field's kind
+    (["issues", "epic_labels"], "epic"),         # not a list
+])
+def test_the_issues_section_refuses_bad_values(sparse_repo, key, value):
+    path = _sparse(sparse_repo)
+    try:
+        proposal = _sparse_form(path, (key, value))
+    except EditError:
+        return
+    assert proposal.errors

@@ -76,6 +76,7 @@ from agentflow.gitops import (
 )
 from agentflow.guards import changed_paths, snapshot
 from agentflow.hitl import ResultError, clean_fact, notify_run, raise_hitl, read_result
+from agentflow.issue_status import link
 
 if TYPE_CHECKING:
     from agentflow.state import Run
@@ -754,6 +755,7 @@ class FeatureLane:
         target = self.cfg.project.fork_from
         opened = [e for e in self.run.events.read() if e["type"] == "pr_opened" and e.get("key") == key]
         if opened:
+            link(self.run)  # a runner stopped between `pr_opened` and its link links on resume; a no-op once linked
             self.run.emit("step_finished", key=key, status="done", summary=f"draft pull request {opened[-1]['url']}")
             return "done"
         if branch in (self.cfg.project.base_branch, target):
@@ -782,6 +784,7 @@ class FeatureLane:
             raise_hitl(self.cfg, self.run, "blocked", key, f"Could not push {branch} or open the pull request: {exc}")
             return "stopped"
         self.run.emit("pr_opened", url=url, key=key)
+        link(self.run)  # as soon as the PR exists, before a conflict or a CI stop can park the run
         if self.confirm_mergeable(phase, step, key, url) != "done":
             return "stopped"
         self.run.emit("step_finished", key=key, status="done", summary=f"draft pull request {url}")
@@ -913,6 +916,13 @@ def _open_findings(state: dict, events: list[dict]) -> list[str]:
     return [f"- `{key}`: {finding_line(as_finding(f))[2:]}" for key, findings in last.items() for f in findings]
 
 
+def issue_line(params: dict) -> str | None:
+    """`Refs #N` for an epic, `Closes #N` for any other issue, else None. It depends on `params` alone."""
+    if not params.get("issue"):
+        return None
+    return f"{'Refs' if params.get('issue_epic') else 'Closes'} #{params['issue']}"
+
+
 def render_pr_body(run: Run, plan: str | None = None) -> str:
     """The draft pull request's body: plan link, gate summary, spend vs budget, skipped steps and reasons,
     effort changes with reasons, footer mismatches, refine rounds, then the attribution line."""
@@ -936,6 +946,7 @@ def render_pr_body(run: Run, plan: str | None = None) -> str:
     marked = state.get("marked_done")
     parts = [
         f"Opened by agentflow run `{run.id}` ({state.get('pipeline')}) from branch `{branch}`.",
+        issue_line(state.get("params") or {}),
         f"Marked done after `{marked['phase']}` by {marked['by']}: the phases under Skipped steps did not run."
         if marked else None,
         f"Plan: `{plan}`" if plan else "Plan: none",

@@ -66,6 +66,7 @@ from agentflow.gitops import (
 )
 from agentflow.hitl import notify_run, open_refine
 from agentflow.intake import gather, save
+from agentflow.issue_status import mark, release
 from agentflow.lanes import Executor, Outcome, footer_next
 from agentflow.state import TERMINAL, Run
 
@@ -132,13 +133,14 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     if not branch_exists(repo, fork):
         raise GitError(f"project.fork_from {fork!r} is not a local branch of {repo}")
 
-    params, inputs = gather(params, repo)
+    params, inputs = gather(params, repo, cfg.issues.epic_labels)
     run = Run.create(cfg, repo, pipeline, params)
     try:
         _set_up(cfg, repo, run, pipeline, params, inputs, opts)
     except Exception as exc:  # the run exists now: it must never be left `running` with nothing behind it
         run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}")
         raise
+    mark(cfg, run)
     return run
 
 
@@ -224,6 +226,7 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
         raise
     finally:
         lock.release()
+        release(run)  # after the lock, and it never raises, so it cannot hide the exception on its way out
 
 
 class _Loop:

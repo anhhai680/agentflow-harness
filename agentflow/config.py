@@ -289,6 +289,13 @@ class MemoryPolicy:
 
 
 @dataclass
+class IssuePolicy:
+    in_progress_label: str = "agentflow:in-progress"  # "" turns off the label and the start comment, never the PR link
+    comment: bool = True  # also post one comment when a run starts from an issue
+    epic_labels: tuple[str, ...] = ("epic",)  # an issue with one of these gets `Refs #N`, never `Closes #N`
+
+
+@dataclass
 class Gate:
     name: str
     run: str
@@ -391,6 +398,7 @@ class Config:
     skills_map: dict[str, str] = field(default_factory=dict)  # the skill `next` names per kind of step (`skills.map`)
     merged: dict = field(default_factory=dict)  # the layers merged, before `@` resolution (`raw` is after it)
     layer_origins: dict[tuple[str, ...], str] = field(default_factory=dict)  # each leaf of `merged`: its layer's name
+    issues: IssuePolicy = field(default_factory=IssuePolicy)  # what a run started from an issue does on GitHub
 
 
 def for_lane(steps: list[Step], lane: str) -> list[Step]:
@@ -839,6 +847,7 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
     effort = _require(raw, "effort", "", dict)
     context = _require(raw, "context", "", dict)
     memory = _optional(raw, "memory", "", dict, {})
+    issues = _optional(raw, "issues", "", dict, {})
     guardrails = _require(raw, "guardrails", "", dict)
     recovery = _optional(raw, "recovery", "", dict, {})
     agents = _require(raw, "agents", "", dict)
@@ -890,6 +899,11 @@ def _build(merged: dict, layer_origins: dict, path: Path) -> Config:
             lessons_max_tokens=_optional(memory, "lessons_max_tokens", "memory", int, 1500),
             digest_tokens=_optional(memory, "digest_tokens", "memory", int, 15000),
             retro_every_days=_optional(memory, "retro_every_days", "memory", int, 7),
+        ),
+        issues=IssuePolicy(
+            in_progress_label=_optional(issues, "in_progress_label", "issues", str, "agentflow:in-progress"),
+            comment=_optional(issues, "comment", "issues", bool, True),
+            epic_labels=tuple(_string_list(issues.get("epic_labels", ["epic"]), "issues.epic_labels")),
         ),
         gates=_build_gates(_require(raw, "gates", "", dict)),
         gate_sets={name: _string_list(members, f"gate_sets.{name}") for name, members in gate_sets.items()},
@@ -1523,6 +1537,19 @@ class _Validator:
                 self.error(f"memory.{key}", f"must be from {low} to {high}{note}")
         self.lessons()
 
+    def issue_policy(self) -> None:
+        pol = self.cfg.issues
+        label = pol.in_progress_label
+        if len(label) > 50 or "\n" in label or "," in label or label.startswith("-"):
+            self.error("issues.in_progress_label", "must be at most 50 characters with no newline and no comma, and "
+                       "not start with `-` (`\"\"` turns the label and the start comment off)")
+        if not isinstance(pol.comment, bool):
+            self.error("issues.comment", "must be true or false")
+        for i, name in enumerate(pol.epic_labels):
+            if not name.strip() or len(name) > 50 or "\n" in name:
+                self.error("issues.epic_labels", f"entry {i} must be a non-empty one-line label of at most 50 characters "
+                           "(`[]` means no issue is an epic)")
+
     def lessons(self) -> None:
         """The pack's lessons file (beside the config): each malformed entry, unknown phase and unknown target is
         a warning, since a bad entry is only left out of prompts. A passed `review_by` is never one, so the date
@@ -1718,6 +1745,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.effort()
     v.context()
     v.memory()
+    v.issue_policy()
     v.approval()
     v.autonomy()
     v.overlays()

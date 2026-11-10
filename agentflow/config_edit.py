@@ -145,6 +145,11 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("memory", "digest_tokens"), "Retro digest size (tokens)", {"kind": "int", "min": 1000, "max": 50000}),
         (("memory", "retro_every_days"), "Days between retros (0 = manual only)", {"kind": "int", "min": 0, "max": 90}),
     ]),
+    ("Issues", "What a run started from an issue does on GitHub.", [
+        (("issues", "in_progress_label"), "In-progress label (empty = off)", {"kind": "text", "allow_empty": True}),
+        (("issues", "comment"), "Comment when a run starts", {"kind": "bool"}),
+        (("issues", "epic_labels"), "Epic labels (these get Refs, never Closes)", {"kind": "list"}),
+    ]),
     ("Autonomy", "What the runner settles by itself before a human hears of it.", [
         (("autonomy", "non_blocking_severities"), "Non-blocking severities", {"kind": "list"}),
         (("autonomy", "finding_rounds"), "Finding rounds", _INT),
@@ -367,7 +372,8 @@ def _check_value(fdef: dict, value: Any) -> str | None:
         what = "a whole number" if kind == "int" else "a number"
         return f"{label} must be {what}" + (f" ({', '.join(bounds)})" if bounds else "")
     if kind in ("text", "enum"):
-        if not isinstance(value, str) or not value.strip() or "\n" in value or len(value) > 500:
+        empty_ok = kind == "text" and fdef.get("allow_empty") and value == ""
+        if not isinstance(value, str) or not (value.strip() or empty_ok) or "\n" in value or len(value) > 500:
             return f"{label} must be one line of text"
         if kind == "enum" and value not in fdef["options"]:
             return f"{label} must be one of {', '.join(fdef['options'])}"

@@ -36,6 +36,7 @@ from agentflow.config_trust import run_config_path
 from agentflow import pack, safeio
 from agentflow.events import lock_state, parse_iso
 from agentflow.gitops import GitError, commits_between, dirty_paths
+from agentflow.issue_status import link, release
 from agentflow.state import TERMINAL, Run
 
 FLOW = Path(__file__).resolve().parent / "flow.py"
@@ -138,6 +139,9 @@ def archive(run: Run, by: str) -> None:
         if run.state.get("archived"):
             raise ControlError(f"{run.id} is already archived")
         run.emit("run_archived", by=by)
+    # outside the lock, so a gh call never holds it: the second try for a link or a release that failed earlier
+    link(run)
+    release(run)
 
 
 # --------------------------------------------------------------------------- cancel
@@ -267,11 +271,14 @@ def cancel(run: Run, by: str, cfg: Config | None = None, grace_s: float = KILL_G
     with run.locked():
         _refuse_terminal(run, "cancel")
         run.emit("run_cancelled", by=by, killed=verified, skipped=skipped)
-    signalled = [pid for pid in verified if _signal(pid, signal.SIGTERM)]
-    run.refresh()  # an agent started between the check and the event is stopped too
-    late, _ = _verify(run, commands, set(verified), 0.0)
-    signalled += [pid for pid in late if _signal(pid, signal.SIGTERM)]
-    _settle(run, signalled, commands, grace_s)
+    try:
+        signalled = [pid for pid in verified if _signal(pid, signal.SIGTERM)]
+        run.refresh()  # an agent started between the check and the event is stopped too
+        late, _ = _verify(run, commands, set(verified), 0.0)
+        signalled += [pid for pid in late if _signal(pid, signal.SIGTERM)]
+        _settle(run, signalled, commands, grace_s)
+    finally:
+        release(run)  # last, outside the lock: a slow gh call never delays stopping the agents
     return verified + late
 
 

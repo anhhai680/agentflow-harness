@@ -74,6 +74,11 @@ memory:
   digest_tokens: 15000       # the size a retro's digest of recent runs is cut to
   retro_every_days: 7        # days between the retros the runner proposes (0 means manual only)
 
+issues:
+  in_progress_label: "agentflow:in-progress"   # "" turns off the label and the start comment (never the PR link)
+  comment: true                                # also post one comment when a run starts from an issue
+  epic_labels: ["epic"]                        # an issue with one of these gets `Refs #N`, never `Closes #N`
+
 hitl: {}
 
 dashboard:

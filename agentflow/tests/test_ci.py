@@ -274,3 +274,16 @@ def test_the_pull_request_body_is_the_audit_trail(flow_repo, gh):
     assert "src/one.py:9: đổi tên biến" in body
     edits = [c for c in gh.calls() if c[:2] == ["pr", "edit"]]
     assert edits and edits[-1][edits[-1].index("--body-file") + 1] == str(run.dir / "pr.md")  # the final body, not the draft's
+
+
+def test_the_refreshed_body_keeps_the_issue_line(flow_repo, gh, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_ISSUE", json.dumps({"title": "Login breaks", "body": "b", "url": "u", "labels": []}))
+    gh.play(PASS)
+    flow_repo.configure(PIPE, autopilot=True)
+    flow_repo.script({RED: [GOOD_TEST], "build/fix": [FIXED]})
+    run = start(flow_repo.cfg, flow_repo.root, "bug", {"issue": "7"}, RunOptions())
+    assert go(flow_repo, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    assert go(flow_repo, run) == "done"
+    assert (run.dir / "pr.md").read_text(encoding="utf-8").split("\n\n")[1] == "Closes #7"
+    assert gh.did("pr", "edit", URL) and gh.did("pr", "ready", URL)
