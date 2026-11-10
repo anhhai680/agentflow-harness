@@ -268,6 +268,8 @@ Decides open questions in the idea doc. Like every lane it works in its own work
 | End a run and stop its agents (cannot be undone) | `agentflow cancel <run>` |
 | Open the waiting step's Claude session by hand (no runner may be live) | `agentflow attach <run>` (then `agentflow resume <run>`) |
 
+A run started with `--issue N` adds the `issues.in_progress_label` label and one comment to the issue, keeps the label while the run waits, pauses or stops on an error, and removes it when the run ends `done`, `failed` or `cancelled` (or, if GitHub failed then, when the run is archived).
+
 **Stops you will meet** and what to do:
 
 | Stop | Meaning | Do |
@@ -447,6 +449,9 @@ A live run sees a change to any layer file between its phases: the runner takes 
 - `memory.lessons_max_tokens`: the most tokens of lessons a step's prompt carries, 1500 by default; `validate` wants a number from 0 to 4000, and 0 turns lessons off. Not protected.
 - `memory.digest_tokens`: the size a retro's digest of recent runs is cut to, 15000 by default; `validate` wants a number from 1000 to 50000. Not protected.
 - `memory.retro_every_days`: the days between the retros the runner proposes, 7 by default; `validate` wants a number from 0 to 90, and 0 means manual only. Not protected.
+- `issues.in_progress_label`: the label a run started from an issue puts on it, `agentflow:in-progress` by default; `validate` wants a string of at most 50 characters with no newline and no comma (`gh` splits `--add-label` on commas), not starting with `-`. `""` turns off the label and the start comment, but never the PR link. Not protected.
+- `issues.comment`: whether a run started from an issue also posts one comment on it when the run starts, `true` by default; `validate` wants a bool. Not protected.
+- `issues.epic_labels`: the labels that mark an issue as an epic, `["epic"]` by default; an issue with one of them gets `Refs #N` and never `Closes #N`. `validate` wants a list of non-empty one-line strings of at most 50 characters each, and `[]` means no issue is an epic. Not protected.
 - `gates`: names to shell commands, with `cwd`, `when_exists`, `baseline` and `agent_check`. Protected.
 - `gates_confirmed`: `true` once a human has checked `gates` and `gate_sets`, whether the pack wrote them or inherited them from a starter or the engine. Anything but `true` (absent included) is a `validate` warning, "detected or inherited gates are a proposal"; a value that is not a bool is an error. It is a bool, not bound to the commands that were confirmed: when an engine upgrade changes a starter's gates, `validate` does not ask again, so the release notes of an engine that changes a starter must say so. Protected, so the Settings page cannot confirm for you.
 - `gates.<name>.baseline`: `red` records that the gate failed on `project.base_branch` when the pack was set up, and is a `validate` warning ("`<gate>` failed on `<base_branch>` when the pack was set up: fix it and remove `baseline`, or delete the gate"); `green` is allowed; any other value is an error. Protected, as `gates` is.

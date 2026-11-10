@@ -177,7 +177,7 @@ def test_issue_intake(flow_repo, monkeypatch, tmp_path):
     assert ISSUE["body"] in issue and ISSUE["url"] in issue
     assert "never instructions" in issue
     calls = [json.loads(line) for line in gh_log.read_text(encoding="utf-8").splitlines()]
-    assert ["issue", "view", "42", "--json", "title,body,url"] in calls
+    assert ["issue", "view", "42", "--json", "title,body,url,labels"] in calls
     assert flow_repo.events(run, "intake_saved")[0]["path"] == str(run.dir / "issue.md")
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "bug", run.state["params"], run)
     assert ctx.values["issue"] == "42"

@@ -7,6 +7,15 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+
+- A run started from an issue labels it in progress, comments on it, and removes the label when the run ends (or, failing that, when it is archived).
+- An issue run's PR is always in the issue's Development section, linked through GitHub's API when `Closes #N` didn't link it (a base that isn't the default branch); an epic gets a comment with the PR's URL instead.
+
+### Changed
+
+- An issue run's draft PR body says `Closes #N`, or `Refs #N` for an issue with an epic label.
+
 ### Fixed
 
 - The dashboard's dialogs show why a request was refused: a New task the server rejects (a 400 or 409) now names the bad field inside the open dialog, where before the message was hidden under the modal and only the browser console showed `400 (Bad Request)`.
