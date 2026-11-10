@@ -9,6 +9,8 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   applies to. The counts in `COUNT_FAMILIES` are the exception: `ci_rounds`, `rollovers`, `progress_not_updated`
   and `rework_pct` are always present (0 when nothing happened), `fix_attempts:<p>` and `human_rejections:<p>`
   are present for every phase of the run, and a key of the open-parameter count families that is absent is 0.
+  `conformance_missing` and `conformance_waived` count the statuses of the run's last `conformance_checked` and
+  are present only for a run that has one.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
 
@@ -36,13 +38,18 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "rollovers": ("lower", False),
     "progress_not_updated": ("lower", False),
     "rework_pct": ("lower", False),
+    "conformance_missing": ("lower", False),  # obligations with no evidence at the last audit
+    "conformance_waived": ("lower", False),   # obligations a person waived at the last audit
+    "cost_usd": ("lower", False),             # added by `scorecard.run_row`, not by `run_signals`
+    "wall_h": ("lower", False),
+    "human_wait_h": ("lower", False),
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
 # `human_rejections` are present for every phase of the run; the open-parameter ones (`guard_trips`,
 # `permission_denied`, `stop`) are present only for a parameter that occurred.
 COUNT_FAMILIES = frozenset({"fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections",
-                            "ci_rounds", "rollovers", "progress_not_updated"})
+                            "ci_rounds", "rollovers", "progress_not_updated", "conformance_missing", "conformance_waived"})
 RUNNER = "runner"  # `phase_rejected.by` for what the runner settles itself; a person's name is never this
 
 
@@ -113,6 +120,7 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
     counts: dict[str, Counter[str]] = {name: Counter() for name in (
         "fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections", "review_blocking")}
     plain: Counter[str] = Counter()
+    audit: dict | None = None
     for ev in events:
         etype = ev.get("type")
         if etype == "fix_attempt":
@@ -135,6 +143,8 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
         elif etype == "review_result":
             if phase := _phase_of(ev.get("key")):
                 counts["review_blocking"][phase] += int(ev.get("blocking") or 0)
+        elif etype == "conformance_checked":
+            audit = ev
         elif etype in ("ci_round", "rolled_over", "progress_not_updated"):
             plain[{"ci_round": "ci_rounds", "rolled_over": "rollovers"}.get(etype, etype)] += 1
     for family, found in counts.items():
@@ -144,6 +154,10 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
         for family in ("fix_attempts", "human_rejections"):
             out.setdefault(f"{family}:{phase['phase']}", 0)
     out.update(_turns(events))
+    if audit is not None:  # the last audit only, and only for a run that was audited
+        statuses = Counter(f.get("status") for f in audit.get("obligations") or [] if isinstance(f, dict))
+        out["conformance_missing"] = statuses["missing"]
+        out["conformance_waived"] = statuses["waived"]
     for phase in metrics.get("phases") or []:
         called = sum(1 for s in phase.get("steps") or [] if s.get("attempts"))
         if called:
