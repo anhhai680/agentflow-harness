@@ -337,7 +337,7 @@ class _Loop:
             if self.walk(phase, executor)[0] == "stopped":
                 return self.status()
             return self.settle(names, index, executor)
-        if row.get("status") == "approved":
+        if row.get("status") == "approved" and not retried(state, name):
             if not row.get("handoff"):
                 self.hand_off(names, index, executor)
             return None
@@ -411,6 +411,16 @@ class _Loop:
         if got and expected and got.lstrip("/") != expected.lstrip("/"):
             self.run.emit("footer_mismatch", phase=name, expected=expected, got=got)
         self.run.emit("handoff_written", phase=name, path=str(path))
+
+
+def retried(state: dict, phase: str) -> bool:
+    """Whether a human retried a step of `phase` (`agentflow retry`) that has not settled again: an approved phase
+    is walked once more for it, then settled again, so the step's run is real evidence and a phase that needs a
+    human asks again."""
+    prefix = f"{phase}/"
+    return any(key.startswith(prefix) and row.get("retry_of") is not None
+               and row.get("status") not in ("done", "unchanged", "skipped")
+               for key, row in state["steps"].items())
 
 
 def refining(state: dict, phase: str) -> bool:

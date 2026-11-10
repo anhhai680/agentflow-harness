@@ -163,8 +163,9 @@ PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "-
 PERMISSION_MODES = ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions")
 EXPECT_VALUES = ("red", "green")
 ON_FAIL_VALUES = ("block",)
+CONFORMANCE_FAILED = "conformance_failed"  # the audit at `finish` found an obligation with no evidence (`block` mode)
 NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable",
-                  "conformance_failed")
+                  CONFORMANCE_FAILED)
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 

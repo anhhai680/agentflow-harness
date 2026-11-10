@@ -1,20 +1,30 @@
-"""Conformance, the pure part: what a run's events show for each obligation of the policy.
+"""Conformance: what a run's events show for each obligation of the policy, and the audit at `finish`.
 
-Nothing here reads a file or the clock. `evaluate` takes the run's events, the obligations that apply and the
-tree that will be pushed, and returns one finding per obligation. Evidence counts only when it comes after the
-last code change (steps, expectations) or was made on exactly the final tree (gates). Events from older runs
+`evaluate` is pure: nothing in it reads a file or the clock. It takes the run's events, the obligations that apply
+and the tree that will be pushed, and returns one finding per obligation. Evidence counts only when it comes after
+the last code change (steps, expectations) or was made on exactly the final tree (gates). Events from older runs
 carry no `tree`, so every reader uses `.get` and a missing tree is no evidence.
+
+`audit` is the one impure entry point: `finish` calls it before the push. It snapshots the final tree, runs the
+gates that have no evidence on it, writes `conformance_checked`, and in `block` mode stops on a missing obligation.
+`render_section` turns that event into the pull request's Conformance section, from config ids, statuses, seqs and
+trees only: no step summary or finding text, which are model text, ever reaches it.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Literal
 
 from agentflow.autonomy import AUTO_BY, blocking_of
-from agentflow.config import Config, Evidence, Obligation
-from agentflow.policy import phase_where, step_phase
-from agentflow.state import MARKED_DONE_SKIP
+from agentflow.conditions import Ctx
+from agentflow.config import CONFORMANCE_FAILED, Config, Evidence, Obligation
+from agentflow.gates import failure_report, gates_ok, record_results, run_gates
+from agentflow.guards import snapshot
+from agentflow.hitl import clean_fact, raise_hitl
+from agentflow.policy import applicable, phase_where, step_phase
+from agentflow.state import MARKED_DONE_SKIP, Run
 
 Status = Literal["satisfied", "waived", "missing", "not_applicable"]
 
@@ -182,3 +192,87 @@ def missing_gates(cfg: Config, findings: list[Finding]) -> list[str]:
     wanted = {item.partition(":")[2] for f in findings if f.status == "missing" for item in f.require
               if item.startswith("gates:")}
     return list(dict.fromkeys(name for set_name, names in cfg.gate_sets.items() if set_name in wanted for name in names))
+
+
+# --------------------------------------------------------------------------- the audit at finish
+
+
+def audit(cfg: Config, run: Run, worktree: Path, ctx: Ctx, key: str) -> bool:
+    """Check the obligations against the tree `finish` is about to push; True: go on, False: stopped.
+
+    The worktree is clean here, so its snapshot is the pushed tree. Gates with no passing result on that tree run
+    now, once, and are recorded on `key`; a failure is the usual `gate_failed` stop there, and approving it runs
+    the audit again. Then `conformance_checked` is written. In `block` mode a missing obligation stops the run
+    with `conformance_failed` before anything is pushed; in `report` mode the run goes on and the pull request
+    shows the gap."""
+    tree = snapshot(worktree)
+    lane = str(ctx.values.get("lane") or run.state.get("pipeline") or "")
+    applying = [obligation for obligation, _ in applicable(cfg, ctx, lane)]
+    ids = {obligation.id for obligation in applying}
+    others = [obligation for obligation in cfg.policy.obligations.values() if obligation.id not in ids]
+    findings = evaluate(cfg, run.events.read(), applying, tree, others)
+    names = missing_gates(cfg, findings)
+    if names:
+        results = run_gates(cfg, names, worktree, run.gate_log_dir(key))
+        record_results(run, key, results, tree)
+        if not gates_ok(results):
+            failed = [r for r in results if not (r.passed or r.skipped)]
+            raise_hitl(cfg, run, "gate_failed", key,
+                       f"Gates failed on the tree {key} would push: {', '.join(r.name for r in failed)}.",
+                       extra=failure_report(failed))
+            return False
+        findings = evaluate(cfg, run.events.read(), applying, tree, others)
+    missing = [f.id for f in findings if f.status == "missing"]
+    run.emit("conformance_checked", key=key, tree=tree, enforce=cfg.policy.enforce, passed=not missing,
+             obligations=[asdict(f) for f in findings])
+    if missing and cfg.policy.enforce == "block":
+        raise_hitl(cfg, run, CONFORMANCE_FAILED, key,
+                   f"{len(missing)} obligation(s) have no evidence on the tree to be pushed: {', '.join(missing)}.")
+        return False
+    return True
+
+
+def retry_keys(cfg: Config, steps: dict, event: dict | None) -> list[str]:
+    """The step keys whose run would bring the evidence a `conformance_checked` event found missing, each once:
+    the run's own key for the step when it walked it, else `<phase>/<id>`. Steps no phase holds are left out."""
+    keys: list[str] = []
+    for finding in (event or {}).get("obligations") or []:
+        if finding.get("status") != "missing":
+            continue
+        for item in finding.get("require") or []:
+            kind, _, step_id = str(item).partition(":")
+            if kind != "step":
+                continue
+            walked = [k for k in steps if str(k).split("/")[-1] == step_id]
+            phase = step_phase(cfg, step_id)
+            key = walked[-1] if walked else (f"{phase}/{step_id}" if phase else None)
+            if key and key not in keys:
+                keys.append(key)
+    return keys
+
+
+def render_section(event: dict | None, run_id: str) -> list[str]:
+    """The lines of the pull request's Conformance section; none when no audit ran.
+
+    Only config ids, statuses, event seqs and the tree go in, plus the evaluator's own notes, each one clean line.
+    A step's summary or a reviewer's text never does, so model text cannot forge a row."""
+    if not event:
+        return []
+    findings = [f for f in event.get("obligations") or [] if isinstance(f, dict)]
+    counted = [f for f in findings if f.get("status") != "not_applicable"]
+    missing = [f for f in counted if f.get("status") == "missing"]
+    enforce = clean_fact(str(event.get("enforce") or "report"))
+    tree = clean_fact(str(event.get("tree") or ""))[:12] or "unknown"
+    if missing:
+        lines = [f"Conformance: {len(missing)} missing ({enforce} mode)"]
+    else:
+        lines = [f"Conformance: all {len(counted)} obligations met"]
+    for finding in findings:
+        require = ", ".join(clean_fact(str(item)) for item in finding.get("require") or []) or "nothing"
+        seqs = [s for s in finding.get("evidence") or [] if isinstance(s, int) and not isinstance(s, bool)]
+        evidence = ", ".join(f"{run_id}#{seq}" for seq in seqs) or "none"
+        note = clean_fact(str(finding.get("note") or ""))
+        line = (f"- `{clean_fact(str(finding.get('id')))}` {clean_fact(str(finding.get('status')))}: {require}"
+                f" · evidence {evidence} · tree {tree}")
+        lines.append(line + (f" ({note})" if note else ""))
+    return lines

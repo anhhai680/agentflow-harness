@@ -45,7 +45,8 @@ from agentflow.flow_control import (
     refine_subject,
     writes_questions,
 )
-from agentflow.gates import GateResult, agent_checks, gates_ok, record_results, run_doc_checks, run_gates
+from agentflow.gates import (GateResult, agent_checks, failure_report, gates_ok, record_results, run_doc_checks,
+                             run_gates)
 from agentflow.gitops import CommitRejected, GitError, NothingToCommit, changed_since, commit, commits_between, head
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, notify_run, park_hitl, raise_hitl, read_result
@@ -1017,11 +1018,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
                 "violation. To keep it for later runs, add it to `.claude/settings.json` on the main checkout.")
 
     def _gate_report(self, failed: list[GateResult]) -> str:
-        blocks = []
-        for r in failed:
-            log = f"Full log: {r.log_path}\n" if r.log_path else ""
-            blocks.append(f"### {r.name} ({r.reason})\n{log}```\n{r.tail}\n```")
-        return "\n\n".join(blocks)
+        return failure_report(failed)
 
     def _fix_lead(self, sr: _StepRun, failed: list[GateResult], attempt: int) -> str:
         lead = (

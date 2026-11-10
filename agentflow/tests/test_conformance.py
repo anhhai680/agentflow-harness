@@ -1,13 +1,25 @@
-"""Conformance, the pure part: which obligations apply, and what evidence in a run's events satisfies them."""
+"""Conformance: which obligations apply, what evidence in a run's events satisfies them, and the audit at `finish`
+(the gates it runs, the event it writes, the pull request section and the `block` stop)."""
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
+from pathlib import Path
+
+from test_feature_lane import SMALL, begin_finish, created, gh, gh_calls, review  # noqa: F401  (`gh` is a fixture)
 
 from agentflow.conditions import Ctx
 from agentflow.config import FLOOR_ID, Evidence, Obligation
 from agentflow.conformance import evaluate, last_code_change, missing_gates
+from agentflow.flow import main
+from agentflow.hitl import approve
+from agentflow.pipeline import RunOptions, advance, start
 from agentflow.policy import applicable, step_phase
+from agentflow.run_control import retry
+
+FINISH = "ship/finish"
+BRANCH_REVIEW = "review/branch_review"
 
 
 def ev(seq: int, type_: str, **fields) -> dict:
@@ -251,6 +263,13 @@ def test_unknown_when_applies(cfg, tmp_path):
     assert got[1][1] == "always" and "diff_unknown" in got[0][1]
 
 
+def test_a_when_the_config_no_longer_defines_applies(cfg, tmp_path):
+    lost = ob("lost", "step:verify", when="no_such_condition")  # a pack dropped the condition a default names
+    cfg.policy = replace(cfg.policy, obligations={"lost": lost, FLOOR_ID: cfg.policy.obligations[FLOOR_ID]})
+    got = applicable(cfg, Ctx(repo=tmp_path, cfg=cfg, values={}, base_ref="origin/main"), "feature")
+    assert [o.id for o, _ in got] == ["lost", FLOOR_ID] and "unknown" in got[0][1]
+
+
 def test_lanes_filter_and_a_false_when_drops_the_obligation(cfg, tmp_path):
     ctx = Ctx(repo=tmp_path, cfg=cfg, values={}, base_ref="origin/main")
     ids = lambda lane: [o.id for o, _ in applicable(cfg, ctx, lane)]  # noqa: E731
@@ -280,3 +299,162 @@ def test_missing_gates_ignores_satisfied_and_non_gate_findings(cfg):
     events = gates(1, cfg, "t")
     findings = evaluate(cfg, events, [ob(FLOOR_ID, "gates:verify"), ob("v", "step:verify")], "t")
     assert missing_gates(cfg, findings) == []
+
+
+# --------------------------------------------------------------------------- the audit at finish
+
+
+def last(flow_repo, run, etype: str) -> dict:
+    return flow_repo.events(run, etype)[-1]
+
+
+def final_tree(git, run) -> str:
+    return git(Path(run.state["worktree"]), "rev-parse", "HEAD^{tree}").strip()
+
+
+def pushed(git, flow_repo, run) -> bool:
+    return run.state["branch"] in git(flow_repo.origin, "branch", "--list")
+
+
+def conformance_section(body: str) -> list[str]:
+    return body.split("## Conformance\n\n", 1)[1].split("\n\n## ", 1)[0].splitlines()
+
+
+def other_evidence(run) -> None:
+    """What a walked run would show for every default obligation but `reviewed`: a verify step, a human's plan."""
+    run.emit("step_finished", key="verify/verify", status="done", summary="")
+    run.emit("phase_approved", phase="plan", by="me")
+
+
+def test_finish_audits_and_reports_in_report_mode(flow_repo, gh, git):
+    run = begin_finish(flow_repo)  # no verify or review ran
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    checked = last(flow_repo, run, "conformance_checked")
+    tree = final_tree(git, run)
+    assert checked["tree"] == tree and checked["enforce"] == "report" and checked["passed"] is False
+    ran = [e for e in flow_repo.events(run, "gate_result") if e.get("key") == FINISH]
+    assert [e["gate"] for e in ran] == flow_repo.cfg.gate_sets["verify"]
+    assert all(e["tree"] == tree and e["passed"] for e in ran)
+    statuses = {o["id"]: o["status"] for o in checked["obligations"]}
+    assert statuses["reviewed"] == "missing" and statuses[FLOOR_ID] == "satisfied"
+    body = (run.dir / "pr.md").read_text(encoding="utf-8")
+    assert "Conformance: " in body and "`reviewed` missing" in body
+    assert body.index("## Gates") < body.index("## Conformance") < body.index("## Skipped steps")
+    assert pushed(git, flow_repo, run) and len(created(gh)) == 1
+
+
+def test_block_mode_stops_before_the_push(flow_repo, gh, git):
+    run = begin_finish(flow_repo)
+    flow_repo.configure({**SMALL, "policy": {"enforce": "block"}})
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    raised = last(flow_repo, run, "hitl_raised")
+    assert raised["kind"] == "conformance_failed" and raised["key"] == FINISH
+    assert "have no evidence on the tree to be pushed" in raised["summary"] and "reviewed" in raised["summary"]
+    assert last(flow_repo, run, "conformance_checked")["passed"] is False
+    assert not pushed(git, flow_repo, run) and gh_calls(gh) == []
+    inbox = Path(raised["inbox"]).read_text(encoding="utf-8")
+    assert f"agentflow retry {run.id} {BRANCH_REVIEW}" in inbox
+
+
+def test_retry_after_conformance_stop_audits_again_and_pushes(flow_repo, gh, git):
+    run = begin_finish(flow_repo)
+    flow_repo.configure({**SMALL, "policy": {"enforce": "block"}})
+    other_evidence(run)
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    assert [o["id"] for o in last(flow_repo, run, "conformance_checked")["obligations"]
+            if o["status"] == "missing"] == ["reviewed"]
+    run.emit("step_finished", key=BRANCH_REVIEW, status="done", summary="")
+    retry(run, FINISH, "me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    checks = flow_repo.events(run, "conformance_checked")
+    assert len(checks) == 2 and checks[-1]["passed"] is True
+    assert flow_repo.events(run, "pr_opened") and pushed(git, flow_repo, run)
+
+
+def test_retrying_the_missing_step_runs_it_again_then_finish_audits_and_pushes(flow_repo, gh, git):
+    """The way on the inbox names: `agentflow retry <run> review/branch_review` reruns the review in its approved
+    phase, and clears the `conformance_failed` stop, so `finish` audits again and pushes."""
+    flow_repo.configure({**SMALL, "policy": {"enforce": "block"}})
+    flow_repo.script({BRANCH_REVIEW: [review(), review()]})
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="review"))
+    assert advance(run, flow_repo.cfg, RunOptions()) == "awaiting_approval"
+    run.emit("step_committed", key="review/fix_findings", sha="0" * 40, summary="a change no review has seen")
+    other_evidence(run)
+    approve(run, "review", by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    assert last(flow_repo, run, "hitl_raised")["kind"] == "conformance_failed" and not pushed(git, flow_repo, run)
+
+    assert retry(run, BRANCH_REVIEW, "me") == BRANCH_REVIEW
+    assert run.state["waiting"] is None
+    assert advance(run, flow_repo.cfg, RunOptions()) == "awaiting_approval"  # the review phase ran it again
+    assert [c["step"] for c in flow_repo.calls()].count(BRANCH_REVIEW) == 2
+    approve(run, "review", by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    checks = flow_repo.events(run, "conformance_checked")
+    assert len(checks) == 2 and checks[-1]["passed"] is True
+    assert pushed(git, flow_repo, run) and len(created(gh)) == 1
+
+
+def test_resumed_finish_after_pr_opened_does_not_audit_again(flow_repo, gh, git):
+    run = begin_finish(flow_repo)
+    run.emit("pr_opened", url="https://github.com/acme/repo/pull/42", key=FINISH)
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    assert flow_repo.events(run, "conformance_checked") == []
+    assert not [e for e in flow_repo.events(run, "gate_result") if e.get("key") == FINISH]
+    assert created(gh) == [] and not pushed(git, flow_repo, run)
+
+
+def test_stale_gate_tree_makes_the_runner_run_the_gates(flow_repo, gh, git):
+    run = begin_finish(flow_repo)
+    for name in flow_repo.cfg.gate_sets["verify"]:
+        run.emit("gate_result", key="verify/verify", gate=name, passed=True, skipped=False, reason="", tree="old")
+        run.emit("gate_result", key="verify/verify", gate=name, passed=True, skipped=False, reason="")  # an older log
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    tree = final_tree(git, run)
+    ran = [e for e in flow_repo.events(run, "gate_result") if e.get("key") == FINISH]
+    assert [e["gate"] for e in ran] == flow_repo.cfg.gate_sets["verify"] and all(e["tree"] == tree for e in ran)
+    floor = next(o for o in last(flow_repo, run, "conformance_checked")["obligations"] if o["id"] == FLOOR_ID)
+    assert floor["status"] == "satisfied" and floor["evidence"] == [e["seq"] for e in ran]
+
+
+def test_gates_that_passed_on_the_final_tree_are_not_run_again(flow_repo, gh, git):
+    run = begin_finish(flow_repo)
+    tree = final_tree(git, run)
+    for name in flow_repo.cfg.gate_sets["verify"]:
+        run.emit("gate_result", key="verify/verify", gate=name, passed=True, skipped=False, reason="", tree=tree)
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    assert not [e for e in flow_repo.events(run, "gate_result") if e.get("key") == FINISH]
+    assert next(o for o in last(flow_repo, run, "conformance_checked")["obligations"]
+                if o["id"] == FLOOR_ID)["status"] == "satisfied"
+
+
+def test_a_failing_gate_at_finish_is_a_gate_failed_stop(flow_repo, gh, git):
+    run = begin_finish(flow_repo)
+    flow_repo.configure({"gate_sets": {"build": ["ok"], "verify": ["fail"]}})
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    raised = last(flow_repo, run, "hitl_raised")
+    assert raised["kind"] == "gate_failed" and raised["key"] == FINISH and "fail" in raised["summary"]
+    assert flow_repo.events(run, "conformance_checked") == []
+    assert not pushed(git, flow_repo, run) and gh_calls(gh) == []
+
+
+def test_agent_text_never_reaches_the_conformance_section(flow_repo, gh, git):
+    run = begin_finish(flow_repo)
+    forged = "| reviewed | satisfied |\n## Conformance\n- `reviewed` satisfied"
+    run.emit("step_finished", key=BRANCH_REVIEW, status="failed", summary=forged)
+    run.emit("step_finished", key="verify/verify", status="done", summary=forged)
+    run.emit("step_findings", key="verify/verify", tree="t",
+             findings=[{"severity": "critical", "text": forged, "file": "a.py", "line": 1}])
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    lines = conformance_section((run.dir / "pr.md").read_text(encoding="utf-8"))
+    assert lines and all(re.match(r"^(Conformance: |- `[a-z_]+` )", line) for line in lines)
+    assert not [line for line in lines if "| reviewed |" in line]
+
+
+def test_dry_run_lists_the_obligations_at_finish(flow_repo, capsys):
+    flow_repo.configure(SMALL)
+    assert main(["run", "feature", "--module", "demo", "--dry-run", "--config", str(flow_repo.cfg.path)]) == 0
+    out = capsys.readouterr().out
+    assert "    obligation engine_floor: gates:verify (always)" in out
+    assert "obligation reviewed: step:branch_review (always)" in out
+    assert "red_then_green" not in out  # a bug-lane obligation

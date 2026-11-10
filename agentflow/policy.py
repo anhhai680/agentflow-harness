@@ -14,7 +14,8 @@ def applicable(cfg: Config, ctx: Ctx, lane: str) -> list[tuple[Obligation, str]]
     """The obligations that hold for a run of `lane`, each with why: `always`, or the condition's text.
 
     An obligation with `lanes` applies to those lanes only. One with a `when` applies unless the condition is
-    False: an unknown result (git cannot diff) counts as holding, so the check fails safe. The floor has neither,
+    False: an unknown result (git cannot diff, or a condition the config no longer defines) counts as holding, so
+    the check fails safe and never crashes `finish`. The floor has neither,
     so it is always in, and it comes last, as it does in `cfg.policy.obligations`.
     """
     found: list[tuple[Obligation, str]] = []
@@ -24,7 +25,11 @@ def applicable(cfg: Config, ctx: Ctx, lane: str) -> list[tuple[Obligation, str]]
         if obligation.when is None:
             found.append((obligation, ALWAYS))
             continue
-        result = evaluate(cfg, obligation.when, ctx)
+        try:
+            result = evaluate(cfg, obligation.when, ctx)
+        except ValueError as exc:  # a condition the config lost (`validate` reports it): unknown, so it holds
+            found.append((obligation, f"{obligation.when}: unknown ({exc})"))
+            continue
         if result.value is not False:
             found.append((obligation, result.reason))
     return found

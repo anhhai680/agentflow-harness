@@ -192,6 +192,15 @@ def record_results(run: Run, key: str, results: list[GateResult], tree: str, *, 
         run.emit("gate_result", **data)
 
 
+def failure_report(failed: list[GateResult]) -> str:
+    """The stop report for failed gates: one `### <gate> (<reason>)` block each, with its log path and output tail."""
+    blocks = []
+    for r in failed:
+        log = f"Full log: {r.log_path}\n" if r.log_path else ""
+        blocks.append(f"### {r.name} ({r.reason})\n{log}```\n{r.tail}\n```")
+    return "\n\n".join(blocks)
+
+
 def summarize(results: list[GateResult]) -> str:
     """One line per gate: `✓ floor`, `✗ py_lint`, `– web_types (skipped: <reason>)`."""
     lines = []

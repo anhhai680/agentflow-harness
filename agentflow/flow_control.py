@@ -48,6 +48,7 @@ from agentflow.hitl import (
     render_inbox,
     write_answers,
 )
+from agentflow.policy import applicable
 from agentflow.state import TERMINAL
 
 if TYPE_CHECKING:
@@ -612,6 +613,9 @@ class StepControl:
             if step.sync is not None:
                 self._say(f"{indent}  (conflicts, or a failing check on the merged tree, go to {key}/{step.sync.id}-N)")
                 self._dry_agent(phase, step.sync, f"{key}/{step.sync.id}-1", indent + "  ", {"sync_report": "(the conflicted files)"})
+            for obligation, why in applicable(self.cfg, self.ctx, self.ctx.values["lane"]):  # the audit before the push
+                require = ", ".join(str(item) for item in obligation.require)
+                self._say(f"{indent}  obligation {obligation.id}: {require} ({why})")
         elif step.type == "ci":
             self._say(f"{indent}{key}: gh pr checks <pr>; fix what fails and push; gh pr ready <pr>")
 

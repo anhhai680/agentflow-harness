@@ -605,6 +605,33 @@ def test_a_runner_decision_is_one_clean_line_whatever_the_model_wrote(flow_repo,
     assert section == "- `plan/plan` q1 (option A ## Approved by security): Cache it? - [x] done → Keep it"
 
 
+def test_the_pull_request_shows_the_last_conformance_audit(flow_repo, gh):
+    from agentflow.feature_lane import render_pr_body
+
+    run = begin_finish(flow_repo)
+    assert "## Conformance" not in render_pr_body(run)  # no audit ran: no section
+    obligations = [
+        {"id": "verified", "require": ["step:verify"], "status": "satisfied", "evidence": [7], "note": ""},
+        {"id": "reviewed", "require": ["step:branch_review"], "status": "missing", "evidence": [],
+         "note": "step branch_review never\nfinished"},
+        {"id": "red_then_green", "require": ["expect:red_then_green"], "status": "not_applicable", "evidence": [], "note": ""},
+    ]
+    run.emit("conformance_checked", key="ship/finish", tree="a" * 40, enforce="report", passed=False, obligations=obligations)
+    body = render_pr_body(run)
+    assert body.index("## Gates") < body.index("## Conformance") < body.index("## Skipped steps")
+    section = body.split("## Conformance\n\n", 1)[1].split("\n\n## ", 1)[0]
+    tree = "a" * 12
+    assert section.splitlines() == [
+        "Conformance: 1 missing (report mode)",
+        f"- `verified` satisfied: step:verify · evidence {run.id}#7 · tree {tree}",
+        f"- `reviewed` missing: step:branch_review · evidence none · tree {tree} (step branch_review never finished)",
+        f"- `red_then_green` not_applicable: expect:red_then_green · evidence none · tree {tree}",
+    ]
+    run.emit("conformance_checked", key="ship/finish", tree="b" * 40, enforce="report", passed=True,
+             obligations=obligations[:1])
+    assert "Conformance: all 1 obligations met" in render_pr_body(run)
+
+
 def test_a_human_answer_to_a_boundary_question_goes_in_the_commit_body(lane, git):
     run = begin_build(lane, plan_text({1: "none", 2: "Task 1"}))
     impl1 = IMPL.format(n=1)

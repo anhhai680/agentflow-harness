@@ -14,7 +14,9 @@ Each action records one event with who took it, through `Run.emit`, and the runn
   process's or the runner's group, running the agent's configured command, and started no later than the
   `agent_started` event. The runner sees the cancel as soon as the agent's call returns and stops.
 - `retry` puts a step back to `pending` (`step_retry`), by default the run's failed step, clearing the stop
-  the runner raised on it; a retried failed step still gets the failed step's check for forbidden paths.
+  the runner raised on it; a retried failed step still gets the failed step's check for forbidden paths. A step
+  of an approved phase runs again, and the phase settles again (`pipeline.retried`). On a `conformance_failed`
+  stop, retrying the step that would bring the missing evidence clears that stop too, so `finish` audits again.
 - `attach` opens the waiting step's Claude Code session interactively in the run's worktree.
 
 `spawn_resume` starts `flow.py resume <run>` in the background (new session, stdin closed, output in the
@@ -31,7 +33,7 @@ import sys
 import time
 from pathlib import Path
 
-from agentflow.config import RETRO_PIPELINE, Config, ConfigError, load_config
+from agentflow.config import CONFORMANCE_FAILED, RETRO_PIPELINE, Config, ConfigError, load_config
 from agentflow.config_trust import run_config_path
 from agentflow import pack, safeio
 from agentflow.events import lock_state, parse_iso
@@ -337,6 +339,9 @@ def retry(run: Run, key: str | None, by: str, reason: str | None = None) -> str:
             if waiting.get("kind") == "phase_approval" or waiting.get("questions"):
                 raise ControlError(f"{key!r} waits for an answer or an approval, not a retry")
             run.emit("hitl_approved", by=by, key=key, kind=waiting["kind"], summary=waiting.get("summary", ""))
+        elif waiting is not None and waiting.get("kind") == CONFORMANCE_FAILED:
+            # retrying a step that would bring missing evidence is the way on this stop names: `finish` audits again
+            run.emit("hitl_approved", by=by, key=waiting["key"], kind=waiting["kind"], summary=waiting.get("summary", ""))
         run.emit("step_retry", by=by, key=key, reason=reason)
     return key
 

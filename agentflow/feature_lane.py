@@ -61,6 +61,7 @@ from agentflow.autonomy import AUTO_BY, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
 from agentflow.config import Config, Phase, Step, brief_files
+from agentflow.conformance import audit, render_section
 from agentflow.flow_control import current_refine, refine_note_block, refine_subject
 from agentflow.gates import gates_ok, record_results, run_gates
 from agentflow.gitops import (
@@ -773,6 +774,8 @@ class FeatureLane:
             return "stopped"
         if not self.runner_commits_only(key):
             return "stopped"
+        if not audit(self.cfg, self.run, self.worktree, self.ctx, key):  # on the tree to be pushed, before the push
+            return "stopped"
         body = self.write_pr_body()
         try:
             push(self.worktree, branch)
@@ -913,6 +916,13 @@ def _open_findings(state: dict, events: list[dict]) -> list[str]:
     return [f"- `{key}`: {finding_line(as_finding(f))[2:]}" for key, findings in last.items() for f in findings]
 
 
+def _conformance(run: Run, events: list[dict]) -> str | None:
+    """The Conformance section from the run's last audit; None when no audit ran."""
+    checks = [e for e in events if e["type"] == "conformance_checked"]
+    lines = render_section(checks[-1] if checks else None, run.id)
+    return _section("Conformance", lines) if lines else None
+
+
 def issue_line(params: dict) -> str | None:
     """`Refs #N` for an epic, `Closes #N` for any other issue, else None. It depends on `params` alone."""
     if not params.get("issue"):
@@ -921,7 +931,7 @@ def issue_line(params: dict) -> str | None:
 
 
 def render_pr_body(run: Run, plan: str | None = None) -> str:
-    """The draft pull request's body: plan link, gate summary, spend vs budget, skipped steps and reasons,
+    """The draft pull request's body: plan link, spend vs budget, gate summary, the conformance audit, skipped steps and reasons,
     effort changes with reasons, footer mismatches, refine rounds, then the attribution line."""
     run.refresh()
     state = run.state
@@ -949,6 +959,7 @@ def render_pr_body(run: Run, plan: str | None = None) -> str:
         f"Plan: `{plan}`" if plan else "Plan: none",
         spend_line,
         _section("Gates", _gate_lines(state)),
+        _conformance(run, events),
         _section("Skipped steps", _skipped_lines(state)),
         _section("Effort changes", efforts),
         _section("Footer mismatches", footers),
