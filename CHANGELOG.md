@@ -7,6 +7,8 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [2.3] - 2026-11-10
+
 ### Added
 
 - A `policy` config: `policy.obligations` (merged by id; the engine ships `verified`, `reviewed`, `plan_approved` and `red_then_green`, and `engine_floor`, `gates:verify`, can't be removed) and `policy.enforce` (`report` or `block`). `validate` checks them, and the Settings page can't change them.
