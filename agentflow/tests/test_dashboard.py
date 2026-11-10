@@ -1135,6 +1135,23 @@ def test_metrics_route_filters_by_date_range_and_lane(dash):
     assert dash.get("/api/metrics", token=None)[0] == 403
 
 
+def test_scorecard_api_needs_the_token_and_returns_the_view(dash):
+    assert dash.get("/api/scorecard", token=None)[0] == 403
+    assert dash.get("/api/scorecard", token="wrong")[0] == 403
+    status, _, body = dash.get("/api/scorecard")
+    data = payload(body)
+    assert status == 200 and set(data) == {"baseline", "lanes"}
+    assert data["baseline"] is False and data["lanes"] == {}
+    assert dash.get("/api/scorecard?lane=nope")[0] == 404
+    assert dash.get("/api/scorecard?from=yesterday")[0] == 400
+
+
+def test_metrics_view_has_a_scorecard_section(dash):
+    page = dash.get("/", token=None)[2].decode("utf-8")
+    metrics = page[page.index('id="metrics-view"'):]
+    assert 'id="scorecard"' in metrics
+
+
 def test_old_runs_stay_in_metrics_and_on_the_board(flow_repo):
     from datetime import UTC, timedelta
 

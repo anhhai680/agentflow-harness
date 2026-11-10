@@ -263,7 +263,7 @@ Decides open questions in the idea doc. Like every lane it works in its own work
 | Everything waiting on you | `agentflow inbox` |
 | Continue a paused, `stalled`, `error` or `ready` run | `agentflow resume <run>` (a stop waiting on you stays until you approve, answer or reject it) |
 | Finish a `ready` run here and open its draft PR | `agentflow resume <run> --mark-done` |
-| Run a step again in a fresh session | `agentflow retry <run> <step-key>` (with no key: the run's failed step, which only a `guard_violation` leaves) |
+| Run a step again in a fresh session | `agentflow retry <run> <step-key>` (with no key: the run's failed step, which only a `guard_violation` leaves). On a step of a phase that is already approved, the retry walks that phase again once; on a `conformance_failed` stop it also clears the stop, so `finish` audits again |
 | Pause (the running step finishes first) | `agentflow pause <run>` |
 | End a run and stop its agents (cannot be undone) | `agentflow cancel <run>` |
 | Open the waiting step's Claude session by hand (no runner may be live) | `agentflow attach <run>` (then `agentflow resume <run>`) |
@@ -339,6 +339,7 @@ agentflow approve <run> <phase|step-key> [--budget N]   # soft budget notifies, 
 agentflow reject <run> <phase|step-key> --note "…"     # a stop inside a plan task refines only that task
                                                        #   (`reject <run> <task-stop-key>`); a batched task's stop is rejected phase-level
 agentflow retry <run> <step-key>                    # a fresh session
+                                                    #   on a step of a phase that is already approved, the phase is walked again once
 agentflow pause | resume | cancel <run>
 agentflow resume <run> --mark-done                  # a ready run: skip to ship, open the draft PR
 agentflow dashboard                                 # token is in the URL fragment; keep it private
@@ -352,6 +353,8 @@ agentflow retro [--since YYYY-MM-DD]                # lessons from the runs ende
 agentflow retro --dry-run                           # print the digest and the session's prompt; creates nothing
 agentflow lessons [--json]                          # each lesson's verdict: its target before and after the runs that
                                                     #   carried it
+agentflow scorecard [--freeze]                      # the finished runs' signals against the baseline frozen on this machine,
+                                                    #   conformance first; also the dashboard's Metrics tab
 ```
 
 ## 11. Safety model in five lines
@@ -493,6 +496,8 @@ There are two layers of lessons:
 - **The pack's `.agentflow/lessons.md`** holds this repository's rules, with ids `L-NNNN`. A merged retro PR or a human changes it. Its path is fixed (there is no config key), it is under the engine floor (`.agentflow/**`), so no agent in a run can edit it, and only the main checkout's copy is read.
 
 A step gets the lessons for every phase plus those whose `applies` names its phase, engine lessons first, and none that is past its `review_by`. The slot holds at most `memory.lessons_max_tokens` (1500 by default; 0 turns lessons off). Over that, the lowest-numbered pack lessons are dropped first, the engine's last, and the run records `memory_truncated`. Each fresh session records which lessons it carried (`lessons_injected`). A result may list the ones it used in `lessons_cited`, and the runner records each as `lesson_cited`.
+
+The conformance audit at `finish` (section 14, `policy`) adds two signals, `conformance_missing` and `conformance_waived`: the obligations that had no evidence, or were waived, at the run's last audit. They reach the retro's digest like every other signal, and `agentflow scorecard` (and the dashboard's Metrics tab) compares them, with the gate and cost signals, against a baseline frozen with `agentflow scorecard --freeze`. A `conformance_missing` above 0 is an SLO breach, and the scorecard lists it first.
 
 ### How a retro runs
 

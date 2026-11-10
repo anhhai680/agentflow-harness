@@ -153,6 +153,8 @@ dialog.wide { width: min(980px, 96vw); }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.wrap { white-space: normal; min-width: 200px; }
 button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
+.sc-slo td { font-weight: 700; }
+.sc-slo td:first-child { border-left: 3px solid var(--bad); }
 .verdict-improved { color: var(--ok); } .verdict-worse { color: var(--bad); } .verdict-muted { color: var(--muted); }
 .chip { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--chip); margin: 2px 4px 2px 0; white-space: nowrap; }
 </style>
@@ -212,6 +214,10 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
       <span id="met-status" class="muted" role="status"></span>
     </div>
     <div id="met-body"></div>
+    <div id="scorecard">
+      <h2 class="lane">Scorecard</h2>
+      <div id="sc-body"></div>
+    </div>
   </section>
   <section id="lessons-view" hidden>
     <p id="les-status" class="muted" role="status"></p>
@@ -952,6 +958,7 @@ function restoreMetricsChoice() {
 
 async function loadMetrics() {
   if (!TOKEN) return;
+  loadScorecard();
   const request = ++metricsUi.request;  // the latest request wins: a filter change is never lost behind a refresh
   try {
     const data = await api("/api/metrics?" + metricsQuery());
@@ -1061,6 +1068,37 @@ function renderMetrics() {
   body.push(el("h2", { class: "lane", text: "Costliest steps" }), table(stepHead, stepRows(t.costliest_steps), [2, 3, 4, 5, 6]));
   body.push(el("h2", { class: "lane", text: "Slowest steps" }), table(stepHead, stepRows(t.slowest_steps), [2, 3, 4, 5, 6]));
   $("met-body").replaceChildren(...body);
+}
+
+// The scorecard: a lane's signals against the frozen baseline. All text goes in through el()'s textContent.
+const scNum = (v) => (v === null || v === undefined ? "-" : String(Math.round(v * 1000) / 1000));
+const scCell = (v, n) => scNum(v) + (v === null || v === undefined ? "" : " (" + n + ")");
+
+function renderScorecard(view) {
+  const body = [];
+  if (!view.baseline) {
+    body.push(el("p", { class: "muted", text: "No baseline is frozen yet. Run `agentflow scorecard --freeze` to freeze one." }));
+  }
+  for (const [lane, rows] of Object.entries(view.lanes || {})) {
+    body.push(el("h3", { class: "wf-title", text: workLabel(lane) }));
+    if (!rows.length) { body.push(el("p", { class: "muted", text: "No signals." })); continue; }
+    body.push(table(["Signal", "Baseline", "Current", "Delta", "Verdict"], rows.map((r) => el("tr", { class: r.slo ? "sc-slo" : null },
+      el("td", { text: r.signal + (r.slo ? " (SLO)" : "") }), el("td", { class: "num", text: scCell(r.baseline, r.baseline_n) }),
+      el("td", { class: "num", text: scCell(r.current, r.current_n) }), el("td", { class: "num", text: scNum(r.delta) }),
+      el("td", { class: r.verdict === "worse" ? "st-bad" : r.verdict === "better" ? "st-ok" : "muted", text: r.verdict + (r.slo ? " - SLO BREACH" : "") }))), [1, 2, 3]));
+  }
+  $("sc-body").replaceChildren(...body);
+}
+
+async function loadScorecard() {
+  if (!TOKEN) return;
+  const params = new URLSearchParams(metricsQuery());
+  params.delete("all");
+  try {
+    renderScorecard(await api("/api/scorecard?" + params.toString()));
+  } catch (err) {
+    $("sc-body").replaceChildren(el("p", { class: "muted", text: "Could not load the scorecard: " + err.message }));
+  }
 }
 
 $("met-range").addEventListener("change", () => {
