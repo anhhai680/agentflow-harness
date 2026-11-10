@@ -14,12 +14,12 @@ from typing import Literal
 from agentflow.autonomy import AUTO_BY, blocking_of
 from agentflow.config import Config, Evidence, Obligation
 from agentflow.policy import phase_where, step_phase
+from agentflow.state import MARKED_DONE_SKIP
 
 Status = Literal["satisfied", "waived", "missing", "not_applicable"]
 
 HUMAN_OVERRIDE = "human override"
 ON_BASE = "on base"
-MARKED_DONE = "marked done"  # a phase skipped for this reason was not skipped by its own `skip_if`
 GREEN, RED = "green", "red"
 
 
@@ -108,7 +108,7 @@ def _approval(events: list[dict], phase: str) -> _Item:
     if approved is not None:
         return _Item(True, [approved["seq"]])
     skipped = _last([e for e in events if e.get("type") == "phase_skipped" and e.get("phase") == phase
-                     and not str(e.get("reason") or "").startswith(MARKED_DONE)])
+                     and e.get("via") == "skip_if"])  # not mark-done, not "all steps skipped"; older logs have no `via`
     if skipped is not None:
         return _Item(True, [skipped["seq"]], ON_BASE)
     return _Item(False, note=f"no human approved {phase}", phase=phase)
@@ -143,7 +143,8 @@ def _waiver(events: list[dict], unmet: list[_Item]) -> Finding | None:
     mark = _last([e for e in events if e.get("type") == "run_marked_done"])
     if mark is None or any(item.phase is None for item in unmet):
         return None
-    skipped = {e.get("phase") for e in events if e.get("type") == "phase_skipped" and e["seq"] > mark["seq"]}
+    skipped = {e.get("phase") for e in events if e.get("type") == "phase_skipped" and e["seq"] > mark["seq"]
+               and str(e.get("reason") or "").startswith(MARKED_DONE_SKIP)}
     if all(item.phase in skipped for item in unmet):
         return Finding("", [], "waived", [mark["seq"]], f"waived by {mark.get('by')}")
     return None

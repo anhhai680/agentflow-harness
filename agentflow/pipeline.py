@@ -69,7 +69,7 @@ from agentflow.hitl import notify_run, open_refine
 from agentflow.intake import gather, save
 from agentflow.issue_status import mark, release
 from agentflow.lanes import Executor, Outcome, footer_next
-from agentflow.state import TERMINAL, Run
+from agentflow.state import MARKED_DONE_SKIP, TERMINAL, Run
 
 DEFAULT_SHOW = ["handoff", "diff", "step_results", "skipped_steps", "gates", "review_findings"]
 DONE_STEPS = ("done", "unchanged")
@@ -345,7 +345,7 @@ class _Loop:
             return None
         marked = state["marked_done"]
         if marked and index < len(names) - 1 and row.get("status") in (None, "pending"):
-            run.emit("phase_skipped", phase=name, reason=f"marked done after {marked['phase']}")
+            run.emit("phase_skipped", phase=name, reason=f"{MARKED_DONE_SKIP} {marked['phase']}")
             return None
         if row.get("status") in (None, "pending"):
             if phase.skip_if is not None:
@@ -353,7 +353,7 @@ class _Loop:
                 if skip is None:
                     return self.status()
                 if skip:
-                    run.emit("phase_skipped", phase=name, reason=reason)
+                    run.emit("phase_skipped", phase=name, reason=reason, via="skip_if")
                     return None
             run.emit("phase_started", phase=name, start_sha=head(self.worktree))
         outcome, ran = self.walk(phase, executor)

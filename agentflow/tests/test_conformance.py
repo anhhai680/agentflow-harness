@@ -125,10 +125,22 @@ def test_runner_approval_is_not_approval(cfg):
 
 def test_skip_if_skip_is_on_base(cfg):
     planned = ob("plan_approved", "approval:plan")
-    skipped = evaluate(cfg, [ev(2, "phase_skipped", phase="plan", reason="plan exists on origin/main")], [planned], "t")[0]
+    skipped = evaluate(cfg, [ev(2, "phase_skipped", phase="plan", reason="plan exists on origin/main", via="skip_if")], [planned], "t")[0]
     assert skipped.status == "satisfied" and "on base" in skipped.note
     marked = [ev(2, "phase_skipped", phase="plan", reason="marked done after build")]
     assert evaluate(cfg, marked, [planned], "t")[0].status == "missing"
+
+
+def test_all_steps_skipped_is_not_approval(cfg):
+    planned = ob("plan_approved", "approval:plan")
+    events = [ev(2, "phase_skipped", phase="plan", reason="all steps skipped")]
+    assert evaluate(cfg, events, [planned], "t")[0].status == "missing"
+
+
+def test_skip_if_skip_without_via_is_not_on_base(cfg):
+    planned = ob("plan_approved", "approval:plan")  # an older log: the skip has a reason but no `via`
+    events = [ev(2, "phase_skipped", phase="plan", reason="plan exists on origin/main")]
+    assert evaluate(cfg, events, [planned], "t")[0].status == "missing"
 
 
 # --------------------------------------------------------------------------- code changes
@@ -193,17 +205,26 @@ def test_waiver_needs_the_phase_skipped_after_the_mark_and_an_unmet_item_in_a_sk
     no_skip = [ev(4, "run_marked_done", by="me", phase="build")]
     assert evaluate(cfg, no_skip, [verified], "t")[0].status == "missing"
     gated = ob("both", "step:verify", "gates:verify")
-    marked = [ev(4, "run_marked_done", by="me", phase="build"), ev(5, "phase_skipped", phase="verify", reason="x")]
+    marked = [ev(4, "run_marked_done", by="me", phase="build"), ev(5, "phase_skipped", phase="verify", reason="marked done after build")]
     assert evaluate(cfg, marked, [gated], "t")[0].status == "missing"
     expect = ob("red_then_green", "expect:red_then_green")
-    skipped_build = [ev(4, "run_marked_done", by="me", phase="plan"), ev(5, "phase_skipped", phase="build", reason="x")]
+    skipped_build = [ev(4, "run_marked_done", by="me", phase="plan"), ev(5, "phase_skipped", phase="build", reason="marked done after build")]
     assert evaluate(cfg, skipped_build, [expect], "t")[0].status == "waived"
+
+
+def test_a_phase_skipped_for_another_reason_after_the_mark_does_not_waive(cfg):
+    verified = ob("verified", "step:verify")
+    events = [ev(4, "run_marked_done", by="me", phase="build"), ev(5, "phase_skipped", phase="verify", reason="all steps skipped")]
+    assert evaluate(cfg, events, [verified], "t")[0].status == "missing"
+    via = [ev(4, "run_marked_done", by="me", phase="build"),
+           ev(5, "phase_skipped", phase="verify", reason="checks done on base", via="skip_if")]
+    assert evaluate(cfg, via, [verified], "t")[0].status == "missing"
 
 
 def test_a_satisfied_obligation_is_not_waived(cfg):
     verified = ob("verified", "step:verify")
     events = [finished(2, "verify/verify"), ev(4, "run_marked_done", by="me", phase="build"),
-              ev(5, "phase_skipped", phase="verify", reason="x")]
+              ev(5, "phase_skipped", phase="verify", reason="marked done after build")]
     assert evaluate(cfg, events, [verified], "t")[0].status == "satisfied"
 
 
