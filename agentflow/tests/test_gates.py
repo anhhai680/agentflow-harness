@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agentflow.config import Gate, load_config
-from agentflow.gates import GateResult, gates_ok, run_gates, summarize
+from agentflow.gates import GateResult, command_digest, gates_ok, reusable_passes, run_gates, summarize
 from conftest import PYTHON_CONFIG
 
 
@@ -174,3 +174,55 @@ def test_record_results_writes_tree_and_a_tail_only_when_asked(tmp_path):
     assert tailed.events[0]["tail"] == "" and tailed.events[1]["tail"] == "boom"
     assert tailed.events[1]["gate"] == "bad" and tailed.events[1]["passed"] is False
     assert tailed.events[1]["log"] == str(tmp_path / "bad.log")
+
+
+# --------------------------------------------------------------------------- reuse by tree
+
+
+def _pass(gate: str, tree: str | None, cmd: str | None, *, passed: bool = True, skipped: bool = False,
+          key: str = "verify/verify") -> dict:
+    e = {"type": "gate_result", "key": key, "gate": gate, "passed": passed, "skipped": skipped, "log": None}
+    if tree is not None:
+        e["tree"] = tree
+    if cmd is not None:
+        e["cmd"] = cmd
+    return e
+
+
+def test_command_digest_follows_the_command_cwd_when_exists_and_env():
+    base = Gate("t", "pytest")
+    d = command_digest(base, {"A": "1"})
+    assert d == command_digest(Gate("t", "pytest"), {"A": "1"})
+    assert len(d) == 12
+    assert d != command_digest(Gate("t", "pytest -x"), {"A": "1"})
+    assert d != command_digest(Gate("t", "pytest", cwd="web"), {"A": "1"})
+    assert d != command_digest(Gate("t", "pytest", when_exists="x"), {"A": "1"})
+    assert d != command_digest(base, {"A": "2"})
+
+
+def test_a_pass_on_the_same_tree_and_command_is_reusable():
+    g = Gate("t", "pytest")
+    digests = {"t": command_digest(g, {})}
+    found = reusable_passes([_pass("t", "T1", digests["t"])], [g], "T1", digests)
+    assert list(found) == ["t"] and found["t"]["key"] == "verify/verify"
+
+
+@pytest.mark.parametrize("event", [
+    _pass("t", "T2", "same"),                    # another tree
+    _pass("t", "T1", "other"),                   # the command changed
+    _pass("t", "T1", "same", passed=False),      # a failure
+    _pass("t", "T1", "same", passed=False, skipped=True),  # a skip
+    _pass("t", None, "same"),                    # an older event with no tree
+    _pass("t", "T1", None),                      # an older event with no command digest
+])
+def test_nothing_else_is_reusable(event):
+    assert reusable_passes([event], [Gate("t", "pytest")], "T1", {"t": "same"}) == {}
+
+
+def test_a_setup_gate_is_never_reused():
+    events = [_pass("db_up", "T1", "same")]
+    assert reusable_passes(events, [Gate("db_up", "up")], "T1", {"db_up": "same"}, never={"db_up"}) == {}
+
+
+def test_no_tree_reuses_nothing():
+    assert reusable_passes([_pass("t", "T1", "same")], [Gate("t", "x")], None, {"t": "same"}) == {}

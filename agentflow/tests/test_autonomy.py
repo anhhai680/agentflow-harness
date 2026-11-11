@@ -181,6 +181,17 @@ def test_a_verify_finding_gets_a_fix_round(auto):
     assert "verify/plan_fixes" in called(auto) and "verify/fix_findings" in called(auto)
 
 
+def test_a_verify_refine_round_ends_with_verify(auto):
+    auto.script({RED: [GOOD_TEST], "build/fix": [FIXED], "verify/verify": [done("thiếu", findings=[BLOCKING]), done("sạch")]})
+    run = begin_bug(auto)
+    assert go(auto, run) == "done"
+    assert [e["phase"] for e in auto.events(run, "phase_rejected")] == ["verify"]
+    steps = called(auto)
+    assert "review/plan_fixes" not in steps and "review/fix_findings" not in steps  # review inherits no round
+    assert "review/branch_review" in steps
+    assert run.state["refine"] is None
+
+
 def test_verify_cannot_clear_its_own_finding_by_answering_unchanged(auto):
     unchanged = {"result": {"status": "unchanged", "summary": "không có gì đổi"}}
     auto.script({RED: [GOOD_TEST], "build/fix": [FIXED],

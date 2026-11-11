@@ -12,6 +12,7 @@ The task text:
 
 The task text above is the plan's, so do not open the plan again. Its **Interfaces** list and the code map at the top of this prompt, when there are any, say where the code you need lives: open those files at those lines, and search only for what neither names. Read the repository's quality rules, and only the spec sections the task cites. Write the failing test first and run it, then write the code, then run the task's tests.
 Run only the tests you wrote or changed, and their directory once at the end. Never run the whole suite: the runner's gates run it.
+This rule wins over the task text: if a step of the task runs the whole suite, a test directory beyond the task's own, or an end-to-end stack, skip that command and say so in your summary.
 Stay inside the files the task lists.
 A test you cannot run, or that cannot reach a service it needs, means `blocked`, never `done`.
 If a test needs an environment you cannot start with the commands the task or the repository's agent instructions give, the environment, not your code, is the problem: report `blocked` with the message.

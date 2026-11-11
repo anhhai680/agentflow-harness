@@ -34,7 +34,7 @@ from agentflow import sources
 from agentflow.conditions import Ctx, evaluate, fmt, paths_read
 from agentflow.commit_checks import runner_head
 from agentflow.config import Config, Phase, Step, for_lane
-from agentflow.gates import GateResult, gates_ok, record_results, resolve, run_gates, summarize
+from agentflow.gates import GateResult, gates_ok, record_results, resolve, run_gates_reusing, summarize
 from agentflow.guards import snapshot
 from agentflow.gitops import CommitRejected, NothingToCommit, commit
 from agentflow.hitl import (
@@ -400,7 +400,8 @@ class StepControl:
         Returns the `{gate_evidence}` text and the failed gates (None when all passed), which start the
         session in its fix loop. The tree is recorded so the gates are not run again on it afterwards."""
         tree = snapshot(self.worktree)
-        results = run_gates(self.cfg, step.gates or [], self.worktree, self.run.gate_log_dir(key))
+        results = run_gates_reusing(self.cfg, self.run, key, step.gates or [], self.worktree,
+                                    self.run.gate_log_dir(key), tree)
         record_results(self.run, key, results, tree)
         failed = [r for r in results if not (r.passed or r.skipped)]
         self.run.emit("gates_prerun", key=key, tree=tree, passed=not failed)
@@ -511,7 +512,8 @@ class StepControl:
         if self.run.state["waiting"] is not None:
             return "stopped"
         tree = snapshot(self.worktree)
-        results = run_gates(self.cfg, step.gates or [], self.worktree, self.run.gate_log_dir(key))
+        results = run_gates_reusing(self.cfg, self.run, key, step.gates or [], self.worktree,
+                                    self.run.gate_log_dir(key), tree)
         record_results(self.run, key, results, tree)
         if gates_ok(results):
             self.run.emit("step_finished", key=key, status="done", summary=summarize(results))

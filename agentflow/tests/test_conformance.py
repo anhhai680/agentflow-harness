@@ -9,7 +9,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_feature_lane import SMALL, begin_finish, created, gh, gh_calls, review  # noqa: F401  (`gh` is a fixture)
+import test_feature_lane
+from test_feature_lane import SMALL, begin_finish, created, gh_calls, review
 
 from agentflow.conditions import Ctx
 from agentflow.config import FLOOR_ID, Evidence, Obligation
@@ -19,6 +20,9 @@ from agentflow.hitl import approve
 from agentflow.pipeline import RunOptions, advance, start
 from agentflow.policy import applicable, step_phase
 from agentflow.run_control import retry
+
+# The fake `gh` fixture, bound by assignment so pytest finds it here and the tests' `gh` parameters don't redefine an import.
+gh = test_feature_lane.gh
 
 FINISH = "ship/finish"
 BRANCH_REVIEW = "review/branch_review"

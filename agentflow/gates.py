@@ -14,12 +14,19 @@ untracked changes, through a `guards.snapshot` tree, so the real index is untouc
 in a section by their line numbers in the hunk headers against the section headings, which come from
 `git grep '^## '` on each side, so the idea doc is never parsed whole. A section runs from its `## `
 heading to the next `## ` heading (`###` subsections stay inside it).
+
+Reuse (`run_gates_reusing`): a gate that already passed in this run on exactly the tree about to be gated, with the
+same command (`run`, `cwd`, `when_exists` and `defaults.env`, as the `cmd` digest on its `gate_result`), is not run
+again: the earlier pass is the evidence, the rule `conformance` already holds the final tree to. A failure, a skip,
+an event with no `tree` or no `cmd`, and the `setup` set's gates (they start things) are never reused.
 """
 
 from __future__ import annotations
 
 import contextlib
 import fnmatch
+import hashlib
+import json
 import os
 import re
 import signal
@@ -49,6 +56,8 @@ class GateResult:
     log_path: Path | None
     tail: str
     duration_s: float = 0.0  # wall time the gate ran, for the run metrics
+    cmd: str = ""  # `command_digest` of what ran; "" for a doc check
+    reused_from: str | None = None  # the step key of the earlier pass this result stands for (`run_gates_reusing`)
 
 
 def _resolve(cfg: Config, names: str | list[str]) -> list[Gate]:
@@ -127,11 +136,17 @@ def _minutes(value: float) -> str:
     return f"{value:g} min"
 
 
+def command_digest(gate: Gate, env: Mapping[str, str] | None) -> str:
+    """What makes two runs of `gate` the same check: its command, cwd, `when_exists` and the run's `defaults.env`."""
+    raw = json.dumps([gate.run, gate.cwd or "", gate.when_exists or "", sorted((env or {}).items())])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
 def _run_one(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min: float,
              env: dict[str, str] | None = None, env_base: Mapping[str, str] | None = None) -> GateResult:
     started = time.monotonic()
     result = _run_gate(gate, cwd, log_dir, tail_lines, timeout_min, env, env_base)
-    return replace(result, duration_s=round(time.monotonic() - started, 3))
+    return replace(result, duration_s=round(time.monotonic() - started, 3), cmd=command_digest(gate, env))
 
 
 def _run_gate(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min: float,
@@ -174,19 +189,78 @@ def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path, *,
             for g in _resolve(cfg, names)]
 
 
+def setup_gate_names(cfg: Config) -> set[str]:
+    """The gates of the `setup` set: they bring the environment up, so a pass of theirs is never reused."""
+    try:
+        return {g.name for g in _resolve(cfg, "setup")} if "setup" in cfg.gate_sets else set()
+    except KeyError:
+        return set()
+
+
+def reusable_passes(events: list[dict], gates: list[Gate], tree: str | None, digests: Mapping[str, str],
+                    never: set[str] | frozenset[str] = frozenset()) -> dict[str, dict]:
+    """Gate name -> the latest `gate_result` that passed (not skipped) on exactly `tree` with the digest in `digests`.
+
+    Pure. A gate in `never`, an event with no `tree` or no `cmd` (older runs), a failure and a skip never count."""
+    if not tree:
+        return {}
+    wanted = {g.name for g in gates if g.name not in never and g.name in digests}
+    found: dict[str, dict] = {}
+    for e in events:
+        if e.get("type") != "gate_result" or not e.get("passed") or e.get("skipped"):
+            continue
+        name = e.get("gate")
+        if name in wanted and e.get("tree") == tree and e.get("cmd") and e.get("cmd") == digests[name]:
+            found[name] = e
+    return found
+
+
+def run_gates_reusing(cfg: Config, run: Run, key: str, names: str | list[str], cwd: Path, log_dir: Path,
+                      tree: str | None) -> list[GateResult]:
+    """`run_gates`, except that a gate with a reusable pass on `tree` (`reusable_passes`) is not run again.
+
+    The results keep the gates' order; a reused one is a pass with `reused_from` set, its old log and no tail.
+    One `gates_reused` event names them (`record_results` writes no `gate_result` for a reused result, so the
+    run's evidence stays one event per gate actually run)."""
+    gates = _resolve(cfg, names)
+    env = cfg.defaults.env
+    digests = {g.name: command_digest(g, env) for g in gates}
+    reused = reusable_passes(run.events.read(), gates, tree, digests, setup_gate_names(cfg))
+    fresh = iter(run_gates(cfg, [g.name for g in gates if g.name not in reused], cwd, log_dir)
+                 if len(reused) < len(gates) else [])
+    results: list[GateResult] = []
+    for g in gates:
+        e = reused.get(g.name)
+        if e is None:
+            results.append(next(fresh))
+            continue
+        log = Path(e["log"]) if e.get("log") else None
+        results.append(GateResult(g.name, True, False, f"reused: passed on this tree in {e.get('key')}", log, "",
+                                  cmd=digests[g.name], reused_from=str(e.get("key"))))
+    if reused:
+        run.emit("gates_reused", key=key, tree=tree, gates=sorted(reused),
+                 **{"from": sorted({str(e.get("key")) for e in reused.values()})})
+    return results
+
+
 def gates_ok(results: list[GateResult]) -> bool:
     """True when no gate that actually ran failed (skipped gates do not count as failures)."""
     return all(r.passed or r.skipped for r in results)
 
 
 def record_results(run: Run, key: str, results: list[GateResult], tree: str, *, with_tail: bool = False) -> None:
-    """Write one `gate_result` per result, each stamped with the `tree` (a `guards.snapshot`) the gates ran on.
+    """Write one `gate_result` per result that ran, each stamped with the `tree` (a `guards.snapshot`) the gates ran
+    on and the gate's `cmd` digest (a reused result writes none).
 
     The caller snapshots the worktree before the gates run. `with_tail` adds a `tail` to every event: a failed
     gate's output tail (the fix loop's and the retro's evidence), `""` for a gate that passed or was skipped."""
     for r in results:
+        if r.reused_from is not None:  # `run_gates_reusing` already said so in its `gates_reused` event
+            continue
         data = {"key": key, "gate": r.name, "passed": r.passed, "skipped": r.skipped, "reason": r.reason,
                 "log": str(r.log_path) if r.log_path else None, "duration_s": r.duration_s, "tree": tree}
+        if r.cmd:
+            data["cmd"] = r.cmd
         if with_tail:  # "" for a gate that passed or was skipped
             data["tail"] = "" if (r.passed or r.skipped) else r.tail
         run.emit("gate_result", **data)

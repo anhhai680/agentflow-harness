@@ -46,7 +46,8 @@ from agentflow.flow_control import (
     writes_questions,
 )
 from agentflow.gates import (GateResult, agent_checks, failure_report, gates_ok, record_results, run_doc_checks,
-                             run_gates)
+                             run_gates_reusing)
+from agentflow.gates import resolve as resolve_gates
 from agentflow.gitops import CommitRejected, GitError, NothingToCommit, changed_since, commit, commits_between, head
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, notify_run, park_hitl, raise_hitl, read_result
@@ -840,26 +841,37 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
     def _failed_gates(self, sr: _StepRun) -> list[GateResult]:
         """The step's gates, then its doc checks (`checks:`, on the diff since the step started); the failed ones.
 
-        A `gates_first` step whose gates passed before the session, on the tree it still has, does not run
-        them again: those results are the evidence it was given."""
+        A gate that already passed in this run on the tree the step has now, with the same command, is not run
+        again (`run_gates_reusing`): that covers a `gates_first` step whose session changed nothing, and a step that
+        changed nothing after another step gated the same tree. In a fix attempt, the gates the last attempt named
+        run first; while one of them still fails, the rest wait for the next attempt (they still run, on the final
+        tree, before the step can finish)."""
         results: list[GateResult] = []
         tree = snapshot(self.worktree)
-        if sr.step.gates and self._prerun_still_holds(sr):
-            self.run.emit("gates_reused", key=sr.key)
-        elif sr.step.gates:
-            results = run_gates(self.cfg, sr.step.gates, self.worktree, self.run.gate_log_dir(sr.key))
+        if sr.step.gates:
+            names = [g.name for g in resolve_gates(self.cfg, sr.step.gates)]
+            first = [n for n in dict.fromkeys(self._last_fix_gates(sr)) if n in names] if sr.fixes else []
+            log_dir = self.run.gate_log_dir(sr.key)
+            if first:
+                results = run_gates_reusing(self.cfg, self.run, sr.key, first, self.worktree, log_dir, tree)
+                if gates_ok(results):
+                    rest = [n for n in names if n not in first]
+                    if rest:
+                        results += run_gates_reusing(self.cfg, self.run, sr.key, rest, self.worktree, log_dir, tree)
+                else:
+                    self.run.emit("gates_deferred", key=sr.key, tree=tree, gates=[n for n in names if n not in first])
+            else:
+                results = run_gates_reusing(self.cfg, self.run, sr.key, names, self.worktree, log_dir, tree)
         if sr.step.checks:
             docs = self.cfg.project.docs
             results += run_doc_checks(sr.step.checks, self.worktree, sr.start_head, docs["idea"], docs["decisions"])
         record_results(self.run, sr.key, results, tree, with_tail=True)
         return [] if gates_ok(results) else [r for r in results if not (r.passed or r.skipped)]
 
-    def _prerun_still_holds(self, sr: _StepRun) -> bool:
-        if not sr.step.gates_first:
-            return False
-        pre = [e for e in self.run.events.read() if e["type"] == "gates_prerun" and e.get("key") == sr.key]
-        # the tree is what makes it safe: a pass on exactly this tree is a pass, whenever it ran
-        return bool(pre) and bool(pre[-1].get("passed")) and pre[-1].get("tree") == snapshot(self.worktree)
+    def _last_fix_gates(self, sr: _StepRun) -> list[str]:
+        """The gates the step's latest `fix_attempt` named: the ones its fix was for."""
+        attempts = [e for e in self.run.events.read() if e["type"] == "fix_attempt" and e.get("key") == sr.key]
+        return [str(name) for name in (attempts[-1].get("gates") or [])] if attempts else []
 
     def _finish(self, sr: _StepRun, result: StepResult) -> Outcome:
         if _mtime(self.run.progress_path()) in (None, sr.progress_mtime):

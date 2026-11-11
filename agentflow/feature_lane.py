@@ -64,7 +64,7 @@ from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
 from agentflow.config import Config, Phase, Step, brief_files
 from agentflow.conformance import audit, clean_tree, render_section
 from agentflow.flow_control import current_refine, refine_note_block, refine_subject
-from agentflow.gates import gates_ok, record_results, run_gates
+from agentflow.gates import gates_ok, record_results, run_gates_reusing
 from agentflow.gitops import (
     CommitRejected,
     GhError,
@@ -627,7 +627,8 @@ class FeatureLane:
                     if e["type"] == "step_finished" and e.get("key") == f"{tkey}/implement" and e.get("status") == "done"]
         if finished and finished[-1].get("tree") == tree:
             return True
-        results = run_gates(self.cfg, gates, self.worktree, self.run.gate_log_dir(commit_key))
+        results = run_gates_reusing(self.cfg, self.run, commit_key, gates, self.worktree,
+                                    self.run.gate_log_dir(commit_key), tree)
         record_results(self.run, commit_key, results, tree)
         if gates_ok(results):
             return True

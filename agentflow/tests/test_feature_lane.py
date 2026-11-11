@@ -214,7 +214,9 @@ def test_review_findings_back_once_then_hitl(lane, git):
     assert FINDING["text"] in calls[3]["argv"][-1] and "src/one.py:3" in calls[3]["argv"][-1]
     assert MINOR["text"] not in calls[3]["argv"][-1]  # the re-review checks what blocked, not the whole last review
     assert len(set(sessions_of(lane, run, review_key))) == 2
-    assert len([e for e in lane.events(run, "gate_result") if e["key"] == impl_key]) == 2  # gates ran again
+    # gated again after the fix: the fix changed no file here, so the passes on that same tree are reused
+    assert len([e for e in lane.events(run, "gate_result") if e["key"] == impl_key]) == 1
+    assert [e["key"] for e in lane.events(run, "gates_reused")] == [impl_key]
     assert [e["blocking"] for e in lane.events(run, "review_result")] == [1, 1]
     waiting = run.state["waiting"]
     assert waiting["kind"] == "review_unresolved" and waiting["key"] == review_key
