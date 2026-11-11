@@ -13,6 +13,7 @@ import posixpath
 import re
 import shlex
 import subprocess
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -295,6 +296,9 @@ class IssuePolicy:
     in_progress_label: str = "agentflow:in-progress"  # "" turns off the label and the start comment, never the PR link
     comment: bool = True  # also post one comment when a run starts from an issue
     epic_labels: tuple[str, ...] = ("epic",)  # an issue with one of these gets `Refs #N`, never `Closes #N`
+    sync_label: str = ""  # open issues with this label become Backlog cards; "" turns the sync off
+    sync_lane: str = "feature"  # the lane of a synced issue that no `lane_labels` entry matches
+    lane_labels: dict[str, str] = field(default_factory=lambda: {"bug": "bug"})  # issue label: lane, first match wins
 
 
 FLOOR_ID = "engine_floor"  # the obligation code adds after the layers merge: no layer can remove or replace it
@@ -992,6 +996,9 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             in_progress_label=_optional(issues, "in_progress_label", "issues", str, "agentflow:in-progress"),
             comment=_optional(issues, "comment", "issues", bool, True),
             epic_labels=tuple(_string_list(issues.get("epic_labels", ["epic"]), "issues.epic_labels")),
+            sync_label=_optional(issues, "sync_label", "issues", str, ""),
+            sync_lane=_optional(issues, "sync_lane", "issues", str, "feature"),
+            lane_labels=_string_map(issues.get("lane_labels", {"bug": "bug"}), "issues.lane_labels"),
         ),
         gates=_build_gates(_require(raw, "gates", "", dict)),
         gate_sets={name: _string_list(members, f"gate_sets.{name}") for name, members in gate_sets.items()},
@@ -1059,6 +1066,16 @@ def resolve_model(cfg: Config, phase: Phase, step: Step, role: str, overrides: d
 
 
 # --------------------------------------------------------------------------- validation
+
+
+def _label_problem(label: str) -> bool:
+    """True when `label` cannot be a GitHub label agentflow passes to `gh` (\"\" is fine: it means off)."""
+    return len(label) > 50 or "\n" in label or "," in label or label.startswith("-")
+
+
+def _same_label(a: str, b: str) -> bool:
+    """GitHub compares label names without case."""
+    return unicodedata.normalize("NFC", a).casefold() == unicodedata.normalize("NFC", b).casefold()
 
 
 class _Validator:
@@ -1628,8 +1645,7 @@ class _Validator:
 
     def issue_policy(self) -> None:
         pol = self.cfg.issues
-        label = pol.in_progress_label
-        if len(label) > 50 or "\n" in label or "," in label or label.startswith("-"):
+        if _label_problem(pol.in_progress_label):
             self.error("issues.in_progress_label", "must be at most 50 characters with no newline and no comma, and "
                        "not start with `-` (`\"\"` turns the label and the start comment off)")
         if not isinstance(pol.comment, bool):
@@ -1638,6 +1654,41 @@ class _Validator:
             if not name.strip() or len(name) > 50 or "\n" in name:
                 self.error("issues.epic_labels", f"entry {i} must be a non-empty one-line label of at most 50 characters "
                            "(`[]` means no issue is an epic)")
+        self.issue_sync(pol)
+
+    def issue_sync(self, pol: IssuePolicy) -> None:
+        """`issues.sync_label`, `sync_lane`, `lane_labels`: which open issues the Backlog shows and their lanes."""
+        if _label_problem(pol.sync_label):
+            self.error("issues.sync_label", "must be at most 50 characters with no newline and no comma, and "
+                       "not start with `-` (`\"\"` turns the sync off)")
+        elif pol.sync_label and pol.in_progress_label and _same_label(pol.sync_label, pol.in_progress_label):
+            self.error("issues.sync_label", "must differ from issues.in_progress_label, or every synced issue "
+                       "would read as taken")
+        for name in pol.lane_labels:
+            if not name.strip() or _label_problem(name):
+                self.error(f"issues.lane_labels.{name}", "an issue label of at most 50 characters with no newline "
+                           "and no comma, not starting with `-`")
+        if not pol.sync_label:
+            return
+        lanes = self.cfg.lanes
+        if pol.sync_lane not in lanes:
+            self.error("issues.sync_lane", f"{pol.sync_lane!r} is not a lane; known: {', '.join(lanes)}")
+        for name, lane in pol.lane_labels.items():
+            if lane not in lanes:
+                self.add("warning", f"issues.lane_labels.{name}",
+                         f"{lane!r} is not a lane of this pack, so issues labelled {name!r} use issues.sync_lane")
+        block = self.cfg.dashboard.get("backlog")
+        block = block if isinstance(block, dict) else {}
+        module_lane = block.get("module_lane")
+        if not module_lane:
+            self.add("warning", "issues.sync_label", "dashboard.backlog.module_lane is not set, so a synced issue "
+                     "starts a plain `--issue` run; a lane that needs a module will not work")
+            return
+        targets = {pol.sync_lane, *(lane for lane in pol.lane_labels.values() if lane in lanes)}
+        mapped = self.cfg.work_source is not None and self.cfg.work_source.kind == "capability_map"
+        if module_lane in targets and mapped and not isinstance(block.get("module_row"), dict):
+            self.error("issues.sync_label", f"a synced issue in the module_lane {module_lane!r} adds a row to the "
+                       "capability map, which needs dashboard.backlog.module_row")
 
     def policy(self) -> None:
         """`policy`: the mode, and each obligation's `when`, `lanes` and evidence, read from the text of the config
@@ -1812,6 +1863,7 @@ class _Validator:
         if tasks is None:
             return
         specs = self.cfg.work_source is not None and self.cfg.work_source.kind == "specs"  # a new spec has no row
+        mapped = self.cfg.work_source is not None and self.cfg.work_source.kind == "capability_map"
         if not isinstance(tasks, dict):
             self.error(f"{path}.new_task", "must map a lane to its form fields")
             return
@@ -1829,6 +1881,9 @@ class _Validator:
                 self.error(where, "`new_module` belongs to the module_lane")
             elif "new_module" in fields and not specs and (lane != module_lane or not isinstance(row, dict)):
                 self.error(where, "`new_module` belongs to the module_lane and needs dashboard.backlog.module_row")
+            elif ("issue" in fields and lane == module_lane and mapped and not isinstance(row, dict)):
+                self.error(where, "an `issue` card in the module_lane adds a row to the capability map, which needs "
+                           "dashboard.backlog.module_row")
 
 
 def _lane_step_ids(steps: list[Step], lane: str) -> set[str]:

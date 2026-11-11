@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentflow"
-version = "2.3"  # keep equal to agentflow.pack.ENGINE_VERSION (test_packaging checks it)
+version = "2.4"  # keep equal to agentflow.pack.ENGINE_VERSION (test_packaging checks it)
 description = "A headless runner that drives Claude Code or Codex through a config-driven SDLC workflow."
 requires-python = ">=3.12"
 dependencies = ["pyyaml>=6"]

@@ -311,6 +311,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
         "backlog_done": pile["done"] if lane is None or lane == module_lane(cfg) else [],
         "done_note": pile["done_note"],
         "sync_note": pile["sync_note"],
+        "issues_note": pile["issues_note"],
         "new_task": pile["new_task"],
         "lane_phases": pile["lane_phases"],
         "lane_labels": pile["lane_labels"],
@@ -750,7 +751,8 @@ def _backlog_text(card: dict) -> str:
     """A Backlog card in the terminal: `name [P]` when it can run in parallel, or what it runs after."""
     if card["blocked_by"]:
         return f"{card['label']} (runs after {', '.join(b['text'] for b in card['blocked_by'])})"
-    return card["label"] + (" [P]" if card["parallel"] else "") + (" (starting)" if card["status"] == "starting" else "")
+    status = {"starting": " (starting)", "taken": " (taken elsewhere)"}.get(card["status"], "")
+    return card["label"] + (" [P]" if card["parallel"] else "") + status
 
 
 def board_table(data: dict) -> str:
@@ -770,6 +772,8 @@ def board_table(data: dict) -> str:
         lines.append("done: " + ", ".join(f"{m['id']} ({m['reason']})" for m in data["backlog_done"]))
     if data.get("done_note"):
         lines.append(f"warning: {data['done_note']}")
+    if data.get("issues_note"):
+        lines.append(f"warning: {data['issues_note']}")
     lines.append(f"Needs human ({len(data['needs_human'])}):")
     for item in data["needs_human"]:
         lines.append(f"  {item['run_id']} · {item['key']} · {item['kind']} · {_short(item['age_s'])} ago")

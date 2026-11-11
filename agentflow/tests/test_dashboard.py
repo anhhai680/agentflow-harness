@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import re
 import subprocess
 import threading
@@ -974,6 +975,57 @@ def test_a_failing_refresh_round_does_not_stop_the_loop(bdash, monkeypatch, caps
     assert "disk full" in capsys.readouterr().err
 
 
+@pytest.fixture
+def idash(bdash, monkeypatch, tmp_path):
+    """`bdash` with the fake `gh` on PATH, `issues.sync_label: agentflow`, and two labelled issues listed."""
+    gh_bin = Path(__file__).parent / "bin"
+    monkeypatch.setenv("PATH", f"{gh_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(tmp_path / "gh.log"))
+    issues = [{"number": 12, "title": "<img src=x onerror=alert(1)>", "labels": [{"name": "agentflow"}, {"name": "bug"}],
+               "url": "https://github.com/example/repo/issues/12"},
+              {"number": 14, "title": "Taken", "labels": [{"name": "agentflow"}, {"name": "agentflow:in-progress"}],
+               "url": "https://github.com/example/repo/issues/14"}]
+    monkeypatch.setenv("FAKE_GH_ISSUE_LIST", json.dumps(issues))
+    bdash.flow.configure({"issues": {"sync_label": "agentflow"}})
+    bdash.server.cfg = bdash.flow.cfg
+    from agentflow.dashboard import refresh_once
+
+    refresh_once(bdash.server)
+    return bdash
+
+
+def test_the_board_carries_synced_issues_and_their_note(idash):
+    data = payload(idash.get("/api/board")[2])
+    cards = {c["key"]: c for c in data["backlog"]}
+    assert cards["issue:12"]["label"] == "#12 · <img src=x onerror=alert(1)>"  # shown through textContent
+    assert cards["issue:12"]["lane"] == "bug" and cards["issue:14"]["status"] == "taken"
+    assert data["issues_note"] == ""
+
+
+def test_a_synced_issue_starts_but_a_taken_or_bad_one_does_not_and_none_can_be_removed(idash):
+    code, _, body = idash.post("/api/backlog/start", {"item": "issue:12"})
+    assert code == 202, body
+    settle(idash)
+    assert idash.fake.calls[-1]["params"] == {"issue": "12"}
+    code, _, body = idash.post("/api/backlog/start", {"item": "issue:14"})
+    assert code == 409 and "in-progress label" in payload(body)["error"]
+    assert idash.post("/api/backlog/start", {"item": "issue:abc"})[0] == 400
+    code, _, body = idash.post("/api/backlog/remove", {"item": "issue:14"})
+    assert code == 409 and "loses the 'agentflow' label" in payload(body)["error"]
+
+
+def test_a_pack_without_a_backlog_block_still_syncs_its_issues(idash, monkeypatch):
+    from agentflow import backlog
+    from agentflow.dashboard import refresh_once
+
+    monkeypatch.setattr(backlog, "refresh", lambda cfg, repo: pytest.fail("no backlog block: no git refresh"))
+    idash.flow.configure({"issues": {"sync_label": "agentflow"}, "dashboard": {"backlog": None}})
+    idash.server.cfg = idash.flow.cfg
+    monkeypatch.setenv("FAKE_GH_ISSUE_LIST", "[]")
+    refresh_once(idash.server)
+    assert backlog._load_state(idash.flow.root)["issues"] == []
+
+
 def test_the_page_names_no_lane_phase_or_path(bdash):
     """The page is framework code: lanes, phases and the form fields all come from the board data."""
     source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
@@ -1040,7 +1092,8 @@ def test_the_page_wires_the_backlog_actions():
     source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
     for needle in ('"/api/backlog"', '"/api/backlog/start"', '"/api/backlog/remove"', "+ New task", "Stop after",
                    "Can run in parallel", "Runs after:", "Parallel with:", "Start", "Remove", "after_choices",
-                   "new_task", "lane_phases", "sync_note", "first_phase"):
+                   "new_task", "lane_phases", "sync_note", "first_phase", "issues_note", "Taken elsewhere",
+                   "issueNode"):
         assert needle in source, needle
     allow = re.search(r"\^\(type\|value[^\n]*", source).group(0)
     for attribute in ("disabled", "maxlength", "multiple"):

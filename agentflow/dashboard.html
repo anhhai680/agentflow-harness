@@ -46,13 +46,13 @@ main { padding: 12px 16px 40px; }
 .done-modules { margin: 6px 0; }
 .done-modules summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .card.backlog.parallel { border-left-color: var(--ok); }  /* the green of .gate-ok */
-.card.backlog.blocked { border-left-color: var(--muted); }
+.card.backlog.blocked, .card.backlog.taken { border-left-color: var(--muted); }
 .card.backlog.starting { border-left-color: var(--warn); }
 .card.backlog.failed-start { border-left-color: var(--bad); }
 .badge.p { color: var(--ok); border: 1px solid var(--ok); font-weight: 700; }
 .badge.lock { color: var(--muted); border: 1px solid var(--line); }
 .badge.ready-mark { border: 1px solid var(--line); }
-#sync-note, #retro-due { margin-bottom: 8px; }
+#sync-note, #issues-note, #retro-due { margin-bottom: 8px; }
 .card a { color: var(--accent); font-size: 12px; }
 .moves { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .moves button { font-size: 12px; padding: 2px 8px; }
@@ -176,6 +176,7 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
 <main>
   <section id="board-view">
     <div id="sync-note" class="muted" role="status" hidden></div>
+    <div id="issues-note" class="muted" role="status" hidden></div>
     <div id="retro-due" class="muted" role="status" hidden></div>
     <div id="columns" class="columns"></div>
     <h2 class="lane">Needs human</h2>
@@ -492,7 +493,17 @@ function backlogMark(item) {
   if (item.status === "parallel") return el("span", { class: "badge p", text: "P", title: "Can run in parallel", "aria-label": "Can run in parallel", role: "img" });
   if (item.status === "blocked") return el("span", { class: "badge lock", text: "Blocked" });
   if (item.status === "starting") return el("span", { class: "badge", text: "Starting…" });
+  if (item.status === "taken") return el("span", { class: "badge lock", text: "Taken elsewhere" });
   return el("span", { class: "badge ready-mark", text: "Ready" });
+}
+
+// A synced issue's link: the server keeps only an https URL of that issue, and the title stays text.
+function issueNode(url) {
+  if (!/^https:\/\//.test(url)) return null;
+  const link = el("a", { href: url, target: "_blank", rel: "noopener noreferrer", text: "Issue ↗",
+    onclick: (ev) => ev.stopPropagation() });
+  link.addEventListener("keydown", (ev) => ev.stopPropagation());
+  return el("div", {}, link);
 }
 
 function backlogNode(item) {
@@ -504,6 +515,7 @@ function backlogNode(item) {
   const node = el("article", { class: "card backlog " + item.status + (item.failure ? " failed-start" : ""), draggable: canStart ? "true" : null },
     el("div", { class: "title", text: item.label }),
     backlogMark(item),
+    item.url ? issueNode(item.url) : null,
     item.blocked_by.length ? el("div", { class: "sub", text: "Runs after: " + item.blocked_by.map((b) => b.text).join(", ") }) : null,
     item.parallel_with.length ? el("div", { class: "sub", text: "Parallel with: " + names(item.parallel_with) }) : null,
     item.note ? el("div", { class: "sub", text: item.note }) : null,
@@ -534,6 +546,7 @@ function newTaskDialog() {
   const build = () => {
     const wanted = data.new_task[kind()];
     const parts = [];
+    if (wanted.includes("issue") && wanted.includes("new_module")) parts.push(el("div", { class: "sub", text: "Fill in the issue number, a new module, or both: an issue marks it on GitHub and links the pull request." }));
     if (wanted.includes("issue")) parts.push(...text("nt-issue", "Issue number", false, 12));
     if (wanted.includes("task")) parts.push(...text("nt-task", "Task (paste a log here if it helps)", true, 16000));
     if (wanted.includes("topic")) parts.push(...text("nt-topic", "Topic", false, 400));
@@ -558,7 +571,8 @@ function newTaskDialog() {
     if (wanted.includes("issue")) body.fields.issue = inputs["nt-issue"].value.trim();
     if (wanted.includes("task")) body.fields.task = inputs["nt-task"].value;
     if (wanted.includes("topic")) body.fields.topic = inputs["nt-topic"].value.trim();
-    if (wanted.includes("new_module")) body.fields.new_module = { module: inputs["nt-module"].value.trim(), responsibility: inputs["nt-resp"].value, deps: chosen("nt-deps") };
+    if (wanted.includes("new_module") && (inputs["nt-module"].value.trim() || inputs["nt-resp"].value.trim()))  // an issue alone is enough
+      body.fields.new_module = { module: inputs["nt-module"].value.trim(), responsibility: inputs["nt-resp"].value, deps: chosen("nt-deps") };
     for (const name of Object.keys(body.fields)) if (body.fields[name] === "" || (typeof body.fields[name] === "string" && !body.fields[name].trim())) delete body.fields[name];
     try {
       await api("/api/backlog", body);
@@ -600,6 +614,8 @@ function renderBoard(data) {
   $("new-task").hidden = !Object.keys(data.new_task).length;
   $("sync-note").hidden = !data.sync_note;
   $("sync-note").textContent = data.sync_note ? "Base branch not updated: " + data.sync_note : "";
+  $("issues-note").hidden = !data.issues_note;
+  $("issues-note").textContent = data.issues_note || "";
   $("retro-due").hidden = !data.retro_due;
   $("retro-due").replaceChildren(...(data.retro_due ? [document.createTextNode("Retro due: " + data.retro_due + " → run "), el("code", { text: "agentflow retro" })] : []));
   if (!ui.dragging) $("columns").replaceChildren(...columns);  // new columns would lose the drop highlights mid-drag

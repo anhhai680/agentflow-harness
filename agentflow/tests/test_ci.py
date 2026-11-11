@@ -287,3 +287,34 @@ def test_the_refreshed_body_keeps_the_issue_line(flow_repo, gh, monkeypatch):
     assert go(flow_repo, run) == "done"
     assert (run.dir / "pr.md").read_text(encoding="utf-8").split("\n\n")[1] == "Closes #7"
     assert gh.did("pr", "edit", URL) and gh.did("pr", "ready", URL)
+
+
+def test_a_link_that_failed_at_finish_is_tried_again_each_ci_round_until_it_holds(flow_repo, gh, monkeypatch):
+    """The PR must land in the issue's Development section: a failed link is retried while the run waits on CI."""
+    from agentflow import issue_status
+
+    monkeypatch.setenv("FAKE_GH_ISSUE", json.dumps({"title": "Login breaks", "body": "b", "url": "u", "labels": [],
+                                                    "id": "I_fake7"}))
+    monkeypatch.setenv("FAKE_GH_FAIL_ON", "api graphql")  # GitHub refuses the link at `finish` and on round 1
+    tries: list[int] = []
+
+    def link(run):
+        tries.append(len(tries))
+        if len(tries) == 2:
+            monkeypatch.delenv("FAKE_GH_FAIL_ON")
+        issue_status.link(run)
+
+    monkeypatch.setattr(ci_lane, "link", link)
+    gh.play(FAIL, PASS)
+    flow_repo.configure(PIPE, autopilot=True)
+    flow_repo.script({RED: [GOOD_TEST], "build/fix": [FIXED]})
+    run = start(flow_repo.cfg, flow_repo.root, "bug", {"issue": "7"}, RunOptions())
+    assert go(flow_repo, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    assert go(flow_repo, run) == "done"
+    assert len(tries) == 2  # the start of the ci step, then the second round
+    assert [e["action"] for e in flow_repo.events(run, "issue_status_failed")] == ["link", "link"]
+    assert [(e["issue"], e["how"]) for e in flow_repo.events(run, "issue_linked")] == [("7", "api")]
+    ready = next(i for i, c in enumerate(gh.calls()) if c[:2] == ["pr", "ready"])
+    mutations = [i for i, c in enumerate(gh.calls()) if c[:2] == ["api", "graphql"]]
+    assert mutations[-1] < ready

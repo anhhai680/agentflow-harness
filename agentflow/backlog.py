@@ -12,12 +12,19 @@ interrupted is never repeated: `settle_interrupted` turns it into a failure for 
 Names here are agentflow's own vocabulary (`issue`, `task`, `topic`, `new_module`, `after`). Lanes, phases, the map
 file and the base branch all come from `config.yaml`; this module names none of them.
 
-Item keys are typed so they cannot clash: `module:<id>`, `card:<id>` and `run:<id>`.
+Open GitHub issues that carry `issues.sync_label` are a third kind: `refresh` reads them with `gh issue list` into
+`backlog_state.json`, and `snapshot` shows them from there (it never calls `gh`). An issue that carries
+`issues.in_progress_label` with no run on this machine is "taken": someone else picked it up, so it cannot start.
+Nothing from an issue's text reaches an argv, a module id, a map row or a refusal: an issue-backed run in the
+module lane works on the derived module `issue-<N>`, and the issue is named only by its number.
+
+Item keys are typed so they cannot clash: `module:<id>`, `card:<id>`, `issue:<number>` and `run:<id>`.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import threading
 import uuid
 from dataclasses import dataclass
@@ -29,7 +36,7 @@ from agentflow import finished, intake, module_queue, sources, work_source
 from agentflow.conditions import first_phase_with_work, make_ctx
 from agentflow.config import check_lane
 from agentflow.events import EventLog, nfc
-from agentflow.gitops import fetch_remote_branch, sync_branch
+from agentflow.gitops import GhError, fetch_remote_branch, gh_json, sync_branch
 from agentflow.state import TERMINAL, Run, list_runs, runs_root
 from agentflow.views import lane_first_phase, lane_phases
 
@@ -47,7 +54,17 @@ LIVE = ("backlog", "starting")
 INTERRUPTED = ("interrupted: the dashboard stopped while this card was starting. Check `git branch` and "
                "`agentflow status` for a run it may have created, then press Start if there is none")
 
+ISSUE_MODULE = "issue-{number}"  # the module of an issue-backed run in the module lane: never from the issue's text
+ISSUE_RESPONSIBILITY = "GitHub issue #{number}"  # its capability-map row's responsibility, fixed text too
+ISSUES_MAX = 100  # the most synced issues the Backlog shows
+TITLE_MAX = 200
+ISSUE_LIST_FIELDS = "number,title,labels,url"
+ISSUE_URL = re.compile(r"https://[A-Za-z0-9.-]+(?::\d{1,5})?/[\w.-]+/[\w.-]+/issues/(\d+)")
+TAKEN = ("carries the in-progress label, but no run on this machine is working on it: someone else may be. "
+         "Remove the label on GitHub to free it")
+
 _SPAWN_LOCK = threading.Lock()  # one start at a time: also closes the check-then-create race on a branch name
+_STATE_LOCK = threading.Lock()  # backlog_state.json is read, changed and written by the refresh thread and by starts
 
 
 class Invalid(ValueError):
@@ -65,8 +82,9 @@ class Refused(Exception):
 class Item:
     """A card, replayed from `backlog.jsonl`.
 
-    `source` is `form` for a card added on the page and `map` for the record a capability-map module gets when
-    someone first presses Start on it (so a failed start has somewhere to keep its reason).
+    `source` is `form` for a card added on the page, `map` for the record a capability-map module gets when
+    someone first presses Start on it (so a failed start has somewhere to keep its reason), and `issue` for the
+    same record of a synced GitHub issue.
     """
 
     id: str
@@ -84,7 +102,11 @@ class Item:
 
     @property
     def key(self) -> str:
-        return f"module:{self.params['module']}" if self.source == "map" else f"card:{self.id}"
+        if self.source == "map":
+            return f"module:{self.params['module']}"
+        if self.source == "issue":
+            return f"issue:{self.params['issue']}"
+        return f"card:{self.id}"
 
     @property
     def deps(self) -> list[str]:
@@ -132,6 +154,11 @@ class Backlog:
     def overlay(self, module: str) -> Item | None:
         """The newest record of a start attempt for map module `module`."""
         found = [i for i in self.items.values() if i.source == "map" and i.params.get("module") == module]
+        return found[-1] if found else None
+
+    def issue_overlay(self, number: str) -> Item | None:
+        """The newest record of a start attempt for synced issue `number`."""
+        found = [i for i in self.items.values() if i.source == "issue" and i.params.get("issue") == number]
         return found[-1] if found else None
 
 
@@ -320,7 +347,8 @@ def add(cfg: Config, repo: Path, lane: str, fields: dict, after: Any = (), to_ph
             clash = [r for r in _live_runs(list_runs(repo)) if (r.state.get("params") or {}).get("module") == params["module"]]
             if clash:
                 raise Refused(f"module {params['module']} already has a live run ({clash[0].id})")
-        label = (f"{new_module['module']} — {_one_line(new_module['responsibility'], 50)}" if new_module
+        label = (f"{new_module['module']} — {_one_line(new_module['responsibility'], 50)}"
+                 + (f" · issue #{params['issue']}" if "issue" in params else "") if new_module
                  else f"issue #{params['issue']}" if "issue" in params
                  else _one_line(params.get("task") or params.get("topic") or ""))
         ident = uuid.uuid4().hex[:8]
@@ -331,8 +359,9 @@ def add(cfg: Config, repo: Path, lane: str, fields: dict, after: Any = (), to_ph
 
 def _refuse_duplicate_issue(issue: str, book: Backlog, runs: list[Run]) -> None:
     for item in book.items.values():
-        if item.status in (*LIVE, "started") and item.params.get("issue") == issue and item.status != "started":
+        if item.status in LIVE and item.source == "form" and item.params.get("issue") == issue:
             raise Refused(f"issue #{issue} is already in Backlog")
+    _refuse_starting_issue(issue, book)
     for run in _live_runs(runs):
         if str((run.state.get("params") or {}).get("issue")) == issue:
             raise Refused(f"issue #{issue} already has a live run ({run.id})")
@@ -375,13 +404,181 @@ def _load_state(repo: Path) -> dict:
 
 
 def _save_state(repo: Path, **changes: Any) -> None:
-    data = _load_state(repo)
-    data.update(changes)
-    path = _state_path(repo)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    with _STATE_LOCK:
+        data = _load_state(repo)
+        data.update(changes)
+        path = _state_path(repo)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+
+
+# --------------------------------------------------------------------------- synced GitHub issues
+
+
+def _fold(name: str) -> str:
+    """A label name as GitHub compares it: without case (NFC first, as `intake.is_epic` does)."""
+    return nfc(name).casefold()
+
+
+def _clean_title(value: Any) -> str:
+    """An issue title fit to show: printable, one line, at most `TITLE_MAX` characters. It is only ever shown."""
+    if not isinstance(value, str):
+        return ""
+    return _one_line("".join(ch if ch.isprintable() else " " for ch in nfc(value)), TITLE_MAX)
+
+
+def _parse_issues(cfg: Config, reply: Any) -> list[dict]:
+    """`gh issue list`'s reply as `{number, title, lane, in_progress, url}` entries. Label names are compared and
+    then dropped; an entry with no usable number or no lane is left out. A reply that is not a list is a
+    `ValueError`."""
+    if not isinstance(reply, list):
+        raise ValueError("gh issue list printed no list")
+    pol = cfg.issues
+    by_label = [(_fold(name), lane) for name, lane in pol.lane_labels.items() if lane in cfg.lanes]
+    fallback = pol.sync_lane if pol.sync_lane in cfg.lanes else None
+    taken = _fold(pol.in_progress_label) if pol.in_progress_label else None
+    out: list[dict] = []
+    seen: set[str] = set()
+    for entry in reply:
+        if len(out) >= ISSUES_MAX:
+            break
+        if not isinstance(entry, dict):
+            continue
+        number = entry.get("number")
+        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+            continue
+        try:
+            ident = intake.issue_number(str(number))
+        except ValueError:
+            continue
+        if ident in seen:
+            continue
+        labels = entry.get("labels")
+        names = {_fold(label["name"]) for label in (labels if isinstance(labels, list) else [])
+                 if isinstance(label, dict) and isinstance(label.get("name"), str)}
+        lane = next((lane for name, lane in by_label if name in names), fallback)
+        if lane is None:
+            continue
+        url = entry.get("url")
+        match = ISSUE_URL.fullmatch(url) if isinstance(url, str) else None
+        seen.add(ident)
+        out.append({"number": ident, "title": _clean_title(entry.get("title")), "lane": lane,
+                    "in_progress": taken is not None and taken in names,
+                    "url": url if match and match.group(1) == ident else ""})
+    return out
+
+
+def sync_issues(cfg: Config, repo: Path) -> str:
+    """Read the open issues that carry `issues.sync_label` into `backlog_state.json`; returns the note the board
+    shows ("" when all is well). It never raises: when `gh` fails, the last list stays and the note says why."""
+    repo = Path(repo)
+    label = cfg.issues.sync_label
+    if not label:
+        if _load_state(repo).get("issues_label"):
+            _save_state(repo, issues=[], issues_label="", issues_note="")
+        return ""
+    try:
+        reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS,
+                         "--limit", str(ISSUES_MAX)], cwd=repo)
+        issues = _parse_issues(cfg, reply)
+    except (GhError, OSError, ValueError, TypeError, RecursionError) as exc:  # RecursionError: absurdly nested JSON
+        note = f"GitHub issues not updated: {_reason(exc)}"
+        _save_state(repo, issues_note=note)
+        return note
+    note = (f"only the first {ISSUES_MAX} open issues labelled {label!r} are shown"
+            if len(reply) >= ISSUES_MAX else "")
+    _save_state(repo, issues=issues, issues_label=label, issues_note=note,
+                issues_at=datetime.now(UTC).isoformat(timespec="seconds"))
+    return note
+
+
+def _synced(cfg: Config, state: dict) -> list[dict]:
+    """The cached issues, while they were read for the current `issues.sync_label` and their lane still exists."""
+    label = cfg.issues.sync_label
+    if not label or state.get("issues_label") != label or not isinstance(state.get("issues"), list):
+        return []
+    out = []
+    for entry in state["issues"]:
+        if not (isinstance(entry, dict) and isinstance(entry.get("number"), str) and entry.get("lane") in cfg.lanes):
+            continue
+        url = entry.get("url")
+        match = ISSUE_URL.fullmatch(url) if isinstance(url, str) else None
+        out.append({**entry, "url": url if match and match.group(1) == entry["number"] else "",
+                    "title": _clean_title(entry.get("title"))})
+    return out
+
+
+def _issue_blocker(number: str, pic: dict) -> str | None:
+    """Why synced issue `number` is not a Backlog card of its own: a run, a card or a module here has it."""
+    for run in pic["runs"]:
+        if str((run.state.get("params") or {}).get("issue") or "") != number:
+            continue
+        if run.state["status"] not in TERMINAL:
+            return f"issue #{number} already has a live run ({run.id})"
+        if run.state["status"] == "done":
+            return f"issue #{number} already has a run ({run.id}) whose pull request is open"
+    for item in pic["book"].cards():
+        if item.status in LIVE and item.params.get("issue") == number:
+            return f"issue #{number} is already card:{item.id}"
+    module = ISSUE_MODULE.format(number=number)
+    if any(n.id == module for n in pic["nodes"]):
+        return f"issue #{number} is module {module}: start module:{module} instead"
+    return None
+
+
+def _issue_run_params(cfg: Config, lane: str, number: str, pic: dict) -> tuple[dict, dict | None]:
+    """`(params, new_module)` for a run of `lane` from issue `number`. The module lane works on the derived module
+    `issue-<N>` (a new map row in a capability map); nothing in either comes from the issue's text."""
+    params: dict = {"issue": number}
+    if lane != module_queue.module_lane(cfg):
+        return params, None
+    module = ISSUE_MODULE.format(number=number)
+    params["module"] = module
+    if any(n.id == module for n in pic["nodes"]):
+        if {e["id"]: e for e in pic["entries"]}[module]["status"] != "backlog":
+            raise Refused(f"module {module} already has a run or is done")
+        return params, None
+    if work_source.kind(cfg) == "capability_map":
+        return params, {"module": module, "responsibility": ISSUE_RESPONSIBILITY.format(number=number), "deps": []}
+    return params, None
+
+
+def _refuse_starting_issue(number: str, book: Backlog) -> None:
+    """A synced issue whose start is in flight has no run yet, so only its record says it is taken here."""
+    record = book.issue_overlay(number)
+    if record is not None and record.status == "starting":
+        raise Refused(f"issue #{number} is starting from its synced card")
+
+
+def _taken_now(cfg: Config, repo: Path, number: str) -> str | None:
+    """Why issue `number` can't start, asked of GitHub at the moment of starting (the board's list can be a minute
+    old): it was closed, or someone put the in-progress label on it. None when it is free or GitHub can't say."""
+    if not cfg.issues.sync_label:
+        return None
+    try:
+        reply = gh_json(["issue", "view", number, "--json", "state,labels"], cwd=repo)
+    except (GhError, OSError, ValueError, RecursionError):
+        return None  # the run's own intake asks GitHub again and stops on a real failure
+    if not isinstance(reply, dict):
+        return None
+    if str(reply.get("state") or "OPEN").upper() == "CLOSED":
+        return f"issue #{number} was closed on GitHub"
+    labels = reply.get("labels")
+    taken = _fold(cfg.issues.in_progress_label) if cfg.issues.in_progress_label else None
+    if taken and isinstance(labels, list) and any(
+            isinstance(label, dict) and isinstance(label.get("name"), str) and _fold(label["name"]) == taken
+            for label in labels):
+        return f"issue #{number} {TAKEN}"
+    return None
+
+
+def _refuse_taken(number: str, pic: dict) -> None:
+    entry = next((i for i in pic["issues"] if i["number"] == number), None)
+    if entry is not None and entry.get("in_progress") and not any(
+            str((r.state.get("params") or {}).get("issue") or "") == number for r in _live_runs(pic["runs"])):
+        raise Refused(f"issue #{number} {TAKEN}")
 
 
 def _picture(cfg: Config, repo: Path) -> dict:
@@ -402,7 +599,8 @@ def _picture(cfg: Config, repo: Path) -> dict:
     view = module_queue.dependency_view(
         nodes, entries, book.cards(), merged=merged, runs={r.id: r for r in runs}, noun=work_source.noun(cfg),
     )
-    return {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "view": view, "state": state}
+    return {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "view": view, "state": state,
+            "issues": _synced(cfg, state)}
 
 
 def _label_of(key: str, pic: dict) -> str:
@@ -413,6 +611,8 @@ def _label_of(key: str, pic: dict) -> str:
     if kind == "run":
         run = next((r for r in pic["runs"] if r.id == name), None)
         return _label_of_run(run) if run else name
+    if kind == "issue":
+        return f"issue #{name}"
     return name
 
 
@@ -435,7 +635,8 @@ def snapshot(cfg: Config, repo: Path) -> dict:
     view, book, lane = pic["view"], pic["book"], module_queue.module_lane(cfg)
     cards: list[dict] = []
 
-    def make(key: str, kind: str, ident: str, label: str, item_lane: str, item: Item | None, **extra: Any) -> dict:
+    def make(key: str, kind: str, ident: str, label: str, item_lane: str, item: Item | None,
+             module: str | None = None, **extra: Any) -> dict:
         info = view.get(key, {"blocked_by": [], "parallel_with": [], "parallel": False})
         failure = item.failure if item is not None else None
         if item is not None and item.status == "starting":
@@ -449,12 +650,14 @@ def snapshot(cfg: Config, repo: Path) -> dict:
             "blocked_by": info["blocked_by"],
             "parallel_with": [{"key": k, "label": _label_of(k, pic)} for k in info["parallel_with"]],
             "parallel": info["parallel"], "failure": failure,
-            "first_phase": _first_phase(cfg, repo, item_lane, ident if kind == "module" else None),
+            "first_phase": _first_phase(cfg, repo, item_lane, ident if kind == "module" else module),
             "removable": item is not None and item.source == "form" and item.status == "backlog",
             "to_phase": item.to_phase if item else None, **extra,
         }
 
     by_entry = {e["id"]: e for e in pic["entries"]}
+    live_issues = {str((r.state.get("params") or {}).get("issue") or "") for r in _live_runs(pic["runs"])}
+    taken = {i["number"] for i in pic["issues"] if i.get("in_progress") and i["number"] not in live_issues}
     for node in pic["nodes"]:
         entry = by_entry[node.id]
         if entry["status"] != "backlog":
@@ -464,8 +667,22 @@ def snapshot(cfg: Config, repo: Path) -> dict:
     for item in book.cards():
         if item.status in ("started", "removed"):
             continue
-        cards.append(make(f"card:{item.id}", "card", item.id, item.label, item.lane, item,
-                          deps=[*item.after, *item.deps], new=item.new_module is not None))
+        card = make(f"card:{item.id}", "card", item.id, item.label, item.lane, item,
+                    deps=[*item.after, *item.deps], new=item.new_module is not None)
+        if item.params.get("issue") in taken and card["status"] != "starting":
+            card["status"], card["note"] = "taken", TAKEN
+        cards.append(card)
+    for entry in pic["issues"]:
+        number = entry["number"]
+        if _issue_blocker(number, pic) is not None:
+            continue
+        module = ISSUE_MODULE.format(number=number) if entry["lane"] == lane else None
+        card = make(f"issue:{number}", "issue", number, f"#{number} · {entry.get('title') or ''}".rstrip(" ·"),
+                    entry["lane"], book.issue_overlay(number), module=module, deps=[], issue=number,
+                    url=entry.get("url") or "")
+        if number in taken and card["status"] != "starting":
+            card["status"], card["note"] = "taken", TAKEN
+        cards.append(card)
     done = [{"key": f"module:{n.id}", "id": n.id, "reason": by_entry[n.id].get("done_reason") or finished.MERGED}
             for n in pic["nodes"] if by_entry[n.id]["status"] == "done"]
     live_runs = [{"key": f"run:{r.id}", "label": _label_of_run(r), "kind": "run"} for r in _live_runs(pic["runs"])]
@@ -485,6 +702,7 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         "modules": [n.id for n in pic["nodes"]],
         "skipped": work_source.skipped(cfg, repo),
         "sync_note": pic["state"].get("sync_note") or "",
+        "issues_note": pic["state"].get("issues_note") or "" if cfg.issues.sync_label else "",
     }
 
 
@@ -564,8 +782,13 @@ def _spec_task(new_module: dict) -> str:
 
 def parse_key(key: Any) -> tuple[str, str]:
     kind, _, name = str(key).partition(":")
-    if kind not in ("module", "card") or not name:
-        raise Invalid("name a card (card:<id>) or a module (module:<id>)")
+    if kind not in ("module", "card", "issue") or not name:
+        raise Invalid("name a card (card:<id>), a module (module:<id>) or an issue (issue:<number>)")
+    if kind == "issue":
+        try:
+            name = str(int(intake.issue_number(name)))
+        except ValueError as exc:
+            raise Invalid(str(exc)) from exc
     return kind, name
 
 
@@ -587,6 +810,23 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
                 raise Refused(f"module {name} already has a run or is done")
             item = book.overlay(name)
             params, new_module, to_phase, item_lane = {"module": name}, None, None, lane or ""
+            numbered = re.fullmatch(r"issue-(\d{1,10})", name)
+            if numbered and any(i["number"] == numbered.group(1) for i in pic["issues"]):
+                _refuse_taken(numbered.group(1), pic)
+                params["issue"] = numbered.group(1)  # so the run marks the issue and its PR closes it
+        elif kind == "issue":
+            entry = next((i for i in pic["issues"] if i["number"] == name), None)
+            if entry is None:
+                raise Refused(f"issue #{name} is not open with the {cfg.issues.sync_label!r} label "
+                              "as of the last refresh" if cfg.issues.sync_label else "issue sync is off")
+            blocker = _issue_blocker(name, pic)
+            if blocker is not None:
+                raise Refused(blocker)
+            _refuse_taken(name, pic)
+            item_lane = entry["lane"]
+            item = book.issue_overlay(name)
+            params, new_module = _issue_run_params(cfg, item_lane, name, pic)
+            to_phase = None
         else:
             item = book.items.get(name)
             if item is None or item.source != "form" or item.status == "removed":
@@ -600,6 +840,12 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
             if any(n.id == params.get("module") for n in pic["nodes"]):
                 raise Refused(f"a spec for {params['module']} now exists; start module:{params['module']} instead")
             params["task"], new_module = _spec_task(new_module), None
+        if kind == "card" and params.get("issue"):
+            _refuse_taken(str(params["issue"]), pic)
+            _refuse_starting_issue(str(params["issue"]), book)
+            if item_lane == lane and "module" not in params:  # an issue-only card in the module lane
+                extra, new_module = _issue_run_params(cfg, item_lane, str(params["issue"]), pic)
+                params.update(extra)
         info = pic["view"].get(key)
         if info and info["blocked_by"]:
             raise Refused(f"{_label_of(key, pic)} is blocked: runs after "
@@ -607,10 +853,14 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
         clash = _live_clash(params, item_lane, pic["runs"])
         if clash:
             raise Refused(clash)
-        if item is None or (kind == "module" and item.status == "started"):  # a card was found above, so None is a module
+        if item is None or (kind in ("module", "issue") and item.status == "started"):  # a card always has its item
             ident = uuid.uuid4().hex[:8]
-            log.append("item_added", by=BY, id=ident, lane=item_lane, kind="module", source="map", params=params,
-                       new_module=None, after=[], to_phase=None, label=name)
+            if kind == "issue":
+                log.append("item_added", by=BY, id=ident, lane=item_lane, kind="issue", source="issue",
+                           params={"issue": name}, new_module=None, after=[], to_phase=None, label=f"issue #{name}")
+            else:
+                log.append("item_added", by=BY, id=ident, lane=item_lane, kind="module", source="map",
+                           params={"module": name}, new_module=None, after=[], to_phase=None, label=name)
         else:
             ident = item.id
         log.append("item_starting", by=BY, id=ident)
@@ -641,6 +891,10 @@ def run_start(
     spawn = spawn or module_queue.spawn_run
     log = _log(repo)
     with _SPAWN_LOCK:
+        taken = _taken_now(cfg, repo, str(job.params["issue"])) if job.params.get("issue") else None
+        if taken is not None:
+            log.append("item_failed", by=BY, id=job.item_id, reason=taken)
+            return None
         if module_queue.backlog_settings(cfg).get("sync_base", False):
             _save_state(repo, sync_note=sync_branch(repo, cfg.project.fork_from))
         try:
@@ -677,6 +931,7 @@ def refresh(cfg: Config, repo: Path) -> dict:
     It only refreshes what the cards show and never starts anything. It skips the assessment when
     `agentflow queue` holds the queue lock."""
     repo = Path(repo)
+    issues_note = sync_issues(cfg, repo)  # never raises, and touches no git
     note = sync_branch(repo, cfg.project.fork_from) if module_queue.backlog_settings(cfg).get("sync_base", False) else ""
     # origin/<fork_from> is where a merged plan lands; fetching it never touches a local branch or the work tree
     fetch_remote_branch(repo, cfg.project.fork_from)
@@ -692,7 +947,7 @@ def refresh(cfg: Config, repo: Path) -> dict:
     if merged is not None:
         changes["merged"] = merged
     _save_state(repo, **changes)
-    return {"note": note, "skipped": skipped}
+    return {"note": note, "skipped": skipped, "issues_note": issues_note}
 
 
 def _recheck_after(cfg: Config, repo: Path) -> dict[str, bool | None]:

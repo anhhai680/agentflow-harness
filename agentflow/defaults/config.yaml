@@ -78,6 +78,9 @@ issues:
   in_progress_label: "agentflow:in-progress"   # "" turns off the label and the start comment (never the PR link)
   comment: true                                # also post one comment when a run starts from an issue
   epic_labels: ["epic"]                        # an issue with one of these gets `Refs #N`, never `Closes #N`
+  sync_label: ""                               # open issues with this label become Backlog cards ("" turns the sync off)
+  sync_lane: feature                           # the lane of a synced issue that no lane_labels entry matches
+  lane_labels: {bug: bug}                      # issue label: lane, for a synced issue; the first match wins
 
 policy:                        # what a finished run must show before it counts as conformant; a pack's own entries merge by id
   enforce: report              # report | block (`block` stops `finish` with `conformance_failed` when an obligation is missing)

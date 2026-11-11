@@ -36,6 +36,7 @@ from agentflow.gitops import (
     update_pr_body,
 )
 from agentflow.hitl import EVENT_EXTRA_MAX, raise_hitl
+from agentflow.issue_status import link
 
 if TYPE_CHECKING:
     from agentflow.state import Run
@@ -75,10 +76,15 @@ class CILane:
         if not opened:
             return self._ci_stop(key, "There is no pull request to watch: `finish` has not opened one.")
         url = str(opened[-1]["url"])
+        link(self.run)  # a link that failed at `finish` gets another try; a no-op once `issue_linked` is logged
         if any(e["type"] == "pr_marked_ready" for e in events):
             self.run.emit("step_finished", key=key, status="done", summary=f"ready for review: {url}")
             return "done"
+        first = True
         while True:
+            if not first:
+                link(self.run)  # and again on every later round, until GitHub lists the link
+            first = False
             fixes, reruns = self._rounds(key)
             self.run.emit("ci_watching", url=url, round=fixes + reruns)
             verdict, detail, checks = self._wait(key, url)

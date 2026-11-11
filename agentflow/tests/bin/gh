@@ -18,7 +18,8 @@ is `$FAKE_GH_PR_ID` when that is set (even to ""), else `PR_fake`, and the numbe
 `$FAKE_GH_CLOSING` plus each line of the file `$FAKE_GH_LOG.closing`. The default `issue view N` reply carries
 `"id": "I_fakeN"`. `api graphql` with `addCloseIssueReferences` in its `query=` argument appends the issue's number
 (from its `issue=I_fakeN` variable) to `$FAKE_GH_LOG.closing`, unless `$FAKE_GH_LINK_IGNORED` is set, and prints
-`{"data": {"addCloseIssueReferences": {"clientMutationId": null}}}`.
+`{"data": {"addCloseIssueReferences": {"clientMutationId": null}}}`. `issue list` prints `$FAKE_GH_ISSUE_LIST`
+(default `[]`).
 """
 
 import json
@@ -85,6 +86,8 @@ elif args[:2] == ["pr", "view"] and "--json" in args and args[args.index("--json
     print(json.dumps({"mergeable": verdicts[min(place, len(verdicts) - 1)], "mergeStateStatus": "CLEAN"}))
 elif args[:2] == ["pr", "view"] and "--json" in args and "state" in args[args.index("--json") + 1:][:1]:
     print(json.dumps({"state": os.environ.get("FAKE_GH_STATE", "OPEN")}))
+elif args[:2] == ["issue", "list"]:
+    print(os.environ.get("FAKE_GH_ISSUE_LIST", "[]"))
 elif args[:2] == ["issue", "view"] and len(args) > 2:
     default = {"title": f"Issue {args[2]}", "body": "", "url": f"https://github.com/example/repo/issues/{args[2]}",
                "id": f"I_fake{args[2]}"}
