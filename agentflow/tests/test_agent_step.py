@@ -212,6 +212,40 @@ def test_a_failed_pre_run_starts_the_session_in_its_fix_loop(flow_repo):
     assert gate_runs(flow_repo, run) == [("flaky", False), ("flaky", True)]
 
 
+def test_a_step_that_changed_nothing_reuses_the_passes_another_step_had_on_the_same_tree(flow_repo):
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, make_step(gates=["ok"])) == "done"
+    other = make_step(id="other", gates=["ok"])
+    assert flow_repo.executor().run_agent_step(make_phase(other), other, "build/other") == "done"
+    assert gate_runs(flow_repo, run) == [("ok", True)]  # once: the second step's tree is the same
+    (reused,) = flow_repo.events(run, "gates_reused")
+    assert reused["key"] == "build/other" and reused["gates"] == ["ok"] and reused["from"] == [KEY]
+
+
+def test_a_setup_gate_runs_every_time(flow_repo):
+    flow_repo.configure({"gate_sets": {"setup": ["ok"]}})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, make_step(gates=["ok"])) == "done"
+    other = make_step(id="other", gates=["ok"])
+    assert flow_repo.executor().run_agent_step(make_phase(other), other, "build/other") == "done"
+    assert gate_runs(flow_repo, run) == [("ok", True), ("ok", True)]
+    assert flow_repo.events(run, "gates_reused") == []
+
+
+def test_a_fix_attempt_runs_the_failed_gate_first_and_defers_the_rest_while_it_fails(flow_repo):
+    flow_repo.configure({"gates": {"flaky": {"run": "test -f fixed.txt"}}})
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"result": DONE}, {"result": DONE},
+                            {"write": {"fixed.txt": "ok\n"}, "result": DONE}]})
+    assert run_step(flow_repo, make_step(gates=["ok", "flaky"], fix_loop=True)) == "done"
+    # the full set, then only `flaky` while it fails, then `flaky` and the rest on the fixed tree
+    assert gate_runs(flow_repo, run) == [("ok", True), ("flaky", False), ("flaky", False), ("flaky", True),
+                                         ("ok", True)]
+    (deferred,) = flow_repo.events(run, "gates_deferred")
+    assert deferred["gates"] == ["ok"]
+    assert [e["gates"] for e in flow_repo.events(run, "fix_attempt")] == [["flaky"], ["flaky"]]
+
+
 def test_a_step_without_gates_first_gets_no_evidence_and_runs_its_gates_after(flow_repo):
     run = flow_repo.new_run()
     step = make_step(gates=["ok"], fix_loop=True)

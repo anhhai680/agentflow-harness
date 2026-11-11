@@ -36,6 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 
+from agentflow import keepawake
 from agentflow.agents import make_agents
 from agentflow.autonomy import (
     AUTO_BY,
@@ -221,7 +222,8 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
     if not lock.acquire():
         raise RunLocked(f"another runner is working on {run.id}; see `agentflow status {run.id}`")
     try:
-        return _Loop(run, cfg, _effective(run, opts)).go()
+        with keepawake.holding():  # until a human is needed or the run ends
+            return _Loop(run, cfg, _effective(run, opts)).go()
     except Exception as exc:
         run.emit("runner_error", error=str(exc) or repr(exc), exception=type(exc).__name__)
         raise

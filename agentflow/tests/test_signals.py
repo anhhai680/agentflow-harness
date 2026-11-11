@@ -69,7 +69,8 @@ def test_stops_and_plain_counters():
 
 
 def test_a_run_with_nothing_to_report_has_only_the_always_present_counts():
-    assert run_signals([], EMPTY_METRICS) == {"ci_rounds": 0, "rollovers": 0, "progress_not_updated": 0, "rework_pct": 0}
+    assert run_signals([], EMPTY_METRICS) == {"ci_rounds": 0, "rollovers": 0, "progress_not_updated": 0, "rework_pct": 0,
+                                              "gate_reruns": 0}
 
 
 def test_a_run_with_a_gate_failure_but_no_ci_rounds_reports_zero_ci_rounds():
@@ -89,7 +90,7 @@ def test_open_parameter_counts_stay_absent_and_count_families_are_lower_is_bette
     out = run_signals([], EMPTY_METRICS)
     assert not [k for k in out if k.split(":")[0] in ("guard_trips", "permission_denied", "stop")]
     assert COUNT_FAMILIES <= set(FAMILIES) and all(FAMILIES[f][0] == "lower" for f in COUNT_FAMILIES)
-    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 10
+    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 12
 
 
 def test_cost_per_task_divides_by_the_steps_that_called_an_agent():
@@ -119,7 +120,7 @@ def test_signals_survive_events_without_the_new_fields():
     evs = [_ev("guard_tripped", key="build/x"), _ev("review_result", key="build/x"), _ev("hitl_raised", key="build/x"),
            _ev("phase_rejected", by="human")]
     assert run_signals(evs, EMPTY_METRICS) == {"ci_rounds": 0, "rollovers": 0, "progress_not_updated": 0, "rework_pct": 0,
-                                           "review_blocking:build": 0}
+                                           "review_blocking:build": 0, "gate_reruns": 0}
 
 
 def test_parse_target_accepts_only_the_vocabulary():
@@ -132,7 +133,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 15
+    assert len(FAMILIES) == 18
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -149,3 +150,38 @@ def test_conformance_counts_come_from_the_last_check():
     assert (bare["conformance_missing"], bare["conformance_waived"]) == (0, 0)
     none = run_signals([], EMPTY_METRICS)
     assert "conformance_missing" not in none and "conformance_waived" not in none
+
+
+def _timed(key: str, gate: str, passed: bool, tree: str | None, secs: float, cmd: str | None = "c1") -> dict:
+    e = _ev("gate_result", key=key, gate=gate, passed=passed, skipped=False, duration_s=secs)
+    if tree is not None:
+        e["tree"] = tree
+    if cmd is not None:
+        e["cmd"] = cmd
+    return e
+
+
+def test_gate_minutes_add_up_by_phase():
+    evs = [_timed("verify/verify", "it", True, "T1", 600), _timed("verify/verify", "lint", True, "T1", 30),
+           _timed("build/b/task-1/implement", "lint", True, "T0", 60)]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert out["gate_minutes:verify"] == 10.5 and out["gate_minutes:build"] == 1.0
+
+
+def test_a_gate_run_again_on_a_tree_it_passed_on_is_a_rerun():
+    evs = [_timed("verify/fix_findings", "it", True, "T1", 600),
+           _timed("verify/verify", "it", True, "T1", 600),          # same tree, same command: a rerun
+           _timed("review/fix_findings", "it", True, "T1", 600, cmd="c2"),  # the command changed: not one
+           _timed("verify/verify", "it", True, "T2", 600),          # another tree: not one
+           _timed("verify/verify", "lint", False, "T3", 5), _timed("verify/verify", "lint", True, "T3", 5),  # a retry
+           _timed("verify/verify", "x", True, None, 5), _timed("verify/verify", "x", True, None, 5)]  # no tree
+    assert run_signals(evs, EMPTY_METRICS)["gate_reruns"] == 1
+
+
+def test_refine_rounds_count_only_the_runner_own_rounds():
+    phases = [{"phase": "verify", "cost_usd": 0.0, "steps": []}, {"phase": "review", "cost_usd": 0.0, "steps": []}]
+    evs = [_ev("phase_rejected", phase="verify", by="runner"), _ev("phase_rejected", phase="verify", by="runner"),
+           _ev("phase_rejected", phase="review", by="me")]
+    out = run_signals(evs, _metrics(phases))
+    assert out["refine_rounds:verify"] == 2 and out["refine_rounds:review"] == 0
+    assert out["human_rejections:review"] == 1

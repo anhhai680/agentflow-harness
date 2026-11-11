@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from agentflow import keepawake
 from agentflow import doctor, flow
 from agentflow.config import load_config
 from agentflow.doctor import Check, gate_programs, render, run_checks
@@ -66,12 +67,19 @@ def _checks(tmp_cfg, repo: Path, patch=None) -> dict[str, Check]:
     return {c.name: c for c in run_checks(cfg, repo)}
 
 
-def test_doctor_is_all_ok_with_every_tool_present_and_logged_in(tmp_cfg, repo):
+def test_doctor_is_all_ok_with_every_tool_present_and_logged_in(tmp_cfg, repo, monkeypatch):
+    monkeypatch.setattr(keepawake, "describe", lambda platform=None: "caffeinate")
     checks = _checks(tmp_cfg, repo)
     assert {n: c.status for n, c in checks.items()} == {
-        "agent:claude": "ok", "gh": "ok", "remote": "ok", "state dir": "ok", "inherited environment": "ok",
-        "gate:build": "ok"}
+        "agent:claude": "ok", "gh": "ok", "remote": "ok", "state dir": "ok", "keep awake": "ok",
+        "inherited environment": "ok", "gate:build": "ok"}
     assert "network" in checks["gh"].detail
+
+
+def test_no_sleep_inhibitor_is_a_warning(tmp_cfg, repo, monkeypatch):
+    monkeypatch.setattr(keepawake, "describe", lambda platform=None: None)
+    check = _checks(tmp_cfg, repo)["keep awake"]
+    assert check.status == "warn" and "sleep" in check.detail
 
 
 def test_a_missing_agent_cli_fails_with_an_install_hint(tmp_cfg, repo):

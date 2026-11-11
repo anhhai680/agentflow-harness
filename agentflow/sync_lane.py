@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from agentflow.config import Config, Phase, Step
-from agentflow.gates import GateResult, gates_ok, record_results, run_gates
+from agentflow.gates import GateResult, gates_ok, record_results, run_gates, run_gates_reusing
 from agentflow.gitops import (
     CommitRejected,
     GhError,
@@ -207,10 +207,11 @@ class SyncLane:
         results: list[GateResult] = []
         tree = snapshot(self.worktree)
         if names:
-            results += run_gates(self.cfg, names if len(names) > 1 else names[0], self.worktree,
-                                 self.run.gate_log_dir(key))
+            results += run_gates_reusing(self.cfg, self.run, key, names if len(names) > 1 else names[0],
+                                         self.worktree, self.run.gate_log_dir(key), tree)
         if with_eval:
-            results += run_gates(self.cfg, ["eval"], self.worktree, self.run.gate_log_dir(key))
+            results += run_gates_reusing(self.cfg, self.run, key, ["eval"], self.worktree, self.run.gate_log_dir(key),
+                                         tree)
         record_results(self.run, key, results, tree)
         return results
 

@@ -53,6 +53,15 @@ def _state_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def _no_keepawake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test run starts a real sleep inhibitor (`keepawake`); `test_keepawake.py` puts the real lookup back.
+    A stub rather than `AGENTFLOW_NO_KEEPAWAKE`, which would reach every agent's environment."""
+    from agentflow import keepawake
+
+    monkeypatch.setattr(keepawake, "inhibitor_argv", lambda pid, platform=None: None)
+
+
+@pytest.fixture(autouse=True)
 def _config_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """No test reads the developer's own user file (`layers.user_config_path`): its config home is a tmp dir."""
     home = tmp_path / "xdg-config"

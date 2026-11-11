@@ -582,7 +582,8 @@ def test_an_unchanged_answer_over_a_changed_tree_is_still_reviewed_and_gated(flo
     since = [e for e in run.events.read() if e["seq"] > answered]
     assert not [e for e in since if e["type"] == "review_skipped"]
     assert [e["step"] for e in since if e["type"] == "agent_started"] == [IMPL1, REVIEW1]
-    assert [e for e in since if e["type"] == "gate_result" and e["key"] == "build/build/task-1/commit"]
+    # gated before the commit: run, or reused from a pass on exactly this tree (the parked session's own gates)
+    assert [e for e in since if e["type"] in ("gate_result", "gates_reused") and e["key"] == "build/build/task-1/commit"]
     assert git_in(git, run, "log", "-1", "--format=%s").strip() == "Refine Task 1: First thing"
     assert "src/one.py" in git_in(git, run, "show", "--name-only", "--format=", "HEAD").split()
 

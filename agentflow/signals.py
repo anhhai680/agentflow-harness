@@ -10,7 +10,10 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   and `rework_pct` are always present (0 when nothing happened), `fix_attempts:<p>` and `human_rejections:<p>`
   are present for every phase of the run, and a key of the open-parameter count families that is absent is 0.
   `conformance_missing` and `conformance_waived` count the statuses of the run's last `conformance_checked` and
-  are present only for a run that has one.
+  are present only for a run that has one. `gate_minutes:<p>` is the time a phase spent in gates (present for a
+  phase that ran one), `gate_reruns` counts gates run again on a tree they had already passed on with the same
+  command (always present: reuse should keep it at 0), and `refine_rounds:<p>` counts the refine rounds the runner
+  opened itself (present for every phase of the run).
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
 
@@ -40,13 +43,17 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "rework_pct": ("lower", False),
     "conformance_missing": ("lower", False),  # obligations with no evidence at the last audit
     "conformance_waived": ("lower", False),   # obligations a person waived at the last audit
+    "gate_minutes": ("lower", True),          # a phase: minutes its gates ran
+    "gate_reruns": ("lower", False),          # gates run again on a tree they had passed on, same command
+    "refine_rounds": ("lower", True),         # a phase: refine rounds the runner opened on its own findings
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
 # `human_rejections` are present for every phase of the run; the open-parameter ones (`guard_trips`,
 # `permission_denied`, `stop`) are present only for a parameter that occurred.
 COUNT_FAMILIES = frozenset({"fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections",
-                            "ci_rounds", "rollovers", "progress_not_updated", "conformance_missing", "conformance_waived"})
+                            "ci_rounds", "rollovers", "progress_not_updated", "conformance_missing", "conformance_waived",
+                            "gate_reruns", "refine_rounds"})
 RUNNER = "runner"  # `phase_rejected.by` for what the runner settles itself; a person's name is never this
 
 
@@ -82,6 +89,32 @@ def _first_pass(events: list[dict]) -> dict[str, float]:
     return {f"gate_first_pass:{gate}": passed / n for gate, (passed, n) in totals.items()}
 
 
+def _gate_time(events: list[dict]) -> dict[str, float]:
+    """`gate_minutes:<phase>` for each phase that ran a gate, and `gate_reruns`: a gate that ran again on a tree it
+    had already passed on (same command, when both events carry one). Events with no `tree` never count as reruns."""
+    minutes: dict[str, float] = {}
+    passed: dict[tuple[str, str], set[str]] = {}
+    reruns = 0
+    for ev in events:
+        if ev.get("type") != "gate_result" or not ev.get("gate"):
+            continue
+        if phase := _phase_of(ev.get("key")):
+            minutes[phase] = minutes.get(phase, 0.0) + float(ev.get("duration_s") or 0.0) / 60
+        tree = ev.get("tree")
+        if not tree:
+            continue
+        slot = (str(ev["gate"]), str(tree))
+        cmd = str(ev.get("cmd") or "")
+        seen = passed.get(slot)
+        if seen is not None and (not cmd or "" in seen or cmd in seen):
+            reruns += 1
+        if ev.get("passed") and not ev.get("skipped"):
+            passed.setdefault(slot, set()).add(cmd)
+    out = {f"gate_minutes:{phase}": round(m, 3) for phase, m in minutes.items()}
+    out["gate_reruns"] = reruns
+    return out
+
+
 def _turns(events: list[dict]) -> dict[str, float]:
     """Agent turns per step, by phase. A turn names its session, not its step, so the step comes from the session
     event that opened the session (or, before one, from the call that just started)."""
@@ -115,7 +148,8 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
     """The signals of one run, only for what the run did. `metrics` is `metrics.run_metrics` for the same run."""
     out: dict[str, float] = _first_pass(events)
     counts: dict[str, Counter[str]] = {name: Counter() for name in (
-        "fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections", "review_blocking")}
+        "fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections", "review_blocking",
+        "refine_rounds")}
     plain: Counter[str] = Counter()
     audit: dict | None = None
     for ev in events:
@@ -137,6 +171,8 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
         elif etype == "phase_rejected":
             if ev.get("phase") and ev.get("by") != RUNNER:
                 counts["human_rejections"][str(ev["phase"])] += 1
+            elif ev.get("phase"):
+                counts["refine_rounds"][str(ev["phase"])] += 1
         elif etype == "review_result":
             if phase := _phase_of(ev.get("key")):
                 counts["review_blocking"][phase] += int(ev.get("blocking") or 0)
@@ -148,9 +184,10 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
         out.update({f"{family}:{param}": n for param, n in found.items()})
     out.update({name: plain[name] for name in ("ci_rounds", "rollovers", "progress_not_updated")})
     for phase in metrics.get("phases") or []:
-        for family in ("fix_attempts", "human_rejections"):
+        for family in ("fix_attempts", "human_rejections", "refine_rounds"):
             out.setdefault(f"{family}:{phase['phase']}", 0)
     out.update(_turns(events))
+    out.update(_gate_time(events))
     if audit is not None:  # the last audit only, and only for a run that was audited
         statuses = Counter(f.get("status") for f in audit.get("obligations") or [] if isinstance(f, dict))
         out["conformance_missing"] = statuses["missing"]

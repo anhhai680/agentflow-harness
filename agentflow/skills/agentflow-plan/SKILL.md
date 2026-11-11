@@ -52,5 +52,6 @@ Each task is a level-3 heading `### Task N: <title>` with N counting from 1. Und
 - Test first: a task's first step writes the failing test, and the next makes it pass.
 - Say what each task changes and why, not how to type the code. Give a signature wherever a task calls or defines one, in its Interfaces list, and a snippet only where exact text matters.
 - Name tests by the runner's real command for the repository. Run only the tests a task touches. The runner's gates run everything else.
+- Never write a command that runs the whole suite, a whole test directory beyond the task's own module, or an end-to-end stack into a task step. Each one costs minutes per task, and the verify gates run them once for the whole branch.
 - If the spec is silent on a decision the design needs, do not invent it. Stop and ask.
 - Write no code in this step.

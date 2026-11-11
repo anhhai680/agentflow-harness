@@ -1,7 +1,7 @@
 Goal: write the implementation plan for module `{module}` to `{plan_target}`.
 
 Read `{spec}` (approved), the repository's quality rules and the architecture part of the repository's agent instructions.
-Split the work into tasks of one testable slice each, with files, an **Interfaces** list (the existing code each task calls, as `path:line` and signature, and what it takes from and gives to other tasks) and exact test commands. Follow TDD: tests first.
+Split the work into tasks of one testable slice each, with files, an **Interfaces** list (the existing code each task calls, as `path:line` and signature, and what it takes from and gives to other tasks) and exact test commands. Follow TDD: tests first. A task's commands run only the tests that task adds or changes: never the whole suite, another module's suites or an end-to-end stack, because the runner's gates run those.
 Give every task a `**Depends on:**` line naming the tasks it needs (`**Depends on:** Task 2, Task 4`, or `**Depends on:** none`). Without one, the runner assumes the task depends on the previous one.
 A task that can't be built until another module merges stays in the plan with no checkboxes, and its body starts with `> **Deferred (<reason>).**`. The runner skips it, and the module counts as done without it.
 On a security-sensitive path (authentication, authorisation, secrets, untrusted input, personal data), add the security checks to the tasks.

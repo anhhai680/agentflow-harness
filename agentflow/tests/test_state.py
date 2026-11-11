@@ -276,6 +276,20 @@ def test_phase_approval_and_rejection_events(run):
     assert run.state["phases"]["plan"]["approval_sha"] == "s2"
 
 
+def test_an_approval_by_the_runner_ends_the_phase_refine_round(run):
+    run.emit("phase_started", phase="verify", start_sha="s0")
+    run.emit("phase_rejected", phase="verify", round=1, note="fix it", by="runner")
+    assert run.state["refine"]["phase"] == "verify" and run.state["status"] == "refining"
+    run.emit("phase_approved", phase="verify", by="runner", sha="s1")  # no approval was raised: the runner settled it
+    assert run.state["refine"] is None and run.state["status"] == "running"
+
+
+def test_approving_another_phase_keeps_a_refine_round(run):
+    run.emit("phase_rejected", phase="build", round=1, note="redo", by="me")
+    run.emit("phase_approved", phase="plan", by="me")
+    assert run.state["refine"]["phase"] == "build"
+
+
 def test_stalled_lock(run):
     assert lock_state(run.dir) == "idle"
     RunLock(run.dir).path.write_text("999999", encoding="utf-8")

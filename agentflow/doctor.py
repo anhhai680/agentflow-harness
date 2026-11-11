@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from agentflow import layers, pack, run_env
+from agentflow import keepawake, layers, pack, run_env
 from agentflow.config import Config, ConfigError, load_config
 
 TIMEOUT_S = 20  # each external command
@@ -194,6 +194,15 @@ def _environment_check(cfg: Config) -> Check:
                  "they are dropped from runs; to keep one, set it in `defaults.env`")
 
 
+def _keepawake_check() -> Check:
+    """Whether a run can keep the machine awake (`keepawake`): a missing inhibitor is a warning, never a failure."""
+    tool = keepawake.describe()
+    if tool:
+        return Check("keep awake", "ok", f"`{tool}` keeps the machine awake while a run works")
+    return Check("keep awake", "warn", "no `caffeinate` or `systemd-inhibit`: the machine may sleep in the middle of a run",
+                 "keep the machine awake yourself during long runs")
+
+
 def gate_path(cfg: Config) -> str:
     """The PATH a gate's programs are looked up on: `defaults.env.PATH`, else this process's."""
     return cfg.defaults.env.get("PATH") or os.environ.get("PATH", os.defpath)
@@ -277,12 +286,14 @@ def _gate_checks(cfg: Config) -> tuple[list[Check], bool]:
 
 
 def run_checks(cfg: Config, repo: Path) -> list[Check]:
-    """Every check, in order: the agents, `gh`, the remote, Docker (when a gate runs it), the state dir, the gates."""
+    """Every check, in order: the agents, `gh`, the remote, Docker (when a gate runs it), the state dir, keeping the
+    machine awake, the inherited environment, the gates."""
     gate_checks, uses_docker = _gate_checks(cfg)
     checks = [*_agent_checks(cfg, repo), _gh_check(repo), _remote_check(repo)]
     if uses_docker:
         checks.append(_docker_check(repo))
     checks.append(_state_dir_check(repo))
+    checks.append(_keepawake_check())
     checks.append(_environment_check(cfg))
     return [*checks, *gate_checks]
 

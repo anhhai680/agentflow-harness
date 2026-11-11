@@ -582,6 +582,10 @@ def _on_phase_approved(state: dict, ev: dict) -> None:
     phase = ev["phase"]
     row = _phase_row(state, phase)
     row["status"] = "approved"
+    if (state.get("refine") or {}).get("phase") == phase:  # the round is over: the next phase must not inherit it
+        state["refine"] = None
+        if state["status"] == "refining":
+            state["status"] = "running"
     if ev.get("sha"):
         row["approval_sha"] = ev["sha"]
     waiting = state["waiting"]
