@@ -336,5 +336,5 @@ dashboard:
       feature: Feature
       bug: Bug fix
     new_task:                       # lane: its form fields; a lane left out can't be added from the page
-      feature: [new_module, after]  # a feature card writes docs/agentflow-<id>-proposal.md
+      feature: [new_module, issue, after]  # a feature card writes docs/agentflow-<id>-proposal.md, or works on issue-<N>
       bug: [issue, task, after]

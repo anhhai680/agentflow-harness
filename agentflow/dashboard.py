@@ -19,7 +19,8 @@ Routes:
   (`resume`) or marks it done (`done`, which ends in the draft pull request) (D16).
   An action the run is not in a state for (a second approve, a live runner) answers 409 with the reason.
 - `POST /api/backlog` (add a card: `lane`, `fields`, `after`, `to_phase`), `POST /api/backlog/start` (`module` or
-  `item`) and `POST /api/backlog/remove` (`item`). A start re-checks that the card is not blocked and has no
+  `item`: `card:<id>`, `module:<id>` or a synced `issue:<number>`) and `POST /api/backlog/remove` (`item`, a card
+  only: a synced issue leaves Backlog when it is closed or loses its label). A start re-checks that the card is not blocked and has no
   duplicate (409 with the reason otherwise), answers 202 at once and runs the slow part (`flow.py run --detach`)
   on a worker thread, one start at a time. Nothing starts by itself: only these calls start work.
 - `GET /api/config` (the Settings page: the config's text, hash and form fields), `POST /api/config/preview` and
@@ -267,9 +268,13 @@ def prepare(server: DashboardServer) -> list[str]:
 
 
 def refresh_once(server: DashboardServer) -> None:
-    """One round of keeping Backlog current: base branch, map assessment, merge state. It starts nothing."""
+    """One round of keeping Backlog current: base branch, map assessment, merge state, synced issues. It starts
+    nothing. A pack with no `dashboard.backlog` block only syncs its issues, when `issues.sync_label` is set."""
     try:
-        backlog.refresh(server.cfg, server.repo)
+        if module_queue.backlog_settings(server.cfg):
+            backlog.refresh(server.cfg, server.repo)
+        elif server.cfg.issues.sync_label:
+            backlog.sync_issues(server.cfg, server.repo)
     except Exception as exc:  # a failed round must not end the loop; the next one tries again
         sys.stderr.write(f"dashboard: backlog refresh failed: {exc}\n")
 
@@ -288,8 +293,7 @@ def serve(repo: Path, cfg: Config, host: str, port: int, token: str,
     announce(f"agentflow dashboard: {dashboard_url(server.server_address[1], token)}\n"
              "Keep this URL private: the token lets anyone with it approve checkpoints. Ctrl-C stops the server.")
     threading.Thread(target=_remind_loop, args=(server,), daemon=True).start()
-    if module_queue.backlog_settings(cfg):
-        threading.Thread(target=_refresh_loop, args=(server,), daemon=True).start()
+    threading.Thread(target=_refresh_loop, args=(server,), daemon=True).start()  # a Settings save may turn sync on
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -520,6 +524,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(202, {"ok": True, "starting": True, "key": key})
             else:
                 kind, name = backlog.parse_key(_text(body, "item", required=True))
+                if kind == "issue":
+                    raise backlog.Refused(f"issue #{name} leaves Backlog when it is closed or loses the "
+                                          f"{server.cfg.issues.sync_label!r} label on GitHub")
                 if kind != "card":
                     raise backlog.Refused(backlog.unremovable(server.cfg))
                 backlog.remove(server.cfg, server.repo, name)

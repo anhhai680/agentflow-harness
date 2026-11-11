@@ -78,6 +78,49 @@ def test_validate_refuses_bad_issue_keys(flow_repo, patch, path):
     assert path in _error_paths(flow_repo, patch)
 
 
+def test_the_issue_sync_keys_default_to_off(flow_repo):
+    cfg = flow_repo.cfg
+    assert (cfg.issues.sync_label, cfg.issues.sync_lane, cfg.issues.lane_labels) == ("", "feature", {"bug": "bug"})
+
+
+def _warnings(flow_repo, patch: dict) -> list[str]:
+    cfg = flow_repo.configure({"issues": patch})
+    return [i.path for i in config.validate(cfg, flow_repo.root) if i.level == "warning"]
+
+
+@pytest.mark.parametrize("patch, path", [
+    ({"sync_label": "a,b"}, "issues.sync_label"),
+    ({"sync_label": "-x"}, "issues.sync_label"),
+    ({"sync_label": "Agentflow:In-Progress"}, "issues.sync_label"),  # GitHub compares labels without case
+    ({"sync_label": "agentflow", "sync_lane": "nope"}, "issues.sync_lane"),
+    ({"lane_labels": {"a,b": "bug"}}, "issues.lane_labels.a,b"),
+    ({"lane_labels": {"-x": "bug"}}, "issues.lane_labels.-x"),
+])
+def test_validate_refuses_bad_issue_sync_keys(flow_repo, patch, path):
+    assert path in _error_paths(flow_repo, patch)
+
+
+def test_a_lane_label_naming_no_lane_is_a_warning_only_while_the_sync_is_on(flow_repo):
+    patch = {"lane_labels": {"bug": "bug", "chore": "nope"}}
+    assert "issues.lane_labels.chore" not in _warnings(flow_repo, patch)
+    assert "issues.lane_labels.chore" in _warnings(flow_repo, {**patch, "sync_label": "agentflow"})
+    assert _error_paths(flow_repo, {**patch, "sync_label": "agentflow"}) == []
+
+
+def test_a_synced_issue_in_a_capability_map_module_lane_needs_a_module_row(flow_repo):
+    cfg = flow_repo.configure({"issues": {"sync_label": "agentflow"},
+                               "dashboard": {"backlog": {"module_row": None,
+                                                         "new_task": {"feature": ["issue"]}}}})
+    paths = [i.path for i in config.validate(cfg, flow_repo.root) if i.level == "error"]
+    assert "issues.sync_label" in paths and "dashboard.backlog.new_task.feature" in paths
+
+
+def test_the_sync_without_a_module_lane_warns(flow_repo):
+    cfg = flow_repo.configure({"issues": {"sync_label": "agentflow"},
+                               "dashboard": {"backlog": {"module_lane": None}}})
+    assert "issues.sync_label" in [i.path for i in config.validate(cfg, flow_repo.root) if i.level == "warning"]
+
+
 def test_validate_refuses_an_epic_label_with_a_newline(flow_repo):
     assert "issues.epic_labels" in _error_paths(flow_repo, {"epic_labels": ["a\nb"]})
 
@@ -576,6 +619,23 @@ def test_the_link_is_made_before_a_conflict_stops_the_run(flow_repo, gh, monkeyp
     assert pipeline.advance(run, flow_repo.cfg, RunOptions()).startswith("waiting")
     assert [e["how"] for e in flow_repo.events(run, "issue_linked")] == ["api"]
     assert not removes(gh)
+
+
+@pytest.mark.parametrize("closing, how", [("7", "keyword"), ("", "api")])
+def test_a_run_on_the_derived_module_of_an_issue_marks_it_and_links_its_pr(flow_repo, gh, monkeypatch, closing, how):
+    """What a synced issue or an issue-only feature card starts: `--module issue-7 --issue 7`."""
+    monkeypatch.setenv("FAKE_GH_CLOSING", closing)
+    flow_repo.configure(SMALL)
+    monkeypatch.delenv("FAKE_GH_ISSUE", raising=False)
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"issue": "7", "module": "issue-7"},
+                RunOptions(from_phase="ship"))
+    assert run.state["branch"].endswith("/issue-7-issue-7")
+    assert (run.dir / "issue.md").is_file()
+    assert ["issue", "edit", "7", "--add-label", LABEL] in calls(gh)
+    assert pipeline.advance(run, flow_repo.cfg, RunOptions()) == "done"
+    assert linked(flow_repo, run) == [{"issue": "7", "pr": PR_URL, "how": how}]
+    assert (run.dir / "pr.md").read_text(encoding="utf-8").split("\n\n")[1] == "Closes #7"
+    assert removes(gh) == [["issue", "edit", "7", "--remove-label", LABEL]]
 
 
 def test_a_feature_run_without_an_issue_makes_no_link_call(flow_repo, gh):

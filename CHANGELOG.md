@@ -7,13 +7,20 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [2.4] - 2026-11-11
+
 ### Added
+
+- `issues.sync_label`, `issues.sync_lane` and `issues.lane_labels`: the dashboard shows the open GitHub issues that carry the sync label as Backlog cards (`issue:<N>`), each in the lane its labels pick. One that carries the in-progress label with no run on this machine shows "Taken elsewhere" and can't start, so two people never work the same issue.
+- A feature card can carry an issue number (`init` now writes `feature: [new_module, issue, after]` for a specs pack). Its run, like a synced issue's, labels and comments on the issue and links its PR into the issue's Development section. In the `module_lane`, an issue with no new module works on the module `issue-<N>`.
 
 - The runner keeps the machine awake while it works (`caffeinate -i` on macOS, `systemd-inhibit` on Linux, tied to the runner's process) and lets go when the run stops for a human or ends; `agentflow doctor` has a `keep awake` check, and `AGENTFLOW_NO_KEEPAWAKE=1` turns it off.
 - Signals `gate_minutes:<phase>`, `gate_reruns` and `refine_rounds:<phase>`, in `agentflow scorecard`, the Metrics tab and as lesson targets, so slow gates, gates run twice and runner-opened refine rounds show up on any repository.
 
 ### Changed
 
+- A PR link to its issue that GitHub refused at `finish` is tried again on every CI round, not only at archive.
+- The spec and plan prompts read the run's `issue.md` when the run comes from an issue.
 - A gate that already passed in the run on exactly the tree being gated, with the same command and `defaults.env`, is reused instead of run again (`gates_reused`), across steps and phases; `gate_result` events now carry the command's `cmd` digest. Failures, skips and the `setup` set's gates always run again.
 - In a fix attempt, the gates the last attempt failed run first, and the rest wait (`gates_deferred`) while one of them still fails; a step still finishes only once its whole gate set passed on its final tree.
 - The plan prompt and skill keep whole-suite, other-module and end-to-end commands out of task steps, and the build prompt tells the implementer to skip such a step when a plan has one: the verify gates run them once for the branch.

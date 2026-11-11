@@ -911,12 +911,31 @@ def test_the_issues_section_edits_round_trip(sparse_repo):
     assert (cfg.issues.in_progress_label, cfg.issues.comment, cfg.issues.epic_labels) == ("", False, ("epic", "initiative"))
 
 
+def test_the_issue_sync_fields_round_trip(sparse_repo):
+    path = _sparse(sparse_repo)
+    fields = _fields(path)
+    assert (fields[("issues", "sync_label")]["value"], fields[("issues", "sync_label")]["source"]) == ("", "engine")
+    assert fields[("issues", "lane_labels")]["value"] == {"bug": "bug"}
+    proposal = _sparse_form(path, (["issues", "sync_label"], "agentflow"), (["issues", "sync_lane"], "bug"),
+                            (["issues", "lane_labels"], {"bug": "bug", "type: bug": "bug"}))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    cfg = load_config(path)
+    assert (cfg.issues.sync_label, cfg.issues.sync_lane) == ("agentflow", "bug")
+    assert cfg.issues.lane_labels == {"bug": "bug", "type: bug": "bug"}
+
+
 @pytest.mark.parametrize("key, value", [
     (["issues", "in_progress_label"], "a,b"),    # validate refuses it
     (["issues", "in_progress_label"], "two\nlines"),  # allow_empty keeps the newline check
     (["issues", "in_progress_label"], "x" * 501),      # and the length check
     (["issues", "comment"], "no"),               # the field's kind
     (["issues", "epic_labels"], "epic"),         # not a list
+    (["issues", "sync_label"], "a,b"),           # validate refuses it
+    (["issues", "sync_label"], "-x"),            # it would read as a gh flag
+    (["issues", "sync_label"], "AgentFlow:In-Progress"),  # the in-progress label, compared without case
+    (["issues", "sync_lane"], "nope"),           # not a lane
+    (["issues", "lane_labels"], "bug"),          # not a map
 ])
 def test_the_issues_section_refuses_bad_values(sparse_repo, key, value):
     path = _sparse(sparse_repo)

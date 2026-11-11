@@ -47,7 +47,7 @@ def _edit(repo: Path, number: str, *flags: str) -> None:
 
 
 def _failed(run: Run, action: str, exc: BaseException) -> None:
-    run.emit("issue_status_failed", action=action, error=str(exc) or type(exc).__name__)
+    run.emit("issue_status_failed", action=action, error=(str(exc) or type(exc).__name__)[:300])  # a retry per CI round
 
 
 def _add_label(run: Run, number: str, label: str) -> bool:

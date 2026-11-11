@@ -167,7 +167,7 @@ def pack_data(d: Detected, *, base: dict, red: frozenset[str] = frozenset()) -> 
     if "specs" in docs:  # fixed data only: nothing from the repository is copied into these two keys
         data["work_source"] = {"kind": "specs"}
         data["dashboard"] = {"backlog": {"module_lane": "feature",
-                                         "new_task": {"feature": ["new_module", "after"],
+                                         "new_task": {"feature": ["new_module", "issue", "after"],
                                                       "bug": ["issue", "task", "after"]}}}
     base_gates = base.get("gates") if isinstance(base.get("gates"), dict) else {}
     for name in [*gates, *(n for n in base_gates if n not in gates)]:

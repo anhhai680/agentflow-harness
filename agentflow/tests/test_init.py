@@ -206,7 +206,7 @@ def test_a_found_specs_directory_adds_a_specs_work_source_and_a_feature_backlog(
     data = init.pack_data(found, base=base)
     assert data["work_source"] == {"kind": "specs"}
     assert data["dashboard"] == {"backlog": {"module_lane": "feature",
-                                             "new_task": {"feature": ["new_module", "after"],
+                                             "new_task": {"feature": ["new_module", "issue", "after"],
                                                           "bug": ["issue", "task", "after"]}}}
     text = init.render_pack(found, base=base)
     assert SPECS_COMMENT + "work_source:\n  kind: specs\ndashboard:\n  backlog:\n    module_lane: feature\n" in text

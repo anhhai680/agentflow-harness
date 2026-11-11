@@ -149,6 +149,10 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("issues", "in_progress_label"), "In-progress label (empty = off)", {"kind": "text", "allow_empty": True}),
         (("issues", "comment"), "Comment when a run starts", {"kind": "bool"}),
         (("issues", "epic_labels"), "Epic labels (these get Refs, never Closes)", {"kind": "list"}),
+        (("issues", "sync_label"), "Sync open issues with this label to Backlog (empty = off)",
+         {"kind": "text", "allow_empty": True}),
+        (("issues", "sync_lane"), "Lane for a synced issue no lane label matches", {"kind": "enum", "options": "@lanes"}),
+        (("issues", "lane_labels"), "Lane by issue label (first match wins)", {"kind": "map", "value_kind": "text"}),
     ]),
     ("Autonomy", "What the runner settles by itself before a human hears of it.", [
         (("autonomy", "non_blocking_severities"), "Non-blocking severities", {"kind": "list"}),
