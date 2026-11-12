@@ -315,7 +315,7 @@ def test_the_retro_session_is_not_sized(flow_repo, gh_log):
     retro = Run.load(flow_repo.root, out.run_id)
     assert flow_repo.events(retro, "effort_decided") == [] and flow_repo.events(retro, "sizer_started") == []
     argv = flow_repo.calls()[0]["argv"]
-    assert ("--effort", "medium") in pairs(argv) or ("--effort", "high") in pairs(argv)  # the floor still holds
+    assert ("--effort", "medium") in pairs(argv)  # effort.default, and the retro step's review role holds the floor
 
 
 def test_the_floor_holds_with_sizing_off(flow_repo):
@@ -350,10 +350,14 @@ def test_the_dry_run_prints_the_floored_level(flow_repo):
     assert flow_repo.calls() == [] and flow_repo.events(run, "sizer_started") == []
 
 
-@pytest.mark.parametrize("key,phase,role,level", [("review/rev", "review", "build", "medium"),
-                                                 ("build/dbg", "build", "debug", "medium"),
-                                                 ("build/impl", "build", "build", "low")])
-def test_attach_applies_the_floor(flow_repo, monkeypatch, key, phase, role, level):
+@pytest.mark.parametrize("key,phase,role,level,exited", [
+    ("review/rev", "review", "build", "medium", True),          # judgement by phase
+    ("build/dbg", "build", "debug", "medium", True),            # judgement by role only
+    ("build/task-1/review", "build", "review", "medium", True),  # a build-phase review step
+    ("build/task-1/review", "build", "review", "medium", False),
+    ("build/impl", "build", "build", "low", True),
+    ("build/impl", "build", None, "low", True)])                # no role recorded counts as build
+def test_attach_applies_the_floor(flow_repo, monkeypatch, key, phase, role, level, exited):
     import subprocess
 
     from agentflow import run_control
@@ -363,6 +367,9 @@ def test_attach_applies_the_floor(flow_repo, monkeypatch, key, phase, role, leve
              start_head=flow_repo.head())
     run.emit("agent_started", agent="claude", pid=999999, model="sonnet", effort="low", step=key,
              session_id="s1", phase=phase, role=role)
+    if exited:  # the shape of a run `attach` accepts: its runner is gone, so the agent has left `agents`
+        run.emit("agent_exited", agent="claude", pid=999999, session_id="s1", step=key, exit_code=0)
+        assert run.refresh()["agents"] == {} and run.state["exited"]
     seen = []
     monkeypatch.setattr(run_control.subprocess, "run",
                         lambda argv, *a, **k: (seen.append(argv), subprocess.CompletedProcess(argv, 0))[1])

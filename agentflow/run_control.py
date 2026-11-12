@@ -363,8 +363,11 @@ def attach(run: Run, cfg: Config) -> int:
     if agent != "claude" or "claude" not in cfg.agents:
         raise ControlError(f"attach opens Claude Code sessions; {key} ran on {agent!r}")
     effort = row.get("effort") or cfg.effort.default
-    role = row.get("role") or next((a.get("role") for a in state["agents"].values()
-                                    if a.get("step") == key and a.get("role")), None) or "build"
+    # A step row carries no role; the one its last call ran as is on that call's record (an agent that has exited is
+    # in `exited`, and a run `attach` accepts has no live runner), else it counts as `build`.
+    calls = [*state.get("exited", []), *state["agents"].values()]
+    role = row.get("role") or next((a["role"] for a in reversed(calls) if a.get("step") == key and a.get("role")),
+                                   None) or "build"
     effort = sizing.floor(effort, sizing.is_judgement(row.get("phase") or "", role), cfg.effort.allowed)
     argv = [*cfg.agents["claude"].command, "--resume", row["session_id"], "--effort", effort]
     worktree = state.get("worktree") or str(run.repo)
