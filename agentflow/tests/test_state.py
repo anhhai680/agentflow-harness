@@ -835,3 +835,36 @@ def test_code_noted_needs_its_text_and_key(run):
         run.emit("code_noted", text="no key")
     with pytest.raises(EventError):
         run.emit("code_noted", key="build/x")
+
+
+def test_effort_decided_sets_the_level_and_marks_the_step_sized(run):
+    run.emit("effort_decided", key="build/x", level="low", source="sizer", answers={}, reason="rename")
+    row = run.state["steps"]["build/x"]
+    assert (row["effort"], row["sized"], row["effort_source"]) == ("low", True, "sizer")
+
+
+def test_effort_escalated_records_an_upward_change(run):
+    run.emit("effort_decided", key="build/x", level="medium", source="sizer")
+    run.emit("effort_escalated", key="build/x", trigger="gate", **{"from": "medium", "to": "high"})
+    row = run.state["steps"]["build/x"]
+    assert row["effort"] == "high" and row["effort_changed"] == "up"
+    assert run.state["effort_changes"][-1] == {"key": "build/x", "from": "medium", "to": "high", "reason": "gate"}
+
+
+def test_a_sizer_call_makes_no_step_row(run):
+    run.emit("agent_started", agent="claude", pid=5, model="haiku", effort="low", step="build/x/size",
+             sizing=True, sizer=True)
+    run.emit("agent_session", session_id="s9", model="claude-haiku-5-5", key="build/x/size", pid=5, sizer=True)
+    run.emit("agent_turn", session_id="s9", key="build/x/size", sizer=True, cost=0.01)
+    run.emit("agent_exited", session_id="s9", key="build/x/size", sizer=True, exit_code=0, cost=0.01)
+    assert not any(k.endswith("/size") for k in run.state["steps"])
+    assert run.state["spend_usd"] > 0
+    (gone,) = run.state["exited"]
+    assert gone["sizer"] is True
+
+
+def test_sizer_started_and_plan_sized_change_no_state(run):
+    before = copy.deepcopy(run.state["steps"])
+    run.emit("sizer_started", key="build/x", tree="t", head="h", state="s")
+    run.emit("plan_sized", key="build/plan", digest="d", tasks=2)
+    assert run.state["steps"] == before

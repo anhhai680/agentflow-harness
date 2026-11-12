@@ -19,6 +19,8 @@ Cost is charged on each `agent_exited` through `state.cost_added`, so a resumed 
 an open call adds its latest `agent_turn` cost. Each call keeps the agent, model and effort it ran on, so
 time and cost can be split by `model · effort`. A call that starts after a review reopened its step, a
 retry, a fix attempt, a rejection or in a refine round counts as **rework**.
+A call whose events carry `sizer` sizes a step's effort: its cost lands in its phase's `cost_usd` and
+`sizing_cost_usd`, and it is never a step, an attempt or a `model · effort` row of a step.
 
 The run ends at `run_finished`, `run_failed` or `run_cancelled`; nothing after that is charged but the cost
 of a call that exits after it. A run archived without one ends at its last event before `run_archived`: the
@@ -89,7 +91,7 @@ class _Fold:
     def _phase_row(self, phase: str) -> dict:
         if phase not in self.phases:
             self.phases[phase] = {"phase": phase, "buckets": _buckets(), "cost_usd": 0.0, "rework_cost_usd": 0.0,
-                                  "attempts": 0, "rework_attempts": 0, "first_at": None, "last_at": None}
+                                  "sizing_cost_usd": 0.0, "attempts": 0, "rework_attempts": 0, "first_at": None, "last_at": None}
         return self.phases[phase]
 
     def _step_row(self, key: str) -> dict:
@@ -118,7 +120,7 @@ class _Fold:
             return self.wait_target
         if self.open:
             key = self.open[-1].get("key")
-            return _phase_of(key) or self.phase, key
+            return _phase_of(key) or self.phase, None if self.open[-1].get("sizer") else key
         return self.phase, self.step
 
     def gap(self, seconds: float, nxt: dict) -> None:
@@ -200,17 +202,18 @@ class _Fold:
 
     def _on_agent_started(self, ev: dict, key: Any) -> None:
         key = key or self.step
+        sizer = bool(ev.get("sizer"))  # sizes a step's effort: its cost is the phase's, it is no step's attempt
         mode, round_ = self.step_mode.get(key or "", (None, None))
         call = {
             "key": key, "session_id": ev.get("session_id"), "pid": ev.get("pid"), "agent": ev.get("agent"),
             "model": ev.get("model"), "model_alias": ev.get("model"), "model_source": None, "effort": ev.get("effort"),
-            "role": ev.get("role"), "sizing": bool(ev.get("sizing")), "mode": mode, "round": round_,
-            "rework": bool(key and key in self.rework_pending), "started_at": ev.get("ts"), "ended_at": None,
+            "role": ev.get("role"), "sizing": bool(ev.get("sizing")), "sizer": sizer, "mode": mode,
+            "round": round_, "rework": bool(key and not sizer and key in self.rework_pending), "started_at": ev.get("ts"), "ended_at": None,
             "agent_s": 0.0, "cost_usd": 0.0, "cost_estimated": False, "live": True, "exit_code": None,
         }
         self.open.append(call)
         self.calls.append(call)
-        if key:
+        if key and not sizer:
             row = self._step_row(key)
             row["attempts"] += 1
             row["rework_attempts"] += int(call["rework"])
@@ -245,7 +248,8 @@ class _Fold:
         if call is None:  # an exit with no start on record: still money spent
             call = {"key": key, "session_id": ev.get("session_id"), "agent": None, "model": None, "effort": None,
                     "role": None, "rework": False, "started_at": ev.get("ts"), "agent_s": 0.0, "mode": None,
-                    "round": None, "model_source": None, "sizing": False, "model_alias": None}
+                    "round": None, "model_source": None, "sizing": False, "model_alias": None,
+                    "sizer": bool(ev.get("sizer"))}
             self.calls.append(call)
         else:
             self.open.remove(call)
@@ -264,6 +268,9 @@ class _Fold:
             return
         row = self._phase_row(phase)
         row["cost_usd"] += cost
+        if call.get("sizer"):
+            row["sizing_cost_usd"] += cost
+            return
         if call.get("rework"):
             row["rework_cost_usd"] += cost
         if key:
@@ -364,6 +371,8 @@ def run_metrics(events: list[dict], now: datetime, stall_s: float = DEFAULT_STAL
 def _shape(fold: _Fold, now: datetime, stalled: bool, effort_changes: dict[str, list[dict]]) -> dict:
     calls_by_key: dict[str, list[dict]] = {}
     for call in fold.calls:
+        if call.get("sizer"):
+            continue
         calls_by_key.setdefault(str(call.get("key")), []).append(call)
     phases = []
     for name, row in fold.phases.items():
@@ -393,6 +402,7 @@ def _shape(fold: _Fold, now: datetime, stalled: bool, effort_changes: dict[str, 
             "wall_s": round(sum(row["buckets"].values()), 1),
             "buckets": _round_buckets(row["buckets"]),
             "cost_usd": round(row["cost_usd"], 6),
+            "sizing_cost_usd": round(row["sizing_cost_usd"], 6),
             "rework_cost_usd": round(row["rework_cost_usd"], 6),
             "attempts": row["attempts"],
             "rework_attempts": row["rework_attempts"],

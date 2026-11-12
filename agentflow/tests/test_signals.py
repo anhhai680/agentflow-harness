@@ -90,7 +90,7 @@ def test_open_parameter_counts_stay_absent_and_count_families_are_lower_is_bette
     out = run_signals([], EMPTY_METRICS)
     assert not [k for k in out if k.split(":")[0] in ("guard_trips", "permission_denied", "stop")]
     assert COUNT_FAMILIES <= set(FAMILIES) and all(FAMILIES[f][0] == "lower" for f in COUNT_FAMILIES)
-    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 12
+    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 15
 
 
 def test_cost_per_task_divides_by_the_steps_that_called_an_agent():
@@ -133,7 +133,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 18
+    assert len(FAMILIES) == 21
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -185,3 +185,34 @@ def test_refine_rounds_count_only_the_runner_own_rounds():
     out = run_signals(evs, _metrics(phases))
     assert out["refine_rounds:verify"] == 2 and out["refine_rounds:review"] == 0
     assert out["human_rejections:review"] == 1
+
+
+def test_escalations_undersized_and_fallbacks_are_counted_per_phase():
+    events = [_ev("effort_decided", key="build/build/task-1/implement", level="medium", source="plan_sizer"),
+              _ev("effort_escalated", key="build/build/task-1/implement", to="high", trigger="gate"),
+              _ev("effort_decided", key="build/build/task-2/implement", level="medium", source="fallback"),
+              _ev("effort_escalated", key="build/build/task-2/implement", to="high", trigger="gate"),
+              _ev("effort_decided", key="verify/verify", level="high", source="sizer"),
+              _ev("effort_escalated", key="verify/verify", to="xhigh", trigger="gate")]
+    out = run_signals(events, {"phases": []})
+    assert out["effort_escalations:build"] == 2 and out["undersized:build"] == 1   # a fallback is not undersized
+    assert out["sizer_fallbacks:build"] == 1 and "undersized:verify" not in out
+    assert parse_target("undersized:build") == ("undersized", "build")
+
+
+def test_sizer_turns_and_cost_stay_out_of_step_signals():
+    evs = [_ev("agent_started", step="build/a", session_id=None),
+           _ev("agent_session", session_id="s1", key="build/a", pid=1),
+           _ev("agent_turn", session_id="s1"), _ev("agent_turn", session_id="s1"),
+           _ev("agent_started", step="build/a/size", session_id=None, sizer=True),
+           _ev("agent_session", session_id="sz", key="build/a/size", pid=2, sizer=True),
+           _ev("agent_turn", session_id="sz", sizer=True), _ev("agent_turn", session_id="sz", key="build/a/size", sizer=True)]
+    assert run_signals(evs, EMPTY_METRICS)["turns_per_step:build"] == 2.0
+    phases = [{"phase": "build", "cost_usd": 0.12, "sizing_cost_usd": 0.02, "steps": [{"key": "build/a", "attempts": 1}]}]
+    out = run_signals([], _metrics(phases, cost=0.12))
+    assert out["cost_per_task:build"] == 0.10
+
+
+def test_the_sizing_families_are_lower_counts():
+    for family in ("effort_escalations", "undersized", "sizer_fallbacks"):
+        assert FAMILIES[family] == ("lower", True) and family in COUNT_FAMILIES

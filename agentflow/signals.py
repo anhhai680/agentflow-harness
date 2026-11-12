@@ -13,7 +13,10 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   are present only for a run that has one. `gate_minutes:<p>` is the time a phase spent in gates (present for a
   phase that ran one), `gate_reruns` counts gates run again on a tree they had already passed on with the same
   command (always present: reuse should keep it at 0), and `refine_rounds:<p>` counts the refine rounds the runner
-  opened itself (present for every phase of the run).
+  opened itself (present for every phase of the run). `effort_escalations:<p>` counts `effort_escalated` events,
+  `undersized:<p>` those whose step was decided `low` or `medium` by a source other than `fallback`, and
+  `sizer_fallbacks:<p>` the `fallback` decisions; all three are present only for a parameter that occurred.
+  Sizer calls (events with `sizer`) are no step's turns, and their cost is not a step's cost.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
 
@@ -46,6 +49,9 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "gate_minutes": ("lower", True),          # a phase: minutes its gates ran
     "gate_reruns": ("lower", False),          # gates run again on a tree they had passed on, same command
     "refine_rounds": ("lower", True),         # a phase: refine rounds the runner opened on its own findings
+    "effort_escalations": ("lower", True),    # a phase: steps whose effort was raised after a gate or review failed
+    "undersized": ("lower", True),            # a phase: escalations of a step sized low or medium by a real sizer
+    "sizer_fallbacks": ("lower", True),       # a phase: steps sized by the fallback because the sizer failed
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
@@ -53,7 +59,8 @@ FAMILIES: dict[str, tuple[str, bool]] = {
 # `permission_denied`, `stop`) are present only for a parameter that occurred.
 COUNT_FAMILIES = frozenset({"fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections",
                             "ci_rounds", "rollovers", "progress_not_updated", "conformance_missing", "conformance_waived",
-                            "gate_reruns", "refine_rounds"})
+                            "gate_reruns", "refine_rounds", "effort_escalations", "undersized",
+                            "sizer_fallbacks"})
 RUNNER = "runner"  # `phase_rejected.by` for what the runner settles itself; a person's name is never this
 
 
@@ -123,6 +130,8 @@ def _turns(events: list[dict]) -> dict[str, float]:
     turns: Counter[str] = Counter()
     for ev in events:
         etype = ev.get("type")
+        if ev.get("sizer"):
+            continue
         if etype == "agent_started":
             current = ev.get("step") or ev.get("key") or current
             if ev.get("session_id") and ev.get("step"):
@@ -149,7 +158,8 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
     out: dict[str, float] = _first_pass(events)
     counts: dict[str, Counter[str]] = {name: Counter() for name in (
         "fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections", "review_blocking",
-        "refine_rounds")}
+        "refine_rounds", "effort_escalations", "undersized", "sizer_fallbacks")}
+    decided: dict[str, tuple[Any, Any]] = {}
     plain: Counter[str] = Counter()
     audit: dict | None = None
     for ev in events:
@@ -176,6 +186,17 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
         elif etype == "review_result":
             if phase := _phase_of(ev.get("key")):
                 counts["review_blocking"][phase] += int(ev.get("blocking") or 0)
+        elif etype == "effort_decided":
+            if ev.get("key"):
+                decided[str(ev["key"])] = (ev.get("level"), ev.get("source"))
+            if ev.get("source") == "fallback" and (phase := _phase_of(ev.get("key"))):
+                counts["sizer_fallbacks"][phase] += 1
+        elif etype == "effort_escalated":
+            if phase := _phase_of(ev.get("key")):
+                counts["effort_escalations"][phase] += 1
+                level, source = decided.get(str(ev["key"]), (None, None))
+                if level in ("low", "medium") and source != "fallback":
+                    counts["undersized"][phase] += 1
         elif etype == "conformance_checked":
             audit = ev
         elif etype in ("ci_round", "rolled_over", "progress_not_updated"):
@@ -195,7 +216,7 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
     for phase in metrics.get("phases") or []:
         called = sum(1 for s in phase.get("steps") or [] if s.get("attempts"))
         if called:
-            out[f"cost_per_task:{phase['phase']}"] = round(float(phase.get("cost_usd") or 0.0) / called, 6)
+            out[f"cost_per_task:{phase['phase']}"] = round((float(phase.get("cost_usd") or 0.0) - float(phase.get("sizing_cost_usd") or 0.0)) / called, 6)
     cost = float(metrics.get("cost_usd") or 0.0)
     out["rework_pct"] = round(100 * float(metrics.get("rework_cost_usd") or 0.0) / cost, 2) if cost else 0
     return out
