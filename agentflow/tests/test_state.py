@@ -863,8 +863,14 @@ def test_a_sizer_call_makes_no_step_row(run):
     assert gone["sizer"] is True
 
 
-def test_sizer_started_and_plan_sized_change_no_state(run):
+def test_sizer_started_sizer_finished_and_plan_sized_change_no_state(run):
     before = copy.deepcopy(run.state["steps"])
     run.emit("sizer_started", key="build/x", tree="t", head="h", state="s")
+    run.emit("sizer_finished", key="build/x/size")
     run.emit("plan_sized", key="build/plan", digest="d", tasks=2)
     assert run.state["steps"] == before
+
+
+def test_sizer_finished_needs_a_key(run):
+    with pytest.raises(EventError):
+        run.emit("sizer_finished")

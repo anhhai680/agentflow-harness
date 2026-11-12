@@ -7,16 +7,20 @@ changed since the run started, the security overlay, the failing gates), asks a 
 
 A sizer gets only `Read`, `Grep` and `Glob` (`AgentCall.read_only`) and answers in its final message. The backstop is
 the repository's whole state: `sizer_started` records the tree, `HEAD` and a hash of `git_state` and `tree_state`,
-and any difference after the call stops the run (`guard_violation`, kind `sizer_edit`). Until that state is back, a
-restart is refused (`sizer_reset_needed`). Anything else that goes wrong in sizing falls back to `effort.default`
-(`high` for a judgement step) and never stops, holds or reminds.
+and any difference after the call stops the run (`guard_violation`, kind `sizer_edit`); a comparison that came back
+clean is recorded as `sizer_finished`. Until that state is back, a restart is refused (`sizer_reset_needed`). A sizer
+with no outcome (its runner died) is waited for and compared before anything else runs for its step or plan, sized or
+not (`check_open_sizers`). The one stop is a sizer that changed the repository, or whose state cannot be compared:
+anything else that goes wrong in sizing falls back to `effort.default` (`high` for a judgement step) and never stops,
+holds or reminds.
 
 `size_plan` sizes a plan's open tasks that have not started when the build phase's `foreach` starts: one plan-sizer
 call (`prompts/size_plan.md`) per `sizing.PLAN_SIZE_CHUNK` task cards, on the phase's `plan`-role model. It records
 an `effort_decided` (`plan_sizer` or `fallback`) for each task's implement step and its review, then a `plan_sized`
 with the plan's digest when no task fell back, so ticking boxes sizes nothing again, an edit sizes only the tasks
-that have not started, and a fallback is tried again on the next entry. A plan sizer that changed the repository
-stops build on the plan's prefix, the same way as a step's sizer.
+that have not started, and a fallback is tried again on the next entry. The sizer is asked only for the tasks with no
+plan-sizer answer for their current text (`task_digest`): one that fell back, a new one or an edited one. A plan
+sizer that changed the repository stops build on the plan's prefix, the same way as a step's sizer.
 
 Agent text is untrusted: only the six normalized answers and a reason cut to `sizing.REASON_MAX` are kept, and
 neither reaches a commit message.
@@ -49,6 +53,7 @@ SIZE_PROMPT = "size.md"
 PLAN_SIZE_PROMPT = "size_plan.md"
 LINE_COUNT_MAX_BYTES = 2 * 1024 * 1024  # a named file larger than this is shown as unreadable
 SIZER_EDIT = "sizer_edit"
+FINISHED = "sizer_finished"  # a sizer whose comparison came back clean
 CLEARS = ("effort_decided", "plan_sized")  # a sizing outcome: the sizer before it is accounted for
 STATE_FIELDS = ("tree", "head", "state")
 
@@ -62,6 +67,12 @@ def _owner(size_key: str) -> str:
 def _sized_by(event: dict) -> str | None:
     """The plan-sizer key an `effort_decided` came from (`<prefix>/size-<i>`), or None."""
     found = event.get("size_key") if event["type"] == "effort_decided" else None
+    return found if isinstance(found, str) else None
+
+
+def _finished(event: dict) -> str | None:
+    """The sizer key a `sizer_finished` names, or None."""
+    found = event.get("key") if event["type"] == FINISHED else None
     return found if isinstance(found, str) else None
 
 
@@ -181,6 +192,8 @@ class SizingLane:
                 raise_hitl(self.cfg, self.run, "guard_violation", prefix,
                            f"Guard violation in {prefix}: {SIZER_EDIT}: {detail}")
             return "stopped"
+        if not self.check_open_sizers(prefix):  # before any skip: a sizer left open may have changed the repository
+            return "stopped"
         entry_trip = self._sizer_trip(prefix)
         resized = entry_trip is not None  # cleared: the plan is sized again, whatever was recorded
         policy = self.cfg.effort
@@ -209,20 +222,26 @@ class SizingLane:
 
             role = step.role or "build"
             judgement = sizing.is_judgement(phase.name, role)
+            digests = {t.n: sizing.plan_digest([(t.n, t.title, t.text)]) for t in todo}
+            kept = self._kept_answers(prefix, todo, digests)  # a good answer is never asked for again
+            answered.update({n: entry for n, (entry, _model) in kept.items()})
+            ask = [t for t in todo if t.n not in answered]
             cards: dict[int, str] = {}
             for task in todo:
                 named = sources.task_files(task)
                 files = [(path, self._line_count(path)) for path in named]
                 security = overlays.touches_security(self.cfg, named)
                 facts[task.n] = (len(files), security)
+                if task.n in answered:
+                    continue
                 card = sizing.task_card(key=f"{prefix}/task-{task.n}/implement", phase=phase.name, role=role,
                                         ask=f"Task {task.n}: {task.title}\n\n{task.text}", files=files, changed=[],
                                         security=security, failing_gates=[])
                 cards[task.n] = f"== Task {task.n} ==\n\n{card}"
 
             size = sizing.PLAN_SIZE_CHUNK
-            for i, start in enumerate(range(0, len(todo), size), 1):
-                chunk = todo[start:start + size]
+            for i, start in enumerate(range(0, len(ask), size), 1):
+                chunk = ask[start:start + size]
                 size_key = f"{prefix}{sizing.SIZE_MARK}-{i}"
                 replies, stopped, model = self._plan_chunk(phase, prefix, size_key, [cards[t.n] for t in chunk], model)
                 if stopped:
@@ -265,8 +284,9 @@ class SizingLane:
                     keys.append(("review", review[task.n]))
                 for part, level in keys:
                     self.run.emit("effort_decided", key=f"{prefix}/task-{task.n}/{part}", level=level, source=source,
-                                  answers=answers, reason=reason, sizer_model=model, files=files, security=security,
-                                  size_key=size_key)
+                                  answers=answers, reason=reason, files=files, security=security, size_key=size_key,
+                                  sizer_model=kept[task.n][1] if task.n in kept else model,
+                                  task_digest=digests[task.n])
                     decided.add(f"{prefix}/task-{task.n}/{part}")
             if not fell_back:  # a fallback is tried again on the next entry; its decisions still settle a cleared stop
                 self.run.emit("plan_sized", key=prefix, digest=digest, tasks=[t.n for t in todo])
@@ -276,6 +296,27 @@ class SizingLane:
                 return "stopped"
             self._plan_fallback(phase, step, prefix, todo, facts, answered, decided, model, small, resized)
             return "done"
+
+    def _kept_answers(self, prefix: str, todo: list[sources.PlanTask],
+                      digests: dict[int, str]) -> dict[int, tuple[tuple[dict | None, str, str], object]]:
+        """The tasks of `todo` whose implement step's last `effort_decided` is a plan sizer's answer for the task as
+        it reads now (`task_digest`): `{task: ((answers, reason, the sizer key), the sizer's model)}`. Only a task
+        with none, a fallback, or a changed text is asked again, so a retried plan sizer never asks for a good answer
+        twice."""
+        last: dict[str, dict] = {}
+        for event in self.run.events.read():
+            if event["type"] == "effort_decided" and isinstance(event.get("key"), str):
+                last[event["key"]] = event
+        kept: dict[int, tuple[tuple[dict | None, str, str], object]] = {}
+        for task in todo:
+            found = last.get(f"{prefix}/task-{task.n}/implement") or {}
+            answers = sizing.parse_answers(found.get("answers"))
+            size_key = found.get("size_key")
+            if (found.get("source") == "plan_sizer" and answers is not None and isinstance(size_key, str)
+                    and found.get("task_digest") == digests[task.n]):
+                reason = " ".join(sizing.reason_text(found.get("reason")).split())
+                kept[task.n] = ((answers, reason, size_key), found.get("sizer_model"))
+        return kept
 
     def _new_trip(self, prefix: str, entry_trip: dict | None) -> bool:
         """Whether a plan sizer of `prefix` was found to have changed the repository since `size_plan` began (a
@@ -455,6 +496,8 @@ class SizingLane:
                 changed = self._changes_since(before)
             except Exception:  # noqa: BLE001 - what cannot be compared cannot be vouched for
                 changed = ["unknown"]
+        if not changed:  # accounted for now: a pause or a crash before its decision never leaves it open
+            self._settle(key)
         if outcome is None or outcome.timed_out or outcome.interruption is not None:
             return None, changed
         try:
@@ -473,8 +516,12 @@ class SizingLane:
         repository is back to `before` (`sizer_reset_needed`)."""
         shown = changed[:sizing.CHANGED_SHOWN]
         more = f" and {len(changed) - len(shown)} more" if len(changed) > len(shown) else ""
-        detail = (f"the read-only sizer changed {', '.join(shown)}{more}. Put the work tree, HEAD and the git state "
-                  "back as they were before it ran, then approve: the step is sized again")
+        if all(before.get(name) is None for name in STATE_FIELDS):  # no `sizer_started` on record
+            detail = (f"the read-only sizer changed {', '.join(shown)}{more}, and no state from before it ran was "
+                      "recorded, so there is nothing to restore: cancel the run and run it again")
+        else:
+            detail = (f"the read-only sizer changed {', '.join(shown)}{more}. Put the work tree, HEAD and the git "
+                      "state back as they were before it ran, then approve: the step is sized again")
         self.run.emit("guard_tripped", key=key, violations=[{"kind": SIZER_EDIT, "detail": detail}],
                       before={name: before.get(name) for name in STATE_FIELDS})
         raise_hitl(self.cfg, self.run, "guard_violation", key, f"Guard violation in {key}: {SIZER_EDIT}: {detail}")
@@ -496,9 +543,13 @@ class SizingLane:
 
     def sizer_reset_needed(self, key: str) -> list[str]:
         """What still differs from the state a sizer of `key` (a step, or a plan prefix) started from, while its
-        `sizer_edit` stop is not cleared; [] when nothing is owed."""
+        `sizer_edit` stop is not cleared; [] when nothing is owed. A sizer of `key` that finished clean after the stop
+        (`sizer_finished`) started only once this check had found the state back, so nothing is owed after it, even
+        when the step is still to be sized (a pause in that sizer)."""
         trip = self._sizer_trip(key)
         if trip is None:
+            return []
+        if any(e["seq"] > trip["seq"] and _owner(_finished(e) or "") == key for e in self.run.events.read()):
             return []
         try:
             return self._changes_since(trip["before"])
@@ -509,21 +560,71 @@ class SizingLane:
         found = [e for e in self.run.events.read() if e["type"] == "sizer_started" and e.get("key") == size_key]
         return {name: found[-1].get(name) for name in STATE_FIELDS} if found else None
 
-    def _orphan_check(self, size_key: str) -> list[str]:
-        """For a sizer whose last `sizer_started` has no outcome after it (its runner died, or the run halted), what
-        differs from that start; [] when there is none. A plan sizer's outcome is a decision that names it
-        (`size_key`). Call it after `wait_for_agents`. Never raises."""
+    def _open_start(self, size_key: str) -> dict | None:
+        """The last `sizer_started` of `size_key` when no outcome follows it (its runner died before comparing), else
+        None. An outcome is a `sizer_finished`, a decision or a `plan_sized` for it or its owner, a decision that names
+        it (`size_key`), or a `guard_tripped` of its owner."""
         owner = _owner(size_key)
         events = self.run.events.read()
         started = [e for e in events if e["type"] == "sizer_started" and e.get("key") == size_key]
         if not started:
-            return []
+            return None
         seq = started[-1]["seq"]
         if any(e["seq"] > seq and ((e["type"] in (*CLEARS, "guard_tripped") and e.get("key") in (owner, size_key))
-                                   or _sized_by(e) == size_key) for e in events):
-            return []
+                                   or size_key in (_sized_by(e), _finished(e))) for e in events):
+            return None
+        return started[-1]
+
+    def _orphan_check(self, size_key: str) -> list[str]:
+        """For a sizer left open (`_open_start`), what differs from its start; [] when there is none, and then it is
+        settled (`sizer_finished`), so a later change is never read as its own. Call it after `wait_for_agents`.
+        Never raises: what cannot be compared is `["unknown"]`."""
         try:
-            return self._changes_since(started[-1])
+            started = self._open_start(size_key)
+            if started is None:
+                return []
+            left = self._changes_since(started)
         except Exception:  # noqa: BLE001
             return ["unknown"]
+        if not left:
+            self._settle(size_key)
+        return left
+
+    def _settle(self, size_key: str) -> None:
+        """Record that the sizer `size_key` left the repository as it found it. A failure leaves it open: it is
+        compared again, from the same start, on the next entry."""
+        try:
+            self.run.emit(FINISHED, key=size_key)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def check_open_sizers(self, owner: str) -> bool:
+        """Before anything runs for `owner` (a step key or a plan prefix), sized or not: wait for each sizer of it left
+        open (`_open_start`) and compare it with the state it started from. False when one changed the repository or
+        cannot be compared: the run is stopped (`sizer_edit`), even when recording the stop fails, since the open
+        sizer is found again on the next entry. True otherwise, with each clean one settled. Not for a dry run."""
+        if self.dry_run:
+            return True
+        keys = dict.fromkeys(e["key"] for e in self.run.events.read()
+                             if e["type"] == "sizer_started" and isinstance(e.get("key"), str)
+                             and sizing.is_sizer_key(e["key"]) and _owner(e["key"]) == owner)
+        for size_key in keys:
+            try:
+                if self._open_start(size_key) is None:
+                    continue
+            except Exception:  # noqa: BLE001 - compared below, which fails closed
+                pass
+            timeout = sizing.SIZE_TIMEOUT_S if size_key == owner + sizing.SIZE_MARK else sizing.PLAN_SIZE_TIMEOUT_S
+            try:
+                wait_for_agents(self.run, self.cfg, size_key, timeout)
+            except Exception:  # noqa: BLE001 - compared all the same
+                pass
+            left = self._orphan_check(size_key)
+            if left:
+                try:
+                    self._sizer_stop(owner, left, self._last_sizer_started(size_key) or {})
+                except Exception:  # noqa: BLE001 - fail closed: the next entry finds it again and stops
+                    pass
+                return False
+        return True
 

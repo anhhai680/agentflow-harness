@@ -288,18 +288,15 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
 
 @dataclass
 class _Turn:
-    """The next agent call: its prompt, the session it resumes (None = fresh), and whether it sizes the step."""
+    """The next agent call: its prompt and the session it resumes (None = fresh)."""
 
     prompt: str
     resume: str | None
-    sizing: bool = False
 
 
 @dataclass
 class _Called:
     outcome: AgentOutcome
-    sizing: bool
-    before: str
     after: str
 
 
@@ -434,14 +431,15 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         A step already done is not run again; a step skipped by its condition, or any step in a
         dry run, is "skipped". A step whose record is `running` or `waiting_human` (the runner was
         stopped, or a human answered) resumes its recorded session at its recorded effort.
-        `share_session_of` names a step whose session a new step continues (at that step's effort,
-        with no effort check), as the tasks of a small plan do. A step parked by a question that later
+        `share_session_of` names a step whose session a new step continues (at that step's effort),
+        as the tasks of a small plan do. A step parked by a question that later
         tasks need not wait for returns "stopped" with its record `parked`.
         `fix_first` (gates that already failed, as for a gate step) starts a step that is not resuming
         in its fix loop: the first call is fix attempt 1, with the gate output.
         With `size` and `effort.sizing`, a step that has not started is sized first (`SizingLane.size_step`), unless
-        it continues a shared session, the run is over budget, or it is a dry run. A review that sends the step back to
-        its session (`step_reopened` for `review`, or a refine round) raises its effort once
+        it continues a shared session, the run is over budget, or it is a dry run. Whether sized or not, a sizer of
+        the step left open by a runner that died is checked first (`SizingLane.check_open_sizers`). A review that
+        sends the step back to its session (`step_reopened` for `review`, or a refine round) raises its effort once
         (`SizingLane.escalate_effort`), as its first fix attempt after a failed gate does in `_loop`. A judgement step
         never runs below `medium` (`sizing.floor`), on any path.
         """
@@ -489,10 +487,12 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if left:
                 return self._fail(sr, [Violation("sizer_edit", "reset " + ", ".join(left) + " first")])
             resized = True  # cleared: the step is sized again, whatever its row says
+        # A sizer of this step left open (its runner died): compared before anything runs, sized or not.
+        if not self.dry_run and not self.check_open_sizers(key):
+            return "stopped"
 
         shared = (state["steps"].get(share_session_of) or {}) if share_session_of else {}
         takes_shared = not session and status in UNSTARTED_STEP and bool(shared.get("session_id"))
-        sized_now = False
         if (size and self.cfg.effort.sizing and not self.dry_run and mode == "first" and not resuming
                 and (status in UNSTARTED_STEP or resized) and (not rec.get("sized") or resized)
                 and not takes_shared and not sizing.is_sizer_key(key) and self._under_budget()):
@@ -500,7 +500,6 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if level is None:
                 return "stopped"
             sr.effort = sizing.floor(level, judgement, self.cfg.effort.allowed)
-            sized_now = True
         reopened = _approved(since, key) if resuming else None
         if not self.dry_run and ((reopened is not None and reopened["type"] == "step_reopened"
                                   and reopened.get("reason") == "review") or (mode == "refine" and session)):
@@ -509,14 +508,13 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         if resuming and session:
             turn = _Turn(self._continue_prompt(sr, _answers(since, key), _approved(since, key)), session)
         elif mode == "refine" and session:
-            turn = _Turn(self._prompt(sr, sized=True, resume=session), session)
+            turn = _Turn(self._prompt(sr, resume=session), session)
         elif takes_shared:
             sr.session = shared["session_id"]
             sr.effort = sizing.floor(shared.get("effort") or sr.effort, judgement, self.cfg.effort.allowed)
-            turn = _Turn(self._prompt(sr, sized=True, resume=sr.session), sr.session)
+            turn = _Turn(self._prompt(sr, resume=sr.session), sr.session)
         else:
-            sized = sized_now or bool(rec.get("sized"))
-            turn = _Turn(self._prompt(sr, sized=sized), None)
+            turn = _Turn(self._prompt(sr), None)
         fixing = bool(fix_first) and not resuming
         if fixing:  # a gate step's session starts from the gate output (and a refine round's note)
             refine = current_refine(self.run, phase.name)
@@ -584,7 +582,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             model=model, effort=effort, extra=self._step_extra(key, extra), session=None,
             agent_profile=overlays.agent_profile(self.cfg, step),
         )
-        turn = _Turn(self._prompt(sr, sized=False), None)
+        turn = _Turn(self._prompt(sr), None)
         return agent.argv(self._agent_call(sr, turn, attempt=1))
 
     def _under_budget(self) -> bool:
@@ -728,7 +726,6 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
     def _call(self, sr: _StepRun, turn: _Turn) -> _Called:
         workspace.prepare(self.run)  # fresh copies of the inputs; whatever the agent left there is replaced
         workspace.clear_result(self.run, sr.key)  # a stale result must never count
-        before = snapshot(self.worktree)
         attempt = (self.run.state["steps"].get(sr.key) or {}).get("attempts", 0) + 1
         call = self._agent_call(sr, turn, attempt)
         seen: dict[str, object] = {"model": None, "pid": None}
@@ -737,7 +734,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             data = dict(payload)
             if name == "agent_started":
                 seen["pid"] = data.get("pid")
-                data.update(sizing=turn.sizing, phase=sr.phase.name, role=sr.role)
+                data.update(sizing=False, phase=sr.phase.name, role=sr.role)  # a sizer's own call says True
             elif name == "agent_session":
                 seen["model"] = data.get("model")
                 data.update(key=sr.key, pid=seen["pid"])
@@ -763,7 +760,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 tool=denial.get("tool_name") or denial.get("tool"),
                 input=denial.get("tool_input", denial.get("input")),
             )
-        return _Called(outcome, turn.sizing, before, snapshot(self.worktree))
+        return _Called(outcome, snapshot(self.worktree))
 
     def _record_lessons(self, sr: _StepRun, turn: _Turn) -> None:
         """A fresh session's prompt carries the lessons: record which ones (and their digest), and which a size
@@ -850,11 +847,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             f"Continue the step from `{values['progress']}` and `{values['handoff']}`: read them first, "
             "check the work tree, and do not redo finished work."
         )
-        return _Turn(f"{lead}\n\n{self._prompt(sr, sized=True)}", None)
+        return _Turn(f"{lead}\n\n{self._prompt(sr)}", None)
 
     def _fresh_refine(self, sr: _StepRun, gone: str) -> _Turn:
         """A refine round could not resume the step's session (expired, rolled over): a fresh session gets
-        the same prompt plus `progress.md` and `handoff.md`, at the same effort and with no effort check."""
+        the same prompt plus `progress.md` and `handoff.md`, at the same effort."""
         self.run.emit("resume_failed", key=sr.key, session_id=gone, effort=sr.effort)
         sr.session = None
         values = self._values(sr)
@@ -863,7 +860,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             f"Read `{values['progress']}` and `{values['handoff']}` first: they say what the step did before. "
             "Then check the work tree and refine the step's existing output; do not start over."
         )
-        return _Turn(f"{lead}\n\n{self._prompt(sr, sized=True)}", None)
+        return _Turn(f"{lead}\n\n{self._prompt(sr)}", None)
 
     def _failed_gates(self, sr: _StepRun) -> list[GateResult]:
         """The step's gates, then its doc checks (`checks:`, on the diff since the step started); the failed ones.
@@ -964,8 +961,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
 
     # -- prompt pieces
 
-    def _rec(self, sr: _StepRun, sized: bool) -> dict:
-        return {**(self.run.state["steps"].get(sr.key) or {}), "sized": sized, "agent": sr.agent_name, "role": sr.role}
+    def _rec(self, sr: _StepRun) -> dict:
+        return {**(self.run.state["steps"].get(sr.key) or {}), "agent": sr.agent_name, "role": sr.role}
 
     def _step_extra(self, key: str, extra: dict | None) -> dict:
         """`extra` plus the result path, written out because a headless agent cannot read its environment."""
@@ -974,13 +971,13 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
     def _values(self, sr: _StepRun) -> dict[str, str]:
         return _values(self.cfg, sr.step, self.ctx, sr.extra)
 
-    def _prompt(self, sr: _StepRun, sized: bool, resume: str | None = None) -> str:
+    def _prompt(self, sr: _StepRun, resume: str | None = None) -> str:
         """The step's prompt for a turn that resumes session `resume`, or for a fresh session when it is None.
 
-        A fresh session (the first turn, a rollover, an effort change, a refine round whose session is gone)
+        A fresh session (the first turn, a rollover, a refine round whose session is gone)
         holds nothing yet, so it is never built as a continuation: the skill's text goes in again."""
         step = sr.step if resume else dataclasses.replace(sr.step, continuation=False)
-        prompt = build_prompt(self.cfg, step, self.ctx, self._rec(sr, sized), sr.extra, sr.mode)
+        prompt = build_prompt(self.cfg, step, self.ctx, self._rec(sr), sr.extra, sr.mode)
         return f"{sr.lead}\n\n{prompt}" if sr.lead else prompt
 
     def _result_partial(self, sr: _StepRun) -> str:

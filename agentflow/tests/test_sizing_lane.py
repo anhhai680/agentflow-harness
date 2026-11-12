@@ -982,3 +982,201 @@ def test_a_step_whose_key_merely_contains_size_is_sized(flow_repo, key):
                                           ("build/impl", False)])
 def test_is_sizer_key_matches_only_the_sizers_own_keys(key, expected):
     assert sizing.is_sizer_key(key) is expected
+
+
+# --------------------------------------------------------------------------- an open sizer on a path that does not size
+
+
+def _orphan_sizer(flow_repo, run, key: str = SIZE_KEY, edit: str | None = "toy/x.py") -> None:
+    """A sizer whose runner died in the call (no outcome recorded), then `edit` written by someone."""
+    run.emit("sizer_started", key=key, **flow_repo.executor(run)._repo_state())
+    if edit:
+        path = flow_repo.root / edit
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("y = 1\n", encoding="utf-8")
+
+
+def _stopped_by_the_orphan(flow_repo, run, key: str, edit: str = "toy/x.py") -> None:
+    tripped = flow_repo.events(run, "guard_tripped")
+    assert [t["key"] for t in tripped] == [key] and tripped[0]["violations"][0]["kind"] == "sizer_edit"
+    assert edit in tripped[0]["violations"][0]["detail"]
+    assert run.refresh()["waiting"]["kind"] == "guard_violation"
+    assert flow_repo.events(run, "step_started") == []
+
+
+@pytest.mark.parametrize("how", ["sizing_off", "size_false"])
+def test_an_orphan_sizer_is_checked_when_the_step_is_not_sized(flow_repo, how):
+    if how == "sizing_off":
+        flow_repo.configure({"effort": {"sizing": False}})
+    run = flow_repo.new_run()
+    _orphan_sizer(flow_repo, run)
+    assert run_step(flow_repo, executor=flow_repo.executor(run), size=how != "size_false") == "stopped"
+    assert flow_repo.calls() == []
+    _stopped_by_the_orphan(flow_repo, run, KEY)
+
+
+def test_an_orphan_sizer_is_checked_before_a_refine_round(flow_repo):
+    flow_repo.script({SIZE_KEY: [answer()], KEY: [{"result": DONE}, {"result": DONE}]})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo) == "done"
+    run.emit("phase_rejected", phase="build", round=1, note="tighten it")
+    _orphan_sizer(flow_repo, run)
+    assert run_step(flow_repo, executor=flow_repo.executor(run), mode="refine") == "stopped"
+    assert steps_called(flow_repo) == [SIZE_KEY, KEY]  # no refine call
+    tripped = flow_repo.events(run, "guard_tripped")
+    assert [t["key"] for t in tripped] == [KEY] and "toy/x.py" in tripped[0]["violations"][0]["detail"]
+
+
+def test_a_clean_orphan_sizer_lets_an_unsized_step_run_and_is_settled(flow_repo):
+    flow_repo.configure({"effort": {"sizing": False}})
+    question = {"id": "q1", "question": "Which?", "options": [{"key": "A", "label": "a"}]}
+    flow_repo.script({KEY: [{"write": {"toy/y.py": "z = 1\n"},
+                             "result": {"status": "needs_human", "summary": "q", "questions": [question]}},
+                            {"result": DONE}]})
+    run = flow_repo.new_run()
+    _orphan_sizer(flow_repo, run, edit=None)
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "stopped"  # its own question
+    assert [e["key"] for e in flow_repo.events(run, "sizer_finished")] == [SIZE_KEY]
+    assert answer_questions(run, KEY, {"q1": "A"}, by="test") is True
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"  # toy/y.py is the step's own
+    assert flow_repo.events(run, "guard_tripped") == [] and steps_called(flow_repo) == [KEY, KEY]
+
+
+def test_an_orphan_sizer_whose_state_cannot_be_read_stops_the_step(flow_repo, monkeypatch):
+    flow_repo.configure({"effort": {"sizing": False}})
+    run = flow_repo.new_run()
+    _orphan_sizer(flow_repo, run, edit=None)
+    monkeypatch.setattr(SizingLane, "_repo_state", _raises)
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "stopped"
+    assert flow_repo.calls() == []
+    tripped = flow_repo.events(run, "guard_tripped")
+    assert [t["key"] for t in tripped] == [KEY] and "unknown" in tripped[0]["violations"][0]["detail"]
+
+
+def test_a_dry_run_does_not_check_an_orphan_sizer(flow_repo):
+    run = flow_repo.new_run()
+    _orphan_sizer(flow_repo, run)
+    out = io.StringIO()
+    assert run_step(flow_repo, executor=flow_repo.executor(run, dry_run=True, out=out)) == "skipped"
+    assert flow_repo.events(run, "guard_tripped") == [] and flow_repo.events(run, "sizer_finished") == []
+
+
+@pytest.mark.parametrize("skip", ["sizing_off", "already_sized"])
+def test_an_orphan_plan_sizer_is_checked_when_the_plan_is_not_sized(planned, skip):
+    from agentflow import sources
+
+    run = begin_build(planned, plan_doc(2))
+    if skip == "sizing_off":
+        planned.configure({**BIG, "effort": {"sizing": False}})
+    else:
+        tasks = sources.parse_plan(planned.root / PLAN_PATH)
+        run.emit("plan_sized", key=PREFIX, digest=sizing.plan_digest((t.n, t.title, t.text) for t in tasks),
+                 tasks=[1, 2])
+    _orphan_sizer(planned, run, PLAN_SIZE.format(i=1), edit="pkg/x.py")
+    assert size_directly(planned, run) == "stopped"
+    assert planned.calls() == [] and planned.events(run, "effort_decided") == []
+    tripped = planned.events(run, "guard_tripped")
+    assert [t["key"] for t in tripped] == [PREFIX] and "pkg/x.py" in tripped[0]["violations"][0]["detail"]
+
+
+# --------------------------------------------------------------------------- a pause during a sizer
+
+
+def test_a_change_made_while_paused_in_a_sizer_is_not_the_sizers(flow_repo):
+    flow_repo.script({SIZE_KEY: [{"sleep": 2} | answer(), answer()]})
+    run = flow_repo.new_run()
+    timer = threading.Timer(0.5, lambda: Run.load(flow_repo.root, run.id).emit("run_paused", by="me"))
+    timer.start()
+    assert run_step(flow_repo) == "stopped"
+    timer.join()
+    assert [e["key"] for e in flow_repo.events(run, "sizer_finished")] == [SIZE_KEY]
+    (flow_repo.root / ".DS_Store").write_bytes(b"\0")  # e.g. a file browser, while the run is paused
+    run.emit("run_resumed", by="me")
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    assert flow_repo.events(run, "guard_tripped") == [] and steps_called(flow_repo) == [SIZE_KEY, SIZE_KEY, KEY]
+
+
+def test_a_sizer_that_edited_and_was_paused_still_stops(flow_repo):
+    flow_repo.script({SIZE_KEY: [{"write": {"toy/x.py": "y = 1\n"}, "sleep": 2} | answer()]})
+    run = flow_repo.new_run()
+    timer = threading.Timer(0.5, lambda: Run.load(flow_repo.root, run.id).emit("run_paused", by="me"))
+    timer.start()
+    assert run_step(flow_repo) == "stopped"
+    timer.join()
+    assert flow_repo.events(run, "sizer_finished") == []
+    tripped = flow_repo.events(run, "guard_tripped")
+    assert [t["key"] for t in tripped] == [KEY] and "toy/x.py" in tripped[0]["violations"][0]["detail"]
+    run.emit("run_resumed", by="me")
+    approve(run, KEY, by="me")
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "stopped"  # still there: refused
+    assert len(flow_repo.events(run, "guard_tripped")) == 2 and len(flow_repo.calls()) == 1
+
+
+def test_a_pause_in_the_sizer_after_a_cleared_stop_does_not_blame_later_changes(flow_repo):
+    hook = flow_repo.root / ".git" / "hooks" / "post-commit"
+    flow_repo.script({SIZE_KEY: [{"write": {".git/hooks/post-commit": "#!/bin/sh\n"}} | answer(),
+                                 {"sleep": 2} | answer(), answer()]})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo) == "stopped"
+    hook.unlink()
+    approve(run, KEY, by="me")
+    timer = threading.Timer(0.5, lambda: Run.load(flow_repo.root, run.id).emit("run_paused", by="me"))
+    timer.start()
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "stopped"  # paused in the second sizer
+    timer.join()
+    (flow_repo.root / ".DS_Store").write_bytes(b"\0")
+    run.emit("run_resumed", by="me")
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    assert len(flow_repo.events(run, "guard_tripped")) == 1
+    assert steps_called(flow_repo) == [SIZE_KEY, SIZE_KEY, SIZE_KEY, KEY]
+
+
+def test_a_change_made_while_paused_in_a_plan_sizer_is_not_the_sizers(planned):
+    run = begin_build(planned, plan_doc(2))
+    size1 = PLAN_SIZE.format(i=1)
+    planned.script({size1: [{"sleep": 2} | plan_answer({1: {}, 2: {}}), plan_answer({1: {}, 2: {}})]})
+    timer = threading.Timer(0.5, lambda: Run.load(planned.root, run.id).emit("run_paused", by="me"))
+    timer.start()
+    assert size_directly(planned, run) == "stopped"
+    timer.join()
+    (planned.root / ".DS_Store").write_bytes(b"\0")
+    run.emit("run_resumed", by="me")
+    assert size_directly(planned, run) == "done"
+    assert planned.events(run, "guard_tripped") == [] and steps_called(planned) == [size1, size1]
+    assert [e["tasks"] for e in planned.events(run, "plan_sized")] == [[1, 2]]
+
+
+def test_a_plan_entry_after_a_fallback_asks_only_for_the_tasks_that_fell_back(planned):
+    run = begin_build(planned, plan_doc(2))
+    size1 = PLAN_SIZE.format(i=1)
+    planned.script({size1: [plan_answer({1: {"mechanical": "yes"}}), plan_answer({2: {"risk": "yes"}})]})
+    assert size_directly(planned, run) == "done"  # task 2 has no answer: it falls back
+    assert planned.events(run, "plan_sized") == []
+    assert size_directly(planned, run) == "done"
+    assert cards_in(planned.calls()[1]) == [2]  # task 1's answer is kept
+    decided = planned.events(run, "effort_decided")
+    assert [(e["level"], e["source"]) for e in decided if e["key"] == IMPL.format(n=2)] == [
+        ("medium", "fallback"), ("high", "plan_sizer")]
+    assert {(e["level"], e["source"]) for e in decided if e["key"] == IMPL.format(n=1)} == {("low", "plan_sizer")}
+    assert [e["tasks"] for e in planned.events(run, "plan_sized")] == [[1, 2]]
+
+
+def test_a_kept_answer_whose_task_changed_is_asked_again(planned):
+    run = begin_build(planned, plan_doc(2))
+    size1 = PLAN_SIZE.format(i=1)
+    planned.script({size1: [plan_answer({1: {"mechanical": "yes"}}), plan_answer({1: {"risk": "yes"}, 2: {}})]})
+    assert size_directly(planned, run) == "done"
+    plan = planned.root / PLAN_PATH
+    plan.write_text(plan.read_text(encoding="utf-8").replace("Task 1 code**", "Task 1 code, with a cache**"),
+                    encoding="utf-8")
+    assert size_directly(planned, run) == "done"
+    assert cards_in(planned.calls()[1]) == [1, 2]
+    assert levels_of(planned, run)[IMPL.format(n=1)] == "high"
+
+
+def test_a_sizer_stop_with_no_recorded_state_says_to_cancel(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.executor(run)._sizer_stop(KEY, ["toy/x.py"], {})
+    detail = flow_repo.events(run, "guard_tripped")[0]["violations"][0]["detail"]
+    assert "nothing to restore" in detail and "cancel the run and run it again" in detail
+    assert run.refresh()["waiting"]["kind"] == "guard_violation"  # still a stop

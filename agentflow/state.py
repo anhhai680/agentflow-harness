@@ -395,6 +395,10 @@ def _on_plan_sized(state: dict, ev: dict) -> None:
     """Read from the log, not from the state."""
 
 
+def _on_sizer_finished(state: dict, ev: dict) -> None:
+    """Read from the log, not from the state."""
+
+
 def _on_effort_refused(state: dict, ev: dict) -> None:
     _step_row(state, ev["key"])["effort_refused"] = {"requested": ev.get("requested"), "reason": ev.get("reason")}
 
@@ -762,6 +766,7 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "effort_escalated": _on_effort_escalated,
     "sizer_started": _on_sizer_started,
     "plan_sized": _on_plan_sized,
+    "sizer_finished": _on_sizer_finished,
     "compacted": _on_compacted,
     "rolled_over": _on_rolled_over,
     "subagent_started": _on_subagent_started,
@@ -813,6 +818,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "effort_escalated": ("key", "to"),
     "sizer_started": ("key",),
     "plan_sized": ("key",),
+    "sizer_finished": ("key",),
     "permission_denied": ("key",),
     "progress_not_updated": ("key",),
     "checkpoint_reused": ("key",),
