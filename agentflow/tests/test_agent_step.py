@@ -87,9 +87,8 @@ def test_an_effort_change_is_always_refused(flow_repo):
 
 def test_no_prompt_carries_the_effort_check(flow_repo):
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, flow_repo.new_run())
-    for sized in (False, True):
-        text = build_prompt(flow_repo.cfg, make_step(), ctx, {"sized": sized}, {}, "first")
-        assert "Effort check" not in text and "effort_change" not in text
+    text = build_prompt(flow_repo.cfg, make_step(), ctx, {}, {}, "first")
+    assert "Effort check" not in text and "effort_change" not in text
 
 
 def test_a_packs_own_preamble_copy_with_the_old_block_is_stripped(flow_repo, monkeypatch):
@@ -103,7 +102,7 @@ def test_a_packs_own_preamble_copy_with_the_old_block_is_stripped(flow_repo, mon
     monkeypatch.setattr(lanes, "_template", template)
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, flow_repo.new_run())
     assert old in template(flow_repo.cfg, lanes.PREAMBLE)  # the setup really injects it
-    text = build_prompt(flow_repo.cfg, make_step(), ctx, {"sized": False}, {}, "first")
+    text = build_prompt(flow_repo.cfg, make_step(), ctx, {}, {}, "first")
     assert "Effort check" not in text and "size this step" not in text
 
 
@@ -737,7 +736,7 @@ def test_build_prompt_parts(flow_repo):
     ctx = make_ctx(cfg, flow_repo.root, "feature", {"module": "crm"}, run)
     step = make_step(prompt="spec.md", skill="spec-driven-development", brief=["README.md"])  # an explicit brief: the skill line is plain
     extra = {"result_file": "/workspace/out/step.json"}
-    first = build_prompt(cfg, step, ctx, {"sized": False, "agent": "claude"}, extra, "first")
+    first = build_prompt(cfg, step, ctx, {"agent": "claude"}, extra, "first")
     assert "Effort check" not in first
     assert "Use the `spec-driven-development` skill." in first
     assert "`/workspace/out/step.json`" in first
@@ -746,14 +745,12 @@ def test_build_prompt_parts(flow_repo):
     assert "commit" in first and "push" in first
     assert "docs/specs/SPEC-crm.md" in first
     assert first.index("spec-driven-development") < first.index("/workspace/out/step.json")
-    sized = build_prompt(cfg, step, ctx, {"sized": True, "agent": "claude"}, extra, "first")
-    assert "Effort check" not in sized and "/workspace/out/step.json" in sized
 
 
 def test_build_prompt_names_a_skill_the_template_leaves_out(flow_repo):
     run = flow_repo.new_run()
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
-    prompt = build_prompt(flow_repo.cfg, make_step(skill="writing-plans", brief=["README.md"]), ctx, {"sized": True}, {}, "first")
+    prompt = build_prompt(flow_repo.cfg, make_step(skill="writing-plans", brief=["README.md"]), ctx, {}, {}, "first")
     assert "Use the `writing-plans` skill." in prompt
     assert "do the step `impl`" in prompt
 
@@ -761,7 +758,7 @@ def test_build_prompt_names_a_skill_the_template_leaves_out(flow_repo):
 def test_codex_prompt_reads_skill_file(flow_repo):
     run = flow_repo.new_run()
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
-    prompt = build_prompt(flow_repo.cfg, make_step(prompt="plan.md", skill="writing-plans", brief=["README.md"]), ctx, {"sized": True, "agent": "codex"}, {}, "first")
+    prompt = build_prompt(flow_repo.cfg, make_step(prompt="plan.md", skill="writing-plans", brief=["README.md"]), ctx, {"agent": "codex"}, {}, "first")
     assert "Read `.claude/skills/writing-plans/SKILL.md` and follow it." in prompt
     assert "Use the `writing-plans` skill" not in prompt
 
@@ -936,11 +933,11 @@ def test_skill_and_base_ref_placeholders(flow_repo):
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
     ctx.base_ref = "origin/develop"
     for prompt in ("fix.md", "branch_review.md", "security_review.md"):
-        text = build_prompt(flow_repo.cfg, make_step(prompt=prompt, skill="x", brief=[]), ctx, {"sized": True}, {}, "first")
+        text = build_prompt(flow_repo.cfg, make_step(prompt=prompt, skill="x", brief=[]), ctx, {}, {}, "first")
         assert "{skill}" not in text and "{base_ref}" not in text and "origin/main" not in text, prompt
-    fix = build_prompt(flow_repo.cfg, make_step(prompt="fix.md", skill="x", brief=[]), ctx, {"sized": True}, {}, "first")
+    fix = build_prompt(flow_repo.cfg, make_step(prompt="fix.md", skill="x", brief=[]), ctx, {}, {}, "first")
     assert "## The `x` skill" in fix
-    review = build_prompt(flow_repo.cfg, make_step(prompt="branch_review.md", skill=None, brief=[]), ctx, {"sized": True}, {}, "first")
+    review = build_prompt(flow_repo.cfg, make_step(prompt="branch_review.md", skill=None, brief=[]), ctx, {}, {}, "first")
     assert "`git diff origin/develop...HEAD`" in review
 
 
@@ -964,7 +961,7 @@ def bundled_skill(monkeypatch, tmp_path, name="agentflow-build", text=None):
 def skill_prompt(flow_repo, step, extra=None, rec=None):
     run = flow_repo.run or flow_repo.new_run()
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
-    return build_prompt(flow_repo.cfg, step, ctx, {"sized": True, **(rec or {})}, extra or {}, "first")
+    return build_prompt(flow_repo.cfg, step, ctx, dict(rec or {}), extra or {}, "first")
 
 
 def test_a_step_without_brief_gets_its_skill_as_brief_verbatim(flow_repo, monkeypatch, tmp_path):
@@ -1147,10 +1144,10 @@ def test_engine_prompts_inline_the_bundled_skills_over_a_sparse_pack(sparse_repo
 # --------------------------------------------------------------------------- what the run already found
 
 
-def _prompt(flow_repo, sized: bool = False) -> str:
+def _prompt(flow_repo) -> str:
     run = flow_repo.run if flow_repo.run is not None else flow_repo.new_run()
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
-    return build_prompt(flow_repo.cfg, make_step(), ctx, {"sized": sized, "agent": "claude", "role": "build"}, {}, "normal")
+    return build_prompt(flow_repo.cfg, make_step(), ctx, {"agent": "claude", "role": "build"}, {}, "normal")
 
 
 def test_without_facts_the_prompt_has_no_heading_and_no_stray_blank_lines(flow_repo):
@@ -1414,7 +1411,7 @@ def test_lessons_for_another_phase_are_left_out(flow_repo, no_engine_lessons):
     _write_pack_lessons(flow_repo, "## L-0001 Build only\n- applies: build\nA build rule.\n"
                                    "## L-0002 Review only\n- applies: review\nA review rule.\n")
     ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
-    prompt = build_prompt(flow_repo.cfg, make_step(), ctx, {"sized": True, "agent": "claude", "role": "build"},
+    prompt = build_prompt(flow_repo.cfg, make_step(), ctx, {"agent": "claude", "role": "build"},
                           {"phase": "build"}, "normal")
     assert "A build rule." in prompt and "A review rule." not in prompt
 

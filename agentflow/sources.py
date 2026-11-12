@@ -22,7 +22,6 @@ MAX_TASK_FILES = 8
 _TASK_HEADING = re.compile(r"^###\s+Task\s+(\d+)\s*:\s*(.*?)\s*$")
 _TOP_HEADING = re.compile(r"^#{1,2}\s")
 BOX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+)\[( |x|X)\]")
-_BOX = BOX  # the old private name
 _DEFERRED = re.compile(r"^\s*>\s*\*\*Deferred\b")
 _DEPENDS = re.compile(r"^\*\*Depends on:\*\*\s*(.*?)\s*$")
 _DEPENDS_TASK = re.compile(r"\bTask\s+(\d+)\b", re.IGNORECASE)
@@ -140,7 +139,7 @@ def parse_plan_text(text: str) -> list[PlanTask]:
     for n, title, start, end in _task_spans(lines):
         body = lines[start:end]
         boxes = [
-            m.group(2) for k, line in enumerate(body) if not fenced[start + k] and (m := _BOX.match(line))
+            m.group(2) for k, line in enumerate(body) if not fenced[start + k] and (m := BOX.match(line))
         ]
         tasks.append(
             PlanTask(
@@ -167,7 +166,7 @@ def tick_task(path: Path, n: int) -> None:
         for i in range(start, end):
             if fenced[i]:
                 continue
-            match = _BOX.match(bare[i])
+            match = BOX.match(bare[i])
             if match and match.group(2) == " ":
                 prefix = match.group(1)
                 lines[i] = f"{prefix}[x]" + lines[i][match.end() :]
@@ -192,7 +191,7 @@ def task_size(task: PlanTask) -> tuple[int, int]:
     """`(checkbox steps, files named)` outside code fences."""
     lines = task.text.splitlines()
     fenced = _fence_flags(lines)
-    steps = sum(1 for i, line in enumerate(lines) if not fenced[i] and _BOX.match(line))
+    steps = sum(1 for i, line in enumerate(lines) if not fenced[i] and BOX.match(line))
     return steps, len(task_files(task))
 
 

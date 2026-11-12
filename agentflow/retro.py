@@ -931,7 +931,7 @@ def _dry_prompt(cfg: Config, repo: Path, step: Step) -> str:
     ctx.base_ref = f"origin/{cfg.project.base_branch}"
     extra = {"result_file": "(the run's result file)", "phase": RETRO_PIPELINE, "run_dir": "(the run's workspace)",
              "progress": "(the run's workspace)/progress.md"}
-    return build_prompt(cfg, step, ctx, {"sized": False, "role": step.role}, extra, "first")
+    return build_prompt(cfg, step, ctx, {"role": step.role}, extra, "first")
 
 
 @contextmanager
