@@ -2,7 +2,8 @@
 
 `FeatureLane` is mixed into `lanes.Executor` next to `flow_control.StepControl`.
 
-`run_foreach` (a `foreach: plan_task` step) walks the plan's tasks in order. A ticked task the run
+`run_foreach` (a `foreach: plan_task` step) walks the plan's tasks in order. Before the first task, `size_plan`
+(`sizing_lane`) sizes the open tasks that have not started, and their reviews. A ticked task the run
 never touched is passed over, and so is a task this run already committed. Each other task runs:
 
 1. the implementer, `<step>/task-<n>/implement`, in a fresh session (a small plan: the previous
@@ -114,8 +115,8 @@ def earlier_review(findings: list[dict], note: str | None) -> str:
 
 class FeatureLane:
     """`run_foreach`, `record_decisions`, `may_park` and `run_finish` for `lanes.Executor`; relies on its
-    `cfg`, `run`, `ctx`, `worktree`, `run_agent_step`, `decide`, `_waiting_on`, `_since_step_started` and
-    `_gate_report`."""
+    `cfg`, `run`, `ctx`, `worktree`, `run_agent_step`, `size_plan`, `decide`, `_waiting_on`, `_since_step_started`
+    and `_gate_report`."""
 
     cfg: Config
     run: Run
@@ -162,6 +163,8 @@ class FeatureLane:
         if small is None:
             return "stopped"
         self._batch_of = self._batches(phase, step, plan, prefix, small)
+        if self.size_plan(phase, step, plan, prefix, small) == "stopped":
+            return "stopped"
         while True:
             stopped, held, attempted = self._plan_pass(phase, step, plan, rel, prefix, small)
             if stopped:
@@ -223,7 +226,8 @@ class FeatureLane:
         plan) lets the run go on; the check is not repeated. True = stopped."""
         if self._waiting_on(prefix):
             return True
-        if any(e["type"] == "hitl_approved" and e.get("key") == prefix for e in self.run.events.read()):
+        if any(e["type"] == "hitl_approved" and e.get("key") == prefix and e.get("kind") != "guard_violation"
+               for e in self.run.events.read()):  # approving a plan sizer's edit stop says nothing about the plan
             return False
         tasks = sources.parse_plan(plan)
         todo = [t for t in tasks if not self._committed(f"{prefix}/task-{t.n}")]

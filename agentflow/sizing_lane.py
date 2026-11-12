@@ -10,6 +10,13 @@ and any difference after the call stops the run (`guard_violation`, kind `sizer_
 restart is refused (`sizer_reset_needed`). Anything else that goes wrong in sizing falls back to `effort.default`
 (`high` for a judgement step) and never stops, holds or reminds.
 
+`size_plan` sizes a plan's open tasks that have not started when the build phase's `foreach` starts: one plan-sizer
+call (`prompts/size_plan.md`) per `sizing.PLAN_SIZE_CHUNK` task cards, on the phase's `plan`-role model. It records
+an `effort_decided` (`plan_sizer` or `fallback`) for each task's implement step and its review, then a `plan_sized`
+with the plan's digest when no task fell back, so ticking boxes sizes nothing again, an edit sizes only the tasks
+that have not started, and a fallback is tried again on the next entry. A plan sizer that changed the repository
+stops build on the plan's prefix, the same way as a step's sizer.
+
 Agent text is untrusted: only the six normalized answers and a reason cut to `sizing.REASON_MAX` are kept, and
 neither reaches a commit message.
 """
@@ -18,11 +25,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING
+import os
+import stat
+from typing import TYPE_CHECKING, Literal
 
-from agentflow import overlays, run_env, sizing
+from agentflow import overlays, run_env, safeio, sizing, sources
 from agentflow.agents import Agent, AgentCall, AgentOutcome, EventCallback
 from agentflow.conditions import fmt
+from agentflow.config import Phase, Step, resolve_model
 from agentflow.flow_control import halted
 from agentflow.gitops import changed_since, git_state, head, tree_state
 from agentflow.guards import changed_paths, snapshot
@@ -30,9 +40,13 @@ from agentflow.hitl import raise_hitl
 from agentflow.run_control import wait_for_agents
 
 if TYPE_CHECKING:  # `lanes` imports this module for `Executor`'s bases
+    from pathlib import Path
+
     from agentflow.lanes import _StepRun
 
 SIZE_PROMPT = "size.md"
+PLAN_SIZE_PROMPT = "size_plan.md"
+LINE_COUNT_MAX_BYTES = 2 * 1024 * 1024  # a named file larger than this is shown as unreadable
 SIZER_EDIT = "sizer_edit"
 CLEARS = ("effort_decided", "plan_sized")  # a sizing outcome: the sizer before it is accounted for
 STATE_FIELDS = ("tree", "head", "state")
@@ -44,12 +58,19 @@ def _owner(size_key: str) -> str:
     return size_key[:at] if at > 0 else size_key
 
 
+def _sized_by(event: dict) -> str | None:
+    """The plan-sizer key an `effort_decided` came from (`<prefix>/size-<i>`), or None."""
+    found = event.get("size_key") if event["type"] == "effort_decided" else None
+    return found if isinstance(found, str) else None
+
+
 def _is_sizer_edit(event: dict) -> bool:
     return any(isinstance(v, dict) and v.get("kind") == SIZER_EDIT for v in event.get("violations") or [])
 
 
 class SizingLane:
-    """Sizes agent steps; a mixin of `Executor` (uses `cfg`, `run`, `agents`, `ctx`, `worktree`, `overrides`)."""
+    """Sizes agent steps and plans; a mixin of `Executor` (uses `cfg`, `run`, `agents`, `ctx`, `worktree`, `overrides`,
+    `dry_run`, `_under_budget`, `_waiting_on`, and `FeatureLane`'s `_refine_round` and `_batch_of`)."""
 
     # -- one step
 
@@ -121,6 +142,176 @@ class SizingLane:
             except Exception:  # noqa: BLE001
                 pass
             return level
+
+    # -- a plan's tasks
+
+    def size_plan(self, phase: Phase, step: Step, plan: Path, prefix: str, small: dict) -> Literal["done", "stopped"]:
+        """Size the open tasks of `plan` that have not started, and their reviews, before `run_foreach` walks it.
+
+        "stopped" when a plan sizer changed the repository (now or before a restart that did not put it back), or a
+        human paused or ended the run; else "done". Any other failure falls back per task and never stops."""
+        if self.dry_run:
+            return "done"
+        self.run.refresh()
+        # A plan sizer changed the repository: nothing runs, sized or not, until it is back as the sizer found it.
+        left = self.sizer_reset_needed(prefix)
+        if left:
+            if not self._waiting_on(prefix):
+                shown = ", ".join(left[:sizing.CHANGED_SHOWN])
+                detail = f"reset {shown} first"
+                self.run.emit("guard_tripped", key=prefix, violations=[{"kind": SIZER_EDIT, "detail": detail}])
+                raise_hitl(self.cfg, self.run, "guard_violation", prefix,
+                           f"Guard violation in {prefix}: {SIZER_EDIT}: {detail}")
+            return "stopped"
+        resized = self._sizer_trip(prefix) is not None  # cleared: the plan is sized again, whatever was recorded
+        policy = self.cfg.effort
+        if not policy.sizing or self._refine_round(phase) or not self._under_budget():
+            if resized:  # settle the cleared stop, so later work is never read as the sizer's edit
+                self.run.emit("plan_sized", key=prefix, digest=None, tasks=[])
+            return "done"
+
+        tasks = sources.parse_plan(plan)
+        digest = sizing.plan_digest((t.n, t.title, t.text) for t in tasks)
+        recorded = [e for e in self.run.events.read() if e["type"] == "plan_sized" and e.get("key") == prefix]
+        if recorded and recorded[-1].get("digest") == digest and not resized:
+            return "done"
+        steps = self.run.state["steps"]
+        todo = [t for t in tasks
+                if t.open and not (steps.get(f"{prefix}/task-{t.n}/implement") or {}).get("session_id")]
+        if todo and (self.run.state["waiting"] is not None or halted(self.run.state["status"])):
+            return "stopped" if halted(self.run.state["status"]) else "done"  # a stop is the lane's to handle
+
+        role = step.role or "build"
+        judgement = sizing.is_judgement(phase.name, role)
+        facts: dict[int, tuple[int, bool]] = {}
+        cards: dict[int, str] = {}
+        for task in todo:
+            named = sources.task_files(task)
+            files = [(path, self._line_count(path)) for path in named]
+            security = overlays.touches_security(self.cfg, named)
+            facts[task.n] = (len(files), security)
+            card = sizing.task_card(key=f"{prefix}/task-{task.n}/implement", phase=phase.name, role=role,
+                                    ask=f"Task {task.n}: {task.title}\n\n{task.text}", files=files, changed=[],
+                                    security=security, failing_gates=[])
+            cards[task.n] = f"== Task {task.n} ==\n\n{card}"
+
+        answered: dict[int, tuple[dict | None, str, str]] = {}  # task -> (answers, reason, the sizer key)
+        model: str | None = None
+        size = sizing.PLAN_SIZE_CHUNK
+        for i, start in enumerate(range(0, len(todo), size), 1):
+            chunk = todo[start:start + size]
+            size_key = f"{prefix}{sizing.SIZE_MARK}-{i}"
+            replies, stopped, model = self._plan_chunk(phase, prefix, size_key, [cards[t.n] for t in chunk], model)
+            if stopped:
+                return "stopped"
+            for task in chunk:
+                entry = (replies or {}).get(str(task.n))
+                entry = entry if isinstance(entry, dict) else {}
+                answers = sizing.parse_answers(entry.get("answers"))
+                reason = " ".join(sizing.reason_text(entry.get("reason")).split())
+                answered[task.n] = (answers, reason, size_key)
+
+        implement: dict[int, str] = {}
+        review: dict[int, str] = {}
+        for task in todo:
+            answers = answered[task.n][0]
+            files, security = facts[task.n]
+            implement[task.n] = sizing.decide(answers, files, security, judgement, policy)[0]
+            review[task.n] = sizing.decide(answers, files, security, True, policy)[0]
+        batch_of = self._batch_of or {}
+        for n in implement:
+            members = [m for m in batch_of.get(n) or [] if m in implement]
+            if members:  # one session for the batch, and one review on its last member
+                implement[n] = sizing.highest(implement[m] for m in members)
+                review[n] = sizing.highest(review[m] for m in members)
+        if implement and small.get("active") and small.get("shared_session"):  # one session for the whole plan
+            top = sizing.highest(implement.values())
+            implement = dict.fromkeys(implement, top)
+        has_review = step.review is not None and (not small.get("active") or bool(small.get("review")))
+
+        fell_back = False
+        for task in todo:
+            answers, reason, size_key = answered[task.n]
+            files, security = facts[task.n]
+            source = "plan_sizer" if answers is not None else "fallback"
+            fell_back = fell_back or answers is None
+            keys = [("implement", implement[task.n])]
+            batch = batch_of.get(task.n)
+            if has_review and (not batch or batch[-1] == task.n):
+                keys.append(("review", review[task.n]))
+            for part, level in keys:
+                self.run.emit("effort_decided", key=f"{prefix}/task-{task.n}/{part}", level=level, source=source,
+                              answers=answers, reason=reason, sizer_model=model, files=files, security=security,
+                              size_key=size_key)
+        if not fell_back:  # a fallback is tried again on the next entry; its decisions still settle a cleared stop
+            self.run.emit("plan_sized", key=prefix, digest=digest, tasks=[t.n for t in todo])
+        return "done"
+
+    def _plan_chunk(self, phase: Phase, prefix: str, size_key: str, cards: list[str],
+                    model: str | None) -> tuple[dict | None, bool, str | None]:
+        """One plan-sizer call over `cards`: `(its per-task replies or None, whether the run stopped, the model)`.
+        Anything that goes wrong gives no replies (each task falls back), unless a sizer changed the repository."""
+        from agentflow.lanes import _template
+
+        orphan_checked = stopping = False
+        try:
+            wait_for_agents(self.run, self.cfg, size_key, sizing.PLAN_SIZE_TIMEOUT_S)
+            left = self._orphan_check(size_key)
+            orphan_checked = True
+            if left:
+                stopping = True
+                self._sizer_stop(prefix, left, self._last_sizer_started(size_key) or {})
+                return None, True, model
+            if halted(self.run.refresh()["status"]):
+                return None, True, model
+            agent_name = phase.agent or self.cfg.defaults.agent
+            agent = self.agents[agent_name]
+            # The phase's `plan`-role model, never the foreach step's own `model:`; `--model <phase>=…` still wins.
+            model, _source = resolve_model(self.cfg, phase, Step(id="size", type="agent", role="plan"), "plan",
+                                           self.overrides)
+            effort = sizing.sizer_effort(True, self.cfg.effort.allowed)
+            prompt = fmt(_template(self.cfg, PLAN_SIZE_PROMPT), {"task_cards": "\n\n".join(cards)})
+            parsed, edited = self._sizer_call(size_key, prompt, agent, str(model), effort, phase.name, "plan",
+                                              sizing.PLAN_SIZE_MAX_TURNS, sizing.PLAN_SIZE_TIMEOUT_S)
+            if edited:
+                stopping = True
+                self._sizer_stop(prefix, edited, self._last_sizer_started(size_key) or {})
+                return None, True, model
+            if halted(self.run.refresh()["status"]):
+                return None, True, model
+            replies = parsed.get("tasks") if isinstance(parsed, dict) else None
+            return (replies if isinstance(replies, dict) else None), False, model
+        except Exception:  # noqa: BLE001 - a sizing failure never stops a run; only a sizer's edit does
+            if stopping:
+                return None, True, model
+            if not orphan_checked:  # never fall back past a sizer that may have changed the repository
+                left = self._orphan_check(size_key)
+                if left:
+                    self._sizer_stop(prefix, left, self._last_sizer_started(size_key) or {})
+                    return None, True, model
+            try:
+                if halted(self.run.refresh()["status"]):
+                    return None, True, model
+            except Exception:  # noqa: BLE001
+                pass
+            return None, False, model
+
+    def _line_count(self, rel: str) -> int | None:
+        """The lines of the regular file `rel` names in the worktree, for a task card; None for a path that leaves the
+        worktree once resolved, a symlink, anything but a regular file, a file over `LINE_COUNT_MAX_BYTES`, or one that
+        cannot be read. The path comes from plan text, so it is never trusted to stay inside."""
+        try:
+            root = self.worktree.resolve()
+            path = self.worktree / rel
+            if not path.resolve().is_relative_to(root):
+                return None
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > LINE_COUNT_MAX_BYTES:
+                return None
+            data = safeio.read_bytes(path, LINE_COUNT_MAX_BYTES)  # no symlink, still a regular file, still small
+        except (OSError, ValueError, RuntimeError):
+            return None
+        return None if data is None else data.count(b"\n")
 
     # -- one sizer session
 
@@ -221,7 +412,8 @@ class SizingLane:
         if not tripped or not _is_sizer_edit(tripped[-1]):
             return None
         last = tripped[-1]["seq"]
-        if any(e["type"] in (*CLEARS, "step_started") and e.get("key") == key and e["seq"] > last for e in events):
+        if any(e["seq"] > last and ((e["type"] in (*CLEARS, "step_started") and e.get("key") == key)
+                                    or _owner(_sized_by(e) or "") == key) for e in events):
             return None
         recorded = [e for e in tripped if _is_sizer_edit(e) and isinstance(e.get("before"), dict)]
         return recorded[-1] if recorded else None
@@ -243,15 +435,16 @@ class SizingLane:
 
     def _orphan_check(self, size_key: str) -> list[str]:
         """For a sizer whose last `sizer_started` has no outcome after it (its runner died, or the run halted), what
-        differs from that start; [] when there is none. Call it after `wait_for_agents`. Never raises."""
+        differs from that start; [] when there is none. A plan sizer's outcome is a decision that names it
+        (`size_key`). Call it after `wait_for_agents`. Never raises."""
         owner = _owner(size_key)
         events = self.run.events.read()
         started = [e for e in events if e["type"] == "sizer_started" and e.get("key") == size_key]
         if not started:
             return []
         seq = started[-1]["seq"]
-        if any(e["type"] in (*CLEARS, "guard_tripped") and e.get("key") in (owner, size_key) and e["seq"] > seq
-               for e in events):
+        if any(e["seq"] > seq and ((e["type"] in (*CLEARS, "guard_tripped") and e.get("key") in (owner, size_key))
+                                   or _sized_by(e) == size_key) for e in events):
             return []
         try:
             return self._changes_since(started[-1])
