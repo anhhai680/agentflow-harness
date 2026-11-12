@@ -23,6 +23,7 @@ import yaml
 from agentflow import layers, pack
 
 KNOWN_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+SIZER_STEP_ID = re.compile(r"size(?:-\d+)?")  # the last part of a sizer's key (`sizing.is_sizer_key`): no step's id
 RETRO_PIPELINE = "retro"  # the retro run's pipeline name: its runs never count as evidence for or against a lesson
 BUILTIN_CHECKS = (
     "file_exists",
@@ -1168,6 +1169,9 @@ class _Validator:
         for step in steps:
             if step.id in seen:
                 self.error(_join(step.path, "id"), f"duplicate step id '{step.id}'")
+            elif SIZER_STEP_ID.fullmatch(step.id):
+                self.error(_join(step.path, "id"), f"step id '{step.id}' is reserved: the runner's effort sizers "
+                                                   "use `size` and `size-<n>`")
             seen.add(step.id)
             if step.review is not None:
                 self.unique_ids([step.review], seen)

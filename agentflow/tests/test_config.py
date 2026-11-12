@@ -255,6 +255,18 @@ def test_duplicate_step_id(tmp_cfg):
     assert ("error", "phases.define.steps[4].id") in errors(issues_for(tmp_cfg, patch))
 
 
+@pytest.mark.parametrize("step_id,refused", [("size", True), ("size-1", True), ("size-12", True),
+                                              ("sizes", False), ("size-up", False), ("resize", False)])
+def test_a_step_id_shaped_like_a_sizer_key_is_refused(tmp_cfg, step_id, refused):
+    def patch(data):
+        phase_step(data, "define", "contracts")["id"] = step_id
+        phase_step(data, "build", "build")["review"]["id"] = "size-2" if refused else "review-2"
+
+    found = errors(issues_for(tmp_cfg, patch))
+    assert (("error", "phases.define.steps[4].id") in found) is refused
+    assert (("error", "phases.build.steps[1].review.id") in found) is refused
+
+
 def test_user_only_skill_as_step(tmp_cfg):
     def patch(data):
         phase_step(data, "define", "contracts")["skill"] = "writing-for-agents"

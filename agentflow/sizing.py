@@ -13,7 +13,7 @@ import json
 import re
 from collections.abc import Iterable, Sequence
 
-from agentflow.config import KNOWN_EFFORT_LEVELS, EffortPolicy
+from agentflow.config import KNOWN_EFFORT_LEVELS, SIZER_STEP_ID, EffortPolicy
 from agentflow.sources import BOX
 
 QUESTIONS = ("interface", "risk", "ambiguity", "breadth", "novelty", "mechanical")
@@ -37,6 +37,13 @@ PLAN_SIZE_TIMEOUT_S = 420
 PLAN_SIZE_CHUNK = 6
 
 _JSON_BLOCK = re.compile(r"```json\s*\n(.*?)\n\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def is_sizer_key(key: str) -> bool:
+    """A sizer's own key: `<step key>/size` or `<plan prefix>/size-<n>`. `validate` refuses a step id of that shape,
+    so a step whose key only contains `/size` (`build/sizes`) is still a step."""
+    _, sep, last = key.rpartition("/")
+    return bool(sep) and SIZER_STEP_ID.fullmatch(last) is not None
 
 
 def is_judgement(phase: str, role: str) -> bool:

@@ -463,7 +463,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         role = role or step.role or DEFAULT_ROLE
         since = self._since_step_started(key)
         started = since[0] if since else None
-        resuming = status in RESUMABLE and started is not None
+        # A stop for a sizer of this step that changed the repository: the step is sized again and starts fresh, even
+        # when an earlier attempt (since retried) had started a session.
+        tripped = not self.dry_run and self._sizer_trip(key) is not None
+        resuming = status in RESUMABLE and started is not None and not tripped
         session = rec.get("session_id")
         reuses_session = bool(session) and (resuming or mode == "refine")
         if reuses_session and started is not None and started.get("model"):
@@ -480,7 +483,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         sr.effort = sizing.floor(sr.effort, judgement, self.cfg.effort.allowed)
         # A sizer of this step changed the repository: nothing runs until it is back as the sizer found it.
         resized = False
-        if not self.dry_run and self._sizer_trip(key) is not None:
+        if tripped:
             left = self.sizer_reset_needed(key)
             if left:
                 return self._fail(sr, [Violation("sizer_edit", "reset " + ", ".join(left) + " first")])
@@ -491,7 +494,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         sized_now = False
         if (size and self.cfg.effort.sizing and not self.dry_run and mode == "first" and not resuming
                 and (status in UNSTARTED_STEP or resized) and (not rec.get("sized") or resized)
-                and not takes_shared and sizing.SIZE_MARK not in key and self._under_budget()):
+                and not takes_shared and not sizing.is_sizer_key(key) and self._under_budget()):
             level = self.size_step(sr, [r.name for r in fix_first or []])
             if level is None:
                 return "stopped"

@@ -808,3 +808,46 @@ def test_no_escalation_with_sizing_off(flow_repo):
     assert {effort_of(c) for c in flow_repo.calls()} == {"medium"} and len(flow_repo.calls()) == 4
     assert flow_repo.events(run, "effort_escalated") == []
 
+
+# --------------------------------------------------------------------------- a restart after a sizer stop, sizer keys
+
+
+def test_a_retried_step_stopped_by_its_sizer_is_sized_again_and_runs_fresh(flow_repo):
+    from agentflow.run_control import retry
+
+    hook = flow_repo.root / ".git" / "hooks" / "post-commit"
+    flow_repo.script({SIZE_KEY: [{"write": {".git/hooks/post-commit": "#!/bin/sh\n"}} | answer(), answer()]})
+    run = flow_repo.new_run()
+    # interrupted in its first turn, a self-sizing one (e.g. started while `effort.sizing` was off): never sized
+    run.emit("step_started", key=KEY, phase="build", agent="claude", model="sonnet", effort="high",
+             start_head=flow_repo.head())
+    run.emit("agent_started", agent="claude", pid=999999, model="sonnet", effort="high", step=KEY, session_id="s1",
+             sizing=True)
+    assert not run.refresh()["steps"][KEY].get("sized")
+    assert retry(Run.load(flow_repo.root, run.id), KEY, by="me") == KEY
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "stopped"  # the sizer edited the repository
+    hook.unlink()
+    approve(run, KEY, by="me")
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    assert steps_called(flow_repo) == [SIZE_KEY, SIZE_KEY, KEY]
+    work = flow_repo.calls()[-1]
+    assert "--resume" not in work["argv"] and effort_of(work) == "medium"
+    assert [e["source"] for e in flow_repo.events(run, "effort_decided")] == ["sizer"]
+
+
+@pytest.mark.parametrize("key", ["build/sizes", "build/size-up", "build/size-1a"])
+def test_a_step_whose_key_merely_contains_size_is_sized(flow_repo, key):
+    step = make_step(id=key.split("/", 1)[1])
+    flow_repo.script({f"{key}/size": [answer(mechanical="yes")]})
+    run = flow_repo.new_run()
+    assert flow_repo.executor(run).run_agent_step(make_phase(step), step, key) == "done"
+    assert steps_called(flow_repo) == [f"{key}/size", key]
+    assert flow_repo.events(run, "effort_decided")[0]["level"] == "low"
+
+
+@pytest.mark.parametrize("key,expected", [("build/impl/size", True), ("build/build/size-1", True),
+                                          ("build/build/size-12", True), ("build/sizes", False),
+                                          ("build/size-up", False), ("build/size-1a", False),
+                                          ("build/impl", False)])
+def test_is_sizer_key_matches_only_the_sizers_own_keys(key, expected):
+    assert sizing.is_sizer_key(key) is expected
