@@ -710,3 +710,101 @@ def test_a_run_paused_while_sizing_the_plan_starts_no_task(planned):
     assert build(planned, run) == ("done", True)  # the open sizer is checked, then the plan is sized again
     assert steps_called(planned)[:3] == [size1, size1, IMPL.format(n=1)]
     assert planned.events(run, "guard_tripped") == [] and len(planned.events(run, "plan_sized")) == 1
+
+
+# --------------------------------------------------------------------------- escalating once (Task 8)
+
+FAILING = make_step(gates=["fail"], fix_loop=True)
+
+
+def effort_of(call: dict) -> str:
+    return dict(pairs(call["argv"]))["--effort"]
+
+
+def test_the_first_gate_failure_resumes_one_level_higher(flow_repo):
+    flow_repo.script({SIZE_KEY: [answer()], KEY: [{"result": DONE}, {"result": DONE}]})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, FAILING) == "stopped"
+    work, fix = flow_repo.calls()[1:3]
+    assert ("--effort", "medium") in pairs(work["argv"])
+    assert ("--effort", "high") in pairs(fix["argv"]) and "--resume" in fix["argv"]
+    escalated = flow_repo.events(run, "effort_escalated")
+    assert [(e["key"], e["from"], e["to"], e["trigger"]) for e in escalated] == [(KEY, "medium", "high", "gate")]
+    assert run.state["steps"][KEY]["effort"] == "high" and run.state["steps"][KEY]["effort_changed"] == "up"
+
+
+def test_a_step_escalates_once(flow_repo):
+    flow_repo.script({SIZE_KEY: [answer()]})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, FAILING) == "stopped"
+    calls = flow_repo.calls()
+    assert [effort_of(c) for c in calls[1:]] == ["medium", "high", "high", "high"]  # three fix attempts
+    assert len(flow_repo.events(run, "effort_escalated")) == 1
+    assert [e["kind"] for e in flow_repo.events(run, "hitl_raised")] == ["fix_attempts_exhausted"]
+    approve(run, KEY, by="me")  # another round of fix attempts: still no second escalation
+    assert run_step(flow_repo, FAILING, executor=flow_repo.executor(run)) == "stopped"
+    assert {effort_of(c) for c in flow_repo.calls()[4:]} == {"high"}
+    assert len(flow_repo.events(run, "effort_escalated")) == 1
+
+
+def test_a_rollover_keeps_the_level(flow_repo):
+    flow_repo.script({SIZE_KEY: [answer()], KEY: [{"usage_pct": [81]}, {"result": DONE}]})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo) == "done"
+    sizer, work, fresh = flow_repo.calls()
+    assert effort_of(work) == "medium" and effort_of(fresh) == "medium" and "--resume" not in fresh["argv"]
+    assert len(flow_repo.events(run, "rolled_over")) == 1 and flow_repo.events(run, "effort_escalated") == []
+
+
+def test_a_reopening_review_resumes_the_implementer_one_level_higher(planned, git):
+    from test_feature_lane import FINDING, review
+
+    run = begin_build(planned, plan_doc(1))
+    impl, rev = IMPL.format(n=1), REVIEW.format(n=1)
+    planned.script({PLAN_SIZE.format(i=1): [plan_answer({1: {}})], rev: [review(FINDING), review()]})
+    assert build(planned, run) == ("done", True)
+    calls = planned.calls()
+    assert steps_called(planned) == [PLAN_SIZE.format(i=1), impl, rev, impl, rev]
+    assert [effort_of(c) for c in calls[1:]] == ["medium", "medium", "high", "medium"]
+    assert "--resume" in calls[3]["argv"]  # the implementer's own session, one level higher
+    escalated = planned.events(run, "effort_escalated")
+    assert [(e["key"], e["from"], e["to"], e["trigger"]) for e in escalated] == [(impl, "medium", "high", "review")]
+
+
+def test_a_refine_round_resumes_one_level_higher(flow_repo):
+    flow_repo.script({SIZE_KEY: [answer()], KEY: [{"result": DONE}, {"result": DONE}]})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo) == "done"
+    run.emit("phase_rejected", phase="build", round=1, note="tighten it")
+    assert run_step(flow_repo, executor=flow_repo.executor(run), mode="refine") == "done"
+    sizer, work, refine = flow_repo.calls()
+    assert effort_of(work) == "medium" and effort_of(refine) == "high" and "--resume" in refine["argv"]
+    assert [e["trigger"] for e in flow_repo.events(run, "effort_escalated")] == ["review"]
+
+
+def test_a_step_started_in_its_fix_loop_escalates_on_its_next_fix(flow_repo):
+    from agentflow.gates import GateResult
+
+    flow_repo.script({SIZE_KEY: [answer()]})
+    run = flow_repo.new_run()
+    failed = [GateResult(name="fail", passed=False, skipped=False, reason="", log_path=None, tail="boom")]
+    assert run_step(flow_repo, FAILING, fix_first=failed) == "stopped"
+    assert [effort_of(c) for c in flow_repo.calls()[1:]] == ["medium", "high", "high"]
+    assert [e["trigger"] for e in flow_repo.events(run, "effort_escalated")] == ["gate"]
+
+
+def test_no_escalation_at_the_top_level(flow_repo):
+    flow_repo.script({SIZE_KEY: [answer(risk="yes")]})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, FAILING) == "stopped"
+    assert {effort_of(c) for c in flow_repo.calls()[1:]} == {"high"} and len(flow_repo.calls()) == 5
+    assert flow_repo.events(run, "effort_escalated") == []
+
+
+def test_no_escalation_with_sizing_off(flow_repo):
+    flow_repo.configure({"effort": {"sizing": False}})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, FAILING) == "stopped"
+    assert {effort_of(c) for c in flow_repo.calls()} == {"medium"} and len(flow_repo.calls()) == 4
+    assert flow_repo.events(run, "effort_escalated") == []
+

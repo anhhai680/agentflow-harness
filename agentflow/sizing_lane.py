@@ -2,7 +2,8 @@
 
 `SizingLane` is a mixin of `Executor`. `size_step` builds a task card from runner facts (the step's ask, the paths
 changed since the run started, the security overlay, the failing gates), asks a sizer session the checklist in
-`prompts/size.md`, and records the level `sizing.decide` gives as `effort_decided`.
+`prompts/size.md`, and records the level `sizing.decide` gives as `effort_decided`. `escalate_effort` raises a step one allowed level, once
+(`effort_escalated`), on its first failed gate or when a review reopens its session; a rollover keeps the level.
 
 A sizer gets only `Read`, `Grep` and `Glob` (`AgentCall.read_only`) and answers in its final message. The backstop is
 the repository's whole state: `sizer_started` records the tree, `HEAD` and a hash of `git_state` and `tree_state`,
@@ -142,6 +143,19 @@ class SizingLane:
             except Exception:  # noqa: BLE001
                 pass
             return level
+
+    def escalate_effort(self, sr: _StepRun, trigger: str) -> None:
+        """Raise `sr`'s effort one allowed level (`effort_escalated`, `trigger` `gate` or `review`), once per step:
+        nothing with sizing off, after an earlier escalation of the step, or at the top allowed level."""
+        if not self.cfg.effort.sizing:
+            return
+        if any(e["type"] == "effort_escalated" and e.get("key") == sr.key for e in self.run.events.read()):
+            return
+        to = sizing.escalate(sr.effort, self.cfg.effort.allowed)
+        if to is None:
+            return
+        self.run.emit("effort_escalated", key=sr.key, trigger=trigger, **{"from": sr.effort, "to": to})
+        sr.effort = to
 
     # -- a plan's tasks
 

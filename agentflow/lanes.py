@@ -439,8 +439,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         `fix_first` (gates that already failed, as for a gate step) starts a step that is not resuming
         in its fix loop: the first call is fix attempt 1, with the gate output.
         With `size` and `effort.sizing`, a step that has not started is sized first (`SizingLane.size_step`), unless
-        it continues a shared session, the run is over budget, or it is a dry run. A judgement step never runs below
-        `medium` (`sizing.floor`), on any path.
+        it continues a shared session, the run is over budget, or it is a dry run. A review that sends the step back to
+        its session (`step_reopened` for `review`, or a refine round) raises its effort once
+        (`SizingLane.escalate_effort`), as its first fix attempt after a failed gate does in `_loop`. A judgement step
+        never runs below `medium` (`sizing.floor`), on any path.
         """
         extra = self._step_extra(key, extra)
         self.run.refresh()
@@ -495,6 +497,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 return "stopped"
             sr.effort = sizing.floor(level, judgement, self.cfg.effort.allowed)
             sized_now = True
+        reopened = _approved(since, key) if resuming else None
+        if not self.dry_run and ((reopened is not None and reopened["type"] == "step_reopened"
+                                  and reopened.get("reason") == "review") or (mode == "refine" and session)):
+            self.escalate_effort(sr, "review")  # a review sent the step back to its session
+            sr.effort = sizing.floor(sr.effort, judgement, self.cfg.effort.allowed)
         if resuming and session:
             turn = _Turn(self._continue_prompt(sr, _answers(since, key), _approved(since, key)), session)
         elif mode == "refine" and session:
@@ -667,6 +674,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if failed:
                 if (sr.step.fix_loop or sr.step.checks) and sr.fixes < self.cfg.defaults.fix_attempts:
                     sr.fixes += 1
+                    self.escalate_effort(sr, "gate")  # once per step; the fix resumes the session one level up
                     self.run.emit("fix_attempt", key=sr.key, attempt=sr.fixes, gates=[r.name for r in failed])
                     turn = _Turn(self._fix_prompt(sr, failed), sr.session)
                     continue
