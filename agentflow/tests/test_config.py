@@ -360,6 +360,21 @@ def test_effort_outside_known_levels(tmp_cfg, patch, bad_path):
     assert ("error", bad_path) in errors(issues_for(tmp_cfg, patch))
 
 
+def test_effort_sizing_defaults_on(sparse_repo):
+    assert load_config(pack.pack_config(sparse_repo)).effort.sizing is True
+
+
+def test_effort_sizing_must_be_a_bool(tmp_cfg):
+    with pytest.raises(ConfigError, match="effort.sizing"):
+        load_config(tmp_cfg({"effort": {"sizing": "yes"}}))
+
+
+def test_effort_allowed_needs_a_level_at_or_above_medium(tmp_cfg, capsys):
+    bad = tmp_cfg({"effort": {"allowed": ["low"], "default": "low"}})
+    assert main(["validate", "--config", str(bad)]) == 1
+    assert "error effort.allowed:" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     "patch, bad_path",
     [

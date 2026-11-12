@@ -77,6 +77,7 @@ recovery:                       # a usage limit just waits for its reset; these 
   failed_attempts: 3            # calls that reached the model and still died: that costs money, an outage does not
 
 effort:
+  sizing: false               # the suite's scripted agents; sizing has its own tests
   default: medium               # every step's sizing session starts here
   allowed: [low, medium, high]  # the only levels an agent may pick; resumes reuse the step's level
 

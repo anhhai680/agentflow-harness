@@ -269,6 +269,7 @@ class Recovery:
 class EffortPolicy:
     default: str
     allowed: list[str]
+    sizing: bool = True
 
 
 @dataclass
@@ -975,6 +976,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
         effort=EffortPolicy(
             default=_require(effort, "default", "effort", str),
             allowed=_string_list(effort.get("allowed"), "effort.allowed"),
+            sizing=_optional(effort, "sizing", "effort", bool, True),
         ),
         context=ContextPolicy(
             autocompact_pct=_require(context, "autocompact_pct", "context", int),
@@ -1616,6 +1618,10 @@ class _Validator:
                 self.error(f"effort.allowed[{i}]", f"unknown effort level '{level}'")
         if any(level not in KNOWN_EFFORT_LEVELS for level in effort.allowed):
             self.error("effort.allowed", f"allowed levels must be within {', '.join(KNOWN_EFFORT_LEVELS)}")
+        floor = KNOWN_EFFORT_LEVELS.index("medium")
+        if effort.allowed and all(level in KNOWN_EFFORT_LEVELS for level in effort.allowed) and not any(
+                KNOWN_EFFORT_LEVELS.index(level) >= floor for level in effort.allowed):
+            self.error("effort.allowed", "needs a level at or above medium: define, plan, review and debug steps never run at low")
         if effort.default not in effort.allowed:
             self.error("effort.default", f"default '{effort.default}' is not in effort.allowed")
 
