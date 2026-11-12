@@ -21,7 +21,8 @@ MAX_TASK_FILES = 8
 
 _TASK_HEADING = re.compile(r"^###\s+Task\s+(\d+)\s*:\s*(.*?)\s*$")
 _TOP_HEADING = re.compile(r"^#{1,2}\s")
-_BOX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+)\[( |x|X)\]")
+BOX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+)\[( |x|X)\]")
+_BOX = BOX  # the old private name
 _DEFERRED = re.compile(r"^\s*>\s*\*\*Deferred\b")
 _DEPENDS = re.compile(r"^\*\*Depends on:\*\*\s*(.*?)\s*$")
 _DEPENDS_TASK = re.compile(r"\bTask\s+(\d+)\b", re.IGNORECASE)
