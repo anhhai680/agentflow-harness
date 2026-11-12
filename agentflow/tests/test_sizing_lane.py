@@ -623,6 +623,76 @@ def test_a_failed_plan_sizer_is_retried_on_the_next_entry(planned, bad):
     assert [e["tasks"] for e in planned.events(run, "plan_sized")] == [[2]]
 
 
+def _raises(*a, **k):
+    raise RuntimeError("boom")
+
+
+def test_a_failure_while_building_task_cards_falls_back_per_task(planned, monkeypatch):
+    monkeypatch.setattr(sizing, "task_card", _raises)
+    run = begin_build(planned, plan_doc(2))
+    assert build(planned, run) == ("done", True)
+    # no sizer at all: the plan's tasks are decided by the fallback, so no step sizer runs for them either
+    assert steps_called(planned) == [IMPL.format(n=1), REVIEW.format(n=1), IMPL.format(n=2), REVIEW.format(n=2)]
+    assert {c["step"]: effort_of(c) for c in planned.calls()} == {
+        IMPL.format(n=1): "medium", REVIEW.format(n=1): "high", IMPL.format(n=2): "medium", REVIEW.format(n=2): "high"}
+    decided = planned.events(run, "effort_decided")
+    assert sorted(e["key"] for e in decided) == sorted([IMPL.format(n=1), REVIEW.format(n=1), IMPL.format(n=2),
+                                                         REVIEW.format(n=2)])
+    assert {(e["source"], e["size_key"]) for e in decided} == {("fallback", PLAN_SIZE.format(i=1))}
+    assert planned.events(run, "plan_sized") == [] and planned.events(run, "hitl_raised") == []
+    assert planned.events(run, "guard_tripped") == [] and planned.events(run, "run_held") == []
+
+
+def test_a_failure_while_building_task_cards_is_retried_on_the_next_entry(planned, monkeypatch):
+    run = begin_build(planned, plan_doc(2))
+    with monkeypatch.context() as patch:
+        patch.setattr(sizing, "task_card", _raises)
+        assert size_directly(planned, run) == "done"
+    assert planned.calls() == [] and planned.events(run, "plan_sized") == []
+    assert {e["source"] for e in planned.events(run, "effort_decided")} == {"fallback"}
+    planned.script({PLAN_SIZE.format(i=1): [plan_answer({1: {"mechanical": "yes"}, 2: {}})]})
+    assert size_directly(planned, run) == "done"  # the plan sizer is tried again
+    assert steps_called(planned) == [PLAN_SIZE.format(i=1)]
+    assert levels_of(planned, run)[IMPL.format(n=1)] == "low"
+    assert [e["tasks"] for e in planned.events(run, "plan_sized")] == [[1, 2]]
+
+
+@pytest.mark.parametrize("act", ["call_raises", "timed_out", "wait_raises", "state_raises"])
+def test_a_failed_plan_sizer_falls_back_without_a_stop(planned, monkeypatch, act):
+    monkeypatch.setattr(sizing, "PLAN_SIZE_TIMEOUT_S", 2)  # the code reads it at call time
+    run = begin_build(planned, plan_doc(2))
+    if act == "call_raises":
+        monkeypatch.setattr(SizingLane, "_run_sizer", _raises)
+    elif act == "timed_out":
+        planned.script({PLAN_SIZE.format(i=1): [{"sleep": 999} | plan_answer({1: {}, 2: {}})]})
+    elif act == "wait_raises":  # before the orphan check: the except path runs it
+        monkeypatch.setattr(sizing_lane, "wait_for_agents", _raises)
+    else:  # after the orphan check: the repository state cannot be read, so `_sizer_call` raises
+        monkeypatch.setattr(SizingLane, "_repo_state", _raises)
+    assert size_directly(planned, run) == "done"
+    decided = planned.events(run, "effort_decided")
+    assert {(e["key"], e["level"], e["source"]) for e in decided} == {
+        (IMPL.format(n=1), "medium", "fallback"), (REVIEW.format(n=1), "high", "fallback"),
+        (IMPL.format(n=2), "medium", "fallback"), (REVIEW.format(n=2), "high", "fallback")}
+    assert {e["size_key"] for e in decided} == {PLAN_SIZE.format(i=1)}
+    assert planned.events(run, "hitl_raised") == [] and planned.events(run, "guard_tripped") == []
+    assert planned.events(run, "run_held") == [] and planned.events(run, "plan_sized") == []
+    assert steps_called(planned) == ([PLAN_SIZE.format(i=1)] if act == "timed_out" else [])
+
+
+def test_a_raising_wait_still_checks_an_orphan_plan_sizer(planned, monkeypatch):
+    run = begin_build(planned, plan_doc(2))
+    size1 = PLAN_SIZE.format(i=1)
+    run.emit("sizer_started", key=size1, **planned.executor(run)._repo_state())  # its runner died in the call
+    (planned.root / "pkg").mkdir(exist_ok=True)
+    (planned.root / "pkg" / "x.py").write_text("y = 1\n", encoding="utf-8")
+    monkeypatch.setattr(sizing_lane, "wait_for_agents", _raises)
+    assert size_directly(planned, run) == "stopped"
+    assert planned.calls() == [] and planned.events(run, "effort_decided") == []
+    tripped = planned.events(run, "guard_tripped")
+    assert [t["key"] for t in tripped] == [PREFIX] and "pkg/x.py" in tripped[0]["violations"][0]["detail"]
+
+
 def test_a_plan_sizer_edit_blocks_build_until_reset(planned, git):
     run = begin_build(planned, plan_doc(2))
     size1 = PLAN_SIZE.format(i=1)
@@ -799,6 +869,18 @@ def test_no_escalation_at_the_top_level(flow_repo):
     assert run_step(flow_repo, FAILING) == "stopped"
     assert {effort_of(c) for c in flow_repo.calls()[1:]} == {"high"} and len(flow_repo.calls()) == 5
     assert flow_repo.events(run, "effort_escalated") == []
+
+
+def test_an_escalation_that_raises_keeps_the_level_and_the_step_runs_on(flow_repo, monkeypatch):
+    monkeypatch.setattr(sizing, "escalate", lambda *a, **k: (_ for _ in ()).throw(ValueError("unknown level")))
+    flow_repo.configure({"effort": {"sizing": True}, "gates": {"flaky": {"run": "test -f fixed.txt"}}})
+    flow_repo.script({SIZE_KEY: [answer()], KEY: [{"result": DONE}, {"write": {"fixed.txt": "ok\n"}, "result": DONE}]})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, make_step(gates=["flaky"], fix_loop=True)) == "done"
+    sizer, work, fix = flow_repo.calls()
+    assert effort_of(work) == "medium" and effort_of(fix) == "medium" and "--resume" in fix["argv"]
+    assert flow_repo.events(run, "effort_escalated") == [] and run.state["steps"][KEY]["effort"] == "medium"
+    assert flow_repo.events(run, "hitl_raised") == [] and run.state["steps"][KEY]["status"] == "done"
 
 
 def test_no_escalation_with_sizing_off(flow_repo):

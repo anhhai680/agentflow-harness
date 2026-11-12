@@ -146,15 +146,19 @@ class SizingLane:
 
     def escalate_effort(self, sr: _StepRun, trigger: str) -> None:
         """Raise `sr`'s effort one allowed level (`effort_escalated`, `trigger` `gate` or `review`), once per step:
-        nothing with sizing off, after an earlier escalation of the step, or at the top allowed level."""
+        nothing with sizing off, after an earlier escalation of the step, or at the top allowed level. Anything that
+        goes wrong leaves the level as it is: an escalation never stops a run."""
         if not self.cfg.effort.sizing:
             return
-        if any(e["type"] == "effort_escalated" and e.get("key") == sr.key for e in self.run.events.read()):
+        try:
+            if any(e["type"] == "effort_escalated" and e.get("key") == sr.key for e in self.run.events.read()):
+                return
+            to = sizing.escalate(sr.effort, self.cfg.effort.allowed)
+            if to is None:
+                return
+            self.run.emit("effort_escalated", key=sr.key, trigger=trigger, **{"from": sr.effort, "to": to})
+        except Exception:  # noqa: BLE001 - e.g. a level `effort.allowed` does not hold
             return
-        to = sizing.escalate(sr.effort, self.cfg.effort.allowed)
-        if to is None:
-            return
-        self.run.emit("effort_escalated", key=sr.key, trigger=trigger, **{"from": sr.effort, "to": to})
         sr.effort = to
 
     # -- a plan's tasks
@@ -184,82 +188,127 @@ class SizingLane:
                 self.run.emit("plan_sized", key=prefix, digest=None, tasks=[])
             return "done"
 
-        tasks = sources.parse_plan(plan)
-        digest = sizing.plan_digest((t.n, t.title, t.text) for t in tasks)
-        recorded = [e for e in self.run.events.read() if e["type"] == "plan_sized" and e.get("key") == prefix]
-        if recorded and recorded[-1].get("digest") == digest and not resized:
-            return "done"
-        steps = self.run.state["steps"]
-        todo = [t for t in tasks
-                if t.open and not (steps.get(f"{prefix}/task-{t.n}/implement") or {}).get("session_id")]
-        if todo and (self.run.state["waiting"] is not None or halted(self.run.state["status"])):
-            return "stopped" if halted(self.run.state["status"]) else "done"  # a stop is the lane's to handle
-
-        role = step.role or "build"
-        judgement = sizing.is_judgement(phase.name, role)
+        todo: list[sources.PlanTask] = []
         facts: dict[int, tuple[int, bool]] = {}
-        cards: dict[int, str] = {}
-        for task in todo:
-            named = sources.task_files(task)
-            files = [(path, self._line_count(path)) for path in named]
-            security = overlays.touches_security(self.cfg, named)
-            facts[task.n] = (len(files), security)
-            card = sizing.task_card(key=f"{prefix}/task-{task.n}/implement", phase=phase.name, role=role,
-                                    ask=f"Task {task.n}: {task.title}\n\n{task.text}", files=files, changed=[],
-                                    security=security, failing_gates=[])
-            cards[task.n] = f"== Task {task.n} ==\n\n{card}"
-
         answered: dict[int, tuple[dict | None, str, str]] = {}  # task -> (answers, reason, the sizer key)
+        decided: set[str] = set()  # the step keys given an `effort_decided` here
         model: str | None = None
-        size = sizing.PLAN_SIZE_CHUNK
-        for i, start in enumerate(range(0, len(todo), size), 1):
-            chunk = todo[start:start + size]
-            size_key = f"{prefix}{sizing.SIZE_MARK}-{i}"
-            replies, stopped, model = self._plan_chunk(phase, prefix, size_key, [cards[t.n] for t in chunk], model)
-            if stopped:
+        stopping = False
+        try:
+            tasks = sources.parse_plan(plan)
+            digest = sizing.plan_digest((t.n, t.title, t.text) for t in tasks)
+            recorded = [e for e in self.run.events.read() if e["type"] == "plan_sized" and e.get("key") == prefix]
+            if recorded and recorded[-1].get("digest") == digest and not resized:
+                return "done"
+            steps = self.run.state["steps"]
+            todo = [t for t in tasks
+                    if t.open and not (steps.get(f"{prefix}/task-{t.n}/implement") or {}).get("session_id")]
+            if todo and (self.run.state["waiting"] is not None or halted(self.run.state["status"])):
+                return "stopped" if halted(self.run.state["status"]) else "done"  # a stop is the lane's to handle
+
+            role = step.role or "build"
+            judgement = sizing.is_judgement(phase.name, role)
+            cards: dict[int, str] = {}
+            for task in todo:
+                named = sources.task_files(task)
+                files = [(path, self._line_count(path)) for path in named]
+                security = overlays.touches_security(self.cfg, named)
+                facts[task.n] = (len(files), security)
+                card = sizing.task_card(key=f"{prefix}/task-{task.n}/implement", phase=phase.name, role=role,
+                                        ask=f"Task {task.n}: {task.title}\n\n{task.text}", files=files, changed=[],
+                                        security=security, failing_gates=[])
+                cards[task.n] = f"== Task {task.n} ==\n\n{card}"
+
+            size = sizing.PLAN_SIZE_CHUNK
+            for i, start in enumerate(range(0, len(todo), size), 1):
+                chunk = todo[start:start + size]
+                size_key = f"{prefix}{sizing.SIZE_MARK}-{i}"
+                replies, stopped, model = self._plan_chunk(phase, prefix, size_key, [cards[t.n] for t in chunk], model)
+                if stopped:
+                    stopping = True
+                    return "stopped"
+                for task in chunk:
+                    entry = (replies or {}).get(str(task.n))
+                    entry = entry if isinstance(entry, dict) else {}
+                    answers = sizing.parse_answers(entry.get("answers"))
+                    reason = " ".join(sizing.reason_text(entry.get("reason")).split())
+                    answered[task.n] = (answers, reason, size_key)
+
+            implement: dict[int, str] = {}
+            review: dict[int, str] = {}
+            for task in todo:
+                answers = answered[task.n][0]
+                files, security = facts[task.n]
+                implement[task.n] = sizing.decide(answers, files, security, judgement, policy)[0]
+                review[task.n] = sizing.decide(answers, files, security, True, policy)[0]
+            batch_of = self._batch_of or {}
+            for n in implement:
+                members = [m for m in batch_of.get(n) or [] if m in implement]
+                if members:  # one session for the batch, and one review on its last member
+                    implement[n] = sizing.highest(implement[m] for m in members)
+                    review[n] = sizing.highest(review[m] for m in members)
+            if implement and small.get("active") and small.get("shared_session"):  # one session for the whole plan
+                top = sizing.highest(implement.values())
+                implement = dict.fromkeys(implement, top)
+            has_review = step.review is not None and (not small.get("active") or bool(small.get("review")))
+
+            fell_back = False
+            for task in todo:
+                answers, reason, size_key = answered[task.n]
+                files, security = facts[task.n]
+                source = "plan_sizer" if answers is not None else "fallback"
+                fell_back = fell_back or answers is None
+                keys = [("implement", implement[task.n])]
+                batch = batch_of.get(task.n)
+                if has_review and (not batch or batch[-1] == task.n):
+                    keys.append(("review", review[task.n]))
+                for part, level in keys:
+                    self.run.emit("effort_decided", key=f"{prefix}/task-{task.n}/{part}", level=level, source=source,
+                                  answers=answers, reason=reason, sizer_model=model, files=files, security=security,
+                                  size_key=size_key)
+                    decided.add(f"{prefix}/task-{task.n}/{part}")
+            if not fell_back:  # a fallback is tried again on the next entry; its decisions still settle a cleared stop
+                self.run.emit("plan_sized", key=prefix, digest=digest, tasks=[t.n for t in todo])
+            return "done"
+        except Exception:  # noqa: BLE001 - a sizing failure never stops a run; only a sizer's edit does
+            if stopping:
                 return "stopped"
-            for task in chunk:
-                entry = (replies or {}).get(str(task.n))
-                entry = entry if isinstance(entry, dict) else {}
-                answers = sizing.parse_answers(entry.get("answers"))
-                reason = " ".join(sizing.reason_text(entry.get("reason")).split())
-                answered[task.n] = (answers, reason, size_key)
+            self._plan_fallback(phase, step, prefix, todo, facts, answered, decided, model, small, resized)
+            return "done"
 
-        implement: dict[int, str] = {}
-        review: dict[int, str] = {}
-        for task in todo:
-            answers = answered[task.n][0]
-            files, security = facts[task.n]
-            implement[task.n] = sizing.decide(answers, files, security, judgement, policy)[0]
-            review[task.n] = sizing.decide(answers, files, security, True, policy)[0]
-        batch_of = self._batch_of or {}
-        for n in implement:
-            members = [m for m in batch_of.get(n) or [] if m in implement]
-            if members:  # one session for the batch, and one review on its last member
-                implement[n] = sizing.highest(implement[m] for m in members)
-                review[n] = sizing.highest(review[m] for m in members)
-        if implement and small.get("active") and small.get("shared_session"):  # one session for the whole plan
-            top = sizing.highest(implement.values())
-            implement = dict.fromkeys(implement, top)
-        has_review = step.review is not None and (not small.get("active") or bool(small.get("review")))
-
-        fell_back = False
-        for task in todo:
-            answers, reason, size_key = answered[task.n]
-            files, security = facts[task.n]
-            source = "plan_sizer" if answers is not None else "fallback"
-            fell_back = fell_back or answers is None
-            keys = [("implement", implement[task.n])]
-            batch = batch_of.get(task.n)
-            if has_review and (not batch or batch[-1] == task.n):
-                keys.append(("review", review[task.n]))
-            for part, level in keys:
-                self.run.emit("effort_decided", key=f"{prefix}/task-{task.n}/{part}", level=level, source=source,
-                              answers=answers, reason=reason, sizer_model=model, files=files, security=security,
-                              size_key=size_key)
-        if not fell_back:  # a fallback is tried again on the next entry; its decisions still settle a cleared stop
-            self.run.emit("plan_sized", key=prefix, digest=digest, tasks=[t.n for t in todo])
-        return "done"
+    def _plan_fallback(self, phase: Phase, step: Step, prefix: str, todo: list[sources.PlanTask],
+                       facts: dict[int, tuple[int, bool]], answered: dict[int, tuple[dict | None, str, str]],
+                       decided: set[str], model: str | None, small: dict, resized: bool) -> None:
+        """After a failure in `size_plan` itself: a `fallback` decision for each step of `todo` not decided yet, with
+        the key of the chunk sizer its card was (or would have been) in, and no `plan_sized`, so the next entry sizes
+        the plan again. A cleared stop with no decision to settle it gets `plan_sized` with no digest, as with sizing
+        off. Never raises: a step left undecided is sized on its own when it starts."""
+        try:
+            policy = self.cfg.effort
+            judgement = sizing.is_judgement(phase.name, step.role or "build")
+            implement = sizing.decide(None, 0, False, judgement, policy)[0]
+            review = sizing.decide(None, 0, False, True, policy)[0]
+            has_review = step.review is not None and (not small.get("active") or bool(small.get("review")))
+            batch_of = self._batch_of or {}
+            for i, task in enumerate(todo):
+                size_key = answered[task.n][2] if task.n in answered else \
+                    f"{prefix}{sizing.SIZE_MARK}-{i // sizing.PLAN_SIZE_CHUNK + 1}"
+                files, security = facts.get(task.n, (0, False))
+                keys = [("implement", implement)]
+                batch = batch_of.get(task.n)
+                if has_review and (not batch or batch[-1] == task.n):
+                    keys.append(("review", review))
+                for part, level in keys:
+                    key = f"{prefix}/task-{task.n}/{part}"
+                    if key in decided:
+                        continue
+                    self.run.emit("effort_decided", key=key, level=level, source="fallback", answers=None, reason="",
+                                  sizer_model=model, files=files, security=security, size_key=size_key)
+                    decided.add(key)
+            if resized and not decided:  # settle the cleared stop, so later work is never read as the sizer's edit
+                self.run.emit("plan_sized", key=prefix, digest=None, tasks=[])
+        except Exception:  # noqa: BLE001
+            pass
 
     def _plan_chunk(self, phase: Phase, prefix: str, size_key: str, cards: list[str],
                     model: str | None) -> tuple[dict | None, bool, str | None]:
