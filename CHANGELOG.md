@@ -7,6 +7,20 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+
+- The runner sizes every step before it starts, with a short read-only sizer session, and sizes a plan's build tasks and their reviews in chunks from the plan; a step goes up one level once, in the same session, on its first failed gate or a reopening review. `effort.sizing: false` turns it off.
+- Events `sizer_started`, `effort_decided`, `effort_escalated` and `plan_sized`, and signals `effort_escalations:<phase>`, `undersized:<phase>` and `sizer_fallbacks:<phase>`, in `agentflow scorecard`, the Metrics tab and as lesson targets.
+
+### Changed
+
+- Define, plan, review and debug steps never run below `medium`, and `validate` refuses an `effort.allowed` with nothing at or above `medium`.
+- `validate` refuses the step ids `size` and `size-<n>`, which are reserved for the sizer's own sessions.
+
+### Removed
+
+- The in-session effort check: no prompt asks the agent to size its own step, and the `effort_change` status is gone from the prompts. A result that still sends one is refused with `effort_refused`.
+
 ## [2.4] - 2026-11-11
 
 ### Added

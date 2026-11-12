@@ -225,11 +225,12 @@ def _drop_skill_section(body: str, keep: bool = False) -> str:
 def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode: Mode) -> str:
     """`_preamble.md` + the step's template (after the refine template in a refine round) + `_result.md`.
 
-    The preamble's effort check is kept only while `rec["sized"]` is false. Placeholders are
-    filled in one pass over the joined text, so values that hold braces go in verbatim.
+    The preamble's effort check is always stripped (a pack's own `_preamble.md` copy may still hold it): the
+    runner sizes every step before it starts. Placeholders are filled in one pass over the joined text, so
+    values that hold braces go in verbatim.
     """
     values = _values(cfg, step, ctx, {})
-    preamble = EFFORT_BLOCK.sub("" if rec.get("sized") else r"\1", _template(cfg, PREAMBLE))
+    preamble = EFFORT_BLOCK.sub("", _template(cfg, PREAMBLE))
     values["lessons"] = _lessons(cfg, ctx.repo, extra.get("phase"), date.today()).text.rstrip("\n")
     preamble = EMPTY_SLOT.sub(lambda m: "" if not values[m.group(1)] else m.group(0), preamble)
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
@@ -515,7 +516,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             turn = _Turn(self._prompt(sr, sized=True, resume=sr.session), sr.session)
         else:
             sized = sized_now or bool(rec.get("sized"))
-            turn = _Turn(self._prompt(sr, sized=sized), None, sizing=not sized)
+            turn = _Turn(self._prompt(sr, sized=sized), None)
         fixing = bool(fix_first) and not resuming
         if fixing:  # a gate step's session starts from the gate output (and a refine round's note)
             refine = current_refine(self.run, phase.name)
@@ -583,7 +584,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             model=model, effort=effort, extra=self._step_extra(key, extra), session=None,
             agent_profile=overlays.agent_profile(self.cfg, step),
         )
-        turn = _Turn(self._prompt(sr, sized=False), None, sizing=True)
+        turn = _Turn(self._prompt(sr, sized=False), None)
         return agent.argv(self._agent_call(sr, turn, attempt=1))
 
     def _under_budget(self) -> bool:
@@ -786,27 +787,12 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
     # -- outcomes
 
     def _effort_change(self, sr: _StepRun, called: _Called, result: StepResult) -> _Turn:
-        """D11: accept only from the sizing session, before any work, and within `effort.allowed`."""
+        """Always refuse: the runner sizes each step before it starts, so no prompt offers a change."""
         requested = str(result.effort)
-        allowed = self.cfg.effort.allowed
-        why = ""
-        if not called.sizing:
-            why = "the step is already sized, and a resumed session keeps its level"
-        elif called.before != called.after:
-            why = "work has already started (the step's diff is not empty)"
-        elif requested not in allowed:
-            why = f"'{requested}' is not one of the allowed levels ({', '.join(allowed)})"
-        elif requested == sr.effort:
-            why = f"the step already runs at {requested}"
-        if why:
-            self.run.emit("effort_refused", key=sr.key, requested=requested, reason=why, agent_reason=result.reason)
-            note = f"Your effort change to `{requested}` was refused: {why}. Carry on with the step at `{sr.effort}`."
-            return _Turn(f"{note}\n\n{self._result_partial(sr)}", sr.session)
-        self.run.emit("effort_changed", key=sr.key, session_id=called.outcome.session_id,
-                      **{"from": sr.effort, "to": requested, "reason": result.reason})
-        sr.effort = requested
-        sr.session = None
-        return _Turn(self._prompt(sr, sized=True), None)
+        why = "the runner sizes each step before it starts"
+        self.run.emit("effort_refused", key=sr.key, requested=requested, reason=why, agent_reason=result.reason)
+        note = f"Your effort change to `{requested}` was refused: {why}. Carry on with the step at `{sr.effort}`."
+        return _Turn(f"{note}\n\n{self._result_partial(sr)}", sr.session)
 
     def _hold(self, sr: _StepRun, turn: _Turn, why: Interruption) -> _Turn | None:
         """The agent cannot work for now: wait, then return the next turn, or None when the run stopped.

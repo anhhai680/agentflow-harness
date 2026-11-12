@@ -63,30 +63,48 @@ def test_first_call_medium_with_sizing(flow_repo):
     c = flow_repo.calls()[0]
     assert ("--effort", "medium") in pairs(c["argv"])
     assert ("--model", "sonnet") in pairs(c["argv"])
-    assert "Effort check" in c["argv"][-1]
+    assert "Effort check" not in c["argv"][-1]
     assert c["env"]["AGENTFLOW_STEP"] == KEY
     assert c["env"]["AGENTFLOW_RESULT"] == str(run.agent_result_path(KEY))  # in the workspace, not runs/
     assert f"`{run.agent_result_path(KEY)}`" in c["argv"][-1]  # the prompt names it: agents cannot read their env
     assert run.state["steps"][KEY]["status"] == "done"
     assert run.state["steps"][KEY]["effort"] == "medium"
     started = flow_repo.events(run, "agent_started")[0]
-    assert started["sizing"] is True
+    assert started["sizing"] is False
 
 
-def test_effort_change_restarts_fresh(flow_repo):
-    run = flow_repo.new_run()
-    flow_repo.script({KEY: [{"result": {"status": "effort_change", "effort": "high", "reason": "6 files"}},
+def test_an_effort_change_is_always_refused(flow_repo):
+    flow_repo.script({KEY: [{"result": {"status": "effort_change", "effort": "high", "reason": "big"}},
                             {"result": DONE}]})
+    run = flow_repo.new_run()
     assert run_step(flow_repo) == "done"
+    refused = flow_repo.events(run, "effort_refused")[0]
+    assert "sizes each step" in refused["reason"] and flow_repo.events(run, "effort_changed") == []
     c = flow_repo.calls()
-    assert len(c) == 2
-    assert "--resume" not in c[1]["argv"]
-    assert ("--effort", "high") in pairs(c[1]["argv"])
-    assert "Effort check" not in c[1]["argv"][-1]
-    changed = flow_repo.events(run, "effort_changed")[0]
-    assert {"from": "medium", "to": "high", "reason": "6 files", "key": KEY}.items() <= changed.items()
-    assert run.state["steps"][KEY]["effort"] == "high"
-    assert run.state["steps"][KEY]["effort_changed"] == "up"
+    assert ("--effort", "medium") in pairs(c[1]["argv"]) and "--resume" in c[1]["argv"]
+    assert all(e["sizing"] is False for e in flow_repo.events(run, "agent_started"))
+
+
+def test_no_prompt_carries_the_effort_check(flow_repo):
+    ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, flow_repo.new_run())
+    for sized in (False, True):
+        text = build_prompt(flow_repo.cfg, make_step(), ctx, {"sized": sized}, {}, "first")
+        assert "Effort check" not in text and "effort_change" not in text
+
+
+def test_a_packs_own_preamble_copy_with_the_old_block_is_stripped(flow_repo, monkeypatch):
+    real = lanes._template
+    old = "<!-- effort-check -->\n## Effort check\nsize this step\n<!-- /effort-check -->\n"
+
+    def template(cfg, name):
+        text = real(cfg, name)
+        return text.replace("## Rules for this step", old + "\n## Rules for this step") if name == lanes.PREAMBLE else text
+
+    monkeypatch.setattr(lanes, "_template", template)
+    ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, flow_repo.new_run())
+    assert old in template(flow_repo.cfg, lanes.PREAMBLE)  # the setup really injects it
+    text = build_prompt(flow_repo.cfg, make_step(), ctx, {"sized": False}, {}, "first")
+    assert "Effort check" not in text and "size this step" not in text
 
 
 def test_effort_change_after_work_refused(flow_repo):
@@ -149,16 +167,17 @@ def test_a_passed_gate_result_has_an_empty_tail(flow_repo):
     assert flow_repo.events(run, "gate_result")[-1]["tail"] == ""
 
 
-def test_fix_loop_keeps_high_effort(flow_repo):
-    run = flow_repo.new_run()
-    flow_repo.script({KEY: [{"result": {"status": "effort_change", "effort": "high", "reason": "hard"}}]})
+def test_fix_loop_keeps_the_steps_effort_and_session(flow_repo):
+    run = flow_repo.new_run()  # sizing is off in this pack, so there is no escalation (test_sizing_lane has it)
     step = make_step(gates=["fail"], fix_loop=True)
     assert run_step(flow_repo, step) == "stopped"
     c = flow_repo.calls()
-    assert len(c) == 5  # sizing call, fresh call at high, three fix attempts
-    assert ("--effort", "medium") in pairs(c[0]["argv"])
+    assert len(c) == 4  # the first call plus defaults.fix_attempts (3)
+    for call in c:
+        assert ("--effort", "medium") in pairs(call["argv"])
     for call in c[1:]:
-        assert ("--effort", "high") in pairs(call["argv"])
+        assert ("--resume", session_of(flow_repo, run)) in pairs(call["argv"])
+    assert flow_repo.events(run, "effort_escalated") == []
     assert hitl_kinds(flow_repo, run) == ["fix_attempts_exhausted"]
 
 
@@ -719,14 +738,14 @@ def test_build_prompt_parts(flow_repo):
     step = make_step(prompt="spec.md", skill="spec-driven-development", brief=["README.md"])  # an explicit brief: the skill line is plain
     extra = {"result_file": "/workspace/out/step.json"}
     first = build_prompt(cfg, step, ctx, {"sized": False, "agent": "claude"}, extra, "first")
-    assert "Effort check" in first
+    assert "Effort check" not in first
     assert "Use the `spec-driven-development` skill." in first
     assert "`/workspace/out/step.json`" in first
     assert str(run.progress_path()) in first
     assert "stop and ask" in first
     assert "commit" in first and "push" in first
     assert "docs/specs/SPEC-crm.md" in first
-    assert first.index("Effort check") < first.index("spec-driven-development") < first.index("/workspace/out/step.json")
+    assert first.index("spec-driven-development") < first.index("/workspace/out/step.json")
     sized = build_prompt(cfg, step, ctx, {"sized": True, "agent": "claude"}, extra, "first")
     assert "Effort check" not in sized and "/workspace/out/step.json" in sized
 
@@ -986,7 +1005,6 @@ def test_a_batch_continuation_does_not_resend_the_skill(flow_repo, monkeypatch, 
 @pytest.mark.parametrize("script", [
     [{"result": DONE}],                                                                 # its first, fresh session
     [{"usage_pct": [81]}, {"result": DONE}],                                            # a rollover
-    [{"result": {"status": "effort_change", "effort": "high", "reason": "big"}}, {"result": DONE}],  # new effort
 ])
 def test_a_continuation_in_a_fresh_session_still_gets_the_skill(flow_repo, monkeypatch, tmp_path, script):
     bundled_skill(monkeypatch, tmp_path)

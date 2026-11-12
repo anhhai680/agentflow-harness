@@ -35,9 +35,6 @@ def unchanged(reason: str) -> dict:
     return {"result": {"status": "unchanged", "summary": reason}}
 
 
-GO_HIGH = {"result": {"status": "effort_change", "effort": "high", "reason": "the spec has many parts"}}
-
-
 @pytest.fixture
 def pipe(flow_repo):
     flow_repo.configure(PIPE)
@@ -89,7 +86,7 @@ def approvals(flow_repo, run) -> list[tuple[str, int]]:
 
 def test_reject_reruns_every_step_with_note(pipe):
     pipe.script({
-        "define/draft": [GO_HIGH, {"write": {SPEC: SPEC_ROUTES}, **done("drafted")},
+        "define/draft": [{"write": {SPEC: SPEC_ROUTES}, **done("drafted")},
                        {"write": {SPEC: SPEC_DELETE}, **done("added the delete route")}],
         "define/contracts": [done("contracts for GET"), done("contracts for DELETE")],
     })
@@ -105,7 +102,7 @@ def test_reject_reruns_every_step_with_note(pipe):
     assert [c["step"] for c in refined] == ["define/draft", "define/contracts"]
     draft, contracts = refined
     assert ("--resume", draft_sid) in pairs(draft["argv"])
-    assert ("--effort", "high") in pairs(draft["argv"])  # the effort the draft step settled on
+    assert ("--effort", "medium") in pairs(draft["argv"])  # the effort the draft step ran at
     assert ("--resume", contracts_sid) in pairs(contracts["argv"])
     assert ("--effort", "medium") in pairs(contracts["argv"])
     for call in refined:
@@ -229,7 +226,7 @@ def test_build_refines_every_task(flow_repo, git):
 
 def test_refine_resume_failed_fresh_session(pipe):
     pipe.script({
-        "define/draft": [GO_HIGH, {"write": {SPEC: SPEC_PLAIN}, **done("drafted")},
+        "define/draft": [{"write": {SPEC: SPEC_PLAIN}, **done("drafted")},
                        {"no_init": True, "exit": 1},
                        {"write": {SPEC: SPEC_PLAIN.replace("mẫu.", "mẫu, đã sửa.")}, **done("revised in a new session")}],
     })
@@ -243,13 +240,13 @@ def test_refine_resume_failed_fresh_session(pipe):
     failed, fresh = calls_for(pipe.calls()[before:], "define/draft")
     assert ("--resume", sid) in pairs(failed["argv"])
     assert "--resume" not in fresh["argv"]
-    assert ("--effort", "high") in pairs(fresh["argv"])
+    assert ("--effort", "medium") in pairs(fresh["argv"])
     prompt = fresh["argv"][-1]
     assert str(run.progress_path()) in prompt and str(run.agent_dir / "handoff.md") in prompt  # workspace copies
     assert NOTE in prompt and "refine round 1" in prompt
     assert EFFORT_CHECK not in prompt
     started = [e for e in pipe.events(run, "agent_started") if e["step"] == "define/draft"]
-    assert started[-1]["sizing"] is False and started[-1]["effort"] == "high"
+    assert started[-1]["sizing"] is False and started[-1]["effort"] == "medium"
     assert [e["key"] for e in pipe.events(run, "resume_failed")] == ["define/draft"]
     assert not [e for e in pipe.events(run, "hitl_raised") if e["key"] == "define/draft"]
     assert run.state["steps"]["define/draft"]["status"] == "done"
@@ -272,7 +269,7 @@ def test_condition_flips_on_refine(pipe):
     assert len(contracts) == 1
     assert "--resume" not in contracts[0]["argv"]  # a fresh session: the step never ran before
     assert ("--effort", "medium") in pairs(contracts[0]["argv"])
-    assert EFFORT_CHECK in contracts[0]["argv"][-1]
+    assert EFFORT_CHECK not in contracts[0]["argv"][-1]
     assert run.state["steps"]["define/contracts"]["status"] == "done"
     inbox = run.inbox_path("define_approved").read_text(encoding="utf-8")
     assert "define/contracts: changed — contracts for GET" in inbox
