@@ -720,7 +720,8 @@ class FeatureLane:
             "topic": question_summary(str(question.get("question", ""))),
         }
         step = dataclasses.replace(rstep, commit=False)
-        outcome = self.run_agent_step(plain, step, rkey, extra=extra, role=rstep.role or "plan")
+        outcome = self.run_agent_step(plain, step, rkey, extra=extra, role=rstep.role or "plan",
+                                      size=False)
         if outcome != "done":
             return outcome
         if any(e["type"] == "decision_recorded" and e.get("key") == rkey for e in self.run.events.read()):

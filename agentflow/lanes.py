@@ -567,9 +567,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             raise ValueError(f"agent {agent_name!r} is not enabled; phase {phase.name!r} needs it")
         role = role or step.role or DEFAULT_ROLE
         model, _source = resolve_model(self.cfg, phase, step, role, self.overrides)
+        effort = sizing.floor(self.cfg.effort.default, sizing.is_judgement(phase.name, role), self.cfg.effort.allowed)
         sr = _StepRun(
             phase=phase, step=step, key=key, mode="first", role=role, agent_name=agent_name, agent=agent,
-            model=model, effort=self.cfg.effort.default, extra=self._step_extra(key, extra), session=None,
+            model=model, effort=effort, extra=self._step_extra(key, extra), session=None,
             agent_profile=overlays.agent_profile(self.cfg, step),
         )
         turn = _Turn(self._prompt(sr, sized=False), None, sizing=True)

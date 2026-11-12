@@ -15,6 +15,7 @@ from agentflow.hitl import approve
 from agentflow.sizing_lane import SizingLane
 from agentflow.state import Run
 from conftest import ENGINE
+from test_retro import gh_log  # noqa: F401  (the fake `gh` fixture the retro test needs)
 from test_agent_step import DONE, KEY, _interrupted, make_phase, make_step, pairs, run_step
 
 SIZE_KEY = f"{KEY}/size"
@@ -259,3 +260,111 @@ def test_sizer_spend_counts_toward_the_run_budget(flow_repo):
     run = flow_repo.new_run()
     run_step(flow_repo)
     assert run.refresh()["spend_usd"] >= 0.05
+
+
+# --------------------------------------------------------------------------- internal sessions and the floor (Task 6)
+
+
+def _no_sizing_traces(flow_repo, run, key: str) -> None:
+    assert not [c for c in flow_repo.calls() if c["step"].endswith("/size")]
+    assert flow_repo.events(run, "effort_decided") == [] and flow_repo.events(run, "sizer_started") == []
+    assert [c["step"] for c in flow_repo.calls()] == [key]
+
+
+def test_internal_sessions_are_not_sized(flow_repo):
+    cond = "build/cond-q"  # a condition question
+    flow_repo.script({cond: [{"result": {"status": "done", "summary": "yes", "signals": {"answer": "yes"}}}]})
+    run = flow_repo.new_run()
+    value, _why = flow_repo.executor(run)._ask_agent(make_phase(make_step()), cond, "some_condition", "no file says")
+    assert value is True
+    _no_sizing_traces(flow_repo, run, cond)
+
+
+def test_a_resolver_session_is_not_sized(flow_repo):
+    from agentflow.autonomy import Resolver
+
+    session = f"{KEY}/resolve-1"
+    flow_repo.script({session: [{"result": {"status": "done", "summary": "settled"}}]})
+    run = flow_repo.new_run()
+    assert flow_repo.cfg.resolve_step is not None
+    assert Resolver(flow_repo.cfg, run, flow_repo.executor(run))._run_session(KEY, "blocked", session, {}) is True
+    _no_sizing_traces(flow_repo, run, session)
+
+
+def test_a_record_step_session_is_not_sized(flow_repo):
+    rkey = f"{KEY}/record-q1"
+    flow_repo.script({rkey: [{"result": {"status": "done", "summary": "filed"}}]})
+    run = flow_repo.new_run()
+    executor = flow_repo.executor(run)
+    record = flow_repo.cfg.record_step
+    assert record is not None
+    assert executor._record_one(make_phase(make_step()), record, rkey, {"question": "q?"}, "A") == "done"
+    _no_sizing_traces(flow_repo, run, rkey)
+
+
+def test_the_retro_session_is_not_sized(flow_repo, gh_log):
+    from agentflow.retro import run_retro
+    from test_retro import KEY as RETRO_KEY, NOW, SEQ, _add, _retro_result, _two_runs_failing
+
+    a, b = _two_runs_failing(flow_repo, "unit")
+    flow_repo.fake.script({RETRO_KEY: [_retro_result(add=[_add(sources=[f"{a}#{SEQ}", f"{b}#{SEQ}"])])]})
+    out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    assert out.run_id
+    calls = [c["step"] for c in flow_repo.calls()]
+    assert calls == [RETRO_KEY]
+    retro = Run.load(flow_repo.root, out.run_id)
+    assert flow_repo.events(retro, "effort_decided") == [] and flow_repo.events(retro, "sizer_started") == []
+    argv = flow_repo.calls()[0]["argv"]
+    assert ("--effort", "medium") in pairs(argv) or ("--effort", "high") in pairs(argv)  # the floor still holds
+
+
+def test_the_floor_holds_with_sizing_off(flow_repo):
+    flow_repo.configure({"effort": {"sizing": False, "default": "low"}})
+    run = flow_repo.new_run()
+    step = make_step(id="rev", role="review")
+    phase = make_phase(step, name="review")
+    assert flow_repo.executor(run).run_agent_step(phase, step, "review/rev") == "done"
+    assert ("--effort", "medium") in pairs(flow_repo.calls()[0]["argv"])
+    assert flow_repo.events(run, "step_started")[0]["effort"] == "medium"
+    # a build step is not floored
+    build = make_step()
+    run2 = flow_repo.new_run()
+    assert flow_repo.executor(run2).run_agent_step(make_phase(build), build, KEY) == "done"
+    assert ("--effort", "low") in pairs(flow_repo.calls()[-1]["argv"])
+
+
+def test_the_dry_run_prints_the_floored_level(flow_repo):
+    flow_repo.configure({"effort": {"sizing": True, "default": "low"}})
+    run = flow_repo.new_run()
+
+    def dry(step, phase_name) -> str:
+        out = io.StringIO()
+        executor = flow_repo.executor(run, dry_run=True, out=out)
+        assert executor.run_steps(make_phase(step, name=phase_name), [step], phase_name) == ("skipped", True)
+        return out.getvalue()
+
+    assert "--effort medium" in dry(make_step(id="idea", role="build"), "plan")  # judgement by phase
+    assert "--effort medium" in dry(make_step(id="rev", role="review"), "build")  # judgement by role
+    text = dry(make_step(id="impl", role="build"), "build")
+    assert "--effort low" in text and "--effort medium" not in text  # a work step keeps effort.default
+    assert flow_repo.calls() == [] and flow_repo.events(run, "sizer_started") == []
+
+
+@pytest.mark.parametrize("key,phase,role,level", [("review/rev", "review", "build", "medium"),
+                                                 ("build/dbg", "build", "debug", "medium"),
+                                                 ("build/impl", "build", "build", "low")])
+def test_attach_applies_the_floor(flow_repo, monkeypatch, key, phase, role, level):
+    import subprocess
+
+    from agentflow import run_control
+
+    run = flow_repo.new_run()
+    run.emit("step_started", key=key, phase=phase, agent="claude", model="sonnet", effort="low",
+             start_head=flow_repo.head())
+    run.emit("agent_started", agent="claude", pid=999999, model="sonnet", effort="low", step=key,
+             session_id="s1", phase=phase, role=role)
+    seen = []
+    monkeypatch.setattr(run_control.subprocess, "run",
+                        lambda argv, *a, **k: (seen.append(argv), subprocess.CompletedProcess(argv, 0))[1])
+    assert run_control.attach(run, flow_repo.cfg) == 0
+    assert seen[0][-4:] == ["--resume", "s1", "--effort", level]

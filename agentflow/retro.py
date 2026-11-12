@@ -1052,7 +1052,8 @@ class _Retro:
 
         executor = Executor(cfg, run, make_agents(cfg), _ctx(cfg, run, worktree), {})
         plain = Phase(name=RETRO_PIPELINE, agent=None, model=None, skip_if=None, steps=[])
-        if executor.run_agent_step(plain, self.step, KEY, role=self.step.role) != "done":
+        if executor.run_agent_step(plain, self.step, KEY, role=self.step.role,
+                                   size=False) != "done":
             return RetroOutcome(run.id, None, f"the retro session stopped: see `agentflow inbox` ({run.id})")
 
         why = self.untouched(worktree, branch, shared, tree, base_bytes)
