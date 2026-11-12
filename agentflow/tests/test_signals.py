@@ -216,3 +216,14 @@ def test_sizer_turns_and_cost_stay_out_of_step_signals():
 def test_the_sizing_families_are_lower_counts():
     for family in ("effort_escalations", "undersized", "sizer_fallbacks"):
         assert FAMILIES[family] == ("lower", True) and family in COUNT_FAMILIES
+
+
+def test_a_fallback_counts_once_per_step_by_its_last_decision():
+    key, other = "build/build/task-1/implement", "build/build/task-2/implement"
+    events = [_ev("effort_decided", key=key, level="medium", source="fallback"),
+              _ev("effort_decided", key=key, level="medium", source="fallback"),   # the plan sizer, tried again
+              _ev("effort_decided", key=other, level="medium", source="fallback"),
+              _ev("effort_decided", key=other, level="low", source="plan_sizer")]  # a later answer replaces it
+    out = run_signals(events, {"phases": []})
+    assert out["sizer_fallbacks:build"] == 1
+    assert "sizer_fallbacks:build" not in run_signals(events[2:], {"phases": []})

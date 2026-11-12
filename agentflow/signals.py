@@ -15,7 +15,8 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   command (always present: reuse should keep it at 0), and `refine_rounds:<p>` counts the refine rounds the runner
   opened itself (present for every phase of the run). `effort_escalations:<p>` counts `effort_escalated` events,
   `undersized:<p>` those whose step was decided `low` or `medium` by a source other than `fallback`, and
-  `sizer_fallbacks:<p>` the `fallback` decisions; all three are present only for a parameter that occurred.
+  `sizer_fallbacks:<p>` the steps whose last decision is a `fallback`; all three are present only for a parameter
+  that occurred.
   Sizer calls (events with `sizer`) are no step's turns, and their cost is not a step's cost.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
@@ -189,8 +190,6 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
         elif etype == "effort_decided":
             if ev.get("key"):
                 decided[str(ev["key"])] = (ev.get("level"), ev.get("source"))
-            if ev.get("source") == "fallback" and (phase := _phase_of(ev.get("key"))):
-                counts["sizer_fallbacks"][phase] += 1
         elif etype == "effort_escalated":
             if phase := _phase_of(ev.get("key")):
                 counts["effort_escalations"][phase] += 1
@@ -201,6 +200,9 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
             audit = ev
         elif etype in ("ci_round", "rolled_over", "progress_not_updated"):
             plain[{"ci_round": "ci_rounds", "rolled_over": "rollovers"}.get(etype, etype)] += 1
+    for key, (_level, source) in decided.items():  # a step's last decision: a retried plan sizer counts once
+        if source == "fallback" and (phase := _phase_of(key)):
+            counts["sizer_fallbacks"][phase] += 1
     for family, found in counts.items():
         out.update({f"{family}:{param}": n for param, n in found.items()})
     out.update({name: plain[name] for name in ("ci_rounds", "rollovers", "progress_not_updated")})
