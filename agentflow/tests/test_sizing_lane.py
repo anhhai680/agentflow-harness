@@ -693,6 +693,55 @@ def test_a_raising_wait_still_checks_an_orphan_plan_sizer(planned, monkeypatch):
     assert [t["key"] for t in tripped] == [PREFIX] and "pkg/x.py" in tripped[0]["violations"][0]["detail"]
 
 
+@pytest.mark.parametrize("broken", ["raise_hitl", "sizer_stop"])
+def test_an_orphan_plan_sizer_stop_that_raises_still_stops(planned, monkeypatch, broken):
+    run = begin_build(planned, plan_doc(2))
+    size1 = PLAN_SIZE.format(i=1)
+    run.emit("sizer_started", key=size1, **planned.executor(run)._repo_state())  # its runner died in the call
+    (planned.root / "pkg").mkdir(exist_ok=True)
+    (planned.root / "pkg" / "x.py").write_text("y = 1\n", encoding="utf-8")
+    with monkeypatch.context() as patch:
+        patch.setattr(sizing_lane, "wait_for_agents", _raises)
+        if broken == "raise_hitl":  # the trip is recorded, the inbox write fails
+            patch.setattr(sizing_lane, "raise_hitl", _raises)
+        else:  # nothing is recorded at all
+            patch.setattr(SizingLane, "_sizer_stop", _raises)
+        assert size_directly(planned, run) == "stopped"
+    assert planned.events(run, "effort_decided") == [] and planned.events(run, "plan_sized") == []
+    assert planned.calls() == []
+    executor = planned.executor(run)
+    if broken == "raise_hitl":  # the trip stays pending: nothing cleared it
+        assert executor._sizer_trip(PREFIX) is not None and "pkg/x.py" in executor.sizer_reset_needed(PREFIX)
+    assert size_directly(planned, run) == "stopped"  # the next entry stops too, and now asks a human
+    assert run.refresh()["waiting"]["kind"] == "guard_violation" and planned.calls() == []
+    assert planned.events(run, "effort_decided") == []
+
+
+def test_a_cleared_plan_stop_whose_plan_cannot_be_read_is_settled_and_sized_again(planned, monkeypatch, git):
+    from agentflow import sources
+
+    run = begin_build(planned, plan_doc(2))
+    size1 = PLAN_SIZE.format(i=1)
+    planned.script({size1: [{"write": {"pkg/x.py": "y = 1\n"}} | plan_answer({1: {}, 2: {}}),
+                            plan_answer({1: {"mechanical": "yes"}, 2: {}})]})
+    assert size_directly(planned, run) == "stopped"
+    (planned.root / "pkg" / "x.py").unlink()
+    approve(run, PREFIX, by="me")
+    executor = planned.executor(run)
+    phase = planned.cfg.phases["build"]
+    step = next(s for s in phase.steps if s.id == "build")
+    plan = executor.worktree / PLAN_PATH
+    executor._batch_of = executor._batches(phase, step, plan, PREFIX, {})
+    with monkeypatch.context() as patch:
+        patch.setattr(sources, "parse_plan", _raises)
+        assert executor.size_plan(phase, step, plan, PREFIX, {}) == "done"
+    assert [(e["digest"], e["tasks"]) for e in planned.events(run, "plan_sized")] == [(None, [])]
+    assert planned.events(run, "effort_decided") == [] and executor._sizer_trip(PREFIX) is None
+    assert size_directly(planned, run) == "done"  # a later entry sizes the plan again
+    assert steps_called(planned) == [size1, size1] and levels_of(planned, run)[IMPL.format(n=1)] == "low"
+    assert [e["tasks"] for e in planned.events(run, "plan_sized")] == [[], [1, 2]]
+
+
 def test_a_plan_sizer_edit_blocks_build_until_reset(planned, git):
     run = begin_build(planned, plan_doc(2))
     size1 = PLAN_SIZE.format(i=1)

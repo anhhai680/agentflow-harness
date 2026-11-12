@@ -181,7 +181,8 @@ class SizingLane:
                 raise_hitl(self.cfg, self.run, "guard_violation", prefix,
                            f"Guard violation in {prefix}: {SIZER_EDIT}: {detail}")
             return "stopped"
-        resized = self._sizer_trip(prefix) is not None  # cleared: the plan is sized again, whatever was recorded
+        entry_trip = self._sizer_trip(prefix)
+        resized = entry_trip is not None  # cleared: the plan is sized again, whatever was recorded
         policy = self.cfg.effort
         if not policy.sizing or self._refine_round(phase) or not self._under_budget():
             if resized:  # settle the cleared stop, so later work is never read as the sizer's edit
@@ -271,10 +272,19 @@ class SizingLane:
                 self.run.emit("plan_sized", key=prefix, digest=digest, tasks=[t.n for t in todo])
             return "done"
         except Exception:  # noqa: BLE001 - a sizing failure never stops a run; only a sizer's edit does
-            if stopping:
+            if stopping or self._new_trip(prefix, entry_trip):
                 return "stopped"
             self._plan_fallback(phase, step, prefix, todo, facts, answered, decided, model, small, resized)
             return "done"
+
+    def _new_trip(self, prefix: str, entry_trip: dict | None) -> bool:
+        """Whether a plan sizer of `prefix` was found to have changed the repository since `size_plan` began (a
+        `sizer_edit` stop it recorded, even one whose inbox write then failed), so no fallback may clear it."""
+        try:
+            now = self._sizer_trip(prefix)
+        except Exception:  # noqa: BLE001 - the events cannot be read: neither can a fallback be recorded
+            return False
+        return now is not None and (entry_trip is None or now.get("seq") != entry_trip.get("seq"))
 
     def _plan_fallback(self, phase: Phase, step: Step, prefix: str, todo: list[sources.PlanTask],
                        facts: dict[int, tuple[int, bool]], answered: dict[int, tuple[dict | None, str, str]],
@@ -350,7 +360,10 @@ class SizingLane:
             if not orphan_checked:  # never fall back past a sizer that may have changed the repository
                 left = self._orphan_check(size_key)
                 if left:
-                    self._sizer_stop(prefix, left, self._last_sizer_started(size_key) or {})
+                    try:
+                        self._sizer_stop(prefix, left, self._last_sizer_started(size_key) or {})
+                    except Exception:  # noqa: BLE001 - fail closed: the next entry finds the edit again and stops
+                        pass
                     return None, True, model
             try:
                 if halted(self.run.refresh()["status"]):
