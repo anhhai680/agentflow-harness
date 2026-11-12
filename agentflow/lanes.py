@@ -1,8 +1,8 @@
 """The agent step lifecycle: run one config step through an agent until it is done or needs a human.
 
 `Executor.run_agent_step` goes round one loop per agent call, in this order: budget check (the soft
-budget notifies once, the hard one stops), then model and effort (from state; `effort.default` for a
-new step), prompt, tree snapshot, the call
+budget notifies once, the hard one stops), then model and effort (from state; for a new step, the level a
+read-only sizer session gave it (`sizing_lane.py`), else `effort.default`), prompt, tree snapshot, the call
 (`agent_started` ... `agent_exited`, spend, one `permission_denied` per denial), guards, the
 `result.json`, gates and doc checks (`checks:`, which always have the fix loop) with the fix loop,
 rollover; and once the result is `done` and the gates pass: the progress check, the commit
@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Literal, TextIO
 
 from agentflow import lessons as lessons_mod
-from agentflow import overlays, pack, run_env, workspace
+from agentflow import overlays, pack, run_env, sizing, workspace
 from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
 from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
@@ -52,6 +52,7 @@ from agentflow.gitops import CommitRejected, GitError, NothingToCommit, changed_
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, notify_run, park_hitl, raise_hitl, read_result
 from agentflow.run_control import wait_for_agents
+from agentflow.sizing_lane import SizingLane
 from agentflow.sync_lane import SyncLane
 from agentflow.state import TERMINAL, Run, workspaces_root
 
@@ -384,7 +385,7 @@ def _violation_text(violations: list[Violation]) -> str:
 # --------------------------------------------------------------------------- executor
 
 
-class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
+class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLane):
     """Runs a run's steps: `run_steps`/`run_step` (control flow, in `flow_control`), plan tasks and
     `finish` (in `feature_lane`), test expectations and fix-looping gate steps (in `bug_eval`) and the
     agent step lifecycle here. `dry_run` prints each agent's command line and calls nothing."""
@@ -425,6 +426,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         role: str | None = None,
         share_session_of: str | None = None,
         fix_first: list[GateResult] | None = None,
+        size: bool = True,
     ) -> Outcome:
         """Run `step` as `key` until it is done ("done"), or a human is needed ("stopped").
 
@@ -436,6 +438,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         tasks need not wait for returns "stopped" with its record `parked`.
         `fix_first` (gates that already failed, as for a gate step) starts a step that is not resuming
         in its fix loop: the first call is fix attempt 1, with the gate output.
+        With `size` and `effort.sizing`, a step that has not started is sized first (`SizingLane.size_step`), unless
+        it continues a shared session, the run is over budget, or it is a dry run. A judgement step never runs below
+        `medium` (`sizing.floor`), on any path.
         """
         extra = self._step_extra(key, extra)
         self.run.refresh()
@@ -469,18 +474,37 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             model=model, effort=rec.get("effort") or self.cfg.effort.default, extra=extra, session=session,
             agent_profile=overlays.agent_profile(self.cfg, step),
         )
+        judgement = sizing.is_judgement(phase.name, role)
+        sr.effort = sizing.floor(sr.effort, judgement, self.cfg.effort.allowed)
+        # A sizer of this step changed the repository: nothing runs until it is back as the sizer found it.
+        resized = False
+        if not self.dry_run and self._sizer_trip(key) is not None:
+            left = self.sizer_reset_needed(key)
+            if left:
+                return self._fail(sr, [Violation("sizer_edit", "reset " + ", ".join(left) + " first")])
+            resized = True  # cleared: the step is sized again, whatever its row says
 
         shared = (state["steps"].get(share_session_of) or {}) if share_session_of else {}
+        takes_shared = not session and status in UNSTARTED_STEP and bool(shared.get("session_id"))
+        sized_now = False
+        if (size and self.cfg.effort.sizing and not self.dry_run and mode == "first" and not resuming
+                and (status in UNSTARTED_STEP or resized) and (not rec.get("sized") or resized)
+                and not takes_shared and sizing.SIZE_MARK not in key and self._under_budget()):
+            level = self.size_step(sr, [r.name for r in fix_first or []])
+            if level is None:
+                return "stopped"
+            sr.effort = sizing.floor(level, judgement, self.cfg.effort.allowed)
+            sized_now = True
         if resuming and session:
             turn = _Turn(self._continue_prompt(sr, _answers(since, key), _approved(since, key)), session)
         elif mode == "refine" and session:
             turn = _Turn(self._prompt(sr, sized=True, resume=session), session)
-        elif not session and status in UNSTARTED_STEP and shared.get("session_id"):
+        elif takes_shared:
             sr.session = shared["session_id"]
-            sr.effort = shared.get("effort") or sr.effort
+            sr.effort = sizing.floor(shared.get("effort") or sr.effort, judgement, self.cfg.effort.allowed)
             turn = _Turn(self._prompt(sr, sized=True, resume=sr.session), sr.session)
         else:
-            sized = bool(rec.get("sized"))
+            sized = sized_now or bool(rec.get("sized"))
             turn = _Turn(self._prompt(sr, sized=sized), None, sizing=not sized)
         fixing = bool(fix_first) and not resuming
         if fixing:  # a gate step's session starts from the gate output (and a refine round's note)
@@ -550,6 +574,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         )
         turn = _Turn(self._prompt(sr, sized=False), None, sizing=True)
         return agent.argv(self._agent_call(sr, turn, attempt=1))
+
+    def _under_budget(self) -> bool:
+        """The run's spend is under its hard budget (the check `_loop` stops on)."""
+        budget = self.run.state.get("budget_usd") or self.cfg.defaults.run_budget_usd
+        return not (budget and float(self.run.state.get("spend_usd") or 0.0) >= budget)
 
     def _loop(self, sr: _StepRun, turn: _Turn) -> Outcome:
         while True:

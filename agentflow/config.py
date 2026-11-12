@@ -157,6 +157,9 @@ PROMPT_PLACEHOLDERS = frozenset(
         "skill",
         "base_ref",
         "self_checks",
+        # sizer prompts (`sizing_lane.py`)
+        "task_card",
+        "task_cards",
     }
 )
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",

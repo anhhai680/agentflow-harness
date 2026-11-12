@@ -521,6 +521,22 @@ class _CliAgent(abc.ABC):
 RUNNER_ONLY_DENY = ("Bash(gh *)",)
 
 
+def _without_mcp_config(args: list[str]) -> list[str]:
+    """`args` with every `--mcp-config` and its values dropped (`--mcp-config=<v>` too): `--strict-mcp-config` still
+    loads the servers it names. It takes a list, so the values run up to the next option."""
+    out: list[str] = []
+    dropping = False
+    for arg in args:
+        if arg == "--mcp-config" or arg.startswith("--mcp-config="):
+            dropping = True
+        elif dropping and not arg.startswith("-"):
+            continue
+        else:
+            dropping = False
+            out.append(arg)
+    return out
+
+
 class ClaudeAgent(_CliAgent):
     name = "claude"
     rollover_enabled = True
@@ -528,7 +544,7 @@ class ClaudeAgent(_CliAgent):
 
     def argv(self, call: AgentCall) -> list[str]:
         spec = self.spec
-        argv = [*spec.command, *spec.base_args]
+        argv = [*spec.command, *(_without_mcp_config(spec.base_args) if call.read_only else spec.base_args)]
         # `--add-dir` takes a list of values, so it goes before other options: right before the
         # prompt it would swallow the prompt as a directory.
         for directory in call.add_dirs:

@@ -20,7 +20,8 @@ from typing import Any, Literal
 
 from agentflow.config import Config, Issue
 
-ViolationKind = Literal["forbidden_path", "agent_commit", "rejected_trailer", "user_only_skill"]
+# `sizer_edit`: a read-only sizer session changed the work tree, `HEAD` or the git state (`sizing_lane.py`)
+ViolationKind = Literal["forbidden_path", "agent_commit", "rejected_trailer", "user_only_skill", "sizer_edit"]
 
 
 @dataclass(frozen=True)

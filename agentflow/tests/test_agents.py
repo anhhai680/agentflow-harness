@@ -208,6 +208,18 @@ def test_a_read_only_claude_call_allows_only_read_tools_and_no_mcp(claude, call)
     assert resumed[-1] == call.prompt and "--tools" in resumed
 
 
+@pytest.mark.parametrize("mcp", [["--mcp-config", "servers.json"], ["--mcp-config=servers.json"],
+                                 ["--mcp-config", "a.json", "b.json"]])
+def test_a_read_only_claude_call_drops_the_packs_mcp_config(cfg, call, mcp):
+    # `--strict-mcp-config` keeps the servers `--mcp-config` names, so a read-only call must not carry one
+    spec = dataclasses.replace(cfg.agents["claude"], base_args=["--verbose", *mcp, "--output-format", "stream-json"])
+    claude = ClaudeAgent(spec, cfg.context)
+    argv = claude.argv(dataclasses.replace(call, read_only=True))
+    assert not [a for a in argv if a.startswith("--mcp-config")] and not {"servers.json", "a.json", "b.json"} & set(argv)
+    assert ("--output-format", "stream-json") in pairs(argv) and "--verbose" in argv
+    assert [a for a in claude.argv(call) if a.startswith("--mcp-config")]  # a working call keeps the pack's servers
+
+
 def test_a_read_only_codex_call_uses_the_read_only_sandbox(codex, call):
     argv = codex.argv(dataclasses.replace(call, read_only=True))
     assert ("-s", "read-only") in pairs(argv) and argv[-1] == call.prompt
