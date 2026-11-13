@@ -188,6 +188,7 @@ class Issue:
     level: Literal["error", "warning"]
     path: str
     message: str
+    fixable: bool = False  # `agentflow validate --fix` repairs it
 
 
 DEFAULT_SKILLS_DIR = ".claude/skills"
@@ -1184,10 +1185,22 @@ class _Validator:
     def templates(self) -> None:
         """Every `{placeholder}` in every prompt template must be a known key."""
         for file in pack.prompt_files(self.cfg.path).values():
-            text = file.read_text(encoding="utf-8")
+            try:
+                text = file.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                self.error(pack.prompt_label(self.cfg.path, file), "is not UTF-8 text")
+                continue
             for name in dict.fromkeys(_PLACEHOLDER.findall(text)):
                 if name not in PROMPT_PLACEHOLDERS:
                     self.error(pack.prompt_label(self.cfg.path, file), f"unknown placeholder '{{{name}}}'")
+
+    def prompt_drift(self) -> None:
+        """The pack's prompt overrides that hold text the engine retired, or copy an engine prompt unchanged."""
+        from agentflow import pack_fix  # it imports `Issue` from here
+
+        for issue in pack_fix.findings(self.cfg.path).issues:
+            if issue not in self.issues:
+                self.issues.append(issue)
 
     def brief(self, files: list[str], prompt: str | None, path: str, skill: Any = None) -> None:
         """A brief goes in the prompt at `{brief}`: a missing file, a `{brief}` with no file, or a file with no
@@ -1980,4 +1993,5 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.overlays()
     v.dashboard()
     v.templates()
+    v.prompt_drift()
     return v.issues

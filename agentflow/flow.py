@@ -52,11 +52,59 @@ def _pack_config() -> Path:
     return pack_config(_find_repo())
 
 
-def cmd_validate(args: argparse.Namespace) -> int:
-    from agentflow.config import ConfigError, load_config, validate
+def _print_validation(cfg, repo: Path, config_path: Path) -> int:
+    """Print every issue `validate` finds and the summary lines; 1 when there is an error, else 0."""
+    from agentflow.config import validate
     from agentflow.guards import settings_coverage
+    from agentflow.pack_fix import shown
+
+    issues = validate(cfg, repo) + settings_coverage(cfg, repo)
+    for issue in issues:  # escaped: a prompt's file name comes from the repository
+        print(shown(f"{issue.level} {issue.path}: {issue.message}") + (" (fixable)" if issue.fixable else ""))
+    errors = sum(1 for i in issues if i.level == "error")
+    if not errors:
+        print(f"ok: {config_path.name} is valid ({len(issues)} warnings)")
+    fixable = sum(1 for i in issues if i.fixable)
+    if fixable:
+        print(f"{fixable} fixable: run agentflow validate --fix")
+    return 1 if errors else 0
+
+
+def _fix_pack(cfg, repo: Path, config_path: Path, dry_run: bool) -> int:
+    """`validate --fix`: print each fix, apply them (unless `dry_run`), then validate again."""
+    from agentflow import pack_fix
+
+    try:
+        pack_fix.check_pack(repo)
+    except pack_fix.FixRefused as exc:
+        print(f"error {pack_fix.shown(str(exc))}")
+        return 1
+    found = pack_fix.findings(config_path)
+    for fix in found.fixes:
+        print(pack_fix.render(fix, repo), end="")
+    for skip in found.skipped:
+        print(f"skipped {pack_fix.shown(os.path.relpath(skip.path, repo))}: {skip.reason}")
+    if dry_run:
+        code = _print_validation(cfg, repo, config_path)
+        print(f"dry run: {len(found.fixes)} files would change; nothing written")
+        return code
+    applied, skipped = pack_fix.apply(found.fixes)
+    for skip in skipped:
+        print(f"skipped {pack_fix.shown(os.path.relpath(skip.path, repo))}: {skip.reason}")
+    print(f"fixed {len(applied)} files")
+    return _print_validation(cfg, repo, config_path)
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    from agentflow.config import ConfigError, load_config
     from agentflow.pack import PackError
 
+    if args.dry_run and not args.fix:
+        print("agentflow validate: error: --dry-run needs --fix", file=sys.stderr)
+        raise SystemExit(2)
+    if args.fix and args.config:
+        print("error validate --fix works only on the repository's own pack")
+        return 1
     try:
         repo = _find_repo()
         config_path = Path(args.config) if args.config else _pack_config()
@@ -68,14 +116,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
     except PackError as exc:
         print(f"error {exc}")
         return 1
-    issues = validate(cfg, repo) + settings_coverage(cfg, repo)
-    for issue in issues:
-        print(f"{issue.level} {issue.path}: {issue.message}")
-    errors = sum(1 for i in issues if i.level == "error")
-    if errors:
-        return 1
-    print(f"ok: {config_path.name} is valid ({len(issues)} warnings)")
-    return 0
+    if args.fix:
+        return _fix_pack(cfg, repo, config_path, args.dry_run)
+    return _print_validation(cfg, repo, config_path)
 
 
 def cmd_config_show(args: argparse.Namespace) -> int:
@@ -1005,6 +1048,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     check = sub.add_parser("validate", help="check config.yaml: skills, prompts, conditions, references")
     check.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+    check.add_argument("--fix", action="store_true",
+                       help="repair what validate marks (fixable) in .agentflow/prompts/; never commits")
+    check.add_argument("--dry-run", action="store_true", help="with --fix: print the changes and write nothing")
     check.set_defaults(func=cmd_validate)
 
     conf = sub.add_parser("config", help="show the pack file, or the effective config with each value's layer")

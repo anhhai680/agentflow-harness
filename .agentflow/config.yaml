@@ -106,7 +106,7 @@ overlays:
   security:
     when_paths: [agentflow/guards.py, agentflow/agents.py, agentflow/config_trust.py, agentflow/safeio.py,
                  agentflow/workspace.py, agentflow/pack.py, agentflow/layers.py, agentflow/detect.py,
-                 agentflow/init.py]
+                 agentflow/init.py, agentflow/pack_fix.py]
     when_keywords: [permission, deny rule, forbidden_paths, bypassPermissions]
     add_skills: {plan: security-and-hardening, review: security-and-hardening}
     review_agent: security-auditor
