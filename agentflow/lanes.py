@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Literal, TextIO
 
 from agentflow import lessons as lessons_mod
-from agentflow import overlays, pack, run_env, sizing, workspace
+from agentflow import doubt, overlays, pack, run_env, sizing, workspace
 from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
 from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
@@ -48,7 +48,8 @@ from agentflow.flow_control import (
 from agentflow.gates import (GateResult, agent_checks, failure_report, gates_ok, record_results, run_doc_checks,
                              run_gates_reusing)
 from agentflow.gates import resolve as resolve_gates
-from agentflow.gitops import CommitRejected, GitError, NothingToCommit, changed_since, commit, commits_between, head
+from agentflow.gitops import (CommitRejected, GitError, NothingToCommit, changed_since, commit, commits_between, head,
+                              outside_only)
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, notify_run, park_hitl, raise_hitl, read_result
 from agentflow.run_control import wait_for_agents
@@ -232,6 +233,12 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     values = _values(cfg, step, ctx, {})
     preamble = EFFORT_BLOCK.sub("", _template(cfg, PREAMBLE))
     values["lessons"] = _lessons(cfg, ctx.repo, extra.get("phase"), date.today()).text.rstrip("\n")
+    # A doubt reviewer judges the artifact on its own: no code map and no handoff, the author's account of the work.
+    # The flag and role are tested first, so every other step's prompt is built exactly as before.
+    doubter = (step.blocks_on_findings and step.role == "review" and extra.get("phase") is not None
+               and doubt.is_doubt_reviewer(cfg, str(extra["phase"]), step, str(ctx.values.get("lane") or "")))
+    if doubter:
+        values["code_map"] = ""  # before the slot is dropped, so it goes whole
     preamble = EMPTY_SLOT.sub(lambda m: "" if not values[m.group(1)] else m.group(0), preamble)
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
     files = list(dict.fromkeys([*step.brief, *step.task_brief]))
@@ -267,7 +274,7 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     values["base_ref"] = ctx.base_ref
     values["earlier_findings"] = ""
     values["gate_evidence"] = ""
-    if ctx.run is not None and ctx.run.handoff_path().exists():
+    if ctx.run is not None and ctx.run.handoff_path().exists() and not doubter:
         body = f"{HANDOFF_LINE}\n\n{body}"
     if mode == "refine":
         refine = _template(cfg, cfg.phase_approval.get("refine_prompt") or DEFAULT_REFINE).strip()
@@ -490,6 +497,12 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         # A sizer of this step left open (its runner died): compared before anything runs, sized or not.
         if not self.dry_run and not self.check_open_sizers(key):
             return "stopped"
+        # A reconcile step starts only on a tree that holds nothing but its artifact: a stray file left from an earlier
+        # stop would otherwise ride along (and the step must not take it for its own work).
+        if not self.dry_run and step.reconciles:
+            outside = self._outside_output(step)
+            if outside:
+                return self._fail(sr, outside)
 
         shared = (state["steps"].get(share_session_of) or {}) if share_session_of else {}
         takes_shared = not session and status in UNSTARTED_STEP and bool(shared.get("session_id"))
@@ -609,6 +622,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             outcome = called.outcome
             violations = check_step(self.cfg, self.worktree, sr.start_head, sr.start_tree, called.after,
                                     outcome.tool_calls, sr.step.forbid)
+            if sr.step.reconciles:
+                violations = [*violations, *self._outside_output(sr.step)]
             if violations:
                 return self._fail(sr, violations)
             if outcome.resume_failed:
@@ -909,8 +924,14 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if refine is not None:  # refined work goes on top as a new commit, with the note
                 parts = [refine_subject(sr.step.id, subject), result.summary.strip(), refine_note_block(refine)]
             message = "\n\n".join(part for part in parts if part)
+            paths = None
+            if sr.step.reconciles:  # its artifact, and nothing else: checked again after the gates, then committed alone
+                outside = self._outside_output(sr.step)
+                if outside:
+                    return self._fail(sr, outside)
+                paths = [fmt(str(sr.step.output), self.ctx)]
             try:
-                sha = commit(self.worktree, message, self.cfg, expected_head=runner_head(self.run))
+                sha = commit(self.worktree, message, self.cfg, paths=paths, expected_head=runner_head(self.run))
             except CommitRejected as exc:
                 return self._fail(sr, [Violation(exc.kind, str(exc))])
             except NothingToCommit:
@@ -950,6 +971,13 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
     def _stop(self, sr: _StepRun, kind: str, summary: str, extra: str = "") -> Outcome:
         raise_hitl(self.cfg, self.run, kind, sr.key, summary, extra=extra)
         return "stopped"
+
+    def _outside_output(self, step: Step) -> list[Violation]:
+        """For a `reconciles` step: what in the tree is more than an edit of its `output` (`gitops.outside_only`).
+        A step with no `output` has nothing it may edit, so that is a violation too."""
+        if not step.output:
+            return [Violation("outside_output", f"reconcile step {step.id} has no output, so it may edit nothing")]
+        return outside_only(self.worktree, fmt(str(step.output), self.ctx))
 
     def _fail(self, sr: _StepRun, violations: list[Violation]) -> Outcome:
         """A guard tripped: the step fails with no retry, and a human looks at the tree."""

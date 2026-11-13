@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import re
 import stat
 import subprocess
@@ -14,16 +15,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from agentflow.guards import check_message, path_matches
+from agentflow.guards import HARDENED, Violation, check_message, path_matches
 from agentflow.pack import LESSONS_FILE
 
 if TYPE_CHECKING:
     from agentflow.config import Config
 
-
-# Run first on every git call the runner makes after an agent may have touched the repository's shared git state:
-# no hook and no fsmonitor command runs (the agent could have planted either), and nothing is hidden from status.
-HARDENED = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+# `HARDENED` (no hook, no fsmonitor) is defined in `guards`, whose `snapshot` needs it and which cannot import this
+# module; every hardened git call here uses it.
 
 
 class GitError(Exception):
@@ -180,13 +179,15 @@ def commit(worktree: Path, message: str, cfg: Config, paths: list[str] | None = 
     `NothingToCommit`. The runner never amends, so this always makes a new commit.
 
     With `paths`, only those paths are staged and committed (a decision recorded in the middle of a
-    task must not take the task's unfinished work with it).
+    task must not take the task's unfinished work with it). They are literal pathspecs (`--literal-pathspecs`):
+    a name such as `docs/[ab].md` never matches another file as a glob.
 
     With `expected_head` (the last `HEAD` the runner recorded), a `HEAD` that moved since (a gate or a test
     command ran code that committed) raises `CommitRejected` (kind `agent_commit`) before anything is
-    staged. The commit runs with no hooks (`core.hooksPath=/dev/null`, `--no-verify`), and the message of
-    the commit actually created is checked again: a rejected trailer in it raises `CommitRejected` naming
-    the commit, which is left in place for the human (never rolled back silently).
+    staged. Every git call that reads the work tree runs with `HARDENED` (no hook, no fsmonitor command), the
+    commit with `--no-verify` too, and the message of the commit actually created is checked again: a rejected
+    trailer in it raises `CommitRejected` naming the commit, which is left in place for the human (never rolled
+    back silently).
     """
     worktree = Path(worktree)
     before = head(worktree)
@@ -203,16 +204,18 @@ def commit(worktree: Path, message: str, cfg: Config, paths: list[str] | None = 
     only = ["--", *paths] if paths is not None else []
     if paths is not None and not paths:
         raise NothingToCommit(f"no paths to commit in {worktree}")
-    _git(worktree, "add", "-A", *only)
-    staged = [p for p in _git(worktree, "diff", "--cached", "--name-only", "--no-renames", "-z", *only).split("\0") if p]
+    git = (*HARDENED, "--literal-pathspecs")
+    _git(worktree, *git, "add", "-A", *only)
+    staged = [p for p in _git(worktree, *git, "diff", "--cached", "--name-only", "--no-renames", "-z", *only).split("\0")
+              if p]
     forbidden = [p for p in staged if any(path_matches(p, g) for g in cfg.guardrails.forbidden_paths)]
     if forbidden:
-        _git(worktree, "reset", "-q")
+        _git(worktree, *git, "reset", "-q")
         raise CommitRejected("commit would include forbidden path(s): " + ", ".join(forbidden), kind="forbidden_path")
     if not staged:
         raise NothingToCommit(f"nothing to commit in {worktree}")
     proc = subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", "commit", "--no-verify", "-q", "-F", "-", *only],
+        ["git", *git, "commit", "--no-verify", "-q", "-F", "-", *only],
         cwd=worktree, input=text + "\n", capture_output=True, text=True, encoding="utf-8", check=False,
     )
     if proc.returncode != 0:
@@ -252,6 +255,40 @@ def _status_entries(worktree: Path) -> list[tuple[str, str]]:
                 entries.append((xy, fields[i]))
             i += 1
     return entries
+
+
+def outside_only(worktree: Path, only: str) -> list[Violation]:
+    """What makes the work tree more than an edit of the one file `only` (a repo-relative path), as `outside_output`
+    violations; empty when `only` is the one path that differs from `HEAD` (or nothing does) and it is a non-empty
+    regular file inside the worktree.
+
+    The tree is read against `HEAD` with `_status_entries` (`HARDENED`: no hook or fsmonitor command runs; renames
+    off, so both paths of a rename are named; submodules included; untracked files included, ignored ones not):
+    every path other than `only` is one violation. `only` itself must be a regular file (not missing, not a symlink,
+    not a folder, not reached through a symlinked folder) with at least one byte. A path that is not a plain relative
+    path inside the work tree (absolute, `..`, `.git`, not normalised) is refused, and so is every failure to read the
+    tree: a check that cannot run never passes."""
+    worktree = Path(worktree)
+    parts = only.split("/") if isinstance(only, str) else []
+    if (not parts or only.startswith("/") or posixpath.normpath(only) != only
+            or any(part in ("", ".", "..") or part.casefold() == ".git" for part in parts)):
+        return [Violation("outside_output", f"{only!r} is not a plain path inside the work tree")]
+    try:
+        entries = _status_entries(worktree)
+    except (GitError, OSError, ValueError) as exc:  # ValueError: a path git printed that is not UTF-8
+        return [Violation("outside_output", f"cannot read the work tree's state, so it cannot be trusted: {exc}")]
+    found = [Violation("outside_output", path) for path in sorted({path for _, path in entries if path != only})]
+    target = worktree / only
+    try:
+        info = os.lstat(target)
+        inside = target.resolve(strict=True) == worktree.resolve(strict=True) / only
+    except (OSError, RuntimeError):  # RuntimeError: a symlink loop
+        info, inside = None, False
+    if info is None or not stat.S_ISREG(info.st_mode) or not inside:
+        found.append(Violation("outside_output", f"{only} was deleted or is not a regular file"))
+    elif info.st_size == 0:
+        found.append(Violation("outside_output", f"{only} is empty"))
+    return found
 
 
 def _lessons_refused(worktree: Path, why: str) -> CommitRejected:

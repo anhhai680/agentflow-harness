@@ -34,7 +34,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import TextIO
 
@@ -139,6 +139,10 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
         raise GitError(f"project.fork_from {fork!r} is not a local branch of {repo}")
 
     params, inputs = gather(params, repo, cfg.issues.epic_labels)
+    # `{date}` (in `plan_target`) is the day the run started, every day it runs: a step resumed tomorrow still names
+    # the file the plan step wrote today, and a reconcile step may edit only that file.
+    if params.get("date") in (None, ""):
+        params["date"] = date.today().isoformat()
     run = Run.create(cfg, repo, pipeline, params)
     try:
         _set_up(cfg, repo, run, pipeline, params, inputs, opts)

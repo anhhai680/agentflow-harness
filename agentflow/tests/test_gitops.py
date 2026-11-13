@@ -598,3 +598,109 @@ def test_commit_lessons_turns_a_failing_hash_object_into_a_git_error(tmp_git, cf
     with pytest.raises(gitops.GitError, match="hash-object"):
         commit_lessons(tmp_git, "Add lessons.", cfg, expected_text="# Lessons\n\n- keep it small\n")
     assert _staged(tmp_git) == []
+
+
+# --------------------------------------------------------------------------- outside_only: a reconcile step's tree
+
+ARTIFACT = "docs/plans/plan.md"
+
+
+def _with_artifact(repo: Path) -> None:
+    """The artifact and a `.gitignore` committed, so the test's later edits are the only changes."""
+    _write(repo, ARTIFACT, "# Plan\n")
+    _write(repo, ".gitignore", "*.log\n")
+    _commit(repo, "artifact")
+
+
+def _outside(violations) -> list[str]:
+    assert all(v.kind == "outside_output" for v in violations)
+    return sorted(v.detail for v in violations)
+
+
+def test_outside_only_names_every_other_path(tmp_git):
+    _with_artifact(tmp_git)
+    _write(tmp_git, ARTIFACT, "# Plan\n\nRevised.\n")
+    assert gitops.outside_only(tmp_git, ARTIFACT) == []  # the artifact alone: nothing outside it
+    _write(tmp_git, "README.md", "edited\n")  # a tracked edit
+    _write(tmp_git, "notes/new.txt", "x\n")  # an untracked file
+    run_git(tmp_git, "mv", "src/app.py", "src/moved.py")  # a rename: both of its paths
+    _write(tmp_git, "build.log", "ignored\n")  # an ignored file is no output
+    assert _outside(gitops.outside_only(tmp_git, ARTIFACT)) == ["README.md", "notes/new.txt", "src/app.py",
+                                                                "src/moved.py"]
+
+
+@pytest.mark.parametrize("change, why", [
+    ("deleted", "was deleted or is not a regular file"),
+    ("symlink", "was deleted or is not a regular file"),
+    ("directory", "was deleted or is not a regular file"),
+    ("empty", "is empty"),
+])
+def test_outside_only_refuses_a_deleted_empty_or_symlinked_artifact(tmp_git, change, why):
+    _with_artifact(tmp_git)
+    path = tmp_git / ARTIFACT
+    path.unlink()
+    if change == "symlink":
+        os.symlink("../../README.md", path)  # a link to a file inside the tree is still not the artifact
+    elif change == "directory":
+        path.mkdir()
+        (path / "inner.md").write_text("x\n", encoding="utf-8")
+    elif change == "empty":
+        path.write_bytes(b"")
+    found = gitops.outside_only(tmp_git, ARTIFACT)
+    assert f"{ARTIFACT} {why}" in _outside(found)
+    if change in ("deleted", "symlink", "empty"):  # nothing else changed, so that is the only violation
+        assert _outside(found) == [f"{ARTIFACT} {why}"]
+
+
+def test_outside_only_refuses_an_artifact_path_that_leaves_the_tree(tmp_git, tmp_path):
+    _with_artifact(tmp_git)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "plan.md").write_text("# Plan\n", encoding="utf-8")
+    for only in ("../elsewhere/plan.md", str(outside / "plan.md"), "docs/plans/../plans/plan.md", ""):
+        assert gitops.outside_only(tmp_git, only), only
+    run_git(tmp_git, "rm", "-q", "-r", "docs")
+    _commit(tmp_git, "no docs")
+    (outside / "plans").mkdir()
+    (outside / "plans" / "plan.md").write_text("# Plan\n", encoding="utf-8")
+    os.symlink(outside, tmp_git / "docs")  # the artifact reached through a symlinked folder
+    assert f"{ARTIFACT} was deleted or is not a regular file" in _outside(gitops.outside_only(tmp_git, ARTIFACT))
+
+
+def test_outside_only_fails_closed_when_git_fails(tmp_git, monkeypatch):
+    _with_artifact(tmp_git)
+
+    def broken(*_a, **_k):
+        raise gitops.GitError("git status failed: boom")
+
+    monkeypatch.setattr(gitops, "_status_entries", broken)
+    found = gitops.outside_only(tmp_git, ARTIFACT)
+    assert found and "boom" in found[0].detail and found[0].kind == "outside_output"
+
+
+def test_outside_only_ignores_a_planted_fsmonitor(tmp_git, cfg, tmp_path):
+    from agentflow.guards import snapshot
+
+    _with_artifact(tmp_git)
+    marker = tmp_path / "fsmonitor-ran"
+    script = tmp_path / "fsmonitor.sh"
+    script.write_text(f'#!/bin/sh\necho ran >> "{marker}"\nexit 1\n', encoding="utf-8")
+    script.chmod(0o755)
+    run_git(tmp_git, "config", "core.fsmonitor", str(script))
+    _write(tmp_git, ARTIFACT, "# Plan\n\nRevised.\n")
+    assert gitops.outside_only(tmp_git, ARTIFACT) == []
+    snapshot(tmp_git)
+    gitops.commit(tmp_git, "Revise the plan.", cfg, paths=[ARTIFACT])
+    assert not marker.exists()
+    run_git(tmp_git, "status", "--porcelain")  # the plant is live: plain git runs it
+    assert marker.exists()
+
+
+def test_commit_paths_are_literal(tmp_git, cfg):
+    _write(tmp_git, "docs/[ab].md", "the artifact\n")
+    _commit(tmp_git, "artifact")  # tracked: as a glob, git would also stage every path it matches
+    _write(tmp_git, "docs/[ab].md", "the artifact, revised\n")
+    _write(tmp_git, "docs/a.md", "a file the glob would match\n")
+    sha = gitops.commit(tmp_git, "Revise the artifact.", cfg, paths=["docs/[ab].md"])
+    assert run_git(tmp_git, "show", "--name-only", "--format=", sha).split("\n")[:-1] == ["docs/[ab].md"]
+    assert run_git(tmp_git, "status", "--porcelain", "--untracked-files=all").strip() == "?? docs/a.md"

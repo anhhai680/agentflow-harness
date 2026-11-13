@@ -21,7 +21,14 @@ from typing import Any, Literal
 from agentflow.config import Config, Issue
 
 # `sizer_edit`: a read-only sizer session changed the work tree, `HEAD` or the git state (`sizing_lane.py`)
-ViolationKind = Literal["forbidden_path", "agent_commit", "rejected_trailer", "user_only_skill", "sizer_edit"]
+# `outside_output`: a reconcile step changed a path other than its `output`, or left that output deleted, empty or
+# not a regular file (`gitops.outside_only`). Never reverted by the runner: a human looks at the tree.
+ViolationKind = Literal["forbidden_path", "agent_commit", "rejected_trailer", "user_only_skill", "sizer_edit",
+                        "outside_output"]
+
+# Run first on every git call the runner makes after an agent may have touched the repository's shared git state:
+# no hook and no fsmonitor command runs (the agent could have planted either), and nothing is hidden from status.
+HARDENED = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
 
 
 @dataclass(frozen=True)
@@ -51,8 +58,8 @@ def snapshot(worktree: Path) -> str:
         if real_index.exists():
             shutil.copyfile(real_index, index)  # seeds the stat cache so the add below is fast
         env = {**os.environ, "GIT_INDEX_FILE": str(index)}
-        _git(worktree, "add", "-A", env=env)
-        return _git(worktree, "write-tree", env=env).strip()
+        _git(worktree, *HARDENED, "add", "-A", env=env)  # an agent's planted fsmonitor never runs here
+        return _git(worktree, *HARDENED, "write-tree", env=env).strip()
 
 
 def changed_paths(worktree: Path, tree_a: str, tree_b: str) -> list[str]:

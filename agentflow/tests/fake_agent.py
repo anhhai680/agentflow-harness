@@ -11,7 +11,7 @@ Act keys: write {relpath: text}, result {...}, result_raw str, usage_pct [..], t
 exit n, no_init bool, final_text str, cost float (this call's, default 0.01; the result event reports
 the session's total, as Claude does), permission_denials [{tool_name, tool_input}] (copied into the
 result event), rate_limit {...} (sent as a `rate_limit_event`'s `rate_limit_info`), result_error bool
-(the result event says `is_error`).
+(the result event says `is_error`), delete [relpath, ...] (files removed after the writes).
 """
 
 from __future__ import annotations
@@ -118,6 +118,8 @@ def main() -> int:
         target = Path(relpath)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
+    for relpath in act.get("delete", []):
+        Path(relpath).unlink()
     if act.get("git_commit"):
         subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
         subprocess.run(["git", "commit", "-q", "-m", act["git_commit"]], check=True, capture_output=True)

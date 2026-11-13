@@ -6,19 +6,19 @@ from __future__ import annotations
 
 import io
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
-from agentflow import doubt, metrics
+from agentflow import conditions, doubt, metrics
 from agentflow.conditions import explain, make_ctx
 from agentflow.feature_lane import _open_findings
 from agentflow.hitl import answer, approve, reject
-from agentflow.lanes import Executor
+from agentflow.lanes import HANDOFF_LINE, Executor, build_prompt
 from agentflow.pipeline import DEFAULT_SHOW, RunOptions, advance, approval_text, dry_run, start
 from agentflow.state import Run
-from conftest import with_doubt
+from conftest import run_git, with_doubt
 
 PIPE = {"gate_sets": {"build": ["ok"], "verify": ["ok"], "setup": []}}
 SPEC = "docs/specs/SPEC-demo.md"
@@ -374,3 +374,150 @@ def test_a_phase_without_a_reconcile_step_is_as_before(flow_repo):
     assert re.findall(r"^## (.+)$", text, re.M) == [TITLES[item] for item in show if item in TITLES]
     assert "Doubt review" not in text
     assert "blocking finding(s) are still open" in text
+
+
+# --------------------------------------------------------------------------- the reconcile step edits only its artifact
+
+
+STRAY = "src/stray_code.py"
+EDITED = SPEC_TEXT.replace("Một mô-đun mẫu.", "Một mô-đun mẫu.\n\nRollback.")
+EDITS_CODE = {"write": {SPEC: EDITED, STRAY: "x = 1\n"}, **done("sửa cả mã", dispositions=[disp("R1-F1", "actionable")])}
+
+
+def worktree(run: Run) -> Path:
+    return Path(run.state["worktree"])
+
+
+def tripped(run: Run, key: str = RECONCILE) -> list[list[dict]]:
+    return [e["violations"] for e in events(run, "guard_tripped") if e["key"] == key]
+
+
+def committed(run: Run, key: str = RECONCILE) -> list[str]:
+    return [e["sha"] for e in events(run, "step_committed") if e["key"] == key]
+
+
+def files_of(run: Run, sha: str) -> list[str]:
+    return [p for p in run_git(worktree(run), "show", "--name-only", "--format=", sha).split("\n") if p]
+
+
+def test_a_reconcile_step_that_edits_code_is_refused(flow):
+    run = begin(flow, {REVIEW: [found(HIGH)], RECONCILE: [EDITS_CODE]})
+    assert go(flow, run) == "waiting_human"
+    assert run.state["waiting"]["kind"] == "guard_violation" and run.state["waiting"]["key"] == RECONCILE
+    assert tripped(run) == [[{"kind": "outside_output", "detail": STRAY}]]
+    assert committed(run) == []
+    assert not events(run, "forbidden_reverted")
+    assert (worktree(run) / STRAY).is_file()  # left for the human, never reverted by the runner
+
+
+def test_a_stray_file_is_never_committed_on_retry(flow):
+    run = begin(flow, {REVIEW: [found(HIGH), done("sạch")],
+                       RECONCILE: [EDITS_CODE, revised(2, disp("R1-F1", "actionable"))]})
+    assert go(flow, run) == "waiting_human"
+    approve(run, RECONCILE, by="me")
+    assert go(flow, run) == "waiting_human"  # the retry stops at its start: the stray file is still there
+    assert tripped(run) == [[{"kind": "outside_output", "detail": STRAY}]] * 2
+    assert called(flow).count(RECONCILE) == 1 and committed(run) == []
+    (worktree(run) / STRAY).unlink()
+    approve(run, RECONCILE, by="me")
+    assert go(flow, run) == "awaiting_approval"
+    assert called(flow).count(RECONCILE) == 2
+    shas = committed(run)
+    assert len(shas) == 1 and files_of(run, shas[0]) == [SPEC]
+    assert "Rollback 2." in run_git(worktree(run), "show", f"{shas[0]}:{SPEC}")
+
+
+def test_a_reconcile_step_may_not_delete_its_artifact(flow):
+    deletes = {"delete": [SPEC], **done("xoá", dispositions=[disp("R1-F1", "actionable")])}
+    run = begin(flow, {REVIEW: [found(HIGH)], RECONCILE: [deletes]})
+    assert go(flow, run) == "waiting_human"
+    assert tripped(run) == [[{"kind": "outside_output", "detail": f"{SPEC} was deleted or is not a regular file"}]]
+    assert committed(run) == []
+    assert SPEC in run_git(worktree(run), "ls-tree", "-r", "--name-only", "HEAD").split("\n")
+
+
+def test_the_allowed_path_survives_a_resume_on_another_day(flow, monkeypatch):
+    run = begin(flow, {}, to="plan")
+    assert go(flow, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    today = date.today()
+    plan = make_ctx(flow.cfg, flow.root, "feature", run.state["params"], run).values["plan_target"]
+    assert today.isoformat() in plan
+
+    class Tomorrow(date):
+        @classmethod
+        def today(cls):
+            return date.fromordinal(today.toordinal() + 1)
+
+    monkeypatch.setattr(conditions, "date", Tomorrow)
+    finding = {"severity": "high", "file": plan, "line": 5, "text": "Task 1 không có lệnh kiểm thử"}
+    flow.script({"plan/plan": [{"write": {plan: PLAN_TEXT}, **done("planned")}],
+                 "plan/plan_review": [found(finding), done("sạch")],
+                 "plan/plan_reconcile": [revised(1, disp("R1-F1", "actionable"), path=plan,
+                                                 text=PLAN_TEXT + "\nRun: `true`\n")]})
+    assert go(flow, run) == "awaiting_approval"
+    wrote = committed(run, "plan/plan")
+    assert len(wrote) == 1 and files_of(run, wrote[0]) == [plan]
+    prompt = next(c for c in flow.calls() if c["step"] == "plan/plan_reconcile")["argv"][-1]
+    assert f"The artifact is `{plan}`" in prompt
+    revised_sha = committed(run, "plan/plan_reconcile")
+    assert len(revised_sha) == 1 and files_of(run, revised_sha[0]) == [plan]
+    assert run.state["params"]["date"] == today.isoformat()  # pinned when the run started
+
+
+# --------------------------------------------------------------------------- the doubt reviewer sees no author notes
+
+
+CODEMAP = "`app/demo.py:1` `CODEMAP-X()`: the demo entry"
+HANDOFF_LEAD = HANDOFF_LINE.split("`")[0]
+FOUR_TASKS = "# Plan: demo\n\n" + "\n".join(
+    f"### Task {n}: Thing {n}\n\n**Depends on:** none\n\n- [ ] **Step 1: Do thing {n}**\n" for n in range(1, 5))
+
+
+def prompts_of(flow, step: str) -> list[str]:
+    return [c["argv"][-1] for c in flow.calls() if c["step"] == step]
+
+
+@pytest.mark.parametrize("autopilot", [True, False])
+def test_the_doubt_reviewer_prompt_has_no_author_notes(flow, autopilot):
+    flow.configure(PIPE, autopilot=autopilot, edit=with_doubt)
+    run = begin(flow, {}, to="build")
+    assert go(flow, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    plan = make_ctx(flow.cfg, flow.root, "feature", run.state["params"], run).values["plan_target"]
+    tasks = {f"build/build/task-{n}/implement": [{"write": {f"src/t{n}.py": f"x = {n}\n"}, **done("xong")}]
+             for n in range(1, 5)}
+    flow.script({"plan/plan": [{"write": {plan: FOUR_TASKS}, **done("planned", code_map=[CODEMAP])}], **tasks})
+    assert go(flow, run) == "awaiting_approval" and run.state["waiting"]["phase"] == "plan"
+    assert run.handoff_path().is_file()
+    [author] = prompts_of(flow, "plan/plan")
+    assert HANDOFF_LEAD in author  # the plan's author was pointed at the handoff, so the review's prompt could be too
+    [review] = prompts_of(flow, "plan/plan_review")
+    assert "CODEMAP-X" not in review and "Code this run has mapped" not in review
+    assert HANDOFF_LEAD not in review and "{code_map}" not in review
+    preamble, marker, _body = review.partition("## The step")
+    assert marker and "\n\n\n" not in preamble  # the empty code-map slot went whole
+    assert "Do not open or append to" in review
+    approve(run, "plan", by="me")
+    go(flow, run)
+    implement = prompts_of(flow, "build/build/task-1/implement")
+    task_review = prompts_of(flow, "build/build/task-1/review")
+    assert implement and task_review
+    assert "CODEMAP-X" in implement[0] and "CODEMAP-X" in task_review[0]
+    assert HANDOFF_LEAD in implement[0] and HANDOFF_LEAD in task_review[0]
+
+
+def test_build_prompt_without_a_phase_is_unchanged(flow, monkeypatch):
+    run = Run.create(flow.cfg, flow.root, "feature", {"module": "demo"})
+    run.emit("code_noted", text=CODEMAP, key="plan/plan")
+    run.handoff_path().parent.mkdir(parents=True, exist_ok=True)
+    run.handoff_path().write_text("# Handoff\n", encoding="utf-8")
+    ctx = make_ctx(flow.cfg, flow.root, "feature", run.state["params"], run)
+    review = next(step for step in flow.cfg.phases["plan"].steps if step.id == "plan_review")
+    with_phase = build_prompt(flow.cfg, review, ctx, {"role": "review"}, {"phase": "plan"}, "first")
+    assert "CODEMAP-X" not in with_phase  # the same step, told its phase, is a doubt reviewer
+    plain = build_prompt(flow.cfg, review, ctx, {"role": "review"}, {}, "first")
+    assert "CODEMAP-X" in plain and HANDOFF_LEAD in plain
+    monkeypatch.setattr(doubt, "is_doubt_reviewer", lambda *_a, **_k: False)  # as before the change: never one
+    assert build_prompt(flow.cfg, review, ctx, {"role": "review"}, {}, "first") == plain
+    assert build_prompt(flow.cfg, review, ctx, {"role": "review"}, {"phase": "plan"}, "first") != with_phase
