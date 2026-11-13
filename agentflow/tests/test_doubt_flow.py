@@ -4,14 +4,16 @@ Every test adds the four steps with `with_doubt`, so the `python` pack's own fil
 
 from __future__ import annotations
 
+import dataclasses
 import io
+import os
 import re
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
-from agentflow import conditions, doubt, metrics
+from agentflow import conditions, doubt, lanes, metrics
 from agentflow.conditions import explain, make_ctx
 from agentflow.feature_lane import _open_findings
 from agentflow.hitl import answer, approve, reject
@@ -404,7 +406,7 @@ def test_a_reconcile_step_that_edits_code_is_refused(flow):
     run = begin(flow, {REVIEW: [found(HIGH)], RECONCILE: [EDITS_CODE]})
     assert go(flow, run) == "waiting_human"
     assert run.state["waiting"]["kind"] == "guard_violation" and run.state["waiting"]["key"] == RECONCILE
-    assert tripped(run) == [[{"kind": "outside_output", "detail": STRAY}]]
+    assert tripped(run) == [[{"kind": "outside_output", "detail": repr(STRAY)}]]
     assert committed(run) == []
     assert not events(run, "forbidden_reverted")
     assert (worktree(run) / STRAY).is_file()  # left for the human, never reverted by the runner
@@ -416,7 +418,7 @@ def test_a_stray_file_is_never_committed_on_retry(flow):
     assert go(flow, run) == "waiting_human"
     approve(run, RECONCILE, by="me")
     assert go(flow, run) == "waiting_human"  # the retry stops at its start: the stray file is still there
-    assert tripped(run) == [[{"kind": "outside_output", "detail": STRAY}]] * 2
+    assert tripped(run) == [[{"kind": "outside_output", "detail": repr(STRAY)}]] * 2
     assert called(flow).count(RECONCILE) == 1 and committed(run) == []
     (worktree(run) / STRAY).unlink()
     approve(run, RECONCILE, by="me")
@@ -431,7 +433,7 @@ def test_a_reconcile_step_may_not_delete_its_artifact(flow):
     deletes = {"delete": [SPEC], **done("xoá", dispositions=[disp("R1-F1", "actionable")])}
     run = begin(flow, {REVIEW: [found(HIGH)], RECONCILE: [deletes]})
     assert go(flow, run) == "waiting_human"
-    assert tripped(run) == [[{"kind": "outside_output", "detail": f"{SPEC} was deleted or is not a regular file"}]]
+    assert tripped(run) == [[{"kind": "outside_output", "detail": f"{SPEC!r} was deleted or is not a regular file"}]]
     assert committed(run) == []
     assert SPEC in run_git(worktree(run), "ls-tree", "-r", "--name-only", "HEAD").split("\n")
 
@@ -518,6 +520,82 @@ def test_build_prompt_without_a_phase_is_unchanged(flow, monkeypatch):
     assert "CODEMAP-X" not in with_phase  # the same step, told its phase, is a doubt reviewer
     plain = build_prompt(flow.cfg, review, ctx, {"role": "review"}, {}, "first")
     assert "CODEMAP-X" in plain and HANDOFF_LEAD in plain
-    monkeypatch.setattr(doubt, "is_doubt_reviewer", lambda *_a, **_k: False)  # as before the change: never one
-    assert build_prompt(flow.cfg, review, ctx, {"role": "review"}, {}, "first") == plain
+    unflagged = dataclasses.replace(review, blocks_on_findings=False)  # a review that can never be a doubt reviewer
+    assert plain == build_prompt(flow.cfg, unflagged, ctx, {"role": "review"}, {}, "first")
+    assert with_phase != build_prompt(flow.cfg, unflagged, ctx, {"role": "review"}, {"phase": "plan"}, "first")
+    monkeypatch.setattr(doubt, "is_doubt_reviewer", lambda *_a, **_k: False)
     assert build_prompt(flow.cfg, review, ctx, {"role": "review"}, {"phase": "plan"}, "first") != with_phase
+
+
+def test_a_reconcile_step_is_never_reverted_by_the_resolver(flow_repo):
+    """`define` resolves its stops here, and a forbidden edit of the draft step is put back (the resolver is live);
+    the reconcile step's same edit, which is also outside its artifact, stops for a human with nothing reverted."""
+    flow_repo.configure({**PIPE, "phases": {"define": {"resolve": True}}}, autopilot=True, edit=with_doubt)
+    forbidden = "CONSTRAINTS.md"
+    flow_repo.script({DRAFT: [{"write": {SPEC: SPEC_TEXT, forbidden: "weaker\n"}, **done("drafted")}, DRAFTED],
+                      REVIEW: [found(HIGH)],
+                      RECONCILE: [{"write": {SPEC: EDITED, forbidden: "weaker\n"},
+                                   **done("sửa", dispositions=[disp("R1-F1", "actionable")])}]})
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(to_phase="define"))
+    assert go(flow_repo, run) == "waiting_human"
+    reverted = events(run, "forbidden_reverted")
+    assert [e["key"] for e in reverted] == [DRAFT]  # the resolver put the draft's edit back
+    assert run.state["waiting"]["kind"] == "guard_violation" and run.state["waiting"]["key"] == RECONCILE
+    kinds = {v["kind"] for v in tripped(run)[-1]}
+    assert kinds == {"forbidden_path", "outside_output"}
+    assert (worktree(run) / forbidden).read_text(encoding="utf-8") == "weaker\n"  # left for the human
+    assert committed(run) == []
+
+
+def test_the_reconcile_commit_holds_only_the_artifact_even_unchecked(flow, monkeypatch):
+    monkeypatch.setattr(lanes, "outside_only", lambda *_a, **_k: [])  # every tree check blinded
+    monkeypatch.setattr(lanes, "git_state_changes", lambda *_a, **_k: [])
+    run = begin(flow, {REVIEW: [found(HIGH), done("sạch")], RECONCILE: [EDITS_CODE]})
+    assert go(flow, run) == "awaiting_approval"
+    [sha] = committed(run)
+    assert files_of(run, sha) == [SPEC]
+    assert (worktree(run) / STRAY).is_file()
+    assert run_git(worktree(run), "status", "--porcelain", "--untracked-files=all").strip() == f"?? {STRAY}"
+
+
+def test_a_planted_attribute_filter_is_refused_before_it_runs(flow, tmp_path):
+    marker = tmp_path / "filter-ran"
+    script = tmp_path / "filter.sh"
+    script.write_text(f'#!/bin/sh\necho ran >> "{marker}"\ncat\n', encoding="utf-8")
+    script.chmod(0o755)
+    run_git(flow.root, "config", "filter.x.clean", str(script))  # a driver no path uses yet
+    common = Path(run_git(flow.root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    attributes = common / "info" / "attributes"
+    plants = {"write": {SPEC: EDITED, str(attributes): "* filter=x\n"},
+              **done("sửa", dispositions=[disp("R1-F1", "actionable")])}
+    run = begin(flow, {REVIEW: [found(HIGH)], RECONCILE: [plants]})
+    assert go(flow, run) == "waiting_human"
+    [[violation]] = tripped(run)
+    assert violation["kind"] == "outside_output" and "info/attributes" in violation["detail"]
+    assert committed(run) == []
+    assert not marker.exists()
+    tracked = next(p for p in run_git(worktree(run), "ls-files").split("\n") if p and p != SPEC)
+    os.utime(worktree(run) / tracked, (1_000_000_000, 1_000_000_000))  # stat-dirty: status must hash it
+    run_git(worktree(run), "status", "--porcelain")  # the plant is live
+    assert marker.exists()
+
+
+def test_a_resumed_reconcile_step_keeps_its_baseline_until_a_human_approves(flow):
+    boundary = {"id": "R1-F1", "question": "Giữ thiết kế?", "evidence": [], "kind": "boundary",
+                "options": [{"key": "A", "label": "Giữ"}, {"key": "B", "label": "Đổi"}]}
+    asks = {"write": {SPEC: EDITED}, "result": {"status": "needs_human", "summary": "cần", "questions": [boundary]}}
+    run = begin(flow, {REVIEW: [found(HIGH), done("sạch")],
+                       RECONCILE: [asks, done("xong", dispositions=[disp("R1-F1", "actionable")])]})
+    assert go(flow, run) == "waiting_human"
+    common = Path(run_git(flow.root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    (common / "info").mkdir(exist_ok=True)
+    (common / "info" / "attributes").write_text("*.md diff\n", encoding="utf-8")  # changed while it waited
+    answer(run, RECONCILE, {"R1-F1": "A"}, by="me")
+    assert go(flow, run) == "waiting_human"  # an answer resumes the step on the baseline it recorded
+    [[violation]] = tripped(run)
+    assert "info/attributes" in violation["detail"]
+    assert called(flow).count(RECONCILE) == 1
+    approve(run, RECONCILE, by="me")  # a human looked at the tree: a new baseline
+    assert go(flow, run) == "awaiting_approval"
+    [sha] = committed(run)
+    assert files_of(run, sha) == [SPEC]

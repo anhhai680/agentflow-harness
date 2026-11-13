@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -603,13 +604,16 @@ def test_commit_lessons_turns_a_failing_hash_object_into_a_git_error(tmp_git, cf
 # --------------------------------------------------------------------------- outside_only: a reconcile step's tree
 
 ARTIFACT = "docs/plans/plan.md"
+REVISED = "# Plan\n\nRevised.\n"
 
 
 def _with_artifact(repo: Path) -> None:
-    """The artifact and a `.gitignore` committed, so the test's later edits are the only changes."""
+    """The artifact and a `.gitignore` committed, so the test's later edits are the only changes. `build/` is an
+    ignored folder that already holds a file."""
     _write(repo, ARTIFACT, "# Plan\n")
-    _write(repo, ".gitignore", "*.log\n")
+    _write(repo, ".gitignore", "*.log\nbuild/\n")
     _commit(repo, "artifact")
+    _write(repo, "build/old.txt", "ignored\n")
 
 
 def _outside(violations) -> list[str]:
@@ -617,16 +621,25 @@ def _outside(violations) -> list[str]:
     return sorted(v.detail for v in violations)
 
 
+def _program(tmp_path: Path, name: str, body: str = "") -> tuple[Path, Path]:
+    """A script that records it ran in a marker file, then runs `body`."""
+    marker = tmp_path / f"{name}-ran"
+    script = tmp_path / f"{name}.sh"
+    script.write_text(f'#!/bin/sh\necho ran >> "{marker}"\n{body}', encoding="utf-8")
+    script.chmod(0o755)
+    return script, marker
+
+
 def test_outside_only_names_every_other_path(tmp_git):
     _with_artifact(tmp_git)
-    _write(tmp_git, ARTIFACT, "# Plan\n\nRevised.\n")
+    _write(tmp_git, ARTIFACT, REVISED)
     assert gitops.outside_only(tmp_git, ARTIFACT) == []  # the artifact alone: nothing outside it
     _write(tmp_git, "README.md", "edited\n")  # a tracked edit
     _write(tmp_git, "notes/new.txt", "x\n")  # an untracked file
     run_git(tmp_git, "mv", "src/app.py", "src/moved.py")  # a rename: both of its paths
     _write(tmp_git, "build.log", "ignored\n")  # an ignored file is no output
-    assert _outside(gitops.outside_only(tmp_git, ARTIFACT)) == ["README.md", "notes/new.txt", "src/app.py",
-                                                                "src/moved.py"]
+    assert _outside(gitops.outside_only(tmp_git, ARTIFACT)) == ["'README.md'", "'notes/new.txt'", "'src/app.py'",
+                                                                "'src/moved.py'"]
 
 
 @pytest.mark.parametrize("change, why", [
@@ -634,8 +647,10 @@ def test_outside_only_names_every_other_path(tmp_git):
     ("symlink", "was deleted or is not a regular file"),
     ("directory", "was deleted or is not a regular file"),
     ("empty", "is empty"),
+    ("hardlink", "is a hard link (it has other names, maybe outside the work tree)"),
+    ("executable", "is executable"),
 ])
-def test_outside_only_refuses_a_deleted_empty_or_symlinked_artifact(tmp_git, change, why):
+def test_outside_only_refuses_a_deleted_empty_or_symlinked_artifact(tmp_git, tmp_path, change, why):
     _with_artifact(tmp_git)
     path = tmp_git / ARTIFACT
     path.unlink()
@@ -646,10 +661,16 @@ def test_outside_only_refuses_a_deleted_empty_or_symlinked_artifact(tmp_git, cha
         (path / "inner.md").write_text("x\n", encoding="utf-8")
     elif change == "empty":
         path.write_bytes(b"")
+    elif change == "hardlink":
+        path.write_text(REVISED, encoding="utf-8")
+        os.link(path, tmp_path / "another-name.md")
+    elif change == "executable":
+        path.write_text(REVISED, encoding="utf-8")
+        path.chmod(0o755)
     found = gitops.outside_only(tmp_git, ARTIFACT)
-    assert f"{ARTIFACT} {why}" in _outside(found)
-    if change in ("deleted", "symlink", "empty"):  # nothing else changed, so that is the only violation
-        assert _outside(found) == [f"{ARTIFACT} {why}"]
+    assert f"{ARTIFACT!r} {why}" in _outside(found)
+    if change != "directory":  # nothing else changed, so that is the only violation
+        assert _outside(found) == [f"{ARTIFACT!r} {why}"]
 
 
 def test_outside_only_refuses_an_artifact_path_that_leaves_the_tree(tmp_git, tmp_path):
@@ -657,14 +678,23 @@ def test_outside_only_refuses_an_artifact_path_that_leaves_the_tree(tmp_git, tmp
     outside = tmp_path / "elsewhere"
     outside.mkdir()
     (outside / "plan.md").write_text("# Plan\n", encoding="utf-8")
-    for only in ("../elsewhere/plan.md", str(outside / "plan.md"), "docs/plans/../plans/plan.md", ""):
+    for only in ("../elsewhere/plan.md", str(outside / "plan.md"), "docs/plans/../plans/plan.md", "", ".git/config"):
         assert gitops.outside_only(tmp_git, only), only
     run_git(tmp_git, "rm", "-q", "-r", "docs")
     _commit(tmp_git, "no docs")
     (outside / "plans").mkdir()
     (outside / "plans" / "plan.md").write_text("# Plan\n", encoding="utf-8")
     os.symlink(outside, tmp_git / "docs")  # the artifact reached through a symlinked folder
-    assert f"{ARTIFACT} was deleted or is not a regular file" in _outside(gitops.outside_only(tmp_git, ARTIFACT))
+    assert f"{ARTIFACT!r} was deleted or is not a regular file" in _outside(gitops.outside_only(tmp_git, ARTIFACT))
+
+
+def test_outside_only_shows_hostile_names_escaped(tmp_git):
+    _with_artifact(tmp_git)
+    name = "evil\nname\x1b[31m.md"
+    _write(tmp_git, name, "x\n")
+    [detail] = _outside(gitops.outside_only(tmp_git, ARTIFACT))
+    assert detail == repr(name)
+    assert "\n" not in detail and "\x1b" not in detail
 
 
 def test_outside_only_fails_closed_when_git_fails(tmp_git, monkeypatch):
@@ -682,18 +712,80 @@ def test_outside_only_ignores_a_planted_fsmonitor(tmp_git, cfg, tmp_path):
     from agentflow.guards import snapshot
 
     _with_artifact(tmp_git)
-    marker = tmp_path / "fsmonitor-ran"
-    script = tmp_path / "fsmonitor.sh"
-    script.write_text(f'#!/bin/sh\necho ran >> "{marker}"\nexit 1\n', encoding="utf-8")
-    script.chmod(0o755)
+    script, marker = _program(tmp_path, "fsmonitor", "exit 1\n")
     run_git(tmp_git, "config", "core.fsmonitor", str(script))
-    _write(tmp_git, ARTIFACT, "# Plan\n\nRevised.\n")
+    _write(tmp_git, ARTIFACT, REVISED)
     assert gitops.outside_only(tmp_git, ARTIFACT) == []
     snapshot(tmp_git)
     gitops.commit(tmp_git, "Revise the plan.", cfg, paths=[ARTIFACT])
+    _write(tmp_git, ARTIFACT, REVISED + "Again.\n")
+    gitops.commit_artifact(tmp_git, "Revise the plan again.", cfg, ARTIFACT)
     assert not marker.exists()
     run_git(tmp_git, "status", "--porcelain")  # the plant is live: plain git runs it
     assert marker.exists()
+
+
+def test_outside_only_refuses_a_planted_clean_filter_before_it_runs(tmp_git, tmp_path):
+    _with_artifact(tmp_git)
+    baseline = gitops.reconcile_baseline(tmp_git, None)
+    script, marker = _program(tmp_path, "filter", "cat\n")
+    run_git(tmp_git, "config", "filter.x.clean", str(script))
+    (tmp_git / ".git" / "info").mkdir(exist_ok=True)
+    (tmp_git / ".git" / "info" / "attributes").write_text("* filter=x\n", encoding="utf-8")
+    _write(tmp_git, ARTIFACT, REVISED)
+    [found] = gitops.outside_only(tmp_git, ARTIFACT, baseline)
+    assert found.kind == "outside_output"
+    assert "the git config" in found.detail and "info/attributes" in found.detail
+    assert not marker.exists()
+    os.utime(tmp_git / "README.md", (1_000_000_000, 1_000_000_000))  # stat-dirty: status must hash it
+    gitops.outside_only(tmp_git, ARTIFACT)  # the plant is live: without the baseline, the hardened status runs it
+    assert marker.exists()
+
+
+def test_a_planted_signing_program_is_refused_and_never_runs(tmp_git, cfg, tmp_path):
+    _with_artifact(tmp_git)
+    baseline = gitops.reconcile_baseline(tmp_git, None)
+    script, marker = _program(tmp_path, "gpg", "exit 1\n")
+    run_git(tmp_git, "config", "commit.gpgsign", "true")
+    run_git(tmp_git, "config", "gpg.program", str(script))
+    _write(tmp_git, ARTIFACT, REVISED)
+    assert "the git config" in _outside(gitops.outside_only(tmp_git, ARTIFACT, baseline))[0]
+    sha = gitops.commit_artifact(tmp_git, "Revise the plan.", cfg, ARTIFACT)  # its own commit never signs either
+    assert not marker.exists()
+    assert run_git(tmp_git, "show", "--name-only", "--format=", sha).split() == [ARTIFACT]
+    _write(tmp_git, "README.md", "edited\n")
+    subprocess.run(["git", "commit", "-qam", "x"], cwd=tmp_git, capture_output=True, check=False)
+    assert marker.exists()  # the plant is live: a plain commit runs it
+
+
+@pytest.mark.parametrize("trick", ["assume_unchanged", "skip_worktree", "ignored_folder"])
+def test_outside_only_sees_what_the_index_and_ignores_hide(tmp_git, trick):
+    _with_artifact(tmp_git)
+    baseline = gitops.reconcile_baseline(tmp_git, None)
+    _write(tmp_git, ARTIFACT, REVISED)
+    if trick == "assume_unchanged":
+        run_git(tmp_git, "update-index", "--assume-unchanged", "README.md")
+        _write(tmp_git, "README.md", "edited behind the flag\n")
+        want = ["'README.md' is newly flagged 'h' in the index, so status cannot see a change to it"]
+    elif trick == "skip_worktree":
+        run_git(tmp_git, "update-index", "--skip-worktree", "src/app.py")
+        (tmp_git / "src" / "app.py").unlink()
+        want = ["'src/app.py' is newly flagged 'S' in the index, so status cannot see a change to it"]
+    else:
+        _write(tmp_git, "build/new.txt", "written inside an ignored folder\n")
+        want = ["'build/new.txt' (ignored) was written"]
+    assert gitops.outside_only(tmp_git, ARTIFACT) == []  # status alone is blind to it
+    assert _outside(gitops.outside_only(tmp_git, ARTIFACT, baseline)) == want
+
+
+def test_outside_only_names_ignored_changes_it_kept_only_by_count(tmp_git, monkeypatch):
+    _with_artifact(tmp_git)
+    monkeypatch.setattr(gitops, "IGNORED_KEPT", 0)
+    baseline = gitops.reconcile_baseline(tmp_git, None)
+    assert baseline["ignored"] is None and baseline["ignored_count"] == 1
+    _write(tmp_git, "build/new.txt", "x\n")
+    assert _outside(gitops.outside_only(tmp_git, ARTIFACT, baseline)) == [
+        "the ignored files changed since the step started (1 before, 2 now)"]
 
 
 def test_commit_paths_are_literal(tmp_git, cfg):
@@ -704,3 +796,82 @@ def test_commit_paths_are_literal(tmp_git, cfg):
     sha = gitops.commit(tmp_git, "Revise the artifact.", cfg, paths=["docs/[ab].md"])
     assert run_git(tmp_git, "show", "--name-only", "--format=", sha).split("\n")[:-1] == ["docs/[ab].md"]
     assert run_git(tmp_git, "status", "--porcelain", "--untracked-files=all").strip() == "?? docs/a.md"
+    _write(tmp_git, "docs/[ab].md", "the artifact, revised again\n")
+    sha = gitops.commit_artifact(tmp_git, "Revise the artifact.", cfg, "docs/[ab].md")
+    assert run_git(tmp_git, "show", "--name-only", "--format=", sha).split("\n")[:-1] == ["docs/[ab].md"]
+    assert run_git(tmp_git, "status", "--porcelain", "--untracked-files=all").strip() == "?? docs/a.md"
+
+
+# --------------------------------------------------------------------------- commit_artifact: the reconcile commit
+
+
+def test_commit_artifact_commits_exactly_the_artifact(tmp_git, cfg):
+    _with_artifact(tmp_git)
+    before = _head(tmp_git)
+    _write(tmp_git, ARTIFACT, REVISED)
+    _write(tmp_git, "stray.py", "x = 1\n")
+    sha = gitops.commit_artifact(tmp_git, "Revise the plan.", cfg, ARTIFACT, expected_head=before)
+    assert run_git(tmp_git, "rev-list", "--parents", "-n", "1", sha).split() == [sha, before]
+    assert run_git(tmp_git, "show", "--name-only", "--format=", sha).split() == [ARTIFACT]
+    assert run_git(tmp_git, "ls-tree", sha, "--", ARTIFACT).split()[0] == "100644"
+    assert cfg.project.commit_trailer in run_git(tmp_git, "log", "-1", "--format=%B", sha)
+    assert run_git(tmp_git, "status", "--porcelain").strip() == "?? stray.py"
+    with pytest.raises(NothingToCommit):
+        gitops.commit_artifact(tmp_git, "Again.", cfg, ARTIFACT)
+
+
+def test_commit_artifact_refuses_a_prestaged_other_path(tmp_git, cfg):
+    _with_artifact(tmp_git)
+    before = _head(tmp_git)
+    _write(tmp_git, ARTIFACT, REVISED)
+    _write(tmp_git, "README.md", "staged by someone\n")
+    run_git(tmp_git, "add", "README.md")
+    with pytest.raises(CommitRejected, match="'README.md'") as caught:
+        gitops.commit_artifact(tmp_git, "Revise the plan.", cfg, ARTIFACT)
+    assert caught.value.kind == "outside_output"
+    assert _head(tmp_git) == before and _staged(tmp_git) == []
+
+
+@pytest.mark.parametrize("swap", ["symlink", "executable", "content"])
+def test_commit_artifact_refuses_a_file_swapped_after_its_check(tmp_git, cfg, monkeypatch, swap):
+    _with_artifact(tmp_git)
+    before = _head(tmp_git)
+    _write(tmp_git, ARTIFACT, REVISED)
+    path = tmp_git / ARTIFACT
+    real = gitops._git_or_raise
+
+    def swapping(repo, *args):
+        if "add" in args:  # between the runner's read of the file and its staging
+            if swap == "symlink":
+                path.unlink()
+                os.symlink("../../README.md", path)
+            elif swap == "executable":
+                path.chmod(0o755)
+            else:
+                path.write_text("# Plan\n\nSomething else.\n", encoding="utf-8")
+        return real(repo, *args)
+
+    monkeypatch.setattr(gitops, "_git_or_raise", swapping)
+    with pytest.raises(CommitRejected) as caught:
+        gitops.commit_artifact(tmp_git, "Revise the plan.", cfg, ARTIFACT)
+    assert caught.value.kind == "outside_output"
+    assert _head(tmp_git) == before and _staged(tmp_git) == []
+
+
+def test_commit_artifact_checks_the_commit_it_created(tmp_git, cfg, monkeypatch):
+    _with_artifact(tmp_git)
+    before = _head(tmp_git)
+    _write(tmp_git, ARTIFACT, REVISED)
+    real = gitops.subprocess.run
+
+    def sneaking(args, *a, **kw):
+        if isinstance(args, list) and "commit" in args and "--no-verify" in args:
+            _write(tmp_git, "README.md", "sneaked in\n")  # a process stages more between the check and the commit
+            real(["git", "add", "README.md"], cwd=tmp_git, check=True)
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitops.subprocess, "run", sneaking)
+    with pytest.raises(CommitRejected, match="left in place") as caught:
+        gitops.commit_artifact(tmp_git, "Revise the plan.", cfg, ARTIFACT)
+    assert caught.value.kind == "outside_output"
+    assert _head(tmp_git) != before  # never rolled back silently: a human looks at it

@@ -24,6 +24,10 @@ if TYPE_CHECKING:
 # `HARDENED` (no hook, no fsmonitor) is defined in `guards`, whose `snapshot` needs it and which cannot import this
 # module; every hardened git call here uses it.
 
+# `HARDENED`, and no setting that could hide a change from `status`: every untracked file, every stat, no untracked cache.
+STRICT = (*HARDENED, "-c", "status.showUntrackedFiles=all", "-c", "core.ignoreStat=false", "-c", "core.untrackedCache=false")
+IGNORED_KEPT = 2000  # ignored paths a reconcile baseline records by name; past it, only their digest and count
+
 
 class GitError(Exception):
     """A git command the runner needed failed."""
@@ -237,8 +241,8 @@ def _status_entries(worktree: Path) -> list[tuple[str, str]]:
 
     Renames are turned off, and should git still report one (`R` or `C`), its source path is kept as an entry
     of its own, so no path a change touches goes unseen. Paths are raw bytes decoded as git printed them: no
-    quoting, so spaces, newlines and a leading `-` arrive as they are."""
-    out = _git_or_raise(worktree, *HARDENED, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
+    quoting, so spaces, newlines and a leading `-` arrive as they are. Read with `STRICT`, so no setting hides one."""
+    out = _git_or_raise(worktree, *STRICT, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
                         "--ignore-submodules=none")
     fields = out.split("\0")
     entries: list[tuple[str, str]] = []
@@ -257,27 +261,108 @@ def _status_entries(worktree: Path) -> list[tuple[str, str]]:
     return entries
 
 
-def outside_only(worktree: Path, only: str) -> list[Violation]:
-    """What makes the work tree more than an edit of the one file `only` (a repo-relative path), as `outside_output`
-    violations; empty when `only` is the one path that differs from `HEAD` (or nothing does) and it is a non-empty
-    regular file inside the worktree.
+def shown(path: str) -> str:
+    """A path an agent chose, for a page or a terminal: quoted, with newlines and control characters escaped."""
+    return repr(path)
 
-    The tree is read against `HEAD` with `_status_entries` (`HARDENED`: no hook or fsmonitor command runs; renames
-    off, so both paths of a rename are named; submodules included; untracked files included, ignored ones not):
-    every path other than `only` is one violation. `only` itself must be a regular file (not missing, not a symlink,
-    not a folder, not reached through a symlinked folder) with at least one byte. A path that is not a plain relative
-    path inside the work tree (absolute, `..`, `.git`, not normalised) is refused, and so is every failure to read the
-    tree: a check that cannot run never passes."""
+
+def _flagged(worktree: Path) -> list[str]:
+    """Index entries flagged skip-worktree (`S`) or assume-unchanged (lower case), as `ls-files -v` prints them:
+    `status` does not see a change to one."""
+    out = _git_or_raise(worktree, *STRICT, "ls-files", "-v", "-z")
+    return sorted(e for e in out.split("\0") if e and (e[0] == "S" or e[0].islower()))
+
+
+def _ignored(worktree: Path) -> list[str]:
+    """Every ignored path, file by file even inside an ignored folder (`--ignored=traditional` with
+    `--untracked-files=all`)."""
+    out = _git_or_raise(worktree, *STRICT, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                        "--ignored=traditional", "--no-renames", "--ignore-submodules=none")
+    return sorted(e[3:] for e in out.split("\0") if e.startswith("!! "))
+
+
+def _digest(paths: list[str]) -> str:
+    return hashlib.sha256("\0".join(paths).encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def reconcile_baseline(worktree: Path, branch: str | None) -> dict[str, Any]:
+    """What a reconcile step's checks compare against (`outside_only`): `git_state` (read first, so no command an
+    agent could have planted has run yet), the flagged index entries and the ignored paths (by name up to
+    `IGNORED_KEPT`, always by digest and count). JSON-able, for the event log. Raises `GitError`/`OSError` when it
+    cannot be read."""
+    worktree = Path(worktree)
+    state = git_state(worktree, branch)
+    flagged, ignored = _flagged(worktree), _ignored(worktree)
+    return {"branch": branch, "git_state": state, "flagged": flagged, "ignored_digest": _digest(ignored),
+            "ignored_count": len(ignored), "ignored": ignored if len(ignored) <= IGNORED_KEPT else None}
+
+
+def git_state_changes(worktree: Path, baseline: dict[str, Any]) -> list[Violation]:
+    """`outside_output` violations naming what of `git_state` differs from the baseline's: the config (a filter, a
+    signing program, an attribute file's setting ...), the push URL, or a control file (`info/attributes`, hooks ...).
+    Read with `HARDENED` and nothing else, so a planted program never runs here; call it before any git command that
+    reads the work tree. A state that cannot be read is a violation too."""
+    try:
+        now = git_state(Path(worktree), baseline.get("branch"))
+    except (GitError, OSError, ValueError) as exc:
+        return [Violation("outside_output", f"cannot read the git state, so it cannot be trusted: {exc}")]
+    before = baseline.get("git_state") or {}
+    out = [label for name, label in (("config", "the git config"), ("push_url", "the push URL of origin"))
+           if now.get(name) != before.get(name)]
+    files_now, files_before = now.get("files") or {}, before.get("files") or {}
+    out += [f"git's {name}" for name in sorted(set(files_now) | set(files_before))
+            if json.dumps(files_now.get(name)) != json.dumps(files_before.get(name))]
+    if not out:
+        return []
+    return [Violation("outside_output", "changed since the step started, so no git command reads the tree: "
+                      + ", ".join(out))]
+
+
+def outside_only(worktree: Path, only: str, baseline: dict[str, Any] | None = None) -> list[Violation]:
+    """What makes the work tree more than an edit of the one file `only` (a repo-relative path), as `outside_output`
+    violations; empty when `only` is the one path that differs from `HEAD` (or nothing does) and it is a non-empty,
+    non-executable regular file inside the worktree with no other name.
+
+    With `baseline` (`reconcile_baseline`), `git_state` is compared first and any difference is returned alone: a
+    changed config or attribute file could run a program (a filter, an fsmonitor) in the very `status` that follows,
+    or make an edited file read as unchanged. Then the tree is read against `HEAD` with `_status_entries` (`STRICT`:
+    no hook or fsmonitor command, no setting that hides a change; renames off, so both paths of a rename are named;
+    submodules included; untracked files included, ignored ones not): every path other than `only` is one violation.
+    With `baseline`, so is a newly flagged index entry (an edit to a skip-worktree or assume-unchanged file is not in
+    `status`) and any change to the ignored paths (a file written inside an ignored folder). `only` itself must be a
+    regular file (not missing, not a symlink, not a folder, not reached through a symlinked folder, not executable, not
+    a hard link) with at least one byte. A path that is not a plain relative path inside the work tree (absolute, `..`,
+    `.git`, not normalised) is refused, and so is every failure to read the tree: a check that cannot run never
+    passes. Every path in a detail is `shown`."""
     worktree = Path(worktree)
     parts = only.split("/") if isinstance(only, str) else []
     if (not parts or only.startswith("/") or posixpath.normpath(only) != only
             or any(part in ("", ".", "..") or part.casefold() == ".git" for part in parts)):
-        return [Violation("outside_output", f"{only!r} is not a plain path inside the work tree")]
+        return [Violation("outside_output", f"{shown(str(only))} is not a plain path inside the work tree")]
+    if baseline is not None:
+        changed = git_state_changes(worktree, baseline)
+        if changed:
+            return changed
     try:
         entries = _status_entries(worktree)
+        flagged = _flagged(worktree) if baseline is not None else []
+        ignored = _ignored(worktree) if baseline is not None else []
     except (GitError, OSError, ValueError) as exc:  # ValueError: a path git printed that is not UTF-8
         return [Violation("outside_output", f"cannot read the work tree's state, so it cannot be trusted: {exc}")]
-    found = [Violation("outside_output", path) for path in sorted({path for _, path in entries if path != only})]
+    found = [Violation("outside_output", shown(path)) for path in sorted({path for _, path in entries if path != only})]
+    if baseline is not None:
+        known = set(baseline.get("flagged") or [])
+        found += [Violation("outside_output", f"{shown(entry[2:])} is newly flagged {entry[0]!r} in the index, so "
+                            "status cannot see a change to it") for entry in flagged if entry not in known]
+        if _digest(ignored) != baseline.get("ignored_digest"):
+            before = baseline.get("ignored")
+            if isinstance(before, list):
+                added, gone = sorted(set(ignored) - set(before)), sorted(set(before) - set(ignored))
+                found += [Violation("outside_output", f"{shown(p)} (ignored) was written") for p in added]
+                found += [Violation("outside_output", f"{shown(p)} (ignored) was removed") for p in gone]
+            if not isinstance(before, list) or not (added or gone):
+                found.append(Violation("outside_output", f"the ignored files changed since the step started "
+                                       f"({baseline.get('ignored_count')} before, {len(ignored)} now)"))
     target = worktree / only
     try:
         info = os.lstat(target)
@@ -285,10 +370,116 @@ def outside_only(worktree: Path, only: str) -> list[Violation]:
     except (OSError, RuntimeError):  # RuntimeError: a symlink loop
         info, inside = None, False
     if info is None or not stat.S_ISREG(info.st_mode) or not inside:
-        found.append(Violation("outside_output", f"{only} was deleted or is not a regular file"))
+        found.append(Violation("outside_output", f"{shown(only)} was deleted or is not a regular file"))
+    elif info.st_nlink != 1:
+        found.append(Violation("outside_output", f"{shown(only)} is a hard link (it has other names, maybe outside "
+                               "the work tree)"))
+    elif info.st_mode & 0o111:
+        found.append(Violation("outside_output", f"{shown(only)} is executable"))
     elif info.st_size == 0:
-        found.append(Violation("outside_output", f"{only} is empty"))
+        found.append(Violation("outside_output", f"{shown(only)} is empty"))
     return found
+
+
+def _artifact_refused(worktree: Path, why: str) -> CommitRejected:
+    """Put the index back at `HEAD` (the working tree is untouched) and name the refusal."""
+    _git(worktree, *HARDENED, "--literal-pathspecs", "reset", "-q")
+    return CommitRejected(f"the reconcile commit was refused: {why}", kind="outside_output")
+
+
+def commit_artifact(worktree: Path, message: str, cfg: Config, path: str, expected_head: str | None = None) -> str:
+    """Commit the one file `path` (a reconcile step's artifact), and nothing else, with `project.commit_trailer`
+    appended; return the new sha. `commit_lessons`'s checks, for a path a step's `output` names.
+
+    In order: `HEAD` must be `expected_head` (`agent_commit`); the message must carry no rejected trailer; `path` must
+    not be a forbidden path. The file is read once (no symlink followed): a non-empty, non-executable regular file
+    with one name, whose bytes are hashed with no filters. Then it alone is staged (`--literal-pathspecs`): the index
+    must differ from `HEAD` at exactly `path`, as mode 100644 and as that hash, else the index is reset and
+    `CommitRejected` (kind `outside_output`) is raised. An unchanged file raises `NothingToCommit`. The commit is the
+    index as checked (no pathspec, so git does not read the file again), with no hook, no fsmonitor and no signing
+    program (`commit.gpgsign=false`). The commit actually created is checked again: one parent, the old `HEAD`;
+    exactly `path` changed, as mode 100644 and the checked blob; no rejected trailer. A failure there raises
+    `CommitRejected` naming the commit, which is left in place for a human (never rolled back silently), as
+    `commit_lessons` does."""
+    worktree = Path(worktree)
+    before = head(worktree)
+    if expected_head is not None and before != expected_head:
+        raise CommitRejected(f"HEAD moved from {expected_head[:12]} to {before[:12]} since the runner last recorded "
+                             "it; the runner commits only on top of its own commits", kind="agent_commit")
+    text = message.strip()
+    trailer = cfg.project.commit_trailer.strip()
+    if trailer and not text.endswith(trailer):
+        text = f"{text}\n\n{trailer}"
+    rejected = check_message(cfg, text)
+    if rejected:
+        raise CommitRejected("commit message carries a rejected trailer: " + ", ".join(v.detail for v in rejected))
+    if any(path_matches(path, g) for g in cfg.guardrails.forbidden_paths):
+        raise CommitRejected(f"commit would include forbidden path(s): {shown(path)}", kind="forbidden_path")
+    try:
+        fd = os.open(worktree / path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError as exc:
+        raise _artifact_refused(worktree, f"{shown(path)} cannot be read as a regular file: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o111 or info.st_size == 0:
+            raise _artifact_refused(worktree, f"{shown(path)} is not a non-empty, non-executable regular file with "
+                                    "one name")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            data = handle.read()
+    finally:
+        os.close(fd)
+    hashed = subprocess.run(["git", "hash-object", "--no-filters", "--stdin"], cwd=worktree, input=data,
+                            capture_output=True, check=False)
+    if hashed.returncode != 0:
+        detail = hashed.stderr.decode("utf-8", "replace").strip() or f"exit {hashed.returncode}"
+        raise GitError(f"git hash-object failed: {detail}")
+    wanted = hashed.stdout.decode().strip()
+
+    git = (*HARDENED, "--literal-pathspecs")
+    _git_or_raise(worktree, *git, "add", "--", path)
+    raw = [f for f in _git(worktree, *git, "diff", "--cached", "--raw", "-z", "--no-renames", "--no-abbrev").split("\0")
+           if f]
+    staged = raw[1::2]
+    if not staged:
+        raise NothingToCommit(f"{shown(path)} is unchanged in {worktree}")
+    if staged != [path]:
+        raise _artifact_refused(worktree, "the index holds other paths: " + ", ".join(shown(p) for p in staged))
+    _, mode, _, blob, *_ = raw[0].split()
+    if mode != "100644":
+        raise _artifact_refused(worktree, f"{shown(path)} would be committed with mode {mode}, not as a regular "
+                                "file (100644)")
+    if blob != wanted:
+        raise _artifact_refused(worktree, f"the staged {shown(path)} (blob {blob[:12]}) is not the file the runner "
+                                f"checked (blob {wanted[:12]}): it changed, or a filter rewrote it")
+    proc = subprocess.run(
+        ["git", *git, "-c", "commit.gpgsign=false", "commit", "--no-verify", "-q", "-F", "-"],
+        cwd=worktree, input=text + "\n", capture_output=True, text=True, encoding="utf-8", check=False,
+    )
+    if proc.returncode != 0:
+        raise GitError(proc.stderr.strip() or f"git commit exited {proc.returncode}")
+
+    sha = head(worktree)
+    parents = _git_or_raise(worktree, *HARDENED, "rev-list", "--parents", "-n", "1", sha).split()[1:]
+    changed = [p for p in _git_or_raise(worktree, *HARDENED, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
+                                        "--no-renames", sha).split("\0") if p]
+    entry = _git_or_raise(worktree, *git, "ls-tree", "-z", sha, "--", path).split()
+    created = _git_or_raise(worktree, *HARDENED, "log", "-1", "--format=%B", sha)
+    rejected = check_message(cfg, created)
+    if rejected:
+        why, kind = "its message carries a rejected trailer: " + ", ".join(v.detail for v in rejected), "rejected_trailer"
+    elif parents != [before]:
+        why, kind = f"its parents are {', '.join(p[:12] for p in parents) or 'none'}, not {before[:12]}", "agent_commit"
+    elif changed != [path]:
+        why, kind = "it changes " + ", ".join(shown(p) for p in changed) + f", not only {shown(path)}", "outside_output"
+    elif not entry or entry[0] != "100644":
+        why, kind = f"it records {shown(path)} with mode {entry[0] if entry else 'none'}, not 100644", "outside_output"
+    elif entry[2] != blob:
+        why, kind = (f"it records {shown(path)} as blob {entry[2][:12]}, not the checked and staged {blob[:12]}",
+                     "outside_output")
+    else:
+        return sha
+    raise CommitRejected(f"commit {sha[:12]} was created, but {why}; it is left in place for a human to inspect "
+                         "(nothing was rolled back)", kind=kind)
 
 
 def _lessons_refused(worktree: Path, why: str) -> CommitRejected:
@@ -883,8 +1074,7 @@ def tree_state(worktree: Path) -> dict[str, Any]:
     differ from `HEAD`, and `HEAD` itself: its commit and the branch it names. Two equal values mean nothing git can
     see changed."""
     worktree = Path(worktree)
-    strict = (*HARDENED, "-c", "status.showUntrackedFiles=all", "-c", "core.ignoreStat=false",
-              "-c", "core.untrackedCache=false")
+    strict = STRICT
     status = _git_or_raise(worktree, *strict, "status", "--porcelain=v1", "-z", "--untracked-files=all",
                            "--ignored=matching", "--no-renames", "--ignore-submodules=none")
     flagged = [entry for entry in _git_or_raise(worktree, *strict, "ls-files", "-v", "-z").split("\0")
