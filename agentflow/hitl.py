@@ -85,6 +85,7 @@ class StepResult:
     can_continue_without: bool = False
     signals: dict = field(default_factory=dict)
     findings: list = field(default_factory=list)
+    dispositions: list = field(default_factory=list)  # a reconcile step's answer to each finding (`doubt.parse_dispositions`)
     risks: list = field(default_factory=list)
     facts: list[str] = field(default_factory=list)
     code_map: list[str] = field(default_factory=list)
@@ -187,6 +188,9 @@ def read_result(path: Path, refine: bool = False) -> StepResult:
     signals, findings, risks = raw.get("signals", {}), raw.get("findings", []), raw.get("risks", [])
     if not isinstance(signals, dict) or not isinstance(findings, list) or not isinstance(risks, list):
         raise ResultError("signals must be an object; findings and risks must be lists")
+    dispositions = raw.get("dispositions", [])
+    if not isinstance(dispositions, list):
+        raise ResultError("dispositions must be a list")
     facts = _parse_lines(raw.get("facts", []), "facts", FACTS_PER_RESULT)
     code_map = _parse_lines(raw.get("code_map", []), "code_map", CODE_MAP_PER_RESULT)
     lessons_cited = _parse_lesson_ids(raw.get("lessons_cited", []))
@@ -200,6 +204,7 @@ def read_result(path: Path, refine: bool = False) -> StepResult:
         can_continue_without=bool(raw.get("can_continue_without", False)),
         signals=nfc(signals),
         findings=nfc(findings),
+        dispositions=nfc(dispositions),
         risks=nfc(risks),
         facts=facts,
         code_map=code_map,
