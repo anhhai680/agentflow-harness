@@ -538,9 +538,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
 
         # A reconcile step starts only on a tree that holds nothing but its artifact: a stray file left from an earlier
         # stop would otherwise ride along (and the step must not take it for its own work). Checked before the
-        # snapshots below, which run `git add`.
-        if step.reconciles:
-            outside = self._reconcile_start(sr, fresh=not (resuming and started is not None))
+        # snapshots below, which run `git add`; a resumed step is checked once its earlier agents are gone.
+        if step.reconciles and not (resuming and started is not None):
+            outside = self._reconcile_start(sr, fresh=True)
             if outside:
                 return self._fail(sr, outside)
         if resuming and started is not None:
@@ -550,6 +550,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 self.run.emit("step_finished", key=key, status="done", summary=last.get("summary", ""), sha=last["sha"])
                 return "done"
             wait_for_agents(self.run, self.cfg, key, self._timeout_s())
+            if step.reconciles:  # after the wait: an agent left running could still change the tree until then
+                outside = self._reconcile_start(sr, fresh=False)
+                if outside:
+                    return self._fail(sr, outside)
             baseline = self._baseline(key, since, started)
             if isinstance(baseline, list):
                 return self._fail(sr, baseline)
@@ -994,26 +998,43 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         return outside_only(self.worktree, fmt(str(sr.step.output), self.ctx), sr.reconcile_base)
 
     def _reconcile_start(self, sr: _StepRun, fresh: bool) -> list[Violation]:
-        """The baseline a reconcile step is checked against, then the check itself. A resumed step keeps the baseline
-        it recorded (`reconcile_baseline`) unless a human approved the step since: a runner that died mid-turn must
-        not adopt what that turn changed. A fresh start, or a human's approval, records a new one (the human looked at
-        the tree)."""
-        recorded = None
-        for event in [] if fresh else self.run.events.read():
+        """The baseline a reconcile step is checked against, then the check itself.
+
+        The git state (`gitops.git_state`) is the one recorded at the step's first start in the run, kept across
+        resumes, approvals and rounds: an approved stop never adopts a changed config, filter, attribute file or
+        replace ref. Only a human's `agentflow retry` of the step (`step_retry`) takes a new one. The flagged index
+        entries and the ignored paths are this attempt's: a resumed step keeps them, so a runner that died mid-turn
+        never adopts what that turn changed, and a fresh start or a human's approval reads them again (the human looked
+        at the tree). A git state that differs from the kept one is refused before those lists are read, since reading
+        them runs `git status`."""
+        original: dict | None = None
+        recorded: dict | None = None
+        for event in self.run.events.read():
             if event.get("key") != sr.key:
                 continue
-            if event["type"] == "hitl_approved":
+            if event["type"] == "step_retry":
+                original = recorded = None
+            elif event["type"] == "hitl_approved":
                 recorded = None
-            elif event["type"] == "reconcile_baseline":
-                recorded = event.get("baseline")
-        if isinstance(recorded, dict):
-            sr.reconcile_base = recorded
-        else:
-            try:
-                sr.reconcile_base = reconcile_baseline(self.worktree, self.run.state.get("branch"))
-            except (GitError, OSError, ValueError) as exc:
-                return [Violation("outside_output", f"cannot read the work tree's state, so it cannot be trusted: {exc}")]
-            self.run.emit("reconcile_baseline", key=sr.key, baseline=sr.reconcile_base)
+            elif event["type"] == "reconcile_baseline" and isinstance(event.get("baseline"), dict):
+                original = original or event["baseline"].get("git_state")
+                recorded = event["baseline"]
+        branch = self.run.state.get("branch")
+        if recorded is not None and not fresh:
+            sr.reconcile_base = {**recorded, "git_state": original or recorded.get("git_state")}
+            return self._outside_output(sr)
+        if original is not None:
+            changed = git_state_changes(self.worktree, {"branch": branch, "git_state": original})
+            if changed:
+                return changed
+        try:
+            base = reconcile_baseline(self.worktree, branch)
+        except (GitError, OSError, ValueError) as exc:
+            return [Violation("outside_output", f"cannot read the work tree's state, so it cannot be trusted: {exc}")]
+        if original is not None:
+            base["git_state"] = original
+        sr.reconcile_base = base
+        self.run.emit("reconcile_baseline", key=sr.key, baseline=base)
         return self._outside_output(sr)
 
     def _fail(self, sr: _StepRun, violations: list[Violation]) -> Outcome:

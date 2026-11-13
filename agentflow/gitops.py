@@ -21,7 +21,7 @@ from agentflow.pack import LESSONS_FILE
 if TYPE_CHECKING:
     from agentflow.config import Config
 
-# `HARDENED` (no hook, no fsmonitor) is defined in `guards`, whose `snapshot` needs it and which cannot import this
+# `HARDENED` (no hook, no fsmonitor, no replace object) is defined in `guards`, whose `snapshot` needs it and which cannot import this
 # module; every hardened git call here uses it.
 
 # `HARDENED`, and no setting that could hide a change from `status`: every untracked file, every stat, no untracked cache.
@@ -299,7 +299,8 @@ def reconcile_baseline(worktree: Path, branch: str | None) -> dict[str, Any]:
 
 def git_state_changes(worktree: Path, baseline: dict[str, Any]) -> list[Violation]:
     """`outside_output` violations naming what of `git_state` differs from the baseline's: the config (a filter, a
-    signing program, an attribute file's setting ...), the push URL, or a control file (`info/attributes`, hooks ...).
+    signing program, an attribute file's setting ...), the push URL, the replace refs, or a control file
+    (`info/attributes`, hooks ...).
     Read with `HARDENED` and nothing else, so a planted program never runs here; call it before any git command that
     reads the work tree. A state that cannot be read is a violation too."""
     try:
@@ -307,7 +308,8 @@ def git_state_changes(worktree: Path, baseline: dict[str, Any]) -> list[Violatio
     except (GitError, OSError, ValueError) as exc:
         return [Violation("outside_output", f"cannot read the git state, so it cannot be trusted: {exc}")]
     before = baseline.get("git_state") or {}
-    out = [label for name, label in (("config", "the git config"), ("push_url", "the push URL of origin"))
+    out = [label for name, label in (("config", "the git config"), ("push_url", "the push URL of origin"),
+                                     ("replace_refs", "the replace refs (`refs/replace`)"))
            if now.get(name) != before.get(name)]
     files_now, files_before = now.get("files") or {}, before.get("files") or {}
     out += [f"git's {name}" for name in sorted(set(files_now) | set(files_before))
@@ -315,7 +317,8 @@ def git_state_changes(worktree: Path, baseline: dict[str, Any]) -> list[Violatio
     if not out:
         return []
     return [Violation("outside_output", "changed since the step started, so no git command reads the tree: "
-                      + ", ".join(out))]
+                      + ", ".join(out) + ". Put it back as it was; to accept the change, retry the step "
+                      "(`agentflow retry`), which takes a new baseline (an approval keeps the old one)")]
 
 
 def outside_only(worktree: Path, only: str, baseline: dict[str, Any] | None = None) -> list[Violation]:
@@ -429,7 +432,7 @@ def commit_artifact(worktree: Path, message: str, cfg: Config, path: str, expect
             data = handle.read()
     finally:
         os.close(fd)
-    hashed = subprocess.run(["git", "hash-object", "--no-filters", "--stdin"], cwd=worktree, input=data,
+    hashed = subprocess.run(["git", *HARDENED, "hash-object", "--no-filters", "--stdin"], cwd=worktree, input=data,
                             capture_output=True, check=False)
     if hashed.returncode != 0:
         detail = hashed.stderr.decode("utf-8", "replace").strip() or f"exit {hashed.returncode}"
@@ -1046,7 +1049,8 @@ def git_state(worktree: Path, branch: str | None = None) -> dict[str, Any]:
     every scope (`git config --list --show-origin`; with `branch`, other branches' `branch.<name>.*` keys left out),
     the push URL of `origin`, and the control files of the checkout and of the repository it shares (`info/exclude`,
     `info/attributes`, `info/sparse-checkout`, `info/grafts`, `hooks/`, `commondir`, `gitdir`, the worktree's `.git`
-    file). The config files themselves are read only through the listing, which holds every value they set (and
+    file), and the replace refs (`refs/replace/*`: a replaced object makes git read a forged one). The config files
+    themselves are read only through the listing, which holds every value they set (and
     every value they include), so another branch's keys written to the shared `config` change nothing here. Two
     equal values mean nothing of it changed. Read with `HARDENED`; nothing it reads runs a command."""
     worktree = Path(worktree)
@@ -1065,7 +1069,9 @@ def git_state(worktree: Path, branch: str | None = None) -> dict[str, Any]:
     marks = {name: _file_mark(path) for name, path in files.items() if name != "dot_git"}
     dot_git = files["dot_git"]  # a linked worktree's `.git` file; a main checkout's folder is read file by file above
     marks["dot_git"] = ("dir",) if dot_git.is_dir() and not dot_git.is_symlink() else _file_mark(dot_git)
-    return {"config": hashlib.sha256(_config_listing(worktree, branch)).hexdigest(), "push_url": url, "files": marks}
+    replaced = _git_or_raise(worktree, *HARDENED, "for-each-ref", "--format=%(refname) %(objectname)", "refs/replace")
+    return {"config": hashlib.sha256(_config_listing(worktree, branch)).hexdigest(), "push_url": url, "files": marks,
+            "replace_refs": hashlib.sha256(replaced.encode("utf-8", "surrogateescape")).hexdigest()}
 
 
 def tree_state(worktree: Path) -> dict[str, Any]:

@@ -27,8 +27,9 @@ ViolationKind = Literal["forbidden_path", "agent_commit", "rejected_trailer", "u
                         "outside_output"]
 
 # Run first on every git call the runner makes after an agent may have touched the repository's shared git state:
-# no hook and no fsmonitor command runs (the agent could have planted either), and nothing is hidden from status.
-HARDENED = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+# no hook and no fsmonitor command runs (the agent could have planted either), nothing is hidden from status, and no
+# `refs/replace` object stands in for a real one (a replaced `HEAD` would make every comparison read a forged tree).
+HARDENED = ("--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
 
 
 @dataclass(frozen=True)
@@ -64,7 +65,7 @@ def snapshot(worktree: Path) -> str:
 
 def changed_paths(worktree: Path, tree_a: str, tree_b: str) -> list[str]:
     """Paths that differ between two trees (added, modified, deleted), sorted."""
-    out = _git(Path(worktree), "diff-tree", "-r", "--name-only", "--no-renames", "-z", tree_a, tree_b)
+    out = _git(Path(worktree), *HARDENED, "diff-tree", "-r", "--name-only", "--no-renames", "-z", tree_a, tree_b)
     return sorted(p for p in out.split("\0") if p)
 
 
@@ -151,13 +152,13 @@ def check_step(
     for path in changed_paths(worktree, start_tree, end_tree):
         if any(path_matches(path, pattern) for pattern in patterns):
             violations.append(Violation("forbidden_path", path))
-    head = _git(worktree, "rev-parse", "HEAD").strip()
+    head = _git(worktree, *HARDENED, "rev-parse", "HEAD").strip()
     if head != start_head:
         violations.append(Violation("agent_commit", f"HEAD moved from {start_head[:12]} to {head[:12]}"))
         try:
-            messages = _git(worktree, "log", "--format=%B%x00", f"{start_head}..{head}")
+            messages = _git(worktree, *HARDENED, "log", "--format=%B%x00", f"{start_head}..{head}")
         except subprocess.CalledProcessError:
-            messages = _git(worktree, "log", "-1", "--format=%B", head)
+            messages = _git(worktree, *HARDENED, "log", "-1", "--format=%B", head)
         for message in messages.split("\0"):
             violations.extend(v for v in check_message(cfg, message) if v not in violations)
     violations.extend(_user_only_violations(cfg, tool_calls))

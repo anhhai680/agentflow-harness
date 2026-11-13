@@ -1488,6 +1488,8 @@ def _nest_reconcile(data: dict) -> None:
     (_reconciling({"output": None}), "error", "phases.plan.steps[1].reconciles", "output"),
     (_reconciling({"commit": False}), "error", "phases.plan.steps[1].reconciles", "commit: true"),
     (_reconciling({"commit": "per_task"}), "error", "phases.plan.steps[1].reconciles", "commit: true"),
+    (_reconciling({"gates": "build"}), "error", "phases.plan.steps[1].reconciles", "runs no `gates`"),
+    (_reconciling({"gates": ["floor"]}), "error", "phases.plan.steps[1].reconciles", "runs no `gates`"),
     (_both(_reconciling(), lambda d: d["phases"]["plan"]["steps"].insert(
         2, {"id": "again", "lanes": ["feature"], "skill": "writing-plans", "role": "plan", "prompt": "spec.md",
             "output": "docs/plans/x.md", "commit": True, "message": "x", "reconciles": True})),

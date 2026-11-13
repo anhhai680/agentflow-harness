@@ -732,11 +732,11 @@ def test_outside_only_refuses_a_planted_clean_filter_before_it_runs(tmp_git, tmp
     (tmp_git / ".git" / "info").mkdir(exist_ok=True)
     (tmp_git / ".git" / "info" / "attributes").write_text("* filter=x\n", encoding="utf-8")
     _write(tmp_git, ARTIFACT, REVISED)
+    os.utime(tmp_git / "README.md", (1_000_000_000, 1_000_000_000))  # stat-dirty: any status must hash it
     [found] = gitops.outside_only(tmp_git, ARTIFACT, baseline)
     assert found.kind == "outside_output"
     assert "the git config" in found.detail and "info/attributes" in found.detail
     assert not marker.exists()
-    os.utime(tmp_git / "README.md", (1_000_000_000, 1_000_000_000))  # stat-dirty: status must hash it
     gitops.outside_only(tmp_git, ARTIFACT)  # the plant is live: without the baseline, the hardened status runs it
     assert marker.exists()
 
@@ -748,8 +748,8 @@ def test_a_planted_signing_program_is_refused_and_never_runs(tmp_git, cfg, tmp_p
     run_git(tmp_git, "config", "commit.gpgsign", "true")
     run_git(tmp_git, "config", "gpg.program", str(script))
     _write(tmp_git, ARTIFACT, REVISED)
-    assert _outside(gitops.outside_only(tmp_git, ARTIFACT, baseline)) == [
-        "changed since the step started, so no git command reads the tree: the git config"]
+    [refused] = _outside(gitops.outside_only(tmp_git, ARTIFACT, baseline))
+    assert refused.startswith("changed since the step started, so no git command reads the tree: the git config. ")
     assert not marker.exists()
     with pytest.raises(gitops.GitError):  # the commit signs as the config says: unchecked, the plant would run
         gitops.commit_artifact(tmp_git, "Revise the plan.", cfg, ARTIFACT)
@@ -873,3 +873,40 @@ def test_commit_artifact_checks_the_commit_it_created(tmp_git, cfg, monkeypatch)
         gitops.commit_artifact(tmp_git, "Revise the plan.", cfg, ARTIFACT)
     assert caught.value.kind == "outside_output"
     assert _head(tmp_git) != before  # never rolled back silently: a human looks at it
+
+
+
+def test_a_replaced_head_is_seen_through(tmp_git, cfg, tmp_path):
+    """A code edit staged, and `HEAD` replaced (`git replace`) by a commit whose tree already holds it beside the old
+    artifact: read through the replace object, the tree differs from `HEAD` only at the artifact."""
+    _with_artifact(tmp_git)
+    baseline = gitops.reconcile_baseline(tmp_git, None)
+    parent = _head(tmp_git)
+    _write(tmp_git, ARTIFACT, REVISED)
+    _write(tmp_git, "src/app.py", "x = 'EVIL'\n")
+    run_git(tmp_git, "add", "src/app.py")
+    tree = run_git(tmp_git, "write-tree").strip()
+    env = {**os.environ, "GIT_INDEX_FILE": str(tmp_path / "forged-index")}
+    import subprocess
+
+    subprocess.run(["git", "read-tree", tree], cwd=tmp_git, env=env, check=True)
+    old_artifact = run_git(tmp_git, "rev-parse", f"HEAD:{ARTIFACT}").strip()
+    subprocess.run(["git", "update-index", "--cacheinfo", f"100644,{old_artifact},{ARTIFACT}"], cwd=tmp_git, env=env,
+                   check=True)
+    forged_tree = subprocess.run(["git", "write-tree"], cwd=tmp_git, env=env, capture_output=True, text=True,
+                                 check=True).stdout.strip()
+    forged = run_git(tmp_git, "commit-tree", forged_tree, "-m", "artifact").strip()
+    run_git(tmp_git, "replace", parent, forged)
+    assert run_git(tmp_git, "status", "--porcelain").split() == ["M", ARTIFACT]  # plain git is fooled
+    [state] = gitops.outside_only(tmp_git, ARTIFACT, baseline)  # the replace ref is a git state change
+    assert "the replace refs" in state.detail
+    assert "'src/app.py'" in _outside(gitops.outside_only(tmp_git, ARTIFACT))  # and the status sees the real HEAD
+    try:
+        sha = gitops.commit_artifact(tmp_git, "Revise the plan.", cfg, ARTIFACT, expected_head=parent)
+    except CommitRejected as exc:
+        assert "'src/app.py'" in str(exc)  # the index holds it beside the artifact
+    else:
+        real = run_git(tmp_git, "--no-replace-objects", "diff-tree", "--no-commit-id", "--name-only", "-r", sha).split()
+        pytest.fail(f"the reconcile commit was made, and really holds {real}")
+    assert _head(tmp_git) == parent  # nothing committed, and the index back at the real HEAD:
+    assert run_git(tmp_git, "--no-replace-objects", "diff", "--cached", "--name-only") == ""

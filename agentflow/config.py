@@ -1645,6 +1645,9 @@ class _Validator:
                     self.error(path, "a reconciles step needs an `output`: the artifact it may change")
                 if step.commit is not True:
                     self.error(path, "a reconciles step needs `commit: true`")
+                if step.gates:
+                    self.error(path, "a reconciles step runs no `gates`: it edits one document and runs no commands, "
+                                     "and the caches a gate writes would stop it as output outside its artifact")
 
     def reconcile_order(self) -> None:
         """Per lane: at most one reconcile step in a phase, before the steps that block on findings. And the two

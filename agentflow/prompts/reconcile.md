@@ -16,6 +16,7 @@ Read the artifact, the contract it is judged against (the task and issue files i
 
 Rules:
 - Edit only `{reconcile_output}`. Never edit another file: the runner refuses a commit that touches one. Do not write code.
+- Do not run commands, tests or tools that write files (caches count): read files only, and edit only the artifact. The runner stops the step on any other change in the tree.
 - Never add an Open Question, and never change the artifact's status line.
 - A decision the docs do not settle, and every `human_decision`, becomes a `needs_human` question of kind `boundary`, never `spec_gap` (the runner answers those itself and files them into the approved spec). The question's `id` is the finding's id (`R<n>-F<m>`, as the list above prints it), so the runner can tie the human's answer to that finding. In a plan, a finding that the spec itself is wrong is also a `boundary` question.
 - Do not answer `unchanged`. Return `done` with `dispositions` even when you changed nothing. Do not mark a finding `actionable` unless the artifact now differs: the runner compares the file.

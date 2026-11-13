@@ -388,7 +388,7 @@ def test_the_doubt_prompts_carry_the_contract():
     classes = ("human_decision", "contract_misread", "actionable", "trade_off", "noise")
     positions = [text.index(f"`{c}`") for c in classes]
     assert positions == sorted(positions)
-    for needed in ("dispositions", "boundary", "Do not answer `unchanged`", "{refine_note}"):
+    for needed in ("dispositions", "boundary", "Do not answer `unchanged`", "{refine_note}", "Do not run commands"):
         assert needed in text, needed
 
 

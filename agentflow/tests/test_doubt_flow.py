@@ -19,6 +19,7 @@ from agentflow.feature_lane import _open_findings
 from agentflow.hitl import answer, approve, reject
 from agentflow.lanes import HANDOFF_LINE, Executor, build_prompt
 from agentflow.pipeline import DEFAULT_SHOW, RunOptions, advance, approval_text, dry_run, start
+from agentflow.run_control import retry
 from agentflow.state import Run
 from conftest import run_git, with_doubt
 
@@ -580,25 +581,68 @@ def test_a_planted_attribute_filter_is_refused_before_it_runs(flow, tmp_path):
     assert marker.exists()
 
 
-def test_a_resumed_reconcile_step_keeps_its_baseline_until_a_human_approves(flow):
+def test_an_approval_never_adopts_a_changed_git_state(flow):
     boundary = {"id": "R1-F1", "question": "Giữ thiết kế?", "evidence": [], "kind": "boundary",
                 "options": [{"key": "A", "label": "Giữ"}, {"key": "B", "label": "Đổi"}]}
     asks = {"write": {SPEC: EDITED}, "result": {"status": "needs_human", "summary": "cần", "questions": [boundary]}}
     run = begin(flow, {REVIEW: [found(HIGH), done("sạch")],
                        RECONCILE: [asks, done("xong", dispositions=[disp("R1-F1", "actionable")])]})
     assert go(flow, run) == "waiting_human"
-    common = Path(run_git(flow.root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
-    (common / "info").mkdir(exist_ok=True)
-    (common / "info" / "attributes").write_text("*.md diff\n", encoding="utf-8")  # changed while it waited
+    run_git(flow.root, "config", "agentflow.planted", "yes")  # changed while the step waited
     answer(run, RECONCILE, {"R1-F1": "A"}, by="me")
     assert go(flow, run) == "waiting_human"  # an answer resumes the step on the baseline it recorded
-    [[violation]] = tripped(run)
-    assert "info/attributes" in violation["detail"]
-    assert called(flow).count(RECONCILE) == 1
-    approve(run, RECONCILE, by="me")  # a human looked at the tree: a new baseline
+    assert "the git config" in tripped(run)[-1][0]["detail"]
+    approve(run, RECONCILE, by="me")
+    assert go(flow, run) == "waiting_human"  # an approval keeps the git state of the step's first start
+    assert len(tripped(run)) == 2 and "the git config" in tripped(run)[-1][0]["detail"]
+    assert "agentflow retry" in tripped(run)[-1][0]["detail"]
+    assert called(flow).count(RECONCILE) == 1 and committed(run) == []
+    retry(run, RECONCILE, by="me")  # a human who accepts the change retries the step: a new baseline
     assert go(flow, run) == "awaiting_approval"
     [sha] = committed(run)
     assert files_of(run, sha) == [SPEC]
+
+
+BLOCKED = {"write": {SPEC: EDITED}, "result": {"status": "blocked", "summary": "kẹt"}}
+
+
+def test_an_approval_reads_the_ignored_files_again(flow):
+    run = begin(flow, {REVIEW: [found(HIGH), done("sạch")],
+                       RECONCILE: [BLOCKED, done("xong", dispositions=[disp("R1-F1", "actionable")])]})
+    assert go(flow, run) == "waiting_human"
+    cache = worktree(run) / "src" / "__pycache__" / "x.pyc"  # ignored: a human's tool wrote it while the step waited
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"x")
+    approve(run, RECONCILE, by="me")
+    assert go(flow, run) == "awaiting_approval"
+    assert len([e for e in events(run, "reconcile_baseline") if e["key"] == RECONCILE]) == 2
+    [sha] = committed(run)
+    assert files_of(run, sha) == [SPEC]
+
+
+def test_a_resumed_reconcile_step_is_checked_after_its_agents_are_gone(flow, tmp_path, monkeypatch):
+    """An agent of the step still running when the runner resumes it plants a filter during the wait: the check runs
+    after the wait, so the snapshot of the approved tree never runs the filter."""
+    marker = tmp_path / "filter-ran"
+    script = tmp_path / "filter.sh"
+    script.write_text(f'#!/bin/sh\necho ran >> "{marker}"\ncat\n', encoding="utf-8")
+    script.chmod(0o755)
+    run = begin(flow, {REVIEW: [found(HIGH), done("sạch")],
+                       RECONCILE: [BLOCKED, done("xong", dispositions=[disp("R1-F1", "actionable")])]})
+    assert go(flow, run) == "waiting_human"
+    approve(run, RECONCILE, by="me")  # a blocked step resumes its session, and an approval snapshots the tree first
+    common = Path(run_git(flow.root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+
+    def orphan_plants(*_a, **_k):
+        run_git(flow.root, "config", "filter.x.clean", str(script))
+        (common / "info").mkdir(exist_ok=True)
+        (common / "info" / "attributes").write_text("* filter=x\n", encoding="utf-8")
+
+    monkeypatch.setattr(lanes, "wait_for_agents", orphan_plants)
+    assert go(flow, run) == "waiting_human"
+    assert "info/attributes" in tripped(run)[-1][0]["detail"]
+    assert not marker.exists()
+    assert called(flow).count(RECONCILE) == 1
 
 
 
@@ -614,7 +658,8 @@ def test_a_planted_signing_program_is_refused_before_the_commit(flow, tmp_path):
     run = begin(flow, {REVIEW: [found(HIGH)], RECONCILE: [plants]})
     assert go(flow, run) == "waiting_human"
     [[violation]] = tripped(run)
-    assert violation == {"kind": "outside_output",
-                         "detail": "changed since the step started, so no git command reads the tree: the git config"}
+    assert violation["kind"] == "outside_output"
+    assert violation["detail"].startswith("changed since the step started, so no git command reads the tree: "
+                                          "the git config. ")
     assert committed(run) == []
     assert not marker.exists()
