@@ -49,6 +49,8 @@ The full suite is slow. While you work, run the test files you touched, and run 
 
 `CHANGELOG.md` records every change a user can see, in [Keep a Changelog](https://keepachangelog.com) format. A change adds one line under `## [Unreleased]` (`Added`, `Changed`, `Fixed` or `Removed`). A release bumps `pyproject.toml` and `pack.ENGINE_VERSION` together, renames `[Unreleased]` to the new version and date, and opens a fresh `[Unreleased]`. The dashboard header shows `pack.ENGINE_VERSION`. `test_packaging` fails if the changelog has no entry for it.
 
+A change that drops or rewords text in an engine prompt (`agentflow/prompts/*.md`) also adds a `Retired` entry to `agentflow/pack_fix.py`, so `validate` can find packs whose overrides still carry the old text and `validate --fix` can repair them (`docs/specs/agentflow-validate-fix-proposal.md`).
+
 ## Engine architecture
 
 **Core rule:** the model never decides the next phase. The runner walks the pack's `phases:`. A lane (`feature | bug`, plus `eval | design` in the `python` fixture pack) picks which steps run, and `conditions:` decide what gets skipped. Conditions are evaluated from files and git, never by a model. The harness proposal relaxes this to "the model proposes, the harness disposes", but that work isn't built yet.
