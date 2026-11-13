@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from agentflow import finished, pack, sources, work_source
 from agentflow.config import ON_UNKNOWN_VALUES, Config, Phase, Step, check_lane, for_lane, resolve_model
+from agentflow.doubt import RECONCILE_ONLY
 from agentflow.gitops import GhError, changed_files, gh_json
 from agentflow.guards import path_matches
 from agentflow.state import SLUG_PARAMS, slugify
@@ -484,7 +485,10 @@ class ExplainLine:
 
 
 def _step_verdict(cfg: Config, step: Step, ctx: Ctx) -> tuple[str, str]:
-    """`(verdict, reason)` from the step's `when` and `unless`."""
+    """`(verdict, reason)` from the step's `when` and `unless`. A `reconciles` step is skipped: it runs only in a
+    reconcile round, which `explain` never shows."""
+    if step.reconciles:
+        return "skip", RECONCILE_ONLY
     reasons: list[str] = []
     if step.when is not None:
         result = evaluate(cfg, step.when, ctx)

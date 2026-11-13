@@ -160,6 +160,7 @@ PROMPT_PLACEHOLDERS = frozenset(
         "skill",
         "base_ref",
         "self_checks",
+        "reconcile_output",
         # sizer prompts (`sizing_lane.py`)
         "task_card",
         "task_cards",
@@ -171,8 +172,9 @@ PERMISSION_MODES = ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypass
 EXPECT_VALUES = ("red", "green")
 ON_FAIL_VALUES = ("block",)
 CONFORMANCE_FAILED = "conformance_failed"  # the audit at `finish` found an obligation with no evidence (`block` mode)
+RECONCILE_CHANGED = "reconcile_changed_conditions"  # a reconcile edit changed which steps of its phase run
 NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable",
-                  CONFORMANCE_FAILED)
+                  CONFORMANCE_FAILED, RECONCILE_CHANGED)
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 

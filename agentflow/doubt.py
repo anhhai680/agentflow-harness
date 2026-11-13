@@ -135,6 +135,12 @@ def since_human_round(events: list[dict], phase: str) -> list[dict]:
     return [event for event in events[start + 1:] if _of_phase(event, phase)]
 
 
+def next_round(events: list[dict], phase: str) -> int:
+    """The number of the phase's next reconcile round: 1 after a human round, then 2, … (`R<n>-F<m>` ids use it)."""
+    return 1 + sum(1 for e in since_human_round(events, phase)
+                   if e.get("type") == "phase_rejected" and e.get("kind") == RECONCILE)
+
+
 @dataclass
 class _Round:
     n: int
@@ -495,6 +501,21 @@ def page_lines(cfg: Config, run: Run, phase: str, lane: str) -> list[str]:
         if reason in STOP_LINES:
             lines.append(STOP_LINES[reason])
     return lines + [_line(row) for row in model.rows]
+
+
+def settled(cfg: Config, events: list[dict], phase: str, lane: str, stop: str) -> dict | None:
+    """The fields of `doubt_settled` when the phase raises its approval: what its doubt review did since the last
+    human round, and why the rounds ended (`stop`: `clean` or one of STOP_REASONS). None when the review never
+    finished since that round (skipped, or no reconcile step), so no signal is written for it."""
+    model = _model(cfg, events, phase, lane)
+    if model is None:
+        return None
+    _, rounds = _split(since_human_round(events, phase))
+    first = len(_round_findings(rounds[0])) if rounds else sum(1 for r in model.rows if r.ident)
+    classes = Counter(r.cls for r in model.rows if r.cls is not None)
+    return {"reviews": model.reviews, "rounds": model.rounds, "first_blocking": first, "open": model.open,
+            "stop": stop, "actionable": classes["actionable"], "noise": classes["noise"],
+            "misread": classes["contract_misread"]}
 
 
 def handoff_risks(cfg: Config, run: Run, phase: str, lane: str) -> list[str]:

@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RETRO_PIPELINE, Config
+from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RECONCILE_CHANGED, RETRO_PIPELINE, Config
 from .events import nfc, parse_iso
 from .state import TERMINAL, Run, list_runs
 
@@ -41,7 +41,9 @@ NOTIFY_TIMEOUT_S = 10
 MESSAGE_MAX = 240
 # Stops that `approve` settles for good (the row becomes done). Every other stop without questions is
 # one the runner raised on a step that has not finished, so `approve` makes that step resumable.
-CLEARED_BY_APPROVE = ("checkpoint", "max_rounds")
+# `RECONCILE_CHANGED`: a reconcile step's edit changed which steps of its phase run. The step finished, and `approve`
+# accepts the edit as it is.
+CLEARED_BY_APPROVE = ("checkpoint", "max_rounds", RECONCILE_CHANGED)
 # A retro run walks no phase and is never resumed (`pipeline.advance` refuses it), so a stop of one has one way out.
 RETRO_WAY_OUT = "cancel it and run `agentflow retro` again"
 
@@ -632,14 +634,29 @@ def reject(run: Run, target: str, by: str, note: str) -> None:
 def open_refine(run: Run, phase: str, by: str, note: str, extra: dict | None = None,
                 scope: str | None = None) -> None:
     """Send `phase` back for a refine round: what a rejection does, and what the runner does with findings.
-    With `scope` (`<phase>/<step>/task-<n>`) only that plan task's steps are refined."""
+    With `scope` (`<phase>/<step>/task-<n>`) only that plan task's steps are refined.
+
+    A reconcile round (`extra["kind"] == "reconcile"`, which the runner opens on a doubt review's findings) is not a
+    human's round: its `round` stays the phase's current one, and `reconcile_round` counts the reconcile rounds since
+    the last human round, so a human's first rejection after them is still round 1."""
+    from agentflow.doubt import RECONCILE, next_round  # it imports this module
+
     note = nfc(note).strip()
-    round_ = run.state["phases"].get(phase, {}).get("round", 0) + 1
-    note_path = run.refine_note_path(phase, round_)
+    extra = dict(extra or {})
+    current = run.state["phases"].get(phase, {}).get("round", 0)
+    if extra.get("kind") == RECONCILE:
+        round_, reconcile_round = current, next_round(run.events.read(), phase)
+        extra["reconcile_round"] = reconcile_round
+        note_path = run.refine_note_path(phase, f"{round_}-r{reconcile_round}")
+        title = f"Reconcile round {reconcile_round} of {phase}"
+    else:
+        round_ = current + 1
+        note_path = run.refine_note_path(phase, round_)
+        title = f"Refine round {round_} of {phase}"
     note_path.parent.mkdir(parents=True, exist_ok=True)
-    note_path.write_text(nfc(f"# Refine round {round_} of {phase}\n\nRejected by {by}.\n\n{note}\n"), encoding="utf-8")
+    note_path.write_text(nfc(f"# {title}\n\nRejected by {by}.\n\n{note}\n"), encoding="utf-8")
     scoped = {"scope": scope} if scope else {}
-    run.emit("phase_rejected", by=by, phase=phase, round=round_, note=note, **(extra or {}), **scoped)
+    run.emit("phase_rejected", by=by, phase=phase, round=round_, note=note, **extra, **scoped)
 
 
 def remind_due(cfg: Config, repo: Path, now: datetime | None = None) -> list[str]:
