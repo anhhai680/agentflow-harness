@@ -17,9 +17,12 @@ from agentflow.hitl import approve
 from agentflow.sizing_lane import SizingLane
 from agentflow.state import Run
 from conftest import ENGINE
-from test_retro import gh_log  # noqa: F401  (the fake `gh` fixture the retro test needs)
+import test_retro
 from test_agent_step import DONE, KEY, _interrupted, make_phase, make_step, pairs, run_step
 from test_feature_lane import BIG, IMPL, PLAN_PATH, REVIEW, begin_build, build, build_with, needs_human
+
+# The fake `gh` fixture the retro test needs, bound by assignment so pytest finds it here and the test's `gh_log` parameter doesn't redefine an import.
+gh_log = test_retro.gh_log
 
 SIZE_KEY = f"{KEY}/size"
 ANSWERS = dict.fromkeys(sizing.QUESTIONS, "no")
