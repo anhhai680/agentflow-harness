@@ -10,6 +10,9 @@ A release that drops or rewords text in an engine prompt adds a `Retired` entry 
 """
 from __future__ import annotations
 
+import difflib
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -153,3 +156,67 @@ def findings(config_path: Path) -> Findings:
             continue
         out.fixes.append(Fix(path, before, None if after == engine else after))
     return out
+
+
+# ---- applying the fixes (`agentflow validate --fix`)
+
+_PROMPT_NAME = re.compile(r"[A-Za-z0-9_.-]+\.md")
+
+
+class FixRefused(Exception):
+    """`validate --fix` will not touch this pack at all."""
+
+
+def check_pack(repo: Path) -> None:
+    """Refuse `--fix` inside an agentflow run (an agent never changes the pack), and on a pack whose folder or
+    `prompts/` folder is a symlink (the writes would land outside the repository)."""
+    if os.environ.get("AGENTFLOW_RUN"):
+        raise FixRefused("validate --fix never runs inside an agentflow run")
+    for folder in (Path(repo) / pack.PACK_DIR, Path(repo) / pack.PACK_DIR / "prompts"):
+        if folder.is_symlink():
+            raise FixRefused(f"{folder} is a symlink")
+
+
+def _rel(path: Path, repo: Path) -> str:
+    return os.path.relpath(path, repo)
+
+
+def render(fix: Fix, repo: Path) -> str:
+    """What the fix does, as a unified diff with `a/` and `b/` headers, or `delete <path>`."""
+    rel = _rel(fix.path, repo)
+    if fix.after is None:
+        return f"delete {rel}\n"
+    lines = difflib.unified_diff(fix.before.decode("utf-8").splitlines(keepends=True),
+                                 fix.after.decode("utf-8").splitlines(keepends=True),
+                                 fromfile=f"a/{rel}", tofile=f"b/{rel}")
+    return "".join(line if line.endswith("\n") else line + "\n" for line in lines)
+
+
+def _inside_prompts(path: Path) -> bool:
+    folder = path.parent
+    return (bool(_PROMPT_NAME.fullmatch(path.name)) and folder.name == "prompts" and folder.parent.name == pack.PACK_DIR
+            and not folder.is_symlink() and not folder.parent.is_symlink())
+
+
+def apply(fixes: list[Fix]) -> tuple[list[Fix], list[Skipped]]:
+    """Write or delete each fix's file, only when it still holds the bytes `findings` read and sits directly in a
+    real `.agentflow/prompts/` folder. Returns the fixes applied and the files skipped."""
+    applied: list[Fix] = []
+    skipped: list[Skipped] = []
+    for fix in fixes:
+        if not _inside_prompts(fix.path):
+            skipped.append(Skipped(fix.path, "outside .agentflow/prompts"))
+            continue
+        try:
+            now = safeio.read_bytes(fix.path, MAX_PROMPT_BYTES)
+        except (OSError, ValueError):
+            now = None
+        if now != fix.before:
+            skipped.append(Skipped(fix.path, "changed since it was read"))
+            continue
+        if fix.after is None:
+            safeio.remove(fix.path)
+        else:
+            safeio.write_text(fix.path, fix.after.decode("utf-8"))
+        applied.append(fix)
+    return applied, skipped

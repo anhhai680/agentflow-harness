@@ -332,6 +332,7 @@ agentflow init [--starter NAME] [--baseline]        # write a sparse pack for th
 agentflow doctor                                    # agent CLIs and logins, gh, origin, Docker, state dir, gate tools,
                                                     #   and the inherited variables a run drops (names only)
 agentflow validate                                  # after every config edit; 0 warnings
+agentflow validate --fix [--dry-run]                # repair what validate marks (fixable); never commits
 agentflow config show                               # the pack file as written
 agentflow config show --effective [PREFIX]          # every value after the layers merge, with its layer
                                                     #   (engine, project or user); PREFIX e.g. defaults, agents.claude
@@ -412,6 +413,8 @@ The engine (`agentflow/`) names no project: everything a repository decides is i
 6. **Check:** `agentflow doctor` (agent CLIs and logins, `gh`, `origin`, Docker, the state dir, each gate's programs), `agentflow validate` (it must print 0 warnings), `agentflow explain feature --module <id>`, and `agentflow run feature --module <id> --dry-run`. Then commit the pack in a PR of its own, so the team reviews the gates and the permission line.
 
 Prompts: put any prompt you want worded differently in `.agentflow/prompts/<name>.md`; it replaces the engine's file of the same name. Skills: a step's skill text is its brief, read from the repository's `project.skills_dir` first and the engine's bundled `agentflow-*` skills second; map your own skills per stage in `skills.map` (section 14). A repository with no skills dir runs on the bundled ones.
+
+After upgrading the engine, run `agentflow validate`: a prompt override that still holds text the engine retired, or that copies an engine prompt unchanged, is a warning, and `agentflow validate --fix --dry-run` shows what `--fix` would change.
 
 Runs, workspaces and worktrees live in the state dir, outside the repository unless `paths.state_dir` puts them inside it; then add that directory to `.gitignore` (`agentflow validate` warns until you do). Removing agentflow from a repository is `rm -rf .agentflow`.
 

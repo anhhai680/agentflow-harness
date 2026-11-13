@@ -131,3 +131,111 @@ def test_cli_marks_fixable_and_hints(pack_repo_python, monkeypatch, capsys):
     lines = capsys.readouterr().out.splitlines()
     assert any(line.startswith("warning prompts/_result.md: ") and line.endswith(" (fixable)") for line in lines)
     assert lines[-1] == "1 fixable: run agentflow validate --fix"
+
+
+# ---- validate --fix
+
+
+def cli(repo: Path, monkeypatch, capsys, *args: str) -> tuple[int, str]:
+    monkeypatch.chdir(repo)
+    code = flow.main(["validate", *args])
+    return code, capsys.readouterr().out
+
+
+def test_dry_run_prints_the_diff_and_writes_nothing(pack_repo_python, monkeypatch, capsys):
+    path = put(pack_repo_python, "_result.md", OLD_RESULT + "\nPack wording.\n")
+    before = path.read_bytes()
+    code, out = cli(pack_repo_python, monkeypatch, capsys, "--fix", "--dry-run")
+    assert code == 0
+    assert "--- a/.agentflow/prompts/_result.md" in out
+    assert any(line.startswith("-") and "effort_change" in line for line in out.splitlines())
+    assert "nothing written" in out
+    assert path.read_bytes() == before
+
+
+def test_fix_rewrites_then_validates_clean(pack_repo_python, monkeypatch, capsys, git):
+    path = put(pack_repo_python, "_result.md", OLD_RESULT + "\nPack wording.\n")
+    git(pack_repo_python, "add", "-A")
+    git(pack_repo_python, "commit", "-q", "-m", "old override")
+    code, out = cli(pack_repo_python, monkeypatch, capsys, "--fix")
+    assert code == 0, out
+    assert path.read_text(encoding="utf-8") == engine("_result.md") + "\nPack wording.\n"
+    assert out.splitlines()[-1] == "ok: config.yaml is valid (0 warnings)"
+    assert git(pack_repo_python, "status", "--porcelain").splitlines() == [" M .agentflow/prompts/_result.md"]
+
+
+def test_fix_deletes_identical_and_landed_overrides(pack_repo_python, monkeypatch, capsys):
+    task = put(pack_repo_python, "task.md", engine("task.md"))
+    result = put(pack_repo_python, "_result.md", OLD_RESULT)
+    code, out = cli(pack_repo_python, monkeypatch, capsys, "--fix")
+    assert code == 0, out
+    assert not task.exists() and not result.exists()
+    assert "delete .agentflow/prompts/task.md" in out
+
+
+def test_fix_leaves_edited_text(pack_repo_python, monkeypatch, capsys):
+    path = put(pack_repo_python, "_result.md", EDITED_RESULT)
+    code, out = cli(pack_repo_python, monkeypatch, capsys, "--fix")
+    assert code == 0, out
+    assert path.read_text(encoding="utf-8") == EDITED_RESULT
+    assert "which the engine retired" in out
+
+
+def test_changed_since_read_is_skipped(pack_repo_python):
+    path = put(pack_repo_python, "_result.md", OLD_RESULT + "\nPack wording.\n")
+    fixes = found(pack_repo_python).fixes
+    path.write_text("edited meanwhile\n", encoding="utf-8")
+    applied, skipped = pack_fix.apply(fixes)
+    assert applied == []
+    assert [(s.path, s.reason) for s in skipped] == [(path, "changed since it was read")]
+    assert path.read_text(encoding="utf-8") == "edited meanwhile\n"
+
+
+def test_apply_refuses_a_path_outside_the_prompts(pack_repo_python, tmp_path):
+    outside = tmp_path / "elsewhere.md"
+    outside.write_text("x", encoding="utf-8")
+    applied, skipped = pack_fix.apply([pack_fix.Fix(outside, b"x", None)])
+    assert applied == [] and [s.reason for s in skipped] == ["outside .agentflow/prompts"]
+    assert outside.exists()
+
+
+def test_symlinked_prompts_dir_is_refused(pack_repo_python, monkeypatch, capsys, tmp_path):
+    target = tmp_path / "shared-prompts"
+    target.mkdir()
+    (target / "_result.md").write_text(OLD_RESULT, encoding="utf-8")
+    folder = prompts(pack_repo_python)
+    for file in folder.iterdir():
+        file.unlink()
+    folder.rmdir()
+    os.symlink(target, folder)
+    code, out = cli(pack_repo_python, monkeypatch, capsys, "--fix")
+    assert code == 1
+    assert "is a symlink" in out
+    assert (target / "_result.md").read_text(encoding="utf-8") == OLD_RESULT
+
+
+def test_refused_inside_a_run(pack_repo_python, monkeypatch, capsys):
+    path = put(pack_repo_python, "_result.md", OLD_RESULT)
+    monkeypatch.setenv("AGENTFLOW_RUN", "r1")
+    code, out = cli(pack_repo_python, monkeypatch, capsys, "--fix")
+    assert code == 1
+    assert "never runs inside an agentflow run" in out
+    assert path.read_text(encoding="utf-8") == OLD_RESULT
+
+
+def test_fix_with_config_is_refused(pack_repo_python, monkeypatch, capsys):
+    code, out = cli(pack_repo_python, monkeypatch, capsys, "--fix", "--config", str(pack.pack_config(pack_repo_python)))
+    assert code == 1
+    assert "works only on the repository's own pack" in out
+
+
+def test_dry_run_without_fix_is_a_usage_error(pack_repo_python, monkeypatch, capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli(pack_repo_python, monkeypatch, capsys, "--dry-run")
+    assert exc.value.code == 2
+
+
+def test_fix_names_skipped_files(pack_repo_python, monkeypatch, capsys):
+    os.symlink(pack.ENGINE_PROMPTS / "task.md", prompts(pack_repo_python) / "x.md")
+    code, out = cli(pack_repo_python, monkeypatch, capsys, "--fix")
+    assert "skipped .agentflow/prompts/x.md: a symlink" in out

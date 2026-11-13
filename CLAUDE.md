@@ -32,6 +32,7 @@ uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_port
 
 uv tool install --reinstall --from . agentflow # install (or refresh) the packaged tool from this checkout
 bin/agentflow validate                         # run after every config edit; it must print "0 warnings"
+bin/agentflow validate --fix [--dry-run]       # repair the warnings validate marks (fixable)
 bin/agentflow explain <lane> --module <id>     # what a lane would run, with no agent calls
 bin/agentflow run <lane> ... --dry-run         # prints the commands and creates nothing
 bin/agentflow next | status | inbox | dashboard
@@ -111,7 +112,7 @@ Tests (`agentflow/tests/`):
   - a `tests/test_config_edit.py` case
   - a line in playbook §14 "Pack reference"
 - **Engine floor:** a pack without a non-empty `gate_sets.verify` is refused, `.agentflow/**` is always forbidden in a run, and user-only skills are refused. A pack can add obligations but can't remove these.
-- Changes to `guards.py`, `agents.py`, `config_trust.py`, `safeio.py`, `workspace.py`, `pack.py`, `layers.py`, `detect.py` or `init.py` trigger the pack's security overlay (`overlays.security.when_paths`). Plan and review that work with the `security-and-hardening` skill and the `security-auditor` agent.
+- Changes to `guards.py`, `agents.py`, `config_trust.py`, `safeio.py`, `workspace.py`, `pack.py`, `layers.py`, `detect.py`, `init.py` or `pack_fix.py` trigger the pack's security overlay (`overlays.security.when_paths`). Plan and review that work with the `security-and-hardening` skill and the `security-auditor` agent.
 
 ## Agent workflow
 

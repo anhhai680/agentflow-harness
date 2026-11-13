@@ -7,6 +7,15 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+
+- `agentflow validate --fix [--dry-run]` repairs pack prompts that hold text the engine retired or that copy an engine prompt unchanged; it writes only `.agentflow/prompts/`, never commits, and refuses to run inside a run.
+- `validate` warns about those prompts, marks a warning it can repair `(fixable)` and ends with `N fixable: run agentflow validate --fix`.
+
+### Fixed
+
+- `validate` reports a prompt that is not UTF-8 text as an error instead of stopping on a traceback.
+
 ## [2.5] - 2026-11-13
 
 ### Added
