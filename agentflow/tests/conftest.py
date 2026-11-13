@@ -238,6 +238,32 @@ FLOW_SETTINGS = {"permissions": {"allow": ["Bash(true)", "Bash(false)", "Bash(te
                                  "deny": ["Bash(touch .claude/*)"]}}
 
 
+def with_doubt(data: dict) -> None:
+    """Add the doubt review to the `python` pack's config: a reconcile step and a reviewer in `define` (before
+    `spec_approval`) and in `plan` (after `plan`). A `configure(edit=...)` or `tmp_cfg` callable. The pack's own file
+    stays as it is, because it pins the `explain` goldens."""
+    data["skills"]["map"]["doubt"] = "agentflow-doubt"
+
+    def pair(prefix: str, reconcile_skill: str, review_prompt: str, output: str, message: str, when: str | None) -> list[dict]:
+        review = {"id": f"{prefix}_review", "lanes": ["feature"], "skill": "agentflow-doubt", "role": "review",
+                  "prompt": review_prompt, "blocks_on_findings": True}
+        if when:
+            review["when"] = when
+        return [{"id": f"{prefix}_reconcile", "lanes": ["feature"], "skill": reconcile_skill, "role": "plan",
+                 "prompt": "reconcile.md", "output": output, "reconciles": True, "commit": True, "message": message},
+                review]
+
+    steps = data["phases"]["define"]["steps"]
+    at = next(i for i, step in enumerate(steps) if step.get("id") == "spec_approval")
+    steps[at:at] = pair("spec", "domain-modeling", "spec_review.md", "docs/specs/SPEC-{module}.md",
+                        "Revise SPEC-{module} after its review", "spec_awaits_approval")
+    steps = data["phases"]["plan"]["steps"]
+    plan = next(step for step in steps if step.get("id") == "plan")
+    at = steps.index(plan) + 1
+    steps[at:at] = pair("plan", "writing-plans", "plan_review.md", plan["output"],
+                        "Revise the {module} plan after its review", None)
+
+
 class FlowRepo:
     """A tmp git repo (branches `main`, `next`, bare `origin`) wired to the fake agent.
 

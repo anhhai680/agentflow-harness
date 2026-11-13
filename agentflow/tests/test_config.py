@@ -9,7 +9,7 @@ import yaml
 from agentflow import pack
 from agentflow.config import ConfigError, Evidence, Issue, load_config, parse_evidence, validate
 from agentflow.flow import main, repo_root
-from conftest import PYTHON_CONFIG
+from conftest import PYTHON_CONFIG, with_doubt
 
 CFG = PYTHON_CONFIG
 
@@ -25,6 +25,11 @@ def errors(issues: list[Issue]) -> list[tuple[str, str]]:
 
 def phase_step(data: dict, phase: str, step_id: str) -> dict:
     return next(s for s in data["phases"][phase]["steps"] if s["id"] == step_id)
+
+
+def test_with_doubt_validates_clean(tmp_cfg):
+    baseline = issues_for(tmp_cfg, None)  # the tmp repo has no settings.json, so the bug lane's rule warning is always there
+    assert issues_for(tmp_cfg, with_doubt) == baseline
 
 
 def test_shipped_config_validates(repo_root):
