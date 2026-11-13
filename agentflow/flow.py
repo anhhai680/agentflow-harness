@@ -70,12 +70,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
         return 1
     issues = validate(cfg, repo) + settings_coverage(cfg, repo)
     for issue in issues:
-        print(f"{issue.level} {issue.path}: {issue.message}")
+        print(f"{issue.level} {issue.path}: {issue.message}" + (" (fixable)" if issue.fixable else ""))
     errors = sum(1 for i in issues if i.level == "error")
-    if errors:
-        return 1
-    print(f"ok: {config_path.name} is valid ({len(issues)} warnings)")
-    return 0
+    if not errors:
+        print(f"ok: {config_path.name} is valid ({len(issues)} warnings)")
+    fixable = sum(1 for i in issues if i.fixable)
+    if fixable:
+        print(f"{fixable} fixable: run agentflow validate --fix")
+    return 1 if errors else 0
 
 
 def cmd_config_show(args: argparse.Namespace) -> int:
