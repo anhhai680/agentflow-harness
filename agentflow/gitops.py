@@ -396,8 +396,9 @@ def commit_artifact(worktree: Path, message: str, cfg: Config, path: str, expect
     with one name, whose bytes are hashed with no filters. Then it alone is staged (`--literal-pathspecs`): the index
     must differ from `HEAD` at exactly `path`, as mode 100644 and as that hash, else the index is reset and
     `CommitRejected` (kind `outside_output`) is raised. An unchanged file raises `NothingToCommit`. The commit is the
-    index as checked (no pathspec, so git does not read the file again), with no hook, no fsmonitor and no signing
-    program (`commit.gpgsign=false`). The commit actually created is checked again: one parent, the old `HEAD`;
+    index as checked (no pathspec, so git does not read the file again), with no hook and no fsmonitor; it is signed as
+    the user's git config says, like every runner commit (a changed signing program is refused before this, by the
+    caller's `git_state` compare). The commit actually created is checked again: one parent, the old `HEAD`;
     exactly `path` changed, as mode 100644 and the checked blob; no rejected trailer. A failure there raises
     `CommitRejected` naming the commit, which is left in place for a human (never rolled back silently), as
     `commit_lessons` does."""
@@ -452,7 +453,7 @@ def commit_artifact(worktree: Path, message: str, cfg: Config, path: str, expect
         raise _artifact_refused(worktree, f"the staged {shown(path)} (blob {blob[:12]}) is not the file the runner "
                                 f"checked (blob {wanted[:12]}): it changed, or a filter rewrote it")
     proc = subprocess.run(
-        ["git", *git, "-c", "commit.gpgsign=false", "commit", "--no-verify", "-q", "-F", "-"],
+        ["git", *git, "commit", "--no-verify", "-q", "-F", "-"],
         cwd=worktree, input=text + "\n", capture_output=True, text=True, encoding="utf-8", check=False,
     )
     if proc.returncode != 0:

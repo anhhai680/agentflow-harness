@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -749,13 +748,12 @@ def test_a_planted_signing_program_is_refused_and_never_runs(tmp_git, cfg, tmp_p
     run_git(tmp_git, "config", "commit.gpgsign", "true")
     run_git(tmp_git, "config", "gpg.program", str(script))
     _write(tmp_git, ARTIFACT, REVISED)
-    assert "the git config" in _outside(gitops.outside_only(tmp_git, ARTIFACT, baseline))[0]
-    sha = gitops.commit_artifact(tmp_git, "Revise the plan.", cfg, ARTIFACT)  # its own commit never signs either
+    assert _outside(gitops.outside_only(tmp_git, ARTIFACT, baseline)) == [
+        "changed since the step started, so no git command reads the tree: the git config"]
     assert not marker.exists()
-    assert run_git(tmp_git, "show", "--name-only", "--format=", sha).split() == [ARTIFACT]
-    _write(tmp_git, "README.md", "edited\n")
-    subprocess.run(["git", "commit", "-qam", "x"], cwd=tmp_git, capture_output=True, check=False)
-    assert marker.exists()  # the plant is live: a plain commit runs it
+    with pytest.raises(gitops.GitError):  # the commit signs as the config says: unchecked, the plant would run
+        gitops.commit_artifact(tmp_git, "Revise the plan.", cfg, ARTIFACT)
+    assert marker.exists()
 
 
 @pytest.mark.parametrize("trick", ["assume_unchanged", "skip_worktree", "ignored_folder"])

@@ -599,3 +599,22 @@ def test_a_resumed_reconcile_step_keeps_its_baseline_until_a_human_approves(flow
     assert go(flow, run) == "awaiting_approval"
     [sha] = committed(run)
     assert files_of(run, sha) == [SPEC]
+
+
+
+def test_a_planted_signing_program_is_refused_before_the_commit(flow, tmp_path):
+    marker = tmp_path / "gpg-ran"
+    script = tmp_path / "gpg.sh"
+    script.write_text(f'#!/bin/sh\necho ran >> "{marker}"\nexit 1\n', encoding="utf-8")
+    script.chmod(0o755)
+    common = Path(run_git(flow.root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    config = common / "config"
+    planted = config.read_text(encoding="utf-8") + f"[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = {script}\n"
+    plants = {"write": {SPEC: EDITED, str(config): planted}, **done("sửa", dispositions=[disp("R1-F1", "actionable")])}
+    run = begin(flow, {REVIEW: [found(HIGH)], RECONCILE: [plants]})
+    assert go(flow, run) == "waiting_human"
+    [[violation]] = tripped(run)
+    assert violation == {"kind": "outside_output",
+                         "detail": "changed since the step started, so no git command reads the tree: the git config"}
+    assert committed(run) == []
+    assert not marker.exists()
