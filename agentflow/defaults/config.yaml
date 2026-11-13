@@ -100,7 +100,8 @@ dashboard:
 # ------------------------------------------------------------------------------------------------ the workflow
 # In `define` and `plan` (feature lane), a doubt review (`spec_review`, `plan_review`) runs before the human approves.
 # Its blocking findings open a reconcile round: only the `reconciles: true` step (`spec_reconcile`, `plan_reconcile`)
-# and the review run again. A pack that does not want the review removes the four steps.
+# and the review run again. A pack that does not want the review writes its own `phases:` without the four steps
+# (it replaces this whole workflow; there is no lighter switch).
 
 skills:
   map:                         # each kind of step's skill; a pack maps its own skills here

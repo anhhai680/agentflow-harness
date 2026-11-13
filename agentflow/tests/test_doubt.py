@@ -429,7 +429,20 @@ def test_page_lines_show_every_status(flow_repo):
     assert by_id["R1-F5"].endswith("(fixed)")  # actionable, the artifact changed, and the review did not dispute it
     assert by_id["R1-F6"].endswith("(unresolved)") and "—" not in by_id["R1-F6"]
     assert "The reviewer disputes a disposition: you decide." in lines
-    assert by_id["R2-F1"].endswith("(still open)")  # the dispute itself is a blocking finding left open
+    assert "R2-F1" not in by_id  # the dispute is the same issue as R1-F2: listed once, as disputed
+    assert "3 still open." in lines[0]  # R1-F2 (disputed), R1-F3 (asked a human), R1-F6 (unresolved)
+
+
+def test_a_disputed_finding_is_counted_once(flow_repo):
+    pending = [started(), *reviewed([HIGH]), round_opened([HIGH], 1), reconciled([disp("R1-F1", "noise", "x")], 1)]
+    lines = page(flow_repo, no_note, [*pending, *reviewed([{**HIGH, "text": "still no rollback", "disputes": "R1-F1"}])])
+    assert [line.split(" ", 1)[0] for line in lines[1:] if line.startswith("R")] == ["R1-F1"]
+    assert lines[-1].endswith("(disputed)")
+    assert "1 still open." in lines[0]
+    # a blocking finding that disputes nothing valid is still listed as open
+    lines = page(flow_repo, no_note, [*pending, *reviewed([{**HIGH, "text": "new problem", "disputes": "R9-F9"}])])
+    assert lines[-1].startswith("R2-F1") and lines[-1].endswith("(still open)")
+    assert "1 still open." in lines[0]  # only the new problem: R1-F1 (noise) was recorded, and a review ran after it
 
 
 def test_page_lines_say_a_noise_finding_is_still_open_while_the_artifact_is_unchanged(flow_repo):

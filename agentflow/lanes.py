@@ -1040,6 +1040,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
     def _fail(self, sr: _StepRun, violations: list[Violation]) -> Outcome:
         """A guard tripped: the step fails with no retry, and a human looks at the tree."""
         summary = f"Guard violation in {sr.key}: {_violation_text(violations)}"
+        if sr.step.reconciles and any(v.kind == "outside_output" for v in violations):
+            summary += (". Remove or revert the file(s) named here before you approve or reject: a later step commits "
+                        "the whole work tree.")
         self.run.emit("guard_tripped", key=sr.key, violations=[{"kind": v.kind, "detail": v.detail} for v in violations])
         raise_hitl(self.cfg, self.run, "guard_violation", sr.key, summary)
         self.run.emit("step_finished", key=sr.key, status="failed", summary=summary)

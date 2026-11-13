@@ -19,10 +19,14 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Changed
 
+- A step result whose `dispositions` is not a list is unreadable, as one whose `findings` is not a list already was.
+- Every runner git call that reads the work tree (the snapshot, the commit, the reconcile checks) runs with `--no-replace-objects`, `core.hooksPath=/dev/null` and `core.fsmonitor=false`, so a user's own fsmonitor daemon is skipped, which can slow commits in a very large repository.
 - The autonomy floor: `autonomy.finding_rounds` counts as at least 1, and findings of severity `critical`, `high` or `medium` (or with none) always block, whatever `autonomy.non_blocking_severities` lists. `validate` refuses a value below the floor, and the Settings form refuses one, so a pack that already sets such a value cannot save from the form until its YAML is fixed.
 
 ### Fixed
 
+- `{date}` (so the `plan_target` file name) is pinned at run start in `params["date"]`, so a run resumed on another day keeps its plan path.
+- Commits with explicit paths (the runner's `commit(paths=...)`) treat them as literal pathspecs (`--literal-pathspecs`), so a path with glob characters names only itself.
 - `validate` reports a prompt that is not UTF-8 text as an error instead of stopping on a traceback.
 
 ## [2.5] - 2026-11-13

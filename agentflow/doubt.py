@@ -1,8 +1,9 @@
 """The rules of a reconcile round: what the runner decides, from events and file contents, in a `needs_approval: true`
 phase whose review found blocking problems (`docs/agentflow-doubt-review-proposal.md`, sections 3 to 6).
 
-- **Numbering** (`numbered`): each blocking finding of a round gets an id, `R<round>-F<n>`. An id is unique for the
-  whole run of a phase, so a note, a prompt, a `disputes` value and the approval page all mean the same finding.
+- **Numbering** (`numbered`): each blocking finding of a round gets an id, `R<round>-F<n>`. An id is unique within a human
+  round of a phase (the numbering restarts at 1 after one), and the events that name it are scoped to that round, so a
+  note, a prompt, a `disputes` value and the approval page all mean the same finding.
 - **Dispositions** (`parse_dispositions`, `answered_boundary`, `unresolved`): the reconcile step classifies every
   blocking finding. The runner checks the list and fails closed: whatever it cannot trust stays unresolved.
 - **Stop rules** (`stop_reason`): when another round is not worth opening. Every rule reads only the phase's events
@@ -448,7 +449,10 @@ def _model(cfg: Config, events: list[dict], phase_name: str, lane: str) -> _Doub
     last = rounds[-1].after if rounds else head
     if not rounds or _review_ran(last, flagged):  # the blocking findings no round answered: the review that ended the rounds
         blocking = [f for f in _review_findings(last, flagged) if is_blocking(cfg, f)]
+        counted = _valid_disputes(blocking, earlier)  # a finding that disputes an earlier answer is that issue, shown as disputed
         for n, finding in enumerate(blocking, 1):
+            if finding.get("disputes") in counted:
+                continue
             rows.append(_Row(f"R{len(rounds) + 1}-F{n}", _severity(finding), _text(finding), None, "", "still open"))
     seen: set[tuple[str, str]] = set()
     for segment in [head, *(rnd.after for rnd in rounds)]:  # every review that ran: a carried-over one adds nothing new

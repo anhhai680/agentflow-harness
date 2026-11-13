@@ -169,6 +169,8 @@ def eligible(cfg: Config, kind: str, key: str, questions: list[dict]) -> bool:
     if phase is None or RESOLVE_MARK in key:
         return False
     if kind == QUESTIONS_KIND:
+        if any(step.reconciles and key == f"{phase.name}/{step.id}" for step in phase.steps):
+            return False  # what a reconcile step asks is a human's, whatever its kind: nothing is filed into the spec unseen
         reserved = human_kinds(cfg)
         return (cfg.autonomy.get("answer_recommended") is True and recommended_answers(questions) is not None
                 and not any(str(q.get("kind") or "other") in reserved for q in questions))

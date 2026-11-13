@@ -289,6 +289,21 @@ def test_a_human_decision_waits_for_a_human(flow):
     assert record["unresolved"] == [] and record["dispositions"][0]["class"] == "human_decision"
 
 
+@pytest.mark.parametrize("kind", ["spec_gap", "ambiguity", "other"])
+def test_a_reconcile_question_is_a_humans_whatever_its_kind(flow, kind):
+    question = {"id": "R1-F1", "question": "Điền vào spec?", "evidence": [], "kind": kind,
+                "options": [{"key": "A", "label": "Có", "recommended": True}, {"key": "B", "label": "Không"}]}
+    asks = {"result": {"status": "needs_human", "summary": "cần người", "questions": [question]}}
+    run = begin(flow, {REVIEW: [found(HIGH)],
+                       RECONCILE: [asks, done("ghi lại", dispositions=[disp("R1-F1", "human_decision", "người đã chốt")])]})
+    assert flow.cfg.autonomy.get("answer_recommended") is True and kind not in flow.cfg.autonomy.get("human_question_kinds", ["boundary"])
+    assert go(flow, run) == "waiting_human"
+    assert not [e for e in events(run, "hitl_answered") if e.get("by") == "runner"]
+    assert answer(run, RECONCILE, {"R1-F1": "A"}, by="me")
+    assert go(flow, run) == "awaiting_approval"
+    assert [e["by"] for e in events(run, "hitl_answered")] == ["me"]
+
+
 def test_a_human_rejection_runs_every_step_and_skips_the_reconcile_step(flow):
     run = begin(flow, {REVIEW: [found(HIGH), done("sạch"), found(HIGH), done("sạch")],
                        RECONCILE: [revised(1, disp("R1-F1", "actionable")), revised(2, disp("R1-F1", "actionable"))]})
@@ -411,6 +426,7 @@ def test_a_reconcile_step_that_edits_code_is_refused(flow):
     assert committed(run) == []
     assert not events(run, "forbidden_reverted")
     assert (worktree(run) / STRAY).is_file()  # left for the human, never reverted by the runner
+    assert "Remove or revert the file(s) named here before you approve or reject" in run.state["waiting"]["summary"]
 
 
 def test_a_stray_file_is_never_committed_on_retry(flow):

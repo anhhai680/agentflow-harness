@@ -390,6 +390,8 @@ def test_the_doubt_prompts_carry_the_contract():
     assert positions == sorted(positions)
     for needed in ("dispositions", "boundary", "Do not answer `unchanged`", "{refine_note}", "Do not run commands"):
         assert needed in text, needed
+    # the step's skill text follows the prompt (no {brief} slot), so the prompt says its rules win
+    assert "These rules override the skill below wherever they conflict" in text
 
 
 def test_a_small_plan_uses_executing_plans(pipe):
