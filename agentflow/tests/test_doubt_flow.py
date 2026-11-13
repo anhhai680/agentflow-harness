@@ -103,7 +103,7 @@ def test_a_high_finding_gets_one_reconcile_round(flow):
     assert record["before"] != record["after"]
     text = page(flow, run)
     assert re.search(r"R1-F1 .*actionable.*\(fixed\)", text)
-    assert "refine round" not in text.splitlines()[1]
+    assert "(refine round" not in text
     log = run.events.read()
     approval = next(e["seq"] for e in log if e["type"] == "phase_approval_raised")
     assert not [e for e in log if e["type"] == "hitl_raised" and e["seq"] < approval]
@@ -166,6 +166,33 @@ def test_a_lost_findings_reconciled_is_recovered(flow, monkeypatch):
     assert called(flow).count(REVIEW) == 1
 
 
+def test_a_lost_findings_reconciled_is_recovered_when_the_review_is_skipped(flow, monkeypatch):
+    """The runner dies after the reconcile step, and its edit dropped the status line, so the review is skipped and
+    never recovers the record: settling the phase writes it, once, before the stop."""
+    real = Executor._reconciled
+    crashed: list[bool] = []
+
+    def once(self, phase, key):
+        if not crashed:
+            crashed.append(True)
+            raise RuntimeError("the runner died")
+        return real(self, phase, key)
+
+    monkeypatch.setattr(Executor, "_reconciled", once)
+    no_status = SPEC_TEXT.replace(STATUS + "\n\n", "")
+    run = begin(flow, {REVIEW: [found(HIGH)], RECONCILE: [revised(1, disp("R1-F1", "actionable"), text=no_status)]})
+    with pytest.raises(RuntimeError):
+        go(flow, run)
+    assert not events(run, "findings_reconciled")
+    assert go(flow, run) == "waiting_human"
+    log = run.events.read()
+    records = [e for e in log if e["type"] == "findings_reconciled"]
+    stop = next(e for e in log if e["type"] == "reconcile_changed_conditions")
+    assert len(records) == 1 and records[0]["seq"] < stop["seq"]
+    assert records[0]["unresolved"] == [] and records[0]["before"] != records[0]["after"]
+    assert REVIEW in stop["changed"] and called(flow).count(REVIEW) == 1
+
+
 def test_a_reconcile_edit_that_skips_the_review_stops(flow):
     no_status = SPEC_TEXT.replace(STATUS + "\n\n", "")
     run = begin(flow, {REVIEW: [found(HIGH), done("sạch")],
@@ -221,7 +248,7 @@ def test_a_human_round_after_reconcile_rounds_is_round_1(flow):
     human = events(run, "phase_rejected")[-1]
     assert human["round"] == 1 and "kind" not in human
     assert go(flow, run) == "awaiting_approval"
-    assert "(refine round 1)" in page(flow, run)
+    assert "(refine round 1)" in page(flow, run)  # the same check that finds no "(refine round" after reconcile rounds
 
 
 def test_rounds_are_bounded(flow):

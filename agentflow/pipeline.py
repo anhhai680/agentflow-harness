@@ -418,6 +418,8 @@ class _Loop:
         a reconcile edit stopped the run), `(False, None)` when the approval is next."""
         run, name = self.run, names[index]
         phase = self.cfg.phases[name]
+        for step in doubt.reconcile_steps(phase, lane):  # a `findings_reconciled` a crash lost, before anything reads it
+            executor._reconciled(phase, f"{name}/{step.id}")
         if executor.conditions_changed(phase):  # the check after the reconcile step, when a crash skipped it
             return True, self.status()
         findings = phase_findings(self.cfg, run, name)
