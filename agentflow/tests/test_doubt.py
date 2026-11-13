@@ -465,6 +465,36 @@ def test_page_offers_cross_model_always_and_names_the_skill_only_when_configured
     assert page(flow_repo, note_when(unknown), events)[0].endswith("For example: /doubt-driven-development.")
 
 
+NOISE_UNCHANGED = [started(), *reviewed([HIGH, LOW]), round_opened([HIGH], 1),
+                   reconciled([disp("R1-F1", "noise", "Task 3 covers it")], 1, "a", "a"),
+                   {"type": "step_unchanged", "key": SPEC_REVIEW, "reason": "x"}]
+FIXED_THEN_CLEAN = [started(), *reviewed([HIGH, LOW]), round_opened([HIGH], 1), reconciled([disp("R1-F1", "actionable")], 1),
+                    *reviewed([])]
+
+
+@pytest.mark.parametrize("events", [NOISE_UNCHANGED, FIXED_THEN_CLEAN], ids=["noise-unchanged", "fixed-then-clean"])
+def test_a_low_finding_of_an_earlier_review_stays_on_the_page(flow_repo, events):
+    lines = page(flow_repo, no_note, events)
+    assert sum("typo" in line for line in lines) == 1
+    assert any(line.startswith("[low]") and line.endswith("(not blocking)") for line in lines)
+    assert any(line.startswith("R1-F1") for line in lines)  # the blocking row behaves as before
+
+
+@pytest.mark.parametrize("events", [NOISE_UNCHANGED, FIXED_THEN_CLEAN], ids=["noise-unchanged", "fixed-then-clean"])
+def test_a_low_finding_of_an_earlier_review_reaches_the_handoff(flow_repo, events):
+    cfg = flow_repo.configure(autopilot=True, edit=no_note)
+    run = flow_repo.new_run()
+    feed(run, events)
+    risks = doubt.handoff_risks(cfg, run, "define", "feature")
+    assert sum("typo" in risk for risk in risks) == 1
+
+
+def test_a_low_finding_raised_again_is_listed_once(flow_repo):
+    events = [started(), *reviewed([HIGH, LOW]), round_opened([HIGH], 1), reconciled([disp("R1-F1", "actionable")], 1),
+              *reviewed([LOW])]
+    assert sum("typo" in line for line in page(flow_repo, no_note, events)) == 1
+
+
 def test_page_and_handoff_are_per_human_round(flow_repo):
     events = [started(), *reviewed([HIGH]), round_opened([HIGH], 1), reconciled([disp("R1-F1", "actionable")], 1), *reviewed([LOW]),
               human_reject(), *reviewed([LOW])]

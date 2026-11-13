@@ -440,15 +440,19 @@ def _model(cfg: Config, events: list[dict], phase_name: str, lane: str) -> _Doub
                              unresolved_ids=unresolved_ids)
             rows.append(_Row(ident, _severity(finding), _text(finding), cls, clean_fact(note), status))
     last = rounds[-1].after if rounds else head
-    if not rounds or _review_ran(last, flagged):
-        left = [f for f in _review_findings(last, flagged)]
-        blocking = [f for f in left if is_blocking(cfg, f)]
-        ids = {id(f): n for n, f in enumerate(blocking, 1)}
-        for finding in left:
-            if id(finding) in ids:
-                rows.append(_Row(f"R{len(rounds) + 1}-F{ids[id(finding)]}", _severity(finding), _text(finding), None, "", "still open"))
-            else:
-                rows.append(_Row("", _severity(finding), _text(finding), None, "", "not blocking"))
+    if not rounds or _review_ran(last, flagged):  # the blocking findings no round answered: the review that ended the rounds
+        blocking = [f for f in _review_findings(last, flagged) if is_blocking(cfg, f)]
+        for n, finding in enumerate(blocking, 1):
+            rows.append(_Row(f"R{len(rounds) + 1}-F{n}", _severity(finding), _text(finding), None, "", "still open"))
+    seen: set[tuple[str, str]] = set()
+    for segment in [head, *(rnd.after for rnd in rounds)]:  # every review that ran: a carried-over one adds nothing new
+        if segment is not head and not _review_ran(segment, flagged):
+            continue
+        for finding in _review_findings(segment, flagged):
+            row = _Row("", _severity(finding), _text(finding), None, "", "not blocking")
+            if not is_blocking(cfg, finding) and (row.severity, row.text) not in seen:
+                seen.add((row.severity, row.text))
+                rows.append(row)
     return _Doubt(reviews, len(rounds), rows)
 
 
