@@ -112,6 +112,7 @@ def _step_row(state: dict, key: str, phase: str | None = None) -> dict:
             "effort": None,
             "effort_changed": None,
             "sized": False,
+            "effort_source": None,
             "attempts": 0,
             "rollovers": 0,
             "result": None,
@@ -260,6 +261,7 @@ def _on_agent_started(state: dict, ev: dict) -> None:
     session, pid = ev.get("session_id"), ev.get("pid")
     name = str(session) if session else str(pid)
     sizing = bool(ev.get("sizing"))
+    sizer = bool(ev.get("sizer"))  # a call that sizes a step's effort: it is never a step of its own
     state["hold"] = None  # a runner that died in a hold never recorded its end
     state["agents"][name] = {
         "session_id": session,
@@ -272,6 +274,7 @@ def _on_agent_started(state: dict, ev: dict) -> None:
         "effort": ev.get("effort"),
         "effort_changed": None,
         "sizing": sizing,
+        "sizer": sizer,
         "status": "sizing" if sizing else "running",
         "context_pct": 0.0,
         "spend": 0.0,
@@ -280,7 +283,7 @@ def _on_agent_started(state: dict, ev: dict) -> None:
         "last_tool": None,
         "subagents": [],
     }
-    if key:
+    if key and not sizer:
         row = _step_row(state, key)
         row["attempts"] += 1
         row["agent"] = ev.get("agent") or row["agent"]
@@ -308,7 +311,7 @@ def _on_agent_session(state: dict, ev: dict) -> None:
         row["model"] = ev.get("model") or row["model"]
         state["agents"][str(session)] = state["agents"].pop(name)
     key = ev.get("key") or (row["step"] if row else None)
-    if key and session:
+    if key and session and not ev.get("sizer") and not (row and row.get("sizer")):
         step = _step_row(state, key)
         step["session_id"] = session
         step["model"] = ev.get("model") or step["model"]
@@ -345,6 +348,7 @@ def _on_agent_exited(state: dict, ev: dict) -> None:
     name, row = _find_agent(state, ev)
     gone = state["agents"].pop(name) if name is not None else {"session_id": ev.get("session_id"), "pid": None}
     cost = cost_added(state.setdefault("session_costs", {}), ev)
+    gone.setdefault("sizer", bool(ev.get("sizer")))
     gone.update({"status": "exited", "exit_code": ev.get("exit_code"), "spend": cost, "exited_at": ev.get("ts")})
     state["exited"].append(gone)
     state["spend_usd"] = round(state["spend_usd"] + cost, 6)
@@ -361,11 +365,38 @@ def _on_effort_changed(state: dict, ev: dict) -> None:
     if row is not None:
         row["effort"] = new
         row["effort_changed"] = direction
-    if key:
+    if key and not ev.get("sizer") and not (row and row.get("sizer")):
         step = _step_row(state, key)
         step["effort"] = new
         step["effort_changed"] = direction
     state["effort_changes"].append({"key": key, "from": ev.get("from"), "to": new, "reason": ev.get("reason")})
+
+
+def _on_effort_decided(state: dict, ev: dict) -> None:
+    row = _step_row(state, ev["key"])
+    row["effort"] = ev["level"]
+    row["sized"] = True
+    row["effort_source"] = ev.get("source")
+
+
+def _on_effort_escalated(state: dict, ev: dict) -> None:
+    row = _step_row(state, ev["key"])
+    row["effort"] = ev["to"]
+    row["effort_changed"] = _direction(ev.get("from"), ev["to"])
+    state["effort_changes"].append(
+        {"key": ev["key"], "from": ev.get("from"), "to": ev["to"], "reason": ev.get("trigger")})
+
+
+def _on_sizer_started(state: dict, ev: dict) -> None:
+    """Read from the log, not from the state."""
+
+
+def _on_plan_sized(state: dict, ev: dict) -> None:
+    """Read from the log, not from the state."""
+
+
+def _on_sizer_finished(state: dict, ev: dict) -> None:
+    """Read from the log, not from the state."""
 
 
 def _on_effort_refused(state: dict, ev: dict) -> None:
@@ -731,6 +762,11 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "agent_exited": _on_agent_exited,
     "effort_changed": _on_effort_changed,
     "effort_refused": _on_effort_refused,
+    "effort_decided": _on_effort_decided,
+    "effort_escalated": _on_effort_escalated,
+    "sizer_started": _on_sizer_started,
+    "plan_sized": _on_plan_sized,
+    "sizer_finished": _on_sizer_finished,
     "compacted": _on_compacted,
     "rolled_over": _on_rolled_over,
     "subagent_started": _on_subagent_started,
@@ -778,6 +814,11 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "step_unchanged": (("key", "step"),),
     "step_retry": ("key",),
     "effort_refused": ("key",),
+    "effort_decided": ("key", "level"),
+    "effort_escalated": ("key", "to"),
+    "sizer_started": ("key",),
+    "plan_sized": ("key",),
+    "sizer_finished": ("key",),
     "permission_denied": ("key",),
     "progress_not_updated": ("key",),
     "checkpoint_reused": ("key",),

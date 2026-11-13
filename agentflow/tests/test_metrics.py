@@ -251,3 +251,31 @@ def test_metrics_view_carries_signal_totals(flow_repo):
     assert view["signals"]["gate_first_pass:unit"] == {"runs": 1, "mean": 0.0}
     assert view["runs"][0]["signals"]["gate_first_pass:unit"] == 0.0
     assert "gate_first_pass:unit" in metrics_table(view)
+
+
+def test_a_sizer_call_costs_its_phase_but_is_never_a_step_or_an_attempt():
+    key = "build/build/task-1/implement"
+    log = Log().add("phase_started", phase="build")
+    log.at(0).add("agent_started", agent="claude", pid=1, model="haiku", effort="low", step="build/build/task-1/size",
+                  session_id=None, role="sizer", phase="build", sizing=True, sizer=True)
+    log.add("agent_session", session_id="sz", model="claude-haiku-5-5", key="build/build/task-1/size", pid=1, sizer=True)
+    log.at(1).add("agent_exited", session_id="sz", exit_code=0, cost=0.02, key="build/build/task-1/size", sizer=True)
+    log.at(1).add("step_started", key=key, phase="build", mode="first")
+    log.call(1, 4, key, 0.10, session="w")
+    log.at(4).add("step_finished", key=key, status="done")
+    log.add("run_finished")
+    m = log.metrics()
+    build = phase(m, "build")
+    assert build["cost_usd"] == pytest.approx(0.12) and build["sizing_cost_usd"] == pytest.approx(0.02)
+    assert [s["key"] for s in build["steps"]] == [key]
+    assert build["steps"][0]["attempts"] == 1 and build["attempts"] == 1
+    assert build["steps"][0]["cost_usd"] == pytest.approx(0.10)
+    assert [s["session_id"] for s in build["steps"][0]["sessions"]] == ["w"]
+    assert m["cost_usd"] == pytest.approx(0.12)
+
+
+def test_a_phase_with_no_sizer_call_reports_zero_sizing_cost():
+    key = "verify/verify"
+    log = Log().add("phase_started", phase="verify").add("step_started", key=key, phase="verify", mode="first")
+    log.call(0, 2, key, 0.5, session="s").add("run_finished")
+    assert phase(log.metrics(), "verify")["sizing_cost_usd"] == 0

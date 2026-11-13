@@ -1,13 +1,5 @@
 You are running headless as step `{step_id}` of the agentflow run `{run}`. Nobody can answer you during the step.
 
-<!-- effort-check -->
-## Effort check
-
-Before any work, size this step. Read its inputs (the skill, the spec section, the plan task and the files they name) and decide whether the default effort level (medium) fits.
-If it clearly does not (a one-line config tweak needs only `low`; a change across many files with hard edge cases needs `high`), stop now, change nothing, and write the result file with `"status": "effort_change"`, the level you want as `"effort"` and why as `"reason"`. The runner starts the step again at that level.
-Otherwise carry on at this level. You will not be asked again.
-<!-- /effort-check -->
-
 ## Rules for this step
 
 - Do not commit, amend, push or open a pull request. The runner commits and pushes.

@@ -1,6 +1,6 @@
 # Proposal: from agentflow (fixed workflow) to an agent harness
 
-Status: proposed (2026-11-04)
+Status: approved (2026-11-12; proposed 2026-11-04)
 
 ## Context
 
@@ -633,6 +633,149 @@ New config keys, each with its four companions (CLAUDE.md invariants):
 | `agents.<a>.models_allowed.<role>` | `_PROTECTED_KEYS` (it bounds the conductor) | a non-empty list per role that contains the role's fallback in `agents.<a>.models` | refused as protected | one line |
 | `conductor.min_samples` | Form, "Conductor" section (int) | an int ≥ 1 | round-trips through propose/save | one line |
 | `autonomy.promote_after_runs` | `_PROTECTED_KEYS` | an int ≥ 1; a level above L0 with fewer finished runs at the level below is refused | refused as protected | one line |
+
+## 6b. Amendments (2026-11-12): effort sized per task, and the conductor as a decision function
+
+These come from a design session on why effort never adapts. Where they differ from sections 3 to 6, these win.
+
+### Why effort never adapts today
+
+Effort has one adaptive path: the effort check in `_preamble.md`. The working agent is asked to size its own step and, if the default level does not fit, to stop with `"status": "effort_change"` (`lanes.py`, `_effort_change`). Across the 21 runs in the state dirs of this machine (about 250 sizing sessions) it never fired: **0 `effort_changed` and 0 `effort_refused` events**. Every `high` step came from a whole run whose pack default was `high`. No transcript mentions effort, and agents start straight on their inputs.
+
+The causes:
+1. **The runner never decides effort.** `effort:` has only `default` and `allowed`. Nothing resolves a level from the task, and the conductor that was meant to (3.3) is not built.
+2. **The agent doing the work is also asked to size it.** The check is an opt-out ("if it *clearly* does not fit … otherwise carry on"). Acting on it means aborting its own session, and the check sits above the rules, run facts, code map, lessons, the step and the inlined skill. A headless agent with a brief that says "do the work" does the work.
+3. **Silence is invisible.** No result has to carry a sizing decision, so "medium fits" and "never read the check" look the same.
+4. **The prompt states the wrong level.** `_preamble.md` says "the default effort level (medium)" as literal text, so a run at `high` tells its agents they are at medium.
+5. **Many sessions skip the check by design:** resumes, refine rounds, fix attempts, and the tasks of a small plan that share one session.
+
+### 1. The conductor is a decision function, not an orchestrator (changes 3.3)
+
+There is no long-lived orchestrator agent that spawns sub-agents and chooses their models. Such an agent would start sessions the runner cannot see, meter, resume or audit. Its context would grow for the whole run and be lost with the runner. And it repeats the effort check's failure, where one model is asked to supervise itself.
+
+Instead, the conductor is a short, read-only, stateless call at fixed decision points. Each call gets a fresh input built from events and the current task, never a growing conversation. It returns typed JSON. The validator (3.4) checks it against the floor, the budget and the obligations. The **runner** then starts every agent session. The conductor never spawns anything itself.
+
+When parallel sessions land (step 3 below), how many run at once is bounded by facts. Two tasks may run side by side only when the runner proves from the plan that they are independent: no shared file, and no task naming the other's output. A pack cap is the upper bound. The conductor chooses within what is proven safe, and it never gets to declare tasks independent.
+
+### 2. Decisions come from the current task only (changes §6 item 1 and 3.10 tier 5)
+
+Tasks differ, so a level that suited past tasks says little about this one. No model or effort choice is made from priors of earlier runs. §6 item 1 (heuristics from `stats.json`, `conductor.min_samples`) is withdrawn, and `conductor.min_samples` is not added. **Lessons stay the only memory across runs that reaches a decision.** If `stats.json` is built, it serves the cost forecast (3.11) and the scorecard only, never a model or effort choice.
+
+### 3. Effort is sized when each task starts (new: slice ES)
+
+Each agent step is sized before its work session starts, by a session whose only job is sizing. The working agent no longer sizes itself.
+
+**Who sizes what:**
+
+| Work | Sized by | When |
+|---|---|---|
+| A build plan task, and its per-task review | the `plan` role's model (Opus here), in **one plan-sizing call** that sees the whole plan | once, when build starts, and again for the unfinished tasks if the plan file changes |
+| A judgement step (4 below) | the step's own resolved model, at `medium` | when the step starts |
+| Any other step (verify, regression test, fix, CI fix, sync) | the agent's `mechanical` model (`agents.<a>.models.mechanical`, else the step's own model), at the lowest allowed level | when the step starts |
+
+A batch of small tasks that shares one session runs at the highest level among its tasks.
+
+**Runner facts.** The sizer receives a task card built by the runner, with no model involved. It holds the step, phase and role; the task text, or the paths of the issue, spec section or plan task; the files the task names (`sources.task_files`) with their line counts; whether the security overlay's condition holds; the diff stat against the fork point for verify, review and ship steps; and the failing gate names for a fix step. The sizer may read files, but it is read-only. A sizer whose session changed the tree is discarded, with the same tree check the retro uses.
+
+**A checklist, not a verdict.** A cheap model judges "how hard is this?" poorly but extracts facts well, so the sizer answers fixed questions. For each one the answer is `yes`, `no` or `unsure`:
+- **interface:** it changes a public interface, schema, contract or config format
+- **risk:** it touches concurrency, persisted state, security, a data migration or money
+- **ambiguity:** the inputs leave a design choice open
+- **breadth:** it crosses modules, or changes more than a few files
+- **novelty:** it needs new logic, not a copy of a pattern the repository already has
+- **mechanical:** it is purely mechanical (a rename, a config value, docs, moving code)
+
+**The rule is engine code, the same in every repository.** `unsure` counts as `yes`.
+- `low` only when `mechanical` is `yes`, every other answer is `no`, the task names at most 2 files, the security overlay does not apply, and the step is not a judgement step.
+- `high` when `risk` is `yes`, when two or more of the other risk questions are `yes`, or when the security overlay applies.
+- `medium` otherwise.
+
+The level is clamped to `effort.allowed`: a level the pack does not allow becomes the nearest allowed level above it, else the highest allowed one. Sizing picks only `low`, `medium` or `high`. A higher level such as `xhigh` is reached only by escalation (5 below).
+
+**Fallbacks.** A sizer that fails, times out or returns bad JSON gives `effort.default`, or `high` for a judgement step, because over-sizing costs tokens and under-sizing costs rework. With `effort.sizing: false`, every step starts at `effort.default`, as it does today apart from the removed check.
+
+### 4. Quality floor for judgement steps (an engine floor)
+
+A judgement step is any step of the `define`, `plan` or `review` phases, or any step with role `plan`, `review` or `debug`. The role half keeps the floor in place when a pack renames phases. `debug` is included because the regression test and the fix both build on its diagnosis, so a shallow diagnosis turns the whole fix into rework. A judgement step:
+- never runs at `low`;
+- is never sized by the `mechanical` model;
+- runs at `medium` only when every checklist answer except `mechanical` is `no`, and otherwise at `high`.
+
+Sizing changes only effort, never the model, so a judgement step keeps its configured model. A pack can narrow `effort.allowed`, but `validate` refuses an `allowed` list with no level at or above `medium`. Like the rest of the engine floor (1b), a pack cannot remove this.
+
+So the cheap model and `low` effort only ever touch work that a gate checks. Work whose quality only a human or a later step would notice is sized by a strong model and runs at `medium` or above.
+
+### 5. Escalation within a task, never a restart
+
+A level that proves too low shows up in the current task, and the response comes from the current task alone:
+- On a gate failure, the **first** fix attempt runs one level higher. The runner cannot tell a trivial failure from a real one, and waiting a round would mean one more attempt at a level that already failed.
+- On a review that reopens the step, the next session runs one level higher.
+- A step escalates **once**. Later fix attempts stay at the raised level, because a repeat failure at the higher level is a task or gate problem, which the resolver and re-plans handle.
+- A context rollover is **not** a trigger. It means the session ran out of context, not that it reasoned too little, and a higher level spends more thinking tokens, so it would bring the next rollover sooner. The new session keeps the step's level.
+- The level never goes above the highest allowed level, and it never goes down within a step.
+
+The fix attempt **resumes the same session** with the higher `--effort`, so the work already done stays. The dashboard's `attach` already resumes with `--effort`. The plan's first task must confirm with a real `claude -p --resume <id> --effort <level>` that the new level takes effect. If it does not, the escalated attempt starts a fresh session seeded from `progress.md`, the existing rollover path. Codex gets the same check with its `effort_arg`.
+
+### 6. The in-session effort check is removed
+
+The `<!-- effort-check -->` block leaves `_preamble.md`, and `effort_change` leaves the statuses `_result.md` lists, which also removes the hard-coded "(medium)". `hitl.RESULT_STATUSES` still parses `effort_change`, so a run started before the change can resume, and the runner refuses it with `effort_refused` as it does today. The `sized` and `sizing` fields of a step row now mean "a sizing decision is recorded".
+
+**Runs already in progress.** After an engine upgrade, a run that is in progress gets sizing for every step it has not started. A step that is running or parked keeps its recorded level, and an `effort_change` from its old prompt is refused as above.
+
+### 7. Events, signals and the scorecard
+
+- `effort_decided{key, level, source: plan_sizer|judge|sizer|fallback|off, answers, reason, sizer_model, cost_usd}`. Its cost counts toward the run budget.
+- `effort_escalated{key, from, to, trigger: gate|review}`.
+- New signals in `signals.py`: `effort_escalations:<phase>`, and `undersized:<phase>` for steps sized `low` or `medium` that then escalated. The scorecard reports the under-sizing rate. It measures **the sizer's** quality and never sets a level, which keeps item 2. A change to the sizing prompts or the rule is checked against it, and against the route-eval suite (4.3) once that exists.
+
+### 8. Rollout (changes 5 and §6 item 7)
+
+**Slice ES** (items 3 to 7) lands ahead of the conductor, as slice LR did. It can only move effort within `effort.allowed` and the floor. It cannot skip an action or an obligation, and the run budget still caps what it spends. The conductor's later slices keep the prerequisites of §6 item 7:
+1. **Slice ES:** effort sizing. The sizing calls are the conductor's first decision points.
+2. **L1, model choice** within `agents.<a>.models_allowed.<role>`, under the same floor.
+3. **L2, parallel sessions and task splits,** bounded by the runner's independence proof (item 1) and a pack cap.
+
+Each slice is measured on rework (`fix_attempts`, `undersized`), cost and the conformance SLO before the next one starts.
+
+New and changed config keys, each with its four companions:
+
+| Key | Settings | `validate` | `test_config_edit` case | Playbook §14 |
+|---|---|---|---|---|
+| `effort.sizing` (new, default `true` in the engine defaults, so every repository gets sizing on upgrade; `false` opts out) | Form, "Effort" section (bool) | a bool | round-trips through propose/save | one line |
+| `effort.allowed` (changed) | the existing Form field | also refuses a list with no level at or above `medium` | a list of only `low` is refused | the line is updated |
+
+### Decisions (grilling, 2026-11-12)
+
+1. `debug` is a judgement step (item 4).
+2. Escalation happens on the first fix attempt (item 5).
+3. The sizing call's limits are engine constants, about 8 turns and 3 minutes, with no pack key until a run shows a need. A call that hits a limit falls back as item 3 says.
+4. `effort.sizing` defaults to `true`.
+5. A step escalates once (item 5).
+6. A context rollover is not an escalation trigger (item 5).
+7. Runs already in progress get sizing for the steps they have not started (item 6).
+8. The checklist and the rule in item 3 are accepted as written. The scorecard's `undersized` rate (item 7) is what shows whether the thresholds need tuning.
+
+**As built (slice ES, 2026-11-12, `docs/plans/2026-11-12-agentflow-harness-slice-es.md`).** Items 3 to 8 are built. They differ from the text above in these ways:
+1. `effort_decided` has no `cost_usd`. A sizer's spend is metered through its own agent events and reported as the phase's `sizing_cost_usd`.
+2. With `effort.sizing: false`, no `effort_decided` is written, although item 6 lists a `source: off`. The step's level is in `step_started`.
+3. The checks of `claude` flags and of resume with a new level were a human pre-flight, not "the plan's first task": an agent in a run cannot call `claude`. They were run by hand in an interactive session. A read-only `--tools` allowlist held under `bypassPermissions`. Resume with `--effort high` was accepted, but the CLI does not report the level it uses, so that remains unconfirmed. Codex is checked at the argv level only.
+4. The scorecard gets counts, not a ratio: `undersized`, `effort_escalations` and `sizer_fallbacks`. The ratio is `undersized` over the phase's `effort_decided` events.
+5. A step that is not a plan task has no named files. Its `files` fact is the number of paths changed since the run started, not a diff stat.
+6. A refine round that resumes a step's session counts as "a review that reopens the step" (trigger `review`).
+7. A gate step that starts inside its fix loop (`fix_first`) is not escalated at that start, because its sizer already sees the failing gates. It escalates on its next fix attempt.
+8. Every CI and sync fix round is a new step key, so each round is sized on its own.
+9. `mechanical: unsure` counts as `no`, where item 3 says `unsure` counts as `yes`. Counting it as `yes` would make an unsure answer produce `low`.
+10. A sizer that changed the repository stops the run instead of being "discarded", because its change would otherwise be committed with the next step. A restart is refused until the tree, `HEAD` and git state match the sizer's `sizer_started`.
+11. Edits to the contents of an existing ignored file are not detected: `tree_state` lists ignored paths without hashing them. The tool allowlist is what prevents such edits.
+12. The plan sizer has its own limits (16 turns, 7 minutes, 6 tasks per call) next to the step sizer's 8 turns and 3 minutes. One call over a whole plan would time out.
+13. The plan sizer's model is the build phase's `plan`-role model, resolved without the foreach step's own `model:`. A `--model build=…` override on the command line still applies.
+14. Found while building:
+    - `validate` refuses the step ids `size` and `size-<n>`, which are the sizer sessions' own key shapes.
+    - A read-only Claude call also drops `--mcp-config` (and its values) from the pack's base args, because `--strict-mcp-config` alone still loads the servers that flag names.
+    - A plan sizer's `effort_decided` events carry `size_key`, so a fallback followed by task work does not leave a false `sizer_edit` stop.
+    - The test seam is `SizingLane._run_sizer`.
+    - A raise anywhere in sizing or escalation falls back, except that a sizer edit or an unverified orphan sizer still stops the run, even if recording the stop itself fails.
+    - `attach` takes a step's role from the exited agent records, because step rows carry none.
 
 ## Next step
 Each slice is planned with `writing-plans` (`docs/plans/YYYY-MM-DD-agentflow-harness-<slice>.md`), starting with slice P (engine/pack separation).

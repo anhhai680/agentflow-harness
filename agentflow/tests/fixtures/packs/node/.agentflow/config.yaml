@@ -27,6 +27,7 @@ defaults:
   agent: claude
 
 effort:
+  sizing: false               # the suite's scripted agents; sizing has its own tests
   default: medium
   allowed: [low, medium, high]
 

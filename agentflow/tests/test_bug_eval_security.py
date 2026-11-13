@@ -262,7 +262,7 @@ def test_eval_gate_refine_round_fixes_with_the_note(flow_repo):
     assert run.state["steps"][EVAL]["status"] == "done"
 
 
-def test_gate_fix_effort_change_keeps_the_gate_output(flow_repo):
+def test_gate_fix_after_a_refused_effort_change_keeps_the_gate_output(flow_repo):
     gate = {"run": "grep -q good src/state.txt || { echo 'recall dropped'; exit 1; }", "when_exists": None}
     flow_repo.configure({"gates": {"floor": {"run": "true"}, "eval": gate}})
     run = eval_run(flow_repo)
@@ -272,9 +272,9 @@ def test_gate_fix_effort_change_keeps_the_gate_output(flow_repo):
     ]})
     assert run_phase(flow_repo, run, "verify") == ("done", True)
     calls = calls_for(flow_repo, EVAL)
-    assert len(calls) == 2 and ("--effort", "high") in pairs(calls[1]["argv"])
-    assert "--resume" not in calls[1]["argv"]  # an accepted effort change starts a fresh session ...
-    assert "recall dropped" in calls[1]["argv"][-1]  # ... that still gets the gate output
+    assert len(calls) == 2 and ("--effort", "medium") in pairs(calls[1]["argv"])  # the change was refused
+    assert "recall dropped" in calls[0]["argv"][-1]  # the gate output reached the first call ...
+    assert "--resume" in calls[1]["argv"] and "refused" in calls[1]["argv"][-1]  # ... and a refusal resumes that session
 
 
 def test_red_checked_again_in_a_refine_round(flow_repo):

@@ -28,6 +28,8 @@ AUTOCOMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"  # Claude Code's own 
 SHELL_ENV_FILE_ENV = "CLAUDE_ENV_FILE"  # a script Claude Code sources in its Bash tool's shell before each command
 SYNTHETIC_MODEL = "<synthetic>"  # Claude Code's own error messages, shown as assistant turns: no model replied
 
+READ_ONLY_TOOLS = ("Read", "Grep", "Glob")  # the only Claude tools a read-only call gets
+
 EventCallback = Callable[[str, dict], None]
 
 
@@ -50,6 +52,8 @@ class AgentCall:
     forbidden_paths: list[str] = field(default_factory=list)  # `guardrails.forbidden_paths`
     runs_root: Path | None = None  # the runner's own state (`state.runs_root`): no agent edits it
     env_base: Mapping[str, str] | None = None  # the inherited environment (`run_env.base`); None: this process's
+    max_turns: int | None = None  # this call's turn cap; None: the agent's own `max_turns`
+    read_only: bool = False  # Claude gets only `READ_ONLY_TOOLS` and no MCP server; Codex a read-only sandbox (fresh session)
 
 
 @dataclass
@@ -517,6 +521,22 @@ class _CliAgent(abc.ABC):
 RUNNER_ONLY_DENY = ("Bash(gh *)",)
 
 
+def _without_mcp_config(args: list[str]) -> list[str]:
+    """`args` with every `--mcp-config` and its values dropped (`--mcp-config=<v>` too): `--strict-mcp-config` still
+    loads the servers it names. It takes a list, so the values run up to the next option."""
+    out: list[str] = []
+    dropping = False
+    for arg in args:
+        if arg == "--mcp-config" or arg.startswith("--mcp-config="):
+            dropping = True
+        elif dropping and not arg.startswith("-"):
+            continue
+        else:
+            dropping = False
+            out.append(arg)
+    return out
+
+
 class ClaudeAgent(_CliAgent):
     name = "claude"
     rollover_enabled = True
@@ -524,11 +544,15 @@ class ClaudeAgent(_CliAgent):
 
     def argv(self, call: AgentCall) -> list[str]:
         spec = self.spec
-        argv = [*spec.command, *spec.base_args]
+        argv = [*spec.command, *(_without_mcp_config(spec.base_args) if call.read_only else spec.base_args)]
         # `--add-dir` takes a list of values, so it goes before other options: right before the
         # prompt it would swallow the prompt as a directory.
         for directory in call.add_dirs:
             argv += ["--add-dir", str(directory)]
+        if call.read_only:
+            # `--tools` is an allowlist that holds in every permission mode, `bypassPermissions` included.
+            # It is variadic like `--add-dir`, so it goes before the next option and never reaches the prompt.
+            argv += ["--tools", ",".join(READ_ONLY_TOOLS), "--strict-mcp-config"]
         argv += ["--model", call.model, *self._effort_args(call)]
         if spec.permission_mode:
             argv += ["--permission-mode", spec.permission_mode]
@@ -542,8 +566,9 @@ class ClaudeAgent(_CliAgent):
         except RuntimeError:  # `Path.home()` with no home directory: there is no user file to protect
             pass
         argv += ["--settings", json.dumps({"permissions": {"deny": deny}})]
-        if spec.max_turns is not None:
-            argv += ["--max-turns", str(spec.max_turns)]
+        max_turns = call.max_turns if call.max_turns is not None else spec.max_turns
+        if max_turns is not None:
+            argv += ["--max-turns", str(max_turns)]
         if call.agent_profile:
             argv += ["--agent", call.agent_profile]
         if call.resume_session:
@@ -595,6 +620,8 @@ class CodexAgent(_CliAgent):
         else:
             if spec.profile:
                 argv += ["-p", spec.profile]
+            if call.read_only:  # a resumed session keeps its own sandbox: `codex exec resume` takes no `-s`
+                argv += ["-s", "read-only"]
             argv += ["--cd", str(call.cwd)]
             for directory in call.add_dirs:
                 argv += ["--add-dir", str(directory)]

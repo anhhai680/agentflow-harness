@@ -295,7 +295,8 @@ class StepControl:
         step = Step(id=cond_key.rsplit("/", 1)[-1], type="agent", role="mechanical", prompt="condition_question.md")
         plain = Phase(name=phase.name, agent=phase.agent, model=None, skip_if=None, steps=[])
         question = f"The runner could not decide the condition `{label}`: {reason}. Does `{label}` hold?"
-        outcome = self.run_agent_step(plain, step, cond_key, extra={"question": question}, role="mechanical")
+        outcome = self.run_agent_step(plain, step, cond_key, extra={"question": question}, role="mechanical",
+                                      size=False)
         if outcome != "done":
             return _STOPPED, ""
         try:

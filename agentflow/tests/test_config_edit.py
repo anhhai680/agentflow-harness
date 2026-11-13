@@ -125,6 +125,7 @@ def test_values_that_need_quoting_are_quoted(shipped):
     (["context", "context_window_tokens"], 50000, EditError),          # below Claude Code's smallest auto-compact window
     (["memory", "lessons_max_tokens"], 5000, EditError),               # above the range
     (["effort", "allowed"], ["low", "turbo"], EditError),
+    (["effort", "sizing"], "yes", EditError),
     (["defaults", "agent"], "nobody", EditError),
     (["autonomy", "resolve_kinds"], {"blocked": 0}, EditError),
     (["dashboard", "backlog", "lane_labels"], {"bug": "two\nlines"}, EditError),
@@ -389,6 +390,7 @@ def test_a_live_runner_reloads_the_shipped_config_before_a_phase(flow_repo, monk
 
 @pytest.mark.parametrize("edit, reason", [
     (lambda d: d["effort"].update(default="turbo"), "effort.default"),
+    (lambda d: d["effort"].update(allowed=["low"], default="low"), "effort.allowed"),
     (lambda d: d.update(phases=dict(reversed(list(d["phases"].items())))), "phases' names or order"),
 ])
 def test_a_live_runner_keeps_its_config_when_the_new_one_is_not_usable(flow_repo, monkeypatch, edit, reason):
@@ -436,6 +438,15 @@ def _user_file(data: dict) -> Path:
 def _sparse_form(path: Path, *changes) -> config_edit.Proposal:
     _, sha = config_edit.read(path)
     return config_edit.propose(path, sha, changes=[{"key": k, "value": v} for k, v in changes], repo=path.parents[1])
+
+
+def test_effort_sizing_round_trips(sparse_repo):
+    path = _sparse(sparse_repo)
+    assert _fields(path)[("effort", "sizing")]["source"] == "engine"
+    proposal = _sparse_form(path, (["effort", "sizing"], False))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    assert load_config(path).effort.sizing is False
 
 
 def test_form_shows_the_effective_value_its_layer_and_its_help(sparse_repo):

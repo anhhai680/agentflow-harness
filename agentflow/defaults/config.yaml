@@ -27,7 +27,7 @@ agents:
     command: [claude]
     base_args: [-p, --output-format, stream-json, --verbose]
     models: {plan: opus, build: sonnet, mechanical: haiku, review: sonnet, debug: opus}  # fallback when a phase sets no model
-    effort_arg: [--effort, "{effort}"]   # the level is the agent's choice (see `effort:`), never set per step
+    effort_arg: [--effort, "{effort}"]   # the runner sizes each step's level (see effort:)
     skill_loading: native
     prices:                      # USD per 1M tokens; prices a session Claude never reported a cost for (rollover, timeout)
       claude-opus-5-5:   {input: 4.00, output: 20.00, cache_read: 0.20, cache_write_5m: 5.00,  cache_write_1h: 8.00}
@@ -55,6 +55,7 @@ recovery:
   failed_attempts: 3
 
 effort:
+  sizing: true    # the runner sizes each step before it starts (false: every step runs at default)
   default: medium
   allowed: [low, medium, high]
 

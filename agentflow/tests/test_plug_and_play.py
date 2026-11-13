@@ -263,6 +263,16 @@ def _feature_run(repo: Path, fake, module: str, acts: list[dict]) -> tuple[str, 
     return run_id, events, fake.calls()[before:]
 
 
+def _work_prompt(calls: list[dict]) -> str:
+    """The first work session's prompt: with `effort.sizing` on (the engine default) a step's sizer is called first,
+    and its prompt carries no lessons."""
+    from agentflow import sizing
+
+    work = [c for c in calls if not sizing.is_sizer_key(c["step"])]
+    assert work and work[0]["step"] == BUILD, [c["step"] for c in calls]
+    return work[0]["argv"][-1]
+
+
 def _first_unit(events: list[dict]) -> dict:
     return next(e for e in events if e["type"] == "gate_result" and e.get("gate") == "unit")
 
@@ -331,7 +341,7 @@ def test_lessons_loop_end_to_end(tmp_path: Path, fakebin: Path, fake, monkeypatc
     # 4. The next run's first prompt carries the lesson under "Lessons from earlier runs".
     after = []
     run_id, events, calls = _feature_run(repo, fake, "three", [FIXED])
-    prompt = calls[0]["argv"][-1]
+    prompt = _work_prompt(calls)
     assert LESSONS_HEADING in prompt
     assert f"- **L-0001** {LESSON_TITLE}: {LESSON_BODY}" in prompt.split(LESSONS_HEADING, 1)[1].split("\n## ", 1)[0]
     assert any("L-0001" in e["ids"] for e in events if e["type"] == "lessons_injected")
@@ -361,6 +371,7 @@ def test_lessons_loop_end_to_end(tmp_path: Path, fakebin: Path, fake, monkeypatc
     lessons_file.write_text(re.sub(r"- review_by: \S+", "- review_by: 2020-01-01", text), encoding="utf-8")
     run_git(repo, "commit", "-q", "-am", "Expire L-0001")
     _run_id, events, calls = _feature_run(repo, fake, "seven", [FIXED])
-    assert "**L-0001**" not in calls[0]["argv"][-1] and LESSON_BODY not in calls[0]["argv"][-1]
+    prompt = _work_prompt(calls)
+    assert "**L-0001**" not in prompt and LESSON_BODY not in prompt
     assert all("L-0001" not in e["ids"] for e in events if e["type"] == "lessons_injected")
     assert _lesson_of(repo, "L-0001")["expired"] is True

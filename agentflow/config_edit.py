@@ -127,9 +127,10 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("recovery", "give_up_h"), "Give up after (h)", _NUM),
         (("recovery", "failed_attempts"), "Failed attempts", _POS),
     ]),
-    ("Effort", "The reasoning effort levels an agent may pick for a step.", [
-        (("effort", "default"), "Starting level", {"kind": "enum", "options": list(KNOWN_EFFORT_LEVELS)}),
-        (("effort", "allowed"), "Allowed levels", {"kind": "list", "options": list(KNOWN_EFFORT_LEVELS)}),
+    ("Effort", "How the runner sizes each step's reasoning effort.", [
+        (("effort", "sizing"), "Size each step before it starts", {"kind": "bool"}),
+        (("effort", "default"), "Level when sizing is off or fails", {"kind": "enum", "options": list(KNOWN_EFFORT_LEVELS)}),
+        (("effort", "allowed"), "Levels a step may run at", {"kind": "list", "options": list(KNOWN_EFFORT_LEVELS)}),
     ]),
     ("Context", "When sessions compact or roll over.", [
         (("context", "autocompact_pct"), "Auto-compact at (%)", _PCT),

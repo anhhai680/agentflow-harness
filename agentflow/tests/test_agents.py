@@ -192,6 +192,42 @@ def test_claude_argv_agent_profile(claude, call):
     assert "--agent" not in claude.argv(call)
 
 
+def test_a_call_turn_cap_overrides_the_agents(claude, call):
+    assert ("--max-turns", "8") in pairs(claude.argv(dataclasses.replace(call, max_turns=8)))
+    assert pairs(claude.argv(call)) == pairs(claude.argv(dataclasses.replace(call, max_turns=None)))
+
+
+def test_a_read_only_claude_call_allows_only_read_tools_and_no_mcp(claude, call):
+    argv = claude.argv(dataclasses.replace(call, read_only=True))
+    at = argv.index("--tools")
+    assert argv[at + 1] == "Read,Grep,Glob" and argv[at + 2].startswith("--")
+    assert argv.index("--strict-mcp-config") < argv.index("--model")
+    assert at < argv.index("--model") and argv[-1] == call.prompt
+    assert "--tools" not in claude.argv(call) and "--strict-mcp-config" not in claude.argv(call)
+    resumed = claude.argv(dataclasses.replace(call, read_only=True, resume_session="abc"))
+    assert resumed[-1] == call.prompt and "--tools" in resumed
+
+
+@pytest.mark.parametrize("mcp", [["--mcp-config", "servers.json"], ["--mcp-config=servers.json"],
+                                 ["--mcp-config", "a.json", "b.json"]])
+def test_a_read_only_claude_call_drops_the_packs_mcp_config(cfg, call, mcp):
+    # `--strict-mcp-config` keeps the servers `--mcp-config` names, so a read-only call must not carry one
+    spec = dataclasses.replace(cfg.agents["claude"], base_args=["--verbose", *mcp, "--output-format", "stream-json"])
+    claude = ClaudeAgent(spec, cfg.context)
+    argv = claude.argv(dataclasses.replace(call, read_only=True))
+    assert not [a for a in argv if a.startswith("--mcp-config")] and not {"servers.json", "a.json", "b.json"} & set(argv)
+    assert ("--output-format", "stream-json") in pairs(argv) and "--verbose" in argv
+    assert [a for a in claude.argv(call) if a.startswith("--mcp-config")]  # a working call keeps the pack's servers
+
+
+def test_a_read_only_codex_call_uses_the_read_only_sandbox(codex, call):
+    argv = codex.argv(dataclasses.replace(call, read_only=True))
+    assert ("-s", "read-only") in pairs(argv) and argv[-1] == call.prompt
+    assert "-s" not in codex.argv(call)
+    resumed = codex.argv(dataclasses.replace(call, read_only=True, resume_session="abc"))
+    assert "-s" not in resumed and resumed == codex.argv(dataclasses.replace(call, resume_session="abc"))
+
+
 def test_codex_argv(codex, call, wt):
     call = dataclasses.replace(call, model="gpt-5-codex", effort="high")
     a = codex.argv(call)

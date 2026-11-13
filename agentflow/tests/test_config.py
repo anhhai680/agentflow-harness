@@ -255,6 +255,18 @@ def test_duplicate_step_id(tmp_cfg):
     assert ("error", "phases.define.steps[4].id") in errors(issues_for(tmp_cfg, patch))
 
 
+@pytest.mark.parametrize("step_id,refused", [("size", True), ("size-1", True), ("size-12", True),
+                                              ("sizes", False), ("size-up", False), ("resize", False)])
+def test_a_step_id_shaped_like_a_sizer_key_is_refused(tmp_cfg, step_id, refused):
+    def patch(data):
+        phase_step(data, "define", "contracts")["id"] = step_id
+        phase_step(data, "build", "build")["review"]["id"] = "size-2" if refused else "review-2"
+
+    found = errors(issues_for(tmp_cfg, patch))
+    assert (("error", "phases.define.steps[4].id") in found) is refused
+    assert (("error", "phases.build.steps[1].review.id") in found) is refused
+
+
 def test_user_only_skill_as_step(tmp_cfg):
     def patch(data):
         phase_step(data, "define", "contracts")["skill"] = "writing-for-agents"
@@ -358,6 +370,21 @@ def test_the_workflow_is_six_phases_and_four_lanes():
 )
 def test_effort_outside_known_levels(tmp_cfg, patch, bad_path):
     assert ("error", bad_path) in errors(issues_for(tmp_cfg, patch))
+
+
+def test_effort_sizing_defaults_on(sparse_repo):
+    assert load_config(pack.pack_config(sparse_repo)).effort.sizing is True
+
+
+def test_effort_sizing_must_be_a_bool(tmp_cfg):
+    with pytest.raises(ConfigError, match="effort.sizing"):
+        load_config(tmp_cfg({"effort": {"sizing": "yes"}}))
+
+
+def test_effort_allowed_needs_a_level_at_or_above_medium(tmp_cfg, capsys):
+    bad = tmp_cfg({"effort": {"allowed": ["low"], "default": "low"}})
+    assert main(["validate", "--config", str(bad)]) == 1
+    assert "error effort.allowed:" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

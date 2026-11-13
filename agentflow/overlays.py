@@ -7,6 +7,9 @@ The overlay holds when the `security_path` condition does (changed paths or plan
   `overlays.security.add_skills` (plan and review), unless the prompt already names that skill;
 - runs the `security_review` step with `--agent <overlays.security.review_agent>`.
 
+`touches_security` asks the same of one plan task's own files (`when_paths` only), so the plan sizer
+raises only that task, not the whole plan.
+
 An unknown `security_path` (git cannot diff, say) counts as holding for the prompt line, which only
 asks for more care; the `security_review` step decides it through its own `when`. The offer of
 `/doubt-driven-development` is the `plan` phase's `approval_note` in `config.yaml`, not an overlay matter.
@@ -14,9 +17,11 @@ asks for more care; the `security_review` step decides it through its own `when`
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from agentflow.conditions import Ctx, evaluate
+from agentflow.guards import path_matches
 
 if TYPE_CHECKING:
     from agentflow.config import Config, Step
@@ -35,6 +40,14 @@ def security_path(cfg: Config, ctx: Ctx) -> bool:
     if CONDITION not in cfg.conditions:
         return False
     return evaluate(cfg, CONDITION, ctx).value is not False
+
+
+def touches_security(cfg: Config, paths: Iterable[str]) -> bool:
+    """Whether any of `paths` matches `overlays.security.when_paths`: one plan task's own files, where
+    `security_path` is the run's (its changed paths and the whole plan's keywords)."""
+    globs = _overlay(cfg).get("when_paths") or []
+    globs = [globs] if isinstance(globs, str) else [str(g) for g in globs]
+    return any(path_matches(path, glob) for path in paths for glob in globs)
 
 
 def skill_lines(cfg: Config, ctx: Ctx, role: str, body: str) -> str:

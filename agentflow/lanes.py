@@ -1,8 +1,8 @@
 """The agent step lifecycle: run one config step through an agent until it is done or needs a human.
 
 `Executor.run_agent_step` goes round one loop per agent call, in this order: budget check (the soft
-budget notifies once, the hard one stops), then model and effort (from state; `effort.default` for a
-new step), prompt, tree snapshot, the call
+budget notifies once, the hard one stops), then model and effort (from state; for a new step, the level a
+read-only sizer session gave it (`sizing_lane.py`), else `effort.default`), prompt, tree snapshot, the call
 (`agent_started` ... `agent_exited`, spend, one `permission_denied` per denial), guards, the
 `result.json`, gates and doc checks (`checks:`, which always have the fix loop) with the fix loop,
 rollover; and once the result is `done` and the gates pass: the progress check, the commit
@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Literal, TextIO
 
 from agentflow import lessons as lessons_mod
-from agentflow import overlays, pack, run_env, workspace
+from agentflow import overlays, pack, run_env, sizing, workspace
 from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
 from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
@@ -52,6 +52,7 @@ from agentflow.gitops import CommitRejected, GitError, NothingToCommit, changed_
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, notify_run, park_hitl, raise_hitl, read_result
 from agentflow.run_control import wait_for_agents
+from agentflow.sizing_lane import SizingLane
 from agentflow.sync_lane import SyncLane
 from agentflow.state import TERMINAL, Run, workspaces_root
 
@@ -224,11 +225,12 @@ def _drop_skill_section(body: str, keep: bool = False) -> str:
 def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode: Mode) -> str:
     """`_preamble.md` + the step's template (after the refine template in a refine round) + `_result.md`.
 
-    The preamble's effort check is kept only while `rec["sized"]` is false. Placeholders are
-    filled in one pass over the joined text, so values that hold braces go in verbatim.
+    The preamble's effort check is always stripped (a pack's own `_preamble.md` copy may still hold it): the
+    runner sizes every step before it starts. Placeholders are filled in one pass over the joined text, so
+    values that hold braces go in verbatim.
     """
     values = _values(cfg, step, ctx, {})
-    preamble = EFFORT_BLOCK.sub("" if rec.get("sized") else r"\1", _template(cfg, PREAMBLE))
+    preamble = EFFORT_BLOCK.sub("", _template(cfg, PREAMBLE))
     values["lessons"] = _lessons(cfg, ctx.repo, extra.get("phase"), date.today()).text.rstrip("\n")
     preamble = EMPTY_SLOT.sub(lambda m: "" if not values[m.group(1)] else m.group(0), preamble)
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
@@ -286,18 +288,15 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
 
 @dataclass
 class _Turn:
-    """The next agent call: its prompt, the session it resumes (None = fresh), and whether it sizes the step."""
+    """The next agent call: its prompt and the session it resumes (None = fresh)."""
 
     prompt: str
     resume: str | None
-    sizing: bool = False
 
 
 @dataclass
 class _Called:
     outcome: AgentOutcome
-    sizing: bool
-    before: str
     after: str
 
 
@@ -384,7 +383,7 @@ def _violation_text(violations: list[Violation]) -> str:
 # --------------------------------------------------------------------------- executor
 
 
-class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
+class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLane):
     """Runs a run's steps: `run_steps`/`run_step` (control flow, in `flow_control`), plan tasks and
     `finish` (in `feature_lane`), test expectations and fix-looping gate steps (in `bug_eval`) and the
     agent step lifecycle here. `dry_run` prints each agent's command line and calls nothing."""
@@ -425,17 +424,24 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         role: str | None = None,
         share_session_of: str | None = None,
         fix_first: list[GateResult] | None = None,
+        size: bool = True,
     ) -> Outcome:
         """Run `step` as `key` until it is done ("done"), or a human is needed ("stopped").
 
         A step already done is not run again; a step skipped by its condition, or any step in a
         dry run, is "skipped". A step whose record is `running` or `waiting_human` (the runner was
         stopped, or a human answered) resumes its recorded session at its recorded effort.
-        `share_session_of` names a step whose session a new step continues (at that step's effort,
-        with no effort check), as the tasks of a small plan do. A step parked by a question that later
+        `share_session_of` names a step whose session a new step continues (at that step's effort),
+        as the tasks of a small plan do. A step parked by a question that later
         tasks need not wait for returns "stopped" with its record `parked`.
         `fix_first` (gates that already failed, as for a gate step) starts a step that is not resuming
         in its fix loop: the first call is fix attempt 1, with the gate output.
+        With `size` and `effort.sizing`, a step that has not started is sized first (`SizingLane.size_step`), unless
+        it continues a shared session, the run is over budget, or it is a dry run. Whether sized or not, a sizer of
+        the step left open by a runner that died is checked first (`SizingLane.check_open_sizers`). A review that
+        sends the step back to its session (`step_reopened` for `review`, or a refine round) raises its effort once
+        (`SizingLane.escalate_effort`), as its first fix attempt after a failed gate does in `_loop`. A judgement step
+        never runs below `medium` (`sizing.floor`), on any path.
         """
         extra = self._step_extra(key, extra)
         self.run.refresh()
@@ -456,7 +462,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
         role = role or step.role or DEFAULT_ROLE
         since = self._since_step_started(key)
         started = since[0] if since else None
-        resuming = status in RESUMABLE and started is not None
+        # A stop for a sizer of this step that changed the repository: the step is sized again and starts fresh, even
+        # when an earlier attempt (since retried) had started a session.
+        tripped = not self.dry_run and self._sizer_trip(key) is not None
+        resuming = status in RESUMABLE and started is not None and not tripped
         session = rec.get("session_id")
         reuses_session = bool(session) and (resuming or mode == "refine")
         if reuses_session and started is not None and started.get("model"):
@@ -469,19 +478,43 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             model=model, effort=rec.get("effort") or self.cfg.effort.default, extra=extra, session=session,
             agent_profile=overlays.agent_profile(self.cfg, step),
         )
+        judgement = sizing.is_judgement(phase.name, role)
+        sr.effort = sizing.floor(sr.effort, judgement, self.cfg.effort.allowed)
+        # A sizer of this step changed the repository: nothing runs until it is back as the sizer found it.
+        resized = False
+        if tripped:
+            left = self.sizer_reset_needed(key)
+            if left:
+                return self._fail(sr, [Violation("sizer_edit", "reset " + ", ".join(left) + " first")])
+            resized = True  # cleared: the step is sized again, whatever its row says
+        # A sizer of this step left open (its runner died): compared before anything runs, sized or not.
+        if not self.dry_run and not self.check_open_sizers(key):
+            return "stopped"
 
         shared = (state["steps"].get(share_session_of) or {}) if share_session_of else {}
+        takes_shared = not session and status in UNSTARTED_STEP and bool(shared.get("session_id"))
+        if (size and self.cfg.effort.sizing and not self.dry_run and mode == "first" and not resuming
+                and (status in UNSTARTED_STEP or resized) and (not rec.get("sized") or resized)
+                and not takes_shared and not sizing.is_sizer_key(key) and self._under_budget()):
+            level = self.size_step(sr, [r.name for r in fix_first or []])
+            if level is None:
+                return "stopped"
+            sr.effort = sizing.floor(level, judgement, self.cfg.effort.allowed)
+        reopened = _approved(since, key) if resuming else None
+        if not self.dry_run and ((reopened is not None and reopened["type"] == "step_reopened"
+                                  and reopened.get("reason") == "review") or (mode == "refine" and session)):
+            self.escalate_effort(sr, "review")  # a review sent the step back to its session
+            sr.effort = sizing.floor(sr.effort, judgement, self.cfg.effort.allowed)
         if resuming and session:
             turn = _Turn(self._continue_prompt(sr, _answers(since, key), _approved(since, key)), session)
         elif mode == "refine" and session:
-            turn = _Turn(self._prompt(sr, sized=True, resume=session), session)
-        elif not session and status in UNSTARTED_STEP and shared.get("session_id"):
+            turn = _Turn(self._prompt(sr, resume=session), session)
+        elif takes_shared:
             sr.session = shared["session_id"]
-            sr.effort = shared.get("effort") or sr.effort
-            turn = _Turn(self._prompt(sr, sized=True, resume=sr.session), sr.session)
+            sr.effort = sizing.floor(shared.get("effort") or sr.effort, judgement, self.cfg.effort.allowed)
+            turn = _Turn(self._prompt(sr, resume=sr.session), sr.session)
         else:
-            sized = bool(rec.get("sized"))
-            turn = _Turn(self._prompt(sr, sized=sized), None, sizing=not sized)
+            turn = _Turn(self._prompt(sr), None)
         fixing = bool(fix_first) and not resuming
         if fixing:  # a gate step's session starts from the gate output (and a refine round's note)
             refine = current_refine(self.run, phase.name)
@@ -543,13 +576,19 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             raise ValueError(f"agent {agent_name!r} is not enabled; phase {phase.name!r} needs it")
         role = role or step.role or DEFAULT_ROLE
         model, _source = resolve_model(self.cfg, phase, step, role, self.overrides)
+        effort = sizing.floor(self.cfg.effort.default, sizing.is_judgement(phase.name, role), self.cfg.effort.allowed)
         sr = _StepRun(
             phase=phase, step=step, key=key, mode="first", role=role, agent_name=agent_name, agent=agent,
-            model=model, effort=self.cfg.effort.default, extra=self._step_extra(key, extra), session=None,
+            model=model, effort=effort, extra=self._step_extra(key, extra), session=None,
             agent_profile=overlays.agent_profile(self.cfg, step),
         )
-        turn = _Turn(self._prompt(sr, sized=False), None, sizing=True)
+        turn = _Turn(self._prompt(sr), None)
         return agent.argv(self._agent_call(sr, turn, attempt=1))
+
+    def _under_budget(self) -> bool:
+        """The run's spend is under its hard budget (the check `_loop` stops on)."""
+        budget = self.run.state.get("budget_usd") or self.cfg.defaults.run_budget_usd
+        return not (budget and float(self.run.state.get("spend_usd") or 0.0) >= budget)
 
     def _loop(self, sr: _StepRun, turn: _Turn) -> Outcome:
         while True:
@@ -637,6 +676,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             if failed:
                 if (sr.step.fix_loop or sr.step.checks) and sr.fixes < self.cfg.defaults.fix_attempts:
                     sr.fixes += 1
+                    self.escalate_effort(sr, "gate")  # once per step; the fix resumes the session one level up
                     self.run.emit("fix_attempt", key=sr.key, attempt=sr.fixes, gates=[r.name for r in failed])
                     turn = _Turn(self._fix_prompt(sr, failed), sr.session)
                     continue
@@ -686,7 +726,6 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
     def _call(self, sr: _StepRun, turn: _Turn) -> _Called:
         workspace.prepare(self.run)  # fresh copies of the inputs; whatever the agent left there is replaced
         workspace.clear_result(self.run, sr.key)  # a stale result must never count
-        before = snapshot(self.worktree)
         attempt = (self.run.state["steps"].get(sr.key) or {}).get("attempts", 0) + 1
         call = self._agent_call(sr, turn, attempt)
         seen: dict[str, object] = {"model": None, "pid": None}
@@ -695,7 +734,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             data = dict(payload)
             if name == "agent_started":
                 seen["pid"] = data.get("pid")
-                data.update(sizing=turn.sizing, phase=sr.phase.name, role=sr.role)
+                data.update(sizing=False, phase=sr.phase.name, role=sr.role)  # a sizer's own call says True
             elif name == "agent_session":
                 seen["model"] = data.get("model")
                 data.update(key=sr.key, pid=seen["pid"])
@@ -721,7 +760,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
                 tool=denial.get("tool_name") or denial.get("tool"),
                 input=denial.get("tool_input", denial.get("input")),
             )
-        return _Called(outcome, turn.sizing, before, snapshot(self.worktree))
+        return _Called(outcome, snapshot(self.worktree))
 
     def _record_lessons(self, sr: _StepRun, turn: _Turn) -> None:
         """A fresh session's prompt carries the lessons: record which ones (and their digest), and which a size
@@ -745,27 +784,12 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
     # -- outcomes
 
     def _effort_change(self, sr: _StepRun, called: _Called, result: StepResult) -> _Turn:
-        """D11: accept only from the sizing session, before any work, and within `effort.allowed`."""
+        """Always refuse: the runner sizes each step before it starts, so no prompt offers a change."""
         requested = str(result.effort)
-        allowed = self.cfg.effort.allowed
-        why = ""
-        if not called.sizing:
-            why = "the step is already sized, and a resumed session keeps its level"
-        elif called.before != called.after:
-            why = "work has already started (the step's diff is not empty)"
-        elif requested not in allowed:
-            why = f"'{requested}' is not one of the allowed levels ({', '.join(allowed)})"
-        elif requested == sr.effort:
-            why = f"the step already runs at {requested}"
-        if why:
-            self.run.emit("effort_refused", key=sr.key, requested=requested, reason=why, agent_reason=result.reason)
-            note = f"Your effort change to `{requested}` was refused: {why}. Carry on with the step at `{sr.effort}`."
-            return _Turn(f"{note}\n\n{self._result_partial(sr)}", sr.session)
-        self.run.emit("effort_changed", key=sr.key, session_id=called.outcome.session_id,
-                      **{"from": sr.effort, "to": requested, "reason": result.reason})
-        sr.effort = requested
-        sr.session = None
-        return _Turn(self._prompt(sr, sized=True), None)
+        why = "the runner sizes each step before it starts"
+        self.run.emit("effort_refused", key=sr.key, requested=requested, reason=why, agent_reason=result.reason)
+        note = f"Your effort change to `{requested}` was refused: {why}. Carry on with the step at `{sr.effort}`."
+        return _Turn(f"{note}\n\n{self._result_partial(sr)}", sr.session)
 
     def _hold(self, sr: _StepRun, turn: _Turn, why: Interruption) -> _Turn | None:
         """The agent cannot work for now: wait, then return the next turn, or None when the run stopped.
@@ -823,11 +847,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             f"Continue the step from `{values['progress']}` and `{values['handoff']}`: read them first, "
             "check the work tree, and do not redo finished work."
         )
-        return _Turn(f"{lead}\n\n{self._prompt(sr, sized=True)}", None)
+        return _Turn(f"{lead}\n\n{self._prompt(sr)}", None)
 
     def _fresh_refine(self, sr: _StepRun, gone: str) -> _Turn:
         """A refine round could not resume the step's session (expired, rolled over): a fresh session gets
-        the same prompt plus `progress.md` and `handoff.md`, at the same effort and with no effort check."""
+        the same prompt plus `progress.md` and `handoff.md`, at the same effort."""
         self.run.emit("resume_failed", key=sr.key, session_id=gone, effort=sr.effort)
         sr.session = None
         values = self._values(sr)
@@ -836,7 +860,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
             f"Read `{values['progress']}` and `{values['handoff']}` first: they say what the step did before. "
             "Then check the work tree and refine the step's existing output; do not start over."
         )
-        return _Turn(f"{lead}\n\n{self._prompt(sr, sized=True)}", None)
+        return _Turn(f"{lead}\n\n{self._prompt(sr)}", None)
 
     def _failed_gates(self, sr: _StepRun) -> list[GateResult]:
         """The step's gates, then its doc checks (`checks:`, on the diff since the step started); the failed ones.
@@ -937,8 +961,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
 
     # -- prompt pieces
 
-    def _rec(self, sr: _StepRun, sized: bool) -> dict:
-        return {**(self.run.state["steps"].get(sr.key) or {}), "sized": sized, "agent": sr.agent_name, "role": sr.role}
+    def _rec(self, sr: _StepRun) -> dict:
+        return {**(self.run.state["steps"].get(sr.key) or {}), "agent": sr.agent_name, "role": sr.role}
 
     def _step_extra(self, key: str, extra: dict | None) -> dict:
         """`extra` plus the result path, written out because a headless agent cannot read its environment."""
@@ -947,13 +971,13 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane):
     def _values(self, sr: _StepRun) -> dict[str, str]:
         return _values(self.cfg, sr.step, self.ctx, sr.extra)
 
-    def _prompt(self, sr: _StepRun, sized: bool, resume: str | None = None) -> str:
+    def _prompt(self, sr: _StepRun, resume: str | None = None) -> str:
         """The step's prompt for a turn that resumes session `resume`, or for a fresh session when it is None.
 
-        A fresh session (the first turn, a rollover, an effort change, a refine round whose session is gone)
+        A fresh session (the first turn, a rollover, a refine round whose session is gone)
         holds nothing yet, so it is never built as a continuation: the skill's text goes in again."""
         step = sr.step if resume else dataclasses.replace(sr.step, continuation=False)
-        prompt = build_prompt(self.cfg, step, self.ctx, self._rec(sr, sized), sr.extra, sr.mode)
+        prompt = build_prompt(self.cfg, step, self.ctx, self._rec(sr), sr.extra, sr.mode)
         return f"{sr.lead}\n\n{prompt}" if sr.lead else prompt
 
     def _result_partial(self, sr: _StepRun) -> str:

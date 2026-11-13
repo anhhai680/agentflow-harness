@@ -271,7 +271,8 @@ class Resolver:
             self._finish(key, kind, "")
             return True
         plain = Phase(name=phase.name, agent=phase.agent, model=None, skip_if=None, steps=[])
-        outcome = self.executor.run_agent_step(plain, step, session_key, extra=extra, role=step.role)
+        outcome = self.executor.run_agent_step(plain, step, session_key, extra=extra, role=step.role,
+                                               size=False)
         if outcome != "done":
             return False
         self.run.refresh()
