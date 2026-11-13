@@ -451,7 +451,8 @@ def _model(cfg: Config, events: list[dict], phase_name: str, lane: str) -> _Doub
         blocking = [f for f in _review_findings(last, flagged) if is_blocking(cfg, f)]
         counted = _valid_disputes(blocking, earlier)  # a finding that disputes an earlier answer is that issue, shown as disputed
         for n, finding in enumerate(blocking, 1):
-            if finding.get("disputes") in counted:
+            disputed_id = finding.get("disputes")
+            if isinstance(disputed_id, str) and disputed_id in counted:  # a list or dict value is malformed: it counts for nothing
                 continue
             rows.append(_Row(f"R{len(rounds) + 1}-F{n}", _severity(finding), _text(finding), None, "", "still open"))
     seen: set[tuple[str, str]] = set()

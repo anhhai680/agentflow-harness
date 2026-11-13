@@ -445,6 +445,13 @@ def test_a_disputed_finding_is_counted_once(flow_repo):
     assert "1 still open." in lines[0]  # only the new problem: R1-F1 (noise) was recorded, and a review ran after it
 
 
+def test_a_malformed_disputes_value_is_still_open_and_does_not_crash_the_page(flow_repo):
+    pending = [started(), *reviewed([HIGH]), round_opened([HIGH], 1), reconciled([disp("R1-F1", "noise", "x")], 1)]
+    for bad in (["R1-F1"], {"id": "R1-F1"}, 7):
+        lines = page(flow_repo, no_note, [*pending, *reviewed([{**HIGH, "text": "odd shape", "disputes": bad}])])
+        assert lines[-1].startswith("R2-F1") and lines[-1].endswith("(still open)")
+
+
 def test_page_lines_say_a_noise_finding_is_still_open_while_the_artifact_is_unchanged(flow_repo):
     events = [started(), *reviewed([HIGH]), round_opened([HIGH], 1), reconciled([disp("R1-F1", "noise", "Task 3 covers it")], 1, "a", "a"),
               {"type": "step_unchanged", "key": SPEC_REVIEW, "reason": "x"}]
