@@ -16,7 +16,10 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   opened itself (present for every phase of the run). `effort_escalations:<p>` counts `effort_escalated` events,
   `undersized:<p>` those whose step was decided `low` or `medium` by a source other than `fallback`, and
   `sizer_fallbacks:<p>` the steps whose last decision is a `fallback`; all three are present only for a parameter
-  that occurred.
+  that occurred. `doubt_blocking:<p>`, `doubt_rounds:<p>`, `doubt_open:<p>`, `doubt_actionable:<p>`, `doubt_noise:<p>`
+  and `doubt_misread:<p>` read the last `doubt_settled` of a phase (the findings its doubt review first raised, the
+  reconcile rounds, the findings still open, and the dispositions given since the last human round). They are
+  present only for a phase that has one, and reconcile rounds are not counted in `refine_rounds:<p>`.
   Sizer calls (events with `sizer`) are no step's turns, and their cost is not a step's cost.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
@@ -53,6 +56,12 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "effort_escalations": ("lower", True),    # a phase: steps whose effort was raised after a gate or review failed
     "undersized": ("lower", True),            # a phase: escalations of a step sized low or medium by a real sizer
     "sizer_fallbacks": ("lower", True),       # a phase: steps sized by the fallback because the sizer failed
+    "doubt_blocking": ("lower", True),        # a phase: findings its first doubt review raised that block
+    "doubt_rounds": ("lower", True),          # a phase: reconcile rounds before the approval
+    "doubt_noise": ("lower", True),           # a phase: findings its reconcile step dispositioned as noise
+    "doubt_misread": ("lower", True),         # a phase: findings dispositioned as a misread contract
+    "doubt_open": ("lower", True),            # a phase: findings still open when it raised its approval
+    "doubt_actionable": ("higher", True),     # a phase: findings dispositioned as actionable
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
@@ -62,6 +71,9 @@ COUNT_FAMILIES = frozenset({"fix_attempts", "guard_trips", "permission_denied", 
                             "ci_rounds", "rollovers", "progress_not_updated", "conformance_missing", "conformance_waived",
                             "gate_reruns", "refine_rounds", "effort_escalations", "undersized",
                             "sizer_fallbacks"})
+DOUBT_FIELDS = (("doubt_blocking", "first_blocking"), ("doubt_rounds", "rounds"), ("doubt_noise", "noise"),
+                ("doubt_misread", "misread"), ("doubt_open", "open"), ("doubt_actionable", "actionable"))
+RECONCILE = "reconcile"  # `phase_rejected.kind` of a round the runner opens on a doubt review's findings
 RUNNER = "runner"  # `phase_rejected.by` for what the runner settles itself; a person's name is never this
 
 
@@ -163,6 +175,7 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
     decided: dict[str, tuple[Any, Any]] = {}
     plain: Counter[str] = Counter()
     audit: dict | None = None
+    settled: dict[str, dict] = {}
     for ev in events:
         etype = ev.get("type")
         if etype == "fix_attempt":
@@ -182,8 +195,11 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
         elif etype == "phase_rejected":
             if ev.get("phase") and ev.get("by") != RUNNER:
                 counts["human_rejections"][str(ev["phase"])] += 1
-            elif ev.get("phase"):
+            elif ev.get("phase") and ev.get("kind") != RECONCILE:
                 counts["refine_rounds"][str(ev["phase"])] += 1
+        elif etype == "doubt_settled":
+            if ev.get("phase"):
+                settled[str(ev["phase"])] = ev   # the last one per phase: a crash can settle a phase twice
         elif etype == "review_result":
             if phase := _phase_of(ev.get("key")):
                 counts["review_blocking"][phase] += int(ev.get("blocking") or 0)
@@ -209,6 +225,10 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
     for phase in metrics.get("phases") or []:
         for family in ("fix_attempts", "human_rejections", "refine_rounds"):
             out.setdefault(f"{family}:{phase['phase']}", 0)
+    for phase, ev in settled.items():
+        for family, field in DOUBT_FIELDS:
+            if isinstance(ev.get(field), (int, float)) and not isinstance(ev.get(field), bool):
+                out[f"{family}:{phase}"] = ev[field]
     out.update(_turns(events))
     out.update(_gate_time(events))
     if audit is not None:  # the last audit only, and only for a run that was audited

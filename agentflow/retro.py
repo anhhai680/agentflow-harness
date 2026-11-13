@@ -263,6 +263,14 @@ def _evidence(ev: dict) -> tuple[str, list[str]] | None:
         return f"{key} at {_q(ev.get('context_pct'))}% of the context window", []
     if etype == "progress_not_updated":
         return key, []
+    if etype == "findings_reconciled":
+        found = ev.get("dispositions")
+        phase = _q(ev.get("phase")) or "?"
+        lines = [_q(f"{phase} {_q(d.get('finding'))} ({_q(d.get('class'))}): {_q(d.get('note'))}")
+                 for d in (found if isinstance(found, list) else [])
+                 if isinstance(d, dict) and d.get("class") in ("contract_misread", "noise")
+                 and isinstance(d.get("finding"), str)]
+        return (f"{key} round {_q(ev.get('round'))}", lines[:DIGEST_TAIL_LINES]) if lines else None
     return None
 
 

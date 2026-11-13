@@ -133,7 +133,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 21
+    assert len(FAMILIES) == 27
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -227,3 +227,57 @@ def test_a_fallback_counts_once_per_step_by_its_last_decision():
     out = run_signals(events, {"phases": []})
     assert out["sizer_fallbacks:build"] == 1
     assert "sizer_fallbacks:build" not in run_signals(events[2:], {"phases": []})
+
+
+DOUBT_FAMILIES = ("doubt_blocking", "doubt_rounds", "doubt_noise", "doubt_misread", "doubt_open", "doubt_actionable")
+
+
+def _settled(phase: str, **fields) -> dict:
+    base = {"reviews": 1, "rounds": 0, "first_blocking": 0, "open": 0, "stop": "clean", "actionable": 0, "noise": 0,
+            "misread": 0}
+    return _ev("doubt_settled", phase=phase, **{**base, **fields})
+
+
+def test_doubt_signals_come_from_doubt_settled():
+    first = _settled("plan", rounds=1, first_blocking=7, open=5, actionable=6, noise=4, misread=3)
+    last = _settled("plan", rounds=2, first_blocking=3, open=1, actionable=1, noise=2, misread=0)
+    other = _settled("define", rounds=1, first_blocking=1, open=0, actionable=1, noise=0, misread=0)
+    out = run_signals([first, last, other], EMPTY_METRICS)
+    assert {k: v for k, v in out.items() if k.endswith(":plan") and k.startswith("doubt_")} == {
+        "doubt_blocking:plan": 3, "doubt_rounds:plan": 2, "doubt_open:plan": 1, "doubt_actionable:plan": 1,
+        "doubt_noise:plan": 2, "doubt_misread:plan": 0}
+    assert out["doubt_blocking:define"] == 1 and out["doubt_actionable:define"] == 1   # one window per phase
+    reversed_ = run_signals([last, first], EMPTY_METRICS)   # the last event wins, not the largest value
+    assert reversed_["doubt_blocking:plan"] == 7 and reversed_["doubt_misread:plan"] == 3
+
+
+def test_no_doubt_key_without_doubt_settled():
+    phases = [{"phase": "plan", "cost_usd": 0.0, "steps": []}]
+    evs = [_ev("phase_rejected", phase="plan", by="runner", kind="reconcile"),
+           _ev("findings_reconciled", phase="plan", key="plan/plan_reconcile", round=1, dispositions=[]),
+           _ev("reconcile_stopped", phase="plan", round=1, reason="max_rounds", open=2)]
+    out = run_signals(evs, _metrics(phases))
+    assert not [k for k in out if k.startswith("doubt_")]
+    assert not [k for k in run_signals([_settled("plan")], EMPTY_METRICS) if k.endswith(":define")]
+    assert out["refine_rounds:plan"] == 0
+
+
+def test_reconcile_rounds_are_not_refine_rounds():
+    phases = [{"phase": "plan", "cost_usd": 0.0, "steps": []}]
+    evs = [_ev("phase_rejected", phase="plan", by="runner", kind="reconcile"),
+           _ev("phase_rejected", phase="plan", by="runner", kind="reconcile"),
+           _ev("phase_rejected", phase="plan", by="runner"),
+           _ev("phase_rejected", phase="plan", by="runner", kind="refine")]
+    out = run_signals(evs, _metrics(phases))
+    assert out["refine_rounds:plan"] == 2 and out["human_rejections:plan"] == 0
+    only = run_signals(evs[:2], _metrics(phases))
+    assert only["refine_rounds:plan"] == 0 and only["human_rejections:plan"] == 0
+
+
+def test_doubt_targets_parse():
+    for family in DOUBT_FAMILIES:
+        assert parse_target(f"{family}:plan") == (family, "plan")
+        assert parse_target(family) is None and parse_target(f"{family}:") is None
+        assert family in FAMILIES and FAMILIES[family][1] is True and family not in COUNT_FAMILIES
+    assert FAMILIES["doubt_actionable"] == ("higher", True)
+    assert all(FAMILIES[f] == ("lower", True) for f in DOUBT_FAMILIES if f != "doubt_actionable")
