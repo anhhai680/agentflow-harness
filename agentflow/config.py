@@ -60,6 +60,7 @@ AUTONOMY_KEYS = ("non_blocking_severities", "finding_rounds", "resolve_kinds", "
 # The `kind` of a `needs_human` question. `boundary`: the repository's docs reserve the decision for a human.
 QUESTION_KINDS = ("spec_gap", "ambiguity", "conflict", "review_dispute", "boundary", "other")
 CI_KEYS = ("poll_s", "appear_min", "timeout_min", "fix_rounds", "rerun_rounds", "sync_rounds")
+FLOOR_BLOCKING = ("critical", "high", "medium")  # severities that always block, whatever `non_blocking_severities` lists
 STEP_KEYS = (
     "id",
     "type",
@@ -92,6 +93,7 @@ STEP_KEYS = (
     "task_briefs",
     "name",
     "blocks_on_findings",
+    "reconciles",
     "forbid",
     "fix",
     "sync",
@@ -201,7 +203,7 @@ REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea
 # `specs`: one module per spec file in `project.docs.specs`, its dependencies from the header (`sources.spec_deps`)
 WORK_SOURCE_KINDS = ("capability_map", "specs")
 SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "verify", "ship",
-                   "review", "debug", "review_feedback")  # review_feedback: the skill sent with blocking findings
+                   "review", "debug", "review_feedback", "doubt")  # review_feedback: the skill sent with blocking findings
 
 
 @dataclass
@@ -402,6 +404,7 @@ class Step:
     continuation: bool = False  # run time only: a later batch member or shared small_plan task; its session has the skill
     name: str | None = None
     blocks_on_findings: bool = False  # its `findings` hold the phase back (`autonomy.phase_findings`)
+    reconciles: bool = False  # in a `needs_approval: true` phase: the step that revises the artifact after a review's findings
     forbid: list[str] = field(default_factory=list)  # guardrails.forbidden_paths for this step only
     fix: Step | None = None  # a `ci` step: the session that fixes a failed check
     sync: Step | None = None  # a `finish` step: the session that resolves the target branch's conflicts
@@ -686,6 +689,8 @@ class _Builder:
         fix = self.step(raw["fix"], _join(path, "fix"), default_id="fix") if raw.get("fix") else None
         sync = self.step(raw["sync"], _join(path, "sync"), default_id="sync") if raw.get("sync") else None
         step_id = raw.get("id") or raw.get("skill") or default_id or step_type
+        if not isinstance(raw.get("reconciles", False), bool):
+            raise ConfigError(_join(path, "reconciles"), "reconciles must be true or false")
         return Step(
             id=str(step_id),
             type=step_type,
@@ -718,6 +723,7 @@ class _Builder:
             task_briefs=dict(raw.get("task_briefs") or {}),
             name=raw.get("name"),
             blocks_on_findings=bool(raw.get("blocks_on_findings", False)),
+            reconciles=raw.get("reconciles", False),
             forbid=_string_list(raw.get("forbid", []), _join(path, "forbid")),
             fix=fix,
             sync=sync,
@@ -1599,6 +1605,73 @@ class _Validator:
             self.step(cfg.resolve_step, {cfg.resolve_step.id})
         if cfg.retro_step is not None:
             self.step(cfg.retro_step, {cfg.retro_step.id})
+        self.reconcile_placement()
+        self.reconcile_steps()
+        self.reconcile_order()
+
+    def reconcile_placement(self) -> None:
+        """`reconciles: true` goes on a step at the top level of a phase: nested in a group, a `review`, `fix` or
+        `sync`, or on `record_step`, `resolve_step` or `retro_step`, it would never be the phase's reconcile step."""
+        cfg = self.cfg
+
+        def nested(step: Step) -> list[Step]:
+            below = [*step.steps, *(s for s in (step.review, step.fix, step.sync) if s is not None)]
+            return [inner for child in below for inner in (child, *nested(child))]
+
+        for phase in cfg.phases.values():
+            for top in phase.steps:
+                for step in nested(top):
+                    if step.reconciles:
+                        self.error(_join(step.path, "reconciles"),
+                                   "a reconciles step must be at the top level of a phase's `steps`")
+        for step in (cfg.record_step, cfg.resolve_step, cfg.retro_step):
+            if step is not None and step.reconciles:
+                self.error(_join(step.path, "reconciles"), "only a step in a phase's `steps` can reconcile")
+
+    def reconcile_steps(self) -> None:
+        """A reconcile step edits the artifact its review found fault with, so it is an agent step that writes."""
+        for phase in self.cfg.phases.values():
+            for step in phase.steps:
+                if not step.reconciles:
+                    continue
+                path = _join(step.path, "reconciles")
+                if step.type != "agent":
+                    self.error(path, "a reconciles step must be an agent step")
+                if step.role == "review":
+                    self.error(path, "a reconciles step edits the artifact, so it cannot have `role: review`")
+                if not step.output:
+                    self.error(path, "a reconciles step needs an `output`: the artifact it may change")
+                if step.commit is not True:
+                    self.error(path, "a reconciles step needs `commit: true`")
+
+    def reconcile_order(self) -> None:
+        """Per lane: at most one reconcile step in a phase, before the steps that block on findings. And the two
+        warnings that mean the step never runs, or that an approval phase has nothing to settle its findings."""
+        cfg = self.cfg
+        for name, phase in cfg.phases.items():
+            path = f"phases.{name}"
+            reconciling = [s for s in phase.steps if s.reconciles]
+            blocking_any = any(s.blocks_on_findings for s in _walk_steps(phase.steps))
+            for lane in cfg.lanes:
+                steps = for_lane(phase.steps, lane)
+                found = [s for s in steps if s.reconciles]
+                if len(found) > 1:
+                    self.error(_join(found[1].path, "reconciles"),
+                               f"lane '{lane}' has {len(found)} reconciles steps in phase '{name}': at most one")
+                for i, step in enumerate(steps):
+                    if step.reconciles and any(s.blocks_on_findings for s in steps[:i]):
+                        self.error(_join(step.path, "reconciles"),
+                                   f"in lane '{lane}' this step comes after a `blocks_on_findings` step: "
+                                   "put it before the steps it reconciles")
+            if reconciling and phase.needs_approval is not True:
+                self.add("warning", _join(reconciling[0].path, "reconciles"),
+                         f"phase '{name}' has `needs_approval: false`, so its reconciles step never runs")
+            elif reconciling and not blocking_any:
+                self.add("warning", _join(reconciling[0].path, "reconciles"),
+                         f"phase '{name}' has no `blocks_on_findings` step, so its reconciles step never runs")
+            if phase.needs_approval is True and blocking_any and not reconciling:
+                self.add("warning", path, f"phase '{name}' needs approval and has `blocks_on_findings` steps but no "
+                                          "reconciles step: its findings go straight to the human")
 
     def lanes(self) -> None:
         """`retro` is the engine's own pipeline (`RETRO_PIPELINE`): a lane of that name would make its runs read as
@@ -1819,9 +1892,12 @@ class _Validator:
         if not isinstance(human, list) or any(kind not in QUESTION_KINDS for kind in human):
             self.error("autonomy.human_question_kinds",
                        f"human_question_kinds must be a list of question kinds: {', '.join(QUESTION_KINDS)}")
-        rounds = cfg.autonomy.get("finding_rounds", 0)
-        if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 0:
-            self.error("autonomy.finding_rounds", "finding_rounds must be a whole number, 0 or more")
+        self.non_blocking_severities()
+        if "finding_rounds" in cfg.autonomy:
+            rounds = cfg.autonomy["finding_rounds"]
+            if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 1:
+                self.error("autonomy.finding_rounds", "finding_rounds must be a whole number, 1 or more: "
+                           "automatic refinement of blocking findings is an engine floor and cannot be switched off")
         kinds = cfg.autonomy.get("resolve_kinds", {})
         if not isinstance(kinds, dict):
             self.error("autonomy.resolve_kinds", "resolve_kinds maps a stop kind to its attempts per step")
@@ -1840,6 +1916,21 @@ class _Validator:
         for key in cfg.ci:
             if key not in CI_KEYS:
                 self.error(f"ci.{key}", "unknown ci key")
+
+    def non_blocking_severities(self) -> None:
+        """The floor: `critical`, `high`, `medium`, an empty severity and a missing one always block."""
+        if "non_blocking_severities" not in self.cfg.autonomy:
+            return
+        path = "autonomy.non_blocking_severities"
+        listed = self.cfg.autonomy["non_blocking_severities"]
+        if not isinstance(listed, list) or not all(isinstance(name, str) for name in listed):
+            self.error(path, "non_blocking_severities must be a list of severity names (strings)")
+            return
+        refused = {*FLOOR_BLOCKING, "", "none", "null"}
+        for name in listed:
+            if name.strip().lower() in refused:
+                self.error(path, f"'{name}' always blocks (engine floor: {', '.join(FLOOR_BLOCKING)}, an empty or "
+                                 "missing severity) and cannot be listed as non-blocking")
 
     def overlays(self) -> None:
         for name, overlay in self.cfg.overlays.items():
@@ -1919,6 +2010,15 @@ def _lane_step_ids(steps: list[Step], lane: str) -> set[str]:
         ids.add(step.id)
         ids |= _lane_step_ids(step.steps, lane)
     return ids
+
+
+def _walk_steps(steps: list[Step]):
+    """Every step of a phase, nested groups and `review` steps included."""
+    for step in steps:
+        yield step
+        if step.review is not None:
+            yield from _walk_steps([step.review])
+        yield from _walk_steps(step.steps)
 
 
 def _all_step_ids(steps: list[Step]) -> set[str]:

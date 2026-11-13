@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from agentflow.commit_checks import runner_head
-from agentflow.config import QUESTION_KINDS, Config, Phase, Step
+from agentflow.config import FLOOR_BLOCKING, QUESTION_KINDS, Config, Phase, Step
 from agentflow.flow_control import halted
 from agentflow.gitops import restore_paths
 from agentflow.hitl import ResultError, answer, clean_fact, notify_run, read_result
@@ -48,9 +48,21 @@ OPTION_SHOWN = 40  # characters of an option key in the notification of an answe
 
 
 def is_blocking(cfg: Config, finding: dict) -> bool:
-    """Fails closed: a finding blocks unless its severity is one `config.yaml` lists as non-blocking."""
-    allowed = {str(name).lower() for name in cfg.autonomy.get("non_blocking_severities") or ()}
-    return str(finding.get("severity", "")).strip().lower() not in allowed
+    """Fails closed: a finding blocks unless its severity is one `config.yaml` lists as non-blocking.
+    The engine floor: `critical`, `high`, `medium`, an empty severity and a missing one always block."""
+    severity = finding.get("severity")
+    name = "" if severity is None else str(severity).strip().lower()
+    if not name or name in FLOOR_BLOCKING:
+        return True
+    allowed = {str(listed).lower() for listed in cfg.autonomy.get("non_blocking_severities") or ()}
+    return name not in allowed
+
+
+def round_limit(cfg: Config) -> int:
+    """How many refine rounds the runner may open on a phase's blocking findings: `autonomy.finding_rounds`, but at
+    least 1, and 1 for a value that is not a whole number or is missing (a workflow that drops the `autonomy` block)."""
+    value = cfg.autonomy.get("finding_rounds")
+    return max(value, 1) if isinstance(value, int) and not isinstance(value, bool) else 1
 
 
 def as_finding(raw: object) -> dict:

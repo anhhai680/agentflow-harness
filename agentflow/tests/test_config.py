@@ -1422,6 +1422,111 @@ def test_validate_policy_rules(tmp_cfg, patch, level, path, text):
     assert found[0].level == level and text in found[0].message
 
 
+def _reconciling(step_patch=None, phase="plan", at=1, review=True):
+    """The `plan` phase of the fixture pack with a reconcile step and a blocking review, built from steps and
+    prompts that exist in the pack (`step_patch` changes the reconcile step)."""
+    def patch(data: dict) -> None:
+        steps = data["phases"][phase]["steps"]
+        reconcile = {"id": "reconcile", "lanes": ["feature"], "skill": "writing-plans", "role": "plan",
+                     "prompt": "spec.md", "output": "docs/plans/{date}-{module}-{slug}.md", "commit": True,
+                     "message": "Revise the plan", "reconciles": True}
+        reconcile.update(step_patch or {})
+        steps.insert(at, reconcile)
+        if review:
+            steps.append({"id": "doubt_review", "lanes": ["feature"], "skill": "requesting-code-review",
+                          "role": "review", "prompt": "branch_review.md", "blocks_on_findings": True})
+
+    return patch
+
+
+def _both(*patches):
+    def patch(data: dict) -> None:
+        for each in patches:
+            each(data)
+
+    return patch
+
+
+def _set(*keys_and_value):
+    *keys, value = keys_and_value
+
+    def patch(data: dict) -> None:
+        node = data
+        for key in keys[:-1]:
+            node = node.setdefault(key, {})
+        node[keys[-1]] = value
+
+    return patch
+
+
+def _nest_reconcile(data: dict) -> None:
+    _reconciling()(data)
+    steps = data["phases"]["plan"]["steps"]
+    steps[1] = {"id": "group", "lanes": ["feature"], "steps": [steps[1]]}
+
+
+@pytest.mark.parametrize("patch, level, path, text", [
+    (_set("autonomy", "non_blocking_severities", "minor"), "error", "autonomy.non_blocking_severities", "list"),
+    (_set("autonomy", "non_blocking_severities", [1]), "error", "autonomy.non_blocking_severities", "list"),
+    (_set("autonomy", "non_blocking_severities", ["minor", "Medium"]),
+     "error", "autonomy.non_blocking_severities", "always blocks"),
+    (_set("autonomy", "non_blocking_severities", ["HIGH"]), "error", "autonomy.non_blocking_severities", "HIGH"),
+    (_set("autonomy", "non_blocking_severities", ["critical"]), "error", "autonomy.non_blocking_severities", "critical"),
+    (_set("autonomy", "non_blocking_severities", [""]), "error", "autonomy.non_blocking_severities", "always blocks"),
+    (_set("autonomy", "non_blocking_severities", ["none"]), "error", "autonomy.non_blocking_severities", "none"),
+    (_set("autonomy", "non_blocking_severities", ["null"]), "error", "autonomy.non_blocking_severities", "null"),
+    (_set("autonomy", "finding_rounds", 0), "error", "autonomy.finding_rounds", "1 or more"),
+    (_set("autonomy", "finding_rounds", -1), "error", "autonomy.finding_rounds", "1 or more"),
+    (_set("autonomy", "finding_rounds", True), "error", "autonomy.finding_rounds", "whole number"),
+    (_reconciling({"type": "gate"}), "error", "phases.plan.steps[1].reconciles", "agent step"),
+    (_reconciling({"role": "review"}), "error", "phases.plan.steps[1].reconciles", "role: review"),
+    (_reconciling({"output": None}), "error", "phases.plan.steps[1].reconciles", "output"),
+    (_reconciling({"commit": False}), "error", "phases.plan.steps[1].reconciles", "commit: true"),
+    (_reconciling({"commit": "per_task"}), "error", "phases.plan.steps[1].reconciles", "commit: true"),
+    (_both(_reconciling(), lambda d: d["phases"]["plan"]["steps"].insert(
+        2, {"id": "again", "lanes": ["feature"], "skill": "writing-plans", "role": "plan", "prompt": "spec.md",
+            "output": "docs/plans/x.md", "commit": True, "message": "x", "reconciles": True})),
+     "error", "phases.plan.steps[2].reconciles", "at most one"),
+    (_both(_reconciling(), lambda d: d["phases"]["plan"]["steps"].reverse()),
+     "error", "phases.plan.steps[1].reconciles", "after a `blocks_on_findings`"),
+    (_nest_reconcile, "error", "phases.plan.steps[1].steps[0].reconciles", "top level"),
+    (_both(_reconciling(), _set("retro_step", {"id": "retro", "skill": "writing-plans", "role": "review",
+                                               "prompt": "refine.md", "reconciles": True})),
+     "error", "retro_step.reconciles", "only a step in a phase"),
+    (_both(_reconciling(phase="build", at=1), lambda d: d["phases"]["build"]["steps"].__setitem__(
+        slice(None), [d["phases"]["build"]["steps"][0], d["phases"]["build"]["steps"][1]])),
+     "warning", "phases.build.steps[1].reconciles", "needs_approval: false"),
+    (_reconciling(review=False), "warning", "phases.plan.steps[1].reconciles", "no `blocks_on_findings` step"),
+    (lambda d: d["phases"]["plan"]["steps"].append(
+        {"id": "doubt_review", "lanes": ["feature"], "skill": "requesting-code-review", "role": "review",
+         "prompt": "branch_review.md", "blocks_on_findings": True}),
+     "warning", "phases.plan", "straight to the human"),
+    (_set("skills", "map", {"doubt": "doubt-driven-development"}),
+     "error", "skills.map.doubt", "user-only"),
+])
+def test_validate_doubt_rules(tmp_cfg, patch, level, path, text):
+    found = [i for i in issues_for(tmp_cfg, patch) if i.path == path]
+    assert found, path
+    assert found[0].level == level and text in found[0].message
+
+
+def test_the_doubt_skill_is_a_known_skills_map_key(tmp_cfg):
+    issues = issues_for(tmp_cfg, _set("skills", "map", {"doubt": "requesting-code-review"}))
+    assert not [i for i in issues if i.path.startswith("skills")]
+
+
+def test_reconciles_must_be_a_bool(tmp_cfg):
+    with pytest.raises(ConfigError, match="reconciles must be true or false"):
+        load_config(tmp_cfg(_reconciling({"reconciles": "false"})))
+
+
+def test_an_absent_finding_rounds_is_not_an_error(tmp_cfg):
+    def patch(data: dict) -> None:
+        del data["autonomy"]
+
+    assert not [i for i in issues_for(tmp_cfg, patch) if i.path.startswith("autonomy")]
+
+
 def test_a_default_naming_a_lane_the_pack_lacks_never_applies(tmp_cfg):
     def patch(data: dict) -> None:
         data["lanes"] = ["feature"]

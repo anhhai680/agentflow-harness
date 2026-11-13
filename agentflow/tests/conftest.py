@@ -255,10 +255,12 @@ class FlowRepo:
         self.cfg = self.configure()
         self.run = None
 
-    def configure(self, patch: dict | None = None, autopilot: bool = False, batch: bool = False):
+    def configure(self, patch: dict | None = None, autopilot: bool = False, batch: bool = False,
+                  edit: Callable[[dict], None] | None = None):
         """`autopilot=False` (the default) keeps a human at every phase and no `ci` step, so a test pins one
         stop or approval at a time: no phase resolves its stops and the runner takes no recommended answer. `autopilot=True` is the workflow as shipped. `batch=False` (the default)
-        drops the build step's `batch`, so a test's file-less plan tasks each get a session and a review."""
+        drops the build step's `batch`, so a test's file-less plan tasks each get a session and a review.
+        `edit` changes the config last, after the patch, for a change a `patch` mapping cannot say (a step list)."""
         from agentflow.config import load_config
 
         base = {
@@ -284,6 +286,8 @@ class FlowRepo:
             merged = deep_merge(deep_merge(data, base), patch or {})  # so `None` in `patch` deletes any key
             data.clear()
             data.update(merged)
+            if edit is not None:
+                edit(data)
 
         self.cfg = load_config(self._make_cfg(build))
         return self.cfg

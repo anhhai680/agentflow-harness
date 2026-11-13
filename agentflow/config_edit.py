@@ -157,7 +157,7 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
     ]),
     ("Autonomy", "What the runner settles by itself before a human hears of it.", [
         (("autonomy", "non_blocking_severities"), "Non-blocking severities", {"kind": "list"}),
-        (("autonomy", "finding_rounds"), "Finding rounds", _INT),
+        (("autonomy", "finding_rounds"), "Finding rounds", _POS),
         (("autonomy", "answer_recommended"), "Take recommended answers", {"kind": "bool"}),
         (("autonomy", "human_question_kinds"), "Question kinds only a human answers",
          {"kind": "list", "options": list(QUESTION_KINDS)}),

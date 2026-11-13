@@ -46,6 +46,7 @@ from agentflow.autonomy import (
     finding_rounds,
     findings_note,
     phase_findings,
+    round_limit,
 )
 from agentflow import pack, run_env, work_source
 from agentflow.commit_checks import runner_head
@@ -397,7 +398,7 @@ class _Loop:
             self.run.emit("phase_approved", by=AUTO_BY, phase=name, sha=head(self.worktree))
             self.hand_off(names, index, executor)
             return None
-        if finding_rounds(self.run, name) < int(self.cfg.autonomy.get("finding_rounds") or 0):
+        if finding_rounds(self.run, name) < round_limit(self.cfg):
             open_refine(self.run, name, AUTO_BY, findings_note(blocking))
             return self.phase(names, index)
         raise_phase_approval(self.cfg, self.run, name)
