@@ -704,7 +704,9 @@ REQUIRED = {("defaults", "agent"), ("effort", "default"), ("effort", "allowed"),
             ("context", "gate_output_lines")}
 STEP_SKILLS = {  # each default step, by its id path, and the `skills.map` key its skill comes from
     "define/debug": "debug", "define/draft": "define", "define/grill_open_questions/grill": "decide",
-    "define/grill_open_questions/apply": "design_doc", "plan/plan": "plan", "build/build": "build",
+    "define/grill_open_questions/apply": "design_doc", "define/spec_reconcile": "design_doc",
+    "define/spec_review": "doubt", "plan/plan": "plan", "plan/plan_reconcile": "plan", "plan/plan_review": "doubt",
+    "build/build": "build",
     "build/build/review": "review", "build/build/small_plan": "build_small", "build/regression_test": "build",
     "build/fix": "build", "verify/plan_fixes": "review_feedback", "verify/fix_findings": "review_feedback",
     "verify/verify": "verify", "review/plan_fixes": "review_feedback", "review/fix_findings": "review_feedback",
@@ -835,7 +837,7 @@ def test_every_skills_map_reference_in_the_defaults_resolves(tmp_path):
     assert skills == {"decide": "agentflow-define", "define": "agentflow-define", "design_doc": "agentflow-define",
                       "plan": "agentflow-plan", "build": "agentflow-build", "build_small": "agentflow-build",
                       "debug": "agentflow-debug", "verify": "agentflow-verify", "review": "agentflow-review",
-                      "review_feedback": "agentflow-respond"}
+                      "review_feedback": "agentflow-respond", "doubt": "agentflow-doubt"}
     for name in skills.values():
         found = pack.skill_file(tmp_path, ".claude/skills", name)
         assert found is not None and pack.is_bundled(found), name

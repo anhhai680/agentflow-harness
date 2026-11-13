@@ -98,6 +98,9 @@ dashboard:
   port: 7788
 
 # ------------------------------------------------------------------------------------------------ the workflow
+# In `define` and `plan` (feature lane), a doubt review (`spec_review`, `plan_review`) runs before the human approves.
+# Its blocking findings open a reconcile round: only the `reconciles: true` step (`spec_reconcile`, `plan_reconcile`)
+# and the review run again. A pack that does not want the review removes the four steps.
 
 skills:
   map:                         # each kind of step's skill; a pack maps its own skills here
@@ -111,6 +114,7 @@ skills:
     verify: agentflow-verify
     review: agentflow-review
     review_feedback: agentflow-respond
+    doubt: agentflow-doubt     # the adversarial reviewer of a spec and a plan; a pack may map its own, never a user-only skill
 
 conditions:                    # evaluated by the runner from files and git, never by a model
   spec_exists:            {check: file_exists, path: "{spec}"}
@@ -191,6 +195,10 @@ phases:
           - {id: answers, type: checkpoint, wait_for: answered_file}
           - {id: apply, skill: "@skills.map.design_doc", role: build, prompt: spec_apply.md,
              commit: true, message: "Resolve open questions in the {module} spec"}
+      - {id: spec_reconcile, lanes: [feature], skill: "@skills.map.design_doc", role: plan, prompt: reconcile.md,
+         output: "{spec}", reconciles: true, commit: true, message: "Revise the {module} spec after its review"}
+      - {id: spec_review, lanes: [feature], skill: "@skills.map.doubt", role: review, prompt: spec_review.md,
+         when: spec_awaits_approval, blocks_on_findings: true}
       - {id: spec_approval, lanes: [feature], gates: [], when: spec_awaits_approval}  # keeps `define` for its approval
   plan:
     needs_approval: true
@@ -199,6 +207,10 @@ phases:
     steps:
       - {id: plan, lanes: [feature], skill: "@skills.map.plan", role: plan, prompt: plan.md,
          output: "{plan_target}", commit: true, message: "Plan {module}"}
+      - {id: plan_reconcile, lanes: [feature], skill: "@skills.map.plan", role: plan, prompt: reconcile.md,
+         output: "{plan_target}", reconciles: true, commit: true, message: "Revise the {module} plan after its review"}
+      - {id: plan_review, lanes: [feature], skill: "@skills.map.doubt", role: review, prompt: plan_review.md,
+         blocks_on_findings: true}
   build:
     needs_approval: false
     resolve: true

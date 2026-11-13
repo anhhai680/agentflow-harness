@@ -663,3 +663,26 @@ def test_a_planted_signing_program_is_refused_before_the_commit(flow, tmp_path):
                                           "the git config. ")
     assert committed(run) == []
     assert not marker.exists()
+
+
+def test_the_engine_defaults_run_the_doubt_review(sparse_repo):
+    """A sparse pack states no `phases:`, so the doubt review comes from the engine defaults alone."""
+    from agentflow import pack
+    from agentflow.config import load_config, validate
+
+    cfg = load_config(pack.pack_config(sparse_repo))
+    ctx = make_ctx(cfg, sparse_repo, "feature", {"module": "demo"})
+    spec = sparse_repo / ctx.values["spec"]
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(SPEC_TEXT.replace(STATUS, "Status: proposed"), encoding="utf-8")  # what the bundled define skill writes
+    lines = {line.key: line for line in explain(cfg, "feature", ctx) if line.verdict != "approval"}
+    for key in ("define/spec_review", "plan/plan_review"):
+        assert lines[key].verdict == "run", key
+    for key in ("define/spec_reconcile", "plan/plan_reconcile"):
+        assert (lines[key].verdict, lines[key].reason) == ("skip", doubt.RECONCILE_ONLY), key
+    assert [i for i in validate(cfg, sparse_repo) if i.level == "error" or i.path.startswith(("phases", "skills"))] == []
+    spec.write_text(SPEC_TEXT.replace(STATUS, "Status: approved"), encoding="utf-8")  # a decision a human made isn't reviewed
+    assert {line.key: line for line in explain(cfg, "feature", ctx)}["define/spec_review"].verdict == "skip"
+    # the bug lane is as before
+    bug = {line.key for line in explain(cfg, "bug", make_ctx(cfg, sparse_repo, "bug", {"slug": "x"}))}
+    assert not {k for k in bug if "reconcile" in k or k.endswith(("spec_review", "plan_review"))}
