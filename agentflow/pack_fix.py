@@ -11,12 +11,14 @@ A release that drops or rewords text in an engine prompt adds a `Retired` entry 
 from __future__ import annotations
 
 import difflib
+import errno
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agentflow import pack, safeio
+from agentflow import pack
 from agentflow.config import Issue
 
 MAX_PROMPT_BYTES = 1_000_000  # a prompt larger than this is skipped, never read whole
@@ -96,19 +98,46 @@ class Findings:
     skipped: list[Skipped] = field(default_factory=list)
 
 
-def _read(path: Path) -> tuple[bytes, str] | Skipped:
+_PROMPT_NAME = re.compile(r"[A-Za-z0-9_.-]+\.md")
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def shown(text: str) -> str:
+    """`text` safe to print to a terminal: every control character but tab and newline as `\\xNN`. File names and
+    contents come from the repository, which may carry escape sequences."""
+    return _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
+def _read(path: Path, follow: bool) -> tuple[bytes, str] | Skipped:
+    """The bytes and text of a prompt, read with one bounded open (following a symlink only when `follow`)."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | (0 if follow else os.O_NOFOLLOW)
     try:
-        data = safeio.read_bytes(path, MAX_PROMPT_BYTES)
-    except safeio.SymlinkRefused:
-        return Skipped(path, "a symlink")
-    except (ValueError, OSError):
-        return Skipped(path, "not a regular file or larger than 1 MB")
-    if data is None:
-        return Skipped(path, "not a regular file or larger than 1 MB")
+        fd = os.open(path, flags)
+    except OSError as exc:
+        return Skipped(path, "a symlink" if exc.errno == errno.ELOOP or path.is_symlink() else "not readable")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return Skipped(path, "not a regular file")
+        if info.st_size > MAX_PROMPT_BYTES:
+            return Skipped(path, "larger than 1 MB")
+        data = _read_fd(fd)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_PROMPT_BYTES:
+        return Skipped(path, "larger than 1 MB")
     try:
         return data, data.decode("utf-8")
     except UnicodeDecodeError:
         return Skipped(path, "not UTF-8")
+
+
+def _read_fd(fd: int) -> bytes:
+    chunks, size = [], 0
+    while size <= MAX_PROMPT_BYTES and (chunk := os.read(fd, 65536)):
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
 
 
 def _engine_bytes(name: str) -> bytes | None:
@@ -116,36 +145,69 @@ def _engine_bytes(name: str) -> bytes | None:
     return file.read_bytes() if file.is_file() else None
 
 
+def _not_in_place(path: Path) -> str | None:
+    """Why `--fix` can't change this prompt where it is, or None when it can."""
+    folder = path.parent
+    if folder.is_symlink() or folder.parent.is_symlink():
+        return "in a symlinked folder"
+    if path.is_symlink():
+        return "a symlink"
+    if not _PROMPT_NAME.fullmatch(path.name):
+        return "an unusual file name"
+    return None
+
+
+def _scan(text: str) -> tuple[str, list[Retired], list[Retired]]:
+    """`text` with every exact retired text replaced, the entries that matched, and the entries whose token is
+    still there after that (the text was edited)."""
+    crlf = "\r\n" in text
+    changed, matched = text, []
+    for entry in RETIRED:
+        old, new = (entry.old.replace("\n", "\r\n"), entry.new.replace("\n", "\r\n")) if crlf else (entry.old, entry.new)
+        if old in changed:
+            changed = changed.replace(old, new)
+            matched.append(entry)
+    return changed, matched, [entry for entry in RETIRED if entry.detect in changed]
+
+
+def _edited(entry: Retired) -> str:
+    return (f"mentions {entry.detect!r}, which the engine retired in {entry.retired_in} ({entry.id}), in text that "
+            f"was edited, so validate --fix leaves it: compare it with engine:prompts/{entry.file}")
+
+
 def findings(config_path: Path) -> Findings:
     """Every drift problem in the pack's own prompts (`<pack>/prompts/*.md`), with the fixes for those that have one
-    right answer. Reads only; a prompt it can't read safely is `skipped`, never an issue."""
+    right answer. Reads only. A prompt `--fix` can't change in place (a symlink, a symlinked folder, an unusual
+    name) is still read, through its link, and its problems reported as not fixable."""
     out = Findings()
     folder = Path(config_path).parent / "prompts"
-    if not folder.is_dir() or folder.is_symlink():
+    if not folder.is_dir():
         return out
     for path in sorted(folder.glob("*.md")):
-        read = _read(path)
+        label = pack.prompt_label(config_path, path)
+        why_not = _not_in_place(path)
+        read = _read(path, follow=why_not is not None)
         if isinstance(read, Skipped):
-            out.skipped.append(read)
+            out.skipped.append(Skipped(path, why_not or read.reason))
+            if read.reason == "larger than 1 MB":
+                out.issues.append(Issue("warning", label, "is larger than 1 MB, so validate can't check it for text "
+                                                          "the engine retired"))
             continue
         before, text = read
-        label = pack.prompt_label(config_path, path)
-        crlf = "\r\n" in text
-        changed = text
-        for entry in RETIRED:
-            old, new = (entry.old.replace("\n", "\r\n"), entry.new.replace("\n", "\r\n")) if crlf else (entry.old, entry.new)
-            if old in changed:
-                changed = changed.replace(old, new)
-                does = "removes it" if not entry.new else "replaces it with the engine's current text"
+        changed, matched, edited = _scan(text)
+        if why_not:
+            out.skipped.append(Skipped(path, why_not))
+            for entry in matched:
                 out.issues.append(Issue("warning", label, f"holds text the engine retired in {entry.retired_in} "
-                                                          f"({entry.id}); validate --fix {does}", fixable=True))
-        for entry in RETIRED:
-            if entry.detect in changed:
-                out.issues.append(Issue("warning", label, f"mentions {entry.detect!r}, which the engine retired in "
-                                                          f"{entry.retired_in} ({entry.id}), in text that was edited, "
-                                                          f"so validate --fix leaves it: compare it with "
-                                                          f"engine:prompts/{entry.file}"))
-        after = changed.encode("utf-8")
+                                                          f"({entry.id}), but it is {why_not}, so validate --fix "
+                                                          f"leaves it: compare it with engine:prompts/{entry.file}"))
+            out.issues.extend(Issue("warning", label, _edited(entry)) for entry in edited)
+            continue
+        for entry in matched:
+            does = "removes it" if not entry.new else "replaces it with the engine's current text"
+            out.issues.append(Issue("warning", label, f"holds text the engine retired in {entry.retired_in} "
+                                                      f"({entry.id}); validate --fix {does}", fixable=True))
+        out.issues.extend(Issue("warning", label, _edited(entry)) for entry in edited)
         engine = _engine_bytes(path.name)
         if changed == text:
             if engine is not None and before == engine:
@@ -154,13 +216,12 @@ def findings(config_path: Path) -> Findings:
                                                           f"validate --fix deletes it", fixable=True))
                 out.fixes.append(Fix(path, before, None))
             continue
+        after = changed.encode("utf-8")
         out.fixes.append(Fix(path, before, None if after == engine else after))
     return out
 
 
 # ---- applying the fixes (`agentflow validate --fix`)
-
-_PROMPT_NAME = re.compile(r"[A-Za-z0-9_.-]+\.md")
 
 
 class FixRefused(Exception):
@@ -168,9 +229,9 @@ class FixRefused(Exception):
 
 
 def check_pack(repo: Path) -> None:
-    """Refuse `--fix` inside an agentflow run (an agent never changes the pack), and on a pack whose folder or
-    `prompts/` folder is a symlink (the writes would land outside the repository)."""
-    if os.environ.get("AGENTFLOW_RUN"):
+    """Refuse `--fix` inside an agentflow run (an agent never changes the pack; the variable counts even when empty),
+    and on a pack whose folder or `prompts/` folder is a symlink (the writes would land outside the repository)."""
+    if "AGENTFLOW_RUN" in os.environ:
         raise FixRefused("validate --fix never runs inside an agentflow run")
     for folder in (Path(repo) / pack.PACK_DIR, Path(repo) / pack.PACK_DIR / "prompts"):
         if folder.is_symlink():
@@ -182,14 +243,14 @@ def _rel(path: Path, repo: Path) -> str:
 
 
 def render(fix: Fix, repo: Path) -> str:
-    """What the fix does, as a unified diff with `a/` and `b/` headers, or `delete <path>`."""
-    rel = _rel(fix.path, repo)
+    """What the fix does, as a unified diff with `a/` and `b/` headers, or `delete <path>`; escaped for a terminal."""
+    rel = shown(_rel(fix.path, repo))
     if fix.after is None:
         return f"delete {rel}\n"
     lines = difflib.unified_diff(fix.before.decode("utf-8").splitlines(keepends=True),
                                  fix.after.decode("utf-8").splitlines(keepends=True),
                                  fromfile=f"a/{rel}", tofile=f"b/{rel}")
-    return "".join(line if line.endswith("\n") else line + "\n" for line in lines)
+    return "".join(shown(line.removesuffix("\n").removesuffix("\r")) + "\n" for line in lines)
 
 
 def _inside_prompts(path: Path) -> bool:
@@ -198,9 +259,77 @@ def _inside_prompts(path: Path) -> bool:
             and not folder.is_symlink() and not folder.parent.is_symlink())
 
 
+_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _apply_one(fix: Fix) -> str | None:
+    """Apply one fix through directory handles opened without following a symlink, so no folder on the way can be
+    swapped for a link once checked. The file must still be the one regular, singly linked file `findings` read,
+    holding the same bytes; a rewrite goes to a new file renamed over it, so nothing is written through a link and
+    an interrupted write leaves the old prompt. Returns why it was skipped, or None once applied."""
+    name = fix.path.name
+    pack_dir = os.open(fix.path.parent.parent, _DIR)
+    try:
+        folder = os.open("prompts", _DIR, dir_fd=pack_dir)
+    finally:
+        os.close(pack_dir)
+    try:
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+        except OSError:
+            return "changed since it was read"
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PROMPT_BYTES:
+                return "changed since it was read"
+            if info.st_nlink != 1:
+                return "has other hard links"
+            now = _read_fd(fd)
+        finally:
+            os.close(fd)
+        if now != fix.before:
+            return "changed since it was read"
+
+        def same() -> bool:
+            current = os.stat(name, dir_fd=folder, follow_symlinks=False)
+            return (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino)
+
+        if fix.after is None:
+            if not same():
+                return "changed since it was read"
+            os.unlink(name, dir_fd=folder)
+            return None
+        temp = f".{name}.fix-{os.getpid()}"
+        out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, stat.S_IMODE(info.st_mode),
+                      dir_fd=folder)
+        try:
+            try:
+                os.fchmod(out, stat.S_IMODE(info.st_mode))
+                view = memoryview(fix.after)
+                while view:
+                    view = view[os.write(out, view):]
+                os.fsync(out)
+            finally:
+                os.close(out)
+            if not same():
+                os.unlink(temp, dir_fd=folder)
+                return "changed since it was read"
+            os.replace(temp, name, src_dir_fd=folder, dst_dir_fd=folder)
+        except BaseException:
+            try:
+                os.unlink(temp, dir_fd=folder)
+            except OSError:
+                pass
+            raise
+        return None
+    finally:
+        os.close(folder)
+
+
 def apply(fixes: list[Fix]) -> tuple[list[Fix], list[Skipped]]:
     """Write or delete each fix's file, only when it still holds the bytes `findings` read and sits directly in a
-    real `.agentflow/prompts/` folder. Returns the fixes applied and the files skipped."""
+    real `.agentflow/prompts/` folder. A file that fails is skipped with the reason; the others still go ahead.
+    Returns the fixes applied and the files skipped."""
     applied: list[Fix] = []
     skipped: list[Skipped] = []
     for fix in fixes:
@@ -208,15 +337,11 @@ def apply(fixes: list[Fix]) -> tuple[list[Fix], list[Skipped]]:
             skipped.append(Skipped(fix.path, "outside .agentflow/prompts"))
             continue
         try:
-            now = safeio.read_bytes(fix.path, MAX_PROMPT_BYTES)
-        except (OSError, ValueError):
-            now = None
-        if now != fix.before:
-            skipped.append(Skipped(fix.path, "changed since it was read"))
-            continue
-        if fix.after is None:
-            safeio.remove(fix.path)
+            reason = _apply_one(fix)
+        except OSError as exc:
+            reason = f"could not write: {exc.strerror or exc}"
+        if reason is None:
+            applied.append(fix)
         else:
-            safeio.write_text(fix.path, fix.after.decode("utf-8"))
-        applied.append(fix)
+            skipped.append(Skipped(fix.path, reason))
     return applied, skipped

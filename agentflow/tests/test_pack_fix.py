@@ -115,8 +115,44 @@ def test_unreadable_prompts_are_skipped(pack_repo_python):
     put(pack_repo_python, "bad.md", b"\xff\xfe")
     got = found(pack_repo_python)
     assert sorted(s.path.name for s in got.skipped) == ["bad.md", "big.md", "x.md"]
-    assert got.issues == [] and got.fixes == []
-    drift_issues(pack_repo_python)  # does not raise
+    assert got.fixes == []
+    assert [(i.path, i.fixable) for i in got.issues] == [("prompts/big.md", False)]
+    assert "larger than 1 MB" in got.issues[0].message
+    issues = validate(load_config(pack.pack_config(pack_repo_python)), pack_repo_python)
+    assert ("error", "prompts/bad.md", "is not UTF-8 text") in [(i.level, i.path, i.message) for i in issues]
+
+
+def test_symlinked_prompt_with_retired_text_warns(pack_repo_python, tmp_path):
+    shared = tmp_path / "shared_result.md"
+    shared.write_text(OLD_RESULT, encoding="utf-8")
+    os.symlink(shared, prompts(pack_repo_python) / "_result.md")
+    got = found(pack_repo_python)
+    assert [(i.path, i.fixable) for i in got.issues] == [("prompts/_result.md", False)]
+    assert "a symlink" in got.issues[0].message and "2.5" in got.issues[0].message
+    assert got.fixes == []
+
+
+def test_symlinked_prompts_folder_with_retired_text_warns(pack_repo_python, tmp_path):
+    shared = tmp_path / "shared-prompts"
+    shared.mkdir()
+    (shared / "_result.md").write_text(OLD_RESULT, encoding="utf-8")
+    folder = prompts(pack_repo_python)
+    for file in folder.iterdir():
+        file.unlink()
+    folder.rmdir()
+    os.symlink(shared, folder)
+    got = found(pack_repo_python)
+    assert [(i.path, i.fixable) for i in got.issues] == [("prompts/_result.md", False)]
+    assert "symlinked folder" in got.issues[0].message
+    assert got.fixes == []
+
+
+def test_unusual_name_is_not_marked_fixable(pack_repo_python):
+    put(pack_repo_python, "my prompt.md", OLD_RESULT)
+    got = found(pack_repo_python)
+    assert [(i.path, i.fixable) for i in got.issues] == [("prompts/my prompt.md", False)]
+    assert "unusual file name" in got.issues[0].message
+    assert got.fixes == []
 
 
 def test_python_pack_has_no_drift(pack_repo_python):
@@ -239,3 +275,66 @@ def test_fix_names_skipped_files(pack_repo_python, monkeypatch, capsys):
     os.symlink(pack.ENGINE_PROMPTS / "task.md", prompts(pack_repo_python) / "x.md")
     code, out = cli(pack_repo_python, monkeypatch, capsys, "--fix")
     assert "skipped .agentflow/prompts/x.md: a symlink" in out
+
+
+
+def test_refused_inside_a_run_even_when_the_variable_is_empty(pack_repo_python, monkeypatch, capsys):
+    path = put(pack_repo_python, "_result.md", OLD_RESULT)
+    monkeypatch.setenv("AGENTFLOW_RUN", "")
+    code, out = cli(pack_repo_python, monkeypatch, capsys, "--fix")
+    assert code == 1 and "never runs inside an agentflow run" in out
+    assert path.read_text(encoding="utf-8") == OLD_RESULT
+
+
+def test_apply_never_writes_through_a_hard_link(pack_repo_python, tmp_path):
+    path = put(pack_repo_python, "_result.md", OLD_RESULT + "\nPack wording.\n")
+    fixes = found(pack_repo_python).fixes
+    outside = tmp_path / "victim.md"
+    outside.write_bytes(path.read_bytes())
+    path.unlink()
+    os.link(outside, path)
+    applied, skipped = pack_fix.apply(fixes)
+    assert applied == [] and [s.path for s in skipped] == [path]
+    assert outside.read_bytes() == (OLD_RESULT + "\nPack wording.\n").encode("utf-8")
+
+
+def test_apply_never_deletes_a_folder_swapped_in(pack_repo_python):
+    path = put(pack_repo_python, "task.md", engine("task.md"))
+    fixes = found(pack_repo_python).fixes
+    path.unlink()
+    path.mkdir()
+    (path / "keep.txt").write_text("keep", encoding="utf-8")
+    applied, skipped = pack_fix.apply(fixes)
+    assert applied == [] and [s.path for s in skipped] == [path]
+    assert (path / "keep.txt").exists()
+
+
+def test_rewrite_keeps_the_file_mode(pack_repo_python):
+    path = put(pack_repo_python, "_result.md", OLD_RESULT + "\nPack wording.\n")
+    path.chmod(0o640)
+    applied, _ = pack_fix.apply(found(pack_repo_python).fixes)
+    assert len(applied) == 1
+    assert path.stat().st_mode & 0o777 == 0o640
+    assert [p.name for p in prompts(pack_repo_python).iterdir() if p.name.startswith(".")] == []
+
+
+def test_a_write_error_is_skipped_not_raised(pack_repo_python):
+    put(pack_repo_python, "task.md", engine("task.md"))
+    fixes = found(pack_repo_python).fixes
+    folder = prompts(pack_repo_python)
+    folder.chmod(0o555)
+    try:
+        applied, skipped = pack_fix.apply(fixes)
+    finally:
+        folder.chmod(0o755)
+    assert applied == []
+    assert skipped[0].reason.startswith("could not write")
+
+
+def test_output_escapes_control_characters(pack_repo_python, monkeypatch, capsys):
+    put(pack_repo_python, "x\x1b[2K.md", OLD_RESULT)
+    put(pack_repo_python, "_result.md", OLD_RESULT.replace(STATUS.old, STATUS.old + "\n\x1b[31mRED"))
+    for args in ((), ("--fix", "--dry-run")):
+        code, out = cli(pack_repo_python, monkeypatch, capsys, *args)
+        assert "\x1b" not in out, args
+        assert "\\x1b" in out, args

@@ -102,8 +102,13 @@ Every `Retired` entry is a warning. There is no per-entry level (see Decided beh
 - **Never inside a run.** `--fix` refuses when `AGENTFLOW_RUN` is set: an agent in a run may not change the pack,
   and the pack is always the main checkout's, outside the run's worktree.
 - **Only the pack's own prompt files.** It writes only regular files directly under the pack's `prompts/`, as listed
-  by `pack.prompt_files`. Each write and delete goes through `safeio` (`write_text`, `remove`), which never follows
-  a symlink. A symlinked prompt is refused and named.
+  by `pack.prompt_files`. Each write and delete works through directory handles opened without following a
+  symlink (`.agentflow`, then `prompts` inside it), on a file that must still be regular and singly linked. A rewrite
+  goes to a new file renamed over the old one, and a delete unlinks only that file. A symlinked prompt, a prompt in
+  a symlinked folder, or one with an unusual name is never changed: `validate` still reads it through its link and
+  reports its retired text as not fixable, and `--fix` names it as skipped. File names and text are printed with
+  control characters escaped. (Changed in the final review, 2026-11-13: the first version used `safeio.write_text`
+  and `safeio.remove`.)
 - **Compare before write.** It reads each file, computes the fix, and before writing checks that the file still has
   the bytes it read. If it changed, that file is skipped and named, and the other fixes still apply.
 - **No `config.yaml` edits in this slice.** None of the fixable problems lives there. A later fix that renames a

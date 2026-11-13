@@ -56,10 +56,11 @@ def _print_validation(cfg, repo: Path, config_path: Path) -> int:
     """Print every issue `validate` finds and the summary lines; 1 when there is an error, else 0."""
     from agentflow.config import validate
     from agentflow.guards import settings_coverage
+    from agentflow.pack_fix import shown
 
     issues = validate(cfg, repo) + settings_coverage(cfg, repo)
-    for issue in issues:
-        print(f"{issue.level} {issue.path}: {issue.message}" + (" (fixable)" if issue.fixable else ""))
+    for issue in issues:  # escaped: a prompt's file name comes from the repository
+        print(shown(f"{issue.level} {issue.path}: {issue.message}") + (" (fixable)" if issue.fixable else ""))
     errors = sum(1 for i in issues if i.level == "error")
     if not errors:
         print(f"ok: {config_path.name} is valid ({len(issues)} warnings)")
@@ -76,20 +77,20 @@ def _fix_pack(cfg, repo: Path, config_path: Path, dry_run: bool) -> int:
     try:
         pack_fix.check_pack(repo)
     except pack_fix.FixRefused as exc:
-        print(f"error {exc}")
+        print(f"error {pack_fix.shown(str(exc))}")
         return 1
     found = pack_fix.findings(config_path)
     for fix in found.fixes:
         print(pack_fix.render(fix, repo), end="")
     for skip in found.skipped:
-        print(f"skipped {os.path.relpath(skip.path, repo)}: {skip.reason}")
+        print(f"skipped {pack_fix.shown(os.path.relpath(skip.path, repo))}: {skip.reason}")
     if dry_run:
         code = _print_validation(cfg, repo, config_path)
         print(f"dry run: {len(found.fixes)} files would change; nothing written")
         return code
     applied, skipped = pack_fix.apply(found.fixes)
     for skip in skipped:
-        print(f"skipped {os.path.relpath(skip.path, repo)}: {skip.reason}")
+        print(f"skipped {pack_fix.shown(os.path.relpath(skip.path, repo))}: {skip.reason}")
     print(f"fixed {len(applied)} files")
     return _print_validation(cfg, repo, config_path)
 
