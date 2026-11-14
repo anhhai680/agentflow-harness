@@ -59,9 +59,9 @@ def test_stale_sha_only_counts_review_fixes_after_verify():
 
 def test_render_pr_marks_criteria_and_lists_gaps():
     lines = v.render_pr(True, v.parse(GOOD), "abcdef123456")
-    assert lines == ["- Criterion 1: `tests/test_a.py::test_one` ✓ (before review fix abcdef123456)",
-                     "- Criterion 2: `tests/test_a.py::test_two` ✗ (before review fix abcdef123456)",
-                     "- not verified: Criterion 3: needs a browser"]
+    assert lines == ["- `Criterion 1`: `tests/test_a.py::test_one` ✓ (before review fix abcdef123456)",
+                     "- `Criterion 2`: `tests/test_a.py::test_two` ✗ (before review fix abcdef123456)",
+                     "- not verified: `Criterion 3`: `needs a browser`"]
 
 def test_render_without_a_story():
     assert v.render_pr(False, None, None) == ["verify did not run"]
@@ -78,7 +78,7 @@ def test_render_prompt_lists_gates_criteria_and_gaps():
 
 def test_a_criterion_that_did_not_run_is_marked_not_run():
     story = v.parse({"verification": {"criteria": [{"criterion": "C", "evidence": "e", "ran": False, "passed": False}]}})
-    assert v.render_pr(True, story, None) == ["- C: `e` – not run"]
+    assert v.render_pr(True, story, None) == ["- `C`: `e` – not run"]
 
 def test_read_story(tmp_path):
     class FakeRun:
@@ -97,6 +97,37 @@ def test_backticks_in_code_text_are_replaced():
     story = v.parse({"verification": {
         "gates": [{"gate": "g`1", "cmd": "run `x`", "result": "ok `r`", "passed": True}],
         "criteria": [{"criterion": "C", "evidence": "a`b", "ran": True, "passed": True}]}})
-    assert v.render_pr(True, story, None) == ["- C: `a'b` ✓"]
+    assert v.render_pr(True, story, None) == ["- `C`: `a'b` ✓"]
     assert v.render_prompt(True, story).splitlines()[0] == "- gate `g'1`: ok `r` ✓"
     assert story.gates[0].cmd == "run 'x'"  # cmd is not rendered, so it is checked on the parsed story
+
+def test_model_text_in_the_pr_is_inert():
+    hostile = ["<!-- x", "@org/team", "Closes #1", "[a](https://e.vil)"]
+    story = v.parse({"verification": {
+        "criteria": [{"criterion": text, "evidence": "t", "ran": True, "passed": True} for text in hostile],
+        "not_verified": [{"what": text, "why": text} for text in hostile]}})
+    plain = v.parse({"verification": {
+        "criteria": [{"criterion": "c", "evidence": "t", "ran": True, "passed": True}] * len(hostile),
+        "not_verified": [{"what": "w", "why": "y"}] * len(hostile)}})
+    lines = v.render_pr(True, story, None)
+    assert len(lines) == len(v.render_pr(True, plain, None)) == 2 * len(hostile)
+    for line in lines:
+        outside = "".join(line.split("`")[0::2])  # the text outside every code span
+        assert not any(text in outside for text in hostile) and not any(c in outside for c in "<@#[")
+    for text in hostile:
+        assert sum(line.count(f"`{text}`") for line in lines) == 3  # criterion, what and why, each in its own span
+
+
+def test_an_empty_text_is_never_an_empty_code_span():
+    story = v.parse({"verification": {
+        "criteria": [{"criterion": "C", "evidence": "", "ran": True, "passed": True}],
+        "not_verified": [{"what": "W", "why": ""}],
+        "gates": [{"gate": "g", "cmd": "", "result": "", "passed": True}]}})
+    pr, prompt = v.render_pr(True, story, None), v.render_prompt(True, story).splitlines()
+    assert pr == ["- `C`: (none) ✓", "- not verified: `W`: (none)"]
+    assert "``" not in "".join(pr + prompt) and prompt[1] == "- C: (none) ✓"
+
+
+def test_the_prompt_keeps_model_prose_plain():
+    story = v.parse({"verification": {"criteria": [{"criterion": "C 1", "evidence": "t", "ran": True, "passed": True}]}})
+    assert v.render_prompt(True, story) == "- C 1: `t` ✓"

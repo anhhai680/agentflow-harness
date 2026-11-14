@@ -3,7 +3,8 @@
 
 The result is model text, so nothing here trusts it. A malformed signal or item is dropped, never repaired, every text
 is one clean line (`clean_fact`) cut to `MAX_TEXT`, each list is cut to `MAX_ITEMS`, and a backtick that could close
-the code span an evidence or command sits in is replaced. Everything is a pure function except `read_story`."""
+the code span a text sits in is replaced. In the pull request every model text is a code span. Everything is a pure
+function except `read_story`."""
 
 from __future__ import annotations
 
@@ -134,13 +135,21 @@ def _mark(ran: bool, passed: bool) -> str:
     return ("✓" if passed else "✗") if ran else "– not run"
 
 
-def _lines(story: Story, with_gates: bool, suffix: str) -> list[str]:
+def _span(text: str) -> str:
+    """One parsed text as a code span, so markdown, HTML, mentions and issue keywords in it are shown, never acted on.
+    Its backticks become apostrophes; an empty text is `(none)`, never an empty span."""
+    return f"`{text.replace('`', "'")}`" if text else "(none)"
+
+
+def _lines(story: Story, with_gates: bool, suffix: str, show=str) -> list[str]:
+    """One line per gate (when `with_gates`), criterion and gap. `show` renders each prose text; the gate name and the
+    evidence are always a code span."""
     lines = []
     if with_gates:
-        lines += [f"- gate `{g.gate}`: {g.result} {_mark(True, g.passed)}" for g in story.gates]
-    lines += [f"- {c.criterion}: `{c.evidence}` {_mark(c.ran, c.passed)}{suffix if c.ran else ''}"
+        lines += [f"- gate {_span(g.gate)}: {show(g.result)} {_mark(True, g.passed)}" for g in story.gates]
+    lines += [f"- {show(c.criterion)}: {_span(c.evidence)} {_mark(c.ran, c.passed)}{suffix if c.ran else ''}"
               for c in story.criteria]
-    lines += [f"- not verified: {g.what}: {g.why}" for g in story.not_verified]
+    lines += [f"- not verified: {show(g.what)}: {show(g.why)}" for g in story.not_verified]
     if story.more:
         lines.append(f"- … and {story.more} more")
     return lines
@@ -154,13 +163,14 @@ def render_prompt(found: bool, story: Story | None) -> str:
 
 
 def render_pr(found: bool, story: Story | None, stale: str | None) -> list[str]:
-    """The story for the pull request body, without the gates (its own section has them). `stale` is the sha of a
-    review fix made after verify, which every criterion that ran is marked with."""
+    """The story for the pull request body, without the gates (its own section has them). Every model text is a code
+    span, so nothing in it renders or links. `stale` is the sha of a review fix made after verify, which every
+    criterion that ran is marked with."""
     if not found:
         return [NOT_RUN]
     if story is None:
         return [NO_EVIDENCE]
-    return _lines(story, False, f" (before review fix {stale})" if stale else "")
+    return _lines(story, False, f" (before review fix {stale})" if stale else "", _span)
 
 
 def read_story(run: Run) -> tuple[bool, Story | None]:

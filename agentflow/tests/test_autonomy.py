@@ -213,12 +213,19 @@ def test_a_verify_without_a_fix_plan_reruns_only_verify(auto):
     assert run.state["refine"] is None
 
 
-def test_a_verify_finding_that_outlasts_its_rounds_is_not_sent_to_a_fix_plan(auto):
+def test_a_verify_finding_that_outlasts_its_rounds_is_not_sent_to_a_fix_plan(auto, notified):
     auto.configure(PIPE, autopilot=True, edit=drop_verify_fix_steps)
-    auto.script({RED: [GOOD_TEST], "build/fix": [FIXED], "verify/verify": [done("thiếu", findings=[BLOCKING])] * 6})
+    rounds = round_limit(auto.cfg)
+    auto.script({RED: [GOOD_TEST], "build/fix": [FIXED],
+                 "verify/verify": [done("thiếu", findings=[BLOCKING])] * (rounds + 1)})
     run = begin_bug(auto)
-    assert go(auto, run) != "done"
-    assert "verify/plan_fixes" not in called(auto)
+    assert go(auto, run) == "awaiting_approval"  # the rounds are used up: the phase goes to a human
+    assert run.state["waiting"]["phase"] == "verify"
+    assert [e["phase"] for e in auto.events(run, "phase_rejected")] == ["verify"] * rounds
+    assert called(auto).count("verify/verify") == rounds + 1  # the first session and one per round, nothing more
+    assert not {"verify/plan_fixes", "verify/fix_findings", "review/branch_review"} & set(called(auto))
+    page = approval_text(auto.cfg, run, "verify")
+    assert "1 blocking finding(s) are still open" in page and BLOCKING["text"] in page
 
 
 def test_verify_cannot_clear_its_own_finding_by_answering_unchanged(auto):

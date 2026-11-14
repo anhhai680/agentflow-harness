@@ -13,7 +13,7 @@ A claim that the work is done, fixed or passing needs fresh evidence from this e
 2. Do not run those gate commands again. Their output is the evidence.
 3. For each acceptance criterion in the spec and each verification command in the plan, name the test or command that ran and its result.
 4. Run what no gate covers: the plan's or the spec's own verification commands that are not among the gates. Name each one, with its result.
-5. List what could not run as not verified, with the reason. A criterion nothing ran for is never met.
+5. List what could not run as not verified, with the reason. A criterion nothing ran for is never met. A criterion that needs something outside the worktree (a browser, a running stack) is not verified and a minor finding, not a blocking one.
 6. Report each gate, each extra command and each criterion with its real result.
 
 ## When a gate fails
@@ -29,7 +29,8 @@ A claim that the work is done, fixed or passing needs fresh evidence from this e
 
 - Claim nothing you did not see. "Should pass" and "looks right" are not results.
 - Never judge the code by reading it: review does that.
-- If something fails or could not be run, say which gate or command and why, and put it in the result's findings as blocking. A failure mentioned only in the summary slips through.
+- A gate or command that ran and failed, or an environment failure that breaks a gate and that you cannot fix in the worktree, is a blocking finding: say which gate or command and why. A failure mentioned only in the summary slips through.
+- A criterion that could not run because it needs something outside the worktree is not blocking: list it as not verified and add it as a minor finding, so it reaches the pull request.
 - Fix only the cause of a failure. Never weaken a quality rule, skip a test or add a suppression to make it pass.
 - If you change a file, the runner runs every gate again after you, so keep changes to what a failure demands.
 - Never commit.

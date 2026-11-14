@@ -630,8 +630,8 @@ def test_pr_body_has_a_verification_section(flow_repo, gh):
     write_verify(run, STORY)
     body = render_pr_body(run)
     assert body.index("## Gates") < body.index("## Verification")
-    assert verification_section(body).splitlines() == ["- Criterion 1: `tests/test_a.py::test_one` ✓",
-                                                       "- not verified: Criterion 3: needs a browser"]
+    assert verification_section(body).splitlines() == ["- `Criterion 1`: `tests/test_a.py::test_one` ✓",
+                                                       "- not verified: `Criterion 3`: `needs a browser`"]
     assert body.split("## Gates\n\n", 1)[1].split("\n\n## ", 2)[1].startswith("Verification")  # right after Gates
 
 
@@ -642,8 +642,8 @@ def test_pr_body_marks_evidence_older_than_a_review_fix(flow_repo, gh):
     write_verify(run, STORY)
     run.emit("step_committed", key="review/fix_findings", sha="f" * 40, summary="fix")
     lines = verification_section(render_pr_body(run)).splitlines()
-    assert lines[0] == "- Criterion 1: `tests/test_a.py::test_one` ✓ (before review fix ffffffffffff)"
-    assert lines[1] == "- not verified: Criterion 3: needs a browser"
+    assert lines[0] == "- `Criterion 1`: `tests/test_a.py::test_one` ✓ (before review fix ffffffffffff)"
+    assert lines[1] == "- not verified: `Criterion 3`: `needs a browser`"
 
 
 def test_pr_body_says_verify_did_not_run(flow_repo, gh):

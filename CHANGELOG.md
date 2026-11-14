@@ -9,12 +9,13 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
-- The pull request body has a `Verification` section: each acceptance criterion with what ran to prove it, what verify could not run and why, and evidence older than a review fix marked as such.
+- The pull request body has a `Verification` section: each acceptance criterion with what ran to prove it, what verify could not run and why, and evidence older than a review fix marked as such. Each text verify wrote is shown as code, so it cannot render, link or mention.
 - Synced issues that GitHub marks *blocked by* another issue show `Runs after:` / `Blocks:` on the Backlog and cannot start until the blocker is met, and `doctor` checks that `gh` can read issue dependencies.
 
 ### Changed
 
-- `verify` proves the branch works and debugs a failing gate in its own step, with no fix plan of its own; `branch_review` judges five axes, checks verify's evidence and no longer re-checks completeness or coverage. A pack override of `verify.md` or `branch_review.md` with the old text gets a `validate --fix` repair.
+- `verify` proves the branch works and debugs a failing gate in its own step, with no fix plan of its own; a criterion it cannot run because it needs something outside the worktree (a browser, a running stack) is listed as not verified and is a `minor` finding, no longer a blocking one. `branch_review` judges five axes, checks verify's evidence under `## What verify proved` and no longer re-checks completeness or coverage. A pack override of `verify.md` or `branch_review.md` with the old text gets a `validate --fix` repair, which also adds that section.
+- The per-task review in `build` (`@skills.map.review`, the bundled `agentflow-review` skill) also judges the five axes.
 
 ### Fixed
 
