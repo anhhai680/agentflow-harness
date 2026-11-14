@@ -86,6 +86,12 @@ def test_old_verify_failure_line_is_fixable(pack_repo_python):
     assert drift_issues(pack_repo_python) == got.issues
 
 
+def test_a_prompt_that_only_says_fix_only_the_cause_is_not_drift(pack_repo_python):
+    put(pack_repo_python, "fix.md", "Read the failure. Then fix only the cause.\n")
+    assert found(pack_repo_python).issues == []
+    assert drift_issues(pack_repo_python) == []
+
+
 def test_old_preamble_block_is_one_fixable_issue(pack_repo_python):
     put(pack_repo_python, "_preamble.md", OLD_PREAMBLE + "\nPack rule.\n")
     got = found(pack_repo_python)

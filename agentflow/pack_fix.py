@@ -40,7 +40,7 @@ RETIRED: tuple[Retired, ...] = (
         id="verify-fix-only-the-cause",
         file="verify.md",
         retired_in="2.7",
-        detect="fix only the cause",
+        detect="say which gate and why, and fix only the cause",
         old=(
             "If something fails, say which gate and why, and fix only the cause. Never weaken the repository's "
             "quality rules, skip a test or add a suppression to pass."
