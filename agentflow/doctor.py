@@ -142,6 +142,16 @@ def _gh_check(repo: Path) -> Check:
     return Check("gh", "fail", f"{check.detail} (this check needs the network)", check.fix)
 
 
+def _gh_fields_check(repo: Path) -> Check:
+    """Whether this `gh` lists `blockedBy` among the `issue list --json` fields. `gh` prints the field list when
+    `--json` has no value, offline and without a login, so the exit code is ignored."""
+    _, output = _run(["gh", "issue", "list", "--json"], repo)
+    if any(line.strip() == "blockedBy" for line in output.splitlines()):
+        return Check("gh issue fields", "ok", "this gh reads issue dependencies")
+    return Check("gh issue fields", "fail", "this gh cannot read issue dependencies (no blockedBy field)",
+                 "update gh: the Backlog cannot read issue dependencies")
+
+
 def _remote_check(repo: Path) -> Check:
     code, output = _run(["git", "remote", "get-url", "origin"], repo)
     if code == 0 and output:
@@ -286,10 +296,13 @@ def _gate_checks(cfg: Config) -> tuple[list[Check], bool]:
 
 
 def run_checks(cfg: Config, repo: Path) -> list[Check]:
-    """Every check, in order: the agents, `gh`, the remote, Docker (when a gate runs it), the state dir, keeping the
+    """Every check, in order: the agents, `gh`, its issue fields (with `issues.sync_label`), the remote, Docker (when a gate runs it), the state dir, keeping the
     machine awake, the inherited environment, the gates."""
     gate_checks, uses_docker = _gate_checks(cfg)
-    checks = [*_agent_checks(cfg, repo), _gh_check(repo), _remote_check(repo)]
+    checks = [*_agent_checks(cfg, repo), _gh_check(repo)]
+    if cfg.issues.sync_label and shutil.which("gh"):
+        checks.append(_gh_fields_check(repo))
+    checks.append(_remote_check(repo))
     if uses_docker:
         checks.append(_docker_check(repo))
     checks.append(_state_dir_check(repo))

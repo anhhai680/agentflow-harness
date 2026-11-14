@@ -7,6 +7,14 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+
+- Synced issues that GitHub marks *blocked by* another issue show `Runs after:` / `Blocks:` on the Backlog and cannot start until the blocker is met, and `doctor` checks that `gh` can read issue dependencies.
+
+### Fixed
+
+- A synced issue no longer shows `Ready` while an issue it is blocked by is still open.
+
 ## [2.6] - 2026-11-13
 
 ### Added
