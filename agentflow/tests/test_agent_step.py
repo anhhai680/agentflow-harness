@@ -1161,6 +1161,31 @@ def test_verification_is_never_read_from_the_worktree(flow_repo):
     assert "Criterion 1" not in prompt and "VERIFIED:\n\nEND" in prompt
 
 
+def test_branch_review_prompt_has_five_axes_and_the_story(flow_repo):
+    from test_verification import GOOD
+    text = (ENGINE / "prompts" / "branch_review.md").read_text(encoding="utf-8")
+    (flow_repo.cfg.path.parent / "prompts" / "engine_branch_review.md").write_text(text, encoding="utf-8")
+    run = flow_repo.run or flow_repo.new_run()
+    flow_repo.run = run
+    target = run.result_path("verify/verify")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"status": "done", "summary": "ok", "signals": GOOD}), encoding="utf-8")
+    prompt = skill_prompt(flow_repo, make_step(prompt="engine_branch_review.md", skill=None, brief=[]))
+    for want in ("readability and simplicity", "architecture", "performance", '"None"',
+                 "## What verify proved", "- Criterion 1:"):
+        assert want in prompt, want
+    assert "{verification}" not in prompt
+    for gone in ("every task landed", "tests cover the changed lines"):
+        assert gone not in prompt, gone
+
+
+def test_bundled_review_skill_has_five_axes():
+    text = (ENGINE / "skills" / "agentflow-review" / "SKILL.md").read_text(encoding="utf-8")
+    for want in ("Readability", "Architecture", "Performance", "## Verify the verification"):
+        assert want in text, want
+    assert "Did every task land" not in text
+
+
 def test_a_step_without_a_skill_but_with_a_brief_renders_no_empty_skill_heading(flow_repo):
     (flow_repo.root / "mybrief.md").write_text("MY BRIEF\n", encoding="utf-8")
     for template in ("fix.md", "fix_findings.md", "verify.md"):

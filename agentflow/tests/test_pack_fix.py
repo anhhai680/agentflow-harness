@@ -92,6 +92,28 @@ def test_a_prompt_that_only_says_fix_only_the_cause_is_not_drift(pack_repo_pytho
     assert drift_issues(pack_repo_python) == []
 
 
+def test_old_branch_review_checklist_is_fixable(pack_repo_python):
+    entry = next(e for e in pack_fix.RETIRED if e.id == "branch-review-checklist")
+    assert (entry.file, entry.retired_in) == ("branch_review.md", "2.7")
+    old = engine("branch_review.md").replace(entry.new, entry.old)
+    assert "every task landed" in old
+    put(pack_repo_python, "branch_review.md", old + "\nPack wording.\n")
+    got = found(pack_repo_python)
+    assert len(got.issues) == 1
+    issue = got.issues[0]
+    assert (issue.level, issue.path, issue.fixable) == ("warning", "prompts/branch_review.md", True)
+    assert "2.7" in issue.message
+    assert len(got.fixes) == 1
+    assert got.fixes[0].after.decode("utf-8") == engine("branch_review.md") + "\nPack wording.\n"
+    assert drift_issues(pack_repo_python) == got.issues
+
+
+def test_a_prompt_that_only_says_every_task_landed_is_not_drift(pack_repo_python):
+    put(pack_repo_python, "task_review.md", "Check that every task landed.\n")
+    assert found(pack_repo_python).issues == []
+    assert drift_issues(pack_repo_python) == []
+
+
 def test_old_preamble_block_is_one_fixable_issue(pack_repo_python):
     put(pack_repo_python, "_preamble.md", OLD_PREAMBLE + "\nPack rule.\n")
     got = found(pack_repo_python)

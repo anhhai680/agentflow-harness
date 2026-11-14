@@ -7,7 +7,7 @@ Goal: review the whole branch against its base: `git diff origin/main...HEAD` an
 Judge the code on its own. Do not open or append to `{progress}`, whatever the rules above say about it: it holds the implementers' account of this work.
 
 Read the spec and the plan the branch implements, and the repository's quality rules.
-Check that every task landed, nothing outside the plan changed, tests cover the changed lines, and the docs the change touches (spec, idea doc, decision record index) are consistent.
+Check that nothing outside the plan changed and that the docs the change touches (spec, idea doc, decision record index) are consistent. Then judge the change on five axes, and write "None" for an axis that does not apply: correctness (does the code do what the spec says, are edge cases and error paths handled, are the tests the right tests), readability and simplicity, architecture (does it fit the existing patterns, is logic leaking into a shared module, is there a near-duplicate helper), security, and performance.
 Do not edit code. The runner sends blocking findings to a fix round and reviews again, and any it cannot resolve go to a human. Minor findings go in the pull request.
 Put every finding in the result's `findings` list as `{"severity": "blocking", "file": "path", "line": 12, "text": "what is wrong and why"}`; `severity` is `blocking` for anything the brief calls Critical or Important, and `minor` for anything it calls Minor. No other value: any other severity counts as blocking. If there is nothing blocking, say so plainly in `summary`.
 Put each line of the brief's "Declined to judge" section in the result's `risks` list.

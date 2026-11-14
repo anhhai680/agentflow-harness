@@ -61,6 +61,24 @@ RETIRED: tuple[Retired, ...] = (
         ),
     ),
     Retired(
+        id="branch-review-checklist",
+        file="branch_review.md",
+        retired_in="2.7",
+        detect="Check that every task landed, nothing outside the plan changed",
+        old=(
+            "Check that every task landed, nothing outside the plan changed, tests cover the changed lines, and "
+            "the docs the change touches (spec, idea doc, decision record index) are consistent."
+        ),
+        new=(
+            "Check that nothing outside the plan changed and that the docs the change touches (spec, idea doc, "
+            'decision record index) are consistent. Then judge the change on five axes, and write "None" for an '
+            "axis that does not apply: correctness (does the code do what the spec says, are edge cases and error "
+            "paths handled, are the tests the right tests), readability and simplicity, architecture (does it fit "
+            "the existing patterns, is logic leaking into a shared module, is there a near-duplicate helper), "
+            "security, and performance."
+        ),
+    ),
+    Retired(
         id="effort-check-block",
         file="_preamble.md",
         retired_in="2.5",
