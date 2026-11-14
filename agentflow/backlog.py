@@ -58,8 +58,20 @@ ISSUE_MODULE = "issue-{number}"  # the module of an issue-backed run in the modu
 ISSUE_RESPONSIBILITY = "GitHub issue #{number}"  # its capability-map row's responsibility, fixed text too
 ISSUES_MAX = 100  # the most synced issues the Backlog shows
 TITLE_MAX = 200
-ISSUE_LIST_FIELDS = "number,title,labels,url"
+ISSUE_LIST_FIELDS = "number,title,labels,url,blockedBy,blocking"
+ISSUE_LIST_FIELDS_OLD = "number,title,labels,url"  # what a `gh` without the relationship fields can list
+REFS_MAX = 100  # more nodes than this, or a `totalCount` above the nodes kept, is an incomplete list
+REF_URL_MAX = 512
 ISSUE_URL = re.compile(r"https://[A-Za-z0-9.-]+(?::\d{1,5})?/[\w.-]+/[\w.-]+/issues/(\d+)")
+ISSUE_REF_URL = re.compile(r"https://[A-Za-z0-9.-]+(?::\d{1,5})?/([\w.-]+/[\w.-]+)/issues/(\d+)", re.ASCII)
+REPO_NAME = re.compile(r"[\w.-]+/[\w.-]+", re.ASCII)
+REPO_MAX = 200
+# why an issue's blocked-by / blocking lists are not known: the only words a cached `deps_note` may carry
+UNKNOWN_OLD_GH = "update gh"
+UNKNOWN_CACHE = "refresh the board to read them"
+UNKNOWN_TRUNCATED = "the list is longer than GitHub returned"
+UNKNOWN_BAD = "a blocker could not be read"
+UNKNOWN_REASONS = (UNKNOWN_OLD_GH, UNKNOWN_CACHE, UNKNOWN_TRUNCATED, UNKNOWN_BAD)
 TAKEN = ("carries the in-progress label, but no run on this machine is working on it: someone else may be. "
          "Remove the label on GitHub to free it")
 
@@ -429,10 +441,74 @@ def _clean_title(value: Any) -> str:
     return _one_line("".join(ch if ch.isprintable() else " " for ch in nfc(value)), TITLE_MAX)
 
 
-def _parse_issues(cfg: Config, reply: Any) -> list[dict]:
-    """`gh issue list`'s reply as `{number, title, lane, in_progress, url}` entries. Label names are compared and
-    then dropped; an entry with no usable number or no lane is left out. A reply that is not a list is a
-    `ValueError`."""
+def _here(url: str) -> str | None:
+    """The `owner/repo` of a synced issue's own URL, or None when it is not an issue URL."""
+    match = ISSUE_REF_URL.fullmatch(url) if isinstance(url, str) and len(url) <= REF_URL_MAX else None
+    return match.group(1) if match else None
+
+
+def _parse_refs(field: Any, here: str | None) -> tuple[list[dict], str]:
+    """A `blockedBy` / `blocking` value as refs `{number, state, repo}` and why the list is not known ("" when
+    it is complete). `repo` is None for an issue of `here` (compared without case), else its `owner/repo`. The
+    reply is untrusted: only a number, a state word and a repo name are kept, never a title or any other text, and
+    a node that cannot be read makes the whole list unknown (the good nodes are still returned)."""
+    if not isinstance(field, dict):
+        return [], UNKNOWN_BAD
+    nodes, total = field.get("nodes"), field.get("totalCount")
+    if not isinstance(nodes, list) or isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        return [], UNKNOWN_BAD
+    refs: list[dict] = []
+    bad = False
+    for node in nodes[:REFS_MAX]:
+        number = node.get("number") if isinstance(node, dict) else None
+        url = node.get("url") if isinstance(node, dict) else None
+        match = ISSUE_REF_URL.fullmatch(url) if isinstance(url, str) and len(url) <= REF_URL_MAX else None
+        if (isinstance(number, bool) or not isinstance(number, int) or number <= 0 or match is None
+                or match.group(2) != str(number)):
+            bad = True
+            continue
+        try:
+            ident = intake.issue_number(str(number))
+        except ValueError:
+            bad = True
+            continue
+        repo = match.group(1)
+        state = node.get("state")
+        refs.append({"number": ident, "state": "closed" if isinstance(state, str) and state.upper() == "CLOSED" else "open",
+                     "repo": None if here is not None and repo.casefold() == here.casefold() else repo})
+    if bad:
+        return refs, UNKNOWN_BAD
+    return refs, UNKNOWN_TRUNCATED if len(nodes) > REFS_MAX or total > len(refs) else ""
+
+
+def _cached_refs(value: Any) -> list[dict] | None:
+    """A cached ref list, checked again as untrusted input (the cache file can be edited): each ref has exactly
+    the shape `_parse_refs` writes, or the whole list is None."""
+    if not isinstance(value, list) or len(value) > REFS_MAX:
+        return None
+    out: list[dict] = []
+    for ref in value:
+        if not (isinstance(ref, dict) and set(ref) == {"number", "state", "repo"}):
+            return None
+        number, state, repo = ref["number"], ref["state"], ref["repo"]
+        if not isinstance(number, str) or state not in ("open", "closed"):
+            return None
+        try:
+            if intake.issue_number(number) != number:
+                return None
+        except ValueError:
+            return None
+        if repo is not None and not (isinstance(repo, str) and len(repo) <= REPO_MAX and REPO_NAME.fullmatch(repo)):
+            return None
+        out.append({"number": number, "state": state, "repo": repo})
+    return out
+
+
+def _parse_issues(cfg: Config, reply: Any, *, with_deps: bool = True) -> list[dict]:
+    """`gh issue list`'s reply as `{number, title, lane, in_progress, url, blocked_by, blocks, deps_complete,
+    deps_note}` entries. Label names are compared and then dropped; an entry with no usable number or no lane is
+    left out. With `with_deps` False (an old `gh` was asked without the relationship fields) every entry has no
+    refs and its lists are unknown. A reply that is not a list is a `ValueError`."""
     if not isinstance(reply, list):
         raise ValueError("gh issue list printed no list")
     pol = cfg.issues
@@ -464,9 +540,16 @@ def _parse_issues(cfg: Config, reply: Any) -> list[dict]:
         url = entry.get("url")
         match = ISSUE_URL.fullmatch(url) if isinstance(url, str) else None
         seen.add(ident)
+        url = url if match and match.group(1) == ident else ""
+        if with_deps:
+            blocked_by, why_by = _parse_refs(entry.get("blockedBy"), _here(url))
+            blocks, why_blocks = _parse_refs(entry.get("blocking"), _here(url))
+            why = UNKNOWN_BAD if UNKNOWN_BAD in (why_by, why_blocks) else why_by or why_blocks
+        else:
+            blocked_by, blocks, why = [], [], UNKNOWN_OLD_GH
         out.append({"number": ident, "title": _clean_title(entry.get("title")), "lane": lane,
-                    "in_progress": taken is not None and taken in names,
-                    "url": url if match and match.group(1) == ident else ""})
+                    "in_progress": taken is not None and taken in names, "url": url,
+                    "blocked_by": blocked_by, "blocks": blocks, "deps_complete": not why, "deps_note": why})
     return out
 
 
@@ -479,16 +562,26 @@ def sync_issues(cfg: Config, repo: Path) -> str:
         if _load_state(repo).get("issues_label"):
             _save_state(repo, issues=[], issues_label="", issues_note="")
         return ""
+    old_gh = False
     try:
-        reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS,
-                         "--limit", str(ISSUES_MAX)], cwd=repo)
-        issues = _parse_issues(cfg, reply)
+        try:
+            reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS,
+                             "--limit", str(ISSUES_MAX)], cwd=repo)
+        except GhError as exc:
+            if "unknown json field" not in str(exc).lower():
+                raise
+            old_gh = True  # a `gh` without the relationship fields: ask once more for the rest
+            reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS_OLD,
+                             "--limit", str(ISSUES_MAX)], cwd=repo)
+        issues = _parse_issues(cfg, reply, with_deps=not old_gh)
     except (GhError, OSError, ValueError, TypeError, RecursionError) as exc:  # RecursionError: absurdly nested JSON
         note = f"GitHub issues not updated: {_reason(exc)}"
         _save_state(repo, issues_note=note)
         return note
-    note = (f"only the first {ISSUES_MAX} open issues labelled {label!r} are shown"
-            if len(reply) >= ISSUES_MAX else "")
+    notes = [f"only the first {ISSUES_MAX} open issues labelled {label!r} are shown"] if len(reply) >= ISSUES_MAX else []
+    if old_gh:
+        notes.append(f"issue dependencies not read: {UNKNOWN_OLD_GH}")
+    note = "; ".join(notes)
     _save_state(repo, issues=issues, issues_label=label, issues_note=note,
                 issues_at=datetime.now(UTC).isoformat(timespec="seconds"))
     return note
@@ -505,8 +598,13 @@ def _synced(cfg: Config, state: dict) -> list[dict]:
             continue
         url = entry.get("url")
         match = ISSUE_URL.fullmatch(url) if isinstance(url, str) else None
+        blocked_by, blocks = _cached_refs(entry.get("blocked_by")), _cached_refs(entry.get("blocks"))
+        complete = blocked_by is not None and blocks is not None and entry.get("deps_complete") is True
+        cached_note = entry.get("deps_note")
         out.append({**entry, "url": url if match and match.group(1) == entry["number"] else "",
-                    "title": _clean_title(entry.get("title"))})
+                    "title": _clean_title(entry.get("title")), "blocked_by": blocked_by or [], "blocks": blocks or [],
+                    "deps_complete": complete,
+                    "deps_note": "" if complete else cached_note if cached_note in UNKNOWN_REASONS else UNKNOWN_CACHE})
     return out
 
 

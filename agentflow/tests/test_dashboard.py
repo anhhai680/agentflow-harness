@@ -982,9 +982,11 @@ def idash(bdash, monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", f"{gh_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_GH_LOG", str(tmp_path / "gh.log"))
     issues = [{"number": 12, "title": "<img src=x onerror=alert(1)>", "labels": [{"name": "agentflow"}, {"name": "bug"}],
-               "url": "https://github.com/example/repo/issues/12"},
+               "url": "https://github.com/example/repo/issues/12",
+                "blockedBy": {"nodes": [], "totalCount": 0}, "blocking": {"nodes": [], "totalCount": 0}},
               {"number": 14, "title": "Taken", "labels": [{"name": "agentflow"}, {"name": "agentflow:in-progress"}],
-               "url": "https://github.com/example/repo/issues/14"}]
+               "url": "https://github.com/example/repo/issues/14",
+                "blockedBy": {"nodes": [], "totalCount": 0}, "blocking": {"nodes": [], "totalCount": 0}}]
     monkeypatch.setenv("FAKE_GH_ISSUE_LIST", json.dumps(issues))
     bdash.flow.configure({"issues": {"sync_label": "agentflow"}})
     bdash.server.cfg = bdash.flow.cfg

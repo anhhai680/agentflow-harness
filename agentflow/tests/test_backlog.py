@@ -775,9 +775,19 @@ def test_the_text_board_lists_the_done_modules(bk):
 # --------------------------------------------------------------------------- synced GitHub issues
 
 
-def _issue(number, title="Login breaks", labels=("agentflow",), url=None) -> dict:
+def _node(number, state="OPEN", repo="example/repo", title="<b>hostile</b>") -> dict:
+    return {"id": f"I_{number}", "number": number, "state": state, "title": title,
+            "url": f"https://github.com/{repo}/issues/{number}"}
+
+
+def _issue(number, title="Login breaks", labels=("agentflow",), url=None, blocked_by=(), blocking=(), total=None) -> dict:
+    def refs(nodes):
+        nodes = list(nodes)
+        return {"nodes": nodes, "totalCount": total if total is not None else len(nodes)}
+
     return {"number": number, "title": title, "labels": [{"name": name} for name in labels],
-            "url": url if url is not None else f"https://github.com/example/repo/issues/{number}"}
+            "url": url if url is not None else f"https://github.com/example/repo/issues/{number}",
+            "blockedBy": refs(blocked_by), "blocking": refs(blocking)}
 
 
 def _gh_calls(bk) -> list[list[str]]:
@@ -818,8 +828,8 @@ def test_a_refresh_lists_the_labelled_open_issues_and_the_board_shows_them_witho
     _list_issues(monkeypatch, _issue(12), _issue(13, "Crash on save", ("agentflow", "Bug")))
     ibk.refresh()
     assert [c for c in _gh_calls(ibk) if c[:2] == ["issue", "list"]] == [
-        ["issue", "list", "--label", "agentflow", "--state", "open", "--json", "number,title,labels,url",
-         "--limit", "100"]]
+        ["issue", "list", "--label", "agentflow", "--state", "open", "--json",
+         "number,title,labels,url,blockedBy,blocking", "--limit", "100"]]
     monkeypatch.setenv("FAKE_GH_FAIL", "1")
     calls = len(_gh_calls(ibk))
     cards = ibk.cards()
@@ -831,6 +841,136 @@ def test_a_refresh_lists_the_labelled_open_issues_and_the_board_shows_them_witho
     assert cards["issue:12"]["first_phase"] == next(iter(ibk.cfg.phases))
     pile = backlog.snapshot(ibk.cfg, ibk.root)
     assert "issue:12" not in [c["key"] for c in pile["after_choices"]]
+
+
+def test_the_sync_asks_for_blocked_by_and_keeps_bare_refs(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(2, blocked_by=[_node(1), _node(9, "CLOSED"), _node(1, repo="other/lib")],
+                                     blocking=[_node(3)]))
+    ibk.refresh()
+    assert "number,title,labels,url,blockedBy,blocking" in _gh_calls(ibk)[-1]
+    entry = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    assert entry["blocked_by"] == [{"number": "1", "state": "open", "repo": None},
+                                   {"number": "9", "state": "closed", "repo": None},
+                                   {"number": "1", "state": "open", "repo": "other/lib"}]
+    assert entry["blocks"] == [{"number": "3", "state": "open", "repo": None}]
+    assert entry["deps_complete"] is True and entry["deps_note"] == "" and "hostile" not in json.dumps(entry)
+
+
+def test_a_repo_is_compared_without_case(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(2, blocked_by=[_node(1, repo="Example/Repo")]))
+    ibk.refresh()
+    entry = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    assert entry["blocked_by"] == [{"number": "1", "state": "open", "repo": None}]
+
+
+@pytest.mark.parametrize("node", [
+    {"number": "1", "url": "https://github.com/example/repo/issues/1"},           # number is a string
+    {"number": True, "url": "https://github.com/example/repo/issues/1"},
+    {"number": 10**30, "url": "https://github.com/example/repo/issues/1"},
+    {"number": 1, "url": "https://github.com/example/repo/issues/2"},            # url names another issue
+    {"number": 1},                                                               # no url
+    {"number": {"n": 1}, "url": "https://github.com/example/repo/issues/1"},
+])
+def test_an_unreadable_blocker_node_makes_the_list_unknown(ibk, monkeypatch, node):
+    _list_issues(monkeypatch, {**_issue(2), "blockedBy": {"nodes": [node], "totalCount": 1}})
+    ibk.refresh()
+    entry = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    assert entry["deps_complete"] is False and entry["deps_note"] == backlog.UNKNOWN_BAD
+
+
+@pytest.mark.parametrize("field", [None, "x", [], {"nodes": "x", "totalCount": 0}, {"nodes": [], "totalCount": "0"},
+                                   {"nodes": [], "totalCount": True}, {"nodes": []}, {"totalCount": 0}])
+def test_a_relationship_field_of_the_wrong_shape_is_unknown(ibk, monkeypatch, field):
+    _list_issues(monkeypatch, {**_issue(2), "blockedBy": field})
+    ibk.refresh()
+    entry = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    assert entry["blocked_by"] == [] and entry["deps_complete"] is False and entry["deps_note"] == backlog.UNKNOWN_BAD
+
+
+def test_a_missing_state_reads_open(ibk, monkeypatch):
+    node = {"number": 1, "url": "https://github.com/example/repo/issues/1"}
+    _list_issues(monkeypatch, {**_issue(2), "blockedBy": {"nodes": [node], "totalCount": 1}})
+    ibk.refresh()
+    entry = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    assert entry["blocked_by"] == [{"number": "1", "state": "open", "repo": None}] and entry["deps_complete"] is True
+
+
+def test_a_truncated_list_is_unknown(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(2, blocked_by=[_node(1)], total=5))
+    ibk.refresh()
+    entry = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    assert entry["blocked_by"] == [{"number": "1", "state": "open", "repo": None}]
+    assert entry["deps_complete"] is False and entry["deps_note"] == backlog.UNKNOWN_TRUNCATED
+
+
+def test_more_nodes_than_the_bound_are_unknown_and_cut(ibk, monkeypatch):
+    nodes = [_node(n) for n in range(1, backlog.REFS_MAX + 4)]
+    _list_issues(monkeypatch, _issue(2, blocked_by=nodes))
+    ibk.refresh()
+    entry = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    assert len(entry["blocked_by"]) == backlog.REFS_MAX
+    assert entry["deps_complete"] is False and entry["deps_note"] == backlog.UNKNOWN_TRUNCATED
+
+
+def test_relationships_that_do_not_order_work_change_nothing(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(2, blocked_by=[_node(1)]))
+    ibk.refresh()
+    plain = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    extra = {**_issue(2, blocked_by=[_node(1)]), "parent": {"number": 7}, "subIssues": {"nodes": [_node(8)], "totalCount": 1},
+             "relatesTo": {"nodes": [_node(9)], "totalCount": 1}}
+    _list_issues(monkeypatch, extra)
+    ibk.refresh()
+    assert backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0] == plain
+
+
+def test_an_old_gh_is_asked_again_without_the_dependency_fields(ibk, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_OLD", "1")
+    _list_issues(monkeypatch, _issue(2))
+    note = ibk.refresh()["issues_note"]
+    lists = [c for c in _gh_calls(ibk) if c[:2] == ["issue", "list"]]
+    assert [c[c.index("--json") + 1] for c in lists] == [backlog.ISSUE_LIST_FIELDS, backlog.ISSUE_LIST_FIELDS_OLD]
+    assert "update gh" in note
+    entry = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    assert entry["deps_complete"] is False and entry["deps_note"] == "update gh"
+    assert entry["blocked_by"] == [] and entry["blocks"] == []
+
+
+def test_a_cache_from_before_the_change_reads_as_unknown_until_refreshed(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(2))
+    ibk.refresh()
+    state = backlog._load_state(ibk.root)
+    backlog._save_state(ibk.root, issues=[{k: v for k, v in e.items() if k not in ("blocked_by", "blocks", "deps_complete", "deps_note")}
+                                         for e in state["issues"]])
+    entry = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    assert entry["deps_complete"] is False and entry["deps_note"] == backlog.UNKNOWN_CACHE
+    ibk.refresh()
+    assert backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]["deps_complete"] is True
+
+
+@pytest.mark.parametrize("bad", [[{"number": "x", "state": "open", "repo": None}], [{"number": "1", "state": "OPEN", "repo": None}],
+                                 [{"number": "1", "state": "open", "repo": "a b/c"}], "nope", [[]],
+                                 [{"number": "1", "state": "open", "repo": None, "title": "x"}],
+                                 [{"number": "1", "state": "open"}], [{"number": 1, "state": "open", "repo": None}],
+                                 [{"number": "1", "state": "open", "repo": None}] * 101])  # one more than REFS_MAX
+def test_a_tampered_cached_ref_reads_as_unknown(ibk, monkeypatch, bad):
+    _list_issues(monkeypatch, _issue(2))
+    ibk.refresh()
+    state = backlog._load_state(ibk.root)
+    backlog._save_state(ibk.root, issues=[{**e, "blocked_by": bad} for e in state["issues"]])
+    entry = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    assert entry["deps_complete"] is False and entry["deps_note"] == backlog.UNKNOWN_CACHE
+    assert entry["blocked_by"] == []
+
+
+def test_a_cached_unknown_reason_is_kept_only_when_it_is_one_of_ours(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(2, blocked_by=[_node(1)], total=5))
+    ibk.refresh()
+    state = backlog._load_state(ibk.root)
+    entry = backlog._synced(ibk.cfg, state)[0]
+    assert entry["deps_note"] == backlog.UNKNOWN_TRUNCATED
+    backlog._save_state(ibk.root, issues=[{**e, "deps_note": "<script>"} for e in state["issues"]])
+    entry = backlog._synced(ibk.cfg, backlog._load_state(ibk.root))[0]
+    assert entry["deps_complete"] is False and entry["deps_note"] == backlog.UNKNOWN_CACHE
 
 
 def test_the_first_lane_label_that_matches_wins(ibk, monkeypatch):
@@ -872,7 +1012,8 @@ def test_odd_entries_are_dropped_and_titles_come_back_bounded_and_on_one_line(bk
     five = out[0]
     assert five["title"].startswith("a b c") and len(five["title"]) == backlog.TITLE_MAX and "\n" not in five["title"]
     assert five["url"] == "" and out[1]["url"] == "" and out[2]["title"] == "" and out[2]["lane"] == "feature"
-    assert set(five) == {"number", "title", "lane", "in_progress", "url"}  # label names are never kept
+    assert set(five) == {"number", "title", "lane", "in_progress", "url", "blocked_by", "blocks", "deps_complete",
+                         "deps_note"}  # label names are never kept
 
 
 def test_at_most_issues_max_are_kept_and_the_note_says_so(ibk, monkeypatch):
