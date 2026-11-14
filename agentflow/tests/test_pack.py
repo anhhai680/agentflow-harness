@@ -382,7 +382,7 @@ def test_skill_file_does_not_let_a_symlinked_skill_dir_name_escape_the_rule(tmp_
 
 
 BUNDLED = sorted(p for p in pack.ENGINE_SKILLS.iterdir() if p.is_dir())
-STAGES = ("define", "plan", "build", "debug", "verify", "review", "respond", "retro")
+STAGES = ("define", "plan", "build", "debug", "verify", "review", "respond", "retro", "doubt")
 
 
 def test_the_bundle_holds_one_skill_per_stage():

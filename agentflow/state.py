@@ -642,28 +642,41 @@ def _on_run_archived(state: dict, ev: dict) -> None:
     state["archived"] = {"by": ev.get("by"), "at": ev.get("ts")}
 
 
-def _in_scope(key: str, scope: str | None) -> bool:
+def _in_scope(key: str, scope: str | None, keys: list[str] | None = None) -> bool:
     """Whether a rejection scoped to one plan task (`<phase>/<step>/task-<n>`) sends `key` back: the task's
-    own steps, and the steps that hold it (the `foreach` step), or the phase would never reach the task."""
+    own steps, and the steps that hold it (the `foreach` step), or the phase would never reach the task.
+    With `keys` (a reconcile round's), only those steps and the steps under them go back."""
+    if keys is not None and not any(key == k or key.startswith(k + "/") for k in keys):
+        return False
     return not scope or key == scope or key.startswith(scope + "/") or scope.startswith(key + "/")
+
+
+RECONCILE_KIND = "reconcile"  # `doubt.RECONCILE`: a round the runner opens on a doubt review's findings, not a human's
 
 
 def _on_phase_rejected(state: dict, ev: dict) -> None:
     phase, round_ = ev["phase"], ev.get("round", 1)
     scope = ev.get("scope") or None
+    keys = ev.get("keys") if isinstance(ev.get("keys"), list) else None
     row = _phase_row(state, phase)
     row["status"] = "refining"
-    row["round"] = round_
+    if ev.get("kind") == RECONCILE_KIND:  # the human's round number stays: the page's "refine round N" is theirs
+        row["reconcile_round"] = ev.get("reconcile_round")
+    else:
+        row["round"] = round_
     for key, step in state["steps"].items():
-        if step["phase"] == phase and _in_scope(key, scope):  # a step outside the scope keeps its status
+        if step["phase"] == phase and _in_scope(key, scope, keys):  # a step outside the scope keeps its status
             step["status"] = "refine_pending"
             step["round"] = round_
     state["refine"] = {"phase": phase, "round": round_, "note": ev.get("note", "")}
     if scope:
         state["refine"]["scope"] = scope
+    for name in ("kind", "keys", "digests"):  # a human's round keeps exactly {phase, round, note}
+        if name in ev:
+            state["refine"][name] = ev[name]
     state["resolving"] = None
     parked = state.setdefault("parked", {})
-    for key in [k for k, item in parked.items() if item.get("phase") == phase and _in_scope(k, scope)]:
+    for key in [k for k, item in parked.items() if item.get("phase") == phase and _in_scope(k, scope, keys)]:
         parked.pop(key)  # its step runs again in the refine round
     state["waiting"] = None
     if state["status"] not in TERMINAL:
@@ -1084,7 +1097,7 @@ class Run:
     def gate_log_dir(self, key: str) -> Path:
         return self.dir / "gates" / safe_name(key)
 
-    def refine_note_path(self, phase: str, round: int) -> Path:
+    def refine_note_path(self, phase: str, round: int | str) -> Path:
         return self.dir / "refine" / f"{phase}-{round}.md"
 
 

@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Literal, TextIO
 
 from agentflow import lessons as lessons_mod
-from agentflow import overlays, pack, run_env, sizing, workspace
+from agentflow import doubt, overlays, pack, run_env, sizing, workspace
 from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
 from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
@@ -48,7 +48,8 @@ from agentflow.flow_control import (
 from agentflow.gates import (GateResult, agent_checks, failure_report, gates_ok, record_results, run_doc_checks,
                              run_gates_reusing)
 from agentflow.gates import resolve as resolve_gates
-from agentflow.gitops import CommitRejected, GitError, NothingToCommit, changed_since, commit, commits_between, head
+from agentflow.gitops import (CommitRejected, GitError, NothingToCommit, changed_since, commit, commit_artifact,
+                              commits_between, git_state_changes, head, outside_only, reconcile_baseline)
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, notify_run, park_hitl, raise_hitl, read_result
 from agentflow.run_control import wait_for_agents
@@ -232,6 +233,12 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     values = _values(cfg, step, ctx, {})
     preamble = EFFORT_BLOCK.sub("", _template(cfg, PREAMBLE))
     values["lessons"] = _lessons(cfg, ctx.repo, extra.get("phase"), date.today()).text.rstrip("\n")
+    # A doubt reviewer judges the artifact on its own: no code map and no handoff, the author's account of the work.
+    # The flag and role are tested first, so every other step's prompt is built exactly as before.
+    doubter = (step.blocks_on_findings and step.role == "review" and extra.get("phase") is not None
+               and doubt.is_doubt_reviewer(cfg, str(extra["phase"]), step, str(ctx.values.get("lane") or "")))
+    if doubter:
+        values["code_map"] = ""  # before the slot is dropped, so it goes whole
     preamble = EMPTY_SLOT.sub(lambda m: "" if not values[m.group(1)] else m.group(0), preamble)
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
     files = list(dict.fromkeys([*step.brief, *step.task_brief]))
@@ -267,7 +274,7 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     values["base_ref"] = ctx.base_ref
     values["earlier_findings"] = ""
     values["gate_evidence"] = ""
-    if ctx.run is not None and ctx.run.handoff_path().exists():
+    if ctx.run is not None and ctx.run.handoff_path().exists() and not doubter:
         body = f"{HANDOFF_LINE}\n\n{body}"
     if mode == "refine":
         refine = _template(cfg, cfg.phase_approval.get("refine_prompt") or DEFAULT_REFINE).strip()
@@ -298,6 +305,7 @@ class _Turn:
 class _Called:
     outcome: AgentOutcome
     after: str
+    refused: list[Violation] = dataclasses.field(default_factory=list)  # found before the tree could be read safely
 
 
 @dataclass
@@ -327,6 +335,7 @@ class _StepRun:
     holds: int = 0  # since the last result; these three reset once the agent can work again
     agent_failures: int = 0
     down_since: float | None = None
+    reconcile_base: dict | None = None  # a reconcile step's `gitops.reconcile_baseline`, the checks compare against it
 
 
 def _mtime(path: Path) -> float | None:
@@ -527,6 +536,13 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             print(shlex.join(agent.argv(call)), file=self.out)
             return "skipped"
 
+        # A reconcile step starts only on a tree that holds nothing but its artifact: a stray file left from an earlier
+        # stop would otherwise ride along (and the step must not take it for its own work). Checked before the
+        # snapshots below, which run `git add`; a resumed step is checked once its earlier agents are gone.
+        if step.reconciles and not (resuming and started is not None):
+            outside = self._reconcile_start(sr, fresh=True)
+            if outside:
+                return self._fail(sr, outside)
         if resuming and started is not None:
             committed = [e for e in since if e["type"] == "step_committed" and e.get("key") == key]
             if committed:
@@ -534,6 +550,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 self.run.emit("step_finished", key=key, status="done", summary=last.get("summary", ""), sha=last["sha"])
                 return "done"
             wait_for_agents(self.run, self.cfg, key, self._timeout_s())
+            if step.reconciles:  # after the wait: an agent left running could still change the tree until then
+                outside = self._reconcile_start(sr, fresh=False)
+                if outside:
+                    return self._fail(sr, outside)
             baseline = self._baseline(key, since, started)
             if isinstance(baseline, list):
                 return self._fail(sr, baseline)
@@ -607,8 +627,12 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if self.run.refresh()["status"] in TERMINAL:
                 return "stopped"  # cancelled while the agent ran: nothing more is called or recorded
             outcome = called.outcome
+            if called.refused:  # the git state changed: nothing that reads the tree has run, and nothing may
+                return self._fail(sr, called.refused)
             violations = check_step(self.cfg, self.worktree, sr.start_head, sr.start_tree, called.after,
                                     outcome.tool_calls, sr.step.forbid)
+            if sr.step.reconciles:
+                violations = [*violations, *self._outside_output(sr)]
             if violations:
                 return self._fail(sr, violations)
             if outcome.resume_failed:
@@ -760,6 +784,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 tool=denial.get("tool_name") or denial.get("tool"),
                 input=denial.get("tool_input", denial.get("input")),
             )
+        if sr.step.reconciles and sr.reconcile_base is not None:  # before the snapshot: it runs `git add`
+            planted = git_state_changes(self.worktree, sr.reconcile_base)
+            if planted:
+                return _Called(outcome, sr.start_tree, planted)
         return _Called(outcome, snapshot(self.worktree))
 
     def _record_lessons(self, sr: _StepRun, turn: _Turn) -> None:
@@ -898,6 +926,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         return [str(name) for name in (attempts[-1].get("gates") or [])] if attempts else []
 
     def _finish(self, sr: _StepRun, result: StepResult) -> Outcome:
+        if sr.step.reconciles:  # checked again after the gates, before any snapshot or commit
+            outside = self._outside_output(sr)
+            if outside:
+                return self._fail(sr, outside)
         if _mtime(self.run.progress_path()) in (None, sr.progress_mtime):
             self.run.emit("progress_not_updated", key=sr.key)
         sha = None
@@ -910,7 +942,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 parts = [refine_subject(sr.step.id, subject), result.summary.strip(), refine_note_block(refine)]
             message = "\n\n".join(part for part in parts if part)
             try:
-                sha = commit(self.worktree, message, self.cfg, expected_head=runner_head(self.run))
+                if sr.step.reconciles:  # its artifact alone, and the commit checked to hold exactly that
+                    sha = commit_artifact(self.worktree, message, self.cfg, fmt(str(sr.step.output), self.ctx),
+                                          expected_head=runner_head(self.run))
+                else:
+                    sha = commit(self.worktree, message, self.cfg, expected_head=runner_head(self.run))
             except CommitRejected as exc:
                 return self._fail(sr, [Violation(exc.kind, str(exc))])
             except NothingToCommit:
@@ -951,9 +987,62 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         raise_hitl(self.cfg, self.run, kind, sr.key, summary, extra=extra)
         return "stopped"
 
+    def _outside_output(self, sr: _StepRun) -> list[Violation]:
+        """For a `reconciles` step: what in the tree is more than an edit of its `output`, against the step's baseline
+        (`gitops.outside_only`). A step with no `output` has nothing it may edit, and one with no baseline has nothing
+        to be checked against: both are violations too."""
+        if not sr.step.output:
+            return [Violation("outside_output", f"reconcile step {sr.step.id} has no output, so it may edit nothing")]
+        if sr.reconcile_base is None:
+            return [Violation("outside_output", f"reconcile step {sr.step.id} has no baseline to be checked against")]
+        return outside_only(self.worktree, fmt(str(sr.step.output), self.ctx), sr.reconcile_base)
+
+    def _reconcile_start(self, sr: _StepRun, fresh: bool) -> list[Violation]:
+        """The baseline a reconcile step is checked against, then the check itself.
+
+        The git state (`gitops.git_state`) is the one recorded at the step's first start in the run, kept across
+        resumes, approvals and rounds: an approved stop never adopts a changed config, filter, attribute file or
+        replace ref. Only a human's `agentflow retry` of the step (`step_retry`) takes a new one. The flagged index
+        entries and the ignored paths are this attempt's: a resumed step keeps them, so a runner that died mid-turn
+        never adopts what that turn changed, and a fresh start or a human's approval reads them again (the human looked
+        at the tree). A git state that differs from the kept one is refused before those lists are read, since reading
+        them runs `git status`."""
+        original: dict | None = None
+        recorded: dict | None = None
+        for event in self.run.events.read():
+            if event.get("key") != sr.key:
+                continue
+            if event["type"] == "step_retry":
+                original = recorded = None
+            elif event["type"] == "hitl_approved":
+                recorded = None
+            elif event["type"] == "reconcile_baseline" and isinstance(event.get("baseline"), dict):
+                original = original or event["baseline"].get("git_state")
+                recorded = event["baseline"]
+        branch = self.run.state.get("branch")
+        if recorded is not None and not fresh:
+            sr.reconcile_base = {**recorded, "git_state": original or recorded.get("git_state")}
+            return self._outside_output(sr)
+        if original is not None:
+            changed = git_state_changes(self.worktree, {"branch": branch, "git_state": original})
+            if changed:
+                return changed
+        try:
+            base = reconcile_baseline(self.worktree, branch)
+        except (GitError, OSError, ValueError) as exc:
+            return [Violation("outside_output", f"cannot read the work tree's state, so it cannot be trusted: {exc}")]
+        if original is not None:
+            base["git_state"] = original
+        sr.reconcile_base = base
+        self.run.emit("reconcile_baseline", key=sr.key, baseline=base)
+        return self._outside_output(sr)
+
     def _fail(self, sr: _StepRun, violations: list[Violation]) -> Outcome:
         """A guard tripped: the step fails with no retry, and a human looks at the tree."""
         summary = f"Guard violation in {sr.key}: {_violation_text(violations)}"
+        if sr.step.reconciles and any(v.kind == "outside_output" for v in violations):
+            summary += (". Remove or revert the file(s) named here before you approve or reject: a later step commits "
+                        "the whole work tree.")
         self.run.emit("guard_tripped", key=sr.key, violations=[{"kind": v.kind, "detail": v.detail} for v in violations])
         raise_hitl(self.cfg, self.run, "guard_violation", sr.key, summary)
         self.run.emit("step_finished", key=sr.key, status="failed", summary=summary)

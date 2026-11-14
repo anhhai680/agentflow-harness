@@ -238,6 +238,32 @@ FLOW_SETTINGS = {"permissions": {"allow": ["Bash(true)", "Bash(false)", "Bash(te
                                  "deny": ["Bash(touch .claude/*)"]}}
 
 
+def with_doubt(data: dict) -> None:
+    """Add the doubt review to the `python` pack's config: a reconcile step and a reviewer in `define` (before
+    `spec_approval`) and in `plan` (after `plan`). A `configure(edit=...)` or `tmp_cfg` callable. The pack's own file
+    stays as it is, because it pins the `explain` goldens."""
+    data["skills"]["map"]["doubt"] = "agentflow-doubt"
+
+    def pair(prefix: str, reconcile_skill: str, review_prompt: str, output: str, message: str, when: str | None) -> list[dict]:
+        review = {"id": f"{prefix}_review", "lanes": ["feature"], "skill": "agentflow-doubt", "role": "review",
+                  "prompt": review_prompt, "blocks_on_findings": True}
+        if when:
+            review["when"] = when
+        return [{"id": f"{prefix}_reconcile", "lanes": ["feature"], "skill": reconcile_skill, "role": "plan",
+                 "prompt": "reconcile.md", "output": output, "reconciles": True, "commit": True, "message": message},
+                review]
+
+    steps = data["phases"]["define"]["steps"]
+    at = next(i for i, step in enumerate(steps) if step.get("id") == "spec_approval")
+    steps[at:at] = pair("spec", "domain-modeling", "spec_review.md", "docs/specs/SPEC-{module}.md",
+                        "Revise SPEC-{module} after its review", "spec_awaits_approval")
+    steps = data["phases"]["plan"]["steps"]
+    plan = next(step for step in steps if step.get("id") == "plan")
+    at = steps.index(plan) + 1
+    steps[at:at] = pair("plan", "writing-plans", "plan_review.md", plan["output"],
+                        "Revise the {module} plan after its review", None)
+
+
 class FlowRepo:
     """A tmp git repo (branches `main`, `next`, bare `origin`) wired to the fake agent.
 
@@ -255,10 +281,12 @@ class FlowRepo:
         self.cfg = self.configure()
         self.run = None
 
-    def configure(self, patch: dict | None = None, autopilot: bool = False, batch: bool = False):
+    def configure(self, patch: dict | None = None, autopilot: bool = False, batch: bool = False,
+                  edit: Callable[[dict], None] | None = None):
         """`autopilot=False` (the default) keeps a human at every phase and no `ci` step, so a test pins one
         stop or approval at a time: no phase resolves its stops and the runner takes no recommended answer. `autopilot=True` is the workflow as shipped. `batch=False` (the default)
-        drops the build step's `batch`, so a test's file-less plan tasks each get a session and a review."""
+        drops the build step's `batch`, so a test's file-less plan tasks each get a session and a review.
+        `edit` changes the config last, after the patch, for a change a `patch` mapping cannot say (a step list)."""
         from agentflow.config import load_config
 
         base = {
@@ -284,6 +312,8 @@ class FlowRepo:
             merged = deep_merge(deep_merge(data, base), patch or {})  # so `None` in `patch` deletes any key
             data.clear()
             data.update(merged)
+            if edit is not None:
+                edit(data)
 
         self.cfg = load_config(self._make_cfg(build))
         return self.cfg

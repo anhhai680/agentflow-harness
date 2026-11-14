@@ -212,6 +212,35 @@ def test_each_signal_event_is_evidence_and_runner_settled_ones_are_not(tmp_git, 
     assert "runner note" not in evidence and "runner answer" not in evidence
 
 
+def test_reconciled_noise_is_retro_evidence(tmp_git, cfg):
+    reconciled = {"type": "findings_reconciled", "key": "plan/plan_reconcile", "phase": "plan", "round": 1,
+                  "unresolved": [], "before": "a", "after": "b", "dispositions": [
+                      {"finding": "F1", "class": "noise", "note": "the plan already says so"},
+                      {"finding": "F2", "class": "actionable", "note": "fixed in task 3"},
+                      {"finding": "F3", "class": "contract_misread", "note": "the spec allows it"},
+                      {"finding": "F4", "class": "trade_off", "note": "slower but simpler"},
+                      "junk", {"finding": ["x"], "class": "noise", "note": 5}]}
+    clean = {**reconciled, "dispositions": [{"finding": "F1", "class": "actionable", "note": "fixed"}]}
+    a = _finished(tmp_git, extra=[reconciled, clean, {**reconciled, "dispositions": "nope"}])
+    evidence = _section(build_digest(tmp_git, cfg, None, NOW).text, "## Evidence")
+    assert f"- {a}#3 findings_reconciled: " in evidence
+    assert "    > plan F1 (noise): the plan already says so" in evidence
+    assert "    > plan F3 (contract_misread): the spec allows it" in evidence
+    assert "F2" not in evidence and "F4" not in evidence       # only noise and contract_misread are evidence
+    assert f"{a}#4" not in evidence and f"{a}#5" not in evidence  # nothing to cite: no entry at all
+    assert "junk" not in evidence
+
+
+def test_reconciled_evidence_is_cleaned_and_capped(tmp_git, cfg):
+    many = [{"finding": f"F{i}", "class": "noise", "note": _LONG} for i in range(30)]
+    a = _finished(tmp_git, extra=[{"type": "findings_reconciled", "key": "plan/r", "phase": _LONG, "round": 1,
+                                   "dispositions": many}])
+    evidence = [ln for ln in _section(build_digest(tmp_git, cfg, None, NOW).text, "## Evidence").splitlines() if ln]
+    assert evidence[0].startswith(f"- {a}#3 findings_reconciled: ")
+    assert len(evidence) == 1 + DIGEST_TAIL_LINES
+    assert all(len(ln) <= len("    > ") + DIGEST_LINE_MAX for ln in evidence[1:])
+
+
 def test_signals_and_lessons_tables(tmp_git, cfg):
     pack_dir = tmp_git / ".agentflow"
     pack_dir.mkdir()
@@ -321,6 +350,9 @@ _LONG_LINES = "\n".join([_LONG] * 15)
     {"type": "budget_estimate_over_hard", "estimate": _LONG, "hard": _LONG},
     {"type": "rolled_over", "key": _LONG, "context_pct": _LONG},
     {"type": "progress_not_updated", "key": _LONG},
+    {"type": "findings_reconciled", "key": _LONG, "phase": _LONG, "round": _LONG, "dispositions": [
+        {"finding": _LONG, "class": "noise", "note": _LONG}, {"finding": "F2", "class": "contract_misread",
+                                                              "note": _LONG_LINES}] * 8},
 ], ids=lambda ev: ev["type"])
 def test_every_quoted_line_of_every_event_type_is_cleaned_and_cut(tmp_git, cfg, event):
     import unicodedata

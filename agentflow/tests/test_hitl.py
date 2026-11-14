@@ -635,3 +635,16 @@ def test_lessons_cited_keeps_the_first_ten(tmp_path):
     assert read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x"})).lessons_cited == []
     assert read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x",
                                                           "lessons_cited": ["E-0003"]})).lessons_cited == ["E-0003"]
+
+
+def test_read_result_takes_dispositions(tmp_path):
+    disposed = [{"finding": "R1-F1", "class": "noise", "note": "Task 3 covers it"}]
+    res = read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x", "dispositions": disposed}))
+    assert res.dispositions == disposed
+    assert read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x"})).dispositions == []
+
+
+@pytest.mark.parametrize("bad", ["R1-F1", {"finding": "R1-F1"}, 3])
+def test_read_result_refuses_dispositions_that_are_not_a_list(tmp_path, bad):
+    with pytest.raises(ResultError, match="dispositions must be a list"):
+        read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x", "dispositions": bad}))

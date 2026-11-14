@@ -77,6 +77,7 @@ agentflow (own repo, installed as a tool: `uv tool install agentflow`)     <proj
 - Every diff passes the pack's declared `gate_sets.verify` on the final tree.
 - No edits to the pack itself (`.agentflow/**`) or to the pack's `forbidden_paths` during a run.
 - No user-only skills.
+- Automatic refinement of `critical`, `high` and `medium` findings can't be switched off: at least one round (`autonomy.finding_rounds`), and those severities always block.
 - Budget is a hard stop.
 - 100% conformance before `finish`.
 

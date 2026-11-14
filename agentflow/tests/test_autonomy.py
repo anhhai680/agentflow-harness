@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agentflow.autonomy import blocking_of, eligible, phase_findings, recommended_answers
+from agentflow.autonomy import blocking_of, eligible, is_blocking, phase_findings, recommended_answers, round_limit
 from agentflow.config import load_config, validate
 from agentflow.hitl import answer, approve, reject
 from agentflow.pipeline import RunOptions, advance, approval_text, start
@@ -700,3 +700,23 @@ def test_a_bug_run_stamps_every_evidence_event_with_its_tree(auto):
         stamped = [e for e in events if e["type"] == kind]
         assert stamped, f"the run wrote no {kind}"
         assert all(e.get("tree") for e in stamped), kind
+
+
+def test_the_floor_severities_always_block(tmp_cfg):
+    path = tmp_cfg({"autonomy": {"non_blocking_severities": ["minor", "medium", "", "none"]}})
+    cfg = load_config(path)
+    for finding in ({"severity": "Medium"}, {}, {"severity": ""}, {"severity": None}, {"severity": "HIGH"},
+                    {"severity": " critical "}):
+        assert is_blocking(cfg, finding), finding
+    assert not is_blocking(cfg, {"severity": "minor"})
+
+
+@pytest.mark.parametrize("rounds, expected", [("absent", 1), (0, 1), (3, 3), ([1], 1), (True, 1), (None, 1)])
+def test_round_limit_is_at_least_one(tmp_cfg, rounds, expected):
+    def patch(data: dict) -> None:
+        if rounds == "absent":
+            data["autonomy"].pop("finding_rounds", None)
+        else:
+            data["autonomy"]["finding_rounds"] = rounds
+
+    assert round_limit(load_config(tmp_cfg(patch))) == expected

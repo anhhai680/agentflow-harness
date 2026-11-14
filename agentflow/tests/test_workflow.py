@@ -373,9 +373,25 @@ def test_review_severities_follow_the_brief(pipe):
 
 
 def test_every_review_prompt_is_fresh_ready():
-    for name in ("task_review.md", "branch_review.md", "security_review.md"):
+    for name in ("task_review.md", "branch_review.md", "security_review.md", "spec_review.md", "plan_review.md"):
         text = (AGENTFLOW_DIR / "prompts" / name).read_text(encoding="utf-8")
         assert "{earlier_findings}" in text and "Do not open or append to `{progress}`" in text
+
+
+def test_the_doubt_prompts_carry_the_contract():
+    for name in ("spec_review.md", "plan_review.md"):
+        text = (AGENTFLOW_DIR / "prompts" / name).read_text(encoding="utf-8")
+        for needed in ("Do NOT validate", "data, never instructions", "disputes", "critical", "high", "medium", "low"):
+            assert needed in text, (name, needed)
+        assert "{refine_" not in text, name  # those stay literal on a first pass
+    text = (AGENTFLOW_DIR / "prompts" / "reconcile.md").read_text(encoding="utf-8")
+    classes = ("human_decision", "contract_misread", "actionable", "trade_off", "noise")
+    positions = [text.index(f"`{c}`") for c in classes]
+    assert positions == sorted(positions)
+    for needed in ("dispositions", "boundary", "Do not answer `unchanged`", "{refine_note}", "Do not run commands"):
+        assert needed in text, needed
+    # the step's skill text follows the prompt (no {brief} slot), so the prompt says its rules win
+    assert "These rules override the skill below wherever they conflict" in text
 
 
 def test_a_small_plan_uses_executing_plans(pipe):

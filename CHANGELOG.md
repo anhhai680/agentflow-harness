@@ -7,13 +7,28 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [2.6] - 2026-11-13
+
 ### Added
 
 - `agentflow validate --fix [--dry-run]` repairs pack prompts that hold text the engine retired or that copy an engine prompt unchanged; it writes only `.agentflow/prompts/`, never commits, and refuses to run inside a run.
 - `validate` warns about those prompts, marks a warning it can repair `(fixable)` and ends with `N fixable: run agentflow validate --fix`.
+- A doubt review of the spec and the plan runs by default in the `feature` lane, before a human approves `define` or `plan`: the steps `spec_review`, `plan_review`, `spec_reconcile` and `plan_reconcile` are in the engine defaults, with the bundled `agentflow-doubt` skill (`skills.map.doubt`) and prompts.
+- A reconcile round: the runner reopens the phase on the reviewer's `critical`, `high` and `medium` findings, runs the `reconciles: true` step and the review again, and stops when the artifact did not change, a disposition is disputed, two rounds fixed nothing or `autonomy.finding_rounds` is used up; the reconcile step may change only its `output`, which a guard and the commit check enforce (`outside_output`).
+- The approval page and the handoff list each finding of a doubt review with its disposition and status.
+- `validate` checks `reconciles` and `blocks_on_findings` steps, and the keys `phases.<name>.steps[].reconciles` and `skills.map.doubt` are protected in the Settings form.
+- Signals `doubt_blocking`, `doubt_rounds`, `doubt_actionable`, `doubt_noise`, `doubt_misread` and `doubt_open`, per phase, from the new `doubt_settled` event, in `agentflow scorecard`, the Metrics tab and as lesson targets.
+
+### Changed
+
+- A step result whose `dispositions` is not a list is unreadable, as one whose `findings` is not a list already was.
+- The runner's git calls for the snapshot, the commit and the reconcile checks run with `--no-replace-objects`, `core.hooksPath=/dev/null` and `core.fsmonitor=false`, so a user's own fsmonitor daemon is skipped, which can slow commits in a very large repository.
+- The autonomy floor: `autonomy.finding_rounds` counts as at least 1, and findings of severity `critical`, `high` or `medium` (or with none) always block, whatever `autonomy.non_blocking_severities` lists. `validate` refuses a value below the floor, and the Settings form refuses one, so a pack that already sets such a value cannot save from the form until its YAML is fixed.
 
 ### Fixed
 
+- `{date}` (so the `plan_target` file name) is pinned at run start in `params["date"]`, so a run resumed on another day keeps its plan path.
+- Commits with explicit paths (the runner's `commit(paths=...)`) treat them as literal pathspecs (`--literal-pathspecs`), so a path with glob characters names only itself.
 - `validate` reports a prompt that is not UTF-8 text as an error instead of stopping on a traceback.
 
 ## [2.5] - 2026-11-13

@@ -10,7 +10,9 @@ skipped too, which is how each lane walks the one workflow: a phase with no step
 stops nobody. A phase that ran is then settled (`_Loop.settle`): with `needs_approval: true` it ends at
 `<phase>_approved` and the run stops; with `false` the runner approves it itself once its `blocks_on_findings`
 steps hold nothing blocking, opening refine rounds on what they found, up to `autonomy.finding_rounds`, and
-then going to a human after all. Stops inside a phase go to the resolver first (`autonomy.Resolver`). After `phase_approved`
+then going to a human after all. A `needs_approval: true` phase with a `reconciles` step (a doubt review of the
+spec or the plan) first opens reconcile rounds on its review's blocking findings, until `doubt.stop_reason` ends
+them: only the reconcile step and the review run again, and the approval page shows each finding's disposition. Stops inside a phase go to the resolver first (`autonomy.Resolver`). After `phase_approved`
 the runner writes `handoff.md`, checks the last skill footer against the next phase's first skill
 (`footer_mismatch`; the route never changes), ends the run if that phase was `--to`, and goes on.
 A rejected phase runs again as a refine round: every step of it again with the note, then it is settled
@@ -32,7 +34,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import TextIO
 
@@ -46,10 +48,11 @@ from agentflow.autonomy import (
     finding_rounds,
     findings_note,
     phase_findings,
+    round_limit,
 )
-from agentflow import pack, run_env, work_source
+from agentflow import doubt, pack, run_env, work_source
 from agentflow.commit_checks import runner_head
-from agentflow.conditions import Ctx, evaluate, make_ctx
+from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
 from agentflow.config import (
     RETRO_PIPELINE, Config, ConfigError, Phase, Step, check_lane, for_lane, layer_files, load_config, validate,
@@ -136,6 +139,10 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
         raise GitError(f"project.fork_from {fork!r} is not a local branch of {repo}")
 
     params, inputs = gather(params, repo, cfg.issues.epic_labels)
+    # `{date}` (in `plan_target`) is the day the run started, every day it runs: a step resumed tomorrow still names
+    # the file the plan step wrote today, and a reconcile step may edit only that file.
+    if params.get("date") in (None, ""):
+        params["date"] = date.today().isoformat()
     run = Run.create(cfg, repo, pipeline, params)
     try:
         _set_up(cfg, repo, run, pipeline, params, inputs, opts)
@@ -382,10 +389,16 @@ class _Loop:
         """The phase's steps are finished: wait for its human, or go on by itself once nothing blocks it.
 
         Blocking findings get a refine round the runner opens itself, up to `autonomy.finding_rounds`.
-        After those, the findings go to a human on the phase's approval page."""
+        After those, the findings go to a human on the phase's approval page. A phase that needs approval and has a
+        `reconciles` step gets reconcile rounds on its doubt review's findings first (`settle_doubt`)."""
         name = names[index]
         phase = self.cfg.phases[name]
         if needs_approval(phase):
+            lane = self.run.state["pipeline"]
+            if doubt.reconcile_steps(phase, lane):  # any other approval phase settles exactly as it always has
+                walked, outcome = self.settle_doubt(names, index, executor, lane)
+                if walked:
+                    return outcome
             raise_phase_approval(self.cfg, self.run, name)
             return "awaiting_approval"
         findings = phase_findings(self.cfg, self.run, name)
@@ -397,16 +410,52 @@ class _Loop:
             self.run.emit("phase_approved", by=AUTO_BY, phase=name, sha=head(self.worktree))
             self.hand_off(names, index, executor)
             return None
-        if finding_rounds(self.run, name) < int(self.cfg.autonomy.get("finding_rounds") or 0):
+        if finding_rounds(self.run, name) < round_limit(self.cfg):
             open_refine(self.run, name, AUTO_BY, findings_note(blocking))
             return self.phase(names, index)
         raise_phase_approval(self.cfg, self.run, name)
         return "awaiting_approval"
 
+    def settle_doubt(self, names: list[str], index: int, executor: Executor, lane: str) -> tuple[bool, str | None]:
+        """A `needs_approval: true` phase with a reconcile step: open a reconcile round on its review's blocking
+        findings while `doubt.stop_reason` allows one, then walk the phase again. `(True, outcome)` when it did (or
+        a reconcile edit stopped the run), `(False, None)` when the approval is next."""
+        run, name = self.run, names[index]
+        phase = self.cfg.phases[name]
+        for step in doubt.reconcile_steps(phase, lane):  # a `findings_reconciled` a crash lost, before anything reads it
+            executor._reconciled(phase, f"{name}/{step.id}")
+        if executor.conditions_changed(phase):  # the check after the reconcile step, when a crash skipped it
+            return True, self.status()
+        findings = phase_findings(self.cfg, run, name)
+        finished = [key for key in doubt.flagged_keys(phase, lane)
+                    if (run.state["steps"].get(key) or {}).get("status") in DONE_STEPS]
+        tree = snapshot(self.worktree) if finished else ""
+        for key in finished:  # every pass, `[]` for a clean review: what the pull request lists as left open
+            run.emit("step_findings", key=key, findings=[f for f in findings if f["key"] == key], tree=tree)
+        blocking = blocking_of(self.cfg, findings)
+        events = run.events.read()
+        stop = doubt.stop_reason(self.cfg, events, phase, lane) if blocking else None
+        if blocking and stop is None:
+            history = doubt.since_human_round(events, name)
+            numbered = doubt.numbered(blocking, doubt.next_round(events, name))
+            digests = {f"{name}/{step.id}": doubt.artifact_digest(self.worktree, fmt(str(step.output), executor.ctx))
+                       for step in doubt.reconcile_steps(phase, lane)}
+            open_refine(run, name, AUTO_BY, doubt.reconcile_note(numbered, history),
+                        extra={"kind": doubt.RECONCILE, "keys": doubt.round_keys(phase, lane), "findings": numbered,
+                               "digests": digests, "conditions": executor.phase_conditions(phase)})
+            return True, self.phase(names, index)
+        if blocking:
+            run.emit("reconcile_stopped", phase=name, round=doubt.next_round(events, name) - 1, reason=stop,
+                     open=len(blocking))
+        fields = doubt.settled(self.cfg, run.events.read(), name, lane, stop or "clean")
+        if fields is not None:
+            run.emit("doubt_settled", phase=name, **fields)
+        return False, None
+
     def hand_off(self, names: list[str], index: int, executor: Executor) -> None:
         """After `phase_approved`: write the handoff and compare the skill footer with the route."""
         name = names[index]
-        path = write_handoff(self.run, name)
+        path = write_handoff(self.cfg, self.run, name)
         footers = [e for e in self.run.events.read() if e["type"] == "skill_footer" and e.get("phase") == name]
         got = footers[-1]["next"] if footers else None
         expected = _next_skill(self.cfg, names, index, executor.ctx)
@@ -436,6 +485,8 @@ def refining(state: dict, phase: str) -> bool:
 
 def _first_skill(cfg: Config, phase: Phase, steps: list[Step], ctx: Ctx) -> str | None:
     for step in for_lane(steps, ctx.values["lane"]):
+        if step.reconciles:  # it runs only in a reconcile round, never as a phase's first step
+            continue
         when = evaluate(cfg, step.when, ctx).value if step.when is not None else True
         unless = evaluate(cfg, step.unless, ctx).value if step.unless is not None else False
         if when is False or unless is True:
@@ -516,13 +567,15 @@ def _gates(run: Run, phase: str) -> list[str]:
     return lines
 
 
-def _risks(run: Run, phase: str) -> list[str]:
+def _risks(cfg: Config, run: Run, phase: str) -> list[str]:
     lines = []
     for key in _phase_steps(run, phase):
         result = read_json(run.result_path(key))
         risks = result.get("risks") if isinstance(result, dict) else None
         for risk in risks if isinstance(risks, list) else []:
             lines.append(f"- `{key}`: {_one_line(risk if isinstance(risk, str) else str(risk))}")
+    if phase in cfg.phases:  # the doubt review's open findings, low findings and trade-offs, so `build` sees them
+        lines += [f"- {_one_line(risk)}" for risk in doubt.handoff_risks(cfg, run, phase, run.state["pipeline"])]
     return lines
 
 
@@ -530,24 +583,24 @@ def _section(title: str, lines: list[str], level: str = "###") -> str:
     return f"{level} {title}\n\n" + ("\n".join(lines) if lines else "(none)")
 
 
-def _handoff_text(run: Run, phase: str) -> str:
+def _handoff_text(cfg: Config, run: Run, phase: str) -> str:
     parts = [
         f"## {phase}",
         _section("Artifacts", [f"- `{p}`" for p in _artifacts(run, phase)]),
         _section("Decisions", _decisions(run, phase)),
         _section("Skipped steps", _skipped(run, phase)),
         _section("Gates", _gates(run, phase)),
-        _section("Risks", _risks(run, phase)),
+        _section("Risks", _risks(cfg, run, phase)),
     ]
     return "\n\n".join(parts)
 
 
-def write_handoff(run: Run, phase: str) -> Path:
+def write_handoff(cfg: Config, run: Run, phase: str) -> Path:
     """Write the phase's handoff and rebuild `handoff.md` from every approved phase, newest first."""
     run.refresh()
     folder = run.dir / "handoffs"
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / f"{phase}.md").write_text(_handoff_text(run, phase) + "\n", encoding="utf-8")
+    (folder / f"{phase}.md").write_text(_handoff_text(cfg, run, phase) + "\n", encoding="utf-8")
     order = [e["phase"] for e in run.events.read() if e["type"] == "phase_approved"]
     if phase not in order:
         order.append(phase)
@@ -591,9 +644,11 @@ def _step_results(run: Run, phase: str) -> list[str]:
 
 def _round_lines(run: Run, phase: str) -> list[str]:
     """What each step did in the phase's latest refine round: `changed`, `unchanged` (with the agent's
-    reason), `skipped` (with the condition's) or `failed`, from the events since the rejection."""
+    reason), `skipped` (with the condition's) or `failed`, from the events since the human's rejection (a reconcile
+    round the runner opened is part of what followed it, not a round of its own)."""
     events = run.events.read()
-    rejected = max((e["seq"] for e in events if e["type"] == "phase_rejected" and e.get("phase") == phase), default=0)
+    rejected = max((e["seq"] for e in events if e["type"] == "phase_rejected" and e.get("phase") == phase
+                    and e.get("kind") != doubt.RECONCILE), default=0)
     last: dict[str, tuple[str, str]] = {}
     for event in events:
         key = str(event.get("key") or "")
@@ -610,11 +665,17 @@ def _round_lines(run: Run, phase: str) -> list[str]:
 
 
 def _review_findings(cfg: Config, run: Run, phase: str) -> list[str]:
-    """Per-task reviews (their last round), then the phase's own `blocks_on_findings` steps."""
+    """Per-task reviews (their last round), then the phase's own `blocks_on_findings` steps, or, in a phase whose
+    doubt review ran, that review's lines: each finding with its round, disposition and status."""
     lines = []
     for key, review in run.state["reviews"].items():
         if key.startswith(f"{phase}/"):
             lines += [f"`{key}`: {finding_line(f)[2:]}" for f in review.get("findings") or [] if isinstance(f, dict)]
+    doubted = doubt.page_lines(cfg, run, phase, run.state["pipeline"]) if phase in cfg.phases else []
+    if doubted:
+        lead = [doubted[0], *(line for line in doubted[1:] if line in doubt.STOP_LINES.values())]
+        rows = [line for line in doubted[1:] if line not in doubt.STOP_LINES.values()]
+        return [*lead, "", *(f"- {line}" for line in [*lines, *rows])]
     lines += [f"`{f['key']}`: {finding_line(f)[2:]}" for f in phase_findings(cfg, run, phase)]
     blocking = blocking_of(cfg, phase_findings(cfg, run, phase))
     lead = [f"**{len(blocking)} blocking finding(s) are still open.** Approving ships them.", ""] if blocking else []
@@ -634,7 +695,7 @@ def approval_text(cfg: Config, run: Run, phase: str) -> str:
         "handoff": lambda: _section("Handoff (written when you approve)", [
             "Artifacts:", *([f"- `{p}`" for p in _artifacts(run, phase)] or ["(none)"]),
             "", "Decisions:", *(_decisions(run, phase) or ["(none)"]),
-            "", "Risks:", *(_risks(run, phase) or ["(none)"]),
+            "", "Risks:", *(_risks(cfg, run, phase) or ["(none)"]),
         ], "##"),
         "diff": lambda: _section("Diff", _diff_lines(run, phase), "##"),
         "step_results": lambda: _section("Step results", _step_results(run, phase), "##"),
@@ -644,8 +705,8 @@ def approval_text(cfg: Config, run: Run, phase: str) -> str:
     }
     shown = [builders[item]() for item in cfg.phase_approval.get("show", DEFAULT_SHOW) if item in builders]
     lead += _approval_note(cfg, run, phase)
-    if round_:  # after a refine round: what changed since the human last looked, step by step
-        previous = (run.state["phases"].get(phase) or {}).get("approval_sha")
+    previous = (run.state["phases"].get(phase) or {}).get("approval_sha")
+    if round_ and previous:  # after a human's refine round: what changed since they last looked, step by step
         shown = [
             _section("Since the last approval request", _diff_since(run, previous), "##"),
             _section(f"Steps in refine round {round_}", _round_lines(run, phase), "##"),

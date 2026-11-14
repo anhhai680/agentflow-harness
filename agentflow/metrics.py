@@ -35,7 +35,7 @@ from datetime import datetime
 from typing import Any
 
 from agentflow.events import parse_iso
-from agentflow.state import cost_added
+from agentflow.state import RECONCILE_KIND as RECONCILE, cost_added
 
 BUCKETS = ("agent", "gates", "human", "ci", "hold", "down", "runner")
 WAITS = {
@@ -166,6 +166,8 @@ class _Fold:
         self.phase_status[str(ev.get("phase"))] = "approved"
 
     def _on_phase_rejected(self, ev: dict, key: Any) -> None:
+        if ev.get("kind") == RECONCILE:  # the runner's own round on a doubt review's findings is not rework
+            return
         phase = str(ev.get("phase"))
         self.rework_pending.update(k for k in self.steps if _phase_of(k) == phase)
 

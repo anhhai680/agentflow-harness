@@ -55,6 +55,7 @@ from __future__ import annotations
 import dataclasses
 import re
 import subprocess
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -64,6 +65,7 @@ from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
 from agentflow.config import Config, Phase, Step, brief_files
 from agentflow.conformance import audit, clean_tree, render_section
+from agentflow.doubt import RECONCILE
 from agentflow.flow_control import current_refine, refine_note_block, refine_subject
 from agentflow.gates import gates_ok, record_results, run_gates_reusing
 from agentflow.gitops import (
@@ -965,8 +967,11 @@ def render_pr_body(run: Run, plan: str | None = None) -> str:
     footers = [f"- after `{m.get('phase')}`: the skill footer named `{m.get('got')}`, the route went to "
                f"`{m.get('expected')}`" for m in state.get("footer_mismatches", [])]
     events = run.events.read()
+    rejected = [e for e in events if e["type"] == "phase_rejected"]
     refines = [f"- `{e.get('phase')}` round {e.get('round')} ({'the runner' if e.get('by') == AUTO_BY else e.get('by')}): "
-               f"{' '.join(str(e.get('note', '')).split())}" for e in events if e["type"] == "phase_rejected"]
+               f"{' '.join(str(e.get('note', '')).split())}" for e in rejected if e.get("kind") != RECONCILE]
+    reconciled = Counter(str(e.get("phase")) for e in rejected if e.get("kind") == RECONCILE)
+    refines += [f"- Doubt review: {n} reconcile round(s) on {phase}" for phase, n in reconciled.items()]
     marked = state.get("marked_done")
     parts = [
         f"Opened by agentflow run `{run.id}` ({state.get('pipeline')}) from branch `{branch}`.",

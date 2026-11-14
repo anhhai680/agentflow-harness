@@ -30,10 +30,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TextIO
 
-from agentflow import sources
+from agentflow import doubt, sources
 from agentflow.conditions import Ctx, evaluate, fmt, paths_read
 from agentflow.commit_checks import runner_head
-from agentflow.config import Config, Phase, Step, for_lane
+from agentflow.config import RECONCILE_CHANGED, Config, Phase, Step, for_lane
 from agentflow.gates import GateResult, gates_ok, record_results, resolve, run_gates_reusing, summarize
 from agentflow.guards import snapshot
 from agentflow.gitops import CommitRejected, NothingToCommit, commit
@@ -109,7 +109,10 @@ def refine_subject(label: str, title: str) -> str:
 
 
 def refine_note_block(refine: dict) -> str:
-    """The rejection note, for the body of a commit made in its refine round."""
+    """The rejection note, for the body of a commit made in its refine round (or in a reconcile round, whose note
+    holds the findings it answers: it is not a human's round, so it has no round number of theirs)."""
+    if refine.get("kind") == doubt.RECONCILE:
+        return f"Reconcile round note:\n{refine.get('note', '')}"
     return f"Refine round {refine.get('round')} note:\n{refine.get('note', '')}"
 
 
@@ -246,7 +249,10 @@ class StepControl:
     # ------------------------------------------------------------------ conditions
 
     def _should_run(self, phase: Phase, step: Step, key: str) -> tuple[bool | None, str | None, str, Any]:
-        """`(True|False|None, condition label, reason, the condition itself)`; None means the run stopped to ask."""
+        """`(True|False|None, condition label, reason, the condition itself)`; None means the run stopped to ask.
+        A `reconciles` step runs only in a reconcile round of its phase, never on a first pass or in a human's round."""
+        if step.reconciles and not doubt.in_reconcile_round(self.run.state, phase.name):
+            return False, None, doubt.RECONCILE_ONLY, None
         if step.when is not None:
             value, reason = self.decide(phase, step.when, f"{key}.when")
             if value is None:
@@ -377,11 +383,19 @@ class StepControl:
         self.run.refresh()
         rec = self.run.state["steps"].get(key) or {}
         refine = self.run.state.get("refine") or {}
+        if step.reconciles:
+            return self._run_reconcile(phase, step, key, extra)
+        reconciling = doubt.in_reconcile_round(self.run.state, phase.name)
+        if reconciling and step.blocks_on_findings and rec.get("status") not in ("running", "waiting_human"):
+            if self._carried_over(phase, key):
+                return "done"
         rerun = refine.get("phase") == phase.name and bool(rec.get("session_id") or rec.get("result"))
         # A review never resumes: it is told the last one's findings and the note. Nor does a step whose findings
         # hold the phase back, because `unchanged` would clear them with no check having run.
         review = step.role == "review" or step.blocks_on_findings
-        if review and rerun:
+        if review and rerun and reconciling and doubt.is_doubt_reviewer(self.cfg, phase.name, step, self.ctx.values["lane"]):
+            extra = {**(extra or {}), "earlier_findings": doubt.earlier_for_review(self.run.events.read(), phase.name)}
+        elif review and rerun:
             extra = {**(extra or {}), "earlier_findings": self._earlier_step_review(key, refine.get("note"))}
         mode = "refine" if rerun and not review else "first"
         fix_first = None
@@ -394,6 +408,124 @@ class StepControl:
         if outcome == "done" and rec.get("status") not in DONE_STATUSES and writes_questions(step):
             self._render_questions(key, mode == "refine")
         return outcome
+
+    # ------------------------------------------------------------------ reconcile rounds
+
+    def _run_reconcile(self, phase: Phase, step: Step, key: str, extra: dict[str, str] | None) -> Outcome:
+        """The reconcile step of a reconcile round: a fresh session (never `refine`, whose prompt asks for `unchanged`)
+        that answers the round's findings and edits only its `output`. Once it is done the runner records what it
+        answered (`findings_reconciled`), then stops for a human when its edit changed which steps of the phase run."""
+        opened = self._round_opened(phase.name)
+        number = (opened or {}).get("reconcile_round") or ""
+        extra = {**(extra or {}), "reconcile_output": fmt(str(step.output), self.ctx), "refine_round": str(number)}
+        outcome = self.run_agent_step(phase, step, key, extra=extra, mode="first")
+        if outcome != "done":
+            return outcome
+        self._reconciled(phase, key)
+        return "stopped" if self.conditions_changed(phase) else "done"
+
+    def _round_opened(self, phase: str, events: list[dict] | None = None) -> dict | None:
+        """The `phase_rejected` that opened the reconcile round `phase` is in, or None outside one."""
+        if not doubt.in_reconcile_round(self.run.state, phase):
+            return None
+        events = self.run.events.read() if events is None else events
+        opened = [e for e in events if e["type"] == "phase_rejected" and e.get("phase") == phase]
+        return opened[-1] if opened and opened[-1].get("kind") == doubt.RECONCILE else None
+
+    def _reconciled(self, phase: Phase, key: str) -> None:
+        """Record `findings_reconciled` for the round's reconcile step `key`, once it is done and when the round has
+        none for it yet (also after a crash, before the round's review runs). `before` is the artifact's digest when
+        the round opened, never one taken at a restart; `after` is the digest now."""
+        self.run.refresh()
+        if (self.run.state["steps"].get(key) or {}).get("status") not in DONE_STATUSES:
+            return
+        events = self.run.events.read()
+        opened = self._round_opened(phase.name, events)
+        if opened is None or any(e["type"] == "findings_reconciled" and e.get("key") == key and e["seq"] > opened["seq"]
+                                 for e in events):
+            return
+        step = next((s for s in for_lane(phase.steps, self.ctx.values["lane"]) if f"{phase.name}/{s.id}" == key), None)
+        if step is None:
+            return
+        ids = [f["id"] for f in opened.get("findings") or [] if isinstance(f, dict) and isinstance(f.get("id"), str)]
+        try:
+            raw = read_result(self.run.result_path(key)).dispositions
+        except ResultError:
+            raw = []
+        kept = doubt.parse_dispositions(raw, set(ids))
+        answered = doubt.answered_boundary(events, key, int(opened["seq"]))
+        digests = (self.run.state.get("refine") or {}).get("digests") or opened.get("digests") or {}
+        self.run.emit("findings_reconciled", key=key, phase=phase.name, round=opened.get("reconcile_round"),
+                      dispositions=[{"finding": d.finding, "class": d.cls, "note": d.note} for d in kept],
+                      unresolved=doubt.unresolved(ids, kept, answered), before=str(digests.get(key) or ""),
+                      after=doubt.artifact_digest(self.worktree, fmt(str(step.output), self.ctx)))
+
+    def _carried_over(self, phase: Phase, key: str) -> bool:
+        """For a review in a reconcile round: record a lost `findings_reconciled` first, and when the round's reconcile
+        step left the artifact as it was, carry the last review over (`step_unchanged`) instead of running it."""
+        lane = self.ctx.values["lane"]
+        for step in doubt.reconcile_steps(phase, lane):
+            self._reconciled(phase, f"{phase.name}/{step.id}")
+        events = self.run.events.read()
+        opened = self._round_opened(phase.name, events)
+        if opened is None:
+            return False
+        records = [e for e in events if e["type"] == "findings_reconciled" and e["seq"] > opened["seq"]]
+        if not records or records[-1].get("before") != records[-1].get("after"):
+            return False
+        self.run.emit("step_unchanged", key=key, reason="the artifact did not change, so the last review stands")
+        return True
+
+    def phase_conditions(self, phase: Phase) -> dict[str, bool]:
+        """Whether each step a reconcile round does not run would run now (its `when` and `unless`, an unknown counted
+        as running), and the same for the phase's doubt reviews: what a reconcile edit must not change."""
+        lane = self.ctx.values["lane"]
+        keys, reviews = set(doubt.round_keys(phase, lane)), set(doubt.flagged_keys(phase, lane))
+        found: dict[str, bool] = {}
+        for key, step in _walk(phase.steps, phase.name, lane):
+            if (key not in keys or key in reviews) and (step.when is not None or step.unless is not None):
+                found[key] = self._would_run(step)
+        return found
+
+    def _would_run(self, step: Step) -> bool:
+        when = evaluate(self.cfg, step.when, self.ctx).value if step.when is not None else True
+        unless = evaluate(self.cfg, step.unless, self.ctx).value if step.unless is not None else False
+        return when is not False and unless is not True
+
+    def conditions_changed(self, phase: Phase) -> bool:
+        """After the round's reconcile step: when its edit turned a doubt review's conditions false, or another step's
+        true (an Open Question makes grilling due), record `reconcile_changed_conditions` and stop for a human, once
+        per round. The phase is then never settled as if the review had passed. True when the run stopped."""
+        self.run.refresh()
+        events = self.run.events.read()
+        opened = self._round_opened(phase.name, events)
+        if opened is None or not isinstance(opened.get("conditions"), dict):
+            return False
+        lane = self.ctx.values["lane"]
+        keys = [f"{phase.name}/{s.id}" for s in doubt.reconcile_steps(phase, lane)]
+        done = [k for k in keys if (self.run.state["steps"].get(k) or {}).get("status") in DONE_STATUSES]
+        if not done or any(e["type"] == "reconcile_changed_conditions" and e["seq"] > opened["seq"] for e in events):
+            return False
+        reviews = set(doubt.flagged_keys(phase, lane))
+        steps = dict(_walk(phase.steps, phase.name, lane))
+        now = self.phase_conditions(phase)
+        changed: dict[str, str] = {}
+        for key, was in opened["conditions"].items():
+            if key not in now or key not in steps or was == now[key]:
+                continue
+            if (key in reviews) == bool(was):  # a review that would have run, or another step that would not have
+                step = steps[key]
+                changed[key] = condition_label(step.when if step.when is not None else step.unless)
+        if not changed:
+            return False
+        key = done[0]
+        self.run.emit("reconcile_changed_conditions", key=key, phase=phase.name, changed=changed)
+        which = ", ".join(f"`{k}` ({label})" for k, label in changed.items())
+        raise_hitl(self.cfg, self.run, RECONCILE_CHANGED, key,
+                   f"The reconcile edit of {key} changed which steps of {phase.name} run: {which}. The runner does not "
+                   f"treat the phase as reviewed. Check the artifact: approve to go on with it as it is, or reject the "
+                   f"phase with a note.")
+        return True
 
     def _prerun_gates(self, step: Step, key: str) -> tuple[str, list[GateResult] | None]:
         """Run a `gates_first` step's gates before its session: their output is the session's evidence.
@@ -548,7 +680,10 @@ class StepControl:
     # ------------------------------------------------------------------ dry run
 
     def _dry_verdict(self, step: Step) -> tuple[str, str]:
-        """`run`, `skip` or `ask` (unknown, so a real run would decide it then) from `when`/`unless`."""
+        """`run`, `skip` or `ask` (unknown, so a real run would decide it then) from `when`/`unless`. A `reconciles`
+        step is skipped: a dry run never has a reconcile round."""
+        if step.reconciles:
+            return "skip", doubt.RECONCILE_ONLY
         for cond, skip_on in ((step.when, False), (step.unless, True)):
             if cond is None:
                 continue
@@ -635,6 +770,17 @@ class StepControl:
             tasks = [t for t in sources.parse_plan(self.ctx.repo / rel) if t.open]
             return [(str(t.n), f"Task {t.n}: {t.title}", t.text) for t in tasks]
         return [("N", "Task N (one session per plan task; no plan yet)", "(the task's text from the plan)")]
+
+
+def _walk(steps: list[Step], prefix: str, lane: str) -> list[tuple[str, Step]]:
+    """Every step of `lane` under `prefix` as `(key, step)`, groups recursed into (a repeated group's steps under
+    their plain key, not `r<n>/`)."""
+    found: list[tuple[str, Step]] = []
+    for step in for_lane(steps, lane):
+        key = f"{prefix}/{step.id}"
+        found.append((key, step))
+        found += _walk(step.steps, key, lane)
+    return found
 
 
 def _word(value: bool) -> str:

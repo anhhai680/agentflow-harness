@@ -202,6 +202,33 @@ def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
 
 
+def test_the_form_refuses_switching_refinement_off(shipped):
+    with pytest.raises(EditError):
+        form(shipped, (["autonomy", "finding_rounds"], 0))
+    assert not form(shipped, (["autonomy", "finding_rounds"], 1)).errors
+    _, sha = config_edit.read(shipped)
+    proposal = config_edit.propose(shipped, sha, text=SHIPPED.replace("finding_rounds: 2", "finding_rounds: 0"), repo=REPO)
+    assert "autonomy.finding_rounds" in [i.path for i in proposal.errors]
+    listed = SHIPPED.replace("non_blocking_severities: [minor, low, info, nit]",
+                             "non_blocking_severities: [minor, high]")
+    assert listed != SHIPPED
+    proposal = config_edit.propose(shipped, sha, text=listed, repo=REPO)
+    assert "autonomy.non_blocking_severities" in [i.path for i in proposal.errors]
+
+
+def test_reconciles_blocks_on_findings_and_the_doubt_skill_are_protected(shipped):
+    _, sha = config_edit.read(shipped)
+    for old, new in [
+        ("      - {id: plan, lanes: [feature], skill: writing-plans,",
+         "      - {id: plan, reconciles: true, lanes: [feature], skill: writing-plans,"),     # a step reconciles
+        ("blocks_on_findings: true, gates_first: true,", "blocks_on_findings: false, gates_first: true,"),  # flipped
+        ("  map:                          #", "  map:\n    doubt: agentflow-review\n    #"),  # skills.map.doubt added
+    ]:
+        assert old in SHIPPED, old
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
+
+
 def test_retro_step_is_protected(shipped):
     assert "retro_step" in config_edit.PROTECTED
     with pytest.raises(Refused):  # the form has no field for it
