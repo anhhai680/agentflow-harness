@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- The pull request body has a `Verification` section: each acceptance criterion with what ran to prove it, what verify could not run and why, and evidence older than a review fix marked as such.
 - Synced issues that GitHub marks *blocked by* another issue show `Runs after:` / `Blocks:` on the Backlog and cannot start until the blocker is met, and `doctor` checks that `gh` can read issue dependencies.
 
 ### Fixed

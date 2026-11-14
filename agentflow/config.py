@@ -146,6 +146,7 @@ PROMPT_PLACEHOLDERS = frozenset(
         "task_start_sha",
         "earlier_findings",
         "gate_evidence",
+        "verification",
         "brief",
         "phase",
         "stop_kind",

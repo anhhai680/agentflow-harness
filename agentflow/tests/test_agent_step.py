@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import subprocess
@@ -1098,6 +1099,53 @@ def test_a_pack_template_that_names_a_bundled_skill_still_gets_it_inlined(flow_r
     assert "Rules with {module}" in prompt and "Its full text follows" in prompt  # an agent cannot load a bundled skill
     codex = skill_prompt(flow_repo, step, rec={"agent": "codex"})
     assert "Rules with {module}" in codex and "SKILL.md" not in codex  # nothing points it at a file that is not there
+
+
+VERIFY_STORY = {"verification": {
+    "gates": [{"gate": "unit", "cmd": "pytest", "result": "12 passed", "passed": True}],
+    "criteria": [{"criterion": "Criterion 1", "evidence": "tests/test_a.py::test_one", "ran": True, "passed": True}],
+    "not_verified": [{"what": "Criterion 3", "why": "needs a browser"}]}}
+
+
+def verification_prompt(flow_repo, signals=None, path=None):
+    (flow_repo.cfg.path.parent / "prompts" / "with_verification.md").write_text(
+        "Goal: review.\n\nVERIFIED:\n{verification}\nEND\n", encoding="utf-8")
+    run = flow_repo.run or flow_repo.new_run()
+    flow_repo.run = run
+    if signals is not None:
+        target = path or run.result_path("verify/verify")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"status": "done", "summary": "ok", "signals": signals}), encoding="utf-8")
+    return skill_prompt(flow_repo, make_step(prompt="with_verification.md", skill=None))
+
+
+def test_verification_placeholder_carries_the_story(flow_repo):
+    prompt = verification_prompt(flow_repo, VERIFY_STORY)
+    assert "- Criterion 1: `tests/test_a.py::test_one` ✓" in prompt
+    assert "- gate `unit`: 12 passed ✓" in prompt and "- not verified: Criterion 3: needs a browser" in prompt
+
+
+def test_verification_placeholder_is_empty_when_verify_never_ran(flow_repo):
+    prompt = verification_prompt(flow_repo)
+    assert "VERIFIED:\n\nEND" in prompt and "{verification}" not in prompt and "verify reported" not in prompt
+
+
+@pytest.mark.parametrize("signals", [{}, {"verification": "x"}])
+def test_verification_placeholder_says_no_evidence(flow_repo, signals):
+    assert "VERIFIED:\nverify reported no evidence\nEND" in verification_prompt(flow_repo, signals)
+
+
+def test_verification_text_with_braces_stays_literal(flow_repo):
+    story = {"verification": {"criteria": [
+        {"criterion": "keeps {module} literal", "evidence": "t", "ran": True, "passed": True}]}}
+    prompt = verification_prompt(flow_repo, story)
+    assert "- keeps {module} literal: `t` ✓" in prompt and "keeps crm literal" not in prompt
+
+
+def test_verification_is_never_read_from_the_worktree(flow_repo):
+    planted = flow_repo.root / "results" / "verify__verify.json"  # where a model could write in its worktree
+    prompt = verification_prompt(flow_repo, VERIFY_STORY, path=planted)
+    assert "Criterion 1" not in prompt and "VERIFIED:\n\nEND" in prompt
 
 
 def test_a_step_without_a_skill_but_with_a_brief_renders_no_empty_skill_heading(flow_repo):
