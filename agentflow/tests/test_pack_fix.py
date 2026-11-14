@@ -70,6 +70,22 @@ def test_old_result_line_is_fixable(pack_repo_python):
     assert drift_issues(pack_repo_python) == got.issues
 
 
+def test_old_verify_failure_line_is_fixable(pack_repo_python):
+    entry = next(e for e in pack_fix.RETIRED if e.id == "verify-fix-only-the-cause")
+    assert (entry.file, entry.retired_in) == ("verify.md", "2.7")
+    old = engine("verify.md").replace(entry.new, entry.old)
+    assert "fix only the cause" in old
+    put(pack_repo_python, "verify.md", old + "\nPack wording.\n")
+    got = found(pack_repo_python)
+    assert len(got.issues) == 1
+    issue = got.issues[0]
+    assert (issue.level, issue.path, issue.fixable) == ("warning", "prompts/verify.md", True)
+    assert "2.7" in issue.message
+    assert len(got.fixes) == 1
+    assert got.fixes[0].after.decode("utf-8") == engine("verify.md") + "\nPack wording.\n"
+    assert drift_issues(pack_repo_python) == got.issues
+
+
 def test_old_preamble_block_is_one_fixable_issue(pack_repo_python):
     put(pack_repo_python, "_preamble.md", OLD_PREAMBLE + "\nPack rule.\n")
     got = found(pack_repo_python)

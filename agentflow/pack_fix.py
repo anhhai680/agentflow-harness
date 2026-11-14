@@ -37,6 +37,30 @@ class Retired:
 
 RETIRED: tuple[Retired, ...] = (
     Retired(
+        id="verify-fix-only-the-cause",
+        file="verify.md",
+        retired_in="2.7",
+        detect="fix only the cause",
+        old=(
+            "If something fails, say which gate and why, and fix only the cause. Never weaken the repository's "
+            "quality rules, skip a test or add a suppression to pass."
+        ),
+        new=(
+            "If a gate failed, stop the line and debug it: reproduce the failure, find where it comes from, fix the "
+            "cause and guard it with a test. Say whether the cause is in the branch or in the environment (a clock, a "
+            "database, a port, a flaky test the branch does not touch). Never weaken the repository's quality rules, "
+            "skip a test or add a suppression to pass.\n"
+            "Do not judge the code by reading it against the spec: the review phase does that. For each acceptance "
+            "criterion in the spec and each verification command in the plan, name the test or command that ran and "
+            "its result. A criterion nothing ran for is not verified: list it with the reason, never as met.\n"
+            "Put that account in the result's `signals` as `{\"verification\": {\"gates\": [{\"gate\": \"name\", "
+            "\"cmd\": \"command\", \"result\": \"result line\", \"passed\": true}], \"criteria\": "
+            "[{\"criterion\": \"Success Criterion 3\", \"evidence\": \"the test or command\", \"ran\": true, "
+            "\"passed\": true}], \"not_verified\": [{\"what\": \"Success Criterion 7\", \"why\": \"needs a "
+            "browser\"}]}}`."
+        ),
+    ),
+    Retired(
         id="effort-check-block",
         file="_preamble.md",
         retired_in="2.5",

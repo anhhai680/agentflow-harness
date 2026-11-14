@@ -92,6 +92,19 @@ def test_no_prompt_carries_the_effort_check(flow_repo):
     assert "Effort check" not in text and "effort_change" not in text
 
 
+def test_engine_verify_prompt_debugs_and_asks_for_the_story():
+    text = (ENGINE / "prompts" / "verify.md").read_text(encoding="utf-8")
+    for want in ("stop the line", '"verification"', "not_verified", "never as met"):
+        assert want in text, want
+    assert "fix only the cause" not in text
+
+
+def test_bundled_verify_skill_is_test_and_debug():
+    text = (ENGINE / "skills" / "agentflow-verify" / "SKILL.md").read_text(encoding="utf-8")
+    assert "## When a gate fails" in text and "Reproduce" in text
+    assert "Compare the result against the spec" not in text
+
+
 def test_a_packs_own_preamble_copy_with_the_old_block_is_stripped(flow_repo, monkeypatch):
     real = lanes._template
     old = "<!-- effort-check -->\n## Effort check\nsize this step\n<!-- /effort-check -->\n"
