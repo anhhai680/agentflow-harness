@@ -694,11 +694,30 @@ def _picture(cfg: Config, repo: Path) -> dict:
     book = Backlog.load(repo)
     state = _load_state(repo)
     merged = {k: v for k, v in (state.get("merged") or {}).items() if isinstance(k, str)}
-    view = module_queue.dependency_view(
+    pic = {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "state": state,
+           "issues": _synced(cfg, state)}
+    issues = []
+    for entry in pic["issues"]:
+        record = book.issue_overlay(entry["number"])
+        issues.append({"number": entry["number"], "blocked_by": entry["blocked_by"],
+                       "deps_complete": entry["deps_complete"], "on_board": _issue_blocker(entry["number"], pic) is None,
+                       "starting": record is not None and record.status == "starting"})
+    pic["view"] = module_queue.dependency_view(
         nodes, entries, book.cards(), merged=merged, runs={r.id: r for r in runs}, noun=work_source.noun(cfg),
+        issues=issues,
     )
-    return {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "view": view, "state": state,
-            "issues": _synced(cfg, state)}
+    return pic
+
+
+def _deps_unknown(key: str, params: dict, pic: dict) -> str | None:
+    """Why the blockers of the synced issue behind `key` (`issue:N`, or a form card whose `params.issue` is a synced
+    N) are not known: the entry's `deps_note`. None when they are known, or `key` is not tied to a synced issue."""
+    kind, _, name = key.partition(":")
+    number = name if kind == "issue" else str(params.get("issue") or "") if kind == "card" else ""
+    entry = next((i for i in pic["issues"] if i["number"] == number), None)
+    if entry is None or entry["deps_complete"]:
+        return None
+    return entry["deps_note"] or UNKNOWN_CACHE
 
 
 def _label_of(key: str, pic: dict) -> str:
@@ -737,12 +756,18 @@ def snapshot(cfg: Config, repo: Path) -> dict:
              module: str | None = None, **extra: Any) -> dict:
         info = view.get(key, {"blocked_by": [], "parallel_with": [], "parallel": False})
         failure = item.failure if item is not None else None
+        unknown = _deps_unknown(key, getattr(item, "params", None) or {}, pic)
         if item is not None and item.status == "starting":
             status = "starting"
-        elif info["blocked_by"]:
+        elif info["blocked_by"] or unknown:
             status = "blocked"
         else:
             status = "parallel" if info["parallel"] else "ready"
+        if unknown and status != "starting":
+            extra["note"] = f"Dependencies unknown: {unknown}"
+        elif info.get("cycle") and kind == "issue":
+            extra["note"] = info["cycle"]
+        extra.setdefault("blocks", [])
         return {
             "key": key, "kind": kind, "id": ident, "label": label, "lane": item_lane, "status": status,
             "blocked_by": info["blocked_by"],
@@ -775,9 +800,12 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         if _issue_blocker(number, pic) is not None:
             continue
         module = ISSUE_MODULE.format(number=number) if entry["lane"] == lane else None
+        blockers = list(dict.fromkeys(module_queue.issue_key(r) for r in entry["blocked_by"]))
+        blocks = [{"key": module_queue.issue_key(r), "label": f"{r['repo']}#{r['number']}" if r["repo"] else f"#{r['number']}"}
+                  for r in entry["blocks"]]
         card = make(f"issue:{number}", "issue", number, f"#{number} · {entry.get('title') or ''}".rstrip(" ·"),
-                    entry["lane"], book.issue_overlay(number), module=module, deps=[], issue=number,
-                    url=entry.get("url") or "")
+                    entry["lane"], book.issue_overlay(number), module=module, deps=blockers, issue=number,
+                    url=entry.get("url") or "", blocks=blocks)
         if number in taken and card["status"] != "starting":
             card["status"], card["note"] = "taken", TAKEN
         cards.append(card)
@@ -920,6 +948,9 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
             blocker = _issue_blocker(name, pic)
             if blocker is not None:
                 raise Refused(blocker)
+            unknown = _deps_unknown(key, {}, pic)
+            if unknown:
+                raise Refused(f"issue #{name}: its dependencies could not be read: {unknown}")
             _refuse_taken(name, pic)
             item_lane = entry["lane"]
             item = book.issue_overlay(name)
@@ -939,6 +970,9 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
                 raise Refused(f"a spec for {params['module']} now exists; start module:{params['module']} instead")
             params["task"], new_module = _spec_task(new_module), None
         if kind == "card" and params.get("issue"):
+            unknown = _deps_unknown(key, params, pic)
+            if unknown:
+                raise Refused(f"issue #{params['issue']}: its dependencies could not be read: {unknown}")
             _refuse_taken(str(params["issue"]), pic)
             _refuse_starting_issue(str(params["issue"]), book)
             if item_lane == lane and "module" not in params:  # an issue-only card in the module lane
@@ -1048,6 +1082,17 @@ def refresh(cfg: Config, repo: Path) -> dict:
     return {"note": note, "skipped": skipped, "issues_note": issues_note}
 
 
+def _blocker_runs(entry: dict, runs: dict[str, Run]) -> set[str]:
+    """The runs here of the local issues in `entry`'s `blocked_by` that are live or whose pull request is open: whether
+    each is merged decides whether the issue it blocks may start."""
+    found: set[str] = set()
+    for ref in entry["blocked_by"]:
+        run = module_queue.issue_run(ref["number"], runs) if ref["repo"] is None else None
+        if run is not None and run.state["status"] in (*module_queue._LIVE, "done"):
+            found.add(run.id)
+    return found
+
+
 def _recheck_after(cfg: Config, repo: Path) -> dict[str, bool | None]:
     """Whether the pull request of every run that some card or run-ref waits on is merged (once true, always)."""
     book = Backlog.load(repo)
@@ -1061,7 +1106,10 @@ def _recheck_after(cfg: Config, repo: Path) -> dict[str, bool | None]:
                 wanted.add(name)
             elif target is not None and target.run_id:
                 wanted.add(target.run_id)
-    previous = _load_state(repo).get("merged") or {}
+    state = _load_state(repo)
+    for entry in _synced(cfg, state):  # also the blockers of a form card's issue: it is in the same list
+        wanted |= _blocker_runs(entry, runs)
+    previous = state.get("merged") or {}
     result: dict[str, bool | None] = {k: v for k, v in previous.items() if v is True}
     for run_id in wanted:
         if result.get(run_id) is True:

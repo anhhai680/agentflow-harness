@@ -1307,3 +1307,150 @@ def test_a_cached_url_is_checked_again_before_the_board_shows_it(ibk, monkeypatc
     backlog._save_state(ibk.root, **state)
     card = ibk.cards()["issue:12"]
     assert card["url"] == "" and card["label"] == "#12 · a b"
+
+
+# --------------------------------------------------------------------------- issue dependencies on the board
+
+
+def _statuses(cards: dict[str, dict]) -> dict[str, str]:
+    return {k: c["status"] for k, c in cards.items() if k.startswith("issue:")}
+
+
+def test_an_issue_blocked_by_an_open_issue_cannot_start(ibk, monkeypatch):  # the root-cause regression
+    _list_issues(monkeypatch, _issue(1, blocking=[_node(2)]), _issue(2, blocked_by=[_node(1)]))
+    ibk.refresh()
+    cards = ibk.cards()
+    assert cards["issue:2"]["status"] == "blocked"
+    assert [b["text"] for b in cards["issue:2"]["blocked_by"]] == ["issue #1 (in Backlog)"]
+    assert cards["issue:1"]["blocks"] == [{"key": "issue:2", "label": "#2"}]
+    assert cards["issue:1"]["status"] in ("ready", "parallel")
+    with pytest.raises(Refused, match=r"blocked: runs after issue #1"):
+        backlog.begin_start(ibk.cfg, ibk.root, "issue:2")
+
+
+def test_unrelated_issues_are_parallel_and_a_dependent_is_not(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(1, blocking=[_node(2)]), _issue(2, blocked_by=[_node(1)]), _issue(3))
+    ibk.refresh()
+    cards = ibk.cards()
+    with_ = {k: [p["key"] for p in cards[k]["parallel_with"]] for k in ("issue:1", "issue:2", "issue:3")}
+    assert "issue:3" in with_["issue:1"] and "issue:1" in with_["issue:3"]
+    assert "issue:1" not in with_["issue:2"] and "issue:2" not in with_["issue:1"]
+    assert cards["issue:1"]["status"] == "parallel" and cards["issue:3"]["status"] == "parallel"
+    assert cards["issue:2"]["status"] == "blocked"
+
+
+def test_a_chain_only_starts_at_its_root(ibk, monkeypatch):
+    _list_issues(
+        monkeypatch,
+        _issue(10, blocking=[_node(11), _node(13)]),
+        _issue(11, blocked_by=[_node(10)], blocking=[_node(12)]),
+        _issue(12, blocked_by=[_node(11)], blocking=[_node(13)]),
+        _issue(13, blocked_by=[_node(10), _node(12)]),
+    )
+    ibk.refresh()
+    cards = ibk.cards()
+    assert _statuses(cards)["issue:10"] in ("ready", "parallel")
+    assert [k for k, s in _statuses(cards).items() if s in ("ready", "parallel")] == ["issue:10"]
+    assert cards["issue:10"]["blocks"] == [{"key": "issue:11", "label": "#11"}, {"key": "issue:13", "label": "#13"}]
+    for key in ("issue:11", "issue:12", "issue:13"):
+        with pytest.raises(Refused, match="blocked: runs after"):
+            backlog.begin_start(ibk.cfg, ibk.root, key)
+
+
+def test_the_blocker_run_here_frees_its_dependent_only_once_merged(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(1, blocking=[_node(2)]), _issue(2, blocked_by=[_node(1)]))
+    ibk.refresh()
+    run = Run.load(ibk.root, ibk.start("issue:1"))
+    texts = lambda: [b["text"] for b in ibk.cards()["issue:2"]["blocked_by"]]  # noqa: E731
+    assert texts() == ["issue #1 (running)"]
+    run.emit("run_finished")
+    assert texts() == ["issue #1 (PR open)"]
+    # GitHub closes #1 (its PR is merged there), but this checkout's run is not known to be merged yet
+    _list_issues(monkeypatch, _issue(2, blocked_by=[_node(1, state="CLOSED")]))
+    ibk.refresh()
+    assert ibk.cards()["issue:2"]["status"] == "blocked" and texts() == ["issue #1 (PR open)"]
+    ibk.merges.state[run.refresh()["branch"]] = True
+    ibk.refresh()
+    cards = ibk.cards()
+    assert cards["issue:2"]["status"] in ("ready", "parallel") and cards["issue:2"]["blocked_by"] == []
+
+
+def test_a_blocker_outside_the_synced_set_still_blocks(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(2, blocked_by=[_node(7)]))
+    ibk.refresh()
+    card = ibk.cards()["issue:2"]
+    assert card["status"] == "blocked"
+    assert [b["text"] for b in card["blocked_by"]] == ["issue #7 (open (not on this board))"]
+    with pytest.raises(Refused, match="runs after issue #7"):
+        backlog.begin_start(ibk.cfg, ibk.root, "issue:2")
+
+
+def test_unknown_dependencies_show_and_refuse(ibk, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_OLD", "1")
+    _list_issues(monkeypatch, _issue(2))
+    ibk.refresh()
+    card = ibk.cards()["issue:2"]
+    assert card["status"] == "blocked" and card["note"] == "Dependencies unknown: update gh"
+    with pytest.raises(Refused) as caught:
+        backlog.begin_start(ibk.cfg, ibk.root, "issue:2")
+    assert str(caught.value) == "issue #2: its dependencies could not be read: update gh"
+    assert ibk.spawn.calls == []
+
+
+def test_an_issue_cycle_shows_its_note_and_refuses(ibk, monkeypatch):
+    _list_issues(monkeypatch,
+                 _issue(3, blocked_by=[_node(5)], blocking=[_node(5)]),
+                 _issue(5, blocked_by=[_node(3)], blocking=[_node(3)]))
+    ibk.refresh()
+    cards = ibk.cards()
+    assert cards["issue:3"]["status"] == "blocked" and cards["issue:3"]["note"] == "dependency cycle: #3 -> #5 -> #3"
+    with pytest.raises(Refused):
+        backlog.begin_start(ibk.cfg, ibk.root, "issue:3")
+
+
+def test_a_form_card_for_a_blocked_issue_is_refused(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(1), _issue(2, blocked_by=[_node(1)]))
+    ibk.refresh()
+    item = backlog.add(ibk.cfg, ibk.root, "bug", {"issue": "2"})
+    card = ibk.cards()[f"card:{item.id}"]
+    assert card["status"] == "blocked"
+    assert [b["text"] for b in card["blocked_by"]] == ["issue #1 (in Backlog)"]
+    with pytest.raises(Refused, match="runs after issue #1"):
+        backlog.begin_start(ibk.cfg, ibk.root, f"card:{item.id}")
+
+
+def test_a_form_card_for_an_issue_with_unknown_dependencies_is_refused(ibk, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_OLD", "1")
+    _list_issues(monkeypatch, _issue(2))
+    ibk.refresh()
+    item = backlog.add(ibk.cfg, ibk.root, "bug", {"issue": "2"})
+    card = ibk.cards()[f"card:{item.id}"]
+    assert card["status"] == "blocked" and card["note"] == "Dependencies unknown: update gh"
+    with pytest.raises(Refused, match="issue #2: its dependencies could not be read: update gh"):
+        backlog.begin_start(ibk.cfg, ibk.root, f"card:{item.id}")
+
+
+def test_a_blockers_title_never_reaches_the_board_or_the_log(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(2, blocked_by=[_node(1, title="SECRET-TITLE")]))
+    ibk.refresh()
+    assert "SECRET-TITLE" not in json.dumps(backlog.snapshot(ibk.cfg, ibk.root))
+    with pytest.raises(Refused) as caught:
+        backlog.begin_start(ibk.cfg, ibk.root, "issue:2")
+    assert "SECRET-TITLE" not in str(caught.value)
+    logs = [p for p in ibk.root.rglob("*") if p.is_file() and ".git" not in p.parts]
+    state_dir = backlog._state_path(ibk.root).parent
+    logs += [p for p in state_dir.rglob("*") if p.is_file()]
+    assert logs and not [p for p in logs if "SECRET-TITLE" in p.read_text(encoding="utf-8", errors="ignore")]
+
+
+def test_an_issue_in_the_module_lane_waits_for_its_blocker(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(2, blocked_by=[_node(1)]))
+    ibk.refresh()
+    with pytest.raises(Refused, match="runs after issue #1"):
+        backlog.begin_start(ibk.cfg, ibk.root, "issue:2")
+    _list_issues(monkeypatch, _issue(2, blocked_by=[_node(1, state="CLOSED")]))
+    ibk.refresh()
+    ibk.start("issue:2")
+    call = ibk.spawn.calls[-1]
+    assert call["lane"] == "feature" and call["params"] == {"issue": "2", "module": "issue-2"}
+    assert call["new_module"] == {"module": "issue-2", "responsibility": "GitHub issue #2", "deps": []}
