@@ -156,6 +156,20 @@ def test_a_missing_gh_fails_with_an_install_hint(tmp_cfg, repo, bindir):
     assert check.status == "fail" and "install gh" in check.fix
 
 
+SYNC = _patch(issues={"sync_label": "agentflow"})
+
+
+def test_the_gh_fields_check_runs_only_with_issue_sync(tmp_cfg, repo):
+    assert "gh issue fields" not in _checks(tmp_cfg, repo)
+    assert _checks(tmp_cfg, repo, SYNC)["gh issue fields"].status == "ok"
+
+
+def test_a_gh_without_blocked_by_fails_the_fields_check(tmp_cfg, repo, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_JSON_FIELDS", "Specify one or more comma-separated fields for `--json`:\n  number\n  title")
+    check = _checks(tmp_cfg, repo, SYNC)["gh issue fields"]
+    assert check.status == "fail" and "update gh" in check.fix
+
+
 def test_no_origin_remote_fails(tmp_cfg, repo):
     _git(repo, "remote", "remove", "origin")
     check = _checks(tmp_cfg, repo)["remote"]

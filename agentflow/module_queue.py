@@ -577,15 +577,19 @@ def _cycle_through(start: str, deps: dict[str, list[str]]) -> list[str] | None:
     return None
 
 
+def _ring(cycle: list[str]) -> list[str]:
+    """The members of a cycle, rotated to start at the smallest, so every one on it names it the same way."""
+    first = cycle.index(min(cycle))
+    return cycle[first:] + cycle[:first]
+
+
 def _map_problem(node: sources.ModuleNode, deps: dict[str, list[str]], noun: str = "capability map") -> str | None:
     unknown = [d for d in node.deps if d not in deps]
     if unknown:
         return f"depends on {', '.join(unknown)}, which is not in the {noun}"
     cycle = _cycle_through(node.id, deps)
     if cycle:
-        members = cycle[:-1]
-        first = members.index(min(members))  # every module on the cycle names it the same way
-        ring = members[first:] + members[:first]
+        ring = _ring(cycle[:-1])
         return "dependency cycle: " + " -> ".join([*ring, ring[0]])
     return None
 
@@ -730,9 +734,43 @@ _RUN_WORDS = {"running": "running", "refining": "running", "waiting_human": "wai
               "cancelled": "cancelled", "error": "stopped on an error"}
 
 
+def issue_key(ref: dict) -> str:
+    """`issue:<N>`, or `issue:<owner/repo>#<N>` for an issue in another repository."""
+    return f"issue:{ref['repo']}#{ref['number']}" if ref["repo"] else f"issue:{ref['number']}"
+
+
+def issue_run(number: str, runs: dict[str, Run]) -> Run | None:
+    """The newest run for issue `number` (`runs` is oldest first), or None."""
+    for run in reversed(list(runs.values())):
+        if str((run.state.get("params") or {}).get("issue")) == number:
+            return run
+    return None
+
+
+_ABANDONED = ("failed", "cancelled")  # a run that will never open or merge a pull request
+
+
+def issue_run_holds(run: Run) -> bool:
+    """Whether an issue's run here still holds the issue after GitHub closed it: one that is live, stopped on an
+    error (it can be resumed) or `done` with its pull request open. A failed, cancelled or archived run does not."""
+    return not run.state.get("archived") and run.state["status"] not in _ABANDONED
+
+
+def issue_ref_done(ref: dict, runs: dict[str, Run], merged: dict[str, bool | None]) -> bool:
+    """Whether a blocker is met: it is closed and, if this checkout has a run for it that still holds it
+    (`issue_run_holds`), that run's PR merged."""
+    if ref["state"] != "closed":
+        return False
+    if ref["repo"] is not None:
+        return True
+    run = issue_run(ref["number"], runs)
+    return run is None or not issue_run_holds(run) or merged.get(run.id) is True
+
+
 def dependency_view(
     nodes: list[sources.ModuleNode], entries: list[dict], cards: list, *,
     merged: dict[str, bool | None] | None = None, runs: dict[str, Run] | None = None, noun: str = "capability map",
+    issues: list[dict] | None = None,
 ) -> dict[str, dict]:
     """For each unfinished item, `blocked_by`, `parallel_with` and `parallel`.
 
@@ -745,8 +783,25 @@ def dependency_view(
 
     `parallel_with` lists unfinished items with no dependency path to or from the item (transitively). `parallel`
     holds when the item is unblocked and at least one of those is unblocked or running now.
+
+    `issues` are the synced GitHub issues, each `{number, blocked_by, deps_complete, on_board, starting}` (`blocked_by`
+    holds refs `{number, state, repo}`). Each on-board one is an item `issue:<N>`, blocked by the issues in its
+    `blocked_by`, and its result also has `cycle`. A blocker that is not an item is only a target: it is named in
+    `blocked_by`, and it is met when closed (and, if this checkout ran it, when that run's PR merged). A card whose
+    `params.issue` names a synced issue also waits for that issue's blockers, and so does the module named in an
+    entry's optional `module` (the issue's derived module, when the work source has it).
     """
     merged, runs = merged or {}, runs or {}
+    by_issue = {i["number"]: i for i in issues or []}
+    targets: dict[str, dict] = {}  # issue key -> its ref: open when any entry's ref says open
+    for i in issues or []:
+        for ref in i["blocked_by"]:
+            old = targets.setdefault(issue_key(ref), dict(ref))
+            if ref["state"] == "open":
+                old["state"] = "open"
+    for i in issues or []:
+        if i["on_board"]:
+            targets[f"issue:{i['number']}"] = {"number": i["number"], "state": "open", "repo": None}
     by_entry = {e["id"]: e for e in entries}
     cards = [c for c in cards if c.status != "removed"]
     owner: dict[str, str] = {}  # run id -> the item that owns the run
@@ -773,6 +828,8 @@ def dependency_view(
         if kind == "card":
             card = next((c for c in cards if c.id == name), None)
             return bool(card and card.run_id and merged.get(card.run_id) is True)
+        if kind == "issue":
+            return issue_ref_done(targets[key], runs, merged)
         return merged.get(name) is True
 
     def state_word(key: str) -> str:
@@ -789,6 +846,16 @@ def dependency_view(
             if card.run_id and card.status == "started":
                 return run_word(card.run_id)
             return "starting" if card.status == "starting" else "in Backlog"
+        if kind == "issue":
+            ref = targets[key]
+            run = issue_run(ref["number"], runs) if ref["repo"] is None else None
+            if run:
+                return _RUN_WORDS.get(run.state["status"], run.state["status"])
+            if ref["repo"] is None and by_issue.get(ref["number"], {}).get("on_board"):
+                return "starting" if by_issue[ref["number"]]["starting"] else "in Backlog"
+            if ref["state"] == "closed":
+                return "closed"
+            return "open" if ref["repo"] else "open (not on this board)"
         return run_word(name)
 
     def label(key: str) -> str:
@@ -797,12 +864,24 @@ def dependency_view(
             run = runs.get(name)
             params = (run.state.get("params") or {}) if run else {}
             return str(params.get("module") or (f"issue #{params['issue']}" if params.get("issue") else name))
+        if kind == "issue":
+            ref = targets[key]
+            return f"{ref['repo']}#{ref['number']}" if ref["repo"] else f"issue #{ref['number']}"
         return labels.get(key, name)
 
-    keys = [f"module:{n.id}" for n in nodes] + [f"card:{c.id}" for c in cards]
+    keys = ([f"module:{n.id}" for n in nodes] + [f"card:{c.id}" for c in cards]
+            + [f"issue:{i['number']}" for i in issues or [] if i["on_board"]])
     deps: dict[str, list[str]] = {f"module:{n.id}": [f"module:{d}" for d in n.deps] for n in nodes}
+    blockers = {f"issue:{i['number']}": list(dict.fromkeys(issue_key(r) for r in i["blocked_by"])) for i in issues or []}
     for c in cards:
-        deps[f"card:{c.id}"] = list(dict.fromkeys(norm(r) for r in [*c.after, *c.deps]))
+        issue = by_issue.get(str((getattr(c, "params", None) or {}).get("issue")))
+        found = blockers.get(f"issue:{issue['number']}", []) if issue else []
+        deps[f"card:{c.id}"] = list(dict.fromkeys([*(norm(r) for r in [*c.after, *c.deps]), *found]))
+    for i in issues or []:  # the module named after a synced issue runs that issue, so it waits for its blockers
+        module = f"module:{i['module']}" if i.get("module") else None
+        if module in deps:
+            deps[module] = list(dict.fromkeys([*deps[module], *blockers[f"issue:{i['number']}"]]))
+    deps.update(blockers)  # an issue that is not on the board still passes its blockers on to what waits for it
     unfinished = [k for k in keys if not is_done(k)]
 
     def ancestors(key: str) -> set[str]:
@@ -824,6 +903,9 @@ def dependency_view(
         if kind == "module":
             run = runs.get(by_entry[name].get("run_id") or "")
             return bool(run and run.state["status"] in _LIVE)
+        if kind == "issue":
+            run = issue_run(name, runs)
+            return by_issue[name]["starting"] or bool(run and run.state["status"] in _LIVE)
         card = next(c for c in cards if c.id == name)
         run = runs.get(card.run_id or "")
         return card.status == "starting" or bool(run and run.state["status"] in _LIVE)
@@ -832,6 +914,8 @@ def dependency_view(
         kind, _, name = key.partition(":")
         if kind == "module":
             return bool(by_entry[name].get("run_id"))
+        if kind == "issue":
+            return by_issue[name]["starting"]
         card = next(c for c in cards if c.id == name)
         return card.status in ("starting", "started")
 
@@ -841,9 +925,20 @@ def dependency_view(
         return running(key) if started(key) else not blocked[key]
 
     peers = {k: [o for o in unfinished if o != k and o not in above[k] and k not in above[o]] for k in unfinished}
-    return {k: {"blocked_by": blocked[k], "parallel_with": peers[k],
-                "parallel": not blocked[k] and any(can_run_beside(o) for o in peers[k])}
-            for k in unfinished}
+    def cycle(key: str) -> str | None:
+        found = _cycle_through(key, deps)
+        if not found:
+            return None
+        ring = _ring(found[:-1])
+        return "dependency cycle: " + " -> ".join(f"#{k.removeprefix('issue:')}" for k in [*ring, ring[0]])
+
+    out = {k: {"blocked_by": blocked[k], "parallel_with": peers[k],
+               "parallel": not blocked[k] and any(can_run_beside(o) for o in peers[k])}
+           for k in unfinished}
+    for k in unfinished:
+        if k.startswith("issue:"):
+            out[k]["cycle"] = cycle(k)
+    return out
 
 
 @contextmanager

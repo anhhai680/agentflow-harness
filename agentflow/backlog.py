@@ -58,8 +58,20 @@ ISSUE_MODULE = "issue-{number}"  # the module of an issue-backed run in the modu
 ISSUE_RESPONSIBILITY = "GitHub issue #{number}"  # its capability-map row's responsibility, fixed text too
 ISSUES_MAX = 100  # the most synced issues the Backlog shows
 TITLE_MAX = 200
-ISSUE_LIST_FIELDS = "number,title,labels,url"
+ISSUE_LIST_FIELDS = "number,title,labels,url,blockedBy,blocking"
+ISSUE_LIST_FIELDS_OLD = "number,title,labels,url"  # what a `gh` without the relationship fields can list
+REFS_MAX = 100  # more nodes than this, or a `totalCount` above the nodes kept, is an incomplete list
+REF_URL_MAX = 512
 ISSUE_URL = re.compile(r"https://[A-Za-z0-9.-]+(?::\d{1,5})?/[\w.-]+/[\w.-]+/issues/(\d+)")
+ISSUE_REF_URL = re.compile(r"https://[A-Za-z0-9.-]+(?::\d{1,5})?/([\w.-]+/[\w.-]+)/issues/(\d+)", re.ASCII)
+REPO_NAME = re.compile(r"[\w.-]+/[\w.-]+", re.ASCII)
+REPO_MAX = 200
+# why an issue's blocked-by / blocking lists are not known: the only words a cached `deps_note` may carry
+UNKNOWN_OLD_GH = "update gh"
+UNKNOWN_CACHE = "refresh the board to read them"
+UNKNOWN_TRUNCATED = "the list is longer than GitHub returned"
+UNKNOWN_BAD = "a blocker could not be read"
+UNKNOWN_REASONS = (UNKNOWN_OLD_GH, UNKNOWN_CACHE, UNKNOWN_TRUNCATED, UNKNOWN_BAD)
 TAKEN = ("carries the in-progress label, but no run on this machine is working on it: someone else may be. "
          "Remove the label on GitHub to free it")
 
@@ -429,10 +441,74 @@ def _clean_title(value: Any) -> str:
     return _one_line("".join(ch if ch.isprintable() else " " for ch in nfc(value)), TITLE_MAX)
 
 
-def _parse_issues(cfg: Config, reply: Any) -> list[dict]:
-    """`gh issue list`'s reply as `{number, title, lane, in_progress, url}` entries. Label names are compared and
-    then dropped; an entry with no usable number or no lane is left out. A reply that is not a list is a
-    `ValueError`."""
+def _here(url: str) -> str | None:
+    """The `owner/repo` of a synced issue's own URL, or None when it is not an issue URL."""
+    match = ISSUE_REF_URL.fullmatch(url) if isinstance(url, str) and len(url) <= REF_URL_MAX else None
+    return match.group(1) if match else None
+
+
+def _parse_refs(field: Any, here: str | None) -> tuple[list[dict], str]:
+    """A `blockedBy` / `blocking` value as refs `{number, state, repo}` and why the list is not known ("" when
+    it is complete). `repo` is None for an issue of `here` (compared without case), else its `owner/repo`. The
+    reply is untrusted: only a number, a state word and a repo name are kept, never a title or any other text, and
+    a node that cannot be read makes the whole list unknown (the good nodes are still returned)."""
+    if not isinstance(field, dict):
+        return [], UNKNOWN_BAD
+    nodes, total = field.get("nodes"), field.get("totalCount")
+    if not isinstance(nodes, list) or isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        return [], UNKNOWN_BAD
+    refs: list[dict] = []
+    bad = False
+    for node in nodes[:REFS_MAX]:
+        number = node.get("number") if isinstance(node, dict) else None
+        url = node.get("url") if isinstance(node, dict) else None
+        match = ISSUE_REF_URL.fullmatch(url) if isinstance(url, str) and len(url) <= REF_URL_MAX else None
+        if (isinstance(number, bool) or not isinstance(number, int) or number <= 0 or match is None
+                or match.group(2) != str(number)):
+            bad = True
+            continue
+        try:
+            ident = intake.issue_number(str(number))
+        except ValueError:
+            bad = True
+            continue
+        repo = match.group(1)
+        state = node.get("state")
+        refs.append({"number": ident, "state": "closed" if isinstance(state, str) and state.upper() == "CLOSED" else "open",
+                     "repo": None if here is not None and repo.casefold() == here.casefold() else repo})
+    if bad:
+        return refs, UNKNOWN_BAD
+    return refs, UNKNOWN_TRUNCATED if len(nodes) > REFS_MAX or total > len(refs) else ""
+
+
+def _cached_refs(value: Any) -> list[dict] | None:
+    """A cached ref list, checked again as untrusted input (the cache file can be edited): each ref has exactly
+    the shape `_parse_refs` writes, or the whole list is None."""
+    if not isinstance(value, list) or len(value) > REFS_MAX:
+        return None
+    out: list[dict] = []
+    for ref in value:
+        if not (isinstance(ref, dict) and set(ref) == {"number", "state", "repo"}):
+            return None
+        number, state, repo = ref["number"], ref["state"], ref["repo"]
+        if not isinstance(number, str) or state not in ("open", "closed"):
+            return None
+        try:
+            if intake.issue_number(number) != number:
+                return None
+        except ValueError:
+            return None
+        if repo is not None and not (isinstance(repo, str) and len(repo) <= REPO_MAX and REPO_NAME.fullmatch(repo)):
+            return None
+        out.append({"number": number, "state": state, "repo": repo})
+    return out
+
+
+def _parse_issues(cfg: Config, reply: Any, *, with_deps: bool = True) -> list[dict]:
+    """`gh issue list`'s reply as `{number, title, lane, in_progress, url, blocked_by, blocks, deps_complete,
+    deps_note}` entries. Label names are compared and then dropped; an entry with no usable number or no lane is
+    left out. With `with_deps` False (an old `gh` was asked without the relationship fields) every entry has no
+    refs and its lists are unknown. A reply that is not a list is a `ValueError`."""
     if not isinstance(reply, list):
         raise ValueError("gh issue list printed no list")
     pol = cfg.issues
@@ -464,10 +540,22 @@ def _parse_issues(cfg: Config, reply: Any) -> list[dict]:
         url = entry.get("url")
         match = ISSUE_URL.fullmatch(url) if isinstance(url, str) else None
         seen.add(ident)
+        url = url if match and match.group(1) == ident else ""
+        if with_deps:
+            blocked_by, why_by = _parse_refs(entry.get("blockedBy"), _here(url))
+            blocks, why_blocks = _parse_refs(entry.get("blocking"), _here(url))
+            why = UNKNOWN_BAD if UNKNOWN_BAD in (why_by, why_blocks) else why_by or why_blocks
+        else:
+            blocked_by, blocks, why = [], [], UNKNOWN_OLD_GH
         out.append({"number": ident, "title": _clean_title(entry.get("title")), "lane": lane,
-                    "in_progress": taken is not None and taken in names,
-                    "url": url if match and match.group(1) == ident else ""})
+                    "in_progress": taken is not None and taken in names, "url": url,
+                    "blocked_by": blocked_by, "blocks": blocks, "deps_complete": not why, "deps_note": why})
     return out
+
+
+def _old_gh(exc: GhError) -> bool:
+    """Whether `gh` failed because it does not know a `--json` field (one older than the relationship fields)."""
+    return "unknown json field" in str(exc).lower()
 
 
 def sync_issues(cfg: Config, repo: Path) -> str:
@@ -479,16 +567,26 @@ def sync_issues(cfg: Config, repo: Path) -> str:
         if _load_state(repo).get("issues_label"):
             _save_state(repo, issues=[], issues_label="", issues_note="")
         return ""
+    old_gh = False
     try:
-        reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS,
-                         "--limit", str(ISSUES_MAX)], cwd=repo)
-        issues = _parse_issues(cfg, reply)
+        try:
+            reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS,
+                             "--limit", str(ISSUES_MAX)], cwd=repo)
+        except GhError as exc:
+            if not _old_gh(exc):
+                raise
+            old_gh = True  # a `gh` without the relationship fields: ask once more for the rest
+            reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS_OLD,
+                             "--limit", str(ISSUES_MAX)], cwd=repo)
+        issues = _parse_issues(cfg, reply, with_deps=not old_gh)
     except (GhError, OSError, ValueError, TypeError, RecursionError) as exc:  # RecursionError: absurdly nested JSON
         note = f"GitHub issues not updated: {_reason(exc)}"
         _save_state(repo, issues_note=note)
         return note
-    note = (f"only the first {ISSUES_MAX} open issues labelled {label!r} are shown"
-            if len(reply) >= ISSUES_MAX else "")
+    notes = [f"only the first {ISSUES_MAX} open issues labelled {label!r} are shown"] if len(reply) >= ISSUES_MAX else []
+    if old_gh:
+        notes.append(f"issue dependencies not read: {UNKNOWN_OLD_GH}")
+    note = "; ".join(notes)
     _save_state(repo, issues=issues, issues_label=label, issues_note=note,
                 issues_at=datetime.now(UTC).isoformat(timespec="seconds"))
     return note
@@ -505,8 +603,13 @@ def _synced(cfg: Config, state: dict) -> list[dict]:
             continue
         url = entry.get("url")
         match = ISSUE_URL.fullmatch(url) if isinstance(url, str) else None
+        blocked_by, blocks = _cached_refs(entry.get("blocked_by")), _cached_refs(entry.get("blocks"))
+        complete = blocked_by is not None and blocks is not None and entry.get("deps_complete") is True
+        cached_note = entry.get("deps_note")
         out.append({**entry, "url": url if match and match.group(1) == entry["number"] else "",
-                    "title": _clean_title(entry.get("title"))})
+                    "title": _clean_title(entry.get("title")), "blocked_by": blocked_by or [], "blocks": blocks or [],
+                    "deps_complete": complete,
+                    "deps_note": "" if complete else cached_note if cached_note in UNKNOWN_REASONS else UNKNOWN_CACHE})
     return out
 
 
@@ -554,11 +657,20 @@ def _refuse_starting_issue(number: str, book: Backlog) -> None:
 
 def _taken_now(cfg: Config, repo: Path, number: str) -> str | None:
     """Why issue `number` can't start, asked of GitHub at the moment of starting (the board's list can be a minute
-    old): it was closed, or someone put the in-progress label on it. None when it is free or GitHub can't say."""
+    old): it was closed, someone put the in-progress label on it, or an issue it runs after is not done. None when
+    it is free or GitHub can't say (a failed call: the cached decision stands). An old `gh` with no `blockedBy` is
+    asked once more for the state and labels alone, and the cached decision on the blockers stands."""
     if not cfg.issues.sync_label:
         return None
+    old_gh = False
     try:
-        reply = gh_json(["issue", "view", number, "--json", "state,labels"], cwd=repo)
+        try:
+            reply = gh_json(["issue", "view", number, "--json", "state,labels,blockedBy"], cwd=repo)
+        except GhError as exc:
+            if not _old_gh(exc):
+                raise
+            old_gh = True
+            reply = gh_json(["issue", "view", number, "--json", "state,labels"], cwd=repo)
     except (GhError, OSError, ValueError, RecursionError):
         return None  # the run's own intake asks GitHub again and stops on a real failure
     if not isinstance(reply, dict):
@@ -571,6 +683,23 @@ def _taken_now(cfg: Config, repo: Path, number: str) -> str | None:
             isinstance(label, dict) and isinstance(label.get("name"), str) and _fold(label["name"]) == taken
             for label in labels):
         return f"issue #{number} {TAKEN}"
+    if old_gh:
+        return None
+    state = _load_state(repo)
+    synced = _synced(cfg, state)
+    # this repository is the one in the issue's own cached url, else in any synced issue's: all are of this one
+    urls = [i["url"] for i in synced if i["number"] == number] + [i["url"] for i in synced]
+    here = next((found for found in map(_here, urls) if found), None)
+    refs, note = _parse_refs(reply.get("blockedBy"), here)
+    if note:
+        return f"issue #{number}: its dependencies could not be read: {note}"
+    runs = {r.id: r for r in list_runs(repo)}
+    merged = {k: v for k, v in (state.get("merged") or {}).items() if isinstance(k, str)}
+    waiting = [ref for ref in refs if not module_queue.issue_ref_done(ref, runs, merged)]
+    if waiting:  # a number, a repository name and a state word only: never a title
+        names = ", ".join(f"{ref['repo']}#{ref['number']} (open)" if ref["repo"] else f"issue #{ref['number']} (open)"
+                          for ref in waiting)
+        return f"issue #{number} is blocked: runs after {names}"
     return None
 
 
@@ -596,11 +725,42 @@ def _picture(cfg: Config, repo: Path) -> dict:
     book = Backlog.load(repo)
     state = _load_state(repo)
     merged = {k: v for k, v in (state.get("merged") or {}).items() if isinstance(k, str)}
-    view = module_queue.dependency_view(
+    pic = {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "state": state,
+           "issues": _synced(cfg, state)}
+    issues = []
+    for entry in pic["issues"]:
+        record = book.issue_overlay(entry["number"])
+        issues.append({"number": entry["number"], "blocked_by": entry["blocked_by"],
+                       "deps_complete": entry["deps_complete"], "on_board": _issue_blocker(entry["number"], pic) is None,
+                       "starting": record is not None and record.status == "starting",
+                       "module": ISSUE_MODULE.format(number=entry["number"])})
+    pic["view"] = module_queue.dependency_view(
         nodes, entries, book.cards(), merged=merged, runs={r.id: r for r in runs}, noun=work_source.noun(cfg),
+        issues=issues,
     )
-    return {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "view": view, "state": state,
-            "issues": _synced(cfg, state)}
+    return pic
+
+
+def _module_issue(module: str, pic: dict) -> str | None:
+    """The synced issue whose derived module (`ISSUE_MODULE`) is `module`, or None."""
+    return next((i["number"] for i in pic["issues"] if ISSUE_MODULE.format(number=i["number"]) == module), None)
+
+
+def _deps_unknown(key: str, params: dict, pic: dict) -> str | None:
+    """Why the blockers of the synced issue behind `key` (`issue:N`, a form card whose `params.issue` is a synced
+    N, or the module derived from a synced N) are not known: the entry's `deps_note`. None when they are known, or
+    `key` is not tied to a synced issue."""
+    kind, _, name = key.partition(":")
+    if kind == "issue":
+        number = name
+    elif kind == "card":
+        number = str(params.get("issue") or "")
+    else:
+        number = (_module_issue(name, pic) or "") if kind == "module" else ""
+    entry = next((i for i in pic["issues"] if i["number"] == number), None)
+    if entry is None or entry["deps_complete"]:
+        return None
+    return entry["deps_note"] or UNKNOWN_CACHE
 
 
 def _label_of(key: str, pic: dict) -> str:
@@ -639,12 +799,18 @@ def snapshot(cfg: Config, repo: Path) -> dict:
              module: str | None = None, **extra: Any) -> dict:
         info = view.get(key, {"blocked_by": [], "parallel_with": [], "parallel": False})
         failure = item.failure if item is not None else None
+        unknown = _deps_unknown(key, getattr(item, "params", None) or {}, pic)
         if item is not None and item.status == "starting":
             status = "starting"
-        elif info["blocked_by"]:
+        elif info["blocked_by"] or unknown:
             status = "blocked"
         else:
             status = "parallel" if info["parallel"] else "ready"
+        if unknown and status != "starting":
+            extra["note"] = f"Dependencies unknown: {unknown}"
+        elif info.get("cycle") and kind == "issue":
+            extra["note"] = info["cycle"]
+        extra.setdefault("blocks", [])
         return {
             "key": key, "kind": kind, "id": ident, "label": label, "lane": item_lane, "status": status,
             "blocked_by": info["blocked_by"],
@@ -677,9 +843,12 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         if _issue_blocker(number, pic) is not None:
             continue
         module = ISSUE_MODULE.format(number=number) if entry["lane"] == lane else None
+        blockers = list(dict.fromkeys(module_queue.issue_key(r) for r in entry["blocked_by"]))
+        blocks = [{"key": module_queue.issue_key(r), "label": f"{r['repo']}#{r['number']}" if r["repo"] else f"#{r['number']}"}
+                  for r in entry["blocks"]]
         card = make(f"issue:{number}", "issue", number, f"#{number} · {entry.get('title') or ''}".rstrip(" ·"),
-                    entry["lane"], book.issue_overlay(number), module=module, deps=[], issue=number,
-                    url=entry.get("url") or "")
+                    entry["lane"], book.issue_overlay(number), module=module, deps=blockers, issue=number,
+                    url=entry.get("url") or "", blocks=blocks)
         if number in taken and card["status"] != "starting":
             card["status"], card["note"] = "taken", TAKEN
         cards.append(card)
@@ -810,10 +979,13 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
                 raise Refused(f"module {name} already has a run or is done")
             item = book.overlay(name)
             params, new_module, to_phase, item_lane = {"module": name}, None, None, lane or ""
-            numbered = re.fullmatch(r"issue-(\d{1,10})", name)
-            if numbered and any(i["number"] == numbered.group(1) for i in pic["issues"]):
-                _refuse_taken(numbered.group(1), pic)
-                params["issue"] = numbered.group(1)  # so the run marks the issue and its PR closes it
+            number = _module_issue(name, pic)
+            if number is not None:
+                unknown = _deps_unknown(f"module:{name}", {}, pic)
+                if unknown:
+                    raise Refused(f"issue #{number}: its dependencies could not be read: {unknown}")
+                _refuse_taken(number, pic)
+                params["issue"] = number  # so the run marks the issue and its PR closes it
         elif kind == "issue":
             entry = next((i for i in pic["issues"] if i["number"] == name), None)
             if entry is None:
@@ -822,6 +994,9 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
             blocker = _issue_blocker(name, pic)
             if blocker is not None:
                 raise Refused(blocker)
+            unknown = _deps_unknown(key, {}, pic)
+            if unknown:
+                raise Refused(f"issue #{name}: its dependencies could not be read: {unknown}")
             _refuse_taken(name, pic)
             item_lane = entry["lane"]
             item = book.issue_overlay(name)
@@ -841,6 +1016,9 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
                 raise Refused(f"a spec for {params['module']} now exists; start module:{params['module']} instead")
             params["task"], new_module = _spec_task(new_module), None
         if kind == "card" and params.get("issue"):
+            unknown = _deps_unknown(key, params, pic)
+            if unknown:
+                raise Refused(f"issue #{params['issue']}: its dependencies could not be read: {unknown}")
             _refuse_taken(str(params["issue"]), pic)
             _refuse_starting_issue(str(params["issue"]), book)
             if item_lane == lane and "module" not in params:  # an issue-only card in the module lane
@@ -950,6 +1128,17 @@ def refresh(cfg: Config, repo: Path) -> dict:
     return {"note": note, "skipped": skipped, "issues_note": issues_note}
 
 
+def _blocker_runs(entry: dict, runs: dict[str, Run]) -> set[str]:
+    """The runs here of the local issues in `entry`'s `blocked_by` that still hold their issue
+    (`module_queue.issue_run_holds`): whether each is merged decides whether the issue it blocks may start."""
+    found: set[str] = set()
+    for ref in entry["blocked_by"]:
+        run = module_queue.issue_run(ref["number"], runs) if ref["repo"] is None else None
+        if run is not None and module_queue.issue_run_holds(run):
+            found.add(run.id)
+    return found
+
+
 def _recheck_after(cfg: Config, repo: Path) -> dict[str, bool | None]:
     """Whether the pull request of every run that some card or run-ref waits on is merged (once true, always)."""
     book = Backlog.load(repo)
@@ -963,7 +1152,10 @@ def _recheck_after(cfg: Config, repo: Path) -> dict[str, bool | None]:
                 wanted.add(name)
             elif target is not None and target.run_id:
                 wanted.add(target.run_id)
-    previous = _load_state(repo).get("merged") or {}
+    state = _load_state(repo)
+    for entry in _synced(cfg, state):  # also the blockers of a form card's issue: it is in the same list
+        wanted |= _blocker_runs(entry, runs)
+    previous = state.get("merged") or {}
     result: dict[str, bool | None] = {k: v for k, v in previous.items() if v is True}
     for run_id in wanted:
         if result.get(run_id) is True:
