@@ -12,6 +12,10 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 - The pull request body has a `Verification` section: each acceptance criterion with what ran to prove it, what verify could not run and why, and evidence older than a review fix marked as such.
 - Synced issues that GitHub marks *blocked by* another issue show `Runs after:` / `Blocks:` on the Backlog and cannot start until the blocker is met, and `doctor` checks that `gh` can read issue dependencies.
 
+### Changed
+
+- `verify` proves the branch works and debugs a failing gate in its own step, with no fix plan of its own; `branch_review` judges five axes, checks verify's evidence and no longer re-checks completeness or coverage. A pack override of `verify.md` or `branch_review.md` with the old text gets a `validate --fix` repair.
+
 ### Fixed
 
 - A synced issue no longer shows `Ready` while an issue it is blocked by is still open.

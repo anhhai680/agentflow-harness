@@ -708,8 +708,7 @@ STEP_SKILLS = {  # each default step, by its id path, and the `skills.map` key i
     "define/spec_review": "doubt", "plan/plan": "plan", "plan/plan_reconcile": "plan", "plan/plan_review": "doubt",
     "build/build": "build",
     "build/build/review": "review", "build/build/small_plan": "build_small", "build/regression_test": "build",
-    "build/fix": "build", "verify/plan_fixes": "review_feedback", "verify/fix_findings": "review_feedback",
-    "verify/verify": "verify", "review/plan_fixes": "review_feedback", "review/fix_findings": "review_feedback",
+    "build/fix": "build", "verify/verify": "verify", "review/plan_fixes": "review_feedback", "review/fix_findings": "review_feedback",
     "review/branch_review": "review", "ship/finish/sync": "debug", "ship/ci/fix": "debug",
     "record_step": "design_doc", "resolve_step": "debug",
 }
@@ -817,6 +816,12 @@ def test_every_default_step_has_an_explicit_id_and_a_mapped_skill():
     assert DEFAULTS["checkpoints"] == {} and "approval_note" not in DEFAULTS["phases"]["plan"]
     for gone in ("spec_defines_contracts", "spec_api_reviewed", "spec_needs_api_design", "security_path"):
         assert gone not in DEFAULTS["conditions"]
+
+
+def test_engine_default_verify_has_no_refine_round_step():
+    ids = {name: [step["id"] for step in DEFAULTS["phases"][name]["steps"]] for name in ("verify", "review")}
+    assert ids["verify"] == ["setup", "verify"]
+    assert ids["review"] == ["setup", "plan_fixes", "fix_findings", "branch_review"]
 
 
 def test_a_sparse_pack_maps_a_default_step_to_its_own_skill(sparse_repo):

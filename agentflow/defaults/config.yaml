@@ -243,6 +243,15 @@ phases:
     model: sonnet
     steps:
       - *setup
+      - {id: verify, lanes: [feature, bug], skill: "@skills.map.verify", role: build, prompt: verify.md,
+         blocks_on_findings: true, gates_first: true, gates: verify, fix_loop: true, commit: true,
+         message: "Fix failures found in verification"}
+  review:
+    needs_approval: false
+    resolve: true
+    model: {default: sonnet, build: sonnet}
+    steps:
+      - {<<: *setup, lanes: [feature, bug], when: refine_round}
       - &plan_fixes
         {id: plan_fixes, lanes: [feature, bug], skill: "@skills.map.review_feedback", role: plan, model: opus,
          prompt: plan_fixes.md, when: refine_round}
@@ -250,17 +259,6 @@ phases:
         {id: fix_findings, lanes: [feature, bug], skill: "@skills.map.review_feedback", role: build,
          prompt: fix_findings.md, when: refine_round, gates: verify, fix_loop: true, commit: true,
          message: "Fix findings"}
-      - {id: verify, lanes: [feature, bug], skill: "@skills.map.verify", role: build, prompt: verify.md,
-         blocks_on_findings: true, gates_first: true, gates: verify, fix_loop: true, commit: true,
-         message: "Fix issues found in verification"}
-  review:
-    needs_approval: false
-    resolve: true
-    model: {default: sonnet, build: sonnet}
-    steps:
-      - {<<: *setup, lanes: [feature, bug], when: refine_round}
-      - *plan_fixes
-      - *fix_findings
       - {id: branch_review, lanes: [feature, bug], skill: "@skills.map.review", role: review,
          prompt: branch_review.md, blocks_on_findings: true}
   ship:
