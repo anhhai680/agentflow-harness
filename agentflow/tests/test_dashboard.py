@@ -1016,6 +1016,51 @@ def test_a_synced_issue_starts_but_a_taken_or_bad_one_does_not_and_none_can_be_r
     assert code == 409 and "loses the 'agentflow' label" in payload(body)["error"]
 
 
+@pytest.fixture
+def ddash(bdash, monkeypatch, tmp_path):
+    """`bdash` with the fake `gh` on PATH and two labelled issues: #12 is blocked by #14, which blocks #12."""
+    gh_bin = Path(__file__).parent / "bin"
+    monkeypatch.setenv("PATH", f"{gh_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(tmp_path / "gh.log"))
+
+    def node(number):
+        return {"id": f"I_{number}", "number": number, "state": "OPEN", "title": "t",
+                "url": f"https://github.com/example/repo/issues/{number}"}
+
+    def refs(*nodes):
+        return {"nodes": list(nodes), "totalCount": len(nodes)}
+
+    issues = [{"number": 12, "title": "Blocked", "labels": [{"name": "agentflow"}],
+               "url": "https://github.com/example/repo/issues/12", "blockedBy": refs(node(14)), "blocking": refs()},
+              {"number": 14, "title": "Blocker", "labels": [{"name": "agentflow"}],
+               "url": "https://github.com/example/repo/issues/14", "blockedBy": refs(), "blocking": refs(node(12))}]
+    monkeypatch.setenv("FAKE_GH_ISSUE_LIST", json.dumps(issues))
+    bdash.flow.configure({"issues": {"sync_label": "agentflow"}})
+    bdash.server.cfg = bdash.flow.cfg
+    from agentflow.dashboard import refresh_once
+
+    refresh_once(bdash.server)
+    return bdash
+
+
+def test_the_board_carries_blockers_and_blocks(ddash):
+    cards = {c["key"]: c for c in payload(ddash.get("/api/board")[2])["backlog"]}
+    assert cards["issue:12"]["status"] == "blocked"
+    assert cards["issue:12"]["blocked_by"][0]["text"] == "issue #14 (in Backlog)"
+    assert cards["issue:14"]["blocks"] == [{"key": "issue:12", "label": "#12"}]
+
+
+def test_starting_a_blocked_issue_is_a_409(ddash):
+    code, _, body = ddash.post("/api/backlog/start", {"item": "issue:12"})
+    assert code == 409 and "runs after issue #14" in payload(body)["error"]
+    assert ddash.fake.calls == []
+
+
+def test_the_page_renders_the_blocks_line():
+    page = (Path(__file__).parents[1] / "dashboard.html").read_text(encoding="utf-8")
+    assert 'text: "Blocks: " + names(item.blocks)' in page
+
+
 def test_a_pack_without_a_backlog_block_still_syncs_its_issues(idash, monkeypatch):
     from agentflow import backlog
     from agentflow.dashboard import refresh_once

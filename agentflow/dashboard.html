@@ -517,6 +517,7 @@ function backlogNode(item) {
     backlogMark(item),
     item.url ? issueNode(item.url) : null,
     item.blocked_by.length ? el("div", { class: "sub", text: "Runs after: " + item.blocked_by.map((b) => b.text).join(", ") }) : null,
+    item.blocks && item.blocks.length ? el("div", { class: "sub", text: "Blocks: " + names(item.blocks) }) : null,
     item.parallel_with.length ? el("div", { class: "sub", text: "Parallel with: " + names(item.parallel_with) }) : null,
     item.note ? el("div", { class: "sub", text: item.note }) : null,
     item.failure ? el("div", { class: "sub gate-bad", text: "Could not start: " + item.failure + (canStart ? " — Start tries again" : "") }) : null,
