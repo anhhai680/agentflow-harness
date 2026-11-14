@@ -32,7 +32,7 @@ def test_hostile_text_stays_on_one_line():
                                       "not_verified": [{"what": hostile, "why": hostile}]}})
     for line in v.render_pr(True, story, None) + v.render_prompt(True, story).splitlines():
         assert "\n" not in line and "‮" not in line and not line.startswith("## ")
-    assert all(line.count("`") % 2 == 0 for line in v.render_pr(True, story, None))  # evidence backticks replaced
+    assert all(line.count("`") % 2 == 0 for line in v.render_pr(True, story, None))
 
 def test_lists_and_text_are_capped():
     many = [{"criterion": "c" * 1000, "evidence": "t", "ran": True, "passed": True}] * 100
@@ -92,3 +92,11 @@ def test_read_story(tmp_path):
     run.result_path(v.VERIFY_KEY).write_text(json.dumps({"status": "done", "summary": "ok", "signals": GOOD}))
     found, story = v.read_story(run)
     assert found and story == v.parse(GOOD)
+
+def test_backticks_in_code_text_are_replaced():
+    story = v.parse({"verification": {
+        "gates": [{"gate": "g`1", "cmd": "run `x`", "result": "ok `r`", "passed": True}],
+        "criteria": [{"criterion": "C", "evidence": "a`b", "ran": True, "passed": True}]}})
+    assert v.render_pr(True, story, None) == ["- C: `a'b` ✓"]
+    assert v.render_prompt(True, story).splitlines()[0] == "- gate `g'1`: ok `r` ✓"
+    assert story.gates[0].cmd == "run 'x'"  # cmd is not rendered, so it is checked on the parsed story
