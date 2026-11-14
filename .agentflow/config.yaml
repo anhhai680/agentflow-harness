@@ -264,6 +264,16 @@ phases:                         # the main workflow, in order; --from/--to on th
     model: sonnet
     steps:
       - *setup
+      - {id: verify, lanes: [feature, bug], skill: verification-before-completion, role: build, prompt: verify.md,
+         brief: [.claude/skills/verification-before-completion/SKILL.md, .claude/skills/systematic-debugging/SKILL.md],
+         blocks_on_findings: true, gates_first: true,
+         gates: verify, fix_loop: true, commit: true, message: "Fix failures found in verification"}
+  review:                                    # the reviewers and the fix on sonnet, `plan_fixes` on opus
+    needs_approval: false
+    resolve: true
+    model: {default: sonnet, build: sonnet}
+    steps:
+      - {<<: *setup, lanes: [feature, bug], when: refine_round}  # the fix below runs the verify gates
       - &plan_fixes                                                   # a refine round: decide what each finding needs
         {id: plan_fixes, lanes: [feature, bug], skill: receiving-code-review, role: plan, model: opus,
          prompt: plan_fixes.md, brief: .claude/skills/receiving-code-review/SKILL.md, when: refine_round}
@@ -271,17 +281,7 @@ phases:                         # the main workflow, in order; --from/--to on th
         {id: fix_findings, lanes: [feature, bug], skill: receiving-code-review, role: build,
          prompt: fix_findings.md, brief: .claude/skills/receiving-code-review/SKILL.md,
          when: refine_round, gates: verify, fix_loop: true, commit: true, message: "Fix findings"}
-      - {id: verify, lanes: [feature, bug], skill: verification-before-completion, role: build, prompt: verify.md,
-         brief: .claude/skills/verification-before-completion/SKILL.md, blocks_on_findings: true, gates_first: true,
-         gates: verify, fix_loop: true, commit: true, message: "Fix issues found in verification"}
-  review:                                    # the reviewers and the fix on sonnet, `plan_fixes` on opus
-    needs_approval: false
-    resolve: true
-    model: {default: sonnet, build: sonnet}
-    steps:
-      - {<<: *setup, lanes: [feature, bug], when: refine_round}  # the fix below runs the verify gates
-      - *plan_fixes
-      - *fix_findings                        # the reviews are read-only: their findings are fixed here, then re-checked
+                                             # (the reviews are read-only: their findings are fixed above, then re-checked)
       - {id: branch_review, lanes: [feature, bug], skill: requesting-code-review, role: review,
          prompt: branch_review.md, brief: .claude/skills/requesting-code-review/code-reviewer.md,
          blocks_on_findings: true}
