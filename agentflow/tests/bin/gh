@@ -109,6 +109,8 @@ elif args[:2] == ["issue", "list"]:
 elif args[:2] == ["issue", "view"] and len(args) > 2:
     default = {"title": f"Issue {args[2]}", "body": "", "url": f"https://github.com/example/repo/issues/{args[2]}",
                "id": f"I_fake{args[2]}"}
+    if "--json" in args and "blockedBy" in args[args.index("--json") + 1]:
+        default["blockedBy"] = {"nodes": [], "totalCount": 0}  # the real `gh` prints a field only when asked for it
     print(os.environ.get("FAKE_GH_ISSUE") or json.dumps(default))
 else:
     print(os.environ.get("FAKE_GH_JSON", "[]"))

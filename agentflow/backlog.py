@@ -652,11 +652,12 @@ def _refuse_starting_issue(number: str, book: Backlog) -> None:
 
 def _taken_now(cfg: Config, repo: Path, number: str) -> str | None:
     """Why issue `number` can't start, asked of GitHub at the moment of starting (the board's list can be a minute
-    old): it was closed, or someone put the in-progress label on it. None when it is free or GitHub can't say."""
+    old): it was closed, someone put the in-progress label on it, or an issue it runs after is not done. None when
+    it is free or GitHub can't say (a failed call, an old `gh` with no `blockedBy`: the cached decision stands)."""
     if not cfg.issues.sync_label:
         return None
     try:
-        reply = gh_json(["issue", "view", number, "--json", "state,labels"], cwd=repo)
+        reply = gh_json(["issue", "view", number, "--json", "state,labels,blockedBy"], cwd=repo)
     except (GhError, OSError, ValueError, RecursionError):
         return None  # the run's own intake asks GitHub again and stops on a real failure
     if not isinstance(reply, dict):
@@ -669,6 +670,18 @@ def _taken_now(cfg: Config, repo: Path, number: str) -> str | None:
             isinstance(label, dict) and isinstance(label.get("name"), str) and _fold(label["name"]) == taken
             for label in labels):
         return f"issue #{number} {TAKEN}"
+    state = _load_state(repo)
+    cached = next((i for i in _synced(cfg, state) if i["number"] == number), None)
+    refs, note = _parse_refs(reply.get("blockedBy"), _here(cached["url"]) if cached else None)
+    if note:
+        return f"issue #{number}: its dependencies could not be read: {note}"
+    runs = {r.id: r for r in list_runs(repo)}
+    merged = {k: v for k, v in (state.get("merged") or {}).items() if isinstance(k, str)}
+    waiting = [ref for ref in refs if not module_queue.issue_ref_done(ref, runs, merged)]
+    if waiting:  # a number, a repository name and a state word only: never a title
+        names = ", ".join(f"{ref['repo']}#{ref['number']} (open)" if ref["repo"] else f"issue #{ref['number']} (open)"
+                          for ref in waiting)
+        return f"issue #{number} is blocked: runs after {names}"
     return None
 
 

@@ -1278,9 +1278,13 @@ def test_a_form_card_for_an_issue_whose_synced_start_is_in_flight_is_refused(ibk
         backlog.add(ibk.cfg, ibk.root, "bug", {"issue": "13"})
 
 
+NO_BLOCKERS = {"nodes": [], "totalCount": 0}
+
+
 @pytest.mark.parametrize("reply, says", [
-    ({"state": "CLOSED", "labels": []}, "was closed on GitHub"),
-    ({"state": "OPEN", "labels": [{"name": "AgentFlow:In-Progress"}]}, "carries the in-progress label"),
+    ({"state": "CLOSED", "labels": [], "blockedBy": NO_BLOCKERS}, "was closed on GitHub"),
+    ({"state": "OPEN", "labels": [{"name": "AgentFlow:In-Progress"}], "blockedBy": NO_BLOCKERS},
+     "carries the in-progress label"),
 ])
 def test_github_is_asked_again_at_start_and_a_closed_or_taken_issue_does_not_start(ibk, monkeypatch, reply, says):
     _list_issues(monkeypatch, _issue(13, labels=("agentflow", "bug")))
@@ -1288,7 +1292,7 @@ def test_github_is_asked_again_at_start_and_a_closed_or_taken_issue_does_not_sta
     monkeypatch.setenv("FAKE_GH_ISSUE", json.dumps(reply))
     assert ibk.start("issue:13") is None
     assert ibk.spawn.calls == []
-    assert ["issue", "view", "13", "--json", "state,labels"] in _gh_calls(ibk)
+    assert ["issue", "view", "13", "--json", "state,labels,blockedBy"] in _gh_calls(ibk)
     assert says in ibk.cards()["issue:13"]["failure"]
 
 
@@ -1296,6 +1300,52 @@ def test_a_start_goes_on_when_github_cannot_be_asked(ibk, monkeypatch):
     _list_issues(monkeypatch, _issue(13, labels=("agentflow", "bug")))
     ibk.refresh()
     monkeypatch.setenv("FAKE_GH_FAIL_ON", "issue view")
+    assert ibk.start("issue:13")
+
+
+def _live_reply(*nodes, total=None) -> str:
+    return json.dumps({"state": "OPEN", "labels": [],
+                       "blockedBy": {"nodes": list(nodes), "totalCount": total if total is not None else len(nodes)}})
+
+
+def test_a_blocker_added_since_the_last_refresh_stops_the_start(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(13, labels=("agentflow", "bug")))
+    ibk.refresh()
+    monkeypatch.setenv("FAKE_GH_ISSUE", _live_reply(_node(5, title="SECRET")))
+    assert ibk.start("issue:13") is None and ibk.spawn.calls == []
+    failure = ibk.cards()["issue:13"]["failure"]
+    assert "is blocked: runs after issue #5 (open)" in failure and "SECRET" not in failure
+
+
+def test_a_live_blocker_in_another_repository_names_its_repository(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(13, labels=("agentflow", "bug")))
+    ibk.refresh()
+    monkeypatch.setenv("FAKE_GH_ISSUE", _live_reply(_node(5), _node(9, repo="other/place", title="SECRET")))
+    assert ibk.start("issue:13") is None and ibk.spawn.calls == []
+    failure = ibk.cards()["issue:13"]["failure"]
+    assert failure.endswith("issue #13 is blocked: runs after issue #5 (open), other/place#9 (open)")
+    assert "SECRET" not in failure
+
+
+def test_a_truncated_live_list_stops_the_start(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(13, labels=("agentflow", "bug")))
+    ibk.refresh()
+    monkeypatch.setenv("FAKE_GH_ISSUE", _live_reply(_node(5, "CLOSED"), total=3))
+    assert ibk.start("issue:13") is None and ibk.spawn.calls == []
+    assert "issue #13: its dependencies could not be read: " in ibk.cards()["issue:13"]["failure"]
+
+
+def test_a_live_blocker_that_is_closed_lets_the_start_go_on(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(13, labels=("agentflow", "bug")))
+    ibk.refresh()
+    monkeypatch.setenv("FAKE_GH_ISSUE", _live_reply(_node(5, "CLOSED")))
+    assert ibk.start("issue:13")
+
+
+def test_an_old_gh_at_start_keeps_the_cached_decision(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(13, labels=("agentflow", "bug")))
+    ibk.refresh()
+    monkeypatch.setenv("FAKE_GH_OLD", "1")
     assert ibk.start("issue:13")
 
 
