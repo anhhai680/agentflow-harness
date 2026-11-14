@@ -547,6 +547,109 @@ def test_dependency_view_follows_dependencies_transitively_for_parallel_with():
     assert view["module:a"]["parallel"] is True and view["module:c"]["parallel"] is False
 
 
+def _ref(n, state="open", repo=None) -> dict:
+    return {"number": n, "state": state, "repo": repo}
+
+
+def _iss(n, *blockers, on_board=True, complete=True) -> dict:
+    return {"number": n, "blocked_by": list(blockers), "deps_complete": complete, "on_board": on_board,
+            "starting": False}
+
+
+def _issue_run(run_id, status, issue="1"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(id=run_id, state={"status": status, "params": {"issue": issue}})
+
+
+def test_dependency_view_without_issues_is_unchanged():
+    from agentflow.sources import ModuleNode
+
+    nodes = [ModuleNode("a", []), ModuleNode("b", ["a"]), ModuleNode("c", ["b"]), ModuleNode("d", [])]
+    entries = [{"id": i, "status": "backlog", "run_id": None} for i in "abcd"]
+    plain = module_queue.dependency_view(nodes, entries, [])
+    assert plain == module_queue.dependency_view(nodes, entries, [], issues=None)
+    assert plain == module_queue.dependency_view(nodes, entries, [], issues=[])
+    assert all("cycle" not in v for v in plain.values())
+
+
+def test_an_issue_blocked_by_an_open_issue_is_blocked_and_unrelated_ones_are_parallel():
+    from agentflow.sources import ModuleNode
+
+    view = module_queue.dependency_view([ModuleNode("m", [])], [{"id": "m", "status": "backlog", "run_id": None}], [],
+                                        issues=[_iss("1"), _iss("2", _ref("1")), _iss("3")])
+    assert view["issue:2"]["blocked_by"] == [{"key": "issue:1", "text": "issue #1 (in Backlog)"}]
+    assert sorted(view["issue:1"]["parallel_with"]) == ["issue:3", "module:m"]
+    assert "issue:1" not in view["issue:2"]["parallel_with"] and view["issue:3"]["parallel"] is True
+    assert view["issue:2"]["cycle"] is None
+
+
+@pytest.mark.parametrize("status, merged, free", [("running", None, False), ("done", None, False), ("done", True, True),
+                                                  ("failed", None, True), ("cancelled", None, True)])
+def test_a_closed_blocker_is_met_only_when_its_open_run_merged(status, merged, free):
+    view = module_queue.dependency_view([], [], [], issues=[_iss("2", _ref("1", "closed"))],
+                                        runs={"r1": _issue_run("r1", status)}, merged={"r1": merged})
+    assert bool(view["issue:2"]["blocked_by"]) is (not free)
+
+
+def test_a_closed_blocker_with_no_run_is_met():
+    view = module_queue.dependency_view([], [], [], issues=[_iss("2", _ref("1", "closed"))])
+    assert view["issue:2"]["blocked_by"] == []
+
+
+def test_an_open_blocker_holds_even_when_its_run_merged():
+    view = module_queue.dependency_view([], [], [], issues=[_iss("2", _ref("1"))],
+                                        runs={"r1": _issue_run("r1", "done")}, merged={"r1": True})
+    assert [b["key"] for b in view["issue:2"]["blocked_by"]] == ["issue:1"]
+
+
+def test_a_cross_repo_blocker_never_matches_a_local_run():
+    runs = {"r1": _issue_run("r1", "done")}
+    open_view = module_queue.dependency_view([], [], [], issues=[_iss("2", _ref("1", repo="other/lib"))],
+                                             runs=runs, merged={"r1": True})
+    assert open_view["issue:2"]["blocked_by"] == [{"key": "issue:other/lib#1", "text": "other/lib#1 (open)"}]
+    closed_view = module_queue.dependency_view([], [], [], issues=[_iss("2", _ref("1", "closed", "other/lib"))],
+                                               runs=runs, merged={})
+    assert closed_view["issue:2"]["blocked_by"] == []
+
+
+def test_a_blocker_off_the_board_is_a_target_not_a_peer():
+    view = module_queue.dependency_view([], [], [], issues=[_iss("2", _ref("7")), _iss("3")])
+    assert view["issue:2"]["blocked_by"] == [{"key": "issue:7", "text": "issue #7 (open (not on this board))"}]
+    assert "issue:7" not in view and all("issue:7" not in v["parallel_with"] for v in view.values())
+
+
+def test_a_blocker_with_a_live_run_reads_running():
+    view = module_queue.dependency_view([], [], [], issues=[_iss("1", on_board=False), _iss("2", _ref("1"))],
+                                        runs={"r1": _issue_run("r1", "running")})
+    assert view["issue:2"]["blocked_by"] == [{"key": "issue:1", "text": "issue #1 (running)"}]
+    assert "issue:1" not in view
+
+
+def test_an_issue_cycle_is_named_and_does_not_loop():
+    view = module_queue.dependency_view([], [], [], issues=[_iss("3", _ref("5")), _iss("5", _ref("3"))])
+    for key in ("issue:3", "issue:5"):
+        assert view[key]["blocked_by"] and view[key]["cycle"] == "dependency cycle: #3 -> #5 -> #3"
+
+
+def test_a_board_issue_beside_a_running_module_is_parallel():
+    from agentflow.sources import ModuleNode
+
+    view = module_queue.dependency_view([ModuleNode("m", [])], [{"id": "m", "status": "backlog", "run_id": "r9"}], [],
+                                        runs={"r9": _issue_run("r9", "running", issue="")}, issues=[_iss("1")])
+    assert view["issue:1"]["parallel"] is True
+
+
+def test_a_form_card_carrying_an_issue_inherits_its_blockers():
+    from types import SimpleNamespace
+
+    card = SimpleNamespace(id="c1", label="x", status="backlog", run_id=None, after=[], deps=[],
+                           params={"issue": "2"})
+    view = module_queue.dependency_view([], [], [card], issues=[_iss("2", _ref("1"), on_board=False)])
+    assert view["card:c1"]["blocked_by"][0]["key"] == "issue:1"
+    assert "cycle" not in view["card:c1"]
+
+
 # --------------------------------------------------------------------------- the terminal board
 
 
