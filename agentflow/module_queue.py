@@ -747,15 +747,24 @@ def issue_run(number: str, runs: dict[str, Run]) -> Run | None:
     return None
 
 
+_ABANDONED = ("failed", "cancelled")  # a run that will never open or merge a pull request
+
+
+def issue_run_holds(run: Run) -> bool:
+    """Whether an issue's run here still holds the issue after GitHub closed it: one that is live, stopped on an
+    error (it can be resumed) or `done` with its pull request open. A failed, cancelled or archived run does not."""
+    return not run.state.get("archived") and run.state["status"] not in _ABANDONED
+
+
 def issue_ref_done(ref: dict, runs: dict[str, Run], merged: dict[str, bool | None]) -> bool:
-    """Whether a blocker is met: it is closed and, if this checkout has a run for it, that run's PR merged
-    (or the run is no longer going)."""
+    """Whether a blocker is met: it is closed and, if this checkout has a run for it that still holds it
+    (`issue_run_holds`), that run's PR merged."""
     if ref["state"] != "closed":
         return False
     if ref["repo"] is not None:
         return True
     run = issue_run(ref["number"], runs)
-    return run is None or run.state["status"] not in (*_LIVE, "done") or merged.get(run.id) is True
+    return run is None or not issue_run_holds(run) or merged.get(run.id) is True
 
 
 def dependency_view(
@@ -779,7 +788,8 @@ def dependency_view(
     holds refs `{number, state, repo}`). Each on-board one is an item `issue:<N>`, blocked by the issues in its
     `blocked_by`, and its result also has `cycle`. A blocker that is not an item is only a target: it is named in
     `blocked_by`, and it is met when closed (and, if this checkout ran it, when that run's PR merged). A card whose
-    `params.issue` names a synced issue also waits for that issue's blockers.
+    `params.issue` names a synced issue also waits for that issue's blockers, and so does the module named in an
+    entry's optional `module` (the issue's derived module, when the work source has it).
     """
     merged, runs = merged or {}, runs or {}
     by_issue = {i["number"]: i for i in issues or []}
@@ -867,6 +877,10 @@ def dependency_view(
         issue = by_issue.get(str((getattr(c, "params", None) or {}).get("issue")))
         found = blockers.get(f"issue:{issue['number']}", []) if issue else []
         deps[f"card:{c.id}"] = list(dict.fromkeys([*(norm(r) for r in [*c.after, *c.deps]), *found]))
+    for i in issues or []:  # the module named after a synced issue runs that issue, so it waits for its blockers
+        module = f"module:{i['module']}" if i.get("module") else None
+        if module in deps:
+            deps[module] = list(dict.fromkeys([*deps[module], *blockers[f"issue:{i['number']}"]]))
     deps.update(blockers)  # an issue that is not on the board still passes its blockers on to what waits for it
     unfinished = [k for k in keys if not is_done(k)]
 

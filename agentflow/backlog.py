@@ -553,6 +553,11 @@ def _parse_issues(cfg: Config, reply: Any, *, with_deps: bool = True) -> list[di
     return out
 
 
+def _old_gh(exc: GhError) -> bool:
+    """Whether `gh` failed because it does not know a `--json` field (one older than the relationship fields)."""
+    return "unknown json field" in str(exc).lower()
+
+
 def sync_issues(cfg: Config, repo: Path) -> str:
     """Read the open issues that carry `issues.sync_label` into `backlog_state.json`; returns the note the board
     shows ("" when all is well). It never raises: when `gh` fails, the last list stays and the note says why."""
@@ -568,7 +573,7 @@ def sync_issues(cfg: Config, repo: Path) -> str:
             reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS,
                              "--limit", str(ISSUES_MAX)], cwd=repo)
         except GhError as exc:
-            if "unknown json field" not in str(exc).lower():
+            if not _old_gh(exc):
                 raise
             old_gh = True  # a `gh` without the relationship fields: ask once more for the rest
             reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS_OLD,
@@ -653,11 +658,19 @@ def _refuse_starting_issue(number: str, book: Backlog) -> None:
 def _taken_now(cfg: Config, repo: Path, number: str) -> str | None:
     """Why issue `number` can't start, asked of GitHub at the moment of starting (the board's list can be a minute
     old): it was closed, someone put the in-progress label on it, or an issue it runs after is not done. None when
-    it is free or GitHub can't say (a failed call, an old `gh` with no `blockedBy`: the cached decision stands)."""
+    it is free or GitHub can't say (a failed call: the cached decision stands). An old `gh` with no `blockedBy` is
+    asked once more for the state and labels alone, and the cached decision on the blockers stands."""
     if not cfg.issues.sync_label:
         return None
+    old_gh = False
     try:
-        reply = gh_json(["issue", "view", number, "--json", "state,labels,blockedBy"], cwd=repo)
+        try:
+            reply = gh_json(["issue", "view", number, "--json", "state,labels,blockedBy"], cwd=repo)
+        except GhError as exc:
+            if not _old_gh(exc):
+                raise
+            old_gh = True
+            reply = gh_json(["issue", "view", number, "--json", "state,labels"], cwd=repo)
     except (GhError, OSError, ValueError, RecursionError):
         return None  # the run's own intake asks GitHub again and stops on a real failure
     if not isinstance(reply, dict):
@@ -670,9 +683,14 @@ def _taken_now(cfg: Config, repo: Path, number: str) -> str | None:
             isinstance(label, dict) and isinstance(label.get("name"), str) and _fold(label["name"]) == taken
             for label in labels):
         return f"issue #{number} {TAKEN}"
+    if old_gh:
+        return None
     state = _load_state(repo)
-    cached = next((i for i in _synced(cfg, state) if i["number"] == number), None)
-    refs, note = _parse_refs(reply.get("blockedBy"), _here(cached["url"]) if cached else None)
+    synced = _synced(cfg, state)
+    # this repository is the one in the issue's own cached url, else in any synced issue's: all are of this one
+    urls = [i["url"] for i in synced if i["number"] == number] + [i["url"] for i in synced]
+    here = next((found for found in map(_here, urls) if found), None)
+    refs, note = _parse_refs(reply.get("blockedBy"), here)
     if note:
         return f"issue #{number}: its dependencies could not be read: {note}"
     runs = {r.id: r for r in list_runs(repo)}
@@ -714,7 +732,8 @@ def _picture(cfg: Config, repo: Path) -> dict:
         record = book.issue_overlay(entry["number"])
         issues.append({"number": entry["number"], "blocked_by": entry["blocked_by"],
                        "deps_complete": entry["deps_complete"], "on_board": _issue_blocker(entry["number"], pic) is None,
-                       "starting": record is not None and record.status == "starting"})
+                       "starting": record is not None and record.status == "starting",
+                       "module": ISSUE_MODULE.format(number=entry["number"])})
     pic["view"] = module_queue.dependency_view(
         nodes, entries, book.cards(), merged=merged, runs={r.id: r for r in runs}, noun=work_source.noun(cfg),
         issues=issues,
@@ -722,11 +741,22 @@ def _picture(cfg: Config, repo: Path) -> dict:
     return pic
 
 
+def _module_issue(module: str, pic: dict) -> str | None:
+    """The synced issue whose derived module (`ISSUE_MODULE`) is `module`, or None."""
+    return next((i["number"] for i in pic["issues"] if ISSUE_MODULE.format(number=i["number"]) == module), None)
+
+
 def _deps_unknown(key: str, params: dict, pic: dict) -> str | None:
-    """Why the blockers of the synced issue behind `key` (`issue:N`, or a form card whose `params.issue` is a synced
-    N) are not known: the entry's `deps_note`. None when they are known, or `key` is not tied to a synced issue."""
+    """Why the blockers of the synced issue behind `key` (`issue:N`, a form card whose `params.issue` is a synced
+    N, or the module derived from a synced N) are not known: the entry's `deps_note`. None when they are known, or
+    `key` is not tied to a synced issue."""
     kind, _, name = key.partition(":")
-    number = name if kind == "issue" else str(params.get("issue") or "") if kind == "card" else ""
+    if kind == "issue":
+        number = name
+    elif kind == "card":
+        number = str(params.get("issue") or "")
+    else:
+        number = (_module_issue(name, pic) or "") if kind == "module" else ""
     entry = next((i for i in pic["issues"] if i["number"] == number), None)
     if entry is None or entry["deps_complete"]:
         return None
@@ -949,10 +979,13 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
                 raise Refused(f"module {name} already has a run or is done")
             item = book.overlay(name)
             params, new_module, to_phase, item_lane = {"module": name}, None, None, lane or ""
-            numbered = re.fullmatch(r"issue-(\d{1,10})", name)
-            if numbered and any(i["number"] == numbered.group(1) for i in pic["issues"]):
-                _refuse_taken(numbered.group(1), pic)
-                params["issue"] = numbered.group(1)  # so the run marks the issue and its PR closes it
+            number = _module_issue(name, pic)
+            if number is not None:
+                unknown = _deps_unknown(f"module:{name}", {}, pic)
+                if unknown:
+                    raise Refused(f"issue #{number}: its dependencies could not be read: {unknown}")
+                _refuse_taken(number, pic)
+                params["issue"] = number  # so the run marks the issue and its PR closes it
         elif kind == "issue":
             entry = next((i for i in pic["issues"] if i["number"] == name), None)
             if entry is None:
@@ -1096,12 +1129,12 @@ def refresh(cfg: Config, repo: Path) -> dict:
 
 
 def _blocker_runs(entry: dict, runs: dict[str, Run]) -> set[str]:
-    """The runs here of the local issues in `entry`'s `blocked_by` that are live or whose pull request is open: whether
-    each is merged decides whether the issue it blocks may start."""
+    """The runs here of the local issues in `entry`'s `blocked_by` that still hold their issue
+    (`module_queue.issue_run_holds`): whether each is merged decides whether the issue it blocks may start."""
     found: set[str] = set()
     for ref in entry["blocked_by"]:
         run = module_queue.issue_run(ref["number"], runs) if ref["repo"] is None else None
-        if run is not None and run.state["status"] in (*module_queue._LIVE, "done"):
+        if run is not None and module_queue.issue_run_holds(run):
             found.add(run.id)
     return found
 

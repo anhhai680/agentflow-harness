@@ -556,10 +556,10 @@ def _iss(n, *blockers, on_board=True, complete=True) -> dict:
             "starting": False}
 
 
-def _issue_run(run_id, status, issue="1"):
+def _issue_run(run_id, status, issue="1", archived=None):
     from types import SimpleNamespace
 
-    return SimpleNamespace(id=run_id, state={"status": status, "params": {"issue": issue}})
+    return SimpleNamespace(id=run_id, state={"status": status, "params": {"issue": issue}, "archived": archived})
 
 
 def test_dependency_view_without_issues_is_unchanged():
@@ -584,12 +584,23 @@ def test_an_issue_blocked_by_an_open_issue_is_blocked_and_unrelated_ones_are_par
     assert view["issue:2"]["cycle"] is None
 
 
-@pytest.mark.parametrize("status, merged, free", [("running", None, False), ("done", None, False), ("done", True, True),
-                                                  ("failed", None, True), ("cancelled", None, True)])
-def test_a_closed_blocker_is_met_only_when_its_open_run_merged(status, merged, free):
+ARCHIVED = {"by": "cli", "at": "2026-11-14T00:00:00Z"}
+
+
+@pytest.mark.parametrize("status, merged, free, archived", [
+    ("running", None, False, None), ("done", None, False, None), ("done", True, True, None),
+    ("failed", None, True, None), ("cancelled", None, True, None),
+    ("done", None, True, ARCHIVED),  # an archived run is filed away: it no longer holds the issue
+    ("error", None, False, None),  # stopped on an error, but resumable: still the issue's run here
+])
+def test_a_closed_blocker_is_met_only_when_its_open_run_merged(status, merged, free, archived):
+    run = _issue_run("r1", status, archived=archived)
     view = module_queue.dependency_view([], [], [], issues=[_iss("2", _ref("1", "closed"))],
-                                        runs={"r1": _issue_run("r1", status)}, merged={"r1": merged})
+                                        runs={"r1": run}, merged={"r1": merged})
     assert bool(view["issue:2"]["blocked_by"]) is (not free)
+    assert module_queue.issue_run_holds(run) is (not free or merged is True)
+    entry = {"blocked_by": [_ref("1", "closed")]}  # the runs whose merge the refresh checks are the same ones
+    assert backlog._blocker_runs(entry, {"r1": run}) == ({"r1"} if module_queue.issue_run_holds(run) else set())
 
 
 def test_a_closed_blocker_with_no_run_is_met():
@@ -1220,6 +1231,30 @@ def test_a_spec_named_after_the_issue_takes_its_place_and_its_start_carries_the_
     assert isbk.spawn.calls[-1]["params"] == {"module": "issue-12", "issue": "12"}
 
 
+def test_a_spec_named_after_a_blocked_issue_is_blocked_by_its_blockers(isbk, monkeypatch):
+    _list_issues(monkeypatch, _issue(1, blocking=[_node(2)]), _issue(2, blocked_by=[_node(1)]))
+    write(isbk.root, "docs/specs/SPEC-issue-2.md", "# Issue 2\n\n**Depends on:** none\n")
+    isbk.refresh()
+    card = isbk.cards()["module:issue-2"]
+    assert card["status"] == "blocked"
+    assert [b["text"] for b in card["blocked_by"]] == ["issue #1 (in Backlog)"]
+    with pytest.raises(Refused, match=r"blocked: runs after issue #1"):
+        backlog.begin_start(isbk.cfg, isbk.root, "module:issue-2")
+    assert isbk.spawn.calls == []
+
+
+def test_a_spec_named_after_an_issue_with_unknown_dependencies_shows_and_refuses(isbk, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_OLD", "1")
+    _list_issues(monkeypatch, _issue(2))
+    write(isbk.root, "docs/specs/SPEC-issue-2.md", "# Issue 2\n\n**Depends on:** none\n")
+    isbk.refresh()
+    card = isbk.cards()["module:issue-2"]
+    assert card["status"] == "blocked" and card["note"] == "Dependencies unknown: update gh"
+    with pytest.raises(Refused) as caught:
+        backlog.begin_start(isbk.cfg, isbk.root, "module:issue-2")
+    assert str(caught.value) == "issue #2: its dependencies could not be read: update gh"
+
+
 def test_a_feature_card_with_only_an_issue_works_on_the_derived_module(isbk, monkeypatch):
     item = backlog.add(isbk.cfg, isbk.root, "feature", {"issue": "#65"})
     assert item.label == "issue #65"
@@ -1347,6 +1382,44 @@ def test_an_old_gh_at_start_keeps_the_cached_decision(ibk, monkeypatch):
     ibk.refresh()
     monkeypatch.setenv("FAKE_GH_OLD", "1")
     assert ibk.start("issue:13")
+
+
+def test_an_old_gh_at_start_still_stops_a_closed_issue(ibk, monkeypatch):
+    _list_issues(monkeypatch, _issue(13, labels=("agentflow", "bug")))
+    ibk.refresh()
+    monkeypatch.setenv("FAKE_GH_OLD", "1")
+    monkeypatch.setenv("FAKE_GH_ISSUE", json.dumps({"state": "CLOSED", "labels": []}))
+    assert ibk.start("issue:13") is None and ibk.spawn.calls == []
+    assert ["issue", "view", "13", "--json", "state,labels"] in _gh_calls(ibk)
+    assert "was closed on GitHub" in ibk.cards()["issue:13"]["failure"]
+
+
+def _finished_issue_run(ibk, issue: str) -> Run:
+    """A run here for issue `issue` whose pull request is open (not known to be merged)."""
+    item = backlog.add(ibk.cfg, ibk.root, "bug", {"issue": issue})
+    run = Run.load(ibk.root, ibk.start(f"card:{item.id}"))
+    run.emit("run_finished")
+    return run
+
+
+@pytest.mark.parametrize("synced", [False, True])
+def test_a_same_repo_live_blocker_is_local_when_the_issue_has_no_cached_url(ibk, monkeypatch, synced):
+    # issue #20 is either a form card's issue that is not synced, or a synced one whose cached url is unusable;
+    # #13 is synced with a good url, so the start still knows which repository is this one
+    _list_issues(monkeypatch, _issue(13, labels=("agentflow", "bug")),
+                 *([_issue(20, labels=("agentflow", "bug"))] if synced else []))
+    ibk.refresh()
+    if synced:
+        state = backlog._load_state(ibk.root)
+        next(i for i in state["issues"] if i["number"] == "20")["url"] = "javascript:alert(1)"
+        backlog._save_state(ibk.root, **state)
+    _finished_issue_run(ibk, "5")
+    key = "issue:20" if synced else f"card:{backlog.add(ibk.cfg, ibk.root, 'bug', {'issue': '20'}).id}"
+    monkeypatch.setenv("FAKE_GH_ISSUE", _live_reply(_node(5, "CLOSED", title="SECRET")))
+    calls = len(ibk.spawn.calls)
+    assert ibk.start(key) is None and len(ibk.spawn.calls) == calls
+    failure = ibk.cards()[key]["failure"]
+    assert failure.endswith("issue #20 is blocked: runs after issue #5 (open)") and "SECRET" not in failure
 
 
 def test_a_cached_url_is_checked_again_before_the_board_shows_it(ibk, monkeypatch):
