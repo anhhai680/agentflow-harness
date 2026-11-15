@@ -21,6 +21,13 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   reconcile rounds, the findings still open, and the dispositions given since the last human round). They are
   present only for a phase that has one, and reconcile rounds are not counted in `refine_rounds:<p>`.
   Sizer calls (events with `sizer`) are no step's turns, and their cost is not a step's cost.
+  `lead_time_h` is the hours from `run_started` to `pr_marked_ready` (present only for a run that has both).
+  `human_blocked_share` is the metrics `human` bucket over the run's wall time, 0..1 (present only when the run has
+  wall time): the time a stop, a phase approval or a ready phase waited with nothing else started. Today that is
+  "no running agent, no gate and an open item"; when parking lets agents run while an item is open, the signal must
+  stay true to it, so it keeps meaning time spent waiting on a person with no work going. `full_suite_runs` counts
+  the batches of gate results (consecutive `gate_result` events of one step) that ran every gate of the
+  `full_suite` passed in, skipped and failed results included; it is present only when `full_suite` is non-empty.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
 
@@ -31,7 +38,10 @@ Pure functions over data: nothing here reads a file or the clock. Fields added t
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Collection
 from typing import Any
+
+from agentflow.events import parse_iso
 
 # family -> (the direction that is better, whether the key takes a parameter after `:`)
 FAMILIES: dict[str, tuple[str, bool]] = {
@@ -62,6 +72,9 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "doubt_misread": ("lower", True),         # a phase: findings dispositioned as a misread contract
     "doubt_open": ("lower", True),            # a phase: findings still open when it raised its approval
     "doubt_actionable": ("higher", True),     # a phase: findings dispositioned as actionable
+    "lead_time_h": ("lower", False),          # hours from the run's start to its pull request marked ready
+    "human_blocked_share": ("lower", False),  # share of wall time spent waiting on a person with no work started
+    "full_suite_runs": ("lower", False),      # times the whole verify gate set ran, in one batch of gate results
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
@@ -70,7 +83,7 @@ FAMILIES: dict[str, tuple[str, bool]] = {
 COUNT_FAMILIES = frozenset({"fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections",
                             "ci_rounds", "rollovers", "progress_not_updated", "conformance_missing", "conformance_waived",
                             "gate_reruns", "refine_rounds", "effort_escalations", "undersized",
-                            "sizer_fallbacks"})
+                            "sizer_fallbacks", "full_suite_runs"})
 DOUBT_FIELDS = (("doubt_blocking", "first_blocking"), ("doubt_rounds", "rounds"), ("doubt_noise", "noise"),
                 ("doubt_misread", "misread"), ("doubt_open", "open"), ("doubt_actionable", "actionable"))
 RECONCILE = "reconcile"  # `phase_rejected.kind` of a round the runner opens on a doubt review's findings
@@ -166,8 +179,48 @@ def _turns(events: list[dict]) -> dict[str, float]:
     return {f"turns_per_step:{phase}": total / steps for phase, (total, steps) in per_phase.items()}
 
 
-def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
-    """The signals of one run, only for what the run did. `metrics` is `metrics.run_metrics` for the same run."""
+def _lead_time(events: list[dict]) -> dict[str, float]:
+    """`lead_time_h`: hours from the first `run_started` to the first `pr_marked_ready`, when the run has both."""
+    started = ready = None
+    for ev in events:
+        etype = ev.get("type")
+        if etype == "run_started" and started is None:
+            started = parse_iso(ev.get("ts"))
+        elif etype == "pr_marked_ready" and ready is None:
+            ready = parse_iso(ev.get("ts"))
+    if started is None or ready is None:
+        return {}
+    return {"lead_time_h": round((ready - started).total_seconds() / 3600, 3)}
+
+
+def _full_suite_runs(events: list[dict], full_suite: Collection[str]) -> int:
+    """How many batches ran every gate of `full_suite`. A batch is a maximal run of consecutive `gate_result` events
+    with the same `key`; passed, failed and skipped results all count, since every gate runs even after a failure."""
+    need = set(full_suite)
+    runs = 0
+    batch: set[str] = set()
+    batch_key: object = None
+    in_batch = False
+
+    def close() -> int:
+        return int(in_batch and need <= batch)
+
+    for ev in events:
+        if ev.get("type") == "gate_result" and ev.get("gate"):
+            if in_batch and ev.get("key") != batch_key:
+                runs += close()
+                batch = set()
+            in_batch, batch_key = True, ev.get("key")
+            batch.add(str(ev["gate"]))
+        else:
+            runs += close()
+            in_batch, batch = False, set()
+    return runs + close()
+
+
+def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str] = ()) -> dict[str, float]:
+    """The signals of one run, only for what the run did. `metrics` is `metrics.run_metrics` for the same run.
+    `full_suite` names the gates of the verify set; with it, `full_suite_runs` is present."""
     out: dict[str, float] = _first_pass(events)
     counts: dict[str, Counter[str]] = {name: Counter() for name in (
         "fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections", "review_blocking",
@@ -241,6 +294,12 @@ def run_signals(events: list[dict], metrics: dict) -> dict[str, float]:
             out[f"cost_per_task:{phase['phase']}"] = round((float(phase.get("cost_usd") or 0.0) - float(phase.get("sizing_cost_usd") or 0.0)) / called, 6)
     cost = float(metrics.get("cost_usd") or 0.0)
     out["rework_pct"] = round(100 * float(metrics.get("rework_cost_usd") or 0.0) / cost, 2) if cost else 0
+    out.update(_lead_time(events))
+    wall = float(metrics.get("wall_s") or 0.0)
+    if wall > 0:
+        out["human_blocked_share"] = round(float((metrics.get("buckets") or {}).get("human") or 0.0) / wall, 4)
+    if full_suite:
+        out["full_suite_runs"] = _full_suite_runs(events, full_suite)
     return out
 
 

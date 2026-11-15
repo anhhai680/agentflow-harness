@@ -6,6 +6,7 @@ from __future__ import annotations
 from agentflow.signals import COUNT_FAMILIES, FAMILIES, aggregate_signals, parse_target, run_signals
 
 EMPTY_METRICS = {"cost_usd": 0.0, "rework_cost_usd": 0.0, "phases": []}
+VERIFY = ("lint", "unit")
 
 
 def _ev(etype: str, **fields) -> dict:
@@ -90,7 +91,7 @@ def test_open_parameter_counts_stay_absent_and_count_families_are_lower_is_bette
     out = run_signals([], EMPTY_METRICS)
     assert not [k for k in out if k.split(":")[0] in ("guard_trips", "permission_denied", "stop")]
     assert COUNT_FAMILIES <= set(FAMILIES) and all(FAMILIES[f][0] == "lower" for f in COUNT_FAMILIES)
-    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 15
+    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 16
 
 
 def test_cost_per_task_divides_by_the_steps_that_called_an_agent():
@@ -133,7 +134,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 27
+    assert len(FAMILIES) == 30
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -281,3 +282,50 @@ def test_doubt_targets_parse():
         assert family in FAMILIES and FAMILIES[family][1] is True and family not in COUNT_FAMILIES
     assert FAMILIES["doubt_actionable"] == ("higher", True)
     assert all(FAMILIES[f] == ("lower", True) for f in DOUBT_FAMILIES if f != "doubt_actionable")
+
+
+def test_lead_time_runs_from_start_to_the_ready_pr():
+    evs = [_ev("run_started") | {"ts": "2026-11-03T09:00:00+00:00"},
+           _ev("pr_marked_ready") | {"ts": "2026-11-03T11:30:00+00:00"}]
+    assert run_signals(evs, EMPTY_METRICS)["lead_time_h"] == 2.5
+
+
+def test_no_lead_time_without_a_ready_pr():
+    assert "lead_time_h" not in run_signals([_ev("run_started"), _ev("run_cancelled")], EMPTY_METRICS)
+
+
+def test_human_blocked_share_is_the_human_bucket_over_wall_time():
+    m = {**EMPTY_METRICS, "wall_s": 400.0, "buckets": {"human": 100.0, "agent": 300.0}}
+    assert run_signals([], m)["human_blocked_share"] == 0.25
+
+
+def test_a_run_with_no_wall_time_has_no_blocked_share():
+    assert "human_blocked_share" not in run_signals([], {**EMPTY_METRICS, "wall_s": 0.0, "buckets": {}})
+
+
+def test_full_suite_runs_counts_whole_batches_only():
+    whole = [_gate("verify/verify", "lint", True), _gate("verify/verify", "unit", False, skipped=True)]
+    partial = [_ev("gates_reused", key="ship/finish", gates=["lint"]), _gate("ship/finish", "unit", True)]
+    assert run_signals(whole + partial, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 1
+
+
+def test_full_suite_runs_counts_each_batch_on_the_same_step():
+    batch = [_gate("verify/verify", "lint", True), _gate("verify/verify", "unit", False)]
+    evs = batch + [_ev("agent_started", key="verify/verify"), _ev("agent_exited", key="verify/verify")] + batch
+    assert run_signals(evs, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 2
+
+
+def test_full_suite_runs_reads_old_gate_results():
+    old = [{"seq": 1, "type": "gate_result", "key": "verify/verify", "gate": g, "passed": True} for g in VERIFY]
+    assert run_signals(old, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 1
+
+
+def test_full_suite_runs_is_absent_without_a_verify_set_and_zero_when_none_ran():
+    assert "full_suite_runs" not in run_signals([], EMPTY_METRICS)
+    assert run_signals([_gate("build/b", "lint", True)], EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 0
+
+
+def test_the_throughput_families_are_plain_lower_signals():
+    for family in ("lead_time_h", "human_blocked_share", "full_suite_runs"):
+        assert FAMILIES[family] == ("lower", False) and parse_target(family) == (family, None)
+    assert "full_suite_runs" in COUNT_FAMILIES and "lead_time_h" not in COUNT_FAMILIES
