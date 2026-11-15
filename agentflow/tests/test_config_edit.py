@@ -107,6 +107,14 @@ def test_the_form_switches_preflight_on(shipped):
     assert load_config(shipped).preflight.enabled is True
 
 
+def test_the_form_sets_the_watchdog(shipped):
+    proposal = form(shipped, (["watchdog", "no_progress_min"], 15))
+    assert not proposal.errors, proposal.errors
+    assert len(changed_lines(proposal.diff)) == 2  # one line out, one in
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).watchdog.no_progress_min == 15
+
+
 def test_an_optional_text_field_set_to_null_removes_the_key(shipped):
     proposal = form(shipped, (["phases", "verify", "model"], None))
     assert changed_lines(proposal.diff) == ["-    model: sonnet"]

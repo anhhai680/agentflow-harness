@@ -853,6 +853,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "context_window": ("model", "tokens"),
     "runner_error": ("error",),
     "preflight_checked": ("ok",),
+    "watchdog_fired": ("key",),
 }
 TEXT_FIELDS = ("key", "step", "phase", "model", "kind")
 HANDLER_ERRORS = (KeyError, TypeError, AttributeError, ValueError, IndexError)

@@ -11,7 +11,8 @@ Act keys: write {relpath: text}, result {...}, result_raw str, usage_pct [..], t
 exit n, no_init bool, final_text str, cost float (this call's, default 0.01; the result event reports
 the session's total, as Claude does), permission_denials [{tool_name, tool_input}] (copied into the
 result event), rate_limit {...} (sent as a `rate_limit_event`'s `rate_limit_info`), result_error bool
-(the result event says `is_error`), delete [relpath, ...] (files removed after the writes).
+(the result event says `is_error`), delete [relpath, ...] (files removed after the writes), hold_tool s (one
+`Bash` tool call that stays open, with nothing on the stream, for s seconds before its result).
 """
 
 from __future__ import annotations
@@ -126,18 +127,22 @@ def main() -> int:
 
     serial = 0
 
-    def tool_turn(name: str, tool_input: dict) -> None:
+    def tool_turn(name: str, tool_input: dict, hold: float = 0) -> None:
         nonlocal serial
         serial += 1
         tool_id = f"toolu_fake_{serial}"
         content = [{"type": "tool_use", "id": tool_id, "name": name, "input": tool_input}]
         emit({"type": "assistant", "message": {"role": "assistant", "model": model, "content": content,
                                                "usage": usage(2000)}, "parent_tool_use_id": None, **base})
+        if hold:
+            time.sleep(hold)  # the tool runs: the stream says nothing until it returns
         emit({"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}]}, "parent_tool_use_id": None, **base})
 
     for call in act.get("tool_calls", []):
         tool_turn(call["name"], call.get("input", {}))
+    if act.get("hold_tool"):
+        tool_turn("Bash", {"command": "make test"}, hold=float(act["hold_tool"]))
     for sub in act.get("subagents", []):
         tool_turn("Agent", {"description": "fake subagent", "prompt": "fake",
                             "subagent_type": sub["subagent_type"], "model": sub.get("model")})

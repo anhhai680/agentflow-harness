@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- `watchdog.no_progress_min` (0, off, by default) ends a step's agent session whose stream has been quiet for that many minutes and stops it as `step_timeout` (`watchdog_fired`), which a resolver may settle. While a tool call is open, and always for Codex, the limit is at least `defaults.gate_timeout_min`.
 - `preflight.enabled` (off by default) checks the machine once before a run's first phase: each program of the lane's gates is on `PATH` and starts `--version`, Docker answers when a gate runs it, and the `setup` gate set passes. A failure is one `preflight_failed` stop before any agent runs; a pass is cached for the day.
 
 ## [2.7] - 2026-11-15

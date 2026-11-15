@@ -177,6 +177,7 @@ RECONCILE_CHANGED = "reconcile_changed_conditions"  # a reconcile edit changed w
 NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable",
                   CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed")
 PREFLIGHT_KEYS = ("enabled",)
+WATCHDOG_KEYS = ("no_progress_min",)
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -279,6 +280,11 @@ class Recovery:
 @dataclass
 class Preflight:
     enabled: bool = False  # check the machine once before a run's first phase (`preflight.run_preflight`)
+
+
+@dataclass
+class Watchdog:
+    no_progress_min: float = 0  # end a session whose stream is quiet this long (`agents.idle_limit`); 0 = off
 
 
 @dataclass
@@ -458,6 +464,7 @@ class Config:
     path: Path
     recovery: Recovery = field(default_factory=Recovery)
     preflight: Preflight = field(default_factory=Preflight)
+    watchdog: Watchdog = field(default_factory=Watchdog)
     autonomy: dict = field(default_factory=dict)
     resolve_step: Step | None = None
     retro_step: Step | None = None  # the one session of a retro run (`retro.run_retro`); not part of any lane
@@ -569,6 +576,14 @@ def _optional(data: dict, key: str, path: str, kind: type | tuple[type, ...], de
     if key not in data or data[key] is None:
         return default
     return _require(data, key, path, kind)
+
+
+def _number(data: dict, key: str, path: str, default: float) -> float:
+    """An optional int or float; a bool, which YAML reads from `true`, is not a number here."""
+    value = _optional(data, key, path, (int, float), default)
+    if isinstance(value, bool):
+        raise ConfigError(_join(path, key), "expected int or float, got bool")
+    return value
 
 
 def _kind_name(kind: type | tuple[type, ...]) -> str:
@@ -965,6 +980,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
     guardrails = _require(raw, "guardrails", "", dict)
     recovery = _optional(raw, "recovery", "", dict, {})
     preflight = _optional(raw, "preflight", "", dict, {})
+    watchdog = _optional(raw, "watchdog", "", dict, {})
     agents = _require(raw, "agents", "", dict)
     gate_sets = _require(raw, "gate_sets", "", dict)
     docs = dict(_optional(project, "docs", "project", dict, {}))
@@ -1050,6 +1066,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             failed_attempts=_optional(recovery, "failed_attempts", "recovery", int, 3),
         ),
         preflight=Preflight(enabled=_optional(preflight, "enabled", "preflight", bool, False)),
+        watchdog=Watchdog(no_progress_min=_number(watchdog, "no_progress_min", "watchdog", 0)),
         autonomy=_optional(raw, "autonomy", "", dict, {}),
         resolve_step=builder.step(raw["resolve_step"], "resolve_step") if raw.get("resolve_step") else None,
         retro_step=builder.step(raw["retro_step"], "retro_step") if raw.get("retro_step") else None,
@@ -1777,6 +1794,15 @@ class _Validator:
             if key not in PREFLIGHT_KEYS:
                 self.error(f"preflight.{key}", "unknown preflight key")
 
+    def watchdog(self) -> None:
+        """`watchdog.no_progress_min`: 0 (off) or a number of minutes; a key that is not one of this block's is a typo."""
+        if not self.cfg.watchdog.no_progress_min >= 0:
+            self.error("watchdog.no_progress_min", "no_progress_min must be 0 (off) or a positive number of minutes")
+        block = self.cfg.raw.get("watchdog")
+        for key in block if isinstance(block, dict) else ():
+            if key not in WATCHDOG_KEYS:
+                self.error(f"watchdog.{key}", "unknown watchdog key")
+
     def issue_sync(self, pol: IssuePolicy) -> None:
         """`issues.sync_label`, `sync_lane`, `lane_labels`: which open issues the Backlog shows and their lanes."""
         if _label_problem(pol.sync_label):
@@ -2110,6 +2136,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.memory()
     v.issue_policy()
     v.preflight()
+    v.watchdog()
     v.policy()
     v.approval()
     v.autonomy()

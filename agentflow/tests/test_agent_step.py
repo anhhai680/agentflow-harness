@@ -529,6 +529,39 @@ def test_timeout_escalates(flow_repo, monkeypatch):
     assert len(flow_repo.calls()) == 1
 
 
+def test_a_session_that_goes_quiet_is_ended_as_a_timeout(flow_repo):
+    flow_repo.configure({"watchdog": {"no_progress_min": 0.02}})  # 1.2 s
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"sleep": 6, "result": {"status": "done", "summary": "ok"}}]})
+    assert run_step(flow_repo) == "stopped"
+    assert [e["key"] for e in flow_repo.events(run, "watchdog_fired")] == [KEY]
+    assert flow_repo.events(run, "watchdog_fired")[0]["idle_min"] == 0.0  # 0.02 min, rounded to 1
+    assert hitl_kinds(flow_repo, run) == ["step_timeout"]
+    assert run.refresh()["waiting"]["kind"] == "step_timeout"
+    assert "no progress" in flow_repo.events(run, "hitl_raised")[0]["summary"]
+    started = parse_iso(flow_repo.events(run, "agent_started")[0]["ts"])
+    exited = parse_iso(flow_repo.events(run, "agent_exited")[0]["ts"])
+    assert (exited - started).total_seconds() < 6
+    assert len(flow_repo.calls()) == 1
+
+
+def test_an_open_tool_call_is_not_a_stall(flow_repo):
+    flow_repo.configure({"watchdog": {"no_progress_min": 0.02}, "defaults": {"gate_timeout_min": 0.5}})
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"hold_tool": 3, "result": {"status": "done", "summary": "ok"}}]})
+    assert run_step(flow_repo) == "done"
+    assert flow_repo.events(run, "watchdog_fired") == []
+    assert run.state["steps"][KEY]["status"] == "done"
+
+
+def test_the_watchdog_off_changes_nothing(flow_repo):
+    assert flow_repo.cfg.watchdog.no_progress_min == 0
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"sleep": 2, "result": {"status": "done", "summary": "ok"}}]})
+    assert run_step(flow_repo) == "done"
+    assert flow_repo.events(run, "watchdog_fired") == [] and hitl_kinds(flow_repo, run) == []
+
+
 # --------------------------------------------------------------------------- limits and outages
 
 

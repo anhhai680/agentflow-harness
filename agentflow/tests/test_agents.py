@@ -6,6 +6,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,7 @@ from agentflow.agents import (
     ClaudeAgent,
     CodexAgent,
     StreamAccumulator,
+    idle_limit,
     make_agents,
     parse_claude_line,
     parse_codex_line,
@@ -376,6 +379,54 @@ def test_parse_over_threshold_only_on_main_assistant_then_user():
     assert not acc.over_threshold
 
 
+# ----------------------------------------------------------------------------- the no-progress watchdog
+
+
+def _tool_use(tool_id: str, parent: str | None = None) -> str:
+    return json.dumps({"type": "assistant", "parent_tool_use_id": parent, "message": {"content": [
+        {"type": "tool_use", "id": tool_id, "name": "Bash", "input": {"command": "make test"}}]}})
+
+
+def _tool_result(tool_id: str, parent: str | None = None) -> str:
+    return json.dumps({"type": "user", "parent_tool_use_id": parent, "message": {"content": [
+        {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}]}})
+
+
+def test_open_tools_follow_tool_use_and_tool_result():
+    acc = StreamAccumulator(default_window=200000)
+    parse_claude_line(_tool_use("t1"), acc)
+    assert acc.open_tools == {"t1"}
+    parse_claude_line(_tool_use("s1", parent="t1"), acc)  # a subagent's own tool call
+    assert acc.open_tools == {"t1"}
+    parse_claude_line(_tool_result("s1", parent="t1"), acc)
+    parse_claude_line(_tool_result("t1", parent="t1"), acc)  # a sub-thread line never closes a main-thread call
+    assert acc.open_tools == {"t1"}
+    parse_claude_line(_tool_result("t1"), acc)
+    assert acc.open_tools == set()
+
+
+def test_an_open_tool_call_gets_the_gate_timeout(call):
+    watched = dataclasses.replace(call, idle_s=600, tool_idle_s=1800)
+    acc = StreamAccumulator(default_window=200000)
+    assert idle_limit(watched, acc, True) == 600
+    acc.open_tools.add("t1")
+    assert idle_limit(watched, acc, True) == 1800
+
+
+def test_an_agent_that_does_not_track_tools_always_gets_the_gate_timeout(call):
+    watched = dataclasses.replace(call, idle_s=600, tool_idle_s=1800)
+    assert idle_limit(watched, StreamAccumulator(default_window=200000), False) == 1800
+    assert ClaudeAgent.tracks_tools is True and CodexAgent.tracks_tools is False
+
+
+def test_no_idle_limit_when_the_watchdog_is_off(call):
+    acc = StreamAccumulator(default_window=200000)
+    assert call.idle_s is None and call.tool_idle_s is None  # the default: no watchdog
+    assert idle_limit(call, acc, True) is None
+    acc.open_tools.add("t1")
+    assert idle_limit(dataclasses.replace(call, tool_idle_s=1800), acc, False) is None
+
+
 def test_parse_codex_fixture():
     o, events = parse_file(FIXTURES / "codex_stream.jsonl", parser=parse_codex_line)
     assert o.session_id == "0199a213-81c0-7800-8aa1-bbab2a035a53"
@@ -517,6 +568,35 @@ def test_fresh_crash_is_not_resume_failed(fake, fake_claude, call):
     events, on_event = collect()
     o = fake_claude.run(call, on_event)
     assert o.exit_code == 1 and not o.resume_failed
+
+
+def test_a_quiet_session_is_ended_as_stalled(fake, fake_claude, call):
+    fake.script({STEP: [{"sleep": 6}]})
+    events, on_event = collect()
+    started = time.monotonic()
+    o = fake_claude.run(dataclasses.replace(call, idle_s=1, tool_idle_s=30), on_event)
+    assert time.monotonic() - started < 6
+    assert o.stalled and not o.timed_out and o.exit_code != 0
+    assert events[-1][0] == "agent_exited"
+    assert not any(t.name == "agentflow-watchdog" for t in threading.enumerate())  # joined, never leaked
+
+
+def test_a_stalled_resume_is_not_resume_failed(fake, fake_claude, call):
+    fake.script({STEP: [{"no_init": True, "sleep": 6}]})
+    o = fake_claude.run(dataclasses.replace(call, resume_session="gone", idle_s=1, tool_idle_s=30), collect()[1])
+    assert o.stalled and o.session_id is None and not o.resume_failed
+
+
+def test_the_step_timeout_and_the_watchdog_never_both_fire(fake, fake_claude, call):
+    fake.script({STEP: [{"sleep": 6}]})
+    o = fake_claude.run(dataclasses.replace(call, timeout_s=1, idle_s=1, tool_idle_s=1), collect()[1])
+    assert o.timed_out != o.stalled  # one of them ended it, never both
+
+
+def test_an_open_tool_call_outlasts_the_idle_limit(fake, fake_claude, call):
+    fake.script({STEP: [{"hold_tool": 2.5}]})
+    o = fake_claude.run(dataclasses.replace(call, idle_s=1, tool_idle_s=30), collect()[1])
+    assert not o.stalled and o.exit_code == 0
 
 
 def test_transcript_written(fake, fake_claude, call):

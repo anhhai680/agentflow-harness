@@ -1593,3 +1593,14 @@ def test_preflight_enabled_must_be_a_bool(tmp_cfg):
     assert [(i.path, i.message) for i in found if i.level == "error"] == [("preflight.nope", "unknown preflight key")]
     assert load_config(tmp_cfg({"preflight": {"enabled": True}})).preflight.enabled is True
     assert load_config(tmp_cfg({"preflight": None})).preflight.enabled is False
+
+
+def test_watchdog_no_progress_min_must_be_zero_or_more(tmp_cfg):
+    found = issues_for(tmp_cfg, {"watchdog": {"no_progress_min": -1}})
+    assert [i.path for i in found if i.level == "error"] == ["watchdog.no_progress_min"]
+    with pytest.raises(ConfigError, match=r"watchdog\.no_progress_min"):
+        load_config(tmp_cfg({"watchdog": {"no_progress_min": True}}))
+    found = issues_for(tmp_cfg, {"watchdog": {"nope": 1}})
+    assert [(i.path, i.message) for i in found if i.level == "error"] == [("watchdog.nope", "unknown watchdog key")]
+    assert load_config(tmp_cfg({"watchdog": {"no_progress_min": 12.5}})).watchdog.no_progress_min == 12.5
+    assert load_config(tmp_cfg({"watchdog": None})).watchdog.no_progress_min == 0

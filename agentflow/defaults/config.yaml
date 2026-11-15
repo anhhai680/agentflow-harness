@@ -57,6 +57,9 @@ recovery:
 preflight:
   enabled: false   # true: check the machine once before a run's first phase (the gates' programs, Docker, `setup`)
 
+watchdog:
+  no_progress_min: 0   # end a session that writes nothing to its stream this many minutes (0 = off; 15 is a safe start)
+
 effort:
   sizing: true    # the runner sizes each step before it starts (false: every step runs at default)
   default: medium
