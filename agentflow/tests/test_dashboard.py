@@ -16,7 +16,9 @@ from pathlib import Path
 import pytest
 
 from agentflow import hitl, pack
+from agentflow.config import RETRO_PIPELINE
 from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
+from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
 from agentflow.views import _badge
 from conftest import PYTHON_CONFIG, run_git
@@ -580,6 +582,88 @@ def test_action_on_a_live_runner_does_not_spawn_a_second(dash):
     finally:
         lock.release()
     assert dash.spawned == []
+
+
+# --------------------------------------------------------------------------- the actions a run's state allows
+
+
+def _paused(flow):
+    run = flow.new_run()
+    pause(run, "me")
+    return run
+
+
+def _questions(flow):
+    run = flow.new_run()
+    questions = [hitl.Question("q1", "How long?", [hitl.Option("A", "1h", True)], [], "spec_gap")]
+    hitl.raise_hitl(flow.cfg, run, "needs_human", "define/draft", "Needs a decision", questions)
+    return run
+
+
+def _stalled(flow):
+    run = flow.new_run()
+    run.emit("phase_started", phase="build")
+    run.emit("step_started", key="build/x", phase="build")
+    return run
+
+
+def _failed_step(flow):
+    run = _stalled(flow)
+    run.emit("step_finished", key="build/x", status="failed")
+    return run
+
+
+BUILDERS = {
+    "paused": _paused,
+    "ready": lambda flow: ready(flow),
+    "ready_with_work": lambda flow: with_work(flow, ready(flow)),
+    "phase_approval": lambda flow: awaiting(flow),
+    "questions": _questions,
+    "stalled": _stalled,
+    "failed_step": _failed_step,
+    "done": lambda flow: finished_run(flow),
+    "cancelled": lambda flow: _cancelled(flow),
+}
+
+
+def _cancelled(flow):
+    run = flow.new_run()
+    cancel(run, "t", cfg=flow.cfg)
+    return run
+
+
+BODIES = {"approve": {"note": "go"}, "reject": {"note": "redo"}, "answer": {"answers": {"q1": "A"}}}
+ALWAYS_REFUSED_UNLISTED = ("pause", "done", "retry", "cancel")  # these routes answer 409 when the state is wrong
+
+
+@pytest.mark.parametrize("build, listed", [
+    ("paused",         ["resume", "cancel"]),
+    ("ready",          ["resume", "cancel"]),               # no work in the checkout -> no done
+    ("ready_with_work", ["resume", "done", "cancel"]),
+    ("phase_approval", ["approve", "reject", "pause", "cancel"]),
+    ("questions",      ["answer", "reject", "pause", "cancel"]),
+    ("stalled",        ["resume", "pause", "cancel"]),
+    ("failed_step",    ["resume", "pause", "retry", "cancel"]),
+    ("done",           []),
+    ("cancelled",      []),
+])
+@pytest.mark.parametrize("action", RUN_ACTIONS)
+def test_listed_actions_are_never_refused_and_unlisted_ones_are(dash, build, listed, action):
+    run = BUILDERS[build](dash.flow)
+    assert available_actions(run) == listed
+    waits = run.state["waiting"] is not None
+    status, _, body = dash.post(f"/api/runs/{run.id}/{action}", BODIES.get(action, {}))
+    if action in listed:
+        assert status != 409, payload(body)
+    elif action in ALWAYS_REFUSED_UNLISTED or (action in ("approve", "reject") and not waits):
+        assert status == 409, (status, payload(body))
+    # an unlisted resume still answers 200 (it starts a runner): that wrong press is what hiding the button prevents
+
+
+def test_a_retro_run_lists_only_pause_and_cancel(dash):
+    run = Run.create(dash.flow.cfg, dash.flow.root, RETRO_PIPELINE, {}, engine_pipeline=True)
+    run.emit("phase_started", phase="retro")
+    assert available_actions(run) == ["pause", "cancel"]
 
 
 # --------------------------------------------------------------------------- live updates
