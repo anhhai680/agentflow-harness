@@ -7,7 +7,7 @@ function agentTable(rows, withSubs) {
   const body = [];
   for (const r of rows) {
     const effort = el("td", { title: r.effort_reason ? "chose " + r.effort + ": " + r.effort_reason : r.effort_refused ? "refused: " + JSON.stringify(r.effort_refused) : null }, (r.effort || "-") + arrow(r.effort_arrow));
-    body.push(el("tr", { class: "row-link" + (r.idle ? " idle" : ""), title: "open " + r.run_id, onclick: () => openDrawer(r.run_id) },
+    body.push(el("tr", { class: "row-link" + (r.idle ? " idle" : ""), title: "open " + r.run_id, onclick: () => goRun(r.run_id) },
       el("td", { text: r.module }), el("td", { text: r.place }), el("td", { text: r.role || "—" }), el("td", { text: r.agent || "-" }),
       el("td", { text: r.model || "-", title: r.model_source ? "from " + r.model_source : null }), effort,
       el("td", { text: r.status || "-" }), el("td", { text: typeof r.context_pct === "number" ? Math.round(r.context_pct) + "%" : "-" }),

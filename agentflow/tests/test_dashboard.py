@@ -891,8 +891,39 @@ def test_page_script_bootstraps_the_token_from_the_fragment_and_keeps_it_for_rel
 def test_run_drawer_never_hands_null_to_replace_children():
     """The DOM prints a null argument as the text "null"; only `el()` skips null children."""
     source = page_source()
-    block = source[source.index("drawer.replaceChildren(\n"):source.index("function closeDrawer")]
+    block = source[source.index("peek.replaceChildren(\n"):source.index("function closePeek")]
     assert not re.search(r":\s*null\b", block)
+
+
+def test_a_route_hash_survives_the_token_boot():
+    source = page_source()
+    boot = source[source.index("const TOKEN"):source.index("const ui")]
+    assert "if (match)" in boot and "if (location.hash)" not in boot   # only #token= is stripped
+
+
+def test_runs_have_hash_routes():
+    source = page_source()
+    for needle in ('"#/run/"', "hashchange", "function parseRoute", "function routeHash",
+                   'RUN_TABS = ["overview", "activity", "gates", "files"]'):
+        assert needle in source, needle
+
+
+def test_run_page_and_peek_buttons_come_only_from_the_actions_list():
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    drawer_js = (UI_DIR / "drawer.js").read_text(encoding="utf-8")
+    block = run_js[run_js.index("const ACTION_BUTTONS"):run_js.index("\n};", run_js.index("const ACTION_BUTTONS"))]
+    outside = run_js.replace(block, "") + drawer_js
+    assert not re.search(r'act\([^)]*"(pause|resume|retry|cancel|done)"', outside)
+    assert "detail.actions" in run_js and "detail.actions" in drawer_js
+
+
+def test_an_unknown_run_says_so_and_links_back():
+    assert "No run " in (UI_DIR / "run.js").read_text(encoding="utf-8")
+
+
+def test_the_drawer_is_a_peek_with_an_open_run_button():
+    drawer_js = (UI_DIR / "drawer.js").read_text(encoding="utf-8")
+    assert "Open run" in drawer_js and "function openPeek" in drawer_js and "openDrawer" not in page_source()
 
 
 def test_sse_keeps_an_event_written_as_soon_as_the_headers_arrive(dash, monkeypatch):
@@ -1664,11 +1695,11 @@ def test_lessons_api_lists_the_lessons_and_their_effects(dash):
     assert data["note"] == "Before/after compares runs; it shows correlation, not cause."
 
 
-def test_the_lessons_tab_links_evidence_to_the_run_drawer_and_escapes_text():
+def test_the_lessons_tab_links_evidence_to_the_run_page_and_escapes_text():
     source = page_source()
     assert 'id="tab-lessons"' in source and 'id="lessons-view"' in source and '"lessons"' in source
     block = source[source.index("function sourceNodes"):source.index("async function loadLessons")]
-    assert "openDrawer(src.run_id)" in block and "data.note" in block
+    assert "goRun(src.run_id)" in block and "data.note" in block
     assert "innerHTML" not in block  # titles and bodies are model text: every text goes through el()'s textContent
     assert 'api("/api/lessons")' in source
 

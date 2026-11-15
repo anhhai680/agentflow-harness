@@ -11,7 +11,7 @@ function measure(value, runs) {
 function sourceNodes(sources) {
   if (!sources.length) return [el("span", { class: "muted", text: "-" })];
   return sources.map((src) => src.run_id
-    ? el("button", { type: "button", class: "src", title: "open run " + src.run_id + ", event " + src.seq, text: src.ref, onclick: () => openDrawer(src.run_id) })
+    ? el("button", { type: "button", class: "src", title: "open run " + src.run_id + ", event " + src.seq, text: src.ref, onclick: () => goRun(src.run_id) })
     : el("span", { class: "chip", text: src.ref }));
 }
 

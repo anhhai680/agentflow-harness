@@ -15,7 +15,8 @@ async function refresh() {
     renderAgents(agentsData);
     ui.workflow = workflow;
     renderWorkflow();
-    if (ui.drawer && !$("dlg").open) openDrawer(ui.drawer);
+    if (ui.peek && !$("dlg").open) openPeek(ui.peek);
+    if (ui.run && ui.run.detail !== null && !$("dlg").open) openRun(ui.run.id, ui.run.tab, ui.run.sub);  // a missing run is not asked again
     if (ui.view === "metrics") loadMetrics();
     if (ui.view === "lessons") loadLessons();
   } catch (err) {
@@ -40,23 +41,44 @@ function connect() {
 
 const VIEWS = ["board", "workflow", "agents", "metrics", "lessons", "settings"];
 
+// `view` is a header tab's name, or "run" for the Run page, which no tab marks.
 function show(view) {
   ui.view = view;
   for (const name of VIEWS) {
     $(name + "-view").hidden = view !== name;
     $("tab-" + name).setAttribute("aria-pressed", String(view === name));
   }
+  $("run-view").hidden = view !== "run";
+  if (view === "run") return;
   try { localStorage.setItem("agentflow-view", view); } catch (err) { console.warn("agentflow: local storage unavailable", err); }
   if (view === "settings" && TOKEN && !settings.edits.size && !settings.yamlDirty) loadSettings();  // unsaved edits stay
   if (view === "metrics") loadMetrics();
   if (view === "lessons" && TOKEN) loadLessons();
 }
 
+// The hash is the page's place: a tab's `#/<view>` or a run's `#/run/<id>/<tab>`, so a reload and Back keep it.
+function route() {
+  const where = parseRoute(location.hash);
+  closePeek();
+  if (where.view === "run") {
+    openRun(where.run, where.tab, where.sub);
+    return;
+  }
+  ui.run = null;
+  show(where.view);
+}
+
 restoreMetricsChoice();
-for (const name of VIEWS) $("tab-" + name).addEventListener("click", () => show(name));
+for (const name of VIEWS) $("tab-" + name).addEventListener("click", () => { location.hash = "#/" + name; });
 $("new-task").addEventListener("click", newTaskDialog);
-document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("dlg").open) closeDrawer(); });
-try { const saved = localStorage.getItem("agentflow-view"); show(VIEWS.includes(saved) ? saved : "board"); } catch (err) { show("board"); }
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("dlg").open) closePeek(); });
+window.addEventListener("hashchange", route);
+if (!location.hash) {  // a first visit, or the #token= the boot removed: the tab this browser showed last
+  let saved = null;
+  try { saved = localStorage.getItem("agentflow-view"); } catch (err) { console.warn("agentflow: local storage unavailable", err); }
+  history.replaceState(null, "", "#/" + (VIEWS.includes(saved) ? saved : "board"));
+}
+route();
 async function loadVersion() {
   try {
     const info = await api("/api/info");

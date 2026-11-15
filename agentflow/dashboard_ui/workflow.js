@@ -2,7 +2,8 @@
 
 // ------------------------------------------------------------------ workflow view
 
-const STATUS_CLASS = { done: "st-ok", approved: "st-ok", failed: "st-bad", waiting: "st-wait", awaiting_approval: "st-wait", running: "st-run", refining: "st-run" };
+const STATUS_CLASS = { done: "st-ok", approved: "st-ok", ready: "st-ok", failed: "st-bad", stalled: "st-bad", cancelled: "st-bad",
+  waiting: "st-wait", waiting_human: "st-wait", awaiting_approval: "st-wait", running: "st-run", refining: "st-run" };
 
 function stepSkills(step) {
   const skills = [];
@@ -57,11 +58,4 @@ function runStepNode(step) {
     step.skill ? el("span", { class: "muted", text: " " + step.skill }) : null,
     detail ? el("div", { class: "muted", text: detail }) : null,
     step.steps.length ? el("ul", { class: "wf-run" }, step.steps.map(runStepNode)) : null);
-}
-
-function runWorkflow(phases) {
-  return el("div", {}, el("h3", { class: "wf-title", text: "Workflow" }), phases.map((phase) => el("div", { class: "wf-phase" },
-    el("div", {}, el("strong", { text: phase.name }), " ", el("span", { class: STATUS_CLASS[phase.status] || "muted", text: phase.status.replace("_", " ") }),
-      phase.reason ? el("span", { class: "muted", text: " · " + phase.reason }) : null),
-    el("ul", { class: "wf-run" }, phase.steps.map(runStepNode)))));
 }

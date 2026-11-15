@@ -148,7 +148,7 @@ function runPhaseChips(metrics) {
 }
 
 function stepRows(steps) {
-  return steps.map((s) => el("tr", { class: "row-link", title: "open " + s.run_id, onclick: () => openDrawer(s.run_id) },
+  return steps.map((s) => el("tr", { class: "row-link", title: "open " + s.run_id, onclick: () => goRun(s.run_id) },
     el("td", { text: s.module }), el("td", { text: s.key }), el("td", { class: "num", text: dur(s.wall_s) }), el("td", { class: "num", text: money(s.cost_usd) }),
     el("td", { class: "num", text: s.attempts + (s.rework_attempts ? " (" + s.rework_attempts + " rework)" : "") }),
     el("td", { class: "num", text: s.review_rounds || "-" }), el("td", { class: "num", text: s.fixes || "-" }),
@@ -196,7 +196,7 @@ function renderMetrics() {
   body.push(table(["Started", "Run", "Work", "Status", "Time", "Time by bucket", "Cost", "Phases (time · cost · model·effort)"], data.runs.map((r) => {
     const m = r.metrics;
     const flags = [m.live ? "live" : "", m.stalled ? "stalled" : "", m.approx ? "gate time estimated" : ""].filter(Boolean).join(", ");
-    return el("tr", { class: "row-link", title: "open " + r.run_id + (flags ? " (" + flags + ")" : ""), onclick: () => openDrawer(r.run_id) },
+    return el("tr", { class: "row-link", title: "open " + r.run_id + (flags ? " (" + flags + ")" : ""), onclick: () => goRun(r.run_id) },
       el("td", { text: r.started_on || "-" }), el("td", { text: r.module }), el("td", { text: workLabel(r.lane) }),
       el("td", { text: r.status + (r.archived ? " (archived)" : "") + (m.stalled ? " · stalled" : "") }),
       el("td", { class: "num", text: dur(m.wall_s) }), el("td", { class: "stack-cell" }, stackNode(m.buckets, m.wall_s / widest)),
@@ -269,14 +269,14 @@ for (const id of ["met-from", "met-to"]) {
 }
 $("met-lane").addEventListener("change", () => { metricsUi.work = $("met-lane").value; saveMetricsChoice(); loadMetrics(); });
 
-// The drawer's view of one run: a row per phase, and its steps with every agent call (model, effort, role, cost).
+// The Run page's view of one run: a row per phase, and its steps with every agent call (model, effort, role, cost).
 function metricsSection(m) {
   if (!m) return el("p", { class: "muted", text: "No time and cost yet." });
   const flags = [m.live ? "still running: figures up to now" : "", m.stalled ? "stalled: no event for longer than a step may run" : "",
     m.approx ? "gate time estimated for runs older than gate timing" : "", m.cost_estimated ? "~ cost partly estimated" : ""].filter(Boolean);
   const phases = m.phases.filter((p) => p.wall_s >= 1 || p.cost_usd > 0);
   const widest = Math.max(1, ...phases.map((p) => p.wall_s));
-  const order = bucketOrder().filter((b) => m.buckets[b]);  // only the buckets this run used: the drawer is narrow
+  const order = bucketOrder().filter((b) => m.buckets[b]);  // only the buckets this run used: keep the table narrow
   const phaseTable = table(["Phase", "Time", "By bucket", ...order.map((b) => BUCKET_LABEL[b]), "Cost", "Rework", "Calls", "Model · effort"],
     phases.map((p) => el("tr", {},
       el("td", { text: p.phase }), el("td", { class: "num", text: dur(p.wall_s) }),

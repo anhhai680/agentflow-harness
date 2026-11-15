@@ -1,9 +1,9 @@
 "use strict";
 
-// ------------------------------------------------------------------ run detail drawer
+// ------------------------------------------------------------------ the peek: a run's facts and its decision
 
-function section(title, text, open) {
-  return el("details", { open: open }, el("summary", { text: title }), el("pre", { text: text || "(empty)" }));
+function section(title, text, open, key) {
+  return el("details", { open: open, "data-key": key }, el("summary", { text: title }), el("pre", { text: text || "(empty)" }));
 }
 
 function describe(event) {
@@ -15,53 +15,37 @@ function describe(event) {
   return bits.join("  ");
 }
 
-async function openDrawer(runId) {
-  ui.drawer = runId;
-  const drawer = $("drawer");
-  drawer.hidden = false;
+// Space on a card, or a click on its badge: the card's facts and the decision it waits on, without leaving the Board.
+async function openPeek(runId) {
+  ui.peek = runId;
+  const peek = $("drawer");
+  peek.hidden = false;
   let detail;
   try {
     detail = await api(runPath(runId));
   } catch (err) {
-    drawer.replaceChildren(el("p", { text: "Could not load " + runId + ": " + err.message }), el("button", { type: "button", text: "Close", onclick: closeDrawer }));
+    if (ui.peek !== runId) return;
+    peek.replaceChildren(el("p", { text: (err.status === 404 ? "No run " + runId : "Could not load " + runId + ": " + err.message) }),
+      el("button", { type: "button", text: "Close", onclick: closePeek }));
     return;
   }
-  if (ui.drawer !== runId) return;
+  if (ui.peek !== runId) return;
   const facts = detail.facts;
-  const waiting = detail.waiting;
-  const attach = el("input", { type: "text", value: detail.attach, readonly: "readonly", "aria-label": "attach command" });
-  const copy = el("button", { type: "button", text: "Copy", onclick: () => {
-    navigator.clipboard.writeText(detail.attach).then(() => toast("Copied: run it in your terminal"), () => { attach.select(); toast("Press Ctrl-C / ⌘C to copy"); });
-  } });
-  const actions = el("div", { class: "actions" },
-    el("button", { type: "button", text: "Pause", onclick: () => act(runId, "pause") }),
-    el("button", { type: "button", text: "Resume", onclick: () => act(runId, "resume") }),
-    el("button", { type: "button", text: "Retry failed step", onclick: () => act(runId, "retry") }),
-    el("button", { type: "button", class: "danger", text: "Cancel run", onclick: () => { if (confirm("Cancel " + runId + "? Live agents are stopped.")) act(runId, "cancel"); } }),
-    el("button", { type: "button", text: "Close", onclick: closeDrawer }));
-  const records = Object.entries(detail.steps || {}).map(([key, row]) => key + "  " + row.status + (row.skip_reason ? "  (" + row.skip_reason + ")" : "") + (row.result ? "  — " + row.result : ""));
-  const gates = detail.gates.map((g) => (g.skipped ? "– " : g.passed ? "✓ " : "✗ ") + g.key + " " + g.gate + (g.log_tail ? "\n" + g.log_tail : "")).join("\n\n");
   const rows = [["status", detail.status], ["work", workLabel(detail.lane)], ["phase", facts.phase], ["step", facts.step],
-    ["branch", facts.branch], ["worktree", facts.worktree], ["pull request", facts.pr_url], ["spend", money(facts.spend_usd) + limits(facts.soft_budget_usd, facts.budget_usd)],
-    ["refine", facts.refine ? "round " + facts.refine.round + ": " + facts.refine.note : null], ["failure", facts.failure]]
+    ["branch", facts.branch], ["pull request", facts.pr_url], ["spend", money(facts.spend_usd) + limits(facts.soft_budget_usd, facts.budget_usd)],
+    ["refine", facts.refine ? "round " + facts.refine.round + ": " + facts.refine.note : ""], ["failure", facts.failure]]
     .filter(([, v]) => v).map(([k, v]) => el("div", {}, el("span", { class: "muted", text: k + ": " }), String(v)));
-  drawer.replaceChildren(
-    el("h2", { text: runId }), ...rows,
-    el("div", { class: "attach" }, attach, copy), actions,
-    metricsSection(detail.metrics),
-    ...(waiting ? [section("Waiting on " + waiting.key + " (" + waiting.kind + ")", detail.inbox || waiting.summary, true)] : []),
-    runWorkflow(detail.workflow),
-    section("Step records", records.join("\n"), false),
-    el("details", {}, el("summary", { text: "Timeline (" + detail.timeline.length + " events)" }),
-      el("ol", { class: "timeline" }, detail.timeline.slice().reverse().map((e) => el("li", { text: describe(e) })))),
-    section("Gates", gates, false),
-    section("Review findings", Object.keys(detail.reviews).length ? JSON.stringify(detail.reviews, null, 2) : "", false),
-    section("progress.md", detail.progress, false),
-    section("handoff.md", detail.handoff, false),
-    section("Transcript tail" + (detail.transcript_file ? " (" + detail.transcript_file + ")" : ""), detail.transcript, false));
+  const decision = decisionNode(detail) || el("p", { class: "muted", text: "Nothing is waiting on you." });
+  const controls = actionNodes(detail, detail.actions.filter((a) => !DECISION_ACTIONS.includes(a)));
+  peek.replaceChildren(
+    el("h2", { text: detail.label }), el("div", { class: "muted", text: runId }), ...rows,
+    decision,
+    el("div", { class: "actions" }, controls,
+      el("button", { type: "button", class: "primary", text: "Open run", onclick: () => { closePeek(); goRun(runId); } }),
+      el("button", { type: "button", text: "Close", onclick: closePeek })));
 }
 
-function closeDrawer() {
-  ui.drawer = null;
+function closePeek() {
+  ui.peek = null;
   $("drawer").hidden = true;
 }

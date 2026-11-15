@@ -63,7 +63,7 @@ function movesNode(card) {
   const moves = el("div", { class: "moves" },
     next ? button("Continue → " + next, true, continueCard) : null,
     button("Mark done", !next, markDone));
-  moves.addEventListener("keydown", (ev) => ev.stopPropagation());  // Enter on a button must not open the drawer too
+  moves.addEventListener("keydown", (ev) => ev.stopPropagation());  // Enter or Space on a button must not open the run too
   return moves;
 }
 
@@ -84,10 +84,10 @@ function cardNode(card) {
     el("span", { class: g.skipped ? "gate-skip" : g.passed ? "gate-ok" : "gate-bad", text: (g.skipped ? "– " : g.passed ? "✓ " : "✗ ") + g.gate + " " })));
   // A refine round's implementer changed nothing, so its task was not reviewed again.
   const skips = (card.review_skipped || []).map((r) => el("span", { class: "gate-skip", title: "review skipped: " + r.reason, text: "– review task " + r.task + " (" + r.reason + ") " }));
-  const node = el("article", { class: "card " + card.status, tabindex: "0", role: "button", draggable: card.ready ? "true" : null, onclick: () => openDrawer(card.run_id) },
+  const node = el("article", { class: "card " + card.status, tabindex: "0", role: "button", draggable: card.ready ? "true" : null, onclick: () => goRun(card.run_id) },
     el("div", { class: "title", text: card.module }),
     el("div", { class: "sub", text: where }),
-    el("span", { class: "badge", text: card.badge }),
+    el("span", { class: "badge peekable", text: card.badge, title: "Peek (Space)", onclick: (ev) => { ev.stopPropagation(); openPeek(card.run_id); } }),
     card.refine_round ? el("span", { class: "badge", text: "refine " + card.refine_round }) : null,
     agent,
     el("div", { class: "sub", text: "ctx " + (typeof card.context_pct === "number" ? Math.round(card.context_pct) + "%" : "-") + " · " + money(card.spend) + limits(card.soft_budget, card.budget) }),
@@ -96,7 +96,10 @@ function cardNode(card) {
     el("div", { class: "sub", text: "in phase " + ago(card.time_in_phase_s) + " · total " + dur(card.wall_s) }),
     card.pr_link ? prNode(card) : null,
     card.ready ? movesNode(card) : null);
-  node.addEventListener("keydown", (ev) => { if (ev.key === "Enter") openDrawer(card.run_id); });
+  node.addEventListener("keydown", (ev) => {  // Enter opens the Run page, Space a peek at it
+    if (ev.key === "Enter") goRun(card.run_id);
+    else if (ev.key === " ") { ev.preventDefault(); openPeek(card.run_id); }
+  });
   if (card.ready) dragFrom(node, card, card.run_id);
   return node;
 }
@@ -260,6 +263,22 @@ function renderBoard(data) {
   $("needs").replaceChildren(...(data.needs_human.length ? data.needs_human.map(needNode) : [el("p", { class: "muted", text: "Nothing is waiting on you." })]));
 }
 
+// What an approval needs: a blocked stop takes a note (required when it blocked again with nothing changed).
+const needTarget = (item) => (item.kind === "phase_approval" ? item.phase : item.key);
+
+function approveFlow(item) {
+  const target = needTarget(item);
+  if (item.kind === "blocked" || item.kind === "blocked_repeat") {
+    const required = item.kind === "blocked_repeat";
+    const note = prompt("Tell the agent what changed or what to do" + (required ? " (required: it blocked again with nothing changed)" : " (optional)") + ":", "");
+    if (note === null) return;
+    if (required && !note.trim()) { toast("Approving " + item.key + " needs a note: it blocked again with nothing changed"); return; }
+    act(item.run_id, "approve", note.trim() ? { target: target, note: note.trim() } : { target: target });
+  } else if (confirm("Approve " + item.key + " for " + item.run_id + "?")) {
+    act(item.run_id, "approve", { target: target });
+  }
+}
+
 function needNode(item) {
   const questions = item.questions || [];
   const what = el("div", { class: "what" },
@@ -267,23 +286,14 @@ function needNode(item) {
     item.summary ? el("div", { class: "sub", text: item.summary }) : null,
     questions.length ? el("ul", {}, questions.map((q) => el("li", { text: q.id + ": " + q.question }))) : null);
   const buttons = [];
-  const target = item.kind === "phase_approval" ? item.phase : item.key;
   if (questions.length) {
     buttons.push(el("button", { type: "button", class: "primary", text: "Answer…", onclick: () => answerDialog(item) }));
   } else {
-    buttons.push(el("button", { type: "button", class: "primary", text: "Approve", onclick: () => {
-      if (item.kind === "blocked" || item.kind === "blocked_repeat") {
-        const required = item.kind === "blocked_repeat";
-        const note = prompt("Tell the agent what changed or what to do" + (required ? " (required: it blocked again with nothing changed)" : " (optional)") + ":", "");
-        if (note !== null) act(item.run_id, "approve", note.trim() ? { target: target, note: note.trim() } : { target: target });
-      } else if (confirm("Approve " + item.key + " for " + item.run_id + "?")) {
-        act(item.run_id, "approve", { target: target });
-      }
-    } }));
+    buttons.push(el("button", { type: "button", class: "primary", text: "Approve", onclick: () => approveFlow(item) }));
   }
   if (item.kind !== "parked") {
-    buttons.push(el("button", { type: "button", text: "Reject…", onclick: () => rejectDialog(item.run_id, target) }));
+    buttons.push(el("button", { type: "button", text: "Reject…", onclick: () => rejectDialog(item.run_id, needTarget(item)) }));
   }
-  buttons.push(el("button", { type: "button", text: "Open", onclick: () => openDrawer(item.run_id) }));
+  buttons.push(el("button", { type: "button", text: "Open", onclick: () => goRun(item.run_id, "overview", "decision") }));
   return el("div", { class: "need" }, what, ...buttons);
 }

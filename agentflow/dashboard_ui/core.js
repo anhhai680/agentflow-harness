@@ -11,11 +11,11 @@ const TOKEN = (function () {
   } catch (err) {
     console.warn("agentflow: session storage unavailable", err);
   }
-  if (location.hash) { history.replaceState(null, "", location.pathname); }  // keep the token out of the address bar
+  if (match) { history.replaceState(null, "", location.pathname); }  // keep the token out of the address bar; a route stays
   return token;
 })();
 
-const ui = { view: "board", drawer: null, board: null, agents: null, workflow: null, dragging: null, doneOpen: false };
+const ui = { view: "board", peek: null, run: null, board: null, agents: null, workflow: null, dragging: null, doneOpen: false };
 const $ = (id) => document.getElementById(id);
 const workLabel = (lane) => (ui.board && ui.board.lane_labels[lane]) || lane;  // a lane with no label, or an old run's, shows its name
 
@@ -28,7 +28,7 @@ function el(tag, props, ...children) {
     else if (key === "title") node.title = String(value);
     else if (key === "onclick") node.addEventListener("click", value);
     else if (key === "ontoggle") node.addEventListener("toggle", value);
-    else if (/^(type|value|name|for|id|role|tabindex|aria-[a-z]+|readonly|checked|placeholder|open|draggable|href|target|rel|disabled|maxlength|multiple|min|max|step|spellcheck)$/.test(key)) node.setAttribute(key, String(value));
+    else if (/^(type|value|name|for|id|role|tabindex|aria-[a-z]+|readonly|checked|placeholder|open|draggable|href|target|rel|disabled|maxlength|multiple|min|max|step|spellcheck|data-[a-z-]+)$/.test(key)) node.setAttribute(key, String(value));
   }
   for (const child of children.flat()) {
     if (child === null || child === undefined || child === false) continue;
@@ -67,7 +67,9 @@ async function api(path, body) {
   let data = {};
   try { data = text ? JSON.parse(text) : {}; } catch (err) { data = { error: "unreadable response" }; }
   if (!response.ok) {
-    throw new Error(data.error || (response.status === 403 ? "forbidden: open the URL with the token printed by `agentflow dashboard`" : "HTTP " + response.status));
+    const error = new Error(data.error || (response.status === 403 ? "forbidden: open the URL with the token printed by `agentflow dashboard`" : "HTTP " + response.status));
+    error.status = response.status;  // a 404 tells the Run page the run does not exist
+    throw error;
   }
   return data;
 }
