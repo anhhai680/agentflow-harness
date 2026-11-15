@@ -294,6 +294,32 @@ def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metri
     }
 
 
+def _board_figures(run: Run, cfg: Config, now: datetime) -> tuple[dict, dict]:
+    """`(digest, metrics)` of `run` for the Board, cached by its event log's size and mtime (and the local date, which
+    `spend_today` depends on). A live run's entry also expires `DIGEST_LIVE_TTL_S` after it was made, measured on
+    `now`, so a quiet run's wall time keeps counting; an ended run's never does. The callers only read what this
+    returns, so the cached dicts are shared, as `run_metrics_view` shares its own."""
+    path = run.events.path
+    try:
+        stat = path.stat()  # before the read: a log that grows in between misses next time
+        key = (str(path), stat.st_size, stat.st_mtime_ns, now.astimezone().date())
+    except OSError:
+        key = None
+    hit = _DIGEST_CACHE.get(key) if key is not None else None
+    if hit is not None:
+        made, digest, metrics = hit
+        if not metrics["live"] or 0 <= (now - made).total_seconds() < DIGEST_LIVE_TTL_S:
+            return digest, metrics
+    events = run.events.read()
+    digest, metrics = _digest(run, now, events), run_metrics_view(run, cfg, now, events)
+    if key is not None:
+        _DIGEST_CACHE.pop(key, None)  # a replaced entry goes to the back, as the newest
+        while len(_DIGEST_CACHE) >= _METRICS_CACHE_MAX:
+            _DIGEST_CACHE.pop(next(iter(_DIGEST_CACHE)))
+        _DIGEST_CACHE[key] = (now, digest, metrics)
+    return digest, metrics
+
+
 def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None = None) -> dict:
     """The Kanban data for every lane, or one `lane` (see the module docstring)."""
     if lane is not None:
@@ -311,8 +337,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
     by_agent, by_model = Counter(), Counter()
     for run in list_runs(repo):
         state = run.state
-        events = run.events.read()
-        digest = _digest(run, now, events)
+        digest, metrics = _board_figures(run, cfg, now)
         spend_today += digest["spend_today"]
         for row in _live_agents(state):
             by_agent[str(row.get("agent"))] += 1
@@ -325,7 +350,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
             continue
         status = display_status(run)
         counts[status] += 1
-        cards.append(_card(run, status, cfg, now, digest, run_metrics_view(run, cfg, now, events)))
+        cards.append(_card(run, status, cfg, now, digest, metrics))
     needs = [{**item, "age_s": _age(now, item.get("since"))} for item in inbox_items(repo)]
     return {
         "lane": lane,
@@ -702,6 +727,8 @@ def run_detail(run: Run, cfg: Config, raw: bool = False) -> dict:
 
 _METRICS_CACHE: dict[tuple, dict] = {}  # an ended run's metrics, by (events file, size, mtime): they cannot change
 _METRICS_CACHE_MAX = 512
+_DIGEST_CACHE: dict[tuple, tuple[datetime, dict, dict]] = {}  # the board's (digest, metrics) per run, see _board_figures
+DIGEST_LIVE_TTL_S = 30.0
 
 
 def _stall_s(cfg: Config | None) -> float:

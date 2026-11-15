@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -1479,6 +1480,103 @@ def test_old_runs_stay_in_metrics_and_on_the_board(flow_repo):
     assert [c["run_id"] for c in board(flow_repo.root, flow_repo.cfg, now=later)["cards"]] == [run.id]
     card = board(flow_repo.root, flow_repo.cfg, now=later)["cards"][0]
     assert card["wall_s"] >= 0 and card["spend"] == 1.25
+
+
+@pytest.fixture(autouse=True)
+def _no_cached_board_figures():
+    from agentflow import views
+
+    views._DIGEST_CACHE.clear()
+    yield
+    views._DIGEST_CACHE.clear()
+
+
+def _count_reads(monkeypatch, run):
+    """The run's event-log reads by the board's own figures (other readers, such as `list_runs`, are not counted)."""
+    from agentflow import views
+
+    reads = []
+    real = views._digest
+
+    def digest(run_, today, events=None):
+        reads.append(run_.events.path)
+        return real(run_, today, events)
+
+    monkeypatch.setattr(views, "_digest", digest)
+    return reads
+
+
+def test_the_board_reads_an_unchanged_run_once(dash, monkeypatch):
+    from agentflow.views import board
+
+    run = finished_run(dash.flow)
+    reads = _count_reads(monkeypatch, run)
+    board(dash.flow.root, dash.flow.cfg)
+    board(dash.flow.root, dash.flow.cfg)
+    assert reads.count(run.events.path) == 1
+    run.emit("run_archived", by="me")
+    board(dash.flow.root, dash.flow.cfg)
+    assert reads.count(run.events.path) == 2  # a changed log is read again
+
+
+def test_a_live_runs_cached_figures_expire(dash, monkeypatch):
+    from datetime import UTC, timedelta
+
+    from agentflow.views import board
+
+    run = awaiting(dash.flow)
+    run.emit("step_started", key="plan/plan")  # not ended: its metrics are live
+    reads = _count_reads(monkeypatch, run)
+    t0 = datetime.now(UTC)
+    first = board(dash.flow.root, dash.flow.cfg, now=t0)
+    assert first["cards"][0]["run_id"] == run.id
+    board(dash.flow.root, dash.flow.cfg, now=t0 + timedelta(seconds=5))
+    assert len(reads) == 1
+    later = board(dash.flow.root, dash.flow.cfg, now=t0 + timedelta(seconds=31))
+    assert len(reads) == 2
+    assert later["cards"][0]["wall_s"] > first["cards"][0]["wall_s"]  # a quiet live run's wall time keeps counting
+
+
+def test_an_ended_runs_cached_figures_never_expire_but_a_new_day_misses(dash, monkeypatch):
+    from datetime import UTC, timedelta
+
+    from agentflow.views import board
+
+    run = finished_run(dash.flow)
+    reads = _count_reads(monkeypatch, run)
+    t0 = datetime.now(UTC)
+    board(dash.flow.root, dash.flow.cfg, now=t0)
+    board(dash.flow.root, dash.flow.cfg, now=t0 + timedelta(seconds=3600))
+    assert len(reads) == 1 or t0.astimezone().date() != (t0 + timedelta(seconds=3600)).astimezone().date()
+    reads.clear()
+    board(dash.flow.root, dash.flow.cfg, now=t0 + timedelta(days=2))  # spend_today depends on the date
+    assert len(reads) == 1
+
+
+def test_board_figures_cache_is_capped_and_a_failed_stat_skips_it(dash, monkeypatch):
+    from datetime import UTC
+
+    from agentflow import views
+
+    run = finished_run(dash.flow)
+    now = datetime.now(UTC)
+    monkeypatch.setattr(views, "_METRICS_CACHE_MAX", 2)
+    views._DIGEST_CACHE.update({("a",): None, ("b",): None})
+    views._board_figures(run, dash.flow.cfg, now)
+    assert len(views._DIGEST_CACHE) == 2 and ("a",) not in views._DIGEST_CACHE  # the oldest is evicted first
+    views._DIGEST_CACHE.clear()
+    reads = _count_reads(monkeypatch, run)
+    real_stat = Path.stat
+
+    def failing(self, *a, **k):
+        if self == run.events.path and sys._getframe(1).f_code.co_name == "_board_figures":
+            raise OSError("gone")  # only the board's own stat fails; reading the log still works
+        return real_stat(self, *a, **k)
+
+    monkeypatch.setattr(Path, "stat", failing)
+    digest, metrics = views._board_figures(run, dash.flow.cfg, now)
+    views._board_figures(run, dash.flow.cfg, now)
+    assert not views._DIGEST_CACHE and len(reads) == 2 and metrics["cost_usd"] == 1.25 and digest["fixes"] == {}
 
 
 def test_the_board_carries_the_done_modules_and_the_note_and_a_lane_that_is_not_the_module_lane_sees_none(bdash):
