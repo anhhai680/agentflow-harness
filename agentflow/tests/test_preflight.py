@@ -7,9 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from agentflow import doctor, preflight
+from agentflow import doctor, preflight, run_control
+from agentflow.events import LOCK_NAME, lock_state
 from agentflow.hitl import NotWaiting, approve, reject
 from agentflow.pipeline import RunOptions, advance, start
+from agentflow.state import Run
 
 MISSING = "no-such-tool-xyz"
 
@@ -237,6 +239,53 @@ def test_recheck_waiting_leaves_a_broken_machine_and_waits_between_checks(flow_r
     assert len(calls) == 1  # too soon to check again
     run.refresh()
     assert run.state["waiting"]["kind"] == "environment" and not spawned
+
+
+def test_recheck_waiting_leaves_a_run_paused_during_the_probe(flow_repo, monkeypatch):
+    run = environment_wait(flow_repo)
+    wait = dict(run.state["waiting"])
+
+    def probe(cfg, gates, cwd):  # a human pauses the run while the machine is checked
+        run_control.pause(Run.load(flow_repo.root, run.id), by="me")
+        return GREEN
+
+    monkeypatch.setattr(preflight, "probe", probe)
+    spawned: list = []
+    assert preflight.recheck_waiting(flow_repo.cfg, flow_repo.root, spawn=spawned.append) == []
+    run.refresh()
+    assert run.state["status"] == "paused" and run.state["waiting"] == wait
+    assert not of(flow_repo, run, "hitl_approved") and not of(flow_repo, run, "environment_rechecked")
+    assert not spawned
+
+
+def test_recheck_waiting_leaves_a_run_whose_runner_is_live(flow_repo, monkeypatch):
+    calls = probes(monkeypatch, GREEN)
+    run = environment_wait(flow_repo)
+    lock = run.dir / LOCK_NAME
+    lock.write_text(str(os.getpid()), encoding="utf-8")  # the runner that raised the stop is still unwinding
+    assert lock_state(run.dir) == "live"
+    spawned: list = []
+    assert preflight.recheck_waiting(flow_repo.cfg, flow_repo.root, spawn=spawned.append) == []
+    assert not calls and not spawned and not of(flow_repo, run, "environment_rechecked")
+    assert not of(flow_repo, run, "hitl_approved")
+    lock.unlink()
+    assert preflight.recheck_waiting(flow_repo.cfg, flow_repo.root, spawn=spawned.append) == [run.id]
+    assert [r.id for r in spawned] == [run.id]
+
+
+def test_recheck_waiting_marks_a_run_it_cannot_start(flow_repo, monkeypatch):
+    probes(monkeypatch, GREEN)
+    run = environment_wait(flow_repo)
+    lines: list[str] = []
+
+    def spawn(run):
+        raise run_control.ControlError("runner.log is a symlink")
+
+    assert preflight.recheck_waiting(flow_repo.cfg, flow_repo.root, spawn=spawn, log=lines.append) == [run.id]
+    run.refresh()
+    assert run.state["waiting"] is None and run.state["status"] == "error"  # approved, and shown as needing a resume
+    assert "runner.log is a symlink" in run.state["failure"]
+    assert len(lines) == 1 and run.id in lines[0] and f"agentflow resume {run.id}" in lines[0]
 
 
 def test_recheck_waiting_never_raises(flow_repo, monkeypatch):

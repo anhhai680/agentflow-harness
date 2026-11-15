@@ -28,7 +28,7 @@ from agentflow import doctor, gates as gates_mod, hitl, run_env, safeio
 from agentflow.config import Config, Step
 from agentflow.events import lock_state, parse_iso
 from agentflow.hitl import clean_fact
-from agentflow.state import TERMINAL, Run, list_runs, runs_root
+from agentflow.state import Run, list_runs, runs_root
 
 PREFLIGHT_STEP = "preflight"
 CACHE_NAME = "preflight.json"
@@ -223,7 +223,8 @@ def recheck_waiting(cfg: Config, repo: Path, spawn: Callable[[Run], object] | No
                     log: Callable[[str], object] | None = None) -> list[str]:
     """Check the machine again for every run waiting on an `environment` stop, and approve each one whose checks pass
     as the runner (`by: runner`, with a note, so the runner does not check it again), then start its runner with
-    `spawn` when none holds it. A stop is checked at most once every `autonomy.ENV_POLL_S` seconds.
+    `spawn`. A stop is checked at most once every `autonomy.ENV_POLL_S` seconds. A run whose runner is still live (it
+    is unwinding from the stop) waits for the next call, so the run is never approved with nothing to resume it.
 
     Returns the ids of the runs it approved. It never raises: an error is one line to `log` (stderr by default), and
     the other runs are still checked."""
@@ -242,21 +243,46 @@ def recheck_waiting(cfg: Config, repo: Path, spawn: Callable[[Run], object] | No
         return approved
     for run in runs:
         try:
-            if _recheck(cfg, run, spawn):
-                approved.append(run.id)
+            if not _recheck(cfg, run):
+                continue
         except Exception as exc:  # noqa: BLE001 - one run's error never stops the others
             say(f"environment re-check of {run.id} failed: {type(exc).__name__}: {exc}")
+            continue
+        approved.append(run.id)
+        _start(run, spawn, say)
     return approved
 
 
-def _recheck(cfg: Config, run: Run, spawn: Callable[[Run], object]) -> bool:
-    """`recheck_waiting` for one run; True when it approved the run's `environment` stop."""
-    from agentflow.autonomy import AUTO_BY, ENV_POLL_S  # it imports this module
+def _start(run: Run, spawn: Callable[[Run], object], say: Callable[[str], object]) -> None:
+    """Start the runner of a run `_recheck` approved. When that fails, the run is marked `error` (`runner_error`), as a
+    runner that died is, so it shows as needing `agentflow resume` rather than as running with nothing behind it."""
+    try:
+        spawn(run)
+    except Exception as exc:  # noqa: BLE001 - recorded on the run and logged, never raised
+        error = f"the runner could not be started after the machine checks passed: {exc}"
+        try:
+            run.emit("runner_error", error=error, exception=type(exc).__name__)
+        except Exception as emit_exc:  # noqa: BLE001
+            error += f" (and the run could not be marked: {emit_exc})"
+        say(f"{run.id}: {error}; `agentflow resume {run.id}` starts it")
 
+
+def _waits_alone(run: Run) -> bool:
+    """Whether `run` waits on an `environment` stop with no runner behind it. Only such a run is approved and started:
+    a paused run must not be started behind the human who paused it, and a live runner is still unwinding."""
     waiting = run.state["waiting"]
-    # Only a run that waits: a paused run's runner must not be started behind the human who paused it.
-    if run.state["status"] != "waiting_human" or waiting is None or waiting.get("kind") != hitl.ENVIRONMENT:
+    return (run.state["status"] == "waiting_human" and waiting is not None
+            and waiting.get("kind") == hitl.ENVIRONMENT and lock_state(run.dir) != "live")
+
+
+def _recheck(cfg: Config, run: Run) -> bool:
+    """`recheck_waiting` for one run; True when it approved the run's `environment` stop, which then needs its runner
+    started."""
+    from agentflow.autonomy import AUTO_BY, ENV_FIXED, ENV_POLL_S  # it imports this module
+
+    if not _waits_alone(run):
         return False
+    waiting = run.state["waiting"]
     key = waiting["key"]
     events = run.events.read()
     checked = [e for e in events if e["type"] == "environment_rechecked" and e.get("key") == key]
@@ -268,11 +294,10 @@ def _recheck(cfg: Config, run: Run, spawn: Callable[[Run], object]) -> bool:
     if not held or not worktree:
         return False
     outcome = probe(cfg, [str(name) for name in held[-1].get("gates") or []], Path(worktree))
-    with run.locked():
+    with run.locked():  # decided on the run as it is now: a human may have paused it, or a runner started
         now = run.state["waiting"]
-        if (run.state["status"] in TERMINAL or now is None or now.get("kind") != hitl.ENVIRONMENT
-                or now.get("key") != key or now.get("since") != waiting.get("since")):
-            return False  # a human acted while the machine was checked
+        if not _waits_alone(run) or now.get("key") != key or now.get("since") != waiting.get("since"):
+            return False
         run.emit("environment_rechecked", by=AUTO_BY, key=key, ok=outcome.ok, digest=outcome.digest)
         if not outcome.ok:
             return False
@@ -280,7 +305,5 @@ def _recheck(cfg: Config, run: Run, spawn: Callable[[Run], object]) -> bool:
             hitl.approve(run, key, by=AUTO_BY, note=FIXED_NOTE)
         except hitl.NotWaiting:
             return False
-        run.emit("stop_classified", key=key, stop_class=hitl.ENVIRONMENT, action="environment_fixed")
-    if lock_state(run.dir) != "live":
-        spawn(run)
+        run.emit("stop_classified", key=key, stop_class=hitl.ENVIRONMENT, action=ENV_FIXED)
     return True
