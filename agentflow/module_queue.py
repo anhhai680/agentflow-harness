@@ -48,6 +48,7 @@ _MODULE_ID = sources.MODULE_ID
 _STARTED = re.compile(r"^Started (\S+) in ", re.MULTILINE)
 _LIVE = ("running", "refining", "waiting_human", "awaiting_approval", "paused", "ready")
 _ACTIVE = ("running", "refining")
+FREE_HOLDS = ("ci_pending",)  # a run held for one of these (`state["hold"]["reason"]`) occupies no queue slot
 STALL_GRACE_S = 120  # a run just started by `--detach` holds no lock until its background runner takes it
 
 
@@ -529,7 +530,7 @@ def _assess(
         return entry, False, problem or f"run {run.id} crashed: {crashed}; resume it (`agentflow resume {run.id}`)"
     if status in _ACTIVE:
         entry["status"] = "running"
-        return entry, True, problem
+        return entry, (run.state.get("hold") or {}).get("reason") not in FREE_HOLDS, problem
     entry["status"] = "waiting"
     if status in ("failed", "cancelled"):  # holds no slot, is never restarted: only a person can decide
         why = f": {_first_line(run.state['failure'])}" if status == "failed" and run.state.get("failure") else ""

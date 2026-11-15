@@ -115,6 +115,16 @@ def test_the_form_sets_the_watchdog(shipped):
     assert load_config(shipped).watchdog.no_progress_min == 15
 
 
+def test_the_form_sets_the_ci_watch(shipped):
+    proposal = form(shipped, (["ci", "watch_max_h"], 6))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).ci["watch_max_h"] == 6
+    for bad in (-1, 721):
+        with pytest.raises(EditError):
+            form(shipped, (["ci", "watch_max_h"], bad))
+
+
 def test_an_optional_text_field_set_to_null_removes_the_key(shipped):
     proposal = form(shipped, (["phases", "verify", "model"], None))
     assert changed_lines(proposal.diff) == ["-    model: sonnet"]

@@ -1604,3 +1604,39 @@ def test_watchdog_no_progress_min_must_be_zero_or_more(tmp_cfg):
     assert [(i.path, i.message) for i in found if i.level == "error"] == [("watchdog.nope", "unknown watchdog key")]
     assert load_config(tmp_cfg({"watchdog": {"no_progress_min": 12.5}})).watchdog.no_progress_min == 12.5
     assert load_config(tmp_cfg({"watchdog": None})).watchdog.no_progress_min == 0
+
+
+def test_ci_watch_max_h_defaults_off_and_may_be_left_out(sparse_repo, tmp_cfg):
+    assert load_config(pack.pack_config(sparse_repo)).ci["watch_max_h"] == 0  # the engine layer supplies it, off
+    owned = load_config(tmp_cfg())  # a pack that writes its own workflow, `ci` included, without the key: off too
+    assert "watch_max_h" not in owned.ci and not errors(validate(owned, tmp_cfg().parent.parent))
+
+
+def test_ci_watch_max_h_must_be_finite_and_zero_or_more(tmp_cfg):
+    for bad in (-1, float("inf"), float("nan"), 721, 10**400, True):
+        found = issues_for(tmp_cfg, {"ci": {"watch_max_h": bad}})
+        assert [i.path for i in found if i.level == "error"] == ["ci.watch_max_h"], bad
+    for good in (0, 0.05, 6, 720):
+        assert not errors(issues_for(tmp_cfg, {"ci": {"watch_max_h": good}})), good
+    found = issues_for(tmp_cfg, {"watchdog": {"no_progress_min": float("nan")}})
+    assert [i.path for i in found if i.level == "error"] == ["watchdog.no_progress_min"]
+    found = issues_for(tmp_cfg, {"watchdog": {"no_progress_min": float("inf")}})
+    assert [i.path for i in found if i.level == "error"] == ["watchdog.no_progress_min"]
+
+
+def test_watchdog_no_progress_min_loads_as_a_float_and_an_oversized_int_as_inf(tmp_cfg):
+    """A 400-digit integer never reaches the watcher thread's `limit / 4` as an int: it loads as `inf`, which
+    `validate` refuses."""
+    loaded = load_config(tmp_cfg({"watchdog": {"no_progress_min": 15}})).watchdog.no_progress_min
+    assert loaded == 15 and isinstance(loaded, float)
+    huge = load_config(tmp_cfg({"watchdog": {"no_progress_min": 10**400}})).watchdog.no_progress_min
+    assert huge == float("inf")
+    found = issues_for(tmp_cfg, {"watchdog": {"no_progress_min": 10**400}})
+    assert [i.path for i in found if i.level == "error"] == ["watchdog.no_progress_min"]
+
+
+def test_watchdog_no_progress_min_is_capped_at_a_day(tmp_cfg):
+    found = issues_for(tmp_cfg, {"watchdog": {"no_progress_min": 1441}})
+    assert [i.path for i in found if i.level == "error"] == ["watchdog.no_progress_min"]
+    for good in (0, 0.02, 10, 1440):  # no floor for a small positive value: the watchdog's own tests use 0.02
+        assert not errors(issues_for(tmp_cfg, {"watchdog": {"no_progress_min": good}})), good

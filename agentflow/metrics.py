@@ -9,7 +9,8 @@ phase and step at that moment, and to one **bucket**, the thing the run was doin
   the whole gap for a run older than `duration_s` (that step is then flagged `approx`).
 - `human`: a stop, a phase approval or a ready phase waits on a person (`hitl_raised`,
   `phase_approval_raised`, `phase_ready`) until they act.
-- `ci`: the PR's checks are being watched (`ci_watching`).
+- `ci`: the PR's checks are being watched (`ci_watching`), or the run is held watching checks still pending
+  after `ci.timeout_min` (`run_held` with a reason in `HELD_BUCKETS`).
 - `hold`: a usage limit or an outage holds the run (`run_held` .. `run_hold_ended`).
 - `down`: no runner is going: paused, stopped on an error, or a silent gap longer than `stall_s` (a
   killed runner). A run not finished whose last event is older than `stall_s` is `stalled`.
@@ -42,6 +43,7 @@ WAITS = {
     "hitl_raised": "human", "phase_approval_raised": "human", "phase_ready": "human",
     "ci_watching": "ci", "run_held": "hold", "run_paused": "down", "runner_error": "down",
 }
+HELD_BUCKETS = {"ci_pending": "ci"}  # a `run_held` reason charged to a bucket of its own; any other is `hold`
 # Events that end a wait: a person acted, the runner came back, or work started again.
 WAIT_ENDS = {
     "hitl_answered", "hitl_approved", "phase_approved", "phase_rejected", "run_resumed", "run_hold_ended",
@@ -144,7 +146,7 @@ class _Fold:
         if etype in WAIT_ENDS:
             self.wait, self.wait_target = None, None
         if etype in WAITS:
-            self.wait = WAITS[etype]
+            self.wait = HELD_BUCKETS.get(str(ev.get("reason")), "hold") if etype == "run_held" else WAITS[etype]
             self.wait_target = (_phase_of(key) or ev.get("phase") or self.phase, key if key and "/" in str(key) else None)
         handler = getattr(self, f"_on_{etype}", None)
         if handler is not None:

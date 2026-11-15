@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +22,7 @@ LINK = "https://github.com/acme/repo/actions/runs/111/job/222"
 PIPE = {"gate_sets": {"build": ["ok"], "verify": ["ok"], "setup": []},
         "ci": {"poll_s": 0, "appear_min": 0, "timeout_min": 0}}
 PATIENT = {**PIPE, "ci": {"poll_s": 0, "appear_min": 1, "timeout_min": 1}}
+WATCH = {**PATIENT, "ci": {**PATIENT["ci"], "watch_max_h": 1}}
 RED = "build/regression_test"
 GOOD_TEST = {"result": {"status": "done", "summary": "red", "signals": {"test_command": "test -f fixed.txt"}}}
 FIXED = {"write": {"fixed.txt": "ok\n"}, "result": {"status": "done", "summary": "fixed"}}
@@ -318,3 +321,132 @@ def test_a_link_that_failed_at_finish_is_tried_again_each_ci_round_until_it_hold
     ready = next(i for i, c in enumerate(gh.calls()) if c[:2] == ["pr", "ready"])
     mutations = [i for i, c in enumerate(gh.calls()) if c[:2] == ["api", "graphql"]]
     assert mutations[-1] < ready
+
+
+# --------------------------------------------------------------------------- CI still pending is watched, not a stop
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """`ci_lane`'s clock, 60 s on at every reading (`monotonic` and `time` apart) and no sleeping; the global
+    `time` module is untouched."""
+    marks = {"monotonic": 0.0, "time": time.time()}
+
+    def reader(name: str):
+        def read() -> float:
+            marks[name] += 60
+            return marks[name]
+        return read
+
+    monkeypatch.setattr(ci_lane, "time", SimpleNamespace(monotonic=reader("monotonic"), time=reader("time"),
+                                                         sleep=lambda seconds: None))
+    return marks
+
+
+@pytest.fixture
+def notified(monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr("agentflow.hitl.notify", lambda cfg, title, message, run=None: seen.append(message))
+    return seen
+
+
+def watching(timeout_min: float = 1, watch_max_h: float = 1) -> dict:
+    return {**WATCH, "ci": {**WATCH["ci"], "timeout_min": timeout_min, "watch_max_h": watch_max_h}}
+
+
+def test_pending_checks_past_the_timeout_are_watched(flow_repo, gh, clock, notified):
+    gh.play(PENDING, PENDING, PENDING, PASS)
+    run = to_ship(flow_repo, WATCH)
+    assert go(flow_repo, run) == "done"
+    assert gh.did("pr", "ready", URL)
+    held = flow_repo.events(run, "run_held")
+    assert [e["reason"] for e in held] == ["ci_pending"] and held[0]["key"] == "ship/ci"
+    assert len(flow_repo.events(run, "run_hold_ended")) == 1
+    assert not flow_repo.events(run, "hitl_raised")
+    assert len([m for m in notified if "needs nothing from you" in m]) == 1
+    assert run.state["hold"] is None
+
+
+def test_a_gh_error_or_no_checks_during_the_watch_keeps_watching(flow_repo, gh, clock):
+    gh.play(PENDING, PENDING, {"stderr": "HTTP 502", "exit": 1}, NONE, PASS)
+    run = to_ship(flow_repo, WATCH)
+    assert go(flow_repo, run) == "done"
+    assert not flow_repo.events(run, "hitl_raised")
+    assert len(flow_repo.events(run, "run_held")) == 1 and len(flow_repo.events(run, "run_hold_ended")) == 1
+
+
+def test_the_watch_gives_up_after_watch_max_h(flow_repo, gh, clock):
+    gh.play(PENDING)
+    run = to_ship(flow_repo, watching(timeout_min=1, watch_max_h=0.05))  # 3 minutes of watching
+    assert go(flow_repo, run) == "waiting_human"
+    assert run.state["waiting"]["kind"] == "ci_failed"
+    assert "of watching" in run.state["waiting"]["summary"]
+    assert len(flow_repo.events(run, "run_held")) == 1 and len(flow_repo.events(run, "run_hold_ended")) == 1
+    types = [e["type"] for e in run.events.read()]
+    assert types.index("run_hold_ended") < types.index("hitl_raised")
+    assert run.state["hold"] is None
+
+
+def test_no_checks_forever_during_the_watch_gives_up(flow_repo, gh, clock):
+    gh.play(PENDING, NONE)
+    run = to_ship(flow_repo, watching(timeout_min=1, watch_max_h=0.05))
+    assert go(flow_repo, run) == "waiting_human"
+    assert "of watching" in run.state["waiting"]["summary"]
+    assert len(flow_repo.events(run, "run_hold_ended")) == 1
+
+
+def test_an_exception_during_the_watch_ends_the_hold(flow_repo, gh, clock, monkeypatch):
+    gh.play(PENDING)
+    run = to_ship(flow_repo, WATCH)
+    real = ci_lane.pr_checks
+    calls = {"n": 0}
+
+    def third_fails(worktree, url):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("boom")
+        return real(worktree, url)
+
+    monkeypatch.setattr("agentflow.ci_lane.pr_checks", third_fails)
+    with pytest.raises(RuntimeError, match="boom"):
+        go(flow_repo, run)
+    assert len(flow_repo.events(run, "run_hold_ended")) == 1
+    run.refresh()
+    assert run.state["hold"] is None
+
+
+def test_a_pause_ends_the_ci_watch(flow_repo, gh, clock, monkeypatch):
+    gh.play(PENDING, PENDING, PENDING, PASS)
+    run = to_ship(flow_repo, WATCH)
+    real = ci_lane.pr_checks
+    state = {"n": 0}
+
+    def third(worktree, url):
+        state["n"] += 1
+        if state["n"] == 3:
+            pause(run, "me")
+        return real(worktree, url)
+
+    monkeypatch.setattr("agentflow.ci_lane.pr_checks", third)
+    assert go(flow_repo, run) == "paused"
+    assert len(flow_repo.events(run, "run_held")) == 1 and len(flow_repo.events(run, "run_hold_ended")) == 1
+    assert not gh.did("pr", "ready", URL)
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    assert gh.did("pr", "ready", URL)
+
+
+def test_the_watch_off_stops_as_today(flow_repo, gh):
+    gh.play(PENDING)
+    run = to_ship(flow_repo)
+    assert "watch_max_h" not in flow_repo.cfg.ci  # the fixture pack writes its own `ci` without it: the watch is off
+    assert go(flow_repo, run) == "waiting_human"
+    summary = run.state["waiting"]["summary"]
+    assert "did not settle" in summary and "of watching" not in summary
+    assert not flow_repo.events(run, "run_held")
+
+
+def test_a_gh_error_at_the_timeout_with_the_watch_off_stops_as_today(flow_repo, gh):
+    gh.play({"stderr": "HTTP 502", "exit": 1})
+    run = to_ship(flow_repo)
+    assert go(flow_repo, run) == "waiting_human"
+    assert "HTTP 502" in run.state["waiting"]["summary"] and not flow_repo.events(run, "run_held")

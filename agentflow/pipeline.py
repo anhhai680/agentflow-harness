@@ -311,6 +311,8 @@ class _Loop:
         if not state.get("worktree"):
             raise ValueError(f"{run.id} has no worktree recorded; runs are started with `agentflow run`")
         self.worktree = Path(state["worktree"])
+        if state.get("hold"):  # a runner starting holds nothing yet: this hold is one a dead runner left open
+            run.emit("run_hold_ended", key=state["hold"]["key"])
         if state["status"] == "ready":  # a human chose to go on: `--to` no longer ends the run here
             self.opts.to_phase = None
         if state["status"] in ("paused", "error", "ready"):  # a human resumed, or the last runner stopped on an error

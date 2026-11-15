@@ -353,6 +353,23 @@ def test_queue_ready_run_holds_a_slot_and_is_not_a_crash(qrepo, monkeypatch):
     assert queue_tick(qrepo.cfg, qrepo.root, 2, go) == ["crm"]
 
 
+@pytest.mark.parametrize("reason, started", [("ci_pending", ["crm"]), ("usage limit", [])])
+def test_a_run_watching_ci_frees_its_slot(qrepo, monkeypatch, reason, started):
+    write(qrepo.root, "docs/plans/2026-10-28-platform.md", PLAN_DONE)
+    merged(monkeypatch)
+    run = _feature_run(qrepo, "staff-auth", [("run_held", {"key": "ship/ci", "reason": reason,
+                                                            "until": "2026-11-15T12:00:00+00:00"})])
+    assert run.state["status"] == "running" and run.state["hold"]["reason"] == reason
+    lock = run.lock()
+    assert lock.acquire()  # its runner is live
+    try:
+        messages: list[str] = []
+        assert queue_tick(qrepo.cfg, qrepo.root, 1, Starter(qrepo), log=messages.append) == started
+        assert not [m for m in messages if "crashed" in m]
+    finally:
+        lock.release()
+
+
 def marked_done_after(phase: str) -> list[tuple[str, dict]]:
     return [("phase_started", {"phase": phase}), ("phase_ready", {"phase": phase}),
             ("run_marked_done", {"phase": phase, "by": "me"}), ("run_finished", {})]

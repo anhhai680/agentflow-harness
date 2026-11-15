@@ -157,6 +157,22 @@ def test_holds_ci_and_a_pause_are_their_own_buckets():
     assert minutes(phase(m, "ship")["buckets"]) == {"ci": 10}
 
 
+def test_a_ci_pending_hold_is_ci_time():
+    log = Log().add("phase_started", phase="ship")
+    log.add("run_held", key="ship/ci", reason="ci_pending", until="x")
+    log.at(100 / 60).add("run_hold_ended", key="ship/ci")
+    m = log.metrics()
+    assert m["buckets"]["ci"] == 100 and m["buckets"]["hold"] == 0
+
+
+def test_other_holds_stay_hold_time():
+    log = Log().add("phase_started", phase="build")
+    log.at(1).add("run_held", key="build/build", reason="outage", until="x")
+    log.at(1 + 100 / 60).add("run_hold_ended", key="build/build")
+    m = log.metrics()
+    assert m["buckets"]["hold"] == 100 and m["buckets"]["ci"] == 0
+
+
 def test_a_silent_gap_longer_than_any_call_is_a_runner_that_was_down():
     log = Log().add("phase_started", phase="define")
     log.at(0).add("agent_started", agent="claude", pid=1, model="opus", effort="medium", step="define/idea")

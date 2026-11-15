@@ -59,7 +59,9 @@ AUTONOMY_KEYS = ("non_blocking_severities", "finding_rounds", "resolve_kinds", "
                  "human_question_kinds")
 # The `kind` of a `needs_human` question. `boundary`: the repository's docs reserve the decision for a human.
 QUESTION_KINDS = ("spec_gap", "ambiguity", "conflict", "review_dispute", "boundary", "other")
-CI_KEYS = ("poll_s", "appear_min", "timeout_min", "fix_rounds", "rerun_rounds", "sync_rounds")
+CI_KEYS = ("poll_s", "appear_min", "timeout_min", "fix_rounds", "rerun_rounds", "sync_rounds", "watch_max_h")
+CI_OPTIONAL = ("watch_max_h",)  # missing from a pack that writes its own `ci` block: 0 (off)
+CI_WATCH_MAX_H = 720  # `ci.watch_max_h` above this (30 days) is a typo, not a plan
 FLOOR_BLOCKING = ("critical", "high", "medium")  # severities that always block, whatever `non_blocking_severities` lists
 STEP_KEYS = (
     "id",
@@ -178,6 +180,7 @@ NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition"
                   CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed", "environment")
 PREFLIGHT_KEYS = ("enabled",)
 WATCHDOG_KEYS = ("no_progress_min",)
+WATCHDOG_MAX_MIN = 1440  # `watchdog.no_progress_min` above a day is a typo, not a plan
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -584,6 +587,26 @@ def _number(data: dict, key: str, path: str, default: float) -> float:
     if isinstance(value, bool):
         raise ConfigError(_join(path, key), "expected int or float, got bool")
     return value
+
+
+def _float(data: dict, key: str, path: str, default: float) -> float:
+    """`_number` as a float: an integer too large for one is `inf`, which `validate` refuses, so no oversized int
+    reaches arithmetic that would raise `OverflowError` (the watchdog thread divides the limit)."""
+    value = _number(data, key, path, default)
+    try:
+        return float(value)
+    except OverflowError:
+        return math.inf
+
+
+def _finite(value: object) -> bool:
+    """A number that is neither infinite nor NaN; an integer too large for a float is not finite either."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _kind_name(kind: type | tuple[type, ...]) -> str:
@@ -1066,7 +1089,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             failed_attempts=_optional(recovery, "failed_attempts", "recovery", int, 3),
         ),
         preflight=Preflight(enabled=_optional(preflight, "enabled", "preflight", bool, False)),
-        watchdog=Watchdog(no_progress_min=_number(watchdog, "no_progress_min", "watchdog", 0)),
+        watchdog=Watchdog(no_progress_min=_float(watchdog, "no_progress_min", "watchdog", 0)),
         autonomy=_optional(raw, "autonomy", "", dict, {}),
         resolve_step=builder.step(raw["resolve_step"], "resolve_step") if raw.get("resolve_step") else None,
         retro_step=builder.step(raw["retro_step"], "retro_step") if raw.get("retro_step") else None,
@@ -1795,9 +1818,12 @@ class _Validator:
                 self.error(f"preflight.{key}", "unknown preflight key")
 
     def watchdog(self) -> None:
-        """`watchdog.no_progress_min`: 0 (off) or a number of minutes; a key that is not one of this block's is a typo."""
-        if not self.cfg.watchdog.no_progress_min >= 0:
-            self.error("watchdog.no_progress_min", "no_progress_min must be 0 (off) or a positive number of minutes")
+        """`watchdog.no_progress_min`: 0 (off) or a finite number of minutes up to a day; a key that is not one of this
+        block's is a typo."""
+        minutes = self.cfg.watchdog.no_progress_min
+        if not _finite(minutes) or not 0 <= minutes <= WATCHDOG_MAX_MIN:
+            self.error("watchdog.no_progress_min", "no_progress_min must be 0 (off) or a finite number of minutes, "
+                       f"at most {WATCHDOG_MAX_MIN} (a day)")
         block = self.cfg.raw.get("watchdog")
         for key in block if isinstance(block, dict) else ():
             if key not in WATCHDOG_KEYS:
@@ -1957,10 +1983,14 @@ class _Validator:
                 self.error(f"autonomy.resolve_kinds.{kind}", "attempts must be a whole number of at least 1")
         for key in CI_KEYS:
             value = cfg.ci.get(key)
+            if value is None and key in CI_OPTIONAL:  # a pack that writes its own `ci` block may leave it out: off
+                continue
             if value is None and any(step.type == "ci" for phase in cfg.phases.values() for step in phase.steps):
                 self.error(f"ci.{key}", "a ci step needs this setting")
-            elif value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0):
-                self.error(f"ci.{key}", "must be a number, 0 or more")
+            elif value is not None and (not _finite(value) or value < 0):
+                self.error(f"ci.{key}", "must be a finite number, 0 or more")
+            elif key == "watch_max_h" and value > CI_WATCH_MAX_H:
+                self.error("ci.watch_max_h", f"watch_max_h is hours of watching pending checks: at most {CI_WATCH_MAX_H}")
         for key in cfg.ci:
             if key not in CI_KEYS:
                 self.error(f"ci.{key}", "unknown ci key")

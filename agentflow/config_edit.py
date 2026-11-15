@@ -129,7 +129,8 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
     ]),
     ("Environment", "Checks that keep a run from waiting on the machine.", [
         (("preflight", "enabled"), "Check the machine before a run starts", {"kind": "bool"}),
-        (("watchdog", "no_progress_min"), "End a session with no progress after (min, 0 = off)", _NUM),
+        (("watchdog", "no_progress_min"), "End a session with no progress after (min, 0 = off)",
+         {"kind": "number", "min": 0, "max": 1440}),
     ]),
     ("Effort", "How the runner sizes each step's reasoning effort.", [
         (("effort", "sizing"), "Size each step before it starts", {"kind": "bool"}),
@@ -174,6 +175,8 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("ci", "timeout_min"), "Pending timeout (min)", _NUM),
         (("ci", "fix_rounds"), "Fix rounds", _INT),
         (("ci", "rerun_rounds"), "Rerun rounds", _INT),
+        (("ci", "watch_max_h"), "Watch pending checks after the timeout for (h, 0 = stop)",
+         {"kind": "number", "min": 0, "max": 720}),
     ]),
     ("Human in the loop", "Reminders and parking.", [
         (("hitl", "remind_after_h"), "Remind after (h)", _NUM),
