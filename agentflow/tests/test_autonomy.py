@@ -538,6 +538,16 @@ def test_spent_attempts_are_recorded_as_a_repeated_failure_once(auto, notified):
     assert repeated == [(RED, None, "repeated_failure", "human")]
 
 
+def test_a_resolver_that_names_repeated_failure_still_gets_the_runners_record(auto, notified):
+    auto.script({RED: [BLOCKED] * 3, RESOLVE: [done("lại nữa", stop_class="repeated_failure")],
+                 f"{RED}/resolve-2": [done("vẫn chưa")]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "waiting_human"
+    assert not autonomy.Resolver(auto.cfg, run, auto.executor(run)).take_over()  # spent again, no human in between
+    repeated = [c for c in classified(auto, run) if c[2] == "repeated_failure"]
+    assert repeated == [(RED, RESOLVE, "repeated_failure", "none"), (RED, None, "repeated_failure", "human")]
+
+
 def test_stops_outside_a_resolve_phase_are_a_humans(auto, notified):
     auto.script({"define/debug": [BLOCKED]})
     run = start(auto.cfg, auto.root, "bug", {"task": "đăng nhập lỗi"}, RunOptions())

@@ -385,9 +385,10 @@ class Resolver:
         return "confirmed"
 
     def _record_repeated(self, key: str) -> None:
-        """A stop whose resolve attempts are used goes to a human: say so once, until a human acts on `key` again."""
+        """A stop whose resolve attempts are used goes to a human: say so once, until a human acts on `key` again.
+        Only the runner's own record (`action: human`) counts; a resolver that named the class records `none`."""
         if any(e["type"] == "stop_classified" and e.get("key") == key and e.get("stop_class") == "repeated_failure"
-               for e in _since_human(self.run.events.read(), key)):
+               and e.get("action") == "human" for e in _since_human(self.run.events.read(), key)):
             return
         self.run.emit("stop_classified", key=key, stop_class="repeated_failure", action="human")
 
