@@ -5,6 +5,7 @@ Routes:
 - `GET /` (exactly `/`) is the page shell: it holds no run data, so it needs no token. `agentflow dashboard`
   prints `http://127.0.0.1:<port>/#token=<token>`; the fragment never reaches the server or its log, and
   the page keeps the token in `sessionStorage`, so a reload works. Every other route needs the token.
+- `GET /ui/<name>.js`, the page's scripts, from a fixed list; they hold no run data, so they need no token.
 - `GET /api/info` (the harness name and the engine version the page shows in its header),
   `GET /api/board` (every lane, or `?lane=<name>`), `GET /api/workflow`, `GET /api/agents`,
   `GET /api/runs/<id>` (the card detail, its time and cost included), `GET /api/scorecard` (the Metrics tab's scorecard), `GET /api/metrics` (time and cost over
@@ -39,8 +40,8 @@ It can approve checkpoints and start agents, so it is locked down:
 - POST bodies are `application/json` objects of at most 64 KB (the config routes: the config's size limit plus
   64 KB); run ids must have the run-id shape and name
   an existing run directory, and files are read only through the run's own paths, size-capped;
-- every response is `no-store`, `nosniff`, `no-referrer`, not frameable, with a strict CSP (the page's one
-  script and style carry a fresh nonce); JSON escapes `<`, `>` and `&`, and the page renders all run text
+- every response is `no-store`, `nosniff`, `no-referrer`, not frameable, with a strict CSP (the page's
+  scripts and style carry a fresh nonce); JSON escapes `<`, `>` and `&`, and the page renders all run text
   with `textContent`;
 - the terminal log names each refused request's status and, when it has one, its `error` text on one line,
   cut to `LOG_REASON_MAX` characters; the token never appears in it.
@@ -73,6 +74,10 @@ from agentflow.state import Run, runs_root
 from agentflow.views import agents_view, board, lessons_view, metrics_view, run_detail, workflow_view
 
 PAGE = Path(__file__).resolve().with_name("dashboard.html")
+UI_DIR = Path(__file__).resolve().with_name("dashboard_ui")
+UI_SCRIPTS = ("core.js", "dialogs.js", "board.js", "drawer.js", "workflow.js", "agents.js", "metrics.js", "lessons.js",
+              "settings.js", "main.js")  # in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
+UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024
 LOG_REASON_MAX = 200  # the characters of a refused request's `error` its log line keeps
 MIN_TOKEN_CHARS = 22  # 128 bits of token_urlsafe
@@ -391,6 +396,15 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._send(403, b"", "text/plain; charset=utf-8")
             return
+        match = UI_ROUTE.fullmatch(urlsplit(self.path).path)
+        if match:  # the page's scripts carry no run data, so they need no token, but the same-site check stays
+            if not self._same_site():
+                self._send(403, b"", "text/plain; charset=utf-8")
+            elif match.group(1) not in UI_SCRIPTS:
+                self._error(404, "not found")
+            else:
+                self._send(200, (UI_DIR / match.group(1)).read_bytes(), "text/javascript; charset=utf-8")
+            return
         self._handle(self._get)
 
     def do_POST(self) -> None:
@@ -475,7 +489,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _page(self) -> None:
         nonce = secrets.token_urlsafe(18)
-        html = PAGE.read_text(encoding="utf-8").replace("{{NONCE}}", nonce)
+        tags = "\n".join('<script nonce="{{NONCE}}" src="/ui/%s"></script>' % name for name in UI_SCRIPTS)
+        html = PAGE.read_text(encoding="utf-8").replace("{{SCRIPTS}}", tags).replace("{{NONCE}}", nonce)
         self._send(200, html.encode("utf-8"), "text/html; charset=utf-8", PAGE_CSP.format(n=nonce))
 
     def _post(self, path: str, query: dict) -> None:

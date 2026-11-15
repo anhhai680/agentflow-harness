@@ -16,13 +16,19 @@ from pathlib import Path
 import pytest
 
 from agentflow import hitl, pack
-from agentflow.dashboard import make_server
+from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.state import Run, runs_root
 from agentflow.views import _badge
 from conftest import PYTHON_CONFIG, run_git
 
 TOKEN = "k3y-" + "x" * 40
 AGENTFLOW = Path(__file__).resolve().parents[1]
+
+
+def page_source() -> str:
+    """The page shell followed by each of its scripts, in load order: what the source-pinning tests read."""
+    return "\n".join([(AGENTFLOW / "dashboard.html").read_text(encoding="utf-8"),
+                      *((UI_DIR / name).read_text(encoding="utf-8") for name in UI_SCRIPTS)])
 
 
 @dataclass
@@ -122,7 +128,7 @@ def test_info_names_the_engine_version(dash):
     assert status == 200 and headers["content-type"].startswith("application/json")
     assert json.loads(body) == {"name": "agentflow-harness", "version": pack.ENGINE_VERSION}
     assert dash.get("/api/info", token=None)[0] == 403
-    page = dash.get("/", token=None)[2].decode("utf-8")
+    page = page_source()
     assert 'id="version"' in page and "/api/info" in page
 
 
@@ -282,7 +288,7 @@ def test_a_card_shows_the_soft_and_the_hard_budget(dash):
     assert detail["state"]["soft_budget_usd"] == defaults.run_budget_usd
     (row,) = metrics_view(dash.flow.root, dash.flow.cfg)["runs"]
     assert (row["soft_budget"], row["budget"]) == (defaults.run_budget_usd, defaults.run_budget_hard_usd)
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     for needle in ("card.soft_budget", "st.soft_budget_usd", "r.soft_budget", "data.run_budget_hard_usd"):
         assert needle in source
 
@@ -316,7 +322,7 @@ def test_a_card_shows_a_review_a_refine_round_skipped(dash):
     assert card_of(dash)["review_skipped"] == [{"key": "build/build/task-2/review", "task": 2, "reason": "unchanged"}]
     run.emit("review_result", key="build/build/task-2/review", round=1, findings=[], blocking=0, blocking_findings=[])
     assert card_of(dash)["review_skipped"] == []  # a review that ran replaces the skip
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     assert re.search(r"review_skipped[^\n]*gate-skip", source)  # drawn in the existing skipped style
 
 
@@ -344,17 +350,46 @@ def test_page_is_served_with_a_nonce_and_no_unsafe_dom_sinks(dash):
     csp = headers["content-security-policy"]
     nonce = re.search(r"'nonce-([A-Za-z0-9_\-]+)'", csp).group(1)
     page = body.decode("utf-8")
-    assert f'<script nonce="{nonce}">' in page and "{{" not in page
+    assert f'<script nonce="{nonce}" src="/ui/core.js"></script>' in page and "{{" not in page
+    assert PAGE_CSP == ("default-src 'none'; script-src 'nonce-{n}'; style-src 'nonce-{n}'; connect-src 'self'; "
+                        "img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
     assert "connect-src 'self'" in csp and "'unsafe-inline'" not in csp and "'unsafe-eval'" not in csp
     assert dash.get("/", token=None)[1]["content-security-policy"] != csp  # a fresh nonce each time
 
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function",
                  "setTimeout(\"", "setTimeout('", " style=\"", "javascript:"):
         assert sink not in source, sink
     assert not re.search(r"https?://", source)  # no external scripts, fonts or requests
     assert "textContent" in source and "EventSource" in source and "prefers-color-scheme" in source
     assert "X-Agentflow-Token" in source
+
+
+def test_the_page_loads_each_ui_script_once_in_order(dash):
+    status, headers, body = dash.get("/", token=None)
+    nonce = re.search(r"'nonce-([A-Za-z0-9_\-]+)'", headers["content-security-policy"]).group(1)
+    tags = re.findall(r'<script nonce="([^"]+)" src="/ui/([a-z_]+\.js)"></script>', body.decode("utf-8"))
+    assert tags == [(nonce, name) for name in UI_SCRIPTS]
+    assert "<script nonce" not in body.decode("utf-8").replace('<script nonce="%s" src=' % nonce, "")  # no inline script
+
+
+def test_every_ui_file_is_listed():
+    assert sorted(p.name for p in UI_DIR.glob("*.js")) == sorted(UI_SCRIPTS)
+    assert UI_SCRIPTS[0] == "core.js" and UI_SCRIPTS[-1] == "main.js"
+
+
+def test_ui_scripts_need_no_token_but_keep_the_host_check(dash):
+    status, headers, body = dash.get("/ui/core.js", token=None)
+    assert status == 200 and headers["content-type"] == "text/javascript; charset=utf-8"
+    assert headers["cache-control"] == "no-store" and headers["x-content-type-options"] == "nosniff"
+    assert b"const TOKEN" in body
+    assert dash.get("/ui/core.js", token=None, headers={"Host": "evil.example"})[0] == 403
+
+
+@pytest.mark.parametrize("path", ["/ui/evil.js", "/ui/../dashboard.py", "/ui/%2e%2e/dashboard.py",
+                                  "/ui/core.js/", "/ui/CORE.js", "/ui/dashboard.html"])
+def test_only_listed_ui_scripts_are_served(dash, path):
+    assert dash.get(path)[0] == 404
 
 
 # --------------------------------------------------------------------------- actions
@@ -615,7 +650,7 @@ def test_tokenless_page_is_a_shell_without_run_data(dash):
     page = body.decode("utf-8")
     assert status == 200 and headers["content-type"].startswith("text/html")
     assert run.id not in page and "bi-mat" not in page and "ghi chú" not in page
-    assert "agentflow dashboard" in page  # it tells a visitor without a token where the URL comes from
+    assert "agentflow dashboard" in page_source()  # it tells a visitor without a token where the URL comes from
     assert "default-src 'none'" in headers["content-security-policy"]
     assert headers["referrer-policy"] == "no-referrer" and headers["cache-control"] == "no-store"
     assert dash.get("/api/board", token=None)[0] == 403  # the data stays behind the token
@@ -633,9 +668,8 @@ def test_dashboard_url_carries_the_token_in_the_fragment():
 
 
 def test_page_script_bootstraps_the_token_from_the_fragment_and_keeps_it_for_reloads():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
-    script = source.split("<script", 1)[1]
-    boot = script[script.index("const TOKEN"):script.index("const ui")]
+    source = page_source()
+    boot = source[source.index("const TOKEN"):source.index("const ui")]
     assert "location.hash" in boot  # the first visit reads #token=...
     assert 'sessionStorage.getItem("agentflow-token")' in boot  # a reload falls back to the stored token
     assert 'sessionStorage.setItem("agentflow-token"' in boot
@@ -645,7 +679,7 @@ def test_page_script_bootstraps_the_token_from_the_fragment_and_keeps_it_for_rel
 
 def test_run_drawer_never_hands_null_to_replace_children():
     """The DOM prints a null argument as the text "null"; only `el()` skips null children."""
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     block = source[source.index("drawer.replaceChildren(\n"):source.index("function closeDrawer")]
     assert not re.search(r":\s*null\b", block)
 
@@ -1057,7 +1091,7 @@ def test_starting_a_blocked_issue_is_a_409(ddash):
 
 
 def test_the_page_renders_the_blocks_line():
-    page = (Path(__file__).parents[1] / "dashboard.html").read_text(encoding="utf-8")
+    page = page_source()
     assert 'text: "Blocks: " + names(item.blocks)' in page
 
 
@@ -1075,7 +1109,7 @@ def test_a_pack_without_a_backlog_block_still_syncs_its_issues(idash, monkeypatc
 
 def test_the_page_names_no_lane_phase_or_path(bdash):
     """The page is framework code: lanes, phases and the form fields all come from the board data."""
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     cfg = bdash.flow.cfg
     for word in [*cfg.lanes, "CAPABILITY-MAP", "docs/", "origin/", "flow/"]:
         assert not re.search(rf"(?<![A-Za-z-]){re.escape(word)}(?![A-Za-z-])", source), word
@@ -1085,7 +1119,7 @@ def test_the_page_names_no_lane_phase_or_path(bdash):
 
 
 def test_the_page_shows_one_workflow_with_no_lane_filter():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     for gone in ('id="lane"', "ui.lane", 'lane: ""', "All lanes", "inLane", '"?lane="', '"Lane · phase › step"'):
         assert gone not in source, gone
     for card in ("text: card.lane", "text: item.lane"):
@@ -1094,7 +1128,7 @@ def test_the_page_shows_one_workflow_with_no_lane_filter():
 
 
 def test_a_workflow_step_is_badged_only_when_it_runs_for_one_kind_of_work():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     block = source[source.index("function onlyFor"):source.index("function renderWorkflow")]
     assert "step.lanes.length !== 1" in block  # a step for two lanes or more carries no badge
     assert 'workLabel(step.lanes[0]) + " only"' in block
@@ -1102,7 +1136,7 @@ def test_a_workflow_step_is_badged_only_when_it_runs_for_one_kind_of_work():
 
 
 def test_a_step_with_no_skill_is_labelled_by_what_it_is():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     start = source.index("function stepSkills")
     block = source[start:source.index("\n}\n", start)]
     # only an agent step that opts out of TDD (the eval `change`) says so; a gate like `setup` calls no agent
@@ -1112,13 +1146,13 @@ def test_a_step_with_no_skill_is_labelled_by_what_it_is():
 
 
 def test_a_phase_heading_keeps_its_name_apart_from_its_approval():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     rule = next(line for line in source.splitlines() if line.startswith(".col h2 {"))
     assert "gap:" in rule and "flex-wrap: wrap" in rule  # a long approval note wraps, never runs into "PLAN"
 
 
 def test_the_new_task_form_asks_the_kind_of_work_with_radios():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     block = source[source.index("function newTaskDialog"):source.index("function renderBoard")]
     assert "What kind of work?" in block and 'type: "radio"' in block and "workLabel(name)" in block
     assert "nt-lane" not in block
@@ -1136,7 +1170,7 @@ def test_every_lane_label_is_shown_in_the_real_config():
 
 
 def test_the_page_wires_the_backlog_actions():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     for needle in ('"/api/backlog"', '"/api/backlog/start"', '"/api/backlog/remove"', "+ New task", "Stop after",
                    "Can run in parallel", "Runs after:", "Parallel with:", "Start", "Remove", "after_choices",
                    "new_task", "lane_phases", "sync_note", "first_phase", "issues_note", "Taken elsewhere",
@@ -1148,7 +1182,7 @@ def test_the_page_wires_the_backlog_actions():
 
 
 def test_a_blocked_backlog_card_gets_no_start_button_or_drag_handle():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     block = source[source.index("function backlogNode"):source.index("function renderBoard")]
     assert 'const canStart = item.status === "parallel" || item.status === "ready"' in block  # not blocked, not starting
     assert "draggable: canStart" in block and "if (canStart) buttons.push" in block and "if (canStart) dragFrom" in block
@@ -1156,7 +1190,7 @@ def test_a_blocked_backlog_card_gets_no_start_button_or_drag_handle():
 
 def test_a_message_raised_while_the_dialog_is_open_shows_inside_it():
     """`showModal()` puts the dialog in the top layer, above any z-index: a #toast there is hidden under it."""
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     markup = source[source.index('<dialog id="dlg">'):source.index("</dialog>")]
     assert '<p id="dlg-msg" class="gate-bad" role="alert" hidden></p>' in markup
     assert markup.index('id="dlg-msg"') < markup.index('class="dlg-buttons"')  # under the fields, above OK
@@ -1172,7 +1206,7 @@ def test_a_message_raised_while_the_dialog_is_open_shows_inside_it():
 
 
 def test_the_dialog_clears_its_message_and_floats_a_success_message_once_closed():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     block = source[source.index("function dialog(title"):source.index("function rejectDialog")]
     assert block.count("clearDialogMessage()") >= 2  # on open, and again before each OK
     assert block.index("clearDialogMessage()") < block.index("dlg.showModal()")
@@ -1185,7 +1219,7 @@ def test_the_dialog_clears_its_message_and_floats_a_success_message_once_closed(
 
 def test_a_submit_that_outlives_its_dialog_neither_closes_nor_writes_into_the_next():
     """OK, then Escape (or another dialog) before the answer: the late answer floats and closes nothing."""
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     block = source[source.index("function dialog(title"):source.index("function rejectDialog")]
     assert "const run = ++dialogRun;" in block
     ok = block[block.index('ok.addEventListener("click"'):block.index('cancel.addEventListener')]
@@ -1253,7 +1287,7 @@ def test_metrics_view_has_a_scorecard_section(dash):
 
 
 def test_the_scorecard_compares_with_runs_after_the_baseline_unless_the_range_is_custom(dash):
-    page = dash.get("/", token=None)[2].decode("utf-8")
+    page = page_source()
     scorecard = page[page.index('id="scorecard"'):]
     assert scorecard.index("Scorecard</h2>") < scorecard.index('<p id="sc-range" class="muted"></p>') < scorecard.index('id="sc-body"')
     query = page[page.index("function scorecardQuery()"):page.index("async function loadScorecard()")]
@@ -1292,7 +1326,7 @@ def test_the_board_carries_the_done_modules_and_the_note_and_a_lane_that_is_not_
 
 
 def test_the_page_shows_the_done_modules_in_a_details_that_keeps_its_open_state():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     block = source[source.index("function doneNode"):source.index("function renderBoard")]
     assert 'el("details"' in block and '"Done (" +' in block and "ontoggle" in block
     assert "ui.doneOpen" in block and "open: ui.doneOpen" in block
@@ -1323,7 +1357,7 @@ def test_lessons_api_lists_the_lessons_and_their_effects(dash):
 
 
 def test_the_lessons_tab_links_evidence_to_the_run_drawer_and_escapes_text():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     assert 'id="tab-lessons"' in source and 'id="lessons-view"' in source and '"lessons"' in source
     block = source[source.index("function sourceNodes"):source.index("async function loadLessons")]
     assert "openDrawer(src.run_id)" in block and "data.note" in block
@@ -1344,6 +1378,6 @@ def test_board_carries_retro_due(dash):
 
 
 def test_the_page_shows_the_retro_banner_from_safe_text_only():
-    source = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    source = page_source()
     assert 'id="retro-due"' in source and "data.retro_due" in source and '"agentflow retro"' in source
     assert "innerHTML" not in source
