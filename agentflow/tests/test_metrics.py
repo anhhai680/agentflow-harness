@@ -320,3 +320,14 @@ def test_metrics_table_skips_the_breakdown_with_no_wall_time():
 
     text = metrics_table(_view(Log().add("run_started")))
     assert "wall time:" not in text and "Wall time:" not in text and "Lead time:" not in text
+
+
+def test_metrics_table_totals_line_starts_with_blocked_when_no_run_reached_a_ready_pr():
+    from agentflow.views import metrics_table
+
+    key = "build/build/task-1/implement"
+    log = Log().add("run_started").add("phase_started", phase="build").call(0, 60, key, 1.0, session="s1")
+    log.at(60).add("hitl_raised", key=key, kind="blocked").at(120).add("hitl_answered", key=key).add("run_finished")
+    lines = metrics_table(_view(log)).splitlines()
+    assert "Lead time:" not in "\n".join(lines)
+    assert any(line.startswith("Blocked on a human 50.0% of wall time") for line in lines)

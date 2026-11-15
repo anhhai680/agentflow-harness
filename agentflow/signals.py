@@ -4,7 +4,8 @@ A signal is a number with a key: a family (`gate_first_pass`) and, for most fami
 The families are a fixed vocabulary (`FAMILIES`): a lesson names the signal it wants to move as a target in this
 vocabulary (`parse_target`), and the same keys are averaged over many runs (`aggregate_signals`).
 
-- `run_signals(events, metrics)`: the signals of one run. A key appears only when the run gives evidence for it
+- `run_signals(events, metrics, *, full_suite=())`: the signals of one run (`full_suite` is the pack's verify gate
+  names, which `full_suite_runs` counts). A key appears only when the run gives evidence for it
   (a run that never ran gate `lint` has no `gate_first_pass:lint`), so a mean over runs is a mean over the runs it
   applies to. The counts in `COUNT_FAMILIES` are the exception: `ci_rounds`, `rollovers`, `progress_not_updated`
   and `rework_pct` are always present (0 when nothing happened), `fix_attempts:<p>` and `human_rejections:<p>`

@@ -884,7 +884,8 @@ def metrics_table(view: dict) -> str:
                 parts.append(f"Lead time: median {_short(statistics.median(leads) * 3600)}, "
                              f"mean {_short(statistics.fmean(leads) * 3600)} "
                              f"({len(leads)} run{'' if len(leads) == 1 else 's'} reached a ready PR)")
-            parts.append(f"blocked on a human {totals['bucket_pct']['human']:.1f}% of wall time")
+            blocked = f"blocked on a human {totals['bucket_pct']['human']:.1f}% of wall time"
+            parts.append(blocked if leads else blocked.capitalize())
             suite = (view.get("signals") or {}).get("full_suite_runs")
             if suite:
                 parts.append(f"full suite runs: mean {suite['mean']:g} per run")

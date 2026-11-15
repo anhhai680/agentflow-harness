@@ -21,17 +21,30 @@ def _run(run_id: str, lane: str, ended: str) -> SimpleNamespace:
     return SimpleNamespace(id=run_id, state={"pipeline": lane}, events=SimpleNamespace(read=lambda: events))
 
 
+class _FakeRuns(dict):
+    """`{id: (lane, ended, signals)}`; `full_suite` lists the `full_suite` each `run_row` call received."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.full_suite: list = []
+
+
 @pytest.fixture
 def fake_runs(monkeypatch):
     """Finished runs and their signals are synthetic: `runs` is `{id: (lane, ended, signals)}`."""
-    table: dict[str, tuple[str, str, dict]] = {}
+    table = _FakeRuns()
 
     def finished(_repo, since):
         out = [_run(rid, lane, ended) for rid, (lane, ended, _s) in sorted(table.items())]
         return [r for r in out if since is None or datetime.fromisoformat(r.events.read()[0]["ts"]) > since]
 
     monkeypatch.setattr(scorecard, "finished_runs", finished)
-    monkeypatch.setattr(scorecard, "run_row", lambda run, now, **_kw: dict(table[run.id][2]))
+
+    def row(run, now, **kw):
+        table.full_suite.append(kw.get("full_suite"))
+        return dict(table[run.id][2])
+
+    monkeypatch.setattr(scorecard, "run_row", row)
     return table
 
 
@@ -135,6 +148,8 @@ def test_cli_freeze_refuses_a_second_freeze_without_replace(flow_repo, fake_runs
     cfg = ["--config", str(flow_repo.cfg.path)]
     path = runs_root(flow_repo.root) / scorecard.BASELINE
     assert main(["scorecard", "--freeze", *cfg]) == 0 and path.is_file()
+    verify = tuple(flow_repo.cfg.gate_sets["verify"])
+    assert verify and fake_runs.full_suite and set(fake_runs.full_suite) == {verify}
     capsys.readouterr()
     before = path.read_bytes()
     fake_runs["r3"] = ("feature", "2026-11-03T10:00:00+00:00", {"cost_usd": 9.0})
