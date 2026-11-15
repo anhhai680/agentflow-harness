@@ -5,7 +5,10 @@ gates' environment) and at Docker when one of them runs it. `run_preflight` adds
 for the day, and records one `preflight_checked` event. Nothing here is evidence for a run: no `gate_result` is
 written, so the run's gate counts stay what the run itself ran.
 
-It imports `hitl` at module level and `autonomy` never: `autonomy` imports this module.
+`recheck_waiting` checks the machine again for each run that waits on an `environment` stop, and approves the stop as
+the runner once the checks pass; the queue and the dashboard call it next to `hitl.remind_due`.
+
+It imports `hitl` at module level, and `autonomy` (which imports this module) only inside `recheck_waiting`.
 """
 
 from __future__ import annotations
@@ -14,19 +17,23 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from agentflow import doctor, gates as gates_mod, run_env, safeio
+from agentflow import doctor, gates as gates_mod, hitl, run_env, safeio
 from agentflow.config import Config, Step
+from agentflow.events import lock_state, parse_iso
 from agentflow.hitl import clean_fact
-from agentflow.state import Run, runs_root
+from agentflow.state import TERMINAL, Run, list_runs, runs_root
 
 PREFLIGHT_STEP = "preflight"
 CACHE_NAME = "preflight.json"
 CACHE_MAX_BYTES = 1_000_000  # a day's fingerprints are a few lines; a larger file is not ours
+FIXED_NOTE = "The machine checks pass now."  # the note on the runner's approval of an `environment` stop
 
 
 @dataclass(frozen=True)
@@ -70,6 +77,13 @@ def route_gates(cfg: Config, lane: str) -> list[str]:
             _step_gates(cfg, step, lane, names)
     _set_gates(cfg, "verify", names)
     return list(dict.fromkeys(names))
+
+
+def setup_gates(cfg: Config) -> list[str]:
+    """The gate names of `gate_sets.setup`, in order (none when the pack has no setup set)."""
+    names: list[str] = []
+    _set_gates(cfg, "setup", names)
+    return names
 
 
 def _set_gates(cfg: Config, name: str, out: list[str]) -> None:
@@ -200,3 +214,73 @@ def run_preflight(cfg: Config, run: Run, worktree: Path, key: str) -> Probe:
     run.emit("preflight_checked", ok=outcome.ok, lines=outcome.lines, digest=outcome.digest, cached=False,
              duration_s=round(time.monotonic() - started, 3))
     return outcome
+
+
+# --------------------------------------------------------------------------- environment stops
+
+
+def recheck_waiting(cfg: Config, repo: Path, spawn: Callable[[Run], object] | None = None,
+                    log: Callable[[str], object] | None = None) -> list[str]:
+    """Check the machine again for every run waiting on an `environment` stop, and approve each one whose checks pass
+    as the runner (`by: runner`, with a note, so the runner does not check it again), then start its runner with
+    `spawn` when none holds it. A stop is checked at most once every `autonomy.ENV_POLL_S` seconds.
+
+    Returns the ids of the runs it approved. It never raises: an error is one line to `log` (stderr by default), and
+    the other runs are still checked."""
+    say = log or (lambda line: sys.stderr.write(f"agentflow: {line}\n"))
+    if spawn is None:
+        from agentflow.run_control import spawn_resume
+
+        def spawn(run: Run) -> object:
+            return spawn_resume(run, None)
+
+    approved: list[str] = []
+    try:
+        runs = list_runs(repo)
+    except Exception as exc:  # noqa: BLE001 - the queue and the dashboard must go on
+        say(f"environment re-check failed: {type(exc).__name__}: {exc}")
+        return approved
+    for run in runs:
+        try:
+            if _recheck(cfg, run, spawn):
+                approved.append(run.id)
+        except Exception as exc:  # noqa: BLE001 - one run's error never stops the others
+            say(f"environment re-check of {run.id} failed: {type(exc).__name__}: {exc}")
+    return approved
+
+
+def _recheck(cfg: Config, run: Run, spawn: Callable[[Run], object]) -> bool:
+    """`recheck_waiting` for one run; True when it approved the run's `environment` stop."""
+    from agentflow.autonomy import AUTO_BY, ENV_POLL_S  # it imports this module
+
+    waiting = run.state["waiting"]
+    # Only a run that waits: a paused run's runner must not be started behind the human who paused it.
+    if run.state["status"] != "waiting_human" or waiting is None or waiting.get("kind") != hitl.ENVIRONMENT:
+        return False
+    key = waiting["key"]
+    events = run.events.read()
+    checked = [e for e in events if e["type"] == "environment_rechecked" and e.get("key") == key]
+    last = parse_iso(checked[-1].get("ts")) if checked else None
+    if last is not None and datetime.now(UTC) - last < timedelta(seconds=ENV_POLL_S):
+        return False
+    held = [e for e in events if e["type"] == "environment_waiting" and e.get("key") == key]
+    worktree = run.state.get("worktree")
+    if not held or not worktree:
+        return False
+    outcome = probe(cfg, [str(name) for name in held[-1].get("gates") or []], Path(worktree))
+    with run.locked():
+        now = run.state["waiting"]
+        if (run.state["status"] in TERMINAL or now is None or now.get("kind") != hitl.ENVIRONMENT
+                or now.get("key") != key or now.get("since") != waiting.get("since")):
+            return False  # a human acted while the machine was checked
+        run.emit("environment_rechecked", by=AUTO_BY, key=key, ok=outcome.ok, digest=outcome.digest)
+        if not outcome.ok:
+            return False
+        try:
+            hitl.approve(run, key, by=AUTO_BY, note=FIXED_NOTE)
+        except hitl.NotWaiting:
+            return False
+        run.emit("stop_classified", key=key, stop_class=hitl.ENVIRONMENT, action="environment_fixed")
+    if lock_state(run.dir) != "live":
+        spawn(run)
+    return True

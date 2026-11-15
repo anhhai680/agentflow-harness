@@ -534,6 +534,24 @@ def test_rejecting_a_stop_outside_a_task_refines_the_phase(run, cfg, macos_calls
     assert "scope" not in [e for e in run.events.read() if e["type"] == "phase_rejected"][-1]
 
 
+def test_an_environment_stop_cannot_be_rejected(run, cfg, macos_calls):
+    path = raise_hitl(cfg, run, hitl.ENVIRONMENT, "build/fix", "build/fix waits on this machine: `pnpm` is missing")
+    text = path.read_text(encoding="utf-8")
+    assert "approves this itself once the checks pass" in text and f"agentflow cancel {run.id}" in text
+    with pytest.raises(NotWaiting, match="an environment stop has nothing to refine"):
+        reject(run, "build/fix", "me", "try again")
+    assert run.state["waiting"]["kind"] == "environment" and not run.state.get("refine")
+
+
+def test_raise_hitl_notify_overrides_who_is_told(run, cfg, macos_calls):
+    raise_hitl(cfg, run, "blocked", "build/a", "the runner settles it")  # `None`: today's rule, quiet for the runner
+    assert not macos_calls
+    raise_hitl(cfg, run, "blocked", "build/b", "told anyway", notify=True)
+    assert len(macos_calls) == 1
+    raise_hitl(cfg, run, "checkpoint", "plan/doubt_offer", "never told", notify=False)
+    assert len(macos_calls) == 1
+
+
 # ------------------------------------------------------------------ inbox listing and CLI
 
 

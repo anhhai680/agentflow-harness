@@ -30,6 +30,9 @@ RESULT_STATUSES = ("done", "blocked", "needs_human", "effort_change", "unchanged
 # What a resolver may name as a stop's cause (`StepResult.stop_class`). Advisory: the runner acts on `flaky` and
 # `environment` (`autonomy.Resolver`) and records the rest.
 STOP_CLASSES = ("environment", "flaky", "guard_false_positive", "spec_gap", "impact", "repeated_failure")
+# The stop a resolver's `environment` becomes when the machine checks fail (`autonomy.Resolver._hand_over`): one inbox
+# item, which `approve` checks again first and `preflight.recheck_waiting` approves once the checks pass.
+ENVIRONMENT = "environment"
 QUESTION_ID = re.compile(r"^[\w.\-]+$")
 HEADING = re.compile(r"^### (\S+) — (.*)$", re.MULTILINE)
 ANSWER_LINE = re.compile(r"^Answer:[ \t]*(.*)$", re.MULTILINE)
@@ -366,18 +369,24 @@ def _title_for(cfg: Config, run: Run) -> str:
 EVENT_EXTRA_MAX = 4000  # the stop report kept in `hitl_raised`: the last characters, where a log's cause is
 
 
-def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questions: list[Question] | tuple = (), extra: str = "") -> Path:
-    """Stop the run for a human: write the inbox file, record `hitl_raised`, notify. Returns the inbox path."""
+def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questions: list[Question] | tuple = (),
+               extra: str = "", notify: bool | None = None) -> Path:
+    """Stop the run for a human: write the inbox file, record `hitl_raised`, notify. Returns the inbox path.
+
+    `notify`: None is the usual rule (quiet while the runner settles the stop itself: it tells a human if it cannot);
+    True always tells a human, False never does (a stop a human was already told of)."""
     questions = list(questions)
     how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).", _how_to_go_on(run, kind, key, bool(questions), cfg)]
     path = run.inbox_path(key)
     render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
     run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
              questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:])
-    from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
+    if notify is None:
+        from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
 
-    if not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions]):
-        notify(cfg, _title_for(cfg, run), summary or f"{key} needs a decision", run=run)
+        notify = not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions])
+    if notify:
+        notify_run(cfg, run, summary or f"{key} needs a decision")
     return path
 
 
@@ -448,6 +457,11 @@ def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Confi
         return (f"Fix what is listed below, then `agentflow approve {run.id} {key}` runs preflight again; nothing has "
                 f"been spent yet. If a listed setup gate fails on the base branch itself, fix it there, or set "
                 f"`preflight.enabled: false`; `agentflow cancel {run.id}` ends the run.")
+    if kind == ENVIRONMENT:
+        return ("The runner checks the machine again whenever `agentflow queue` or the dashboard is running, and "
+                f"approves this itself once the checks pass. To go on now, fix it and `agentflow approve {run.id} {key}` "
+                f"(it checks again first), or add `--note \"...\"` to go on without the check; `agentflow cancel {run.id}` "
+                "ends the run.")
     return (f"Fix what the stop needs, then `agentflow approve {run.id} {key}` resumes the step's agent session where "
             f"it stopped (it is not marked done); {reject}")
 
@@ -641,6 +655,9 @@ def reject(run: Run, target: str, by: str, note: str) -> None:
         kind, name = _resolve(run, target)
         if (run.state["waiting"] or {}).get("kind") == "preflight_failed":
             raise NotWaiting("preflight has nothing to refine: approve it once the machine is fixed, or cancel the run")
+        if (run.state["waiting"] or {}).get("kind") == ENVIRONMENT:
+            raise NotWaiting("an environment stop has nothing to refine: approve it once the machine is fixed, "
+                             "or cancel the run")
         phase = name if kind == "phase" else (run.state["waiting"]["phase"] or name.split("/")[0])
         scoped = rejected_scope(run, phase, name) if kind == "checkpoint" else None
         open_refine(run, phase, by, note, {"key": name} if kind == "checkpoint" else {},

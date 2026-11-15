@@ -178,3 +178,71 @@ def test_preflight_off_changes_nothing(flow_repo):
     run = begin(flow_repo)
     assert go(flow_repo, run) == "awaiting_approval"
     assert not of(flow_repo, run, "preflight_checked")
+
+
+# --------------------------------------------------------------------------- re-checking an environment stop
+
+RED = preflight.Probe(False, ["gate:lint: `pnpm` is not on PATH"], "e" * 64, "f" * 64)
+GREEN = preflight.Probe(True, [], "0" * 64, "f" * 64)
+KEY = "build/fix"
+
+
+def probes(monkeypatch, *answers):
+    """`preflight.probe` gives the next of `answers` (the last one repeats, an exception is raised); returns its calls."""
+    calls: list[tuple[list[str], Path]] = []
+
+    def probe(cfg, gates, cwd):
+        calls.append((list(gates), Path(cwd)))
+        answer = answers[min(len(calls), len(answers)) - 1]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(preflight, "probe", probe)
+    return calls
+
+
+def environment_wait(flow):
+    """A run waiting on an `environment` stop on `KEY`, with no runner holding its lock."""
+    run = flow.new_run()
+    run.emit("run_updated", worktree=str(flow.root))
+    run.emit("environment_waiting", key=KEY, digest=RED.digest, lines=RED.lines, gates=["lint"], kind="gate_failed")
+    run.emit("hitl_raised", kind="environment", key=KEY, phase="build", summary=f"{KEY} waits on this machine: x")
+    assert run.state["waiting"]["kind"] == "environment"
+    return run
+
+
+def test_recheck_waiting_approves_a_fixed_machine_and_resumes(flow_repo, monkeypatch):
+    calls = probes(monkeypatch, GREEN)
+    run = environment_wait(flow_repo)
+    spawned: list = []
+    assert preflight.recheck_waiting(flow_repo.cfg, flow_repo.root, spawn=spawned.append) == [run.id]
+    assert calls == [(["lint"], flow_repo.root)]
+    run.refresh()
+    assert run.state["waiting"] is None
+    approved = of(flow_repo, run, "hitl_approved")[-1]
+    assert approved["by"] == "runner" and approved["key"] == KEY and approved["note"]
+    assert [(e["ok"], e["by"]) for e in of(flow_repo, run, "environment_rechecked")] == [(True, "runner")]
+    assert [e["action"] for e in of(flow_repo, run, "stop_classified")] == ["environment_fixed"]
+    assert [r.id for r in spawned] == [run.id]
+
+
+def test_recheck_waiting_leaves_a_broken_machine_and_waits_between_checks(flow_repo, monkeypatch):
+    calls = probes(monkeypatch, RED)
+    run = environment_wait(flow_repo)
+    spawned: list = []
+    assert preflight.recheck_waiting(flow_repo.cfg, flow_repo.root, spawn=spawned.append) == []
+    assert [e["ok"] for e in of(flow_repo, run, "environment_rechecked")] == [False]
+    assert preflight.recheck_waiting(flow_repo.cfg, flow_repo.root, spawn=spawned.append) == []
+    assert len(calls) == 1  # too soon to check again
+    run.refresh()
+    assert run.state["waiting"]["kind"] == "environment" and not spawned
+
+
+def test_recheck_waiting_never_raises(flow_repo, monkeypatch):
+    probes(monkeypatch, RuntimeError("probe broke"))
+    environment_wait(flow_repo)
+    lines: list[str] = []
+    assert preflight.recheck_waiting(flow_repo.cfg, flow_repo.root, spawn=lambda run: None, log=lines.append) == []
+    assert len(lines) == 1 and "probe broke" in lines[0]
+    assert preflight.recheck_waiting(flow_repo.cfg, flow_repo.root, spawn=lambda run: None) == []  # stderr by default

@@ -1020,7 +1020,7 @@ def run_queue(
     """Tick every `interval` seconds until interrupted (Ctrl-C ends it cleanly); `once` ticks one time.
 
     A pack with no `work_source` has no modules to start, so the queue refuses to run."""
-    from agentflow import hitl
+    from agentflow import hitl, preflight
 
     if cfg.work_source is None:
         raise ValueError("this pack has no work_source: the queue has no modules to start")
@@ -1036,6 +1036,8 @@ def run_queue(
                 for module in queue_tick(cfg, repo, max_parallel, start, log=say):
                     say(f"started {module}")
                 hitl.remind_due(cfg, repo, datetime.now(UTC))  # waits past `hitl.remind_after_h` are notified again
+                for run_id in preflight.recheck_waiting(cfg, repo, log=say):  # a fixed machine ends its wait
+                    say(f"{run_id}: the machine checks pass now, so the runner approved its environment stop")
                 if once:
                     return 0
                 sleep(interval)

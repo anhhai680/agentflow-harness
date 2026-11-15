@@ -12,6 +12,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 - `watchdog.no_progress_min` (0, off, by default) ends a step's agent session whose stream has been quiet for that many minutes and stops it as `step_timeout` (`watchdog_fired`), which a resolver may settle. While a tool call is open, and always for Codex, the limit is at least `defaults.gate_timeout_min`.
 - `preflight.enabled` (off by default) checks the machine once before a run's first phase: each program of the lane's gates is on `PATH` and starts `--version`, Docker answers when a gate runs it, and the `setup` gate set passes. A failure is one `preflight_failed` stop before any agent runs; a pass is cached for the day.
 - A resolver may name its stop's cause in `stop_class` (`environment`, `flaky`, `guard_false_positive`, `spec_gap`, `impact`, `repeated_failure`), recorded once per session as `stop_classified`. For `flaky`, when the resolver changed nothing, the runner reruns each failed gate alone twice and records one `flaky:` run fact if they all pass. A stop whose resolve attempts are used is recorded as `repeated_failure`.
+- A resolver's `environment` is checked by probing the step's gate programs. When the probes fail too, the stop becomes one `environment` inbox item, notified once per distinct problem. `approve` checks the machine again first (`--note` skips the check), `reject` is refused, and `agentflow queue` and the dashboard approve it themselves and resume the run once the checks pass.
 
 ## [2.7] - 2026-11-15
 

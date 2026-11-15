@@ -855,6 +855,8 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "preflight_checked": ("ok",),
     "watchdog_fired": ("key",),
     "stop_classified": ("key", "stop_class"),
+    "environment_waiting": ("key", "digest"),
+    "environment_rechecked": ("key", "ok"),
 }
 TEXT_FIELDS = ("key", "step", "phase", "model", "kind")
 HANDLER_ERRORS = (KeyError, TypeError, AttributeError, ValueError, IndexError)

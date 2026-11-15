@@ -175,7 +175,7 @@ ON_FAIL_VALUES = ("block",)
 CONFORMANCE_FAILED = "conformance_failed"  # the audit at `finish` found an obligation with no evidence (`block` mode)
 RECONCILE_CHANGED = "reconcile_changed_conditions"  # a reconcile edit changed which steps of its phase run
 NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable",
-                  CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed")
+                  CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed", "environment")
 PREFLIGHT_KEYS = ("enabled",)
 WATCHDOG_KEYS = ("no_progress_min",)
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
