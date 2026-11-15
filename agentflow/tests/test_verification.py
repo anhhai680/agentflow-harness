@@ -49,8 +49,12 @@ def test_text_cut_ends_with_an_ellipsis_only_when_cut():
     assert story.criteria[1].criterion == "short"
 
 def test_stale_sha_only_counts_review_fixes_after_verify():
-    done = lambda seq: {"seq": seq, "type": "step_finished", "key": "verify/verify", "status": "done"}
-    fix = lambda seq, sha: {"seq": seq, "type": "step_committed", "key": "review/fix_findings", "sha": sha}
+    def done(seq):
+        return {"seq": seq, "type": "step_finished", "key": "verify/verify", "status": "done"}
+
+    def fix(seq, sha):
+        return {"seq": seq, "type": "step_committed", "key": "review/fix_findings", "sha": sha}
+
     assert v.stale_sha([done(1)]) is None
     assert v.stale_sha([fix(1, "a" * 40), done(2)]) is None              # a fix before verify's last finish
     assert v.stale_sha([done(1), fix(2, "b" * 40), done(3)]) is None     # verify ran again after it
