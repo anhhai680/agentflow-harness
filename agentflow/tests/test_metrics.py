@@ -253,6 +253,15 @@ def test_metrics_view_carries_signal_totals(flow_repo):
     assert "gate_first_pass:unit" in metrics_table(view)
 
 
+def test_metrics_view_counts_full_suite_runs_with_the_pack_verify_set(flow_repo):
+    from agentflow.views import metrics_view
+    run = flow_repo.new_run()
+    for gate in flow_repo.cfg.gate_sets["verify"]:
+        run.emit("gate_result", key="verify/verify", gate=gate, passed=True, skipped=False, duration_s=0.0)
+    run.emit("run_finished")
+    assert metrics_view(flow_repo.root, flow_repo.cfg)["runs"][0]["signals"]["full_suite_runs"] == 1
+
+
 def test_a_sizer_call_costs_its_phase_but_is_never_a_step_or_an_attempt():
     key = "build/build/task-1/implement"
     log = Log().add("phase_started", phase="build")

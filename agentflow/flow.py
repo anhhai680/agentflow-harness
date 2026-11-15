@@ -875,13 +875,14 @@ def cmd_scorecard(args: argparse.Namespace) -> int:
         date_from = date.fromisoformat(args.date_from) if args.date_from else None
         date_to = date.fromisoformat(args.date_to) if args.date_to else None
         now = datetime.now(UTC)
+        full_suite = tuple(cfg.gate_sets.get("verify") or ())
         if args.replace and not args.freeze:
             raise ValueError("--replace goes with --freeze")
         if args.freeze:
-            data = freeze(repo, args.lane, date_from, date_to, args.replace, now)
+            data = freeze(repo, args.lane, date_from, date_to, args.replace, now, full_suite=full_suite)
             print(f"froze the baseline of {', '.join(data['lanes']) or 'no lanes'}")
             return 0
-        view = scorecard_view(repo, args.lane, date_from, date_to, now)
+        view = scorecard_view(repo, args.lane, date_from, date_to, now, full_suite=full_suite)
     except FileExistsError as exc:
         print(f"error: {exc}")
         return 1

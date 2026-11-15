@@ -686,6 +686,7 @@ def metrics_view(repo: Path, cfg: Config, lane: str | None = None, date_from: da
         date_from = month_start(now)
     if date_from and date_to and date_from > date_to:
         raise ValueError(f"from {date_from} is after to {date_to}")
+    full_suite = tuple(cfg.gate_sets.get("verify") or ())
     rows = []
     for run in list_runs(repo):
         state = run.state
@@ -706,7 +707,7 @@ def metrics_view(repo: Path, cfg: Config, lane: str | None = None, date_from: da
             "pr_link": _pr_link(state),
             "started_on": day.isoformat() if day else None,
             "metrics": metrics,
-            "signals": run_signals(run.events.read(), metrics),
+            "signals": run_signals(run.events.read(), metrics, full_suite=full_suite),
         })
     rows.sort(key=lambda r: r["metrics"].get("started_at") or r["run_id"], reverse=True)
     return {
@@ -896,7 +897,8 @@ def lessons_view(repo: Path, cfg: Config, today: date | None = None) -> dict:
     today = today or now.astimezone().date()
     found = lessons_mod.load(repo)
     rows = []
-    for lesson, effect in zip(found, lessons_mod.effects(repo, found, now), strict=True):
+    full_suite = tuple(cfg.gate_sets.get("verify") or ())
+    for lesson, effect in zip(found, lessons_mod.effects(repo, found, now, full_suite=full_suite), strict=True):
         rows.append({
             "id": lesson.id,
             "title": lesson.title,

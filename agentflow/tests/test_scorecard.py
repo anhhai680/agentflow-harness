@@ -30,7 +30,7 @@ def fake_runs(monkeypatch):
         return [r for r in out if since is None or datetime.fromisoformat(r.events.read()[0]["ts"]) > since]
 
     monkeypatch.setattr(scorecard, "finished_runs", finished)
-    monkeypatch.setattr(scorecard, "run_row", lambda run, now: dict(table[run.id][2]))
+    monkeypatch.setattr(scorecard, "run_row", lambda run, now, **_kw: dict(table[run.id][2]))
     return table
 
 
@@ -143,3 +143,14 @@ def test_cli_freeze_refuses_a_second_freeze_without_replace(flow_repo, fake_runs
     assert path.read_bytes() == before
     assert main(["scorecard", "--freeze", "--replace", *cfg]) == 0
     assert "r3" in path.read_text(encoding="utf-8")
+
+
+def test_run_row_carries_the_throughput_signals(flow_repo):
+    verify = tuple(flow_repo.cfg.gate_sets["verify"])
+    run = flow_repo.new_run()
+    for gate in verify:
+        run.emit("gate_result", key="verify/verify", gate=gate, passed=True, skipped=False, duration_s=1.0)
+    run.emit("pr_marked_ready", url="u", key="ship/ci")
+    run.emit("run_finished")
+    row = scorecard.run_row(run, datetime.now(UTC), full_suite=verify)
+    assert row["full_suite_runs"] == 1 and row["lead_time_h"] >= 0 and "human_blocked_share" in row
