@@ -7,8 +7,12 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [2.7] - 2026-11-15
+
 ### Added
 
+- Three throughput signals, `lead_time_h`, `human_blocked_share` and `full_suite_runs`, for the scorecard and lesson targets.
+- `agentflow metrics` prints where each run's wall time went, as time and share per bucket, with its lead time, the share blocked on a human and its full-suite runs, and the same in total.
 - The pull request body has a `Verification` section: each acceptance criterion with what ran to prove it, what verify could not run and why, and evidence older than a review fix marked as such. Each text verify wrote is shown as code, so it cannot render, link or mention.
 - Synced issues that GitHub marks *blocked by* another issue show `Runs after:` / `Blocks:` on the Backlog and cannot start until the blocker is met, and `doctor` checks that `gh` can read issue dependencies.
 

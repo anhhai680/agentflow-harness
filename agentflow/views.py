@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import statistics
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -686,6 +687,7 @@ def metrics_view(repo: Path, cfg: Config, lane: str | None = None, date_from: da
         date_from = month_start(now)
     if date_from and date_to and date_from > date_to:
         raise ValueError(f"from {date_from} is after to {date_to}")
+    full_suite = tuple(cfg.gate_sets.get("verify") or ())
     rows = []
     for run in list_runs(repo):
         state = run.state
@@ -706,7 +708,7 @@ def metrics_view(repo: Path, cfg: Config, lane: str | None = None, date_from: da
             "pr_link": _pr_link(state),
             "started_on": day.isoformat() if day else None,
             "metrics": metrics,
-            "signals": run_signals(run.events.read(), metrics),
+            "signals": run_signals(run.events.read(), metrics, full_suite=full_suite),
         })
     rows.sort(key=lambda r: r["metrics"].get("started_at") or r["run_id"], reverse=True)
     return {
@@ -821,6 +823,26 @@ def _money(value: float, estimated: bool = False) -> str:
 SIGNAL_ROWS = 20
 
 
+def _wall_line(buckets: dict[str, float], wall_s: float, order: list[str]) -> str | None:
+    """A run's wall time by bucket (time and whole-percent share, only buckets above 0), or None with no wall time."""
+    if not wall_s or wall_s <= 0:
+        return None
+    parts = [f"{b} {_short(buckets[b])} {round(100 * buckets[b] / wall_s)}%" for b in order if buckets.get(b)]
+    return "wall time: " + " · ".join(parts) if parts else None
+
+
+def _kpi_line(signals: dict[str, float]) -> str | None:
+    """A run's throughput KPIs, each part only when its signal exists, or None when none does."""
+    parts = []
+    if signals.get("lead_time_h") is not None:
+        parts.append(f"lead time {_short(signals['lead_time_h'] * 3600)}")
+    if signals.get("human_blocked_share") is not None:
+        parts.append(f"blocked on a human {round(100 * signals['human_blocked_share'])}%")
+    if signals.get("full_suite_runs") is not None:
+        parts.append(f"full suite ×{signals['full_suite_runs']:g}")
+    return " · ".join(parts) or None
+
+
 def metrics_table(view: dict) -> str:
     """`agentflow metrics`: one block per run (a row per phase: wall, each bucket, cost, models), then totals."""
     shown = [b for b in view["buckets"] if any(r["metrics"]["buckets"].get(b) for r in view["runs"])]
@@ -834,6 +856,8 @@ def metrics_table(view: dict) -> str:
         lines.append("")
         lines.append(f"{row['run_id']} · {row['lane']} · {row['module']} · {row['status']} · "
                      f"{_short(m['wall_s'])} · {_money(m['cost_usd'], m['cost_estimated'])}{flags}")
+        lines += ["  " + extra for extra in (_wall_line(m["buckets"], m["wall_s"], view["buckets"]),
+                                             _kpi_line(row.get("signals") or {})) if extra]
         table = [["PHASE", "WALL", *[b.upper() for b in shown], "COST", "REWORK", "MODELS"]]
         for p in m["phases"]:
             if p["status"] == "skipped" and not p["wall_s"] and not p["cost_usd"]:
@@ -848,6 +872,24 @@ def metrics_table(view: dict) -> str:
         share = " · ".join(f"{b} {totals['bucket_pct'][b]:g}%" for b in view["buckets"] if totals["bucket_pct"][b])
         lines.append(f"total {_money(totals['cost_usd'])} · rework {totals['rework_pct']:g}% · "
                      f"median run {_short(totals['wall_s']['median'])} · {share}")
+        if totals["wall_s"]["total"] > 0:
+            lines += ["", f"Wall time: {_short(totals['wall_s']['total'])} over {count} run{'' if count == 1 else 's'}"]
+            lines += ["  " + line for line in _table([["BUCKET", "TIME", "SHARE"],
+                                                       *[[b, _short(totals["buckets"][b]), f"{totals['bucket_pct'][b]:.1f}%"]
+                                                         for b in view["buckets"] if totals["buckets"].get(b)]])]
+            leads = [r["signals"]["lead_time_h"] for r in view["runs"]
+                     if (r.get("signals") or {}).get("lead_time_h") is not None]
+            parts = []
+            if leads:
+                parts.append(f"Lead time: median {_short(statistics.median(leads) * 3600)}, "
+                             f"mean {_short(statistics.fmean(leads) * 3600)} "
+                             f"({len(leads)} run{'' if len(leads) == 1 else 's'} reached a ready PR)")
+            blocked = f"blocked on a human {totals['bucket_pct']['human']:.1f}% of wall time"
+            parts.append(blocked if leads else blocked.capitalize())
+            suite = (view.get("signals") or {}).get("full_suite_runs")
+            if suite:
+                parts.append(f"full suite runs: mean {suite['mean']:g} per run")
+            lines.append(" · ".join(parts))
     signals = view.get("signals") or {}
     if signals:
         lines += ["", "Signals (mean per run; a key counts the runs it applies to)"]
@@ -896,7 +938,8 @@ def lessons_view(repo: Path, cfg: Config, today: date | None = None) -> dict:
     today = today or now.astimezone().date()
     found = lessons_mod.load(repo)
     rows = []
-    for lesson, effect in zip(found, lessons_mod.effects(repo, found, now), strict=True):
+    full_suite = tuple(cfg.gate_sets.get("verify") or ())
+    for lesson, effect in zip(found, lessons_mod.effects(repo, found, now, full_suite=full_suite), strict=True):
         rows.append({
             "id": lesson.id,
             "title": lesson.title,

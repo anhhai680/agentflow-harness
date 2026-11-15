@@ -8,13 +8,15 @@ for the three this module adds (they are not lesson targets: no run's signals ca
 is the one signal with a hard limit: an obligation with no evidence at the last audit, on any current run (an SLO
 breach), and its row comes first.
 
-A run's row is its signals (`signals.run_signals`) plus `cost_usd`, `wall_h` and `human_wait_h`. The date range
-of both commands is the days the runs *ended* (local time). Nothing here changes a run.
+A run's row is its signals (`signals.run_signals`, given the pack's verify gate set so `full_suite_runs` is counted)
+plus `cost_usd`, `wall_h` and `human_wait_h`. The date range of both commands is the days the runs *ended* (local
+time). Nothing here changes a run.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Collection
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -40,11 +42,11 @@ def baseline_path(repo: Path) -> Path:
     return runs_root(repo) / BASELINE
 
 
-def run_row(run: Run, now: datetime) -> dict[str, float]:
+def run_row(run: Run, now: datetime, *, full_suite: Collection[str] = ()) -> dict[str, float]:
     """The signals of `run`, plus its cost in dollars and its wall and human-wait time in hours."""
     events = run.events.read()
     metrics = run_metrics(events, now)
-    row = run_signals(events, metrics)
+    row = run_signals(events, metrics, full_suite=full_suite)
     row["cost_usd"] = float(metrics.get("cost_usd") or 0.0)
     row["wall_h"] = float(metrics.get("wall_s") or 0.0) / 3600
     row["human_wait_h"] = float((metrics.get("buckets") or {}).get("human") or 0.0) / 3600
@@ -87,7 +89,7 @@ def load_baseline(repo: Path) -> dict | None:
 
 
 def freeze(repo: Path, lane: str | None, date_from: date | None, date_to: date | None, replace: bool,
-           now: datetime) -> dict:
+           now: datetime, *, full_suite: Collection[str] = ()) -> dict:
     """Write the baseline from the finished runs in range: per lane its run ids, the first and last end time, the
     engine version and the mean of every signal. `FileExistsError` when a baseline exists and `replace` is false;
     with `lane` and `replace`, the other lanes of the old baseline stay."""
@@ -104,7 +106,7 @@ def freeze(repo: Path, lane: str | None, date_from: date | None, date_to: date |
         group = [(e, r) for n, e, r in chosen if n == name]
         lanes[name] = {"runs": [r.id for _e, r in group], "from": group[0][0].isoformat(),
                        "to": group[-1][0].isoformat(), "engine": ENGINE_VERSION,
-                       "signals": aggregate_signals([run_row(r, now) for _e, r in group])}
+                       "signals": aggregate_signals([run_row(r, now, full_suite=full_suite) for _e, r in group])}
     data = {"frozen_at": now.astimezone(UTC).isoformat(timespec="seconds"), "lanes": lanes}
     safeio.write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
     return data
@@ -135,7 +137,7 @@ def _compare(base: dict, current: dict) -> list[dict]:
 
 
 def scorecard_view(repo: Path, lane: str | None, date_from: date | None, date_to: date | None,
-                   now: datetime) -> dict:
+                   now: datetime, *, full_suite: Collection[str] = ()) -> dict:
     """`{"baseline": bool, "lanes": {lane: [row, ...]}}`. With no dates, a lane's current runs are those that ended
     after its baseline's `to`; with a date, the runs that ended in that range (the baseline's own runs included)."""
     base = load_baseline(repo)
@@ -148,13 +150,14 @@ def scorecard_view(repo: Path, lane: str | None, date_from: date | None, date_to
         if lane is not None and name != lane:
             continue
         since = None if dated else parse_iso(frozen.get("to"))
-        current = [run_row(run, now) for _n, _e, run in _select(repo, name, date_from, date_to, since)]
+        picked = _select(repo, name, date_from, date_to, since)
+        current = [run_row(run, now, full_suite=full_suite) for _n, _e, run in picked]
         lanes[name] = _compare(frozen.get("signals") or {}, aggregate_signals(current))
     # A lane the baseline never saw has no "before", but its conformance still counts: all its finished runs in range.
     extra: dict[str, list[dict]] = {}
     for name, _e, run in _select(repo, lane, date_from, date_to):
         if name not in frozen_lanes:
-            extra.setdefault(name, []).append(run_row(run, now))
+            extra.setdefault(name, []).append(run_row(run, now, full_suite=full_suite))
     for name, rows in sorted(extra.items()):
         lanes[name] = _compare({}, aggregate_signals(rows))
     return {"baseline": True, "lanes": lanes}

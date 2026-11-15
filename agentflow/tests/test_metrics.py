@@ -253,6 +253,15 @@ def test_metrics_view_carries_signal_totals(flow_repo):
     assert "gate_first_pass:unit" in metrics_table(view)
 
 
+def test_metrics_view_counts_full_suite_runs_with_the_pack_verify_set(flow_repo):
+    from agentflow.views import metrics_view
+    run = flow_repo.new_run()
+    for gate in flow_repo.cfg.gate_sets["verify"]:
+        run.emit("gate_result", key="verify/verify", gate=gate, passed=True, skipped=False, duration_s=0.0)
+    run.emit("run_finished")
+    assert metrics_view(flow_repo.root, flow_repo.cfg)["runs"][0]["signals"]["full_suite_runs"] == 1
+
+
 def test_a_sizer_call_costs_its_phase_but_is_never_a_step_or_an_attempt():
     key = "build/build/task-1/implement"
     log = Log().add("phase_started", phase="build")
@@ -279,3 +288,46 @@ def test_a_phase_with_no_sizer_call_reports_zero_sizing_cost():
     log = Log().add("phase_started", phase="verify").add("step_started", key=key, phase="verify", mode="first")
     log.call(0, 2, key, 0.5, session="s").add("run_finished")
     assert phase(log.metrics(), "verify")["sizing_cost_usd"] == 0
+
+
+def _view(log: Log) -> dict:
+    from agentflow.metrics import BUCKETS
+    from agentflow.signals import aggregate_signals, run_signals
+
+    m = log.metrics()
+    row = {"run_id": "r1", "lane": "feature", "module": "m", "status": "done", "metrics": m,
+           "signals": run_signals(log.events, m, full_suite=("unit",))}
+    return {"lane": None, "all_time": True, "from": None, "to": None, "buckets": list(BUCKETS), "runs": [row],
+            "totals": aggregate([row]), "signals": aggregate_signals([row["signals"]])}
+
+
+def test_metrics_table_prints_the_wall_time_breakdown_and_the_kpis():
+    from agentflow.views import metrics_table
+
+    key = "build/build/task-1/implement"
+    log = Log().add("run_started").add("phase_started", phase="build").call(0, 60, key, 1.0, session="s1")
+    log.at(60).add("hitl_raised", key=key, kind="blocked").at(120).add("hitl_answered", key=key)
+    log.add("pr_marked_ready").add("run_finished")
+    lines = metrics_table(_view(log)).splitlines()
+    assert "  wall time: agent 1h00m 50% · human 1h00m 50%" in lines
+    assert "  lead time 2h00m · blocked on a human 50% · full suite ×0" in lines
+    assert ["agent", "1h00m", "50.0%"] in [line.split() for line in lines]
+    assert any(line.startswith("Lead time: median 2h00m, mean 2h00m (1 run reached a ready PR)") for line in lines)
+
+
+def test_metrics_table_skips_the_breakdown_with_no_wall_time():
+    from agentflow.views import metrics_table
+
+    text = metrics_table(_view(Log().add("run_started")))
+    assert "wall time:" not in text and "Wall time:" not in text and "Lead time:" not in text
+
+
+def test_metrics_table_totals_line_starts_with_blocked_when_no_run_reached_a_ready_pr():
+    from agentflow.views import metrics_table
+
+    key = "build/build/task-1/implement"
+    log = Log().add("run_started").add("phase_started", phase="build").call(0, 60, key, 1.0, session="s1")
+    log.at(60).add("hitl_raised", key=key, kind="blocked").at(120).add("hitl_answered", key=key).add("run_finished")
+    lines = metrics_table(_view(log)).splitlines()
+    assert "Lead time:" not in "\n".join(lines)
+    assert any(line.startswith("Blocked on a human 50.0% of wall time") for line in lines)

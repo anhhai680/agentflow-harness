@@ -301,6 +301,8 @@ NOW = datetime(2026, 11, 9, 12, 0, tzinfo=UTC)
 START = datetime(2026, 11, 1, 8, 0, tzinfo=UTC)
 LINT_LESSON = Lesson("L-0001", "Run lint", "Run the linter first.", ("build",), (), None, "gate_first_pass:lint", None)
 
+FULL_LESSON = Lesson("L-0002", "Once", "Run the suite once.", ("build",), (), None, "full_suite_runs", None)
+
 
 def _write_run(repo, n: int, *, gates=(), injected=(), cited=(), lane: str = "feature", end: str | None = "run_finished",
                extra=(), start: datetime | None = None) -> str:
@@ -408,6 +410,15 @@ def test_a_run_without_the_key_does_not_count(tmp_git):
     _runs(tmp_git, before=[("lint", False)] * 3, after=[("tests", True)] * 3, lesson="L-0001")
     (eff,) = effects(tmp_git, [LINT_LESSON], NOW)
     assert (eff.after_runs, eff.after, eff.verdict) == (0, None, "too few runs")
+
+
+def test_a_full_suite_target_is_measured_with_the_verify_set(tmp_git):
+    for n in range(4):
+        _write_run(tmp_git, n, gates=[("unit", True)])
+    for n in range(4, 7):
+        _write_run(tmp_git, n, injected=["L-0002"])
+    (eff,) = effects(tmp_git, [FULL_LESSON], NOW, full_suite=("unit",))
+    assert (eff.baseline, eff.after, eff.verdict) == (1.0, 0.0, "improved")
 
 
 def test_a_count_family_reads_an_absent_key_as_zero(tmp_git):

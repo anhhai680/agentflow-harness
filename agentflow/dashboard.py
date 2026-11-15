@@ -467,7 +467,9 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._error(400, f"bad date range: {exc}")
             return
-        self._json(200, scorecard_view(self.server.repo, lane, days["from"], days["to"], datetime.now(UTC)))
+        full_suite = tuple(self.server.cfg.gate_sets.get("verify") or ())
+        self._json(200, scorecard_view(self.server.repo, lane, days["from"], days["to"], datetime.now(UTC),
+                                       full_suite=full_suite))
 
     def _page(self) -> None:
         nonce = secrets.token_urlsafe(18)

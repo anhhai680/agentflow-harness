@@ -27,7 +27,7 @@ Anything before the first `## ` heading is the file's header and is not read.
   list dashes, so it cannot forge an entry or a key. Braces are kept as they are.
 - `read(path, prefix)` / `load(repo)`: a file (a missing one is empty, a symlink is refused), and both layers.
 - `select(lessons, phase, today, max_tokens)`: what a step's prompt carries, as one Markdown section.
-- `effects(repo, lessons, now)`: each lesson's target signal before and after the runs that carried it, with a
+- `effects(repo, lessons, now, full_suite=())`: each lesson's target signal before and after the runs that carried it, with a
   verdict. It compares runs, so it shows correlation, not cause (`CORRELATION_NOTE`).
 - `run_logs(repo)`: every run's events, read without the lock or a write (the retro digest reads runs this way too).
 """
@@ -37,7 +37,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -383,7 +383,7 @@ def run_logs(repo: Path) -> Iterator[tuple[str, list[dict]]]:
             yield folder.name, events
 
 
-def _run_facts(events: list[dict], now: datetime) -> _RunFacts | None:
+def _run_facts(events: list[dict], now: datetime, full_suite: Collection[str]) -> _RunFacts | None:
     """What `effects` needs from one run's events, or None for a retro run."""
     state = replay(events)
     if state.get("pipeline") == RETRO_PIPELINE:
@@ -397,16 +397,16 @@ def _run_facts(events: list[dict], now: datetime) -> _RunFacts | None:
         elif ev.get("type") == "lesson_cited" and isinstance(ev.get("id"), str):
             cited[ev["id"]] += 1
     counted = state.get("status") in TERMINAL
-    signals = run_signals(events, run_metrics(events, now)) if counted else {}
+    signals = run_signals(events, run_metrics(events, now), full_suite=full_suite) if counted else {}
     return _RunFacts(started, counted, frozenset(injected), cited, signals)
 
 
-def _all_runs(repo: Path, now: datetime) -> list[_RunFacts]:
+def _all_runs(repo: Path, now: datetime, full_suite: Collection[str]) -> list[_RunFacts]:
     """Every non-retro run's facts; a run whose log cannot be read is left out."""
     runs = []
     for _name, events in run_logs(repo):
         try:
-            facts = _run_facts(events, now)
+            facts = _run_facts(events, now, full_suite)
         except RUN_ERRORS:
             continue
         if facts is not None:
@@ -461,13 +461,14 @@ def _effect(lesson: Lesson, runs: list[_RunFacts]) -> LessonEffect:
                         after_mean, verdict, cited)
 
 
-def effects(repo: Path, lessons: list[Lesson], now: datetime) -> list[LessonEffect]:
+def effects(repo: Path, lessons: list[Lesson], now: datetime, *,
+            full_suite: Collection[str] = ()) -> list[LessonEffect]:
     """Each lesson's target signal over the ended, non-retro runs: the mean over the runs that carried it (after)
     against the mean over the runs without it that started before the first run that carried it (baseline). That
     first run is the earliest start among every non-retro run that carried the lesson, live ones included: a live
     run moves the cutoff (a run started beside it ran with the lesson in play, so it is no baseline) but is never an
     after-run itself. Only runs that have the target's key count, except a count family's, where a missing key is 0.
     Fewer than `MIN_AFTER_RUNS` after-runs or no baseline is `too few runs`; a missing or unknown target is
-    `not measured`."""
-    runs = _all_runs(repo, now)
+    `not measured`. `full_suite` is the pack's verify gate set, which `full_suite_runs` needs."""
+    runs = _all_runs(repo, now, full_suite)
     return [_effect(lesson, runs) for lesson in lessons]
