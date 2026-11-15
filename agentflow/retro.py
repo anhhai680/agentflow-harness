@@ -46,7 +46,7 @@ import stat
 import subprocess
 import sys
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -316,7 +316,7 @@ def _signals_table(per_run: list[dict[str, float]]) -> list[str]:
         f"| {_cell(key)} | {row['runs']} | {_number(row['mean'])} |" for key, row in rows.items()]
 
 
-def _lessons_table(repo: Path, now: datetime) -> list[str]:
+def _lessons_table(repo: Path, now: datetime, *, full_suite: Collection[str] = ()) -> list[str]:
     lessons = load(repo)
     if not lessons:
         return ["(none)"]
@@ -324,7 +324,7 @@ def _lessons_table(repo: Path, now: datetime) -> list[str]:
     expired = {lesson.id for lesson in lessons if lesson.review_by is not None and lesson.review_by < today}
     lines = ["| id | title | target | review_by | cited | baseline | after | verdict | expired |",
              "|---|---|---|---|---|---|---|---|---|"]
-    for eff in effects(repo, lessons, now):
+    for eff in effects(repo, lessons, now, full_suite=full_suite):
         lines.append(" | ".join([
             f"| {_cell(eff.id)}", _cell(eff.title), _cell(eff.target),
             eff.review_by.isoformat() if eff.review_by else "-", str(eff.cited),
@@ -357,6 +357,7 @@ def _cut(head: list[str], entries: list[str], tail: list[str], max_tokens: int) 
 def build_digest(repo: Path, cfg: Config, since: datetime | None, now: datetime) -> Digest:
     """The digest of the ended, non-retro runs whose terminal event comes after `since` (see the module doc)."""
     runs = _finished(repo, since)
+    full_suite = tuple(cfg.gate_sets.get("verify") or ())
     run_lines: list[str] = []
     entries: list[str] = []
     per_run: list[dict[str, float]] = []
@@ -366,14 +367,15 @@ def build_digest(repo: Path, cfg: Config, since: datetime | None, now: datetime)
         except RUN_ERRORS:
             metrics = {}
         try:
-            signals = run_signals(events, metrics)
+            signals = run_signals(events, metrics, full_suite=full_suite)
         except RUN_ERRORS:  # an event the signals cannot read: the run still gives its runs line and its evidence
             signals = {}
         per_run.append(signals)
         run_lines.append(_run_line(run, metrics, signals))
         entries += _entries(run.id, events)
     head = [TITLE, "", LEAD, "", "## Runs", "", *(run_lines or ["(none)"]), "", "## Evidence", ""]
-    tail = ["", "## Signals", "", *_signals_table(per_run), "", "## Lessons", "", *_lessons_table(repo, now)]
+    tail = ["", "## Signals", "", *_signals_table(per_run), "", "## Lessons", "",
+            *_lessons_table(repo, now, full_suite=full_suite)]
     evidence, truncated = _cut(head, entries, tail, cfg.memory.digest_tokens)
     return Digest("\n".join(head + evidence + tail) + "\n", tuple(run.id for run, _events in runs), truncated)
 
@@ -599,7 +601,8 @@ def _refs(refs: list[str]) -> str:
 # --------------------------------------------------------------------------- checking the proposals
 
 
-def _digest_signals(repo: Path, digest: Digest, today: date) -> list[dict[str, float]]:
+def _digest_signals(repo: Path, digest: Digest, today: date, *,
+                    full_suite: Collection[str] = ()) -> list[dict[str, float]]:
     """The signals of each run the digest read, from their logs."""
     wanted = set(digest.run_ids)
     now = datetime.combine(today, time.max, UTC)
@@ -608,7 +611,7 @@ def _digest_signals(repo: Path, digest: Digest, today: date) -> list[dict[str, f
         if name not in wanted:
             continue
         try:
-            out.append(run_signals(events, run_metrics(events, now)))
+            out.append(run_signals(events, run_metrics(events, now), full_suite=full_suite))
         except RUN_ERRORS:
             out.append({})
     return out
@@ -725,7 +728,7 @@ def check_proposals(current: list[Lesson], p: Proposals, repo: Path, cfg: Config
             dropped.append(f"{label}: no lesson id is left (L-9999 is taken)")
             continue
         if per_run is None:
-            per_run = _digest_signals(repo, digest, today)
+            per_run = _digest_signals(repo, digest, today, full_suite=tuple(cfg.gate_sets.get("verify") or ()))
         lesson = Lesson(f"L-{number:04d}", title, body, tuple(applies), tuple(good),
                         today + timedelta(days=REVIEW_DEFAULT_DAYS), target, _baseline(target, per_run, today))
         if not _reads_back(lesson):

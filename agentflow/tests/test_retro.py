@@ -259,6 +259,14 @@ def test_signals_and_lessons_tables(tmp_git, cfg):
     assert "E-0001" in lessons
 
 
+def test_the_digest_counts_full_suite_runs_with_the_pack_verify_set(tmp_git, cfg):
+    batch = [{"type": "gate_result", "key": "verify/verify", "gate": gate, "passed": True, "skipped": False,
+              "duration_s": 0.0} for gate in cfg.gate_sets["verify"]]
+    _finished(tmp_git, extra=batch)
+    signals = _section(build_digest(tmp_git, cfg, None, NOW).text, "## Signals")
+    assert "| full_suite_runs | 1 | 1 |" in signals
+
+
 def test_cap_drops_oldest_evidence_first(tmp_git, tmp_cfg):
     cfg = load_config(tmp_cfg({"memory": {"digest_tokens": 1000}}))
     tail = "\n".join(f"line {i} " + "t" * 90 for i in range(20))

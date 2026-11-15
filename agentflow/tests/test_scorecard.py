@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -148,9 +149,11 @@ def test_cli_freeze_refuses_a_second_freeze_without_replace(flow_repo, fake_runs
 def test_run_row_carries_the_throughput_signals(flow_repo):
     verify = tuple(flow_repo.cfg.gate_sets["verify"])
     run = flow_repo.new_run()
+    run.emit("phase_started", phase="verify")
     for gate in verify:
         run.emit("gate_result", key="verify/verify", gate=gate, passed=True, skipped=False, duration_s=1.0)
     run.emit("pr_marked_ready", url="u", key="ship/ci")
+    time.sleep(0.2)  # a run of no wall time has no `human_blocked_share`
     run.emit("run_finished")
     row = scorecard.run_row(run, datetime.now(UTC), full_suite=verify)
     assert row["full_suite_runs"] == 1 and row["lead_time_h"] >= 0 and "human_blocked_share" in row

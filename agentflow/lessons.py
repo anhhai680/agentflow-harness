@@ -27,7 +27,7 @@ Anything before the first `## ` heading is the file's header and is not read.
   list dashes, so it cannot forge an entry or a key. Braces are kept as they are.
 - `read(path, prefix)` / `load(repo)`: a file (a missing one is empty, a symlink is refused), and both layers.
 - `select(lessons, phase, today, max_tokens)`: what a step's prompt carries, as one Markdown section.
-- `effects(repo, lessons, now)`: each lesson's target signal before and after the runs that carried it, with a
+- `effects(repo, lessons, now, full_suite=())`: each lesson's target signal before and after the runs that carried it, with a
   verdict. It compares runs, so it shows correlation, not cause (`CORRELATION_NOTE`).
 - `run_logs(repo)`: every run's events, read without the lock or a write (the retro digest reads runs this way too).
 """
