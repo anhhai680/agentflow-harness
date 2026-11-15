@@ -777,6 +777,42 @@ def test_sse_streams_new_events(dash):
         conn.close()
 
 
+def test_a_quiet_stream_coalesces_agent_turns(dash):
+    run = awaiting(dash.flow)
+    run.emit("agent_started", agent="claude", pid=os.getpid(), model="opus", effort="high", step="plan/plan", role="plan")
+    run.emit("agent_session", session_id="s-1", model="claude-opus-5-5", key="plan/plan", pid=os.getpid())
+    conn = http.client.HTTPConnection("127.0.0.1", dash.port, timeout=5)
+    try:
+        conn.request("GET", f"/api/events?quiet=1&token={TOKEN}")
+        response = conn.getresponse()
+        assert response.fp.readline() == b": connected\n"
+        for i in range(10):
+            run.emit("agent_turn", session_id="s-1", key="plan/plan", tokens=100 + i, context_pct=10 + i,
+                     cost=0.01 * i, last_tool=f"Edit-{i}")
+        run.emit("run_paused", by="t")
+        seen = []
+
+        def read() -> None:  # the stream goes quiet after the last message, so a blocked read must not stall the test
+            try:
+                while line := response.fp.readline().decode("utf-8"):
+                    if line.startswith("data: "):
+                        seen.append(json.loads(line[6:])["event"])
+            except (OSError, ValueError):
+                pass
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        time.sleep(3.5)
+        snapshot = list(seen)
+    finally:
+        conn.close()
+    seen = snapshot
+    types = [e["type"] for e in seen]
+    assert "agent_turn" not in types and "run_paused" in types
+    activity = [e for e in seen if e["type"] == "agent_activity"]
+    assert 1 <= len(activity) <= 2 and activity[-1]["last_tool"] == "Edit-9"
+
+
 def test_sse_reports_runs_created_after_connecting(dash):
     conn = http.client.HTTPConnection("127.0.0.1", dash.port, timeout=5)
     try:

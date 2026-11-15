@@ -12,7 +12,8 @@ Routes:
   the runs started in `?from=YYYY-MM-DD&to=YYYY-MM-DD`, this month by default, or `?all=1`; `&lane=<name>`
   narrows it; a bad date is a 400); `GET /api/lessons` (every lesson with its evidence and its target signal before
   and after the runs that carried it); `GET /api/events` (SSE: every run's new events, runs created
-  later included).
+  later included; with `?quiet=1` each `agent_turn` becomes an `agent_activity` message, at most one every
+  `QUIET_EVERY_S` per run session, and a newer one replaces a waiting one, so the last turn is never lost).
 - `POST /api/runs/<id>/{approve,reject,answer,pause,resume,done,cancel,retry}` with a JSON body. Each action
   calls the same function as the CLI with `by="dashboard"`; reject, a complete answer, resume, done, retry and
   an approval inside a phase then start `flow.py resume <id>` detached (D13), unless a runner already holds
@@ -93,6 +94,8 @@ BACKLOG_LOG = "backlog"  # the `run_id` the live stream gives backlog events
 REFRESH_EVERY_S = 60.0
 SSE_POLL_S = 0.25
 SSE_PING_S = 15.0
+QUIET_EVERY_S = 2.0  # the least gap between two `agent_activity` messages of one session on a quiet stream
+QUIET_FORGET_S = 300.0  # a session's last send is forgotten after this long, so a long stream keeps no history
 REMIND_EVERY_S = 60.0
 BY = "dashboard"
 API_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
@@ -437,7 +440,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/agents":
             self._json(200, agents_view(self.server.repo, self.server.cfg))
         elif path == "/api/events":
-            self._events()
+            self._events(quiet=query.get("quiet") == ["1"])
         elif path == "/api/config":
             self._json(200, config_edit.form_fields(self.server.cfg.path))
         elif path == "/api/metrics":
@@ -632,7 +635,7 @@ class _Handler(BaseHTTPRequestHandler):
         return body
 
     # -- server-sent events
-    def _events(self) -> None:
+    def _events(self, quiet: bool = False) -> None:
         # The starting point is fixed before the 200 goes out: a client that acts as soon as it sees the
         # response must get the events it causes, so nothing written after this line counts as old.
         root = runs_root(self.server.repo)
@@ -646,16 +649,31 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(b": connected\n\n")
         self.wfile.flush()
         pinged = time.monotonic()
+        last_sent: dict[tuple[str, str], float] = {}  # quiet only: when each session's activity last went out
+        pending: dict[tuple[str, str], bytes] = {}  # quiet only: the newest activity message still waiting
         while not self.server.stopping.is_set():
             sent = False
             for path in self._logs(root):
                 name = path.parent.name
                 for event in self._new_events(path, offsets, name):
+                    if quiet and event.get("type") == "agent_turn":
+                        sent |= self._coalesce(name, event, last_sent, pending)
+                        continue
                     self.wfile.write(b"data: " + _json_bytes({"run_id": name, "event": event}) + b"\n\n")
                     sent = True
             for event in self._new_events(root / "backlog.jsonl", offsets, BACKLOG_LOG):
                 self.wfile.write(b"data: " + _json_bytes({"run_id": BACKLOG_LOG, "event": event}) + b"\n\n")
                 sent = True
+            if pending:
+                now = time.monotonic()
+                for key in [k for k in pending if now - last_sent[k] >= QUIET_EVERY_S]:
+                    self.wfile.write(pending.pop(key))
+                    last_sent[key] = now
+                    sent = True
+            if last_sent:
+                now = time.monotonic()
+                for key in [k for k, at in last_sent.items() if k not in pending and now - at > QUIET_FORGET_S]:
+                    del last_sent[key]
             if not sent and time.monotonic() - pinged > SSE_PING_S:
                 self.wfile.write(b": ping\n\n")
                 sent = True
@@ -663,6 +681,23 @@ class _Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 pinged = time.monotonic()
             self.server.stopping.wait(SSE_POLL_S)
+
+    def _coalesce(self, run_id: str, event: dict, last_sent: dict, pending: dict) -> bool:
+        """Turn one `agent_turn` into an `agent_activity` message: send it now when its session has been quiet
+        for `QUIET_EVERY_S`, or keep it (replacing an older waiting one) for the stream loop to send. Returns
+        whether it wrote anything."""
+        key = (run_id, str(event.get("session_id")))
+        message = b"data: " + _json_bytes({"run_id": run_id, "event": {
+            "type": "agent_activity", "session_id": event.get("session_id"), "key": event.get("key"),
+            "last_tool": event.get("last_tool"), "context_pct": event.get("context_pct"),
+            "ts": event.get("ts")}}) + b"\n\n"
+        now = time.monotonic()
+        if key not in pending and (key not in last_sent or now - last_sent[key] >= QUIET_EVERY_S):
+            self.wfile.write(message)
+            last_sent[key] = now
+            return True
+        pending[key] = message
+        return False
 
     @staticmethod
     def _size(path: Path) -> int:
