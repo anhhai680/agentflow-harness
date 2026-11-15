@@ -5,7 +5,11 @@ step, plus the step's `forbid`. Each round is:
 
 1. Poll `gh pr checks` every `ci.poll_s` seconds (the first wait comes before the first poll, so a check that
    has not restarted yet is not read as this round's). A pause or a cancel ends the wait. GitHub reporting no
-   checks for `ci.appear_min` minutes, or any still pending after `ci.timeout_min`, is a `ci_failed` stop.
+   checks for `ci.appear_min` minutes, or any still pending after `ci.timeout_min`, is a `ci_failed` stop. With
+   `ci.watch_max_h` above 0, checks still pending at `ci.timeout_min` are watched instead: the run is held
+   (`run_held`, reason `ci_pending`, which frees its queue slot) for up to that many hours of wall-clock time, and
+   a human is told once that nothing is needed. During the watch a `gh` error or no checks is no verdict; past its
+   end the hold ends, then the `ci_failed` stop is raised. Every way out of the watch ends the hold, once.
 2. All passing or skipped: refresh the pull request's body, mark it ready, and finish.
 3. A failure: run the step's `gates` (the environment), then its `fix` session with the failed jobs' logs. The
    session's own gates hold before the runner commits. A commit is pushed; no commit means the session found
@@ -17,6 +21,7 @@ from __future__ import annotations
 
 import re
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -35,7 +40,7 @@ from agentflow.gitops import (
     rerun_failed,
     update_pr_body,
 )
-from agentflow.hitl import EVENT_EXTRA_MAX, raise_hitl
+from agentflow.hitl import EVENT_EXTRA_MAX, notify_run, raise_hitl
 from agentflow.issue_status import link
 
 if TYPE_CHECKING:
@@ -47,6 +52,7 @@ GOOD = ("pass", "skipping")
 PENDING = ("pending",)
 JOB_LINK = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
 STOP = "ci_failed"
+HOLD_REASON = "ci_pending"  # checks still pending after `ci.timeout_min`, watched for up to `ci.watch_max_h`
 
 
 def failed_checks(checks: list[dict]) -> list[dict]:
@@ -127,37 +133,74 @@ class CILane:
         return (sum(1 for e in rounds if e.get("action") == "fix"), sum(1 for e in rounds if e.get("action") == "rerun"))
 
     def _wait(self, key: str, url: str) -> tuple[Verdict, str, list[dict]]:
-        """Poll until the checks settle: `(verdict, what is wrong, checks)`."""
+        """Poll until the checks settle: `(verdict, what is wrong, checks)`.
+
+        `appear_min` and `timeout_min` are measured on `monotonic`; the watch past `timeout_min` on the wall clock,
+        as the runner's other holds are, since `monotonic` stops while the machine sleeps."""
         settings = self.cfg.ci
         poll = float(settings["poll_s"])
+        timeout_min = settings["timeout_min"]
+        watch_h = settings.get("watch_max_h") or 0
         started = time.monotonic()
         error = ""
-        while True:
-            time.sleep(poll)
-            self.run.refresh()
-            if halted(self.run.state["status"]):
-                return "stopped", "", []
-            waited = (time.monotonic() - started) / 60
-            try:
-                checks = pr_checks(self.worktree, url)
-                error = ""
-            except GhError as exc:  # GitHub being unreachable for a moment is no verdict on the code
-                checks, error = [], str(exc)
-            if not checks and not error:  # none yet: GitHub has not seen the push, or there is no CI at all
-                if waited >= float(settings["appear_min"]):
-                    self._ci_stop(key, f"GitHub reported no checks for {url} after {waited:.0f} minutes.")
+        deadline: float | None = None  # epoch seconds: the end of the watch, once it started
+        held = False  # a `run_held` not ended yet: the `finally` ends it on any way out not already ended
+        try:
+            while True:
+                time.sleep(poll)
+                self.run.refresh()
+                if halted(self.run.state["status"]):
+                    held = self._end_hold(key, held)
                     return "stopped", "", []
-                continue
-            failed = failed_checks(checks or [])
-            pending = [c for c in checks or [] if c.get("bucket") in PENDING]
-            if checks and not failed and not pending:
-                return "pass", "", checks
-            if checks and failed and not pending:
-                return "fail", ", ".join(_failed_names(checks)), checks
-            if waited >= float(settings["timeout_min"]):
-                why = error or f"{len(pending)} check(s) still pending"
-                self._ci_stop(key, f"CI did not settle within {settings['timeout_min']} minutes: {why}.")
-                return "stopped", "", []
+                waited = (time.monotonic() - started) / 60
+                try:
+                    checks = pr_checks(self.worktree, url)
+                    error = ""
+                except GhError as exc:  # GitHub being unreachable for a moment is no verdict on the code
+                    checks, error = [], str(exc)
+                if not checks and not error and deadline is None:  # none yet: GitHub has not seen the push, or no CI
+                    if waited >= float(settings["appear_min"]):
+                        self._ci_stop(key, f"GitHub reported no checks for {url} after {waited:.0f} minutes.")
+                        return "stopped", "", []
+                    continue
+                failed = failed_checks(checks or [])
+                pending = [c for c in checks or [] if c.get("bucket") in PENDING]
+                if checks and not failed and not pending:
+                    held = self._end_hold(key, held)
+                    return "pass", "", checks
+                if checks and failed and not pending:
+                    held = self._end_hold(key, held)
+                    return "fail", ", ".join(_failed_names(checks)), checks
+                if deadline is not None:  # watching: a `gh` error or no checks (just after a re-run) is no verdict
+                    if time.time() >= deadline:
+                        why = error or (f"{len(pending)} check(s) still pending" if checks else "GitHub reported no checks")
+                        held = self._end_hold(key, held)  # before the stop: `metrics` reads the hold's end as a wait's
+                        self._ci_stop(key, f"CI did not settle within {timeout_min} minutes and {watch_h} h of "
+                                           f"watching: {why}.")
+                        return "stopped", "", []
+                    continue
+                if waited >= float(timeout_min):
+                    if float(watch_h) > 0:
+                        now = time.time()
+                        deadline = now + float(watch_h) * 3600
+                        self.run.emit("run_held", key=key, reason=HOLD_REASON,
+                                      until=datetime.fromtimestamp(deadline, UTC).isoformat(timespec="seconds"))
+                        held = True
+                        notify_run(self.cfg, self.run, f"{key}: CI is still running after {timeout_min} min; the run "
+                                                       f"watches it for up to {watch_h} h and needs nothing from you.")
+                        continue
+                    why = error or f"{len(pending)} check(s) still pending"
+                    self._ci_stop(key, f"CI did not settle within {timeout_min} minutes: {why}.")
+                    return "stopped", "", []
+        finally:
+            if held:
+                self.run.emit("run_hold_ended", key=key)
+
+    def _end_hold(self, key: str, held: bool) -> bool:
+        """End the CI watch's hold if one is open; returns the new `held` (False)."""
+        if held:
+            self.run.emit("run_hold_ended", key=key)
+        return False
 
     def _report(self, key: str, checks: list[dict]) -> str:
         """The failed checks with the tail of each job's log, the log itself kept in the run."""

@@ -646,6 +646,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if outcome.timed_out:
                 limit = self.cfg.defaults.step_timeout_min
                 return self._stop(sr, "step_timeout", f"The agent call ran past the step timeout ({limit} min).")
+            if outcome.stalled:
+                quiet = round((outcome.idle_limit_s or 0) / 60, 1)
+                self.run.emit("watchdog_fired", key=sr.key, idle_min=quiet)
+                return self._stop(sr, "step_timeout",
+                                  f"The agent made no progress for {quiet} min, so the runner ended the session.")
 
             result, error = self._read_result(sr)
             if result is None:
@@ -719,7 +724,17 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
     def _timeout_s(self) -> int:
         return max(1, round(self.cfg.defaults.step_timeout_min * 60))
 
+    def _idle_s(self) -> tuple[float | None, float | None]:
+        """The watchdog's two limits (`agents.idle_limit`): `watchdog.no_progress_min`, and while a tool call is open
+        at least `defaults.gate_timeout_min`, since a gate-length command writes nothing until it returns. 0: off."""
+        minutes = self.cfg.watchdog.no_progress_min
+        if not minutes > 0:  # 0, and a value `validate` refuses, never arm a watchdog that fires at once
+            return None, None
+        idle = minutes * 60
+        return idle, max(idle, self.cfg.defaults.gate_timeout_min * 60)
+
     def _agent_call(self, sr: _StepRun, turn: _Turn, attempt: int) -> AgentCall:
+        idle_s, tool_idle_s = self._idle_s()
         return AgentCall(
             prompt=turn.prompt,
             model=sr.model,
@@ -738,6 +753,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             env=self.cfg.defaults.env,
             env_base=run_env.base(self.cfg),
             forbidden_paths=[*self.cfg.guardrails.forbidden_paths, *sr.step.forbid],
+            idle_s=idle_s,
+            tool_idle_s=tool_idle_s,
         )
 
     def context_window_for(self, key: str, model: str) -> int | None:

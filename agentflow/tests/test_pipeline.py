@@ -378,6 +378,20 @@ def test_reject_runs_refine_round(pipe):
     assert run.state["refine"] is None
 
 
+def test_a_new_runner_ends_a_stale_hold(pipe):
+    run = begin(pipe)
+    run.emit("run_held", key="ship/ci", reason="ci_pending", until="2026-11-15T12:00:00+00:00")  # its runner died
+    assert run.state["hold"] is not None
+    seq = run.events.read()[-1]["seq"]
+    go(pipe, run)
+    after = [e for e in run.events.read() if e["seq"] > seq]
+    ended = [i for i, e in enumerate(after) if e["type"] == "run_hold_ended"]
+    assert len(ended) == 1 and after[ended[0]]["key"] == "ship/ci"
+    steps = [i for i, e in enumerate(after) if e["type"] in ("step_started", "phase_started", "agent_started")]
+    assert steps and ended[0] < steps[0]
+    assert run.state["hold"] is None
+
+
 def test_second_runner_is_refused(pipe):
     from agentflow.pipeline import RunLocked
 

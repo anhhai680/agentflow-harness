@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agentflow import hitl
+from agentflow.autonomy import AUTO_BY
 from agentflow.flow import main
 from agentflow.hitl import (
     CODE_MAP_PER_RESULT,
@@ -100,6 +101,16 @@ def test_clean_fact_drops_format_characters():
     # reviewer reads in a prompt, a notification or a pull request body
     assert hitl.clean_fact("﻿use ‮evil‬ the​ cache⁦ here⁩") == "use evil the cache here"
     assert hitl.clean_fact("a​b") == "ab"
+
+
+def test_stop_class_is_advisory(tmp_path):
+    p = tmp_path / "r.json"
+    assert read_result(write_result(p, {"status": "done", "summary": "x", "stop_class": "flaky"})).stop_class == "flaky"
+    assert read_result(write_result(p, {"status": "done", "summary": "x"})).stop_class is None
+    for value in ("weather", 3, None, ["flaky"]):  # never a `ResultError`: the field only advises
+        assert read_result(write_result(p, {"status": "done", "summary": "x", "stop_class": value})).stop_class is None
+    assert hitl.STOP_CLASSES == ("environment", "flaky", "guard_false_positive", "spec_gap", "impact",
+                                 "repeated_failure")
 
 
 @pytest.mark.parametrize("facts", ["one fact", {"a": "b"}, [1], [["nested"]], [None]])
@@ -290,6 +301,74 @@ def test_a_question_the_runner_takes_is_raised_without_a_notification(run, cfg, 
     raise_hitl(cfg, run, "needs_human", "plan/task-1/implement", "Task 1 needs a TTL", [one_question()])
     assert run.state["waiting"]["key"] == "plan/task-1/implement"  # the resolver answers it next
     assert macos_calls == [] and "\a" not in capsys.readouterr().err
+
+
+REPEAT_KEY = "plan/write_plan"
+
+
+def raise_repeat(cfg, run, summary="blocked again"):
+    raise_hitl(cfg, run, "blocked_repeat", REPEAT_KEY, summary)
+    return run.state["waiting"]
+
+
+def hitl_raised_of(run) -> list[dict]:
+    return [e for e in run.events.read() if e["type"] == "hitl_raised"]
+
+
+def heard(monkeypatch) -> list[str]:
+    seen: list[str] = []
+    monkeypatch.setattr(hitl, "notify", lambda cfg, title, message, run=None: seen.append(message))
+    return seen
+
+
+def test_a_reworded_summary_still_counts(run, cfg, monkeypatch):
+    heard(monkeypatch)
+    raise_repeat(cfg, run, "cannot go on")
+    approve(run, REPEAT_KEY, by="me", note="x")
+    assert raise_repeat(cfg, run, "still cannot, in other words")["times"] == 2
+
+
+def test_a_repeat_after_a_human_approval_says_so(run, cfg, monkeypatch):
+    seen = heard(monkeypatch)
+    raise_repeat(cfg, run)
+    assert run.state["waiting"]["times"] == 1
+    approve(run, REPEAT_KEY, by="me", note="x")
+    raise_repeat(cfg, run)
+    assert len(seen) == 2
+    assert "after 1 approval(s)" in seen[1] and "after" not in seen[0]
+    assert seen[1] == f"{REPEAT_KEY} is blocked again for the same reason after 1 approval(s): blocked again"
+    assert run.state["waiting"]["times"] == 2
+    assert hitl_raised_of(run)[-1]["times"] == 2
+    assert "came back after 1 approval(s)" in run.inbox_path(REPEAT_KEY).read_text(encoding="utf-8")
+
+
+def test_a_retry_starts_the_count_afresh(run, cfg, monkeypatch):
+    heard(monkeypatch)
+    raise_repeat(cfg, run)
+    approve(run, REPEAT_KEY, by="me", note="x")
+    run.emit("step_retry", by="me", key=REPEAT_KEY, reason="fresh")
+    assert raise_repeat(cfg, run)["times"] == 1
+
+
+def test_a_blocked_stop_a_human_approved_counts_for_the_repeat(run, cfg, monkeypatch):
+    heard(monkeypatch)
+    raise_hitl(cfg, run, "blocked", REPEAT_KEY, "cannot go on")
+    approve(run, REPEAT_KEY, by="me")
+    assert raise_repeat(cfg, run)["times"] == 2
+
+
+def test_runner_approvals_and_other_kinds_are_not_counted(run, cfg, monkeypatch):
+    seen = heard(monkeypatch)
+    raise_repeat(cfg, run)
+    approve(run, REPEAT_KEY, by=AUTO_BY, note="x")
+    assert raise_repeat(cfg, run)["times"] == 1
+    assert "after" not in seen[-1]
+    for kind in ("blocked", "gate_failed"):
+        raise_hitl(cfg, run, kind, "build/other", "s")
+        approve(run, "build/other", by="me")
+        raise_hitl(cfg, run, kind, "build/other", "s")
+    assert all("times" not in event for event in hitl_raised_of(run) if event["kind"] in ("blocked", "gate_failed"))
+    assert "times" not in run.state["waiting"]
 
 
 def test_notify_failures_are_events_not_exceptions(run, cfg, monkeypatch, capsys):
@@ -522,6 +601,24 @@ def test_rejecting_a_stop_outside_a_task_refines_the_phase(run, cfg, macos_calls
     reject(run, key, "me", "redo")
     assert "scope" not in run.state["refine"]
     assert "scope" not in [e for e in run.events.read() if e["type"] == "phase_rejected"][-1]
+
+
+def test_an_environment_stop_cannot_be_rejected(run, cfg, macos_calls):
+    path = raise_hitl(cfg, run, hitl.ENVIRONMENT, "build/fix", "build/fix waits on this machine: `pnpm` is missing")
+    text = path.read_text(encoding="utf-8")
+    assert "approves this itself once the checks pass" in text and f"agentflow cancel {run.id}" in text
+    with pytest.raises(NotWaiting, match="an environment stop has nothing to refine"):
+        reject(run, "build/fix", "me", "try again")
+    assert run.state["waiting"]["kind"] == "environment" and not run.state.get("refine")
+
+
+def test_raise_hitl_notify_overrides_who_is_told(run, cfg, macos_calls):
+    raise_hitl(cfg, run, "blocked", "build/a", "the runner settles it")  # `None`: today's rule, quiet for the runner
+    assert not macos_calls
+    raise_hitl(cfg, run, "blocked", "build/b", "told anyway", notify=True)
+    assert len(macos_calls) == 1
+    raise_hitl(cfg, run, "checkpoint", "plan/doubt_offer", "never told", notify=False)
+    assert len(macos_calls) == 1
 
 
 # ------------------------------------------------------------------ inbox listing and CLI

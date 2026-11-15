@@ -54,6 +54,12 @@ recovery:
   give_up_h: 24
   failed_attempts: 3
 
+preflight:
+  enabled: false   # true: check the machine once before a run's first phase (the gates' programs, Docker, `setup`)
+
+watchdog:
+  no_progress_min: 0   # end a session that writes nothing to its stream this many minutes (0 = off; 15 is a safe start)
+
 effort:
   sizing: true    # the runner sizes each step before it starts (false: every step runs at default)
   default: medium
@@ -177,6 +183,7 @@ ci:
   fix_rounds: 3
   rerun_rounds: 1
   sync_rounds: 2
+  watch_max_h: 0  # hours to watch checks still pending after timeout_min (a hold, no queue slot); 0 = stop for a human
 
 phases:
   define:

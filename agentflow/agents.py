@@ -1,7 +1,8 @@
 """Agent adapters: build the argv/env for `claude -p` and `codex exec`, run them, parse their streams.
 
 `run` starts the process with stdin closed, tees stdout to the transcript, turns stream lines
-into runner events, and enforces two limits: the step timeout, and the context rollover (D9).
+into runner events, and enforces three limits: the step timeout, the no-progress watchdog (`idle_limit`),
+and the context rollover (D9).
 Parsing is pure (`parse_claude_line`, `parse_codex_line`) so tests can feed recorded streams.
 """
 
@@ -14,6 +15,7 @@ import shlex
 import signal
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +25,9 @@ from . import layers, safeio
 from .config import AgentSpec, Config, ContextPolicy
 
 KILL_GRACE_S = 10
+WATCH_MAX_POLL_S = 5.0  # the watchdog wakes at least this often, and four times per limit when that is shorter
+WATCH_MIN_POLL_S = 0.05  # ... but never more often than this, however small the limit
+WATCHDOG_THREAD = "agentflow-watchdog"
 SUBAGENT_TOOLS = ("Agent", "Task")
 AUTOCOMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"  # Claude Code's own cap on the window `autocompact_pct` is read against
 SHELL_ENV_FILE_ENV = "CLAUDE_ENV_FILE"  # a script Claude Code sources in its Bash tool's shell before each command
@@ -54,6 +59,8 @@ class AgentCall:
     env_base: Mapping[str, str] | None = None  # the inherited environment (`run_env.base`); None: this process's
     max_turns: int | None = None  # this call's turn cap; None: the agent's own `max_turns`
     read_only: bool = False  # Claude gets only `READ_ONLY_TOOLS` and no MCP server; Codex a read-only sandbox (fresh session)
+    idle_s: float | None = None  # end the session after this long with no stream line (`watchdog`); None: no watchdog
+    tool_idle_s: float | None = None  # the same limit while a tool call is open, or for an agent that `tracks_tools` not
 
 
 @dataclass
@@ -84,6 +91,8 @@ class AgentOutcome:
     timed_out: bool
     resume_failed: bool
     interruption: Interruption | None = None
+    stalled: bool = False  # the watchdog ended the session: no stream line for `idle_limit_s` (never with `timed_out`)
+    idle_limit_s: float | None = None  # the limit that was in force when the watchdog fired
 
 
 class Agent(Protocol):
@@ -123,6 +132,7 @@ class StreamAccumulator:
     line_type: str = ""  # "assistant" | "user" | "result" for a main-thread line, else ""
     over_threshold: bool = False
     open_subagents: dict[str, dict] = field(default_factory=dict)
+    open_tools: set[str] = field(default_factory=set)  # main-thread `tool_use` ids with no `tool_result` yet
     limit: dict | None = None  # the latest `rate_limit_event`'s `rate_limit_info`
     reached_model: bool = False
     result_error: bool = False
@@ -155,6 +165,8 @@ class StreamAccumulator:
         rolled_over: bool = False,
         timed_out: bool = False,
         resume_failed: bool = False,
+        stalled: bool = False,
+        idle_limit_s: float | None = None,
     ) -> AgentOutcome:
         return AgentOutcome(
             session_id=self.session_id,
@@ -171,6 +183,8 @@ class StreamAccumulator:
             timed_out=timed_out,
             resume_failed=resume_failed,
             interruption=self.interruption(exit_code),
+            stalled=stalled,
+            idle_limit_s=idle_limit_s if stalled else None,
         )
 
 
@@ -276,6 +290,8 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
             tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
             last_tool = name
             acc.tool_calls.append({"name": name, "input": tool_input, "id": block.get("id")})
+            if main_thread:  # a subagent's own calls run inside the main thread's open `Agent` call
+                acc.open_tools.add(str(block.get("id")))
             if name in SUBAGENT_TOOLS:
                 sub = {
                     "subagent_type": tool_input.get("subagent_type") or "general-purpose",
@@ -315,6 +331,8 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
         if main_thread:
             acc.line_type = "user"
         for block in _blocks(event.get("message")):
+            if main_thread and block.get("type") == "tool_result":
+                acc.open_tools.discard(str(block.get("tool_use_id")))
             sub = acc.open_subagents.pop(str(block.get("tool_use_id")), None) if block.get("type") == "tool_result" else None
             if sub is not None:
                 out.append(("subagent_finished", {
@@ -386,6 +404,17 @@ def parse_codex_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict]
 # --------------------------------------------------------------------------- process control
 
 
+def idle_limit(call: AgentCall, acc: StreamAccumulator, tracks_tools: bool) -> float | None:
+    """How long the stream may stay quiet before the watchdog ends the session; None: no watchdog. While a
+    main-thread tool call is open (a long test run writes nothing until it returns), or for an agent whose
+    stream does not show open tool calls, the limit is the longer `tool_idle_s`."""
+    if call.idle_s is None:
+        return None
+    if acc.open_tools or not tracks_tools:
+        return call.tool_idle_s if call.tool_idle_s is not None else call.idle_s
+    return call.idle_s
+
+
 def _signal_group(proc: subprocess.Popen, sig: int) -> None:
     try:
         os.killpg(proc.pid, sig)
@@ -411,6 +440,7 @@ class _CliAgent(abc.ABC):
     name = ""
     parse_line: Callable[[str, StreamAccumulator], list[tuple[str, dict]]]
     rollover_enabled = False
+    tracks_tools = False  # the stream shows open tool calls (`StreamAccumulator.open_tools`); else `idle_limit` is the long one
 
     def __init__(self, spec: AgentSpec, context: ContextPolicy) -> None:
         self.spec = spec
@@ -458,7 +488,28 @@ class _CliAgent(abc.ABC):
         acc = self._accumulator(call)
         call.transcript_path.parent.mkdir(parents=True, exist_ok=True)
         stderr_path = call.transcript_path.with_name(call.transcript_path.name + ".stderr")
-        state = {"timed_out": False}
+        # The step timeout (`timer`) and the watchdog (`watcher`) each end the session for their own reason, and only
+        # the first to fire does: `claim` sets its flag under `lock`, so `timed_out` and `stalled` are never both true.
+        lock = threading.Lock()
+        state: dict[str, Any] = {"timed_out": False, "stalled": False, "limit": None, "last_line": time.monotonic()}
+        # Set under `lock` (`end_stream`) once the stream has ended (its `result` line, EOF, or a rollover), and again by
+        # the `finally` below: the watcher returns, and `claim("stalled")` refuses from then on. After the stream ends
+        # the runner waits in `proc.wait()`, where `poll()` from another thread says None even for an exited process,
+        # so a CLI that lingers on shutdown is the step timeout's to end, never a stall.
+        done = threading.Event()
+
+        def claim(flag: str, limit: float | None = None) -> bool:
+            with lock:
+                if state["timed_out"] or state["stalled"] or (flag == "stalled" and done.is_set()):
+                    return False
+                state[flag] = True
+                state["limit"] = limit
+                return True
+
+        def end_stream() -> None:
+            with lock:  # so a watcher that has not claimed yet never claims after the stream ended
+                done.set()
+
         rolled_over = False
         with open(call.transcript_path, "a", encoding="utf-8") as transcript, open(stderr_path, "a", encoding="utf-8") as stderr:
             env = {**(os.environ if call.env_base is None else call.env_base), **self.env(call)}
@@ -476,12 +527,26 @@ class _CliAgent(abc.ABC):
             )
 
             def on_timeout() -> None:
-                state["timed_out"] = True
-                _terminate(proc)
+                if claim("timed_out"):
+                    _terminate(proc)
+
+            def watch() -> None:
+                """End the session once its stream has been quiet for longer than `idle_limit`. The limit is read
+                again on every wake, since it changes as tool calls open and close."""
+                while True:
+                    limit = idle_limit(call, acc, self.tracks_tools)
+                    if limit is None or done.wait(max(WATCH_MIN_POLL_S, min(WATCH_MAX_POLL_S, limit / 4))):
+                        return
+                    if proc.poll() is not None:  # it has exited: nothing to end, and its pid may be reused
+                        return
+                    if time.monotonic() - state["last_line"] > limit and claim("stalled", limit):
+                        _terminate(proc)
+                        return
 
             timer = threading.Timer(call.timeout_s, on_timeout)
             timer.daemon = True
             timer.start()
+            watcher: threading.Thread | None = None
             on_event("agent_started", {
                 "agent": self.name,
                 "pid": proc.pid,
@@ -491,25 +556,44 @@ class _CliAgent(abc.ABC):
                 "session_id": call.resume_session,
             })
             try:
+                if idle_limit(call, acc, self.tracks_tools) is not None:
+                    thread = threading.Thread(target=watch, name=WATCHDOG_THREAD, daemon=True)
+                    thread.start()
+                    watcher = thread  # only a started thread is joined
                 assert proc.stdout is not None
                 for line in proc.stdout:
+                    state["last_line"] = time.monotonic()
                     transcript.write(line if line.endswith("\n") else line + "\n")
                     transcript.flush()
                     for name, payload in self.parse_line(line, acc):
                         on_event(name, payload)
+                    if acc.line_type == "result":
+                        end_stream()
                     if acc.over_threshold and acc.line_type in ("user", "result"):
                         rolled_over = True
+                        end_stream()
                         _terminate(proc)
                         break
+                end_stream()  # EOF
                 exit_code = proc.wait()
             finally:
                 timer.cancel()
-                _terminate(proc)
-                if proc.stdout is not None:
-                    proc.stdout.close()
-        timed_out = state["timed_out"]
-        resume_failed = bool(call.resume_session) and exit_code != 0 and acc.session_id is None and not timed_out
-        outcome = acc.to_outcome(exit_code, rolled_over=rolled_over, timed_out=timed_out, resume_failed=resume_failed)
+                end_stream()
+                try:
+                    if watcher is not None:
+                        watcher.join()  # bounded: a watcher that fired is at most inside `_terminate`'s grace period
+                finally:  # the child is always ended, whatever failed above
+                    _terminate(proc)
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+        # A timer callback that started but has not claimed yet may still claim after this read. That is harmless:
+        # the process has exited by now, so its `_terminate` returns at once (`poll()` is set).
+        with lock:
+            timed_out, stalled, limit = state["timed_out"], state["stalled"], state["limit"]
+        resume_failed = (bool(call.resume_session) and exit_code != 0 and acc.session_id is None
+                         and not timed_out and not stalled)
+        outcome = acc.to_outcome(exit_code, rolled_over=rolled_over, timed_out=timed_out, resume_failed=resume_failed,
+                                 stalled=stalled, idle_limit_s=limit)
         on_event("agent_exited", {"session_id": outcome.session_id, "exit_code": exit_code, "cost": outcome.cost_usd,
                                   "cost_estimated": not acc.cost_reported and outcome.cost_usd > 0})
         return outcome
@@ -540,6 +624,7 @@ def _without_mcp_config(args: list[str]) -> list[str]:
 class ClaudeAgent(_CliAgent):
     name = "claude"
     rollover_enabled = True
+    tracks_tools = True
     parse_line = staticmethod(parse_claude_line)
 
     def argv(self, call: AgentCall) -> list[str]:
@@ -599,6 +684,7 @@ class ClaudeAgent(_CliAgent):
 class CodexAgent(_CliAgent):
     name = "codex"
     rollover_enabled = False
+    tracks_tools = False
     parse_line = staticmethod(parse_codex_line)
 
     def argv(self, call: AgentCall) -> list[str]:

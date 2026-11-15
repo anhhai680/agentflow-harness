@@ -472,6 +472,8 @@ def _on_hitl_raised(state: dict, ev: dict) -> None:
         "questions": copy.deepcopy(ev.get("questions") or []),
         "since": ev.get("ts"),
     }
+    if "times" in ev:  # a `blocked_repeat` stop that came back after a human's approval
+        wait["times"] = ev["times"]
     if state["status"] in TERMINAL:  # a stop raised after a cancel is logged, never a wait to act on
         return
     state.setdefault("parked", {}).pop(key, None)  # a parked question that stops the run is now the wait
@@ -852,6 +854,11 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "agent_session": ("session_id",),
     "context_window": ("model", "tokens"),
     "runner_error": ("error",),
+    "preflight_checked": ("ok",),
+    "watchdog_fired": ("key",),
+    "stop_classified": ("key", "stop_class"),
+    "environment_waiting": ("key", "digest"),
+    "environment_rechecked": ("key", "ok"),
 }
 TEXT_FIELDS = ("key", "step", "phase", "model", "kind")
 HANDLER_ERRORS = (KeyError, TypeError, AttributeError, ValueError, IndexError)

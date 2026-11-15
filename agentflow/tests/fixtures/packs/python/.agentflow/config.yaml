@@ -76,6 +76,9 @@ recovery:                       # a usage limit just waits for its reset; these 
   give_up_h: 24                 # an outage longer than this stops for a human
   failed_attempts: 3            # calls that reached the model and still died: that costs money, an outage does not
 
+preflight: {enabled: false}     # check the machine before a run's first phase; a test turns it on
+watchdog: {no_progress_min: 0}  # end a session with no progress after this many minutes; a test turns it on
+
 effort:
   sizing: false               # the suite's scripted agents; sizing has its own tests
   default: medium               # every step's sizing session starts here

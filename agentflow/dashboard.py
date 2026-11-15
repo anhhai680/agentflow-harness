@@ -64,7 +64,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from agentflow import backlog, config_edit, hitl, module_queue, pack
+from agentflow import backlog, config_edit, hitl, module_queue, pack, preflight
 from agentflow.config import Config, ConfigError, for_lane, load_config
 from agentflow.events import EventError, lock_state
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
@@ -254,6 +254,8 @@ def _remind_loop(server: DashboardServer) -> None:
             hitl.remind_due(server.cfg, server.repo)
         except (OSError, ValueError, EventError) as exc:
             sys.stderr.write(f"dashboard: reminders failed: {exc}\n")
+        preflight.recheck_waiting(server.cfg, server.repo, spawn=server.spawn,  # never raises
+                                  log=lambda line: sys.stderr.write(f"dashboard: {line}\n"))
         server.stopping.wait(REMIND_EVERY_S)
 
 

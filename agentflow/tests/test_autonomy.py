@@ -9,9 +9,11 @@ from pathlib import Path
 
 import pytest
 
+from agentflow import autonomy, hitl, preflight
 from agentflow.autonomy import blocking_of, eligible, is_blocking, phase_findings, recommended_answers, round_limit
-from agentflow.config import load_config, validate
+from agentflow.config import NEVER_RESOLVED, load_config, validate
 from agentflow.hitl import answer, approve, reject
+from agentflow.preflight import Probe
 from agentflow.pipeline import RunOptions, advance, approval_text, start
 from agentflow.state import Run
 from conftest import PYTHON_CONFIG
@@ -113,7 +115,7 @@ def test_only_a_real_false_drops_the_human(tmp_cfg, value):
     assert any(i.path == "phases.build.needs_approval" for i in validate(cfg, REPO))
 
 
-@pytest.mark.parametrize("kind", ["budget_exceeded", "agent_unavailable", "phase_approval"])
+@pytest.mark.parametrize("kind", NEVER_RESOLVED)
 def test_a_human_only_stop_cannot_be_listed(tmp_cfg, kind):
     cfg = load_config(tmp_cfg(lambda data: data["autonomy"]["resolve_kinds"].update({kind: 1})))
     assert any(kind in i.path for i in validate(cfg, REPO))
@@ -414,6 +416,287 @@ def test_a_human_stop_gives_fresh_attempts(auto):
     assert go(auto, run) == "done"
     assert len(auto.events(run, "resolve_started")) == 3
     assert called(auto).count(f"{RED}/resolve-3") == 1  # a fresh attempt is a new session, never a finished one
+
+
+def test_a_repeat_through_the_resolver_path_names_it(flow_repo, notified):
+    # A resolver's reopened session is a new one (`step_reopened`, not a `hitl_approved`), so what it leaves is a
+    # plain `blocked` with no count: under the shipped `resolve_kinds.blocked_repeat: 2`, in a `resolve: true`
+    # phase, the "blocked again" wording never reaches a human. The runner hands a `blocked_repeat` stop to a human
+    # directly only when its resolve attempts for the kind are spent (here: none for it), so this test needs 0.
+    flow_repo.configure({"autonomy": {"resolve_kinds": {"blocked_repeat": 0}}}, autopilot=True)
+    flow_repo.script({RED: [BLOCKED] * 10})
+    auto, run = flow_repo, begin_bug(flow_repo, to="build")
+    assert go(auto, run) == "waiting_human"
+    assert run.state["waiting"]["kind"] == "blocked"
+    assert not any("blocked again for the same reason" in text for text in notified)  # the first stop is plain
+    approve(run, RED, by="me", note="I changed the environment")
+    assert go(auto, run) == "waiting_human"
+    assert run.state["waiting"]["kind"] == "blocked_repeat" and run.state["waiting"]["times"] == 2
+    assert any("blocked again for the same reason after 1 approval(s)" in text for text in notified)
+
+
+# --------------------------------------------------------------------------- a stop's class
+
+FIX = "build/fix"
+FIX_RESOLVE = f"{FIX}/resolve-1"
+FLAKY = done("flaky", stop_class="flaky")
+FLAKY_FACT = f"flaky: suite failed in {FIX}, then passed twice when run alone"
+
+
+def gate_failing(flow, tmp_path: Path, runs: int) -> Path:
+    """`verify` is one gate, `suite`, that fails its first `runs` runs and passes after; no fix attempts, so its first
+    failure stops `build/fix`. The counter it keeps lives outside the repository."""
+    counter = tmp_path / "suite-runs"
+    script = f'n=$(cat "{counter}" 2>/dev/null || echo 0); echo $((n + 1)) > "{counter}"; test "$n" -ge {runs}'
+    flow.configure({**PIPE, "gate_sets": {**PIPE["gate_sets"], "verify": ["suite"]}, "gates": {"suite": {"run": script}},
+                    "defaults": {"fix_attempts": 0}}, autopilot=True)
+    return counter
+
+
+def classified(flow, run: Run) -> list[tuple]:
+    return [(e["key"], e.get("session_key"), e["stop_class"], e["action"]) for e in flow.events(run, "stop_classified")]
+
+
+def flaky_facts(flow, run: Run) -> list[tuple]:
+    return [(e["text"], e["key"]) for e in flow.events(run, "run_fact") if e["text"].startswith("flaky: ")]
+
+
+def test_a_flaky_gate_is_confirmed_and_recorded(flow_repo, tmp_path):
+    counter = gate_failing(flow_repo, tmp_path, runs=1)
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED, done("tiếp tục")], FIX_RESOLVE: [FLAKY]})
+    run = begin_bug(flow_repo, to="build")
+    assert go(flow_repo, run) == "done"
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "flaky", "confirmed")]
+    assert flaky_facts(flow_repo, run) == [(FLAKY_FACT, FIX_RESOLVE)]
+    assert run.state["steps"][FIX]["status"] == "done"
+    assert not [e for e in flow_repo.events(run, "gate_result") if str(e.get("key")).startswith(f"{FIX}/flaky")]
+    assert counter.read_text().strip() == "4"  # the step's failure, two reruns alone, then the step's own pass
+
+
+def test_a_gate_that_fails_again_is_not_flaky(flow_repo, tmp_path):
+    gate_failing(flow_repo, tmp_path, runs=10**6)
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED] + [done("lại")] * 3, FIX_RESOLVE: [FLAKY],
+                      f"{FIX}/resolve-2": [FLAKY]})
+    run = begin_bug(flow_repo, to="build")
+    assert go(flow_repo, run) == "waiting_human"
+    flaky = [c for c in classified(flow_repo, run) if c[2] == "flaky"]
+    assert flaky and {c[3] for c in flaky} == {"not_confirmed"}
+    assert not flaky_facts(flow_repo, run)
+
+
+def test_a_flaky_claim_after_a_change_records_no_fact(flow_repo, tmp_path):
+    counter = gate_failing(flow_repo, tmp_path, runs=1)
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED, done("tiếp tục")],
+                      FIX_RESOLVE: [{"write": {"notes.txt": "đã sửa\n"}, **FLAKY}]})
+    run = begin_bug(flow_repo, to="build")
+    assert go(flow_repo, run) == "done"
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "flaky", "tree_changed")]
+    assert not flaky_facts(flow_repo, run)
+    assert counter.read_text().strip() == "2"  # nothing was rerun alone: the step's failure, then its own pass
+
+
+def test_a_resume_does_not_classify_again(flow_repo, tmp_path, monkeypatch):
+    gate_failing(flow_repo, tmp_path, runs=1)
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED, done("tiếp tục")], FIX_RESOLVE: [FLAKY]})
+    run = begin_bug(flow_repo, to="build")
+    real = autonomy.run_gates
+    paused: list[bool] = []
+
+    def pausing(*args, **kwargs):  # a human pauses the run while the first rerun is on
+        results = real(*args, **kwargs)
+        if not paused:
+            paused.append(True)
+            run.emit("run_paused", "me")
+        return results
+
+    monkeypatch.setattr(autonomy, "run_gates", pausing)
+    assert go(flow_repo, run) == "paused"
+    assert run.state["resolving"] is not None  # the resolve is left open
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "flaky", "halted")]
+    assert go(flow_repo, run) == "done"
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "flaky", "halted")]
+    assert len(paused) == 1  # no rerun after the resume
+    assert not flaky_facts(flow_repo, run)
+    assert run.state["resolving"] is None
+
+
+def test_a_class_with_no_routing_is_recorded_only(flow_repo, tmp_path):
+    counter = gate_failing(flow_repo, tmp_path, runs=1)
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED, done("tiếp tục")],
+                      FIX_RESOLVE: [done("hợp đồng", stop_class="spec_gap")]})
+    run = begin_bug(flow_repo, to="build")
+    assert go(flow_repo, run) == "done"
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "spec_gap", "none")]
+    assert counter.read_text().strip() == "2"
+
+
+def test_only_the_last_gate_run_of_the_step_counts(auto):
+    run = auto.new_run()
+    resolver = autonomy.Resolver(auto.cfg, run, auto.executor(run))
+    key, session = "build/x", "build/x/resolve-1"
+    assert resolver._confirm_flaky(key, session, changed=False) == "no_failed_gate"
+    run.emit("gate_result", key=key, gate="ok", passed=False, skipped=False)
+    run.emit("step_retry", key=key)
+    run.emit("gate_result", key=key, gate="ok", passed=True, skipped=False)  # a later run that passed
+    run.emit("gate_result", key="build/y", gate="ok", passed=False, skipped=False)  # another step's
+    assert resolver._confirm_flaky(key, session, changed=False) == "no_failed_gate"
+    run.emit("step_retry", key=key)
+    run.emit("gate_result", key=key, gate="test_command", passed=False, skipped=False)
+    assert resolver._confirm_flaky(key, session, changed=False) == "not_confirmed"  # no gate, so nothing to rerun
+    assert resolver._confirm_flaky(key, session, changed=True) == "tree_changed"
+    assert not auto.events(run, "run_fact")
+
+
+def test_spent_attempts_are_recorded_as_a_repeated_failure_once(auto, notified):
+    auto.script({RED: [BLOCKED] * 3, f"{RED}/resolve-2": [done("vẫn chưa")]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "waiting_human"
+    assert not autonomy.Resolver(auto.cfg, run, auto.executor(run)).take_over()  # the same stop, looked at again
+    repeated = [c for c in classified(auto, run) if c[2] == "repeated_failure"]
+    assert repeated == [(RED, None, "repeated_failure", "human")]
+
+
+def test_a_resolver_that_names_repeated_failure_still_gets_the_runners_record(auto, notified):
+    auto.script({RED: [BLOCKED] * 3, RESOLVE: [done("lại nữa", stop_class="repeated_failure")],
+                 f"{RED}/resolve-2": [done("vẫn chưa")]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "waiting_human"
+    assert not autonomy.Resolver(auto.cfg, run, auto.executor(run)).take_over()  # spent again, no human in between
+    repeated = [c for c in classified(auto, run) if c[2] == "repeated_failure"]
+    assert repeated == [(RED, RESOLVE, "repeated_failure", "none"), (RED, None, "repeated_failure", "human")]
+
+
+# --------------------------------------------------------------------------- an environment stop
+
+ENVIRONMENT = done("pnpm is broken", stop_class="environment")
+# `RED` names the bug lane's red-test step here, so the machine's two answers are `MACHINE_RED` and `MACHINE_GREEN`.
+MACHINE_RED = Probe(False, ["gate:suite: `pnpm` is not on PATH"], "e" * 64, "f" * 64)
+MACHINE_GREEN = Probe(True, [], "0" * 64, "f" * 64)
+
+
+def machine(monkeypatch, *answers: Probe) -> dict:
+    """`preflight.probe` gives the next of `answers` (the last one repeats); every message sent is collected."""
+    seen: dict = {"probed": [], "sent": []}
+
+    def probe(cfg, gates, cwd):
+        seen["probed"].append(list(gates))
+        return answers[min(len(seen["probed"]), len(answers)) - 1]
+
+    monkeypatch.setattr("agentflow.preflight.probe", probe)
+    monkeypatch.setattr("agentflow.autonomy.notify_run", lambda cfg, run, message: seen["sent"].append(message))
+    monkeypatch.setattr("agentflow.hitl.notify", lambda cfg, title, message, run=None: seen["sent"].append(message))
+    return seen
+
+
+def environment_stop(flow, tmp_path: Path, monkeypatch, *answers: Probe, fix: list[dict] | None = None):
+    """`build/fix` runs the gate `suite`, which fails once; its resolver says `environment`. The machine answers
+    `answers` from the first probe on, and only messages sent after `define` count."""
+    gate_failing(flow, tmp_path, runs=1)
+    flow.script({RED: [GOOD_TEST], FIX: fix or [FIXED, done("tiếp tục")], FIX_RESOLVE: [ENVIRONMENT],
+                 f"{FIX}/resolve-2": [ENVIRONMENT]})
+    run = begin_bug(flow, to="build")
+    return run, machine(monkeypatch, *answers)
+
+
+def environment_raised(flow, run: Run) -> list[dict]:
+    return [e for e in flow.events(run, "hitl_raised") if e["kind"] == "environment"]
+
+
+def test_an_environment_stop_is_one_inbox_item(flow_repo, tmp_path, monkeypatch):
+    run, seen = environment_stop(flow_repo, tmp_path, monkeypatch, MACHINE_RED)
+    assert go(flow_repo, run) == "waiting_human"
+    wait = run.state["waiting"]
+    assert wait["kind"] == "environment" and wait["key"] == FIX and "waits on this machine" in wait["summary"]
+    assert run.state["resolving"] is None
+    assert [item["run_id"] for item in hitl.inbox_items(flow_repo.root)] == [run.id]
+    assert len(seen["sent"]) == 1
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "environment", "handed_over")]
+    assert seen["probed"] == [["suite"]]
+    held = flow_repo.events(run, "environment_waiting")
+    assert [(e["key"], e["digest"], e["gates"], e["kind"]) for e in held] == [(FIX, MACHINE_RED.digest, ["suite"], "fix_attempts_exhausted")]
+    inbox = run.inbox_path(FIX).read_text(encoding="utf-8")
+    assert MACHINE_RED.lines[0] in inbox and "pnpm is broken" in inbox and "approves this itself" in inbox
+
+
+def test_environment_twice_gives_one_notification(flow_repo, tmp_path, monkeypatch):
+    run, seen = environment_stop(flow_repo, tmp_path, monkeypatch, MACHINE_RED)
+    assert go(flow_repo, run) == "waiting_human"
+    approve(run, FIX, by="me")
+    sessions = len(flow_repo.calls())
+    assert go(flow_repo, run) == "waiting_human"
+    assert len(environment_raised(flow_repo, run)) == 2
+    assert run.state["waiting"]["kind"] == "environment"
+    assert len(seen["sent"]) == 1
+    assert [e["ok"] for e in flow_repo.events(run, "environment_rechecked")] == [False]
+    assert len(flow_repo.calls()) == sessions  # no agent session started after the approval
+
+
+def test_approve_checks_again_and_goes_on_once_green(flow_repo, tmp_path, monkeypatch):
+    run, seen = environment_stop(flow_repo, tmp_path, monkeypatch, MACHINE_RED, MACHINE_GREEN)
+    assert go(flow_repo, run) == "waiting_human"
+    approve(run, FIX, by="me")
+    assert go(flow_repo, run) == "done"
+    assert [e["ok"] for e in flow_repo.events(run, "environment_rechecked")] == [True]
+    assert classified(flow_repo, run)[-1] == (FIX, None, "environment", "environment_fixed")
+    assert run.state["steps"][FIX]["status"] == "done"
+
+
+def test_approve_with_a_note_skips_the_check(flow_repo, tmp_path, monkeypatch):
+    run, seen = environment_stop(flow_repo, tmp_path, monkeypatch, MACHINE_RED)
+    assert go(flow_repo, run) == "waiting_human"
+    approve(run, FIX, by="me", note="fixed by hand")
+    sessions = len(flow_repo.calls())
+    assert go(flow_repo, run) == "done"
+    assert not flow_repo.events(run, "environment_rechecked")
+    assert seen["probed"] == [["suite"]]  # only the resolver's check
+    resumed = [c for c in flow_repo.calls()[sessions:] if c["step"] == FIX]
+    assert resumed and "--resume" in resumed[0]["argv"] and "fixed by hand" in resumed[0]["argv"][-1]
+
+
+def test_a_note_that_did_not_fix_the_machine_notifies_again(flow_repo, tmp_path, monkeypatch):
+    gate_failing(flow_repo, tmp_path, runs=10**6)  # the gate never passes: the human's note did not hold
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED, done("tiếp tục"), done("vẫn lỗi")], FIX_RESOLVE: [ENVIRONMENT],
+                      f"{FIX}/resolve-2": [ENVIRONMENT]})
+    run = begin_bug(flow_repo, to="build")
+    seen = machine(monkeypatch, MACHINE_RED)
+    assert go(flow_repo, run) == "waiting_human"
+    assert len(seen["sent"]) == 1
+    approve(run, FIX, by="me", note="fixed by hand")  # the human's override: no check
+    assert go(flow_repo, run) == "waiting_human"  # the step fails again, its fresh resolver says `environment`
+    assert run.state["waiting"]["kind"] == "environment"
+    assert [e["digest"] for e in flow_repo.events(run, "environment_waiting")] == [MACHINE_RED.digest] * 2
+    assert len(seen["sent"]) == 2  # the human who overrode the check is told it did not hold
+
+
+def test_the_problem_back_after_a_fix_notifies_again(flow_repo, tmp_path, monkeypatch):
+    run, seen = environment_stop(flow_repo, tmp_path, monkeypatch, MACHINE_RED, MACHINE_GREEN, MACHINE_RED,
+                                 fix=[FIXED, BLOCKED])
+    assert go(flow_repo, run) == "waiting_human"
+    approve(run, FIX, by="me")
+    assert go(flow_repo, run) == "waiting_human"  # green, then the step blocks and its resolver says `environment`
+    assert [e["ok"] for e in flow_repo.events(run, "environment_rechecked")] == [True]
+    assert [e["digest"] for e in flow_repo.events(run, "environment_waiting")] == [MACHINE_RED.digest] * 2
+    assert run.state["waiting"]["kind"] == "environment"
+    assert len(seen["sent"]) == 2
+
+
+def test_green_probes_reopen_the_step_at_once(flow_repo, tmp_path, monkeypatch):
+    run, seen = environment_stop(flow_repo, tmp_path, monkeypatch, MACHINE_GREEN)
+    assert go(flow_repo, run) == "done"
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "environment", "probes_green")]
+    assert not environment_raised(flow_repo, run) and not flow_repo.events(run, "environment_waiting")
+    assert flow_repo.events(run, "step_reopened")[-1]["key"] == FIX
+
+
+def test_stop_gates_prefers_the_gates_that_ran(auto):
+    cfg = auto.configure({**PIPE, "gate_sets": {**PIPE["gate_sets"], "setup": ["ok"]}}, autopilot=True)
+    run = auto.new_run()
+    setup = list(cfg.gate_sets["setup"])
+    assert autonomy.stop_gates(cfg, run, "build/fix") == preflight.route_gates(cfg, run.state["pipeline"])
+    run.emit("gate_result", key="build/fix", gate="lint", passed=False, skipped=False)
+    run.emit("gate_result", key="build/fix/resolve-1", gate="lint", passed=True, skipped=False)
+    run.emit("gate_result", key="build/fixer", gate="other", passed=False, skipped=False)  # another step's
+    assert autonomy.stop_gates(cfg, run, "build/fix") == ["lint", *setup]
 
 
 def test_stops_outside_a_resolve_phase_are_a_humans(auto, notified):
