@@ -127,6 +127,9 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("recovery", "give_up_h"), "Give up after (h)", _NUM),
         (("recovery", "failed_attempts"), "Failed attempts", _POS),
     ]),
+    ("Environment", "Checks that keep a run from waiting on the machine.", [
+        (("preflight", "enabled"), "Check the machine before a run starts", {"kind": "bool"}),
+    ]),
     ("Effort", "How the runner sizes each step's reasoning effort.", [
         (("effort", "sizing"), "Size each step before it starts", {"kind": "bool"}),
         (("effort", "default"), "Level when sizing is off or fails", {"kind": "enum", "options": list(KNOWN_EFFORT_LEVELS)}),

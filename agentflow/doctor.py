@@ -75,10 +75,11 @@ def gate_programs(command: str) -> list[str]:
     return programs
 
 
-def _run(argv: list[str], cwd: Path) -> tuple[int | None, str]:
-    """`(exit code, output)` of `argv`; the code is None when it timed out or could not start."""
+def run_bounded(argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> tuple[int | None, str]:
+    """`(exit code, output)` of `argv`, bounded by `TIMEOUT_S`; the code is None when it timed out or could not start.
+    `env` is the process environment of the command; None keeps this process's."""
     try:
-        proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, errors="replace", start_new_session=True)
     except OSError as exc:
         return None, str(exc)
@@ -124,7 +125,7 @@ def _agent_checks(cfg: Config, repo: Path) -> list[Check]:
         if login is None:
             checks.append(Check(label, "warn", f"{found} found; login not checked"))
             continue
-        code, output = _run([*spec.command, login[0], login[1]], repo)
+        code, output = run_bounded([*spec.command, login[0], login[1]], repo)
         if code == 0:
             checks.append(Check(label, "ok", f"{found}, logged in"))
         else:
@@ -135,7 +136,7 @@ def _agent_checks(cfg: Config, repo: Path) -> list[Check]:
 def _gh_check(repo: Path) -> Check:
     if not shutil.which("gh"):
         return Check("gh", "fail", "`gh` is not on PATH", "install gh (https://cli.github.com), then run `gh auth login`")
-    code, output = _run(["gh", "auth", "status"], repo)
+    code, output = run_bounded(["gh", "auth", "status"], repo)
     if code == 0:
         return Check("gh", "ok", "signed in (this check needs the network)")
     check = _failed("gh", code, output, "run `gh auth login`")
@@ -145,7 +146,7 @@ def _gh_check(repo: Path) -> Check:
 def _gh_fields_check(repo: Path) -> Check:
     """Whether this `gh` lists `blockedBy` among the `issue list --json` fields. `gh` prints the field list when
     `--json` has no value, offline and without a login, so the exit code is ignored."""
-    _, output = _run(["gh", "issue", "list", "--json"], repo)
+    _, output = run_bounded(["gh", "issue", "list", "--json"], repo)
     if any(line.strip() == "blockedBy" for line in output.splitlines()):
         return Check("gh issue fields", "ok", "this gh reads issue dependencies")
     return Check("gh issue fields", "fail", "this gh cannot read issue dependencies (no blockedBy field)",
@@ -153,17 +154,17 @@ def _gh_fields_check(repo: Path) -> Check:
 
 
 def _remote_check(repo: Path) -> Check:
-    code, output = _run(["git", "remote", "get-url", "origin"], repo)
+    code, output = run_bounded(["git", "remote", "get-url", "origin"], repo)
     if code == 0 and output:
         return Check("remote", "ok", f"origin is {output}")
     return Check("remote", "fail", _last_line(output) or "no remote named origin",
                  "add a remote named origin: `finish` pushes the run's branch there")
 
 
-def _docker_check(repo: Path) -> Check:
+def docker_check(repo: Path) -> Check:
     if not shutil.which("docker"):
         return Check("docker", "fail", "`docker` is not on PATH", "start Docker (install it first)")
-    code, output = _run(["docker", "info"], repo)
+    code, output = run_bounded(["docker", "info"], repo)
     if code == 0:
         return Check("docker", "ok", "the daemon answers")
     return _failed("docker", code, output, "start Docker")
@@ -304,7 +305,7 @@ def run_checks(cfg: Config, repo: Path) -> list[Check]:
         checks.append(_gh_fields_check(repo))
     checks.append(_remote_check(repo))
     if uses_docker:
-        checks.append(_docker_check(repo))
+        checks.append(docker_check(repo))
     checks.append(_state_dir_check(repo))
     checks.append(_keepawake_check())
     checks.append(_environment_check(cfg))

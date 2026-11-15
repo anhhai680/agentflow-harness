@@ -7,6 +7,10 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+
+- `preflight.enabled` (off by default) checks the machine once before a run's first phase: each program of the lane's gates is on `PATH` and starts `--version`, Docker answers when a gate runs it, and the `setup` gate set passes. A failure is one `preflight_failed` stop before any agent runs; a pass is cached for the day.
+
 ## [2.7] - 2026-11-15
 
 ### Added

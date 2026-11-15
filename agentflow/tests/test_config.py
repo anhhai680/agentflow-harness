@@ -1584,3 +1584,12 @@ def test_a_null_policy_or_obligations_reports_every_default_it_switches_off(tmp_
 def test_a_policy_that_is_not_a_mapping_is_a_config_error_not_a_crash(tmp_cfg):
     with pytest.raises(ConfigError, match="policy"):
         load_config(tmp_cfg(lambda data: data.update({"policy": 5})))
+
+
+def test_preflight_enabled_must_be_a_bool(tmp_cfg):
+    with pytest.raises(ConfigError, match=r"preflight\.enabled"):
+        load_config(tmp_cfg({"preflight": {"enabled": "yes"}}))
+    found = issues_for(tmp_cfg, {"preflight": {"nope": 1}})
+    assert [(i.path, i.message) for i in found if i.level == "error"] == [("preflight.nope", "unknown preflight key")]
+    assert load_config(tmp_cfg({"preflight": {"enabled": True}})).preflight.enabled is True
+    assert load_config(tmp_cfg({"preflight": None})).preflight.enabled is False

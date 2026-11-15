@@ -99,6 +99,14 @@ def test_the_memory_section_saves_a_zero_and_keeps_the_comments(shipped):
     assert all(line in text for line in SHIPPED.splitlines() if "#" in line)  # every comment survives
 
 
+def test_the_form_switches_preflight_on(shipped):
+    proposal = form(shipped, (["preflight", "enabled"], True))
+    assert not proposal.errors, proposal.errors
+    assert len(changed_lines(proposal.diff)) == 2  # one line out, one in
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).preflight.enabled is True
+
+
 def test_an_optional_text_field_set_to_null_removes_the_key(shipped):
     proposal = form(shipped, (["phases", "verify", "model"], None))
     assert changed_lines(proposal.diff) == ["-    model: sonnet"]

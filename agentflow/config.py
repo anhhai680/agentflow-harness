@@ -175,7 +175,8 @@ ON_FAIL_VALUES = ("block",)
 CONFORMANCE_FAILED = "conformance_failed"  # the audit at `finish` found an obligation with no evidence (`block` mode)
 RECONCILE_CHANGED = "reconcile_changed_conditions"  # a reconcile edit changed which steps of its phase run
 NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable",
-                  CONFORMANCE_FAILED, RECONCILE_CHANGED)
+                  CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed")
+PREFLIGHT_KEYS = ("enabled",)
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -273,6 +274,11 @@ class Defaults:
 class Recovery:
     give_up_h: float = 24
     failed_attempts: int = 3
+
+
+@dataclass
+class Preflight:
+    enabled: bool = False  # check the machine once before a run's first phase (`preflight.run_preflight`)
 
 
 @dataclass
@@ -451,6 +457,7 @@ class Config:
     raw: dict
     path: Path
     recovery: Recovery = field(default_factory=Recovery)
+    preflight: Preflight = field(default_factory=Preflight)
     autonomy: dict = field(default_factory=dict)
     resolve_step: Step | None = None
     retro_step: Step | None = None  # the one session of a retro run (`retro.run_retro`); not part of any lane
@@ -957,6 +964,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
     policy = _optional(raw, "policy", "", dict, {})
     guardrails = _require(raw, "guardrails", "", dict)
     recovery = _optional(raw, "recovery", "", dict, {})
+    preflight = _optional(raw, "preflight", "", dict, {})
     agents = _require(raw, "agents", "", dict)
     gate_sets = _require(raw, "gate_sets", "", dict)
     docs = dict(_optional(project, "docs", "project", dict, {}))
@@ -1041,6 +1049,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             give_up_h=_optional(recovery, "give_up_h", "recovery", (int, float), 24),
             failed_attempts=_optional(recovery, "failed_attempts", "recovery", int, 3),
         ),
+        preflight=Preflight(enabled=_optional(preflight, "enabled", "preflight", bool, False)),
         autonomy=_optional(raw, "autonomy", "", dict, {}),
         resolve_step=builder.step(raw["resolve_step"], "resolve_step") if raw.get("resolve_step") else None,
         retro_step=builder.step(raw["retro_step"], "retro_step") if raw.get("retro_step") else None,
@@ -1761,6 +1770,13 @@ class _Validator:
                            "(`[]` means no issue is an epic)")
         self.issue_sync(pol)
 
+    def preflight(self) -> None:
+        """`preflight.enabled` is checked as it loads; a key that is not one of this block's is a typo."""
+        block = self.cfg.raw.get("preflight")
+        for key in block if isinstance(block, dict) else ():
+            if key not in PREFLIGHT_KEYS:
+                self.error(f"preflight.{key}", "unknown preflight key")
+
     def issue_sync(self, pol: IssuePolicy) -> None:
         """`issues.sync_label`, `sync_lane`, `lane_labels`: which open issues the Backlog shows and their lanes."""
         if _label_problem(pol.sync_label):
@@ -2093,6 +2109,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.context()
     v.memory()
     v.issue_policy()
+    v.preflight()
     v.policy()
     v.approval()
     v.autonomy()

@@ -50,7 +50,7 @@ from agentflow.autonomy import (
     phase_findings,
     round_limit,
 )
-from agentflow import doubt, pack, run_env, work_source
+from agentflow import doubt, pack, preflight, run_env, work_source
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
@@ -69,7 +69,7 @@ from agentflow.gitops import (
     head,
 )
 from agentflow.guards import snapshot
-from agentflow.hitl import notify_run, open_refine
+from agentflow.hitl import notify_run, open_refine, raise_hitl
 from agentflow.intake import gather, save
 from agentflow.issue_status import mark, release
 from agentflow.lanes import Executor, Outcome, footer_next
@@ -318,6 +318,8 @@ class _Loop:
         self.record_env()
         names = list(self.cfg.phases)
         first = self.opts.from_phase or names[0]
+        if self.cfg.preflight.enabled and self.preflight(f"{first}/{preflight.PREFLIGHT_STEP}"):
+            return "waiting_human"
         for index in range(names.index(first), len(names)):
             name = names[index]
             outcome = self.phase(names, index)
@@ -326,6 +328,31 @@ class _Loop:
             if name == self.opts.to_phase and not run.state["marked_done"]:
                 return self.finish()
         return self.finish()
+
+    def preflight(self, key: str) -> bool:
+        """Check the machine before the run's first phase; True when it stopped for a human.
+
+        It runs once: not for a run that started a phase, and not again after a pass. A stop is the human's whatever
+        the phase says (`NEVER_RESOLVED`), and approving it runs this check again. A run still waiting on the
+        stop it raised stays waiting."""
+        run = self.run
+        events = run.events.read()
+        if any(e["type"] == "phase_started" for e in events):
+            return False
+        checked = [e for e in events if e["type"] == "preflight_checked"]
+        if any(e.get("ok") for e in checked):
+            return False
+        if (run.state["waiting"] or {}).get("kind") == "preflight_failed":
+            return True
+        outcome = preflight.run_preflight(self.cfg, run, self.worktree, key)
+        if not outcome.ok:
+            raise_hitl(self.cfg, run, "preflight_failed", key,
+                       f"Preflight found {len(outcome.lines)} problem(s) before the run started: {outcome.lines[0]}",
+                       extra="\n".join(outcome.lines))
+            return True
+        if checked:  # an earlier check failed and a human fixed the machine
+            run.emit("step_finished", key=key, status="done", summary="preflight passed")
+        return False
 
     def phase(self, names: list[str], index: int) -> str | None:
         """Settle one phase; a status to stop with, or None to go on to the next phase."""

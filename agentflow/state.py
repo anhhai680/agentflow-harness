@@ -852,6 +852,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "agent_session": ("session_id",),
     "context_window": ("model", "tokens"),
     "runner_error": ("error",),
+    "preflight_checked": ("ok",),
 }
 TEXT_FIELDS = ("key", "step", "phase", "model", "kind")
 HANDLER_ERRORS = (KeyError, TypeError, AttributeError, ValueError, IndexError)

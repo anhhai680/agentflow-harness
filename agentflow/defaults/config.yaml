@@ -54,6 +54,9 @@ recovery:
   give_up_h: 24
   failed_attempts: 3
 
+preflight:
+  enabled: false   # true: check the machine once before a run's first phase (the gates' programs, Docker, `setup`)
+
 effort:
   sizing: true    # the runner sizes each step before it starts (false: every step runs at default)
   default: medium

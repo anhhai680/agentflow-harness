@@ -434,6 +434,10 @@ def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Confi
         return f"Commit or remove the changes yourself, then `agentflow approve {run.id} {key}` runs the step again; {reject}"
     if kind == CONFORMANCE_FAILED:
         return _conformance_way_on(run, key, cfg)
+    if kind == "preflight_failed":
+        return (f"Fix what is listed below, then `agentflow approve {run.id} {key}` runs preflight again; nothing has "
+                f"been spent yet. If a listed setup gate fails on the base branch itself, fix it there, or set "
+                f"`preflight.enabled: false`; `agentflow cancel {run.id}` ends the run.")
     return (f"Fix what the stop needs, then `agentflow approve {run.id} {key}` resumes the step's agent session where "
             f"it stopped (it is not marked done); {reject}")
 
@@ -625,6 +629,8 @@ def reject(run: Run, target: str, by: str, note: str) -> None:
         raise ValueError("a rejection needs a note")
     with run.locked():
         kind, name = _resolve(run, target)
+        if (run.state["waiting"] or {}).get("kind") == "preflight_failed":
+            raise NotWaiting("preflight has nothing to refine: approve it once the machine is fixed, or cancel the run")
         phase = name if kind == "phase" else (run.state["waiting"]["phase"] or name.split("/")[0])
         scoped = rejected_scope(run, phase, name) if kind == "checkpoint" else None
         open_refine(run, phase, by, note, {"key": name} if kind == "checkpoint" else {},
