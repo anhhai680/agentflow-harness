@@ -35,7 +35,7 @@ from pathlib import Path
 
 from agentflow.config import CONFORMANCE_FAILED, RETRO_PIPELINE, Config, ConfigError, load_config
 from agentflow.config_trust import run_config_path
-from agentflow import pack, safeio, sizing
+from agentflow import hitl, pack, safeio, sizing
 from agentflow.events import lock_state, parse_iso
 from agentflow.gitops import GitError, commits_between, dirty_paths
 from agentflow.issue_status import link, release
@@ -355,8 +355,6 @@ def available_actions(run: Run) -> list[str]:
     """The `RUN_ACTIONS` this run's state allows now, in that order: each rule mirrors the refusal its action makes,
     so a listed action is never refused for the run's state and an unlisted one would be. Read-only: it emits
     nothing and takes no lock, so the answer is as fresh as the state `run` last read."""
-    from agentflow import hitl  # at call time: keeps this module free of an import cycle through hitl
-
     state = run.state
     status = state["status"]
     if status in TERMINAL:

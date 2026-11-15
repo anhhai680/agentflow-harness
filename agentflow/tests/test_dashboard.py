@@ -141,6 +141,19 @@ def test_info_carries_the_board_refresh(dash):
     assert payload(dash.get("/api/info")[2])["board_refresh_s"] == 7
 
 
+def test_info_ignores_an_unusable_board_refresh(dash):
+    for bad in ("x", True, 0.01, 1000, float("nan")):
+        dash.server.cfg.dashboard["board_refresh_s"] = bad
+        assert payload(dash.get("/api/info")[2])["board_refresh_s"] == 2.0, bad
+    dash.server.cfg.dashboard["board_refresh_s"] = 5
+    assert payload(dash.get("/api/info")[2])["board_refresh_s"] == 5.0
+
+
+def test_the_open_tab_reloads_on_a_second_click():
+    main = (UI_DIR / "main.js").read_text(encoding="utf-8")
+    assert 'if (location.hash === "#/" + name) route();' in main
+
+
 def test_api_rejects_without_token(dash):
     status, headers, body = dash.get("/api/board", token=None)
     assert status == 403 and body == b""
@@ -953,7 +966,9 @@ def test_a_replaced_section_keeps_its_scroll():
     region = core[core.index("function patchChildren"):core.index("const entry =")]
     assert "scrollTop" in region and "scrollLeft" in region and '"pre, .scroll"' in region
     # the offsets are applied after the placement loop: a detached element ignores scrollTop
-    assert region.index("keepScroll(node, offsets)") > region.index("parent.insertBefore(node, cursor)")
+    call = "for (const [node, offsets] of scrolls) keepScroll(node, offsets);"
+    assert call in region, "the offsets are never applied"
+    assert region.index(call) > region.index("parent.insertBefore(node, cursor)")
 
 
 def test_a_reconnect_marks_everything_dirty():
@@ -1615,7 +1630,7 @@ def _count_reads(monkeypatch, run):
     return reads
 
 
-def test_the_board_reads_an_unchanged_run_once(dash, monkeypatch):
+def test_the_board_computes_an_unchanged_runs_figures_once(dash, monkeypatch):
     from agentflow.views import board
 
     run = finished_run(dash.flow)

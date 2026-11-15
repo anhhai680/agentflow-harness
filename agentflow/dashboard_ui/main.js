@@ -127,7 +127,10 @@ function route() {
 }
 
 restoreMetricsChoice();
-for (const name of VIEWS) $("tab-" + name).addEventListener("click", () => { location.hash = "#/" + name; });
+for (const name of VIEWS) $("tab-" + name).addEventListener("click", () => {
+  if (location.hash === "#/" + name) route();  // the same hash fires no hashchange: a click on the open tab reloads it
+  else location.hash = "#/" + name;
+});
 $("new-task").addEventListener("click", newTaskDialog);
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("dlg").open) closePeek(); });
 window.addEventListener("hashchange", route);

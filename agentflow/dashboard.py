@@ -67,7 +67,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from agentflow import backlog, config_edit, hitl, module_queue, pack, preflight
-from agentflow.config import Config, ConfigError, for_lane, load_config
+from agentflow.config import Config, ConfigError, _finite, for_lane, load_config
 from agentflow.events import EventError, lock_state
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
 from agentflow.scorecard import scorecard_view
@@ -436,6 +436,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, board(self.server.repo, self.server.cfg, lane))
         elif path == "/api/info":
             refresh = self.server.cfg.dashboard.get("board_refresh_s", DEFAULT_BOARD_REFRESH_S)
+            if not _finite(refresh) or not 0.5 <= refresh <= 60:  # a hand-edited value never reaches the page
+                refresh = DEFAULT_BOARD_REFRESH_S
             self._json(200, {"name": "agentflow-harness", "version": pack.ENGINE_VERSION,
                              "board_refresh_s": float(refresh)})
         elif path == "/api/workflow":
