@@ -613,57 +613,113 @@ def _failed_step(flow):
     return run
 
 
-BUILDERS = {
-    "paused": _paused,
-    "ready": lambda flow: ready(flow),
-    "ready_with_work": lambda flow: with_work(flow, ready(flow)),
-    "phase_approval": lambda flow: awaiting(flow),
-    "questions": _questions,
-    "stalled": _stalled,
-    "failed_step": _failed_step,
-    "done": lambda flow: finished_run(flow),
-    "cancelled": lambda flow: _cancelled(flow),
-}
-
-
 def _cancelled(flow):
     run = flow.new_run()
     cancel(run, "t", cfg=flow.cfg)
     return run
 
 
-BODIES = {"approve": {"note": "go"}, "reject": {"note": "redo"}, "answer": {"answers": {"q1": "A"}}}
-ALWAYS_REFUSED_UNLISTED = ("pause", "done", "retry", "cancel")  # these routes answer 409 when the state is wrong
+def _stop(kind: str):
+    def build(flow):
+        run = flow.new_run()
+        run.emit("phase_started", phase="build")
+        hitl.raise_hitl(flow.cfg, run, kind, "build/x", f"stopped: {kind}")
+        return run
+    return build
+
+
+BUILDERS = {
+    "paused": _paused,
+    "ready": lambda flow: ready(flow),
+    "ready_with_work": lambda flow: with_work(flow, ready(flow)),
+    "phase_approval": lambda flow: awaiting(flow),
+    "questions": _questions,
+    "environment": _stop(hitl.ENVIRONMENT),
+    "preflight_failed": _stop("preflight_failed"),
+    "blocked_repeat": _stop("blocked_repeat"),
+    "stalled": _stalled,
+    "failed_step": _failed_step,
+    "failed_step_live": _failed_step,  # the same run, with a runner holding its lock (taken in the test)
+    "done": lambda flow: finished_run(flow),
+    "cancelled": _cancelled,
+}
+LIVE = ("failed_step_live",)
+NOTES = ("blocked_repeat",)  # a stop that only a note approves
+PAUSE_CANCEL = ["pause", "cancel"]
+
+
+def body_for(build: str, action: str) -> dict:
+    """What the action needs to succeed on this state: a phase approval takes no note, a repeated block needs one."""
+    if action == "approve":
+        return {"note": "go"} if build in NOTES else {}
+    return {"reject": {"note": "redo"}, "answer": {"answers": {"q1": "A"}}}.get(action, {})
 
 
 @pytest.mark.parametrize("build, listed", [
-    ("paused",         ["resume", "cancel"]),
-    ("ready",          ["resume", "cancel"]),               # no work in the checkout -> no done
-    ("ready_with_work", ["resume", "done", "cancel"]),
-    ("phase_approval", ["approve", "reject", "pause", "cancel"]),
-    ("questions",      ["answer", "reject", "pause", "cancel"]),
-    ("stalled",        ["resume", "pause", "cancel"]),
-    ("failed_step",    ["resume", "pause", "retry", "cancel"]),
-    ("done",           []),
-    ("cancelled",      []),
+    ("paused",           ["resume", "cancel"]),
+    ("ready",            ["resume", "cancel"]),               # no work in the checkout -> no done
+    ("ready_with_work",  ["resume", "done", "cancel"]),
+    ("phase_approval",   ["approve", "reject", "pause", "cancel"]),
+    ("questions",        ["answer", "reject", "pause", "cancel"]),
+    ("environment",      ["approve", "pause", "cancel"]),     # hitl.reject refuses an environment stop
+    ("preflight_failed", ["approve", "pause", "cancel"]),     # and a preflight one
+    ("blocked_repeat",   ["approve", "reject", "pause", "cancel"]),  # approve needs a note: body_for gives it one
+    ("stalled",          ["resume", "pause", "cancel"]),
+    ("failed_step",      ["resume", "pause", "retry", "cancel"]),
+    ("failed_step_live", PAUSE_CANCEL),                       # a live runner: nothing to retry or resume
+    ("done",             []),
+    ("cancelled",        []),
 ])
 @pytest.mark.parametrize("action", RUN_ACTIONS)
-def test_listed_actions_are_never_refused_and_unlisted_ones_are(dash, build, listed, action):
+def test_listed_actions_succeed_and_unlisted_ones_are_refused(dash, build, listed, action):
     run = BUILDERS[build](dash.flow)
-    assert available_actions(run) == listed
-    waits = run.state["waiting"] is not None
-    status, _, body = dash.post(f"/api/runs/{run.id}/{action}", BODIES.get(action, {}))
+    lock = run.lock() if build in LIVE else None
+    if lock is not None:
+        assert lock.acquire()
+    try:
+        assert available_actions(run) == listed
+        status, _, body = dash.post(f"/api/runs/{run.id}/{action}", body_for(build, action))
+    finally:
+        if lock is not None:
+            lock.release()
     if action in listed:
-        assert status != 409, payload(body)
-    elif action in ALWAYS_REFUSED_UNLISTED or (action in ("approve", "reject") and not waits):
+        assert status == 200, (status, payload(body))
+    elif action == "resume" and build not in ("done", "cancelled"):
+        # the one wrong press the routes allow: resume answers 200 and starts a runner (or sees one live). Hiding
+        # the button is what prevents it
+        assert status == 200, (status, payload(body))
+    else:
         assert status == 409, (status, payload(body))
-    # an unlisted resume still answers 200 (it starts a runner): that wrong press is what hiding the button prevents
+
+
+def test_a_repeated_block_lists_approve_though_only_an_approval_with_a_note_goes_through(dash):
+    """The known over-listing: `available_actions` cannot know whether the person will write a note."""
+    run = BUILDERS["blocked_repeat"](dash.flow)
+    assert "approve" in available_actions(run)
+    status, _, body = dash.post(f"/api/runs/{run.id}/approve", {})
+    assert status == 409 and "with nothing changed" in payload(body)["error"]
+    assert dash.post(f"/api/runs/{run.id}/approve", {"note": "fixed the cause"})[0] == 200
 
 
 def test_a_retro_run_lists_only_pause_and_cancel(dash):
     run = Run.create(dash.flow.cfg, dash.flow.root, RETRO_PIPELINE, {}, engine_pipeline=True)
     run.emit("phase_started", phase="retro")
-    assert available_actions(run) == ["pause", "cancel"]
+    assert available_actions(run) == PAUSE_CANCEL
+    for action in ("approve", "reject", "answer", "resume", "done", "retry"):
+        status, _, body = dash.post(f"/api/runs/{run.id}/{action}", body_for("retro", action))
+        assert status == 409, (action, status, payload(body))
+    assert dash.spawned == []
+
+
+def test_a_retro_run_that_waits_still_lists_only_pause_and_cancel(dash):
+    run = Run.create(dash.flow.cfg, dash.flow.root, RETRO_PIPELINE, {}, engine_pipeline=True)
+    run.emit("phase_started", phase="retro")
+    questions = [hitl.Question("q1", "Which?", [hitl.Option("A", "this", True)], [], "other")]
+    hitl.raise_hitl(dash.flow.cfg, run, "needs_human", "retro/draft", "Stopped", questions)
+    assert available_actions(run) == PAUSE_CANCEL
+    for action in ("approve", "reject", "answer", "resume", "retry"):
+        status, _, body = dash.post(f"/api/runs/{run.id}/{action}", body_for("retro", action))
+        assert status == 409, (action, status, payload(body))
 
 
 # --------------------------------------------------------------------------- live updates
