@@ -17,6 +17,7 @@ from agentflow.agents import (
     RUNNER_ONLY_DENY,
     ClaudeAgent,
     CodexAgent,
+    WATCHDOG_THREAD,
     StreamAccumulator,
     idle_limit,
     make_agents,
@@ -591,6 +592,33 @@ def test_the_step_timeout_and_the_watchdog_never_both_fire(fake, fake_claude, ca
     fake.script({STEP: [{"sleep": 6}]})
     o = fake_claude.run(dataclasses.replace(call, timeout_s=1, idle_s=1, tool_idle_s=1), collect()[1])
     assert o.timed_out != o.stalled  # one of them ended it, never both
+
+
+def test_a_session_that_ended_its_stream_is_never_a_stall(fake, cfg, call):
+    # Codex's parser sees no `result` line in the fake's stream, so only the stream's end tells the watcher: a CLI
+    # that lingers after it (shutdown hooks) must not be ended as stalled while the runner waits for it to exit.
+    codex = CodexAgent(dataclasses.replace(cfg.agents["codex"], command=fake.command), cfg.context)
+    fake.script({STEP: [{"linger": 3}]})
+    o = codex.run(dataclasses.replace(call, idle_s=1, tool_idle_s=1), collect()[1])
+    assert not o.stalled and not o.timed_out and o.exit_code == 0
+
+
+def test_a_watcher_that_cannot_start_still_ends_the_child(fake, fake_claude, call, monkeypatch):
+    real_start = threading.Thread.start
+
+    def start(self):
+        if self.name == WATCHDOG_THREAD:
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    fake.script({STEP: [{"sleep": 30}]})
+    events, on_event = collect()
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        fake_claude.run(dataclasses.replace(call, idle_s=1, tool_idle_s=30), on_event)
+    pid = next(p["pid"] for n, p in events if n == "agent_started")
+    with pytest.raises(ProcessLookupError):  # terminated and reaped, not left running unsupervised
+        os.kill(pid, 0)
 
 
 def test_an_open_tool_call_outlasts_the_idle_limit(fake, fake_claude, call):

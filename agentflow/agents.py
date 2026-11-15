@@ -492,15 +492,23 @@ class _CliAgent(abc.ABC):
         # the first to fire does: `claim` sets its flag under `lock`, so `timed_out` and `stalled` are never both true.
         lock = threading.Lock()
         state: dict[str, Any] = {"timed_out": False, "stalled": False, "limit": None, "last_line": time.monotonic()}
-        done = threading.Event()  # set by the `finally` below: the watcher returns and is joined there
+        # Set under `lock` (`end_stream`) once the stream has ended (its `result` line, EOF, or a rollover), and again by
+        # the `finally` below: the watcher returns, and `claim("stalled")` refuses from then on. After the stream ends
+        # the runner waits in `proc.wait()`, where `poll()` from another thread says None even for an exited process,
+        # so a CLI that lingers on shutdown is the step timeout's to end, never a stall.
+        done = threading.Event()
 
         def claim(flag: str, limit: float | None = None) -> bool:
             with lock:
-                if state["timed_out"] or state["stalled"]:
+                if state["timed_out"] or state["stalled"] or (flag == "stalled" and done.is_set()):
                     return False
                 state[flag] = True
                 state["limit"] = limit
                 return True
+
+        def end_stream() -> None:
+            with lock:  # so a watcher that has not claimed yet never claims after the stream ended
+                done.set()
 
         rolled_over = False
         with open(call.transcript_path, "a", encoding="utf-8") as transcript, open(stderr_path, "a", encoding="utf-8") as stderr:
@@ -548,9 +556,10 @@ class _CliAgent(abc.ABC):
                 "session_id": call.resume_session,
             })
             try:
-                if idle_limit(call, acc, self.tracks_tools) is not None:  # started inside `try`: always joined
-                    watcher = threading.Thread(target=watch, name=WATCHDOG_THREAD, daemon=True)
-                    watcher.start()
+                if idle_limit(call, acc, self.tracks_tools) is not None:
+                    thread = threading.Thread(target=watch, name=WATCHDOG_THREAD, daemon=True)
+                    thread.start()
+                    watcher = thread  # only a started thread is joined
                 assert proc.stdout is not None
                 for line in proc.stdout:
                     state["last_line"] = time.monotonic()
@@ -558,20 +567,28 @@ class _CliAgent(abc.ABC):
                     transcript.flush()
                     for name, payload in self.parse_line(line, acc):
                         on_event(name, payload)
+                    if acc.line_type == "result":
+                        end_stream()
                     if acc.over_threshold and acc.line_type in ("user", "result"):
                         rolled_over = True
+                        end_stream()
                         _terminate(proc)
                         break
+                end_stream()  # EOF
                 exit_code = proc.wait()
             finally:
                 timer.cancel()
-                done.set()
-                if watcher is not None:
-                    watcher.join()  # bounded: a watcher that fired is at most inside `_terminate`'s grace period
-                _terminate(proc)
-                if proc.stdout is not None:
-                    proc.stdout.close()
-        with lock:  # a timer that fired just before `cancel` may still be setting its flag
+                end_stream()
+                try:
+                    if watcher is not None:
+                        watcher.join()  # bounded: a watcher that fired is at most inside `_terminate`'s grace period
+                finally:  # the child is always ended, whatever failed above
+                    _terminate(proc)
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+        # A timer callback that started but has not claimed yet may still claim after this read. That is harmless:
+        # the process has exited by now, so its `_terminate` returns at once (`poll()` is set).
+        with lock:
             timed_out, stalled, limit = state["timed_out"], state["stalled"], state["limit"]
         resume_failed = (bool(call.resume_session) and exit_code != 0 and acc.session_id is None
                          and not timed_out and not stalled)

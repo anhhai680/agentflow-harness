@@ -545,6 +545,14 @@ def test_a_session_that_goes_quiet_is_ended_as_a_timeout(flow_repo):
     assert len(flow_repo.calls()) == 1
 
 
+def test_a_session_that_lingers_after_its_result_is_not_a_stall(flow_repo):
+    flow_repo.configure({"watchdog": {"no_progress_min": 0.02}})  # 1.2 s
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"linger": 3, "result": {"status": "done", "summary": "ok"}}]})
+    assert run_step(flow_repo) == "done"
+    assert flow_repo.events(run, "watchdog_fired") == [] and hitl_kinds(flow_repo, run) == []
+
+
 def test_an_open_tool_call_is_not_a_stall(flow_repo):
     flow_repo.configure({"watchdog": {"no_progress_min": 0.02}, "defaults": {"gate_timeout_min": 0.5}})
     run = flow_repo.new_run()

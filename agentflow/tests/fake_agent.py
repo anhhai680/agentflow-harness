@@ -12,7 +12,8 @@ exit n, no_init bool, final_text str, cost float (this call's, default 0.01; the
 the session's total, as Claude does), permission_denials [{tool_name, tool_input}] (copied into the
 result event), rate_limit {...} (sent as a `rate_limit_event`'s `rate_limit_info`), result_error bool
 (the result event says `is_error`), delete [relpath, ...] (files removed after the writes), hold_tool s (one
-`Bash` tool call that stays open, with nothing on the stream, for s seconds before its result).
+`Bash` tool call that stays open, with nothing on the stream, for s seconds before its result), linger s
+(after the last line, stdout is closed and the process stays alive s more seconds, as a CLI's shutdown does).
 """
 
 from __future__ import annotations
@@ -176,6 +177,11 @@ def main() -> int:
     emit({"type": "result", "subtype": "success", "is_error": bool(act.get("result_error")), "result": final_text,
           "total_cost_usd": cost, "num_turns": 1, "permission_denials": act.get("permission_denials", []),
           "modelUsage": {model: {"contextWindow": WINDOW, "costUSD": cost}}, **base})
+    if act.get("linger"):
+        sys.stdout.flush()
+        sys.stdout.close()  # a std stream does not own its fd: close the fd too, so the reader sees EOF
+        os.close(1)
+        time.sleep(float(act["linger"]))
     return 0
 
 
