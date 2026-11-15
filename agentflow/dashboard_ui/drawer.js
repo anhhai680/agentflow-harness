@@ -16,16 +16,29 @@ function describe(event) {
 }
 
 // Space on a card, or a click on its badge: the card's facts and the decision it waits on, without leaving the Board.
-async function openPeek(runId) {
+function openPeek(runId) {
   ui.peek = runId;
   const peek = $("drawer");
   peek.hidden = false;
+  if (peek.getAttribute("data-peek") !== runId) {  // another run's facts never stay on screen under this one's name
+    peek.setAttribute("data-peek", runId);
+    peek.replaceChildren(el("p", { class: "muted", text: "Loading " + runId + "…" }));
+  }
+  return loadPeek(runId);
+}
+
+// Fetch the peeked run and patch the peek by key, as the Run page is: an open Inbox stays open. A failure keeps a
+// peek already drawn and says so in a toast.
+async function loadPeek(runId) {
+  const peek = $("drawer");
   let detail;
   try {
     detail = await api(runPath(runId));
   } catch (err) {
     if (ui.peek !== runId) return;
-    peek.replaceChildren(el("p", { text: (err.status === 404 ? "No run " + runId : "Could not load " + runId + ": " + err.message) }),
+    if (err.status !== 404 && childByKey(peek, "head")) { toast("Could not refresh " + runId + ": " + err.message); return; }
+    peek.replaceChildren(
+      el("p", { text: (err.status === 404 ? "No run " + runId : "Could not load " + runId + ": " + err.message) }),
       el("button", { type: "button", text: "Close", onclick: closePeek }));
     return;
   }
@@ -34,18 +47,24 @@ async function openPeek(runId) {
   const rows = [["status", detail.status], ["work", workLabel(detail.lane)], ["phase", facts.phase], ["step", facts.step],
     ["branch", facts.branch], ["pull request", facts.pr_url], ["spend", money(facts.spend_usd) + limits(facts.soft_budget_usd, facts.budget_usd)],
     ["refine", facts.refine ? "round " + facts.refine.round + ": " + facts.refine.note : ""], ["failure", facts.failure]]
-    .filter(([, v]) => v).map(([k, v]) => el("div", {}, el("span", { class: "muted", text: k + ": " }), String(v)));
-  const decision = decisionNode(detail) || el("p", { class: "muted", text: "Nothing is waiting on you." });
-  const controls = actionNodes(detail, detail.actions.filter((a) => !DECISION_ACTIONS.includes(a)));
-  peek.replaceChildren(
-    el("h2", { text: detail.label }), el("div", { class: "muted", text: runId }), ...rows,
-    decision,
-    el("div", { class: "actions" }, controls,
+    .filter(([, v]) => v).map(([k, v]) => [k, String(v)]);
+  const asked = decisionData(detail);
+  const controls = detail.actions.filter((a) => !DECISION_ACTIONS.includes(a));
+  patchChildren(peek, [
+    entry("head", { label: detail.label, id: runId }, (h) => el("div", {}, el("h2", { text: h.label }), el("div", { class: "muted", text: h.id }))),
+    entry("facts", rows, (list) => el("div", {}, list.map(([k, v]) => el("div", {}, el("span", { class: "muted", text: k + ": " }), v)))),
+    asked.waiting || asked.actions.length
+      ? entry("decision", asked, () => decisionNode(detail))
+      : entry("no-decision", null, () => el("p", { class: "muted", text: "Nothing is waiting on you." })),
+    entry("actions", { actions: controls, label: detail.label, live: (detail.live_agents || []).map((a) => a.label) }, () => el("div", { class: "actions" },
+      actionNodes(detail, controls),
       el("button", { type: "button", class: "primary", text: "Open run", onclick: () => { closePeek(); goRun(runId); } }),
-      el("button", { type: "button", text: "Close", onclick: closePeek })));
+      el("button", { type: "button", text: "Close", onclick: closePeek }))),
+  ], entryKey, entryNode);
 }
 
 function closePeek() {
   ui.peek = null;
+  $("drawer").removeAttribute("data-peek");
   $("drawer").hidden = true;
 }

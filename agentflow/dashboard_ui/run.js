@@ -89,12 +89,15 @@ function sinceSeconds(iso) {
   return isNaN(at) ? null : Math.max(0, (Date.now() - at) / 1000);
 }
 
-function gatesText(detail) {
-  return detail.gates.map((g) => (g.skipped ? "– " : g.passed ? "✓ " : "✗ ") + g.key + " " + g.gate + (g.log_tail ? "\n" + g.log_tail : "")).join("\n\n");
-}
-
 function recordsText(detail) {
   return Object.entries(detail.steps || {}).map(([key, row]) => key + "  " + row.status + (row.skip_reason ? "  (" + row.skip_reason + ")" : "") + (row.result ? "  — " + row.result : "")).join("\n");
+}
+
+// What decisionNode shows, as data: its entry is rebuilt when any of it changes, and kept (with an open Inbox) when not.
+function decisionData(detail) {
+  const w = detail.waiting;
+  return { age: w ? ago(sinceSeconds(w.since)) : "", waiting: w, inbox: detail.inbox,
+    actions: detail.actions.filter((a) => DECISION_ACTIONS.includes(a)) };
 }
 
 // The decision a run waits on, with its approve, reject and answer buttons: shown on Overview and in the peek.
@@ -153,8 +156,29 @@ function attachNode(detail) {
   return el("div", { class: "attach" }, attach, copy);
 }
 
-function timelineNode(events) {
-  return el("ol", { class: "timeline" }, events.slice().reverse().map((e) => el("li", { text: describe(e) })));
+// A timeline, newest first, patched line by line (keyed by `seq`): lines already shown stay as they are.
+function patchTimeline(list, events) {
+  patchChildren(list, events.slice().reverse(), (e) => "seq:" + e.seq, (e) => el("li", { text: describe(e) }));
+}
+
+const timelineShell = () => el("ol", { class: "timeline" });
+
+function gateNode(g) {
+  const mark = g.skipped ? "– " : g.passed ? "✓ " : "✗ ";
+  return el("details", { open: !g.skipped && !g.passed ? "open" : null },  // a failure starts open
+    el("summary", {}, el("span", { class: g.skipped ? "gate-skip" : g.passed ? "gate-ok" : "gate-bad", text: mark }), g.key + " " + g.gate),
+    el("pre", { text: g.log_tail || "(no log)" }));
+}
+
+// Gates keyed by `<key>/<gate>/<i>`, where `i` counts the earlier runs of that gate at that step.
+function gateEntries(gates) {
+  const seen = new Map();
+  return gates.map((g) => {
+    const name = g.key + "/" + g.gate;
+    const i = seen.get(name) || 0;
+    seen.set(name, i + 1);
+    return entry(name + "/" + i, g, gateNode);
+  });
 }
 
 function phaseNode(phase, open) {
@@ -164,26 +188,40 @@ function phaseNode(phase, open) {
     el("ul", { class: "wf-run" }, phase.steps.map(runStepNode)));
 }
 
-function renderRunTab(detail, tab, sub) {
-  let body;
+// The tab body is patched by key, so what the reader opened and where they scrolled survive a refresh.
+function runTabEntries(detail, tab, sub) {
+  const heading = (key, text, cls) => entry(key, { text: text, cls: cls }, (h) => el("h3", { class: h.cls, text: h.text }));
   if (tab === "activity") {
-    body = [el("h3", { text: "Timeline (" + detail.timeline.length + " events)" }), timelineNode(detail.timeline)];
-  } else if (tab === "gates") {
-    body = [section("Gates", gatesText(detail), true, "gates"),
-      section("Review findings", Object.keys(detail.reviews).length ? JSON.stringify(detail.reviews, null, 2) : "", false, "reviews")];
-  } else if (tab === "files") {
-    body = [section("progress.md", detail.progress, false, "file:progress"),
-      section("handoff.md", detail.handoff, false, "file:handoff"),
-      section("Transcript tail" + (detail.transcript_file ? " (" + detail.transcript_file + ")" : ""), detail.transcript, false, "file:transcript"),
-      section("Step records", recordsText(detail), false, "file:records")];
-  } else {
-    const current = sub ? null : detail.facts.phase;  // with nothing named, the phase the run is in starts open
-    body = [decisionNode(detail),
-      el("h3", { class: "wf-title", text: "Workflow" }), detail.workflow.map((phase) => phaseNode(phase, phase.name === current)),
-      metricsSection(detail.metrics),
-      el("h3", { class: "wf-title", text: "Recent activity" }), timelineNode(detail.timeline.slice(-10))];
+    return [heading("title", "Timeline (" + detail.timeline.length + " events)"), entry("timeline", null, timelineShell)];
   }
-  $("run-body").replaceChildren(...body.flat().filter(Boolean));
+  if (tab === "gates") {
+    const reviews = Object.keys(detail.reviews).length ? JSON.stringify(detail.reviews, null, 2) : "";
+    return [heading("title", "Gates"),
+      ...(detail.gates.length ? gateEntries(detail.gates) : [entry("no-gates", null, () => el("p", { class: "muted", text: "No gate has run yet." }))]),
+      entry("reviews", reviews, (text) => section("Review findings", text, false, "reviews"))];
+  }
+  if (tab === "files") {
+    const file = (key, title, text) => entry(key, { title: title, text: text }, (f) => section(f.title, f.text, false, key));
+    return [file("file:progress", "progress.md", detail.progress),
+      file("file:handoff", "handoff.md", detail.handoff),
+      file("file:transcript", "Transcript tail" + (detail.transcript_file ? " (" + detail.transcript_file + ")" : ""), detail.transcript),
+      file("file:records", "Step records", recordsText(detail))];
+  }
+  const current = sub ? null : detail.facts.phase;  // with nothing named, the phase the run is in starts open
+  const asked = decisionData(detail);
+  const decision = asked.waiting || asked.actions.length ? [entry("decision", asked, () => decisionNode(detail))] : [];
+  return [...decision,
+    heading("workflow", "Workflow", "wf-title"),
+    ...detail.workflow.map((phase) => entry("phase:" + phase.name, phase, (p) => phaseNode(p, p.name === current))),
+    entry("metrics", detail.metrics, metricsSection),
+    heading("recent-title", "Recent activity", "wf-title"), entry("recent", null, timelineShell)];
+}
+
+function renderRunTab(detail, tab, sub) {
+  const body = $("run-body");
+  patchChildren(body, runTabEntries(detail, tab, sub), entryKey, entryNode);
+  if (tab === "activity") patchTimeline(childByKey(body, "timeline"), detail.timeline);
+  else if (tab !== "gates" && tab !== "files") patchTimeline(childByKey(body, "recent"), detail.timeline.slice(-10));
 }
 
 function renderRun(detail) {
@@ -216,29 +254,45 @@ function scrollToSub(container, sub) {
 
 let runRequest = 0;
 
-// Fetch one run and show it. A refresh of the same route keeps what the reader opened; a new route scrolls to `sub`.
-async function openRun(id, tab, sub) {
+// Go to a run's route. On the same run with its detail in hand (another tab or `sub`), draw from that at once and
+// refetch behind it; on another run, say it is loading. A new route scrolls to `sub` once it is drawn.
+function openRun(id, tab, sub) {
   const prev = ui.run;
-  // `unshown`: this route has not been drawn yet, so a refresh that overtakes its first fetch still scrolls to `sub`
-  const fresh = !prev || prev.id !== id || prev.tab !== tab || prev.sub !== sub || prev.unshown;
-  ui.run = { id: id, tab: tab, sub: sub, detail: prev && prev.id === id ? prev.detail : undefined, unshown: fresh };
+  const same = !!prev && prev.id === id;
+  ui.run = { id: id, tab: tab, sub: sub, detail: same ? prev.detail : undefined, unshown: true };
   show("run");
-  if (!prev || prev.id !== id) renderRunNote("Loading " + id + "…");
+  if (same && prev.detail) showRun(prev.detail);
+  else if (!same) renderRunNote("Loading " + id + "…");
+  loadRun(id);
+}
+
+function showRun(detail) {
+  renderRun(detail);
+  if (!ui.run.unshown) return;
+  ui.run.unshown = false;
+  scrollToSub($("run-body"), ui.run.sub);
+}
+
+// Fetch the open run and patch its page. A failure keeps a page already drawn (and what is open on it) and says so
+// in a toast; only a first load that fails shows the error in its place.
+async function loadRun(id) {
   const request = ++runRequest;
   let detail;
   try {
     detail = await api(runPath(id));
   } catch (err) {
     if (request !== runRequest || !ui.run || ui.run.id !== id) return;
-    if (err.status === 404) ui.run.detail = null;  // gone for good: a refresh never asks again
-    renderRunNote(err.status === 404 ? "No run " + id : "Could not load " + id + ": " + err.message);
+    if (err.status === 404) {
+      ui.run.detail = null;  // gone for good: a refresh never asks again
+      renderRunNote("No run " + id);
+    } else if (ui.run.detail) {
+      toast("Could not refresh " + id + ": " + err.message);
+    } else {
+      renderRunNote("Could not load " + id + ": " + err.message);
+    }
     return;
   }
   if (request !== runRequest || !ui.run || ui.run.id !== id) return;
   ui.run.detail = detail;
-  ui.run.unshown = false;
-  const opened = fresh ? null : new Set(Array.from($("run-body").querySelectorAll("details[data-key]")).filter((d) => d.open).map((d) => d.dataset.key));
-  renderRun(detail);
-  if (opened) for (const node of $("run-body").querySelectorAll("details[data-key]")) node.open = opened.has(node.dataset.key);
-  else scrollToSub($("run-body"), sub);
+  showRun(detail);
 }

@@ -20,6 +20,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Changed
 
+- Dashboard live updates no longer rebuild what you are reading. Open sections, the scroll position and dialogs survive them. The Board refetches at most every `dashboard.board_refresh_s`, and an open Run page refetches only its own run.
 - The dashboard's Board reads an unchanged run's event log once, not on every refresh. A live run's figures are recomputed at least every 30 s.
 - `GET /api/runs/<id>` no longer embeds the run's whole `state.json`: it returns the fields the page shows, plus `actions` (what the run's state allows now), `label`, `stage_rail` and `live_agents`. `?raw=1` returns the old payload for debugging.
 - A `blocked_repeat` stop that comes back after a human's approval says so in its notification and its inbox item, with how many approvals it has outlived (`times` on `hitl_raised` and in the wait). The stop and its refusal of a plain approval are unchanged.

@@ -305,6 +305,6 @@ function metricsSection(m) {
     el("summary", { text: "Time & cost · " + dur(m.wall_s) + " · " + cost(m.cost_usd, m.cost_estimated) + (m.rework_cost_usd ? " (" + money(m.rework_cost_usd) + " rework)" : "") }),
     flags.length ? el("p", { class: "muted", text: flags.join(" · ") }) : "",
     legendNode(m.buckets), phaseTable,
-    el("details", {}, el("summary", { text: "Steps and agent calls" }),
+    el("details", { "data-key": "metrics:steps" }, el("summary", { text: "Steps and agent calls" }),
       table(["Step / call", "Time", "By bucket", "Cost", "Calls", "Notes"], stepBody, [1, 3, 4])));
 }

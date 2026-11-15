@@ -204,7 +204,7 @@ async function reviewSettings() {
     toast("Saved: a running run takes it at its next phase");
     ui.workflow = null;  // the Workflow tab is built from the config
     await loadSettings();
-    scheduleRefresh();
+    refreshAfter();
     return true;
   }, result.ok ? "Save" : "Close", true);
 }

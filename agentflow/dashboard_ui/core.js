@@ -19,6 +19,91 @@ const ui = { view: "board", peek: null, run: null, board: null, agents: null, wo
 const $ = (id) => document.getElementById(id);
 const workLabel = (lane) => (ui.board && ui.board.lane_labels[lane]) || lane;  // a lane with no label, or an old run's, shows its name
 
+// ------------------------------------------------------------------ live updates that keep the reader's place
+
+// Make `parent`'s children the rendered `items`, in order, without rebuilding what has not changed. Each node carries
+// `data-key` (from `keyOf`) and `data-sig` (the item as JSON: a function in an item, its builder, is not part of it).
+// A child whose key and sig are unchanged is the same node, so its open sections, focus and typed text stay. A changed
+// child is replaced, and each `details[data-key]` inside it (and the node itself, when it is a `details`) keeps the
+// open or closed state the reader left it in. Children whose keys are gone are removed; a node already in its place is
+// never moved. A repeated key gets a `~<n>` suffix, so no item is lost and no node is used twice.
+function patchChildren(parent, items, keyOf, render) {
+  const old = new Map();
+  for (const child of Array.from(parent.children)) {
+    const key = child.getAttribute("data-key");
+    if (key !== null && !old.has(key)) old.set(key, child);
+  }
+  const active = document.activeElement;
+  let refocus = null;
+  const used = new Map();
+  const nodes = [];
+  for (const item of items) {
+    let key = String(keyOf(item));
+    const count = (used.get(key) || 0) + 1;
+    used.set(key, count);
+    if (count > 1) key += "~" + count;
+    const sig = JSON.stringify(item);
+    const prev = old.get(key);
+    if (prev && prev.getAttribute("data-sig") === sig) { nodes.push(prev); continue; }
+    const node = render(item);
+    if (!(node instanceof Element)) continue;
+    node.setAttribute("data-key", key);
+    node.setAttribute("data-sig", sig);
+    if (prev) {
+      keepOpen(prev, node);
+      if (prev === active) refocus = node;
+    }
+    nodes.push(node);
+  }
+  const keep = new Set(nodes);
+  for (const child of Array.from(parent.childNodes)) if (!keep.has(child)) parent.removeChild(child);
+  let cursor = parent.firstChild;  // only kept nodes are left, in their old order
+  for (const node of nodes) {
+    if (node === cursor) cursor = cursor.nextSibling;
+    else parent.insertBefore(node, cursor);
+  }
+  if (refocus && typeof refocus.focus === "function") refocus.focus({ preventScroll: true });
+}
+
+// Carry the open state of `prev`'s keyed sections (and of `prev` itself) to the node replacing it.
+function keepOpen(prev, node) {
+  if (prev.tagName === "DETAILS" && node.tagName === "DETAILS") node.open = prev.open;
+  const was = new Map();
+  for (const d of prev.querySelectorAll("details[data-key]")) if (!was.has(d.getAttribute("data-key"))) was.set(d.getAttribute("data-key"), d.open);
+  for (const d of node.querySelectorAll("details[data-key]")) if (was.has(d.getAttribute("data-key"))) d.open = was.get(d.getAttribute("data-key"));
+}
+
+// An item for patchChildren: `data` is what the node shows (its sig), `build(data)` makes the node.
+const entry = (key, data, build) => ({ key: key, data: data, build: build });
+const entryKey = (item) => item.key;
+const entryNode = (item) => item.build(item.data);
+const childByKey = (parent, key) => Array.from(parent.children).find((n) => n.getAttribute("data-key") === key) || null;
+
+// Run `fn` now when its last run started at least `ms()` ago, else once at that time. Calls in between collapse into
+// that one run, and a call while `fn` is still running collapses into one run after it: two runs never overlap.
+function throttle(fn, ms) {
+  let last = -Infinity;
+  let timer = null;
+  let running = false;
+  let again = false;
+  const run = async () => {
+    timer = null;
+    running = true;
+    last = performance.now();
+    try { await fn(); } catch (err) { console.warn("agentflow: refresh failed", err); }
+    running = false;
+    if (again) { again = false; call(); }
+  };
+  const call = () => {
+    if (running) { again = true; return; }
+    if (timer !== null) return;
+    const wait = last + ms() - performance.now();
+    if (wait <= 0) run();
+    else timer = setTimeout(run, wait);
+  };
+  return call;
+}
+
 function el(tag, props, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(props || {})) {
@@ -86,7 +171,7 @@ function actionToast(action, result) {
 async function act(runId, action, body) {
   try {
     toast(actionToast(action, await api(runPath(runId) + "/" + action, body || {})));
-    scheduleRefresh();
+    refreshAfter(runId);
     return true;
   } catch (err) {
     toast(action + " failed: " + err.message);

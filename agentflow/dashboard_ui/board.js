@@ -74,6 +74,27 @@ function prNode(card) {
   return el("div", {}, link);
 }
 
+// The last `agent_activity` of each run: a card rebuilt by a Board refresh keeps showing it.
+const lastActivity = new Map();
+
+const activityText = (ctx, tool) => "ctx " + (typeof ctx === "number" ? Math.round(ctx) + "%" : "-") + (tool ? " · " + tool : "");
+
+// An agent's turn: only its card's activity line changes. The card is found by its data-run, never by a selector
+// built from the run id.
+function patchActivity(runId, event) {
+  const before = lastActivity.get(runId) || {};
+  const now = {
+    context_pct: typeof event.context_pct === "number" ? event.context_pct : before.context_pct,
+    last_tool: event.last_tool || before.last_tool || null,
+  };
+  lastActivity.set(runId, now);
+  for (const card of document.querySelectorAll("[data-run]")) {
+    if (card.getAttribute("data-run") !== runId) continue;
+    const line = card.querySelector(".activity");
+    if (line) line.textContent = activityText(now.context_pct, now.last_tool);
+  }
+}
+
 function cardNode(card) {
   const agent = card.agent
     ? el("div", { class: "sub", title: card.agent.reason ? "effort: " + card.agent.reason : null },
@@ -84,13 +105,17 @@ function cardNode(card) {
     el("span", { class: g.skipped ? "gate-skip" : g.passed ? "gate-ok" : "gate-bad", text: (g.skipped ? "– " : g.passed ? "✓ " : "✗ ") + g.gate + " " })));
   // A refine round's implementer changed nothing, so its task was not reviewed again.
   const skips = (card.review_skipped || []).map((r) => el("span", { class: "gate-skip", title: "review skipped: " + r.reason, text: "– review task " + r.task + " (" + r.reason + ") " }));
-  const node = el("article", { class: "card " + card.status, tabindex: "0", role: "button", draggable: card.ready ? "true" : null, onclick: () => goRun(card.run_id) },
+  if (!card.agent) lastActivity.delete(card.run_id);  // no live agent: its last tool is history
+  const seen = lastActivity.get(card.run_id);
+  const node = el("article", { class: "card " + card.status, tabindex: "0", role: "button", draggable: card.ready ? "true" : null,
+    "data-run": card.run_id, onclick: () => goRun(card.run_id) },
     el("div", { class: "title", text: card.module }),
     el("div", { class: "sub", text: where }),
     el("span", { class: "badge peekable", text: card.badge, title: "Peek (Space)", onclick: (ev) => { ev.stopPropagation(); openPeek(card.run_id); } }),
     card.refine_round ? el("span", { class: "badge", text: "refine " + card.refine_round }) : null,
     agent,
-    el("div", { class: "sub", text: "ctx " + (typeof card.context_pct === "number" ? Math.round(card.context_pct) + "%" : "-") + " · " + money(card.spend) + limits(card.soft_budget, card.budget) }),
+    el("div", { class: "sub" }, el("span", { class: "activity", text: activityText(seen ? seen.context_pct : card.context_pct, seen && seen.last_tool) }),
+      " · " + money(card.spend) + limits(card.soft_budget, card.budget)),
     card.gates.length ? gates : null,
     skips.length ? el("div", { class: "sub" }, skips) : null,
     el("div", { class: "sub", text: "in phase " + ago(card.time_in_phase_s) + " · total " + dur(card.wall_s) }),
@@ -115,7 +140,7 @@ async function startItem(item) {
   } catch (err) {
     toast("Could not start " + item.label + ": " + err.message);
   }
-  scheduleRefresh();
+  refreshAfter();
 }
 
 async function removeItem(item) {
@@ -126,7 +151,7 @@ async function removeItem(item) {
   } catch (err) {
     toast("Could not remove: " + err.message);
   }
-  scheduleRefresh();
+  refreshAfter();
 }
 
 function backlogMark(item) {
@@ -218,13 +243,35 @@ function newTaskDialog() {
     try {
       await api("/api/backlog", body);
       toast("Added to Backlog: press Start or drag it to " + ((data.lane_phases[kind()] || [])[0] || "its first phase"));
-      scheduleRefresh();
+      refreshAfter();
       return true;
     } catch (err) {
       toast("Could not add: " + err.message);
       return false;
     }
   });
+}
+
+// A column keeps its node, and its drop handlers, across refreshes: only its cards are patched, keyed by run id or
+// by backlog item key.
+function columnNode(name) {
+  const col = el("div", { class: "col" });
+  dropOn(col, name);
+  return col;
+}
+
+function columnEntries(data, name) {
+  const cards = name === "Backlog" ? [] : data.cards.filter((c) => c.column === name);
+  const count = name === "Backlog" ? data.backlog.length : cards.length;
+  const entries = [entry("col-head", { name: name, count: count }, (head) => el("h2", {}, el("span", { text: head.name }), el("span", { text: String(head.count) })))];
+  if (name === "Backlog") {
+    entries.push(...data.backlog.map((item) => entry(item.key || item.id, item, backlogNode)));
+    if (data.done_note) entries.push(entry("done-note", data.done_note, (note) => el("div", { class: "muted gate-bad", text: "Done marks not read: " + note })));
+    if ((data.backlog_done || []).length) entries.push(entry("done", data.backlog_done, () => doneNode(data.backlog_done)));
+    if ((data.backlog_skipped || []).length) entries.push(entry("skipped", data.backlog_skipped, (names) => el("div", { class: "muted", text: "Not modules: " + names.join(", ") })));
+  }
+  entries.push(...cards.map((card) => entry(card.run_id, card, cardNode)));
+  return entries;
 }
 
 // Modules that are finished, with why. One line each and no Start button: the open state survives the SSE re-render.
@@ -241,17 +288,7 @@ function renderBoard(data) {
   const byModel = Object.entries(data.agents_running.by_model).map(([k, v]) => k + " " + v).join(" · ");
   $("summary").textContent = counts + " | agents running " + data.agents_running.total + (byModel ? " (" + byModel + ")" : "") +
     " | today " + money(data.spend_today) + " (budget per run: soft " + money(data.run_budget_usd) + " · hard " + money(data.run_budget_hard_usd) + ")";
-  const columns = data.columns.map((name) => {
-    const cards = name === "Backlog" ? [] : data.cards.filter((c) => c.column === name);
-    const col = el("div", { class: "col" }, el("h2", {}, el("span", { text: name }), el("span", { text: String(name === "Backlog" ? data.backlog.length : cards.length) })));
-    dropOn(col, name);
-    if (name === "Backlog") col.append(...data.backlog.map(backlogNode));
-    if (name === "Backlog" && data.done_note) col.append(el("div", { class: "muted gate-bad", text: "Done marks not read: " + data.done_note }));
-    if (name === "Backlog" && (data.backlog_done || []).length) col.append(doneNode(data.backlog_done));
-    if (name === "Backlog" && (data.backlog_skipped || []).length) col.append(el("div", { class: "muted", text: "Not modules: " + data.backlog_skipped.join(", ") }));
-    for (const card of cards) col.append(cardNode(card));
-    return col;
-  });
+  const columns = data.columns.map((name) => entry(name, name, columnNode));
   $("new-task").hidden = !Object.keys(data.new_task).length;
   $("sync-note").hidden = !data.sync_note;
   $("sync-note").textContent = data.sync_note ? "Base branch not updated: " + data.sync_note : "";
@@ -259,7 +296,10 @@ function renderBoard(data) {
   $("issues-note").textContent = data.issues_note || "";
   $("retro-due").hidden = !data.retro_due;
   $("retro-due").replaceChildren(...(data.retro_due ? [document.createTextNode("Retro due: " + data.retro_due + " → run "), el("code", { text: "agentflow retro" })] : []));
-  if (!ui.dragging) $("columns").replaceChildren(...columns);  // new columns would lose the drop highlights mid-drag
+  if (!ui.dragging) {  // a patch mid-drag would lose the drop highlights; dragend draws what arrived
+    patchChildren($("columns"), columns, entryKey, entryNode);
+    for (const name of data.columns) patchChildren(childByKey($("columns"), name), columnEntries(data, name), entryKey, entryNode);
+  }
   $("needs").replaceChildren(...(data.needs_human.length ? data.needs_human.map(needNode) : [el("p", { class: "muted", text: "Nothing is waiting on you." })]));
 }
 

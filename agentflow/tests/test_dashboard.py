@@ -932,6 +932,27 @@ def test_the_drawer_is_a_peek_with_an_open_run_button():
     assert "Open run" in drawer_js and "function openPeek" in drawer_js and "openDrawer" not in page_source()
 
 
+def test_the_page_listens_quietly_and_refreshes_in_buckets():
+    source = page_source()
+    assert "/api/events?quiet=1&token=" in source
+    on_message = source[source.index("stream.onmessage"):source.index("\n", source.index("stream.onmessage"))]
+    assert "onStreamMessage" in on_message and "scheduleRefresh" not in source
+    assert "agent_activity" in source and "patchActivity(" in source and "board_refresh_s" in source
+
+
+def test_live_regions_patch_by_key():
+    for name in ("board.js", "run.js", "drawer.js"):
+        assert "patchChildren(" in (UI_DIR / name).read_text(encoding="utf-8"), name
+    core = (UI_DIR / "core.js").read_text(encoding="utf-8")
+    assert "function patchChildren" in core and "function throttle" in core and "data-sig" in core
+
+
+def test_a_reconnect_marks_everything_dirty():
+    main = (UI_DIR / "main.js").read_text(encoding="utf-8")
+    onopen = main[main.index("stream.onopen"):main.index("stream.onmessage")]
+    assert "dirty.board = true" in onopen and "dirty.agents = true" in onopen and "dirty.runs.add" in onopen
+
+
 def test_sse_keeps_an_event_written_as_soon_as_the_headers_arrive(dash, monkeypatch):
     """A client acting on the 200 at once (the race): its event must still be streamed."""
     from agentflow import dashboard
