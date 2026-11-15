@@ -129,10 +129,16 @@ def new_events(run: Run, after: int) -> list[dict]:
 def test_info_names_the_engine_version(dash):
     status, headers, body = dash.get("/api/info")
     assert status == 200 and headers["content-type"].startswith("application/json")
-    assert json.loads(body) == {"name": "agentflow-harness", "version": pack.ENGINE_VERSION}
+    assert json.loads(body) == {"name": "agentflow-harness", "version": pack.ENGINE_VERSION, "board_refresh_s": 2.0}
     assert dash.get("/api/info", token=None)[0] == 403
     page = page_source()
     assert 'id="version"' in page and "/api/info" in page
+
+
+def test_info_carries_the_board_refresh(dash):
+    assert payload(dash.get("/api/info")[2])["board_refresh_s"] == 2.0
+    dash.server.cfg.dashboard["board_refresh_s"] = 7
+    assert payload(dash.get("/api/info")[2])["board_refresh_s"] == 7
 
 
 def test_api_rejects_without_token(dash):

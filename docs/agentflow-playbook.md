@@ -517,7 +517,7 @@ A live run sees a change to any layer file between its phases: the runner takes 
 - `phase_approval`: the refine prompt and what an approval page shows. Protected.
 - `checkpoints`: who answers each inner checkpoint. Not protected.
 - `hitl`: notifications, reminders and where decisions are recorded. Not protected, except `hitl.notify`.
-- `dashboard`: host, port and the Backlog. Not protected, except `dashboard.host`. `dashboard.backlog.new_task` may list `issue` for the `module_lane` too; in a capability map that needs `dashboard.backlog.module_row`, since such a card adds the row `issue-<N>`.
+- `dashboard`: host, port and the Backlog. Not protected, except `dashboard.host`. `dashboard.board_refresh_s` (2 by default, 0.5–60) is the most often the page refetches the Board while events arrive. `dashboard.backlog.new_task` may list `issue` for the `module_lane` too; in a capability map that needs `dashboard.backlog.module_row`, since such a card adds the row `issue-<N>`.
 
 ## 15. Lessons and retros
 

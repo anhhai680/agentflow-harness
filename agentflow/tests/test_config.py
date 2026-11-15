@@ -1624,6 +1624,14 @@ def test_ci_watch_max_h_must_be_finite_and_zero_or_more(tmp_cfg):
     assert [i.path for i in found if i.level == "error"] == ["watchdog.no_progress_min"]
 
 
+def test_dashboard_board_refresh_s_is_half_a_second_to_a_minute(tmp_cfg):
+    for bad in (0, 0.4, 61, True, "2", float("inf"), float("nan")):
+        found = issues_for(tmp_cfg, {"dashboard": {"board_refresh_s": bad}})
+        assert [i.path for i in found if i.level == "error"] == ["dashboard.board_refresh_s"], bad
+    for good in (0.5, 2, 60):
+        assert not errors(issues_for(tmp_cfg, {"dashboard": {"board_refresh_s": good}})), good
+
+
 def test_watchdog_no_progress_min_loads_as_a_float_and_an_oversized_int_as_inf(tmp_cfg):
     """A 400-digit integer never reaches the watcher thread's `limit / 4` as an int: it loads as `inf`, which
     `validate` refuses."""

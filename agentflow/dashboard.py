@@ -80,6 +80,7 @@ UI_SCRIPTS = ("core.js", "dialogs.js", "board.js", "drawer.js", "workflow.js", "
               "settings.js", "main.js")  # in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
 UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024
+DEFAULT_BOARD_REFRESH_S = 2.0  # the most often the page refetches the Board while events arrive
 LOG_REASON_MAX = 200  # the characters of a refused request's `error` its log line keeps
 MIN_TOKEN_CHARS = 22  # 128 bits of token_urlsafe
 RUN_ID = re.compile(r"^[0-9]{8}-[0-9]{4}-[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -434,7 +435,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, board(self.server.repo, self.server.cfg, lane))
         elif path == "/api/info":
-            self._json(200, {"name": "agentflow-harness", "version": pack.ENGINE_VERSION})
+            refresh = self.server.cfg.dashboard.get("board_refresh_s", DEFAULT_BOARD_REFRESH_S)
+            self._json(200, {"name": "agentflow-harness", "version": pack.ENGINE_VERSION,
+                             "board_refresh_s": float(refresh)})
         elif path == "/api/workflow":
             self._json(200, workflow_view(self.server.cfg))
         elif path == "/api/agents":

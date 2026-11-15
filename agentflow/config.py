@@ -2019,6 +2019,9 @@ class _Validator:
     def dashboard(self) -> None:
         if self.cfg.dashboard.get("host") != "127.0.0.1":
             self.error("dashboard.host", "the dashboard binds 127.0.0.1 only")
+        refresh = self.cfg.dashboard.get("board_refresh_s")
+        if "board_refresh_s" in self.cfg.dashboard and (not _finite(refresh) or not 0.5 <= refresh <= 60):
+            self.error("dashboard.board_refresh_s", "must be a finite number of seconds, from 0.5 to 60")
         if "backlog" in self.cfg.dashboard:
             self.backlog(self.cfg.dashboard["backlog"])
 

@@ -125,6 +125,16 @@ def test_the_form_sets_the_ci_watch(shipped):
             form(shipped, (["ci", "watch_max_h"], bad))
 
 
+def test_the_form_sets_the_board_refresh(shipped):
+    proposal = form(shipped, (["dashboard", "board_refresh_s"], 5))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).dashboard["board_refresh_s"] == 5
+    for bad in (0.1, 120):
+        with pytest.raises(EditError):
+            form(shipped, (["dashboard", "board_refresh_s"], bad))
+
+
 def test_an_optional_text_field_set_to_null_removes_the_key(shipped):
     proposal = form(shipped, (["phases", "verify", "model"], None))
     assert changed_lines(proposal.diff) == ["-    model: sonnet"]
