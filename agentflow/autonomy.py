@@ -10,6 +10,9 @@ Nothing here names a phase. A phase's `needs_approval` and `resolve`, a step's `
   hears of it. The runner acts through the ways out a human has (`answer`, a reopened step), so a stop has one
   meaning whoever settles it. The resolver's session runs as `<key>/resolve-<n>` under the same guards and gates
   as any other, and only the original step's own checks can finish that step.
+- **A stop's class** (`Resolver._classify`): a resolver may name its stop's cause (`hitl.STOP_CLASSES`). Each class is
+  recorded once per session (`stop_classified`); for `flaky` the runner first reruns the failed gates alone
+  (`_confirm_flaky`). A stop whose attempts are used is recorded as `repeated_failure`.
 - **Questions** (`needs_human`): with `autonomy.answer_recommended`, the runner takes the one recommended option of
   every question in **any** phase, `resolve: true` or not, parked or not, records it as `by: runner` and notifies
   one line. A question whose `kind` is in `autonomy.human_question_kinds` (`boundary` by default: the docs reserve
@@ -27,7 +30,8 @@ from typing import TYPE_CHECKING
 from agentflow.commit_checks import runner_head
 from agentflow.config import FLOOR_BLOCKING, QUESTION_KINDS, Config, Phase, Step
 from agentflow.flow_control import halted
-from agentflow.gitops import restore_paths
+from agentflow.gates import run_gates
+from agentflow.gitops import GitError, restore_paths, tree_state
 from agentflow.hitl import ResultError, answer, clean_fact, notify_run, read_result
 from agentflow.state import Run
 
@@ -42,6 +46,7 @@ QUESTIONS_KIND = "needs_human"
 DEFAULT_HUMAN_KINDS = ("boundary",)  # `autonomy.human_question_kinds` when no layer sets it
 QUESTION_CMP_MAX = 2000  # characters of a question's text `asked_again` compares
 OPTION_SHOWN = 40  # characters of an option key in the notification of an answer the runner took
+FLAKY_RERUNS = 2  # how many times `_confirm_flaky` runs each failing gate alone; every one must pass
 
 
 # --------------------------------------------------------------------------- findings
@@ -268,7 +273,10 @@ class Resolver:
     def _resolve(self, wait: dict) -> bool:
         kind, key = wait["kind"], wait["key"]
         attempt = self._attempts(key) + 1
-        if self.cfg.resolve_step is None or attempt > int(self.cfg.autonomy["resolve_kinds"][kind]):
+        if self.cfg.resolve_step is None:
+            return False
+        if attempt > int(self.cfg.autonomy["resolve_kinds"][kind]):
+            self._record_repeated(key)
             return False
         sessions = sum(1 for e in self.run.events.read() if e["type"] == "resolve_started"
                        and e.get("key") == key and e.get("session_key"))
@@ -285,15 +293,103 @@ class Resolver:
             self._finish(key, kind, "")
             return True
         plain = Phase(name=phase.name, agent=phase.agent, model=None, skip_if=None, steps=[])
+        # A session that finished before this call (a resume) has no `before`: it counts as having changed the tree.
+        ran_before = (self.run.state["steps"].get(session_key) or {}).get("status") in ("done", "unchanged")
+        before = None if ran_before else self._tree()
         outcome = self.executor.run_agent_step(plain, step, session_key, extra=extra, role=step.role,
                                                size=False)
         if outcome != "done":
             return False
+        changed = before is None or before != self._tree()
         self.run.refresh()
         summary = str((self.run.state["steps"].get(session_key) or {}).get("result") or "")
         self._remember_facts(session_key)
+        if not self._classify(key, session_key, changed):
+            return False  # a human paused or ended the run: the resolve stays open (`finish_open`)
         self._finish(key, kind, summary)
         return True
+
+    def _tree(self) -> dict | None:
+        """The work tree's `gitops.tree_state`, or None when git cannot read it (which counts as a change)."""
+        try:
+            return tree_state(self.executor.worktree)
+        except (GitError, OSError):
+            return None
+
+    # -- a stop's class (`StepResult.stop_class`): the runner acts on some, and records every one
+
+    def _stop_class(self, session_key: str) -> str | None:
+        """The class the resolver session named for the stop's cause, or None (no class, or no readable result)."""
+        try:
+            return read_result(self.run.result_path(session_key)).stop_class
+        except ResultError:
+            return None
+
+    def _classified(self, session_key: str) -> bool:
+        return any(e["type"] == "stop_classified" and e.get("session_key") == session_key
+                   for e in self.run.events.read())
+
+    def _classify(self, key: str, session_key: str, changed: bool) -> bool:
+        """Act on the class the resolver named, once per session: a resume of the same session (`finish_open`) records
+        nothing again and reruns nothing. False when the run was halted while the runner acted on it."""
+        cls = self._stop_class(session_key)
+        if cls is None or self._classified(session_key):
+            return True
+        if cls == "flaky":
+            action = self._confirm_flaky(key, session_key, changed)
+        else:  # `environment` is recorded only, for now; every other class is recorded only
+            action = "none"
+        self.run.emit("stop_classified", key=key, session_key=session_key, stop_class=cls, action=action)
+        return action != "halted"
+
+    def _failed_gates(self, key: str) -> list[str]:
+        """The gates that failed (not skipped) in the most recent batch of `gate_result` events on `key`: a maximal run
+        of consecutive `gate_result` events with that key, as the signals count them."""
+        batches: list[list[dict]] = []
+        open_ = False
+        for event in self.run.events.read():
+            if event["type"] == "gate_result" and event.get("key") == key:
+                if not open_:
+                    batches.append([])
+                batches[-1].append(event)
+                open_ = True
+            else:
+                open_ = False
+        last = batches[-1] if batches else []
+        return [str(e["gate"]) for e in last if e.get("gate") and not e.get("passed") and not e.get("skipped")]
+
+    def _confirm_flaky(self, key: str, session_key: str, changed: bool) -> str:
+        """Rerun each gate that failed on `key` alone, `FLAKY_RERUNS` times. When every one passes every time, record
+        one `flaky:` fact. Only when the resolver changed nothing: reruns on a tree it changed prove nothing.
+        The reruns record no `gate_result`: they are no evidence, and the step's own gates still decide."""
+        if changed:
+            return "tree_changed"
+        names = self._failed_gates(key)
+        if not names:
+            return "no_failed_gate"
+        if any(name not in self.cfg.gates for name in names):
+            return "not_confirmed"  # a check that is no gate (the regression test command, a doc check) is not rerun
+        log_dir = self.run.gate_log_dir(f"{key}/flaky")
+        for name in names:
+            for _ in range(FLAKY_RERUNS):
+                self.run.refresh()
+                if halted(self.run.state["status"]):
+                    return "halted"
+                results = run_gates(self.cfg, [name], self.executor.worktree, log_dir)
+                if not all(r.passed and not r.skipped for r in results):
+                    return "not_confirmed"
+        text = clean_fact(f"flaky: {', '.join(names)} failed in {key}, then passed twice when run alone")
+        known = {str(f.get("text")).casefold() for f in self.run.state.get("facts") or []}
+        if text.casefold() not in known:
+            self.run.emit("run_fact", text=text, key=session_key)
+        return "confirmed"
+
+    def _record_repeated(self, key: str) -> None:
+        """A stop whose resolve attempts are used goes to a human: say so once, until a human acts on `key` again."""
+        if any(e["type"] == "stop_classified" and e.get("key") == key and e.get("stop_class") == "repeated_failure"
+               for e in _since_human(self.run.events.read(), key)):
+            return
+        self.run.emit("stop_classified", key=key, stop_class="repeated_failure", action="human")
 
     def _remember_facts(self, session_key: str) -> None:
         """Keep what a resolver session found for every later session of the run. Only a resolver's result is read

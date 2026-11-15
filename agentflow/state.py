@@ -854,6 +854,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "runner_error": ("error",),
     "preflight_checked": ("ok",),
     "watchdog_fired": ("key",),
+    "stop_classified": ("key", "stop_class"),
 }
 TEXT_FIELDS = ("key", "step", "phase", "model", "kind")
 HANDLER_ERRORS = (KeyError, TypeError, AttributeError, ValueError, IndexError)

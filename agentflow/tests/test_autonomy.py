@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from agentflow import autonomy
 from agentflow.autonomy import blocking_of, eligible, is_blocking, phase_findings, recommended_answers, round_limit
 from agentflow.config import load_config, validate
 from agentflow.hitl import answer, approve, reject
@@ -414,6 +415,127 @@ def test_a_human_stop_gives_fresh_attempts(auto):
     assert go(auto, run) == "done"
     assert len(auto.events(run, "resolve_started")) == 3
     assert called(auto).count(f"{RED}/resolve-3") == 1  # a fresh attempt is a new session, never a finished one
+
+
+# --------------------------------------------------------------------------- a stop's class
+
+FIX = "build/fix"
+FIX_RESOLVE = f"{FIX}/resolve-1"
+FLAKY = done("flaky", stop_class="flaky")
+FLAKY_FACT = f"flaky: suite failed in {FIX}, then passed twice when run alone"
+
+
+def gate_failing(flow, tmp_path: Path, runs: int) -> Path:
+    """`verify` is one gate, `suite`, that fails its first `runs` runs and passes after; no fix attempts, so its first
+    failure stops `build/fix`. The counter it keeps lives outside the repository."""
+    counter = tmp_path / "suite-runs"
+    script = f'n=$(cat "{counter}" 2>/dev/null || echo 0); echo $((n + 1)) > "{counter}"; test "$n" -ge {runs}'
+    flow.configure({**PIPE, "gate_sets": {**PIPE["gate_sets"], "verify": ["suite"]}, "gates": {"suite": {"run": script}},
+                    "defaults": {"fix_attempts": 0}}, autopilot=True)
+    return counter
+
+
+def classified(flow, run: Run) -> list[tuple]:
+    return [(e["key"], e.get("session_key"), e["stop_class"], e["action"]) for e in flow.events(run, "stop_classified")]
+
+
+def flaky_facts(flow, run: Run) -> list[tuple]:
+    return [(e["text"], e["key"]) for e in flow.events(run, "run_fact") if e["text"].startswith("flaky: ")]
+
+
+def test_a_flaky_gate_is_confirmed_and_recorded(flow_repo, tmp_path):
+    counter = gate_failing(flow_repo, tmp_path, runs=1)
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED, done("tiếp tục")], FIX_RESOLVE: [FLAKY]})
+    run = begin_bug(flow_repo, to="build")
+    assert go(flow_repo, run) == "done"
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "flaky", "confirmed")]
+    assert flaky_facts(flow_repo, run) == [(FLAKY_FACT, FIX_RESOLVE)]
+    assert run.state["steps"][FIX]["status"] == "done"
+    assert not [e for e in flow_repo.events(run, "gate_result") if str(e.get("key")).startswith(f"{FIX}/flaky")]
+    assert counter.read_text().strip() == "4"  # the step's failure, two reruns alone, then the step's own pass
+
+
+def test_a_gate_that_fails_again_is_not_flaky(flow_repo, tmp_path):
+    gate_failing(flow_repo, tmp_path, runs=10**6)
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED] + [done("lại")] * 3, FIX_RESOLVE: [FLAKY],
+                      f"{FIX}/resolve-2": [FLAKY]})
+    run = begin_bug(flow_repo, to="build")
+    assert go(flow_repo, run) == "waiting_human"
+    flaky = [c for c in classified(flow_repo, run) if c[2] == "flaky"]
+    assert flaky and {c[3] for c in flaky} == {"not_confirmed"}
+    assert not flaky_facts(flow_repo, run)
+
+
+def test_a_flaky_claim_after_a_change_records_no_fact(flow_repo, tmp_path):
+    counter = gate_failing(flow_repo, tmp_path, runs=1)
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED, done("tiếp tục")],
+                      FIX_RESOLVE: [{"write": {"notes.txt": "đã sửa\n"}, **FLAKY}]})
+    run = begin_bug(flow_repo, to="build")
+    assert go(flow_repo, run) == "done"
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "flaky", "tree_changed")]
+    assert not flaky_facts(flow_repo, run)
+    assert counter.read_text().strip() == "2"  # nothing was rerun alone: the step's failure, then its own pass
+
+
+def test_a_resume_does_not_classify_again(flow_repo, tmp_path, monkeypatch):
+    gate_failing(flow_repo, tmp_path, runs=1)
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED, done("tiếp tục")], FIX_RESOLVE: [FLAKY]})
+    run = begin_bug(flow_repo, to="build")
+    real = autonomy.run_gates
+    paused: list[bool] = []
+
+    def pausing(*args, **kwargs):  # a human pauses the run while the first rerun is on
+        results = real(*args, **kwargs)
+        if not paused:
+            paused.append(True)
+            run.emit("run_paused", "me")
+        return results
+
+    monkeypatch.setattr(autonomy, "run_gates", pausing)
+    assert go(flow_repo, run) == "paused"
+    assert run.state["resolving"] is not None  # the resolve is left open
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "flaky", "halted")]
+    assert go(flow_repo, run) == "done"
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "flaky", "halted")]
+    assert len(paused) == 1  # no rerun after the resume
+    assert not flaky_facts(flow_repo, run)
+    assert run.state["resolving"] is None
+
+
+def test_a_class_with_no_routing_is_recorded_only(flow_repo, tmp_path):
+    counter = gate_failing(flow_repo, tmp_path, runs=1)
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED, done("tiếp tục")],
+                      FIX_RESOLVE: [done("hợp đồng", stop_class="spec_gap")]})
+    run = begin_bug(flow_repo, to="build")
+    assert go(flow_repo, run) == "done"
+    assert classified(flow_repo, run) == [(FIX, FIX_RESOLVE, "spec_gap", "none")]
+    assert counter.read_text().strip() == "2"
+
+
+def test_only_the_last_gate_run_of_the_step_counts(auto):
+    run = auto.new_run()
+    resolver = autonomy.Resolver(auto.cfg, run, auto.executor(run))
+    key, session = "build/x", "build/x/resolve-1"
+    assert resolver._confirm_flaky(key, session, changed=False) == "no_failed_gate"
+    run.emit("gate_result", key=key, gate="ok", passed=False, skipped=False)
+    run.emit("step_retry", key=key)
+    run.emit("gate_result", key=key, gate="ok", passed=True, skipped=False)  # a later run that passed
+    run.emit("gate_result", key="build/y", gate="ok", passed=False, skipped=False)  # another step's
+    assert resolver._confirm_flaky(key, session, changed=False) == "no_failed_gate"
+    run.emit("step_retry", key=key)
+    run.emit("gate_result", key=key, gate="test_command", passed=False, skipped=False)
+    assert resolver._confirm_flaky(key, session, changed=False) == "not_confirmed"  # no gate, so nothing to rerun
+    assert resolver._confirm_flaky(key, session, changed=True) == "tree_changed"
+    assert not auto.events(run, "run_fact")
+
+
+def test_spent_attempts_are_recorded_as_a_repeated_failure_once(auto, notified):
+    auto.script({RED: [BLOCKED] * 3, f"{RED}/resolve-2": [done("vẫn chưa")]})
+    run = begin_bug(auto, to="build")
+    assert go(auto, run) == "waiting_human"
+    assert not autonomy.Resolver(auto.cfg, run, auto.executor(run)).take_over()  # the same stop, looked at again
+    repeated = [c for c in classified(auto, run) if c[2] == "repeated_failure"]
+    assert repeated == [(RED, None, "repeated_failure", "human")]
 
 
 def test_stops_outside_a_resolve_phase_are_a_humans(auto, notified):

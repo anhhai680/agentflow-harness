@@ -307,6 +307,13 @@ The last two end in an `agent_unavailable` stop. `pause` and `cancel` still work
 
 A resolver session may also record what it found. Its result can carry `facts`, short statements that hold for the whole run (for example, a gate that fails for a reason outside the task). The runner keeps each new one as a `run_fact` event, and every later agent session of the run sees them under "What this run already found" in its prompt, so it checks them instead of diagnosing the same thing again.
 
+A resolver may also name the stop's cause in `stop_class`: `environment`, `flaky`, `guard_false_positive`, `spec_gap`, `impact` or `repeated_failure`. The field is advisory: an unknown value is dropped, never a broken result. The runner records each class once per resolver session as a `stop_classified` event, and acts on two of them:
+
+- `flaky`: only when the resolver changed nothing in the tree, the runner reruns each gate that failed in the step's last gate run alone, twice. If every one passes both times, it records one `flaky: <gates> failed in <step>, then passed twice when run alone` fact. The reruns are not evidence: they write no `gate_result`, and the step's own gates still decide when it resumes.
+- `environment`: recorded only, for now.
+
+Every other class is recorded only. When a stop's resolve attempts are used up and it goes to you, the runner also records it once as `repeated_failure`.
+
 Any step's result may carry `code_map`: up to 8 one-line entries naming existing code the step had to search for (`path:line`, signature, use). The runner keeps them as `code_noted` events (the newest 40, deduplicated), and every later session of the run sees them under "Code this run has mapped" in its prompt, so it opens that code at the line given instead of searching for it again.
 
 The runner fixes what a review finds by itself: `plan_fixes` makes the plan, `fix_findings` makes the change and runs its gates, then fresh review sessions check the branch again. If you stop at `review_approved` because findings outlasted those rounds, reject with a note to send it round again. A refine round belongs to its phase: once the runner approves `verify`, `review` starts with no round of its own and reviews the branch. `verify` has no fix plan of its own: it proves the branch works, debugs a failing gate in its own step, and a blocking verify finding re-runs `verify` in a fresh session. The PR's `Verification` section lists what verify proved and what it could not, and marks evidence older than a review fix.

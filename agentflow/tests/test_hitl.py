@@ -102,6 +102,16 @@ def test_clean_fact_drops_format_characters():
     assert hitl.clean_fact("a​b") == "ab"
 
 
+def test_stop_class_is_advisory(tmp_path):
+    p = tmp_path / "r.json"
+    assert read_result(write_result(p, {"status": "done", "summary": "x", "stop_class": "flaky"})).stop_class == "flaky"
+    assert read_result(write_result(p, {"status": "done", "summary": "x"})).stop_class is None
+    for value in ("weather", 3, None, ["flaky"]):  # never a `ResultError`: the field only advises
+        assert read_result(write_result(p, {"status": "done", "summary": "x", "stop_class": value})).stop_class is None
+    assert hitl.STOP_CLASSES == ("environment", "flaky", "guard_false_positive", "spec_gap", "impact",
+                                 "repeated_failure")
+
+
 @pytest.mark.parametrize("facts", ["one fact", {"a": "b"}, [1], [["nested"]], [None]])
 def test_result_facts_must_be_a_list_of_strings(tmp_path, facts):
     with pytest.raises(ResultError):

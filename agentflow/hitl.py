@@ -27,6 +27,9 @@ from .events import nfc, parse_iso
 from .state import TERMINAL, Run, list_runs
 
 RESULT_STATUSES = ("done", "blocked", "needs_human", "effort_change", "unchanged")
+# What a resolver may name as a stop's cause (`StepResult.stop_class`). Advisory: the runner acts on `flaky` and
+# `environment` (`autonomy.Resolver`) and records the rest.
+STOP_CLASSES = ("environment", "flaky", "guard_false_positive", "spec_gap", "impact", "repeated_failure")
 QUESTION_ID = re.compile(r"^[\w.\-]+$")
 HEADING = re.compile(r"^### (\S+) — (.*)$", re.MULTILINE)
 ANSWER_LINE = re.compile(r"^Answer:[ \t]*(.*)$", re.MULTILINE)
@@ -92,6 +95,7 @@ class StepResult:
     facts: list[str] = field(default_factory=list)
     code_map: list[str] = field(default_factory=list)
     lessons_cited: list[str] = field(default_factory=list)
+    stop_class: str | None = None  # a resolver's class of the stop's cause: one of `STOP_CLASSES`, else None
 
 
 # --------------------------------------------------------------------------- result.json
@@ -211,7 +215,13 @@ def read_result(path: Path, refine: bool = False) -> StepResult:
         facts=facts,
         code_map=code_map,
         lessons_cited=lessons_cited,
+        stop_class=_stop_class(raw.get("stop_class")),
     )
+
+
+def _stop_class(raw: Any) -> str | None:
+    """`stop_class` is advisory, so it never makes a result unreadable: anything but one of `STOP_CLASSES` is None."""
+    return raw if isinstance(raw, str) and raw in STOP_CLASSES else None
 
 
 # --------------------------------------------------------------------------- inbox files
