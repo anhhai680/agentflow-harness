@@ -291,8 +291,8 @@ def _recheck(cfg: Config, run: Run) -> bool:
         return False
     held = [e for e in events if e["type"] == "environment_waiting" and e.get("key") == key]
     worktree = run.state.get("worktree")
-    if not held or not worktree:
-        return False
+    if not held or not worktree or not Path(worktree).is_dir():
+        return False  # a gone worktree would skip every gate (its cwd is missing) and pass: leave the run to a human
     outcome = probe(cfg, [str(name) for name in held[-1].get("gates") or []], Path(worktree))
     with run.locked():  # decided on the run as it is now: a human may have paused it, or a runner started
         now = run.state["waiting"]

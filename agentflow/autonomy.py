@@ -247,8 +247,12 @@ def stop_gates(cfg: Config, run: Run, key: str) -> list[str]:
 
 def _first_notice(events: list[dict], digest: str) -> bool:
     """Whether a human hears of this machine problem: not when an `environment_waiting` with the same `digest` came
-    after the last time the machine was found fixed. One notification per distinct problem."""
-    fixed = max((i for i, e in enumerate(events) if e["type"] == "stop_classified" and e.get("action") == ENV_FIXED),
+    after the last time the machine was found fixed, or a human overrode the check (approved with a note, so they are
+    told when that did not hold). One notification per distinct problem."""
+    fixed = max((i for i, e in enumerate(events)
+                 if (e["type"] == "stop_classified" and e.get("action") == ENV_FIXED)
+                 or (e["type"] == "hitl_approved" and e.get("kind") == ENVIRONMENT and e.get("note")
+                     and e.get("by") != AUTO_BY)),
                 default=-1)
     return not any(e["type"] == "environment_waiting" and e.get("digest") == digest for e in events[fixed + 1:])
 

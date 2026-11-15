@@ -156,6 +156,18 @@ def test_a_preflight_stop_cannot_be_rejected(flow):
         reject(run, "define/preflight", "me", "try again")
 
 
+def test_a_preflight_stop_refuses_a_note(flow):
+    fail_setup(flow)
+    run = begin(flow)
+    assert go(flow, run) == "waiting_human"
+    with pytest.raises(ValueError, match="preflight runs again"):
+        approve(run, "define/preflight", by="me", note="installed it")
+    assert run.state["waiting"]["kind"] == "preflight_failed" and not of(flow, run, "hitl_approved")
+    fail_setup(flow, "true")
+    approve(run, "define/preflight", by="me")  # a plain approval still goes on
+    assert go(flow, run) == "awaiting_approval"
+
+
 def test_a_passing_preflight_is_cached_for_the_day(flow, tmp_path):
     counter = tmp_path / "counter.txt"
     flow.configure({"preflight": {"enabled": True}, "gates": {"s": {"run": f"echo ran >> {counter}"}},
@@ -271,6 +283,22 @@ def test_recheck_waiting_leaves_a_run_whose_runner_is_live(flow_repo, monkeypatc
     lock.unlink()
     assert preflight.recheck_waiting(flow_repo.cfg, flow_repo.root, spawn=spawned.append) == [run.id]
     assert [r.id for r in spawned] == [run.id]
+
+
+@pytest.mark.parametrize("gone", ["missing", "a_file"])
+def test_recheck_waiting_leaves_a_run_whose_worktree_is_gone(flow_repo, monkeypatch, tmp_path, gone):
+    calls = probes(monkeypatch, GREEN)  # every gate's cwd would be missing, so a real probe would pass too
+    run = environment_wait(flow_repo)
+    worktree = tmp_path / "worktree"
+    if gone == "a_file":
+        worktree.write_text("", encoding="utf-8")
+    run.emit("run_updated", worktree=str(worktree))
+    wait = dict(run.state["waiting"])
+    spawned: list = []
+    assert preflight.recheck_waiting(flow_repo.cfg, flow_repo.root, spawn=spawned.append) == []
+    run.refresh()
+    assert not calls and not spawned and run.state["waiting"] == wait
+    assert not of(flow_repo, run, "environment_rechecked") and not of(flow_repo, run, "hitl_approved")
 
 
 def test_recheck_waiting_marks_a_run_it_cannot_start(flow_repo, monkeypatch):

@@ -653,6 +653,21 @@ def test_approve_with_a_note_skips_the_check(flow_repo, tmp_path, monkeypatch):
     assert resumed and "--resume" in resumed[0]["argv"] and "fixed by hand" in resumed[0]["argv"][-1]
 
 
+def test_a_note_that_did_not_fix_the_machine_notifies_again(flow_repo, tmp_path, monkeypatch):
+    gate_failing(flow_repo, tmp_path, runs=10**6)  # the gate never passes: the human's note did not hold
+    flow_repo.script({RED: [GOOD_TEST], FIX: [FIXED, done("tiếp tục"), done("vẫn lỗi")], FIX_RESOLVE: [ENVIRONMENT],
+                      f"{FIX}/resolve-2": [ENVIRONMENT]})
+    run = begin_bug(flow_repo, to="build")
+    seen = machine(monkeypatch, MACHINE_RED)
+    assert go(flow_repo, run) == "waiting_human"
+    assert len(seen["sent"]) == 1
+    approve(run, FIX, by="me", note="fixed by hand")  # the human's override: no check
+    assert go(flow_repo, run) == "waiting_human"  # the step fails again, its fresh resolver says `environment`
+    assert run.state["waiting"]["kind"] == "environment"
+    assert [e["digest"] for e in flow_repo.events(run, "environment_waiting")] == [MACHINE_RED.digest] * 2
+    assert len(seen["sent"]) == 2  # the human who overrode the check is told it did not hold
+
+
 def test_the_problem_back_after_a_fix_notifies_again(flow_repo, tmp_path, monkeypatch):
     run, seen = environment_stop(flow_repo, tmp_path, monkeypatch, MACHINE_RED, MACHINE_GREEN, MACHINE_RED,
                                  fix=[FIXED, BLOCKED])

@@ -623,6 +623,9 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
         waiting_kind = (run.state["waiting"] or {}).get("kind")
         if note and (kind == "phase" or waiting_kind in CLEARED_BY_APPROVE):
             raise ValueError(f"no agent resumes from {name!r}, so nothing would read the note; use `agentflow reject`")
+        if note and waiting_kind == "preflight_failed":
+            raise ValueError(f"no agent resumes from {name!r}: on approval preflight runs again, so a note changes "
+                             f"nothing; approve it without --note once the machine is fixed")
         if waiting_kind == "blocked_repeat" and not note:
             raise NotWaiting(f"{name!r} blocked again with nothing changed, so another plain approval would repeat it. "
                              f"Fix the cause, then `agentflow retry {run.id} {name}` for a fresh session, "
