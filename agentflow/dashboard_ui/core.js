@@ -25,7 +25,8 @@ const workLabel = (lane) => (ui.board && ui.board.lane_labels[lane]) || lane;  /
 // `data-key` (from `keyOf`) and `data-sig` (the item as JSON: a function in an item, its builder, is not part of it).
 // A child whose key and sig are unchanged is the same node, so its open sections, focus and typed text stay. A changed
 // child is replaced, and each `details[data-key]` inside it (and the node itself, when it is a `details`) keeps the
-// open or closed state the reader left it in. Children whose keys are gone are removed; a node already in its place is
+// open or closed state the reader left it in, and each scroll box in it (`pre`, `.scroll`) its scroll offsets: a
+// reader at the bottom of a growing log stays at its bottom. Children whose keys are gone are removed; a node already in its place is
 // never moved. A repeated key gets a `~<n>` suffix, so no item is lost and no node is used twice.
 function patchChildren(parent, items, keyOf, render) {
   const old = new Map();
@@ -35,6 +36,7 @@ function patchChildren(parent, items, keyOf, render) {
   }
   const active = document.activeElement;
   let refocus = null;
+  const scrolls = [];  // [new node, the old node's scroll offsets], set once the new node is in the document
   const used = new Map();
   const nodes = [];
   for (const item of items) {
@@ -51,6 +53,7 @@ function patchChildren(parent, items, keyOf, render) {
     node.setAttribute("data-sig", sig);
     if (prev) {
       keepOpen(prev, node);
+      scrolls.push([node, scrollOffsets(prev)]);
       if (prev === active) refocus = node;
     }
     nodes.push(node);
@@ -62,7 +65,23 @@ function patchChildren(parent, items, keyOf, render) {
     if (node === cursor) cursor = cursor.nextSibling;
     else parent.insertBefore(node, cursor);
   }
+  for (const [node, offsets] of scrolls) keepScroll(node, offsets);  // a detached element ignores scrollTop
   if (refocus && typeof refocus.focus === "function") refocus.focus({ preventScroll: true });
+}
+
+// The scroll boxes of a node (itself first, when it is one), in document order: matched by position across a rebuild.
+const scrollBoxes = (node) => [node, ...node.querySelectorAll("pre, .scroll")].filter((n, i) => i > 0 || n.tagName === "PRE" || n.classList.contains("scroll"));
+
+function scrollOffsets(node) {
+  return scrollBoxes(node).map((n) => ({ top: n.scrollTop, left: n.scrollLeft, bottom: n.scrollTop > 0 && n.scrollTop + n.clientHeight >= n.scrollHeight - 2 }));
+}
+
+function keepScroll(node, offsets) {
+  const boxes = scrollBoxes(node);
+  for (let i = 0; i < Math.min(boxes.length, offsets.length); i++) {
+    boxes[i].scrollTop = offsets[i].bottom ? boxes[i].scrollHeight : offsets[i].top;
+    boxes[i].scrollLeft = offsets[i].left;
+  }
 }
 
 // Carry the open state of `prev`'s keyed sections (and of `prev` itself) to the node replacing it.

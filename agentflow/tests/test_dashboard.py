@@ -947,6 +947,15 @@ def test_live_regions_patch_by_key():
     assert "function patchChildren" in core and "function throttle" in core and "data-sig" in core
 
 
+def test_a_replaced_section_keeps_its_scroll():
+    """A live run's log in a `pre` (max-height, overflow: auto) must not jump to the top when its section is rebuilt."""
+    core = (UI_DIR / "core.js").read_text(encoding="utf-8")
+    region = core[core.index("function patchChildren"):core.index("const entry =")]
+    assert "scrollTop" in region and "scrollLeft" in region and '"pre, .scroll"' in region
+    # the offsets are applied after the placement loop: a detached element ignores scrollTop
+    assert region.index("keepScroll(node, offsets)") > region.index("parent.insertBefore(node, cursor)")
+
+
 def test_a_reconnect_marks_everything_dirty():
     main = (UI_DIR / "main.js").read_text(encoding="utf-8")
     onopen = main[main.index("stream.onopen"):main.index("stream.onmessage")]
