@@ -419,8 +419,10 @@ def test_a_human_stop_gives_fresh_attempts(auto):
 
 
 def test_a_repeat_through_the_resolver_path_names_it(flow_repo, notified):
-    # A resolver's reopened session is a new one, so what it leaves is a plain `blocked`. The runner hands a
-    # `blocked_repeat` stop to a human when its resolve attempts for the kind are spent (here: none for it).
+    # A resolver's reopened session is a new one (`step_reopened`, not a `hitl_approved`), so what it leaves is a
+    # plain `blocked` with no count: under the shipped `resolve_kinds.blocked_repeat: 2`, in a `resolve: true`
+    # phase, the "blocked again" wording never reaches a human. The runner hands a `blocked_repeat` stop to a human
+    # directly only when its resolve attempts for the kind are spent (here: none for it), so this test needs 0.
     flow_repo.configure({"autonomy": {"resolve_kinds": {"blocked_repeat": 0}}}, autopilot=True)
     flow_repo.script({RED: [BLOCKED] * 10})
     auto, run = flow_repo, begin_bug(flow_repo, to="build")
@@ -1022,4 +1024,3 @@ def test_round_limit_is_at_least_one(tmp_cfg, rounds, expected):
             data["autonomy"]["finding_rounds"] = rounds
 
     assert round_limit(load_config(tmp_cfg(patch))) == expected
-
