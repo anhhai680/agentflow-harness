@@ -901,6 +901,12 @@ def test_a_route_hash_survives_the_token_boot():
     assert "if (match)" in boot and "if (location.hash)" not in boot   # only #token= is stripped
 
 
+def test_hidden_wins_over_an_author_display_rule():
+    """`.run-banner { display: flex }` (and `.set-grid`'s grid) would beat the user agent's `[hidden]` rule."""
+    page = (AGENTFLOW / "dashboard.html").read_text(encoding="utf-8")
+    assert "[hidden] { display: none !important; }" in page
+
+
 def test_runs_have_hash_routes():
     source = page_source()
     for needle in ('"#/run/"', "hashchange", "function parseRoute", "function routeHash",

@@ -21,6 +21,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }  /* `hidden` wins over a class's display: flex or grid */
 body { margin: 0; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
 header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
 header h1 { font-size: 16px; margin: 0 8px 0 0; }
