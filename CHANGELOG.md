@@ -7,6 +7,8 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [2.7] - 2026-11-15
+
 ### Added
 
 - Three throughput signals, `lead_time_h`, `human_blocked_share` and `full_suite_runs`, for the scorecard and lesson targets.
