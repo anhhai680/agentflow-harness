@@ -20,7 +20,7 @@ from agentflow.config import RETRO_PIPELINE
 from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
-from agentflow.views import _badge
+from agentflow.views import _badge, step_title
 from conftest import PYTHON_CONFIG, run_git
 
 TOKEN = "k3y-" + "x" * 40
@@ -287,11 +287,11 @@ def test_a_card_shows_the_soft_and_the_hard_budget(dash):
     assert (data["run_budget_usd"], data["run_budget_hard_usd"]) == (defaults.run_budget_usd, defaults.run_budget_hard_usd)
     assert f"$0.00/${defaults.run_budget_usd:.0f}·${defaults.run_budget_hard_usd:.0f}" in board_table(data)
     detail = payload(dash.get(f"/api/runs/{run.id}")[2])
-    assert detail["state"]["soft_budget_usd"] == defaults.run_budget_usd
+    assert detail["facts"]["soft_budget_usd"] == defaults.run_budget_usd
     (row,) = metrics_view(dash.flow.root, dash.flow.cfg)["runs"]
     assert (row["soft_budget"], row["budget"]) == (defaults.run_budget_usd, defaults.run_budget_hard_usd)
     source = page_source()
-    for needle in ("card.soft_budget", "st.soft_budget_usd", "r.soft_budget", "data.run_budget_hard_usd"):
+    for needle in ("card.soft_budget", "facts.soft_budget_usd", "r.soft_budget", "data.run_budget_hard_usd"):
         assert needle in source
 
 
@@ -313,6 +313,34 @@ def test_board_and_run_detail(dash):
     assert len(detail["transcript"]) <= 16 * 1024 and detail["transcript"].endswith('{"type": "result"}\n')
     assert [e["type"] for e in detail["timeline"]][-1] == "phase_approval_raised"
     assert detail["attach"] == f"agentflow attach {planning.id}"
+
+
+@pytest.mark.parametrize("key, title", [
+    ("build/build/task-9/implement/resolve-2", "Task 9 · implement · resolver 2"),
+    ("build/build/task-9/implement", "Task 9 · implement"),
+    ("plan/plan", "plan"),
+    ("define/draft", "define · draft"),
+    ("verify/loop/r2/fix", "verify · loop · round 2 · fix"),
+])
+def test_a_step_key_reads_as_words(key, title):
+    assert step_title(key) == title
+
+
+def test_run_detail_is_slim_unless_raw_is_asked(dash):
+    run = awaiting(dash.flow)
+    detail = payload(dash.get(f"/api/runs/{run.id}")[2])
+    assert "state" not in detail and detail["actions"] == ["approve", "reject", "pause", "cancel"]
+    assert detail["label"] == "crm" and detail["waiting"]["kind"] == "phase_approval"
+    rail = {p["phase"]: p for p in detail["stage_rail"]}
+    assert rail["plan"]["note"] == "waiting on you" and rail["build"]["status"] == "not reached"
+    assert "state" in payload(dash.get(f"/api/runs/{run.id}?raw=1")[2])
+
+
+def test_the_rail_names_a_refine_round(dash):
+    run = awaiting(dash.flow)
+    hitl.reject(run, "plan", "me", "redo")
+    rail = {p["phase"]: p for p in payload(dash.get(f"/api/runs/{run.id}")[2])["stage_rail"]}
+    assert "refine 1" in rail["plan"]["note"]
 
 
 def test_a_card_shows_a_review_a_refine_round_skipped(dash):
@@ -343,7 +371,7 @@ def test_untrusted_text_is_escaped_in_json(dash):
     hitl.reject(run, "plan", "me", note)
     status, _, body = dash.get(f"/api/runs/{run.id}")
     assert status == 200 and b"<script>" not in body and b"<img" not in body
-    assert payload(body)["state"]["refine"]["note"] == note
+    assert payload(body)["facts"]["refine"]["note"] == note
 
 
 def test_page_is_served_with_a_nonce_and_no_unsafe_dom_sinks(dash):

@@ -6,9 +6,11 @@
 - `workflow_view(cfg)`: the workflow from `config.yaml`: its phases and each step's skill, lanes and model.
 - `agents_view(repo, cfg)`: every live agent process across runs, one row each (subagents nested), and
   the ones that exited in the last `dashboard.agents.show_exited_min` minutes.
-- `run_detail(run, cfg)`: one run's state, timeline, its walk of the workflow (`run_workflow`), its time and
+- `run_detail(run, cfg, raw)`: one run's facts, what it waits on, its steps' records, the actions its state
+  allows now, a label, a stage rail, its timeline, its walk of the workflow (`run_workflow`), its time and
   cost (`run_metrics_view`) and size-capped tails of its files, read only through the run's own paths (no
-  symlinks, nothing outside the run directory).
+  symlinks, nothing outside the run directory). `raw` adds the whole `state.json` for debugging.
+- `step_title(key)`: a step key in words (`Task 9 · implement · resolver 2`); `stage_rail` is one entry per phase.
 - `metrics_view(repo, cfg, lane, date_from, date_to)`: time and cost by phase, bucket and `model · effort`
   for every run started in a date range (this month by default), finished and archived runs included, with
   the totals over them (`metrics.aggregate`). `metrics_table` renders it for `agentflow metrics`.
@@ -35,6 +37,7 @@ from agentflow.events import parse_iso
 from agentflow import lessons as lessons_mod
 from agentflow.hitl import inbox_items
 from agentflow.metrics import BUCKETS, aggregate, run_metrics
+from agentflow.run_control import available_actions
 from agentflow.signals import aggregate_signals, run_signals
 from agentflow.state import TERMINAL, Run, cost_added, display_status, list_runs, runs_root
 
@@ -56,7 +59,8 @@ DEFAULT_DONE_DAYS = 0  # 0 keeps every Done card: history stays until a develope
 STALL_MARGIN_S = 15 * 60  # past the step timeout plus this, a silent run had no runner going
 
 __all__ = ["agents_table", "agents_view", "board", "board_table", "metrics_csv", "metrics_table", "metrics_view",
-           "month_start", "run_detail", "run_metrics_view", "run_workflow", "runs_signature", "watch", "workflow_view"]
+           "month_start", "run_detail", "run_metrics_view", "run_workflow", "runs_signature", "stage_rail", "step_title",
+           "watch", "workflow_view"]
 
 
 # --------------------------------------------------------------------------- helpers
@@ -85,6 +89,26 @@ def _label(state: dict, run_id: str) -> str:
         if params.get(name) not in (None, ""):
             return Path(str(params[name])).stem if name == "log" else str(params[name])
     return run_id
+
+
+def step_title(key: str) -> str:
+    """A step key in words: `build/build/task-9/implement/resolve-2` is `Task 9 · implement · resolver 2`."""
+    parts: list[str] = []
+    for part in key.split("/"):
+        if part and (not parts or parts[-1] != part):
+            parts.append(part)
+    words = []
+    for part in parts:
+        if match := re.fullmatch(r"task-(\d+)", part):
+            words = []  # what comes before a task is its phase and step, which the task says already
+            words.append(f"Task {match.group(1)}")
+        elif match := re.fullmatch(r"r(\d+)", part):
+            words.append(f"round {match.group(1)}")
+        elif match := re.fullmatch(r"resolve-(\d+)", part):
+            words.append(f"resolver {match.group(1)}")
+        else:
+            words.append(part)
+    return " · ".join(words)
 
 
 def _digest(run: Run, today: datetime, events: list[dict] | None = None) -> dict:
@@ -466,6 +490,27 @@ def run_workflow(run: Run, cfg: Config) -> list[dict]:
     return out
 
 
+def stage_rail(state: dict, workflow: list[dict], metrics: dict) -> list[dict]:
+    """One `{phase, status, wall_s, note}` per phase of `workflow`: where the run is, at a glance."""
+    wall = {row.get("phase"): row.get("wall_s") for row in metrics.get("phases") or []}
+    refine = state.get("refine") or {}
+    waiting = state.get("waiting") or {}
+    rail = []
+    for phase in workflow:
+        name = phase["name"]
+        notes = []
+        count = next((step["count"] for step in phase["steps"] if step.get("count")), None)
+        if count:
+            notes.append(count)
+        if refine and state.get("phase") == name:
+            notes.append(f"refine {refine.get('round')}")
+        if waiting.get("phase") == name:
+            notes.append("waiting on you")
+        rail.append({"phase": name, "status": phase["status"], "wall_s": wall.get(name),
+                     "note": " · ".join(notes) or None})
+    return rail
+
+
 # --------------------------------------------------------------------------- agents
 
 
@@ -594,8 +639,8 @@ def _newest(folder: Path, pattern: str) -> Path | None:
     return max(files, key=lambda p: p.stat().st_mtime_ns) if files else None
 
 
-def run_detail(run: Run, cfg: Config) -> dict:
-    """What the card's detail drawer shows (see the module docstring)."""
+def run_detail(run: Run, cfg: Config, raw: bool = False) -> dict:
+    """What the run page shows (see the module docstring); `raw` adds the whole `state.json`."""
     state = run.state
     root = run.dir
     gates = []
@@ -607,15 +652,40 @@ def run_detail(run: Run, cfg: Config) -> dict:
                           "log_tail": _tail(root, Path(log), GATE_TAIL_BYTES) if isinstance(log, str) and log else ""})
     transcript = _newest(root / "transcripts", "*.jsonl")
     waiting = state.get("waiting") or {}
-    return {
+    workflow = run_workflow(run, cfg)
+    metrics = run_metrics_view(run, cfg)
+    detail = {
         "run_id": run.id,
+        "label": _label(state, run.id),
+        "lane": state.get("pipeline"),
         "status": display_status(run),
-        "state": state,
+        "facts": {
+            "phase": state.get("phase"),
+            "step": state.get("step"),
+            "branch": state.get("branch"),
+            "worktree": state.get("worktree"),
+            "pr_url": state.get("pr_url"),
+            "pr_link": _pr_link(state),
+            "spend_usd": state.get("spend_usd"),
+            "budget_usd": state.get("budget_usd"),
+            "soft_budget_usd": state.get("soft_budget_usd"),
+            "refine": state.get("refine"),
+            "failure": state.get("failure"),
+        },
+        "waiting": {name: waiting.get(name) for name in ("kind", "key", "phase", "summary", "questions", "since")}
+        if waiting else None,
+        "steps": {key: {"status": row.get("status"), "skip_reason": row.get("skip_reason"), "result": row.get("result")}
+                  for key, row in (state.get("steps") or {}).items()},
+        "actions": available_actions(run),
+        "stage_rail": stage_rail(state, workflow, metrics),
+        "live_agents": [{"label": step_title(str(row.get("step") or "")), "key": row.get("step"),
+                         "model": row.get("model"), "effort": row.get("effort"), "session_id": row.get("session_id")}
+                        for row in _live_agents(state)],
         "timeline": run.events.read()[-TIMELINE_MAX:],
-        "workflow": run_workflow(run, cfg),
+        "workflow": workflow,
         "gates": gates,
         "reviews": state.get("reviews") or {},
-        "metrics": run_metrics_view(run, cfg),
+        "metrics": metrics,
         "progress": _tail(run.agent_dir, run.progress_path()),  # the agent's notes, in its workspace
         "handoff": _tail(root, run.handoff_path()),
         "inbox": _tail(root, run.inbox_path(waiting["key"])) if waiting.get("key") else "",
@@ -623,6 +693,9 @@ def run_detail(run: Run, cfg: Config) -> dict:
         "transcript_file": transcript.name if transcript else None,
         "attach": f"agentflow attach {run.id}",
     }
+    if raw:
+        detail["state"] = state
+    return detail
 
 
 # --------------------------------------------------------------------------- time and cost

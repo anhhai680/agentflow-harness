@@ -8,7 +8,7 @@ Routes:
 - `GET /ui/<name>.js`, the page's scripts, from a fixed list; they hold no run data, so they need no token.
 - `GET /api/info` (the harness name and the engine version the page shows in its header),
   `GET /api/board` (every lane, or `?lane=<name>`), `GET /api/workflow`, `GET /api/agents`,
-  `GET /api/runs/<id>` (the card detail, its time and cost included), `GET /api/scorecard` (the Metrics tab's scorecard), `GET /api/metrics` (time and cost over
+  `GET /api/runs/<id>` (the run's facts, steps, actions, stage rail, time and cost; `?raw=1` adds its whole `state.json`), `GET /api/scorecard` (the Metrics tab's scorecard), `GET /api/metrics` (time and cost over
   the runs started in `?from=YYYY-MM-DD&to=YYYY-MM-DD`, this month by default, or `?all=1`; `&lane=<name>`
   narrows it; a bad date is a 400); `GET /api/lessons` (every lesson with its evidence and its target signal before
   and after the runs that carried it); `GET /api/events` (SSE: every run's new events, runs created
@@ -451,7 +451,7 @@ class _Handler(BaseHTTPRequestHandler):
             if run is None:
                 self._error(404, "no such run")
                 return
-            self._json(200, run_detail(run, self.server.cfg))
+            self._json(200, run_detail(run, self.server.cfg, raw=(query.get("raw") or [""])[0] == "1"))
         else:
             self._error(404, "not found")
 
