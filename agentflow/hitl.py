@@ -376,18 +376,50 @@ def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questio
     `notify`: None is the usual rule (quiet while the runner settles the stop itself: it tells a human if it cannot);
     True always tells a human, False never does (a stop a human was already told of)."""
     questions = list(questions)
-    how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).", _how_to_go_on(run, kind, key, bool(questions), cfg)]
+    counted = {"times": _times_back(run, key)} if kind == "blocked_repeat" else {}
+    how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).",
+           _how_to_go_on(run, kind, key, bool(questions), cfg, **counted)]
     path = run.inbox_path(key)
     render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
     run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
-             questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:])
+             questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:], **counted)
     if notify is None:
         from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
 
         notify = not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions])
     if notify:
-        notify_run(cfg, run, summary or f"{key} needs a decision")
+        notify_run(cfg, run, notice_text({"key": key, "summary": summary, **counted}) or f"{key} needs a decision")
     return path
+
+
+def _times_back(run: Run, key: str) -> int:
+    """How many times this `blocked_repeat` stop has been raised on `key`: 1 plus the approvals a human gave a
+    `blocked` or `blocked_repeat` stop of `key` since its last `agentflow retry`. The summary is not compared: it is
+    model prose, and `blocked_repeat` already means blocked again with the tree unchanged. A raise the runner settled
+    itself (`AUTO_BY`) and every other kind are not counted."""
+    from agentflow.autonomy import AUTO_BY  # autonomy imports this module
+
+    approved = 0
+    for event in run.events.read():
+        if event.get("key") != key:
+            continue
+        if event["type"] == "step_retry":
+            approved = 0
+        elif (event["type"] == "hitl_approved" and event.get("by") != AUTO_BY
+                and event.get("kind") in ("blocked", "blocked_repeat")):
+            approved += 1
+    return 1 + approved
+
+
+def notice_text(wait: dict) -> str:
+    """The line a human is told when a stop is raised: its summary, led by how often a human's approval did not
+    settle it when the same `blocked_repeat` stop came back (`wait["times"]` above 1)."""
+    summary = wait.get("summary") or ""
+    times = int(wait.get("times") or 1)
+    if times > 1:
+        return (f"{wait.get('key')} is blocked again for the same reason after {times - 1} approval(s): "
+                f"{clean_fact(summary)}")
+    return summary
 
 
 def park_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questions: list[Question],
@@ -408,8 +440,9 @@ def park_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, question
     return path
 
 
-def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config) -> str:
-    """The inbox line that says what each way out of this stop does."""
+def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config, times: int = 1) -> str:
+    """The inbox line that says what each way out of this stop does. `times` above 1 is a `blocked_repeat` stop that
+    came back after a human's approval."""
     if run.state.get("pipeline") == RETRO_PIPELINE:
         return (f"A retro run cannot be resumed, approved or answered: `agentflow cancel {run.id}`, then run "
                 "`agentflow retro` again (it reads the same runs, since this retro did not finish).")
@@ -435,7 +468,10 @@ def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Confi
     if kind == "gate_failed":
         return f"Fix the cause, then `agentflow approve {run.id} {key}` runs the gates again; {reject}"
     if kind == "blocked_repeat":
-        return (f"This session blocked again with nothing changed, so a plain approve is refused. Fix the cause, then "
+        again = (f"This exact stop came back after {times - 1} approval(s), so a plain approval would repeat it: fix "
+                 f"the cause, then `agentflow retry {run.id} {key}` starts a fresh session, or approve with --note to "
+                 f"say what changed.\n\n") if times > 1 else ""
+        return (f"{again}This session blocked again with nothing changed, so a plain approve is refused. Fix the cause, then "
                 f"`agentflow retry {run.id} {key}` starts a fresh session, or `agentflow approve {run.id} {key} --note "
                 f"\"...\"` tells this session what changed; {reject}")
     if kind == "eval_regression":

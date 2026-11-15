@@ -14,6 +14,10 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 - A resolver may name its stop's cause in `stop_class` (`environment`, `flaky`, `guard_false_positive`, `spec_gap`, `impact`, `repeated_failure`), recorded once per session as `stop_classified`. For `flaky`, when the resolver changed nothing, the runner reruns each failed gate alone twice and records one `flaky:` run fact if they all pass. A stop whose resolve attempts are used is recorded as `repeated_failure`.
 - A resolver's `environment` is checked by probing the step's gate programs. When the probes fail too, the stop becomes one `environment` inbox item, notified once per distinct problem. `approve` checks the machine again first (`--note` skips the check), `reject` is refused, and `agentflow queue` and the dashboard approve it themselves and resume the run once the checks pass.
 
+### Changed
+
+- A `blocked_repeat` stop that comes back after a human's approval says so in its notification and its inbox item, with how many approvals it has outlived (`times` on `hitl_raised` and in the wait). The stop and its refusal of a plain approval are unchanged.
+
 ## [2.7] - 2026-11-15
 
 ### Added

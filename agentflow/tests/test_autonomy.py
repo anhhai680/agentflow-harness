@@ -418,6 +418,21 @@ def test_a_human_stop_gives_fresh_attempts(auto):
     assert called(auto).count(f"{RED}/resolve-3") == 1  # a fresh attempt is a new session, never a finished one
 
 
+def test_a_repeat_through_the_resolver_path_names_it(flow_repo, notified):
+    # A resolver's reopened session is a new one, so what it leaves is a plain `blocked`. The runner hands a
+    # `blocked_repeat` stop to a human when its resolve attempts for the kind are spent (here: none for it).
+    flow_repo.configure({"autonomy": {"resolve_kinds": {"blocked_repeat": 0}}}, autopilot=True)
+    flow_repo.script({RED: [BLOCKED] * 10})
+    auto, run = flow_repo, begin_bug(flow_repo, to="build")
+    assert go(auto, run) == "waiting_human"
+    assert run.state["waiting"]["kind"] == "blocked"
+    assert not any("blocked again for the same reason" in text for text in notified)  # the first stop is plain
+    approve(run, RED, by="me", note="I changed the environment")
+    assert go(auto, run) == "waiting_human"
+    assert run.state["waiting"]["kind"] == "blocked_repeat" and run.state["waiting"]["times"] == 2
+    assert any("blocked again for the same reason after 1 approval(s)" in text for text in notified)
+
+
 # --------------------------------------------------------------------------- a stop's class
 
 FIX = "build/fix"
@@ -1007,3 +1022,4 @@ def test_round_limit_is_at_least_one(tmp_cfg, rounds, expected):
             data["autonomy"]["finding_rounds"] = rounds
 
     assert round_limit(load_config(tmp_cfg(patch))) == expected
+

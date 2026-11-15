@@ -37,7 +37,7 @@ from agentflow.config import FLOOR_BLOCKING, QUESTION_KINDS, Config, Phase, Step
 from agentflow.flow_control import halted
 from agentflow.gates import run_gates
 from agentflow.gitops import GitError, restore_paths, tree_state
-from agentflow.hitl import ENVIRONMENT, ResultError, answer, clean_fact, notify_run, raise_hitl, read_result
+from agentflow.hitl import ENVIRONMENT, ResultError, answer, clean_fact, notice_text, notify_run, raise_hitl, read_result
 from agentflow.state import Run
 
 if TYPE_CHECKING:
@@ -300,7 +300,7 @@ class Resolver:
         if not settled and not self._handed_over:  # a hand-over told the human already
             self.run.refresh()
             if self.run.state["waiting"] is not None and self.run.state["waiting"]["key"] == key:
-                notify_run(self.cfg, self.run, wait["summary"] or f"{key} needs a decision")
+                notify_run(self.cfg, self.run, notice_text(wait) or f"{key} needs a decision")
         return settled
 
     def _attempts(self, key: str) -> int:
