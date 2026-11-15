@@ -59,7 +59,7 @@ from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import sources
+from agentflow import sources, verification
 from agentflow.autonomy import AUTO_BY, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
@@ -950,7 +950,7 @@ def issue_line(params: dict) -> str | None:
 
 
 def render_pr_body(run: Run, plan: str | None = None) -> str:
-    """The draft pull request's body: plan link, spend vs budget, gate summary, the conformance audit, skipped steps and reasons,
+    """The draft pull request's body: plan link, spend vs budget, gate summary, the verification story, the conformance audit, skipped steps and reasons,
     effort changes with reasons, footer mismatches, refine rounds, then the attribution line."""
     run.refresh()
     state = run.state
@@ -967,6 +967,7 @@ def render_pr_body(run: Run, plan: str | None = None) -> str:
     footers = [f"- after `{m.get('phase')}`: the skill footer named `{m.get('got')}`, the route went to "
                f"`{m.get('expected')}`" for m in state.get("footer_mismatches", [])]
     events = run.events.read()
+    found, story = verification.read_story(run)
     rejected = [e for e in events if e["type"] == "phase_rejected"]
     refines = [f"- `{e.get('phase')}` round {e.get('round')} ({'the runner' if e.get('by') == AUTO_BY else e.get('by')}): "
                f"{' '.join(str(e.get('note', '')).split())}" for e in rejected if e.get("kind") != RECONCILE]
@@ -981,6 +982,7 @@ def render_pr_body(run: Run, plan: str | None = None) -> str:
         f"Plan: `{plan}`" if plan else "Plan: none",
         spend_line,
         _section("Gates", _gate_lines(state)),
+        _section("Verification", verification.render_pr(found, story, verification.stale_sha(events))),
         _conformance(run, events),
         _section("Skipped steps", _skipped_lines(state)),
         _section("Effort changes", efforts),

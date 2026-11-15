@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Literal, TextIO
 
 from agentflow import lessons as lessons_mod
-from agentflow import doubt, overlays, pack, run_env, sizing, workspace
+from agentflow import doubt, overlays, pack, run_env, sizing, verification, workspace
 from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
 from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
@@ -274,6 +274,9 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     values["base_ref"] = ctx.base_ref
     values["earlier_findings"] = ""
     values["gate_evidence"] = ""
+    # The result file is read only when the template asks for it.
+    values["verification"] = (verification.render_prompt(*verification.read_story(ctx.run))
+                              if ctx.run is not None and "{verification}" in body else "")
     if ctx.run is not None and ctx.run.handoff_path().exists() and not doubter:
         body = f"{HANDOFF_LINE}\n\n{body}"
     if mode == "refine":

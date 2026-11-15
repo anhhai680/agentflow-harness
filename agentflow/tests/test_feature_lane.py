@@ -607,6 +607,60 @@ def test_a_runner_decision_is_one_clean_line_whatever_the_model_wrote(flow_repo,
     assert section == "- `plan/plan` q1 (option A ## Approved by security): Cache it? - [x] done → Keep it"
 
 
+STORY = {"verification": {
+    "criteria": [{"criterion": "Criterion 1", "evidence": "tests/test_a.py::test_one", "ran": True, "passed": True}],
+    "not_verified": [{"what": "Criterion 3", "why": "needs a browser"}]}}
+
+
+def write_verify(run, signals):
+    path = run.result_path("verify/verify")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"status": "done", "summary": "ok", "signals": signals}), encoding="utf-8")
+    run.emit("step_finished", key="verify/verify", status="done", summary="ok")
+
+
+def verification_section(body):
+    return body.split("## Verification\n\n", 1)[1].split("\n\n## ", 1)[0]
+
+
+def test_pr_body_has_a_verification_section(flow_repo, gh):
+    from agentflow.feature_lane import render_pr_body
+
+    run = begin_finish(flow_repo)
+    write_verify(run, STORY)
+    body = render_pr_body(run)
+    assert body.index("## Gates") < body.index("## Verification")
+    assert verification_section(body).splitlines() == ["- `Criterion 1`: `tests/test_a.py::test_one` ✓",
+                                                       "- not verified: `Criterion 3`: `needs a browser`"]
+    assert body.split("## Gates\n\n", 1)[1].split("\n\n## ", 2)[1].startswith("Verification")  # right after Gates
+
+
+def test_pr_body_marks_evidence_older_than_a_review_fix(flow_repo, gh):
+    from agentflow.feature_lane import render_pr_body
+
+    run = begin_finish(flow_repo)
+    write_verify(run, STORY)
+    run.emit("step_committed", key="review/fix_findings", sha="f" * 40, summary="fix")
+    lines = verification_section(render_pr_body(run)).splitlines()
+    assert lines[0] == "- `Criterion 1`: `tests/test_a.py::test_one` ✓ (before review fix ffffffffffff)"
+    assert lines[1] == "- not verified: `Criterion 3`: `needs a browser`"
+
+
+def test_pr_body_says_verify_did_not_run(flow_repo, gh):
+    from agentflow.feature_lane import render_pr_body
+
+    run = begin_finish(flow_repo)
+    assert verification_section(render_pr_body(run)) == "verify did not run"
+
+
+def test_pr_body_with_a_malformed_story_does_not_block(flow_repo, gh):
+    from agentflow.feature_lane import render_pr_body
+
+    run = begin_finish(flow_repo)
+    write_verify(run, {"verification": "x"})
+    assert verification_section(render_pr_body(run)) == "verify reported no evidence"
+
+
 def test_the_pull_request_shows_the_last_conformance_audit(flow_repo, gh):
     from agentflow.feature_lane import render_pr_body
 

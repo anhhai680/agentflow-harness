@@ -70,6 +70,89 @@ def test_old_result_line_is_fixable(pack_repo_python):
     assert drift_issues(pack_repo_python) == got.issues
 
 
+def test_old_verify_failure_line_is_fixable(pack_repo_python):
+    entry = next(e for e in pack_fix.RETIRED if e.id == "verify-fix-only-the-cause")
+    assert (entry.file, entry.retired_in) == ("verify.md", "2.7")
+    old = engine("verify.md").replace(entry.new, entry.old)
+    assert "fix only the cause" in old
+    put(pack_repo_python, "verify.md", old + "\nPack wording.\n")
+    got = found(pack_repo_python)
+    assert len(got.issues) == 1
+    issue = got.issues[0]
+    assert (issue.level, issue.path, issue.fixable) == ("warning", "prompts/verify.md", True)
+    assert "2.7" in issue.message
+    assert len(got.fixes) == 1
+    assert got.fixes[0].after.decode("utf-8") == engine("verify.md") + "\nPack wording.\n"
+    assert drift_issues(pack_repo_python) == got.issues
+
+
+def test_old_verify_findings_line_is_fixable(pack_repo_python):
+    entry = next(e for e in pack_fix.RETIRED if e.id == "verify-blocks-what-could-not-run")
+    assert (entry.file, entry.retired_in) == ("verify.md", "2.7")
+    old = engine("verify.md").replace(entry.new, entry.old)
+    assert "or that you could not run" in old
+    put(pack_repo_python, "verify.md", old + "\nPack wording.\n")
+    got = found(pack_repo_python)
+    assert len(got.issues) == 1
+    issue = got.issues[0]
+    assert (issue.level, issue.path, issue.fixable) == ("warning", "prompts/verify.md", True)
+    assert "verify-blocks-what-could-not-run" in issue.message and "2.7" in issue.message
+    assert len(got.fixes) == 1
+    fixed = got.fixes[0].after.decode("utf-8")
+    assert fixed == engine("verify.md") + "\nPack wording.\n"
+    assert "not_verified` and add it to `findings` as `\"severity\": \"minor\"`" in fixed
+    assert drift_issues(pack_repo_python) == got.issues
+
+
+def test_a_whole_old_verify_prompt_fixes_to_the_engines(pack_repo_python):
+    old = engine("verify.md")
+    for entry in pack_fix.RETIRED:
+        if entry.file == "verify.md":
+            old = old.replace(entry.new, entry.old)
+    assert "fix only the cause" in old and "or that you could not run" in old and "signals.verification" not in old
+    put(pack_repo_python, "verify.md", old + "\nPack wording.\n")
+    got = found(pack_repo_python)
+    assert [i.fixable for i in got.issues] == [True, True]
+    assert got.fixes[0].after.decode("utf-8") == engine("verify.md") + "\nPack wording.\n"
+
+
+def test_a_prompt_that_only_says_it_could_not_run_is_not_drift(pack_repo_python):
+    put(pack_repo_python, "fix.md", "Put anything that still fails in the result's findings, and say what you could "
+                                    "not run, or that you could not run it, in the result's summary.\n")
+    assert found(pack_repo_python).issues == []
+    assert drift_issues(pack_repo_python) == []
+
+
+def test_a_prompt_that_only_says_fix_only_the_cause_is_not_drift(pack_repo_python):
+    put(pack_repo_python, "fix.md", "Read the failure. Then fix only the cause.\n")
+    assert found(pack_repo_python).issues == []
+    assert drift_issues(pack_repo_python) == []
+
+
+def test_old_branch_review_checklist_is_fixable(pack_repo_python):
+    entry = next(e for e in pack_fix.RETIRED if e.id == "branch-review-checklist")
+    assert (entry.file, entry.retired_in) == ("branch_review.md", "2.7")
+    old = engine("branch_review.md").replace(entry.new, entry.old)
+    assert "every task landed" in old and "{verification}" not in old and "consistent.\nDo not edit code." in old
+    put(pack_repo_python, "branch_review.md", old + "\nPack wording.\n")
+    got = found(pack_repo_python)
+    assert len(got.issues) == 1
+    issue = got.issues[0]
+    assert (issue.level, issue.path, issue.fixable) == ("warning", "prompts/branch_review.md", True)
+    assert "2.7" in issue.message
+    assert len(got.fixes) == 1
+    fixed = got.fixes[0].after.decode("utf-8")
+    assert fixed == engine("branch_review.md") + "\nPack wording.\n"
+    assert "## What verify proved\n\n{verification}\n\n" in fixed and "judge the tests yourself.\n\nDo not edit" in fixed
+    assert drift_issues(pack_repo_python) == got.issues
+
+
+def test_a_prompt_that_only_says_every_task_landed_is_not_drift(pack_repo_python):
+    put(pack_repo_python, "task_review.md", "Check that every task landed.\n")
+    assert found(pack_repo_python).issues == []
+    assert drift_issues(pack_repo_python) == []
+
+
 def test_old_preamble_block_is_one_fixable_issue(pack_repo_python):
     put(pack_repo_python, "_preamble.md", OLD_PREAMBLE + "\nPack rule.\n")
     got = found(pack_repo_python)
