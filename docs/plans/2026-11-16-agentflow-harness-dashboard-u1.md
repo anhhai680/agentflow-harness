@@ -65,7 +65,7 @@ U0 is shipped: routes, the Run page, `patchChildren` and `throttle` exist (`docs
 - Produces: the key `dashboard.artifact_max_kb`, an int (not a bool) from `16` to `8192` inclusive, `512` when absent. It isn't protected and isn't a user-file key.
 - The form field: `(("dashboard", "artifact_max_kb"), "Largest spec, plan or diff the page loads (KB)", {"kind": "int", "min": 16, "max": 8192})`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # test_config.py, beside test_dashboard_board_refresh_s_is_half_a_second_to_a_minute
@@ -85,20 +85,20 @@ def test_the_form_sets_the_artifact_cap(shipped):
             form(shipped, (["dashboard", "artifact_max_kb"], bad))
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_config.py agentflow/tests/test_config_edit.py -k "artifact_max_kb or artifact_cap" --import-mode=prepend -q`
 Expected: FAIL (no error for `0`; no form field).
 
-- [ ] **Step 3: Add the check and the field**
+- [x] **Step 3: Add the check and the field**
 
 The error text: "must be a whole number of KB, from 16 to 8192". Add to playbook §14's `dashboard` line: "`dashboard.artifact_max_kb` (512 by default, 16–8192) is the largest spec, plan revision or diff the page loads; above it the page shows the head and says so."
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run the same command, then `bin/agentflow validate`. Expected: PASS, and `0 warnings`.
 
-- [ ] **Step 5: Add the changelog line and commit**
+- [x] **Step 5: Add the changelog line and commit**
 
 Under `### Added`: "`dashboard.artifact_max_kb` (512 by default, 16–8192): the largest spec, plan revision or diff the dashboard loads."
 
@@ -150,7 +150,7 @@ git commit -m "Add dashboard.artifact_max_kb with its form field, check and play
   - Every git failure or timeout becomes `NotFound("revision <sha7> is no longer in git")` for a read or diff. Nothing raises past these functions except `NotFound` and `ValueError`.
 - A private helper `_git(repo: Path, *args: str, limit: int | None = None) -> tuple[bytes, bool]` returns `(stdout, cut)`. It uses `subprocess.Popen(["git", *HARDENED, *args], cwd=repo, stdin=DEVNULL, stdout=PIPE, stderr=PIPE)`, and a non-zero exit or a timeout raises `NotFound`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Build the fixture in a real linked worktree, so a test can delete it.
 
@@ -252,20 +252,20 @@ def test_artifact_tabs_follow_the_lane_phases():
 
 Its two `phase_rejected` events use `round=1` and `round=2`. The lost-revision test relies on the cache: the listing it read before `gc` still names the sha, so the read gets past the allow-list and fails in git.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_artifacts.py --import-mode=prepend -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'agentflow.artifacts'`.
 
-- [ ] **Step 3: Implement the module**
+- [x] **Step 3: Implement the module**
 
 For the `--no-walk` parse, split stdout on `\x01`. Each record is a sha, then NUL-separated paths. A `git log` failure (an object is gone) falls back to one `git log` call per sha, dropping the shas that fail.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run the same command, plus `agentflow/tests/test_portability.py`. Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add agentflow/artifacts.py agentflow/tests/test_artifacts.py
@@ -304,7 +304,7 @@ git commit -m "List, read and diff a run's artifacts from its own commits in git
     - `repo` is `self.server.repo`, the main checkout.
   - `run_detail(...)["artifact_tabs"] = artifact_tabs(lane_phases(cfg, state["pipeline"]))`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # test_artifacts.py
@@ -369,20 +369,20 @@ def test_run_detail_names_the_artifact_tabs_its_lane_walks(dash):
 
 `POST` to these routes answers 404, because `_post` matches only `ACTION_ROUTE`'s action names, and `artifacts` isn't one. If it answers anything else, fix the route, not the test.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_artifacts.py agentflow/tests/test_dashboard.py -k "findings or spec_routes or artifact" --import-mode=prepend -q`
 Expected: FAIL (`run_findings` is missing; the routes answer 404 `not found`).
 
-- [ ] **Step 3: Implement `run_findings`, the routes and `artifact_tabs`**
+- [x] **Step 3: Implement `run_findings`, the routes and `artifact_tabs`**
 
 Add to the module docstring's route list: "`GET /api/runs/<id>/artifacts`, `/artifact?path=&sha=` (`sha` a revision of `path` or `head`), `/artifact/diff?path=&from=&to=` and `/findings`: the run's spec, plan and other committed files, read from git and capped at `dashboard.artifact_max_kb`; a path outside the run's artifact list is a 404".
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run the same command, then all of `test_dashboard.py`. Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add agentflow/artifacts.py agentflow/dashboard.py agentflow/views.py agentflow/tests
@@ -406,7 +406,7 @@ git commit -m "Serve a run's artifacts, revisions, diffs and findings to the das
     - On any other approval it is ignored. No field is written when it is `None` or `[]`.
   - The `viewed` body field on `POST /api/runs/<id>/approve` is optional. When given, it must be a list of at most 100 objects, each with exactly two keys: `path` (text of 1–1024 characters) and `sha` (matching `artifacts.SHA`). Otherwise → 400 "viewed must be a list of {path, sha}". The server records it as sent: it is informational, and nothing checks it against the artifacts.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # test_dashboard.py
@@ -433,20 +433,20 @@ def test_the_cli_approval_carries_no_viewed(flow_repo):
     assert "viewed" not in [e for e in run.events.read() if e["type"] == "phase_approved"][-1]
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_dashboard.py agentflow/tests/test_hitl.py -k "viewed" --import-mode=prepend -q`
 Expected: FAIL (`viewed` isn't recorded; the malformed body answers 200).
 
-- [ ] **Step 3: Implement it**
+- [x] **Step 3: Implement it**
 
 Validate `viewed` in `_approve` before calling `hitl.approve`, so a 400 changes nothing. Add to the docstring's approve line: "an approve body may carry `viewed: [{path, sha}]`, the revisions the page showed, recorded on `phase_approved`".
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run the same command, then `agentflow/tests/test_conformance.py` and `agentflow/tests/test_metrics.py`, which read `phase_approved`. Expected: PASS.
 
-- [ ] **Step 5: Add the changelog line and commit**
+- [x] **Step 5: Add the changelog line and commit**
 
 Under `### Added`: "A dashboard approval of a phase records the spec and plan revisions the page showed (`viewed` on `phase_approved`). The CLI's approvals are unchanged."
 
@@ -480,7 +480,7 @@ git commit -m "Record on a dashboard phase approval which artifact revisions the
     - `ref` renders as its text followed by the path in a `<code>` (no navigation in U1).
     - Every string goes through `textContent`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 NODE = shutil.which("node")
@@ -533,20 +533,20 @@ def test_markdown_loads_before_the_run_page():
 
 The `https://example.com` literal lives only in the test file. `agentflow/tests/` is exempt from the page scan.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_dashboard_markdown.py agentflow/tests/test_dashboard.py -k "markdown or hostile or links or source_lines or every_ui_file" --import-mode=prepend -q`
 Expected: FAIL (`markdown.js` doesn't exist). If node is missing, the node tests show as skipped; install node and run again before you go on.
 
-- [ ] **Step 3: Implement `markdown.js` and its styles**
+- [x] **Step 3: Implement `markdown.js` and its styles**
 
 Parse line by line into blocks, then parse the inline nodes of each block's text with one left-to-right scanner: code spans first, then links, then `**`, then `*`/`_`. Keep it to about 200 lines.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run the same command, plus `test_page_is_served_with_a_nonce_and_no_unsafe_dom_sinks` and `test_portability.py`. Expected: PASS, with no test skipped.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add agentflow/dashboard_ui/markdown.js agentflow/dashboard.html agentflow/dashboard.py agentflow/tests
