@@ -814,3 +814,130 @@ def test_audit_reuses_a_pass_by_input_hash(flow_repo, gh, git):
     floor = next(o for o in checked["obligations"] if o["id"] == FLOOR_ID)
     assert floor["status"] == "satisfied" and floor["note"] == ""
     assert not [e for e in flow_repo.events(run, "gate_result") if e.get("key") == FINISH]
+
+
+# --------------------------------------------------------------------------- the full verify set once, at finish
+
+# A neutral finding: no security keyword, so no security review joins the round.
+TIERED_FINDING = {"severity": "blocking", "file": "src/one.py", "line": 3, "text": "Thiếu kiểm tra giá trị rỗng"}
+DONE = {"status": "done", "summary": "did it"}
+
+
+def tiered(flow_repo, run_cmd: str = "echo fine", sync: dict | None = None) -> None:
+    """The verify set is one gate, `ok`, whose `inputs` and `affected` paths are `src/**`; both `fix_findings` steps
+    run the affected tier; the run ends at `finish` (no `ci` step), whose `sync` step gets `sync` on top."""
+    def edit(data: dict) -> None:
+        for phase in ("verify", "review"):
+            for step in data["phases"][phase]["steps"]:
+                if isinstance(step, dict) and step.get("id") == "fix_findings":
+                    step["gate_tier"] = "affected"
+        data["phases"]["ship"]["steps"] = [s for s in data["phases"]["ship"]["steps"] if s.get("type") != "ci"]
+        next(s for s in data["phases"]["ship"]["steps"] if s.get("type") == "finish")["sync"].update(sync or {})
+
+    gate = {"run": run_cmd, "inputs": ["src/**"], "affected": {"run": "true {paths}", "paths": ["src/**"]}}
+    flow_repo.configure({"gate_sets": {"build": ["ok"], "verify": ["ok"], "setup": []}, "gates": {"ok": gate}},
+                        autopilot=True, edit=edit)
+
+
+def review_fixing(flow_repo, path: str, extra: dict | None = None) -> None:
+    flow_repo.script({BRANCH_REVIEW: [review(TIERED_FINDING), review()],
+                      "review/fix_findings": [{"write": {path: "x = 2\n"}, "result": DONE}], **(extra or {})})
+
+
+def audit_gate_runs(monkeypatch) -> list:
+    """The `run_gates` calls the conformance audit makes."""
+    import agentflow.conformance as conformance
+
+    calls: list = []
+    real = conformance.run_gates
+
+    def recording(cfg, names, *args, **kwargs):
+        calls.append(names)
+        return real(cfg, names, *args, **kwargs)
+
+    monkeypatch.setattr(conformance, "run_gates", recording)
+    return calls
+
+
+def test_a_tiered_run_runs_the_full_suite_once(flow_repo, gh, git, monkeypatch):
+    from datetime import UTC, datetime
+
+    from agentflow.metrics import run_metrics
+    from agentflow.signals import run_signals
+
+    tiered(flow_repo)
+    review_fixing(flow_repo, "docs/note.md")  # outside the gate's `inputs`
+    audited = audit_gate_runs(monkeypatch)
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="review"))
+    other_evidence(run)
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done", run.state["waiting"]
+    events = run.events.read()
+    fixed = [e for e in events if e["type"] == "gate_result" and e["key"] == "review/fix_findings"]
+    assert [(e["gate"], e.get("tier"), e["skipped"]) for e in fixed] == [("ok", "affected", True)]
+    assert run_signals(events, run_metrics(events, datetime.now(UTC)), full_suite=["ok"])["full_suite_runs"] == 1
+    assert [e["gate"] for e in events if e["type"] == "gate_result" and e["key"] == FINISH] == ["ok"]
+    assert last(flow_repo, run, "conformance_checked")["passed"] is True
+    assert audited == [] and pushed(git, flow_repo, run) and len(created(gh)) == 1
+
+
+def test_a_fix_inside_the_inputs_runs_the_full_set_again_at_finish(flow_repo, gh, git, monkeypatch):
+    from agentflow.gates import input_hashes
+
+    tiered(flow_repo)
+    review_fixing(flow_repo, "src/x.py")  # inside the gate's `inputs`
+    audited = audit_gate_runs(monkeypatch)
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="verify"))
+    run.emit("phase_approved", phase="plan", by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done", run.state["waiting"]
+    tree = final_tree(git, run)
+    at_finish = [e for e in flow_repo.events(run, "gate_result") if e.get("key") == FINISH and e["gate"] == "ok"]
+    assert len(at_finish) == 1 and "tier" not in at_finish[0] and at_finish[0]["passed"]
+    worktree = Path(run.state["worktree"])
+    assert at_finish[0]["input_hash"] == input_hashes(flow_repo.cfg, [flow_repo.cfg.gates["ok"]], worktree, tree)["ok"]
+    assert audited == []  # the final check gave the audit its evidence
+    checked = last(flow_repo, run, "conformance_checked")
+    floor = next(o for o in checked["obligations"] if o["id"] == FLOOR_ID)
+    assert checked["passed"] is True and floor["evidence"] == [at_finish[0]["seq"]]
+    assert pushed(git, flow_repo, run)
+
+
+def test_a_final_check_failure_goes_to_the_sync_session_and_is_committed(flow_repo, gh, git):
+    tiered(flow_repo, run_cmd="test -f fixed.txt")  # the full command fails until `fixed.txt` exists
+    review_fixing(flow_repo, "src/x.py", {
+        f"{FINISH}/final_fix": [{"write": {"fixed.txt": "ok\n"}, "result": {"status": "done", "summary": "fixed"}}]})
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="review"))
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done", run.state["waiting"]
+    events = run.events.read()
+    assert not [e for e in events if e["type"] == "hitl_raised"]
+    failed = [e for e in events if e["type"] == "gate_result" and e["key"] == FINISH]
+    assert [(e["gate"], e["passed"]) for e in failed] == [("ok", False)]
+    (commit,) = [e for e in events if e["type"] == "step_committed" and e["key"] == f"{FINISH}/final_fix"]
+    (opened,) = [e for e in events if e["type"] == "pr_opened"]
+    assert commit["seq"] < opened["seq"]
+    worktree = Path(run.state["worktree"])
+    assert git(worktree, "log", "-1", "--format=%s").strip() == "Fix what the full verify run found"
+    assert git(worktree, "rev-parse", "HEAD").strip() == commit["sha"]
+    assert "fixed.txt" in git(flow_repo.origin, "ls-tree", "--name-only", run.state["branch"])
+    assert [c["step"] for c in flow_repo.calls()].count(f"{FINISH}/final_fix") == 1
+
+
+def test_without_a_deferred_run_finish_is_unchanged(flow_repo, gh, git):
+    run = begin_finish(flow_repo)  # no step ran the affected tier
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    events = run.events.read()
+    assert not [e for e in events if "final_fix" in str(e.get("key") or "")]
+    start_seq = next(e["seq"] for e in events if e["type"] == "phase_started")
+    assert [e["type"] for e in events if e["seq"] >= start_seq] == [
+        "phase_started", "gate_result", "conformance_checked", "pr_opened", "step_finished", "phase_approved",
+        "handoff_written", "run_finished"]
+
+
+def test_a_final_check_failure_with_no_fix_session_is_a_gate_failed_stop(flow_repo, gh, git):
+    tiered(flow_repo, run_cmd="test -f fixed.txt", sync={"fix_loop": False})
+    review_fixing(flow_repo, "src/x.py")
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="review"))
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    raised = last(flow_repo, run, "hitl_raised")
+    assert raised["kind"] == "gate_failed" and raised["key"] == FINISH and "would push: ok" in raised["summary"]
+    assert f"{FINISH}/final_fix" not in [c["step"] for c in flow_repo.calls()]
+    assert flow_repo.events(run, "conformance_checked") == [] and not pushed(git, flow_repo, run)

@@ -67,7 +67,7 @@ from agentflow.config import Config, Phase, Step, brief_files
 from agentflow.conformance import audit, clean_tree, render_section
 from agentflow.doubt import RECONCILE
 from agentflow.flow_control import current_refine, refine_note_block, refine_subject
-from agentflow.gates import gates_ok, record_results, run_gates_reusing
+from agentflow.gates import deferred_full, failure_report, gates_ok, record_results, run_gates_reusing
 from agentflow.gitops import (
     CommitRejected,
     GhError,
@@ -116,9 +116,9 @@ def earlier_review(findings: list[dict], note: str | None) -> str:
 
 
 class FeatureLane:
-    """`run_foreach`, `record_decisions`, `may_park` and `run_finish` for `lanes.Executor`; relies on its
-    `cfg`, `run`, `ctx`, `worktree`, `run_agent_step`, `size_plan`, `decide`, `_waiting_on`, `_since_step_started`
-    and `_gate_report`."""
+    """`run_foreach`, `record_decisions`, `may_park`, `run_finish` and `final_check` for `lanes.Executor`; relies on
+    its `cfg`, `run`, `ctx`, `worktree`, `run_agent_step`, `size_plan`, `decide`, `_waiting_on`, `_since_step_started`
+    and `_gate_report`, and on `run_sync`, `confirm_mergeable`, `_plain` and `_sync_report` from `sync_lane.SyncLane`."""
 
     cfg: Config
     run: Run
@@ -774,6 +774,9 @@ class FeatureLane:
             return "stopped"
         if not self.runner_commits_only(key):
             return "stopped"
+        if deferred_full(self.run.events.read()):  # a fix step ran the affected tier: the full set is still owed
+            if self.final_check(phase, step, key) != "done" or not self.runner_commits_only(key):
+                return "stopped"
         try:
             sha = head(self.worktree)  # what the audit checks is exactly what gets pushed
         except (GitError, subprocess.CalledProcessError) as exc:
@@ -796,6 +799,31 @@ class FeatureLane:
             return "stopped"
         self.run.emit("step_finished", key=key, status="done", summary=f"draft pull request {url}")
         return "done"
+
+    def final_check(self, phase: Phase, step: Step, key: str) -> Outcome:
+        """The full `verify` set, once, on the committed tree `finish` is about to audit and push, when some step ran
+        only the affected tier (`gates.deferred_full`). A pass (or a pass reused for this tree or these inputs) is
+        "done", and its results are the audit's evidence. A failure goes to a session of the `sync` step, at the
+        full tier, whose gates and fix loop decide and whose work the runner commits (`<key>/final_fix`); with no
+        such session to run, or once it is already done, it is the audit's `gate_failed` stop. "stopped" = a human."""
+        tree = snapshot(self.worktree)
+        results = run_gates_reusing(self.cfg, self.run, key, "verify", self.worktree, self.run.gate_log_dir(key), tree)
+        record_results(self.run, key, results, tree)
+        if gates_ok(results):
+            return "done"
+        failed = [r for r in results if not (r.passed or r.skipped)]
+        sync = step.sync
+        fix_key = f"{key}/final_fix"
+        done = (self.run.state["steps"].get(fix_key) or {}).get("status") in DONE_STATUSES
+        if sync is not None and sync.fix_loop and not done:
+            fixer = dataclasses.replace(sync, gate_tier="full", commit=True, message="Fix what the full verify run found")
+            return self.run_agent_step(self._plain(phase), fixer, fix_key,
+                                       extra={"sync_report": self._sync_report([], "")}, role=sync.role,
+                                       fix_first=failed)
+        raise_hitl(self.cfg, self.run, "gate_failed", key,
+                   f"Gates failed on the tree {key} would push: {', '.join(r.name for r in failed)}.",
+                   extra=failure_report(failed))
+        return "stopped"
 
     def _unmoved(self, key: str, sha: str) -> bool:
         """HEAD is still `sha`, the commit the audit checked (a gate it ran could have committed); False = stopped."""
