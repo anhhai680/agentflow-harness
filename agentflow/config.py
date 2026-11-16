@@ -377,6 +377,79 @@ GATE_TIERS = ("full", "affected")  # a step's `gate_tier`: the gates' whole comm
 AFFECTED_KEYS = ("run", "paths")
 
 
+_WORD_END = frozenset(" \t\n;&|")  # what may follow `{paths}`: the end of a shell word
+
+
+def unquoted_paths_word(run: str) -> bool:
+    """True when every `{paths}` in the `affected.run` template `run` is its own unquoted shell word, so each
+    shell-quoted file name stays one inert argument: never inside `'...'`, `"..."`, backticks, `$(...)` or `${...}`,
+    never after an unquoted `#` on its line or after an unquoted here-document `<<`, and with only the start,
+    whitespace before it and the end, whitespace, `;`, `&` or `|` after it. `{{` and `}}` are literal braces.
+
+    A small, conservative scan of POSIX shell quoting: a template it cannot read as safe is refused."""
+    single = double = backtick = comment = heredoc = False
+    depth = 0  # open `$(` and `${`
+    prev = ""  # the last character read outside a quote, "" at the start
+    i, n = 0, len(run)
+    while i < n:
+        if comment:
+            if run.startswith("{paths}", i):
+                return False  # a newline in a name would end the comment and run the rest
+            if run[i] == "\n":
+                comment, prev = False, "\n"
+            i += 1
+            continue
+        if single:
+            if run[i] == "'":
+                single = False
+            elif run.startswith("{paths}", i):
+                return False
+            i += 1
+            continue
+        if run.startswith("{{", i):
+            if prev == "$":
+                depth += 1  # `${{` renders `${`
+            prev, i = "{", i + 2
+            continue
+        if run.startswith("}}", i):
+            if depth:
+                depth -= 1
+            prev, i = "}", i + 2
+            continue
+        if run.startswith("{paths}", i):
+            after = run[i + 7:i + 8]
+            if (double or backtick or depth or heredoc or prev not in ("", " ", "\t", "\n")
+                    or (after and after not in _WORD_END)):
+                return False
+            prev, i = "}", i + 7
+            continue
+        c = run[i]
+        if c == "\\":
+            prev, i = "\\", i + 2  # the escaped character is literal
+            continue
+        if c == "'" and not double:
+            single = True
+        elif c == '"':
+            double = not double
+        elif c == "`":
+            backtick = not backtick
+        elif c == "$" and run.startswith("$(", i):
+            depth, i, prev = depth + 1, i + 2, "("
+            continue
+        elif c == ")" and depth:
+            depth -= 1
+        elif c == "#" and not double and not backtick and not depth and prev in ("", " ", "\t", "\n"):
+            comment = True
+        elif c == "<" and not double and run.startswith("<<", i) and not run.startswith("<<<", i):
+            heredoc = True
+        elif c == "<" and run.startswith("<<<", i):
+            prev, i = "<", i + 3
+            continue
+        prev = c
+        i += 1
+    return True
+
+
 @dataclass(frozen=True)
 class Affected:
     """A gate's `affected` command: `run` takes the changed files its `paths` globs match, as `{paths}`."""
@@ -1702,6 +1775,10 @@ class _Validator:
         if not run.strip() or fields is None or any(f != ("paths", "", None) for f in fields):
             self.error(_join(path, "run"), "affected.run is a non-empty command whose only placeholder is `{paths}`; "
                        "write a literal brace as `{{` or `}}`")
+        elif not unquoted_paths_word(run):
+            self.error(_join(path, "run"), "`{paths}` must be its own unquoted word: not inside quotes, backticks, "
+                       "`$(...)` or `${...}`, and not after a `#` or a here-document, so each file name stays one "
+                       "inert argument")
         bad = [p for p in affected.paths if not isinstance(p, str) or not p.strip() or posixpath.isabs(p)
                or ".." in p.split("/")]
         if not affected.paths or bad:

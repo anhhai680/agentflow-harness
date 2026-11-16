@@ -440,7 +440,7 @@ def test_changed_paths_are_quoted_and_dash_safe(tmp_git, tmp_path):
 
 
 def test_hostile_names_reach_the_command_as_one_inert_argument_each(tmp_git, tmp_path):
-    changed = ["it's.py", "new\nline.py", "*.py", "`touch pwned2`.py", "a;touch pwned3.py", "{paths}.py", "--x.py",
+    changed = ["it's.py", "*.py", "`touch pwned2`.py", "a;touch pwned3.py", "{paths}.py", "--x.py",
                "q\"uote.py", "back\\slash.py", "$HOME.py"]
     affected = Affected(run="printf '%s\\0' {paths} > out.bin", paths=["**/*.py"])
     cfg = _affected(tmp_git, changed, affected=affected)
@@ -449,6 +449,39 @@ def test_hostile_names_reach_the_command_as_one_inert_argument_each(tmp_git, tmp
     got = (tmp_git / "out.bin").read_bytes().decode().split("\0")[:-1]
     assert sorted(got) == sorted(["./--x.py" if p == "--x.py" else p for p in changed])
     assert not list(tmp_git.glob("pwned*"))
+
+
+def test_a_name_with_a_control_character_is_dropped(tmp_git):
+    names = ["new\nline.py", "cr\rx.py", "tab\tx.py", "esc\x1bx.py", "del\x7fx.py"]
+    for name in names:
+        (tmp_git / name).write_text("x = 1\n", encoding="utf-8")
+    gate = Gate("t", "true", affected=Affected(run="echo {paths}", paths=["**"]))
+    assert affected_gate(gate, names, tmp_git) is None
+    assert affected_gate(gate, [*names, "src/app.py"], tmp_git).run == "echo src/app.py"
+
+
+@pytest.mark.parametrize("template", ["echo '{paths}'", 'echo "{paths}"', "echo `{paths}`", "echo $({paths})",
+                                      "echo ${{x:-{paths}}}", "echo # {paths}", "echo x{paths}"])
+def test_a_template_that_would_not_keep_the_names_inert_runs_the_full_command(tmp_git, tmp_path, template):
+    """Defence in depth for a pack that skipped `validate`: a `{paths}` that is not its own unquoted word."""
+    cfg = _affected(tmp_git, ["$(touch pwned).py"], affected=Affected(run=template, paths=["**/*.py"]))
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=["$(touch pwned).py"])
+    assert result.tier == "full" and (tmp_git / "out.txt").read_text() == "full\n"
+    assert not (tmp_git / "pwned").exists()
+
+
+def test_a_rendered_command_over_the_byte_limit_runs_the_full_command(tmp_git, tmp_path):
+    from agentflow.gates import MAX_AFFECTED_COMMAND_BYTES, MAX_AFFECTED_PATHS
+
+    assert MAX_AFFECTED_COMMAND_BYTES == 64 * 1024
+    deep = "/".join(["d" * 240] * 3)  # about 800 bytes a path, under every PATH_MAX
+    names = [f"{deep}/t{i:02}.py" for i in range(90)]  # well under MAX_AFFECTED_PATHS, over the byte limit
+    assert len(names) < MAX_AFFECTED_PATHS and sum(len(n) + 1 for n in names) > MAX_AFFECTED_COMMAND_BYTES
+    cfg = _affected(tmp_git, names)
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=names)
+    assert result.passed and result.tier == "full" and (tmp_git / "out.txt").read_text() == "full\n"
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=names[:10])
+    assert result.tier == "affected" and len((tmp_git / "out.txt").read_text().splitlines()) == 10
 
 
 def test_names_outside_the_worktree_are_never_passed(tmp_git, tmp_path):

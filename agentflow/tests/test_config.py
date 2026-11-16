@@ -1731,6 +1731,26 @@ def test_affected_allows_only_the_paths_placeholder(tmp_cfg):
             load_config(tmp_cfg(affected(bad)))
 
 
+@pytest.mark.parametrize("template", [
+    "echo '{paths}'", 'echo "{paths}"', "echo `{paths}`", "echo $({paths})", "echo $(ls {paths})",
+    'echo "a {paths} b"', "echo ${{x:-{paths}}}", "echo x # {paths}", "echo x{paths}", "echo {paths}x",
+    "cat <<EOF\n{paths}\nEOF", "echo '{paths}' {paths}", "echo \"$(echo ')')\" '{paths}'",
+])
+def test_affected_refuses_a_paths_placeholder_that_is_not_its_own_unquoted_word(tmp_cfg, template):
+    patch = {"gates": {"floor": {"run": "true", "affected": {"run": template, "paths": ["**/*.py"]}}}}
+    assert ("error", "gates.floor.affected.run") in errors(issues_for(tmp_cfg, patch))
+
+
+@pytest.mark.parametrize("template", [
+    "echo {paths}", "pytest {paths} -q", "pytest -q {paths}; echo done", "pytest {paths}|tee log", "a && b {paths}",
+    "echo '#' {paths}", "echo \"it's\" {paths}", "echo $(date) {paths}", "printf '%s\\n' {paths} > out.txt",
+    "echo {{x}} {paths}", "echo ${{HOME}} {paths}", "x <<< y {paths}", "cd api &&\n  pytest {paths}",
+])
+def test_affected_accepts_a_paths_placeholder_that_is_its_own_unquoted_word(tmp_cfg, template):
+    patch = {"gates": {"floor": {"run": "true", "affected": {"run": template, "paths": ["**/*.py"]}}}}
+    assert ("error", "gates.floor.affected.run") not in errors(issues_for(tmp_cfg, patch))
+
+
 def test_gate_tier_needs_gates(tmp_cfg):
     def tier(step_id: str, value):
         def edit(data):
@@ -1756,6 +1776,8 @@ def test_the_engine_defaults_mark_the_fix_steps_affected(sparse_repo):
     cfg = _sparse_config(sparse_repo)
     assert phase_step_of(cfg, "review", "fix_findings").gate_tier == "affected"
     assert phase_step_of(cfg, "ship", "finish").sync.gate_tier == "affected"
-    assert phase_step_of(cfg, "ship", "ci").fix.gate_tier == "affected"
+    # `ci.fix` stays full: `ci_lane` pushes right after the fix and no conformance audit follows, so an affected-only
+    # check would ship a tree no full verify has seen.
+    assert phase_step_of(cfg, "ship", "ci").fix.gate_tier == "full"
     assert phase_step_of(cfg, "verify", "verify").gate_tier == "full"
     assert phase_step_of(cfg, "build", "fix").gate_tier == "full"

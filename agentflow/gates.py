@@ -35,7 +35,8 @@ Tiers: a step with `gate_tier: affected` (the steps that fix things) runs each g
 the files the step changed (`affected_gate`): its `paths` globs pick them, each is shell-quoted, and a gate with none
 of them is skipped ("no affected paths"). Such a result is written with `tier: "affected"`, and it is never reused
 and never floor evidence: the full set still runs on the final tree. A gate without `affected`, and one that would
-take more than `MAX_AFFECTED_PATHS` paths, runs its whole `run`, as an ordinary full-tier result.
+take more than `MAX_AFFECTED_PATHS` paths or render a command over `MAX_AFFECTED_COMMAND_BYTES`, runs its whole `run`,
+as an ordinary full-tier result; so does one whose `{paths}` is not its own unquoted word (`validate` refuses that).
 """
 
 from __future__ import annotations
@@ -59,7 +60,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from agentflow import run_env, safeio
-from agentflow.config import Config, Gate
+from agentflow.config import Config, Gate, unquoted_paths_word
 from agentflow.guards import HARDENED, path_matches, snapshot
 
 if TYPE_CHECKING:
@@ -68,6 +69,9 @@ if TYPE_CHECKING:
 KILL_WAIT_S = 5
 # Above this many matched paths an `affected` command would risk the argument limit: the gate runs its whole `run`.
 MAX_AFFECTED_PATHS = 200
+# A rendered `affected` command longer than this (bytes) runs the whole `run` instead: one argv string has a limit
+# (about 128 KiB on Linux), and `Popen` would raise E2BIG rather than fail the gate.
+MAX_AFFECTED_COMMAND_BYTES = 64 * 1024
 _AFFECTED_FIELD = re.compile(r"\{\{|\}\}|\{paths\}")
 
 
@@ -244,15 +248,17 @@ def _affected_paths(gate: Gate, changed: Sequence[str], cwd: Path) -> list[str]:
     """The paths of `changed` that `gate.affected.paths` match and that exist inside the worktree `cwd`, made relative
     to `gate.cwd` when it has one (the ones outside it are dropped). In order, each once.
 
-    A path is repository file names, so it is untrusted: an empty one, an absolute one, one with a `..` part or a NUL,
-    and one that resolves outside the worktree (through a symlink) are never passed on."""
+    A path is repository file names, so it is untrusted: an empty one, an absolute one, one with a `..` part or a
+    control character (NUL, a newline, any other below 0x20, and DEL), and one that resolves outside the worktree
+    (through a symlink) are never passed on."""
     if gate.affected is None:
         return []
     root = Path(cwd).resolve()
     prefix = posixpath.normpath(gate.cwd) if gate.cwd else "."
     out: list[str] = []
     for raw in dict.fromkeys(changed):
-        if not isinstance(raw, str) or not raw or "\0" in raw or posixpath.isabs(raw) or ".." in raw.split("/"):
+        if (not isinstance(raw, str) or not raw or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw)
+                or posixpath.isabs(raw) or ".." in raw.split("/")):
             continue
         path = posixpath.normpath(raw)
         if not any(path_matches(path, pattern) for pattern in gate.affected.paths):
@@ -281,25 +287,31 @@ def _render_affected(template: str, paths: list[str]) -> str:
 
 def affected_gate(gate: Gate, changed: Sequence[str], cwd: Path) -> Gate | None:
     """`gate` with its `affected` command, rendered with the paths of `changed` it takes (`_affected_paths`), as its
-    `run`; None when the gate has no `affected` or no path is left."""
+    `run`; None when the gate has no `affected`, its `{paths}` is not its own unquoted word, or no path is left."""
+    if gate.affected is None or not unquoted_paths_word(gate.affected.run):
+        return None
     paths = _affected_paths(gate, changed, cwd)
-    if gate.affected is None or not paths:
+    if not paths:
         return None
     return replace(gate, run=_render_affected(gate.affected.run, paths))
 
 
 def _tiered(gate: Gate, tier: str, changed: Sequence[str], cwd: Path) -> tuple[Gate | GateResult, str]:
     """What runs for `gate` at `tier`, and the result's tier: the gate itself at the full tier (no `affected`, the full
-    tier asked, or more than `MAX_AFFECTED_PATHS` paths), a skip when no changed path is the gate's, or its rendered
-    `affected` command."""
-    if tier != "affected" or gate.affected is None:
+    tier asked, a template whose `{paths}` is not its own unquoted word (`validate` refuses it too), more than
+    `MAX_AFFECTED_PATHS` paths, or a rendered command over `MAX_AFFECTED_COMMAND_BYTES`), a skip when no changed path
+    is the gate's, or its rendered `affected` command."""
+    if tier != "affected" or gate.affected is None or not unquoted_paths_word(gate.affected.run):
         return gate, "full"
     paths = _affected_paths(gate, changed, cwd)
     if len(paths) > MAX_AFFECTED_PATHS:
         return gate, "full"
     if not paths:
         return GateResult(gate.name, False, True, "no affected paths", None, "", tier="affected"), "affected"
-    return replace(gate, run=_render_affected(gate.affected.run, paths)), "affected"
+    run = _render_affected(gate.affected.run, paths)
+    if len(run.encode("utf-8", "surrogateescape")) > MAX_AFFECTED_COMMAND_BYTES:
+        return gate, "full"
+    return replace(gate, run=run), "affected"
 
 
 def deferred_full(events: list[dict]) -> bool:

@@ -279,8 +279,8 @@ phases:
       - id: ci
         type: ci
         gates: setup
-        fix: {id: fix, skill: "@skills.map.debug", role: plan, prompt: ci_fix.md, gates: verify, gate_tier: affected,
-              fix_loop: true, forbid: [".github/workflows/**"], commit: true, message: "Fix CI failures"}
+        fix: {id: fix, skill: "@skills.map.debug", role: plan, prompt: ci_fix.md, gates: verify, fix_loop: true,
+              forbid: [".github/workflows/**"], commit: true, message: "Fix CI failures"}
 
 phase_approval:
   refine_prompt: refine.md
