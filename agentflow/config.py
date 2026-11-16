@@ -181,6 +181,7 @@ NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition"
 PREFLIGHT_KEYS = ("enabled",)
 WATCHDOG_KEYS = ("no_progress_min",)
 WATCHDOG_MAX_MIN = 1440  # `watchdog.no_progress_min` above a day is a typo, not a plan
+GATE_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # a gate's `group` or `resource`
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -378,6 +379,8 @@ class Gate:
     when_exists: str | None = None
     baseline: str | None = None  # `red`: it failed on the base branch when the pack was set up (a human fixes or deletes it)
     agent_check: bool = False  # the build prompt lists it as a check the implementer runs itself (`{self_checks}`)
+    group: str | None = None  # gates of different groups run at the same time; one group runs in order (`gates.run_gates`)
+    resource: str | None = None  # gates that share a resource never run at the same time, within one run
 
 
 @dataclass
@@ -814,6 +817,8 @@ def _build_gates(data: dict) -> dict[str, Gate]:
             when_exists=_optional(raw, "when_exists", path, str, None),
             baseline=raw.get("baseline"),  # kept as written: `validate` refuses anything but red or green
             agent_check=_optional(raw, "agent_check", path, bool, False),
+            group=_optional(raw, "group", path, str, None),
+            resource=_optional(raw, "resource", path, str, None),
         )
     return out
 
@@ -1590,6 +1595,7 @@ class _Validator:
         elif confirmed is not True:
             self.add("warning", "gates_confirmed", "detected or inherited gates are a proposal: check `gates` and "
                      "`gate_sets`, then set `gates_confirmed: true`")
+        setup_gates = set(self.cfg.gate_sets.get("setup") or [])
         for name, gate in self.cfg.gates.items():
             path = f"gates.{name}"
             if gate.cwd is not None and (posixpath.isabs(gate.cwd) or ".." in gate.cwd.split("/")):
@@ -1597,6 +1603,12 @@ class _Validator:
             if gate.agent_check and (gate.cwd is not None or "\n" in gate.run.strip() or "`" in gate.run):
                 self.error(_join(path, "agent_check"), "an agent check runs from the worktree root as one line, exactly "
                            "as written: drop `cwd` and keep `run` to one line with no backtick, or turn agent_check off")
+            for key in ("group", "resource"):
+                value = getattr(gate, key)
+                if value is not None and GATE_LABEL.fullmatch(value) is None:
+                    self.error(_join(path, key), f"{key} is a name of 1-40 letters, digits, `_`, `.` or `-`")
+            if gate.group is not None and name in setup_gates:
+                self.add("warning", _join(path, "group"), "setup gates start things in order; drop `group`")
             if gate.baseline is None:
                 continue
             if gate.baseline not in BASELINES:

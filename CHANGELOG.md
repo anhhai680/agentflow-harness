@@ -7,6 +7,10 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+
+- `gates.<name>.group` and `gates.<name>.resource`: gates of different groups run at the same time (each group in set order), and gates that share a resource never overlap within a run. Gates with no group run in order as before, and leaving early kills every group's processes.
+
 ## [2.8] - 2026-11-16
 
 ### Added

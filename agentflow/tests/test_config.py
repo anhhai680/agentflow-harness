@@ -1648,3 +1648,24 @@ def test_watchdog_no_progress_min_is_capped_at_a_day(tmp_cfg):
     assert [i.path for i in found if i.level == "error"] == ["watchdog.no_progress_min"]
     for good in (0, 0.02, 10, 1440):  # no floor for a small positive value: the watchdog's own tests use 0.02
         assert not errors(issues_for(tmp_cfg, {"watchdog": {"no_progress_min": good}})), good
+
+
+# --------------------------------------------------------------------------- gate groups and resources
+
+
+def test_gate_group_and_resource_are_names(tmp_cfg):
+    cfg = load_config(tmp_cfg({"gates": {"floor": {"run": "true", "group": "api", "resource": "db.1"}}}))
+    assert (cfg.gates["floor"].group, cfg.gates["floor"].resource) == ("api", "db.1")
+    assert load_config(tmp_cfg()).gates["floor"].group is None
+    found = errors(issues_for(tmp_cfg, {"gates": {"floor": {"run": "true", "group": "a b", "resource": ""}}}))
+    assert ("error", "gates.floor.group") in found
+    assert ("error", "gates.floor.resource") in found
+    assert ("error", "gates.floor.group") not in errors(
+        issues_for(tmp_cfg, {"gates": {"floor": {"run": "true", "group": "api", "resource": "db"}}}))
+
+
+def test_a_grouped_setup_gate_is_a_warning(tmp_cfg):
+    found = _warnings(issues_for(tmp_cfg, {"gates": {"setup_py": {"run": "uv sync", "group": "api"}}}))
+    assert ("gates.setup_py.group", "setup gates start things in order; drop `group`") in found
+    assert not [w for w in _warnings(issues_for(tmp_cfg, {"gates": {"floor": {"run": "true", "group": "api"}}}))
+                if w[0] == "gates.floor.group"]

@@ -8,6 +8,11 @@ and the group is killed too whenever the runner leaves early. A missing `cwd` fa
 reason names the path). Gate logs are written fresh and never through a symlink (`safeio`). `gates_ok` treats skipped gates as not failing, so a missing optional code
 root does not block a step, but the summary always shows them.
 
+Groups (`run_gates`): gates with the same `group` run in set order in one thread, and the groups run at the same time; the
+gates with no `group` form one group of their own, so a set with no `group` runs exactly as it always did, in order and
+with no thread. A gate with a `resource` holds that name's lock while it runs, so two gates sharing one never overlap
+(within one run). The results keep the set's order. However `run_gates` is left, every gate's process group is killed.
+
 Doc checks (`run_doc_checks`) are the design lane's built-in gates, named in a step's `checks:`. They
 read `git diff` from a base commit to the working tree as it is now (committed, staged, unstaged and
 untracked changes, through a `guards.snapshot` tree, so the real index is untouched). Lines are placed
@@ -31,8 +36,10 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
@@ -107,15 +114,50 @@ def _kill_group(proc: subprocess.Popen) -> None:
         os.killpg(proc.pid, signal.SIGKILL)
 
 
+class _Live:
+    """The gate processes running now, so that leaving `run_gates` early can kill every group's, not one thread's."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._procs: set[subprocess.Popen] = set()
+        self._closed = False
+
+    def add(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            if self._closed:  # the runner is leaving: nothing new may start
+                _kill_group(proc)
+            else:
+                self._procs.add(proc)
+
+    def remove(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._procs.discard(proc)
+
+    def kill_all(self) -> None:
+        """Kill every process still running, and refuse to start more."""
+        with self._lock:
+            self._closed = True
+            for proc in self._procs:
+                _kill_group(proc)
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+
 def _shell(command: str, cwd: Path, timeout_s: float, env: dict[str, str] | None = None,
-           env_base: Mapping[str, str] | None = None) -> tuple[int | None, str]:
+           env_base: Mapping[str, str] | None = None, live: _Live | None = None) -> tuple[int | None, str]:
     """`(exit code, output)` of `command` run by the shell in its own process group; `(None, output)` when
     it was killed at `timeout_s`. The group is killed whenever this is left with it still running. The
-    environment is `env_base` (default: this process's) with `env` on top."""
+    environment is `env_base` (default: this process's) with `env` on top. A `live` registry holds the process
+    while it runs."""
     base = os.environ if env_base is None else env_base
     proc = subprocess.Popen(command, shell=True, cwd=cwd, env={**base, **(env or {})}, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                             errors="replace", start_new_session=True)
+    if live is not None:
+        live.add(proc)
     try:
         try:
             output, _ = proc.communicate(timeout=timeout_s)
@@ -130,6 +172,8 @@ def _shell(command: str, cwd: Path, timeout_s: float, env: dict[str, str] | None
     finally:
         if proc.returncode is None:  # left early (timeout, an exception, Ctrl-C): take its children too
             _kill_group(proc)
+        if live is not None:
+            live.remove(proc)
 
 
 def _minutes(value: float) -> str:
@@ -143,21 +187,23 @@ def command_digest(gate: Gate, env: Mapping[str, str] | None) -> str:
 
 
 def _run_one(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min: float,
-             env: dict[str, str] | None = None, env_base: Mapping[str, str] | None = None) -> GateResult:
+             env: dict[str, str] | None = None, env_base: Mapping[str, str] | None = None,
+             live: _Live | None = None) -> GateResult:
     started = time.monotonic()
-    result = _run_gate(gate, cwd, log_dir, tail_lines, timeout_min, env, env_base)
+    result = _run_gate(gate, cwd, log_dir, tail_lines, timeout_min, env, env_base, live)
     return replace(result, duration_s=round(time.monotonic() - started, 3), cmd=command_digest(gate, env))
 
 
 def _run_gate(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min: float,
-              env: dict[str, str] | None, env_base: Mapping[str, str] | None = None) -> GateResult:
+              env: dict[str, str] | None, env_base: Mapping[str, str] | None = None,
+              live: _Live | None = None) -> GateResult:
     if gate.when_exists and not (cwd / gate.when_exists).exists():
         return GateResult(gate.name, False, True, f"{gate.when_exists} missing", None, "")
     run_dir = cwd / gate.cwd if gate.cwd else cwd
     if not run_dir.is_dir():
         reason = f"cwd {gate.cwd} does not exist in {cwd}"
         return GateResult(gate.name, False, False, reason, None, f"The gate did not run: {reason}.")
-    code, output = _shell(gate.run, run_dir, max(1.0, timeout_min * 60), env, env_base)
+    code, output = _shell(gate.run, run_dir, max(1.0, timeout_min * 60), env, env_base, live)
     if code is None:
         output += f"\n[agentflow: killed after {_minutes(timeout_min)}]\n"
     log_path = log_dir / f"{gate.name}.log"
@@ -172,21 +218,63 @@ def _run_gate(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min
     return GateResult(gate.name, passed, False, "" if passed else f"exit {code}", log_path, tail)
 
 
+def _collect(futures: list[Future]) -> None:
+    """Wait for every future, then re-raise the first exception (in order). `run_gates` leaves through here."""
+    wait(futures)
+    for future in futures:
+        future.result()
+
+
 def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path, *,
               env_base: Mapping[str, str] | None = None) -> list[GateResult]:
-    """Run gates in order (all of them, even after a failure) with `cwd` as the worktree root.
+    """Run gates (all of them, even after a failure) with `cwd` as the worktree root.
 
     A `str` names a `gate_sets` entry. Each gate's full output goes to `<log_dir>/<gate>.log`
     after a `$ <command>` line; `tail` keeps the last `context.gate_output_lines` lines. Each gate
     gets `defaults.gate_timeout_min`. Its environment is `env_base` (default: `run_env.base`, this process's
     environment without the variables a run does not inherit) with `defaults.env` on top.
+
+    The gates with no `group` form one group of their own. One group runs in set order, in this thread. With
+    several, each group runs in its own thread (in set order inside it), and a gate with a `resource` holds
+    that name's lock while it runs. The results are in set order. Leaving early (an exception, Ctrl-C) kills
+    every gate's process group, whichever thread started it.
     """
     cwd, log_dir = Path(cwd), Path(log_dir)
     if env_base is None:
         env_base = run_env.base(cfg)
     timeout = cfg.defaults.gate_timeout_min
-    return [_run_one(g, cwd, log_dir, cfg.context.gate_output_lines, timeout, cfg.defaults.env, env_base)
-            for g in _resolve(cfg, names)]
+    gates = _resolve(cfg, names)
+    groups: dict[str | None, list[int]] = {}
+    for i, gate in enumerate(gates):
+        groups.setdefault(gate.group, []).append(i)
+
+    def run(gate: Gate, live: _Live | None = None) -> GateResult:
+        return _run_one(gate, cwd, log_dir, cfg.context.gate_output_lines, timeout, cfg.defaults.env, env_base, live)
+
+    if len(groups) <= 1:  # no `group` anywhere, or all in one: today's plain loop
+        return [run(g) for g in gates]
+    live = _Live()
+    locks = {r: threading.Lock() for r in {g.resource for g in gates if g.resource}}
+    results: dict[int, GateResult] = {}
+
+    def run_group(indexes: list[int]) -> None:
+        for i in indexes:
+            if live.closed:
+                return
+            gate = gates[i]
+            if gate.resource:
+                with locks[gate.resource]:
+                    results[i] = run(gate, live)
+            else:
+                results[i] = run(gate, live)
+
+    pool = ThreadPoolExecutor(max_workers=len(groups), thread_name_prefix="gates")
+    try:
+        _collect([pool.submit(run_group, indexes) for indexes in groups.values()])
+    finally:
+        live.kill_all()  # whatever still runs (an interrupt, a crashed thread), every group's
+        pool.shutdown(wait=True)
+    return [results[i] for i in range(len(gates))]
 
 
 def setup_gate_names(cfg: Config) -> set[str]:

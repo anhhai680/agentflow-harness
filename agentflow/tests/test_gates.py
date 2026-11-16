@@ -226,3 +226,80 @@ def test_a_setup_gate_is_never_reused():
 
 def test_no_tree_reuses_nothing():
     assert reusable_passes([_pass("t", "T1", "same")], [Gate("t", "x")], None, {"t": "same"}) == {}
+
+
+# --------------------------------------------------------------------------- groups and resources
+
+
+def _meet(me: str, other: str, wait_s: int) -> str:
+    """A gate script: leave `<me>.on`, then wait up to `wait_s` for `<other>.on` (exit 1 if it never shows)."""
+    return (f"touch {me}.on; i=0; while [ ! -e {other}.on ]; do i=$((i+1)); [ $i -gt {wait_s * 20} ] && exit 1; "
+            "sleep 0.05; done")
+
+
+def test_two_groups_run_at_the_same_time(tmp_git, tmp_path):
+    cfg = cfg_with({"a": Gate("a", _meet("a", "b", 5), group="x"), "b": Gate("b", _meet("b", "a", 5), group="y")})
+    results = run_gates(cfg, ["a", "b"], tmp_git, tmp_path / "logs")
+    assert [(r.name, r.passed) for r in results] == [("a", True), ("b", True)]
+
+
+def test_ungrouped_gates_still_run_one_after_another(tmp_git, tmp_path):
+    cfg = cfg_with({"a": _meet("a", "b", 1), "b": _meet("b", "a", 1)})
+    results = run_gates(cfg, ["a", "b"], tmp_git, tmp_path / "logs")
+    assert [(r.name, r.passed) for r in results] == [("a", False), ("b", True)]
+
+
+def test_a_group_runs_in_set_order_and_results_keep_set_order(tmp_git, tmp_path):
+    def note(name: str) -> str:
+        return f"sleep 0.2; echo {name} >> order.txt"
+    cfg = cfg_with({"c": note("c"), "a": Gate("a", note("a"), group="x"), "b": Gate("b", note("b"), group="x")})
+    results = run_gates(cfg, ["c", "a", "b"], tmp_git, tmp_path / "logs")
+    order = (tmp_git / "order.txt").read_text().split()
+    assert order.index("a") < order.index("b")
+    assert sorted(order) == ["a", "b", "c"]
+    assert [r.name for r in results] == ["c", "a", "b"]
+
+
+def test_a_failed_gate_does_not_stop_the_rest_of_its_group(tmp_git, tmp_path):
+    cfg = cfg_with({"a": Gate("a", "exit 1", group="x"), "b": Gate("b", "true", group="x"), "c": "true"})
+    results = run_gates(cfg, ["a", "b", "c"], tmp_git, tmp_path / "logs")
+    assert [(r.name, r.passed) for r in results] == [("a", False), ("b", True), ("c", True)]
+
+
+def test_a_shared_resource_never_overlaps(tmp_git, tmp_path):
+    script = "mkdir db.lock || exit 1; sleep 0.3; rmdir db.lock"
+    cfg = cfg_with({"a": Gate("a", script, group="x", resource="db"), "b": Gate("b", script, group="y", resource="db")})
+    results = run_gates(cfg, ["a", "b"], tmp_git, tmp_path / "logs")
+    assert [(r.name, r.passed) for r in results] == [("a", True), ("b", True)]
+
+
+def test_leaving_early_kills_every_groups_process(tmp_git, tmp_path, monkeypatch):
+    from agentflow import gates
+
+    def sleeper(name: str) -> str:
+        return f"echo $$ > {name}.pid; exec sleep 30"
+    cfg = cfg_with({"a": Gate("a", sleeper("a"), group="x"), "b": Gate("b", sleeper("b"), group="y")})
+
+    def interrupted(futures):
+        import time
+        deadline = time.monotonic() + 10
+        while not ((tmp_git / "a.pid").exists() and (tmp_git / "b.pid").exists()
+                   and (tmp_git / "a.pid").read_text().strip() and (tmp_git / "b.pid").read_text().strip()):
+            assert time.monotonic() < deadline, "the gates never started"
+            time.sleep(0.05)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gates, "_collect", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        run_gates(cfg, ["a", "b"], tmp_git, tmp_path / "logs")
+    import time
+    pids = [int((tmp_git / f"{n}.pid").read_text()) for n in "ab"]
+    deadline = time.monotonic() + gates.KILL_WAIT_S
+    for pid in pids:
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, f"process {pid} is still alive"
+            time.sleep(0.05)

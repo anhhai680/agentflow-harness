@@ -252,6 +252,16 @@ def test_the_form_refuses_switching_refinement_off(shipped):
     assert "autonomy.non_blocking_severities" in [i.path for i in proposal.errors]
 
 
+def test_gate_groups_are_protected(shipped):
+    _, sha = config_edit.read(shipped)
+    old = 'floor:        {run: "true"}'
+    assert old in SHIPPED
+    for extra in ("group: api", "resource: db"):
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=SHIPPED.replace(old, f'floor:        {{run: "true", {extra}}}', 1),
+                                repo=REPO)
+
+
 def test_reconciles_blocks_on_findings_and_the_doubt_skill_are_protected(shipped):
     _, sha = config_edit.read(shipped)
     for old, new in [
