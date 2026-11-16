@@ -508,7 +508,7 @@ def test_an_accepted_template_runs_no_hostile_name(tmp_git, template):
 _FUZZ_FRAGMENTS = ("'", '"', "`", "\\", "$(", ")", "(", "${{", "}}", "{{", "#", ";", "&", "|", "\n", " ", " ", "$'",
                    "case x in ", "esac", "echo ", "a", "<<", "((", "$[", "]", "\\\n", "&&", ";;", "=", "<(", "$\"",
                    "x)", "${", "}", "{", "if ", "then ", "fi", "for i in ", "do ", "done", "[[ ", " ]]", "!", "*",
-                   "<<<", "%", "/", ":", "-")
+                   "<<<", "%", "/", ":", "-", "$", "<")
 _FUZZ_NAMES = ["x$(touch PWNED)y.py", "q'$(touch PWNED)'q.py", "d\"$(touch PWNED)\"d.py", "b`touch PWNED`b.py"]
 
 

@@ -391,7 +391,8 @@ def unquoted_paths_word(run: str) -> bool:
 
     A small, conservative scan of POSIX shell quoting: a template it cannot read as safe is refused. It fails
     closed on everything it cannot track rather than mimic the shell's grammar: an escaped `{` (the renderer still
-    replaces `{paths}` after a backslash), a lone `${` (the renderer leaves it as it is), any backtick (the
+    replaces `{paths}` after a backslash), a line continuation anywhere but after a blank (the shell deletes it before
+    it reads tokens), a lone `${` (the renderer leaves it as it is), any backtick (the
     shell ignores quotes when it looks for the closing one), `$'...'`, `$[` and `((` (arithmetic reads its words as
     if double-quoted), `$(` or `${` opened inside `"..."`, an unquoted `#` anywhere but right after a word character
     (a comment, after a blank, an operator or a line continuation, hides quotes from the scan), a `#` or an unquoted
@@ -432,6 +433,11 @@ def unquoted_paths_word(run: str) -> bool:
         if c == "`" or (c == "{" and prev == "$"):
             return False  # a backtick ends whatever quotes say; the renderer leaves a lone `${`, which is not tracked
         if c == "\\":
+            if run.startswith("\n", i + 1):
+                if prev not in ("", " ", "\t", "\n"):
+                    return False  # the shell deletes a line continuation, so it could glue `$(`, `$'`, `${` or `<<`
+                i += 2  # removed text: what follows starts a word, as after the blank before it
+                continue
             if run.startswith("{", i + 1):
                 return False  # the renderer still replaces a `{paths}` after a backslash: never read as escaped
             prev, i = "\\", i + 2  # the escaped character is literal
@@ -1796,7 +1802,8 @@ class _Validator:
         elif not unquoted_paths_word(run):
             self.error(_join(path, "run"), "`{paths}` must be its own unquoted word: not inside quotes, "
                        "`$(...)` or `${...}`, never after a backslash or a here-document, in a template with no "
-                       "backtick, `$'...'`, `$[`, `((` or comment `#`, with its quotes and substitutions balanced, so "
+                       "backtick, `$'...'`, `$[`, `((`, comment `#` or line continuation after anything but a blank, "
+                       "with its quotes and substitutions balanced, so "
                        "each file name stays one inert argument")
         bad = [p for p in affected.paths if not isinstance(p, str) or not p.strip() or posixpath.isabs(p)
                or ".." in p.split("/")]
