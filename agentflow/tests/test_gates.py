@@ -470,6 +470,41 @@ def test_a_template_that_would_not_keep_the_names_inert_runs_the_full_command(tm
     assert not (tmp_git / "pwned").exists()
 
 
+@pytest.mark.parametrize("template", __import__("test_config").HOSTILE_TEMPLATES)
+def test_a_template_with_hostile_quoting_runs_the_full_command(tmp_git, tmp_path, template):
+    """The runtime check refuses what `validate` refuses: no file name runs, whatever the quoting tricks."""
+    name = "x$(touch pwned)y.py"
+    cfg = _affected(tmp_git, [name], affected=Affected(run=template, paths=["**/*.py"]))
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=[name])
+    assert result.tier == "full" and (tmp_git / "out.txt").read_text() == "full\n"
+    assert affected_gate(cfg.gates["t"], [name], tmp_git) is None
+    assert not (tmp_git / "pwned").exists()
+
+
+@pytest.mark.parametrize("template", [
+    "echo {paths}", "ruff check {paths}", "cmd --flag {paths} | tail -n 5", "cmd {paths} && other",
+    "echo $(date) {paths}", "echo \"$HOME\" {paths}",
+])
+def test_an_accepted_template_runs_no_hostile_name(tmp_git, template):
+    import subprocess
+
+    from agentflow.gates import _render_affected
+
+    name = "x$(touch PWNED)y`touch PWNED`;touch PWNED.py"
+    gate = Gate("t", "true", affected=Affected(run=template, paths=["**"]))
+    (tmp_git / name).write_text("x = 1\n", encoding="utf-8")
+    ran = affected_gate(gate, [name], tmp_git)
+    assert ran is not None and ran.run == _render_affected(template, [name])
+    bindir = tmp_git / "bin"
+    bindir.mkdir()
+    for tool in ("ruff", "cmd", "other"):
+        (bindir / tool).write_text("#!/bin/sh\nexit 0\n")
+        (bindir / tool).chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    subprocess.run(["sh", "-c", ran.run], cwd=tmp_git, env=env, capture_output=True, check=False)
+    assert not (tmp_git / "PWNED").exists()
+
+
 def test_a_rendered_command_over_the_byte_limit_runs_the_full_command(tmp_git, tmp_path):
     from agentflow.gates import MAX_AFFECTED_COMMAND_BYTES, MAX_AFFECTED_PATHS
 

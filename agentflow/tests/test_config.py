@@ -1764,6 +1764,41 @@ def test_affected_accepts_a_paths_placeholder_that_is_its_own_unquoted_word(tmp_
     assert ("error", "gates.floor.affected.run") not in errors(issues_for(tmp_cfg, patch))
 
 
+# Each of these let a file name run as shell code (`x$(touch PWNED)y.py`) through a `{paths}` the scanner thought safe.
+HOSTILE_TEMPLATES = [
+    "echo \"$(echo '\"')') {paths} \"",  # `'` is ignored while a `"` is open inside `$(...)`
+    "echo \\{paths} \\'",  # an escaped placeholder is still replaced by the renderer
+    "echo $'\\' {paths} \\'",  # ANSI-C quoting
+    "echo \"$(case x in (x) \" {paths} \";; esac)\"",  # a case-pattern `)` closes `$(` early
+    "echo \"`echo`\" {paths}", "echo \"${{x}}\" {paths}", "echo {paths} '", "echo {paths} \"", "echo {paths} $(echo",
+    "echo $(echo # ') x\n) ' {paths} 'y'", "echo {paths} `echo", "echo $(echo (a)) {paths}", "echo \\{{paths}}",
+    "echo x\\{paths}", "echo {paths} $'a'",
+]
+
+
+@pytest.mark.parametrize("template", HOSTILE_TEMPLATES)
+def test_affected_refuses_a_template_whose_quoting_could_let_a_name_run(tmp_cfg, template):
+    patch = {"gates": {"floor": {"run": "true", "affected": {"run": template, "paths": ["**/*.py"]}}}}
+    assert ("error", "gates.floor.affected.run") in errors(issues_for(tmp_cfg, patch)), template
+
+
+@pytest.mark.parametrize("template", HOSTILE_TEMPLATES)
+def test_the_scanner_refuses_every_hostile_template(template):
+    from agentflow.config import unquoted_paths_word
+
+    assert not unquoted_paths_word(template), template
+
+
+@pytest.mark.parametrize("template", [
+    "pytest {paths}", "ruff check {paths}", "cmd --flag {paths} | tail -n 5", "cmd {paths} && other",
+    "echo $(date) {paths}", "echo \"$HOME\" '{{x}}' {paths}", "pytest -q {paths} 2>&1",
+])
+def test_the_scanner_still_accepts_the_ordinary_templates(template):
+    from agentflow.config import unquoted_paths_word
+
+    assert unquoted_paths_word(template), template
+
+
 def test_gate_tier_needs_gates(tmp_cfg):
     def tier(step_id: str, value):
         def edit(data):
