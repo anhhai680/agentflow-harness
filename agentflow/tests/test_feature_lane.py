@@ -1129,3 +1129,33 @@ def test_task_reviews_carry_the_tree(lane):
     reviews = lane.events(run, "review_result")
     assert len(reviews) == 2
     assert all(e.get("tree") for e in reviews)
+
+
+# --------------------------------------------------------------------------- the affected tier
+
+
+def test_a_fix_step_runs_the_affected_tier(flow_repo):
+    def tiered(data):
+        for phase in ("verify", "review"):
+            for step in data["phases"][phase]["steps"]:
+                if isinstance(step, dict) and step.get("id") == "fix_findings":
+                    step["gate_tier"] = "affected"
+
+    affected = {"run": "true {paths}", "paths": ["**/*.py"]}
+    flow_repo.configure({"gate_sets": {"build": ["ok"], "verify": ["ok"], "setup": []},
+                         "gates": {"ok": {"affected": affected}}}, autopilot=True, edit=tiered)
+    red = {"result": {"status": "done", "summary": "red", "signals": {"test_command": "test -f fixed.txt"}}}
+    flow_repo.script({"build/regression_test": [red],
+                      "build/fix": [{"write": {"fixed.txt": "ok\n"}, "result": DONE_RESULT}],
+                      "review/branch_review": [review(FINDING), review()],
+                      "review/fix_findings": [{"write": {"src/x.py": "x = 2\n"}, "result": DONE_RESULT}]})
+    run = start(flow_repo.cfg, flow_repo.root, "bug", {"task": "đăng nhập lỗi"}, RunOptions(to_phase="review"))
+    assert advance(run, flow_repo.cfg, RunOptions()) == "awaiting_approval"
+    approve(run, "define", by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    fixed = [e for e in flow_repo.events(run, "gate_result") if e["key"] == "review/fix_findings"]
+    assert fixed and all(e.get("tier") == "affected" and e["passed"] for e in fixed)
+    log = Path(fixed[0]["log"]).read_text(encoding="utf-8")
+    assert log.startswith("$ true src/x.py\n")
+    verified = [e for e in flow_repo.events(run, "gate_result") if e["key"] == "verify/verify"]
+    assert verified and all("tier" not in e for e in verified)  # the steps that do not fix things stay full

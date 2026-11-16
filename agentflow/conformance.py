@@ -4,7 +4,8 @@
 and the tree that will be pushed, and returns one finding per obligation. Evidence counts only when it comes after
 the last code change that makes it stale (steps, expectations; see `_staling`) or was made on exactly the final
 tree (gates), or by a gate whose `input_hash` there equals the one on the result (the files it declares as `inputs`
-are the same). Events from older runs
+are the same). An affected-tier result (`tier: "affected"`, passed or skipped) is never gate evidence: it checked
+only the files a fix changed. Events from older runs
 carry no `tree`, so every reader uses `.get` and a missing tree is no evidence.
 
 `audit` is the one impure entry point: `finish` calls it before the push. It snapshots the final tree, runs the
@@ -114,6 +115,7 @@ def _gates(cfg: Config, events: list[dict], set_name: str, final_tree: str,
     for name in names:
         wanted = (hashes or {}).get(name)
         result = _last([e for e in events if e.get("type") == "gate_result" and e.get("gate") == name and final_tree
+                        and e.get("tier") != "affected"  # it checked only the files a fix changed: never the floor
                         and (e.get("tree") == final_tree or (e.get("input_hash") and e.get("input_hash") == wanted))])
         if result is None:
             unmet.append(f"{name}: no result on the final tree")

@@ -12,6 +12,7 @@ import math
 import posixpath
 import re
 import shlex
+import string
 import subprocess
 import unicodedata
 from dataclasses import dataclass, field
@@ -100,6 +101,7 @@ STEP_KEYS = (
     "fix",
     "sync",
     "human_paths",
+    "gate_tier",
 )
 
 
@@ -371,6 +373,18 @@ class Policy:
     disabled: tuple[str, ...] = ()  # engine default ids a layer switched off (and the floor, if nulled), for `validate`
 
 
+GATE_TIERS = ("full", "affected")  # a step's `gate_tier`: the gates' whole commands, or their `affected` ones
+AFFECTED_KEYS = ("run", "paths")
+
+
+@dataclass(frozen=True)
+class Affected:
+    """A gate's `affected` command: `run` takes the changed files its `paths` globs match, as `{paths}`."""
+
+    run: str
+    paths: list[str]
+
+
 @dataclass
 class Gate:
     name: str
@@ -382,6 +396,7 @@ class Gate:
     group: str | None = None  # gates of different groups run at the same time; one group runs in order (`gates.run_gates`)
     resource: str | None = None  # gates that share a resource never run at the same time, within one run
     inputs: list[str] = field(default_factory=list)  # globs of the files the gate reads: its pass holds while none of them changes
+    affected: Affected | None = None  # the command a `gate_tier: affected` step runs instead, on the files it changed
 
 
 @dataclass
@@ -431,6 +446,7 @@ class Step:
     fix: Step | None = None  # a `ci` step: the session that fixes a failed check
     sync: Step | None = None  # a `finish` step: the session that resolves the target branch's conflicts
     human_paths: list[str] = field(default_factory=list)  # a `sync` step: conflicts in these paths are a human's
+    gate_tier: str = "full"  # `affected`: its gates run their `affected` command on the files the step changed
     path: str = ""
 
 
@@ -780,6 +796,7 @@ class _Builder:
             fix=fix,
             sync=sync,
             human_paths=_string_list(raw.get("human_paths", []), _join(path, "human_paths")),
+            gate_tier=raw.get("gate_tier", "full"),  # kept as written: `validate` refuses anything but full or affected
             path=path,
         )
 
@@ -814,12 +831,30 @@ def _gate_inputs(value: Any, path: str) -> list[str]:
     return list(value)
 
 
+def _gate_affected(value: Any, path: str, inputs: list[str]) -> Affected | None:
+    """A gate's `affected: {run, paths}`; `paths` defaults to the gate's `inputs`, else `["**"]` (`validate` checks
+    the template and the globs)."""
+    if value is None:
+        return None
+    here = _join(path, "affected")
+    if not isinstance(value, dict):
+        raise ConfigError(here, "expected a mapping with `run` and `paths`")
+    for key in value:
+        if key not in AFFECTED_KEYS:
+            raise ConfigError(_join(here, str(key)), "unknown key: affected has `run` and `paths`")
+    paths = value.get("paths")
+    if paths is not None and not isinstance(paths, list):
+        raise ConfigError(_join(here, "paths"), "expected a list of globs")
+    return Affected(run=_require(value, "run", here, str), paths=list(paths) if paths is not None else list(inputs or ["**"]))
+
+
 def _build_gates(data: dict) -> dict[str, Gate]:
     out: dict[str, Gate] = {}
     for name, raw in data.items():
         path = f"gates.{name}"
         if not isinstance(raw, dict):
             raise ConfigError(path, "expected a mapping")
+        inputs = _gate_inputs(raw.get("inputs"), path)
         out[name] = Gate(
             name=name,
             run=_require(raw, "run", path, str),
@@ -829,7 +864,8 @@ def _build_gates(data: dict) -> dict[str, Gate]:
             agent_check=_optional(raw, "agent_check", path, bool, False),
             group=_optional(raw, "group", path, str, None),
             resource=_optional(raw, "resource", path, str, None),
-            inputs=_gate_inputs(raw.get("inputs"), path),
+            inputs=inputs,
+            affected=_gate_affected(raw.get("affected"), path, inputs),
         )
     return out
 
@@ -1335,6 +1371,10 @@ class _Validator:
             self.error(_join(p, "on_fail"), f"on_fail must be one of {', '.join(ON_FAIL_VALUES)}")
         if step.gates_first and (step.type != "agent" or not step.gates):
             self.error(_join(p, "gates_first"), "gates_first needs an agent step with `gates`")
+        if not isinstance(step.gate_tier, str) or step.gate_tier not in GATE_TIERS:
+            self.error(_join(p, "gate_tier"), f"gate_tier must be one of {', '.join(GATE_TIERS)}")
+        elif step.gate_tier == "affected" and not step.gates:
+            self.error(_join(p, "gate_tier"), "gate_tier: affected needs a step with `gates`")
         if step.commit not in (True, False, "per_task"):
             self.error(_join(p, "commit"), "commit must be true, false or per_task")
         for lane in step.lanes:
@@ -1627,6 +1667,8 @@ class _Validator:
                 if not gate.inputs or bad:
                     self.error(_join(path, "inputs"), "inputs is a non-empty list of globs, each a relative path "
                                "inside the repository with no `..` part")
+            if gate.affected is not None:
+                self.affected(gate.affected, _join(path, "affected"))
             if gate.baseline is None:
                 continue
             if gate.baseline not in BASELINES:
@@ -1647,6 +1689,24 @@ class _Validator:
             for i, member in enumerate(members):
                 if member not in self.cfg.gates:
                     self.error(f"gate_sets.{name}[{i}]", f"'{member}' is not a defined gate")
+
+    def affected(self, affected: Affected, path: str) -> None:
+        """`affected.run` is a non-empty command whose one placeholder is `{paths}` (`{{` and `}}` are braces);
+        `affected.paths` is a non-empty list of relative globs with no `..` part."""
+        run = affected.run
+        try:
+            fields = [(name, spec, conversion) for _, name, spec, conversion in string.Formatter().parse(run)
+                      if name is not None]
+        except ValueError:
+            fields = None
+        if not run.strip() or fields is None or any(f != ("paths", "", None) for f in fields):
+            self.error(_join(path, "run"), "affected.run is a non-empty command whose only placeholder is `{paths}`; "
+                       "write a literal brace as `{{` or `}}`")
+        bad = [p for p in affected.paths if not isinstance(p, str) or not p.strip() or posixpath.isabs(p)
+               or ".." in p.split("/")]
+        if not affected.paths or bad:
+            self.error(_join(path, "paths"), "affected.paths is a non-empty list of globs, each a relative path "
+                       "inside the repository with no `..` part")
 
     def bug_lane(self) -> None:
         """The bug lane's red/green check runs the regression test only when a Bash allow rule covers it."""

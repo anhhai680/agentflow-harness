@@ -30,6 +30,12 @@ digest and the mode and blob of every file of the tree its globs match, untracke
 never (so a gate that reads an ignored file must not declare `inputs`). A fresh result carries it; a pass whose
 `input_hash` equals the gate's hash on the tree about to be gated stands for it, and `conformance` accepts the same
 pass as evidence on the final tree only when the hash there is equal too.
+
+Tiers: a step with `gate_tier: affected` (the steps that fix things) runs each gate that has an `affected` command on
+the files the step changed (`affected_gate`): its `paths` globs pick them, each is shell-quoted, and a gate with none
+of them is skipped ("no affected paths"). Such a result is written with `tier: "affected"`, and it is never reused
+and never floor evidence: the full set still runs on the final tree. A gate without `affected`, and one that would
+take more than `MAX_AFFECTED_PATHS` paths, runs its whole `run`, as an ordinary full-tier result.
 """
 
 from __future__ import annotations
@@ -39,12 +45,14 @@ import fnmatch
 import hashlib
 import json
 import os
+import posixpath
 import re
+import shlex
 import signal
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -58,6 +66,9 @@ if TYPE_CHECKING:
     from agentflow.state import Run
 
 KILL_WAIT_S = 5
+# Above this many matched paths an `affected` command would risk the argument limit: the gate runs its whole `run`.
+MAX_AFFECTED_PATHS = 200
+_AFFECTED_FIELD = re.compile(r"\{\{|\}\}|\{paths\}")
 
 
 @dataclass
@@ -72,6 +83,7 @@ class GateResult:
     cmd: str = ""  # `command_digest` of what ran; "" for a doc check
     reused_from: str | None = None  # the step key of the earlier pass this result stands for (`run_gates_reusing`)
     input_hash: str | None = None  # `hash_inputs` of the gate's `inputs` on the tree it ran on; None for a gate with none
+    tier: str = "full"  # "affected": its `affected` command ran (or it skipped for no affected path); never evidence
 
 
 def _resolve(cfg: Config, names: str | list[str]) -> list[Gate]:
@@ -228,6 +240,73 @@ def input_hashes(cfg: Config, gates: list[Gate], cwd: Path, tree: str) -> dict[s
     return {g.name: hash_inputs(entries, g.inputs, command_digest(g, env)) for g in declared}
 
 
+def _affected_paths(gate: Gate, changed: Sequence[str], cwd: Path) -> list[str]:
+    """The paths of `changed` that `gate.affected.paths` match and that exist inside the worktree `cwd`, made relative
+    to `gate.cwd` when it has one (the ones outside it are dropped). In order, each once.
+
+    A path is repository file names, so it is untrusted: an empty one, an absolute one, one with a `..` part or a NUL,
+    and one that resolves outside the worktree (through a symlink) are never passed on."""
+    if gate.affected is None:
+        return []
+    root = Path(cwd).resolve()
+    prefix = posixpath.normpath(gate.cwd) if gate.cwd else "."
+    out: list[str] = []
+    for raw in dict.fromkeys(changed):
+        if not isinstance(raw, str) or not raw or "\0" in raw or posixpath.isabs(raw) or ".." in raw.split("/"):
+            continue
+        path = posixpath.normpath(raw)
+        if not any(path_matches(path, pattern) for pattern in gate.affected.paths):
+            continue
+        try:
+            target = root / path
+            if not target.exists() or not target.resolve().is_relative_to(root):
+                continue  # deleted, or a symlink out of the worktree
+        except (OSError, ValueError):
+            continue
+        if prefix != ".":
+            if not path.startswith(f"{prefix}/"):
+                continue
+            path = path[len(prefix) + 1:]
+        out.append(path)
+    return out
+
+
+def _render_affected(template: str, paths: list[str]) -> str:
+    """`template` with `{paths}` replaced by `paths`, each one shell-quoted (and `./`-prefixed when it starts with
+    `-`, so no file name reads as an option), joined by spaces. `{{` and `}}` are literal braces; nothing else is a
+    placeholder, and the replaced text is never read again."""
+    args = " ".join(shlex.quote(f"./{p}" if p.startswith("-") else p) for p in paths)
+    return _AFFECTED_FIELD.sub(lambda m: {"{{": "{", "}}": "}"}.get(m.group(0), args), template)
+
+
+def affected_gate(gate: Gate, changed: Sequence[str], cwd: Path) -> Gate | None:
+    """`gate` with its `affected` command, rendered with the paths of `changed` it takes (`_affected_paths`), as its
+    `run`; None when the gate has no `affected` or no path is left."""
+    paths = _affected_paths(gate, changed, cwd)
+    if gate.affected is None or not paths:
+        return None
+    return replace(gate, run=_render_affected(gate.affected.run, paths))
+
+
+def _tiered(gate: Gate, tier: str, changed: Sequence[str], cwd: Path) -> tuple[Gate | GateResult, str]:
+    """What runs for `gate` at `tier`, and the result's tier: the gate itself at the full tier (no `affected`, the full
+    tier asked, or more than `MAX_AFFECTED_PATHS` paths), a skip when no changed path is the gate's, or its rendered
+    `affected` command."""
+    if tier != "affected" or gate.affected is None:
+        return gate, "full"
+    paths = _affected_paths(gate, changed, cwd)
+    if len(paths) > MAX_AFFECTED_PATHS:
+        return gate, "full"
+    if not paths:
+        return GateResult(gate.name, False, True, "no affected paths", None, "", tier="affected"), "affected"
+    return replace(gate, run=_render_affected(gate.affected.run, paths)), "affected"
+
+
+def deferred_full(events: list[dict]) -> bool:
+    """True when some `gate_result` ran at the affected tier: the full set is still owed on the final tree."""
+    return any(e.get("type") == "gate_result" and e.get("tier") == "affected" for e in events)
+
+
 def _run_one(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min: float,
              env: dict[str, str] | None = None, env_base: Mapping[str, str] | None = None,
              live: _Live | None = None) -> GateResult:
@@ -268,7 +347,8 @@ def _collect(futures: list[Future]) -> None:
 
 
 def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path, *,
-              env_base: Mapping[str, str] | None = None) -> list[GateResult]:
+              env_base: Mapping[str, str] | None = None, tier: str = "full",
+              changed: Sequence[str] = ()) -> list[GateResult]:
     """Run gates (all of them, even after a failure) with `cwd` as the worktree root.
 
     A `str` names a `gate_sets` entry. Each gate's full output goes to `<log_dir>/<gate>.log`
@@ -280,21 +360,29 @@ def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path, *,
     several, each group runs in its own thread (in set order inside it), and a gate with a `resource` holds
     that name's lock while it runs. The results are in set order. Leaving early (an exception, Ctrl-C) kills
     every gate's process group, whichever thread started it.
+
+    At `tier="affected"` a gate with `affected` runs that command on the paths of `changed` it takes (`_tiered`), and
+    its result has `tier="affected"`; a gate without one runs its `run`, at the full tier.
     """
     cwd, log_dir = Path(cwd), Path(log_dir)
     if env_base is None:
         env_base = run_env.base(cfg)
     timeout = cfg.defaults.gate_timeout_min
     gates = _resolve(cfg, names)
+    jobs = [_tiered(g, tier, changed, cwd) for g in gates]
     groups: dict[str | None, list[int]] = {}
     for i, gate in enumerate(gates):
         groups.setdefault(gate.group, []).append(i)
 
-    def run(gate: Gate, live: _Live | None = None) -> GateResult:
-        return _run_one(gate, cwd, log_dir, cfg.context.gate_output_lines, timeout, cfg.defaults.env, env_base, live)
+    def run(i: int, live: _Live | None = None) -> GateResult:
+        job, job_tier = jobs[i]
+        if isinstance(job, GateResult):  # nothing to run at this tier
+            return job
+        result = _run_one(job, cwd, log_dir, cfg.context.gate_output_lines, timeout, cfg.defaults.env, env_base, live)
+        return replace(result, tier=job_tier)
 
     if len(groups) <= 1:  # no `group` anywhere, or all in one: today's plain loop
-        return [run(g) for g in gates]
+        return [run(i) for i in range(len(gates))]
     live = _Live()
     locks = {r: threading.Lock() for r in {g.resource for g in gates if g.resource}}
     results: dict[int, GateResult] = {}
@@ -306,9 +394,9 @@ def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path, *,
             gate = gates[i]
             if gate.resource:
                 with locks[gate.resource]:
-                    results[i] = run(gate, live)
+                    results[i] = run(i, live)
             else:
-                results[i] = run(gate, live)
+                results[i] = run(i, live)
 
     pool = ThreadPoolExecutor(max_workers=len(groups), thread_name_prefix="gates")
     try:
@@ -333,14 +421,15 @@ def reusable_passes(events: list[dict], gates: list[Gate], tree: str | None, dig
     """Gate name -> the latest `gate_result` that passed (not skipped) on exactly `tree` with the digest in `digests`,
     or, for a gate in `hashes` (its input hash on `tree`), whose `input_hash` equals that one, on whatever tree.
 
-    Pure. A gate in `never`, an event with no `tree` or no `cmd` (older runs), a failure and a skip never count."""
+    Pure. A gate in `never`, an event with no `tree` or no `cmd` (older runs), a failure, a skip and an affected-tier
+    result (`tier: "affected"`: it checked only the paths a step changed) never count."""
     if not tree:
         return {}
     wanted = {g.name for g in gates if g.name not in never and g.name in digests}
     hashes = hashes or {}
     found: dict[str, dict] = {}
     for e in events:
-        if e.get("type") != "gate_result" or not e.get("passed") or e.get("skipped"):
+        if e.get("type") != "gate_result" or not e.get("passed") or e.get("skipped") or e.get("tier") == "affected":
             continue
         name = e.get("gate")
         if name not in wanted:
@@ -353,7 +442,7 @@ def reusable_passes(events: list[dict], gates: list[Gate], tree: str | None, dig
 
 
 def run_gates_reusing(cfg: Config, run: Run, key: str, names: str | list[str], cwd: Path, log_dir: Path,
-                      tree: str | None) -> list[GateResult]:
+                      tree: str | None, *, tier: str = "full", changed: Sequence[str] = ()) -> list[GateResult]:
     """`run_gates`, except that a gate with a reusable pass on `tree` (`reusable_passes`) is not run again.
 
     The results keep the gates' order; a reused one is a pass with `reused_from` set, its old log and no tail.
@@ -362,20 +451,25 @@ def run_gates_reusing(cfg: Config, run: Run, key: str, names: str | list[str], c
 
     A gate with `inputs` also reuses a pass from another tree when the files its `inputs` match are the same
     (`input_hashes`): its fresh result carries the `input_hash`, and a pass taken from another tree is told in a
-    `gate_cache_hit` event."""
+    `gate_cache_hit` event.
+
+    `tier` and `changed` go to `run_gates` for the gates not reused. Reuse comes first at either tier, and only a
+    full-tier pass is ever reused; an affected-tier result carries no `input_hash`, so nothing takes it for the
+    gate's whole check."""
     gates = _resolve(cfg, names)
     env = cfg.defaults.env
     digests = {g.name: command_digest(g, env) for g in gates}
     hashes = input_hashes(cfg, gates, cwd, tree) if tree else {}
     reused = reusable_passes(run.events.read(), gates, tree, digests, setup_gate_names(cfg), hashes)
-    fresh = iter(run_gates(cfg, [g.name for g in gates if g.name not in reused], cwd, log_dir)
-                 if len(reused) < len(gates) else [])
+    fresh = iter(run_gates(cfg, [g.name for g in gates if g.name not in reused], cwd, log_dir, tier=tier,
+                           changed=changed) if len(reused) < len(gates) else [])
     results: list[GateResult] = []
     for g in gates:
         e = reused.get(g.name)
         if e is None:
             result = next(fresh)
-            results.append(replace(result, input_hash=hashes[g.name]) if g.name in hashes else result)
+            full = result.tier != "affected"
+            results.append(replace(result, input_hash=hashes[g.name]) if full and g.name in hashes else result)
             continue
         log = Path(e["log"]) if e.get("log") else None
         results.append(GateResult(g.name, True, False, f"reused: passed on this tree in {e.get('key')}", log, "",
@@ -396,7 +490,8 @@ def gates_ok(results: list[GateResult]) -> bool:
 
 def record_results(run: Run, key: str, results: list[GateResult], tree: str, *, with_tail: bool = False) -> None:
     """Write one `gate_result` per result that ran, each stamped with the `tree` (a `guards.snapshot`) the gates ran
-    on, the gate's `cmd` digest and, for a gate with `inputs`, its `input_hash` (a reused result writes none).
+    on, the gate's `cmd` digest and, for a gate with `inputs`, its `input_hash` (a reused result writes none). An
+    affected-tier result also writes `tier: "affected"`; a full one writes no `tier`.
 
     The caller snapshots the worktree before the gates run. `with_tail` adds a `tail` to every event: a failed
     gate's output tail (the fix loop's and the retro's evidence), `""` for a gate that passed or was skipped."""
@@ -409,6 +504,8 @@ def record_results(run: Run, key: str, results: list[GateResult], tree: str, *, 
             data["cmd"] = r.cmd
         if r.input_hash is not None:
             data["input_hash"] = r.input_hash
+        if r.tier == "affected":  # written only for these: a result with no `tier` is a full one, as it always was
+            data["tier"] = "affected"
         if with_tail:  # "" for a gate that passed or was skipped
             data["tail"] = "" if (r.passed or r.skipped) else r.tail
         run.emit("gate_result", **data)

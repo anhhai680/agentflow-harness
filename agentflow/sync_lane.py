@@ -44,7 +44,7 @@ from agentflow.gitops import (
     push,
     unmerged_paths,
 )
-from agentflow.guards import path_matches, snapshot
+from agentflow.guards import changed_paths, path_matches, snapshot
 from agentflow.hitl import ResultError, raise_hitl, read_result
 
 if TYPE_CHECKING:
@@ -177,7 +177,7 @@ class SyncLane:
             eval_needed, _ = self.decide(phase, "eval_required", f"{key}.eval_required")
             if eval_needed is None:
                 return "stopped"
-        results = self._run_merge_gates(key, names, with_eval=bool(eval_needed))
+        results = self._run_merge_gates(key, names, with_eval=bool(eval_needed), tier=sync.gate_tier)
         if gates_ok(results):
             return "done"
         failed = [r for r in results if not (r.passed or r.skipped)]
@@ -203,12 +203,16 @@ class SyncLane:
                 return "stopped"
         return "done"
 
-    def _run_merge_gates(self, key: str, names: list[str], with_eval: bool) -> list[GateResult]:
+    def _run_merge_gates(self, key: str, names: list[str], with_eval: bool, tier: str = "full") -> list[GateResult]:
+        """The `sync` gates on the merged, uncommitted tree, at `tier` (the `sync` step's `gate_tier`): an affected
+        run takes the paths the merge changed against `HEAD`, the branch before the merge. The eval gate runs in full."""
         results: list[GateResult] = []
         tree = snapshot(self.worktree)
         if names:
+            changed = changed_paths(self.worktree, "HEAD", tree) if tier == "affected" else []
             results += run_gates_reusing(self.cfg, self.run, key, names if len(names) > 1 else names[0],
-                                         self.worktree, self.run.gate_log_dir(key), tree)
+                                         self.worktree, self.run.gate_log_dir(key), tree,
+                                         tier="affected" if tier == "affected" else "full", changed=changed)
         if with_eval:
             results += run_gates_reusing(self.cfg, self.run, key, ["eval"], self.worktree, self.run.gate_log_dir(key),
                                          tree)

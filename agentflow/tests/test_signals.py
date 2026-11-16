@@ -315,6 +315,15 @@ def test_full_suite_runs_counts_each_batch_on_the_same_step():
     assert run_signals(evs, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 2
 
 
+def test_an_affected_batch_is_not_a_full_suite_run():
+    affected = [{**_gate("review/fix_findings", g, True), "tier": "affected"} for g in VERIFY]
+    assert run_signals(affected, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 0
+    mixed = [_gate("ship/ci/fix-1", "lint", True), {**_gate("ship/ci/fix-1", "unit", True), "tier": "affected"}]
+    assert run_signals(mixed, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 0
+    full = [_gate("verify/verify", g, True) for g in VERIFY]
+    assert run_signals(affected + full, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 1
+
+
 def test_full_suite_runs_reads_old_gate_results():
     old = [{"seq": 1, "type": "gate_result", "key": "verify/verify", "gate": g, "passed": True} for g in VERIFY]
     assert run_signals(old, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 1

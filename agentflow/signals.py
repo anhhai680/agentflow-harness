@@ -199,7 +199,8 @@ def _lead_time(events: list[dict]) -> dict[str, float]:
 
 def _full_suite_runs(events: list[dict], full_suite: Collection[str]) -> int:
     """How many batches ran every gate of `full_suite`. A batch is a maximal run of consecutive `gate_result` events
-    with the same `key`; passed, failed and skipped results all count, since every gate runs even after a failure."""
+    with the same `key`; passed, failed and skipped results all count, since every gate runs even after a failure.
+    An affected-tier result (`tier: "affected"`) is no part of a batch."""
     need = set(full_suite)
     runs = 0
     batch: set[str] = set()
@@ -210,6 +211,8 @@ def _full_suite_runs(events: list[dict], full_suite: Collection[str]) -> int:
         return int(in_batch and need <= batch)
 
     for ev in events:
+        if ev.get("type") == "gate_result" and ev.get("tier") == "affected":
+            continue  # it ran only the files a fix changed: never part of a full run
         if ev.get("type") == "gate_result" and ev.get("gate"):
             if in_batch and ev.get("key") != batch_key:
                 runs += close()

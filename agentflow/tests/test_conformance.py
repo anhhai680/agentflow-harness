@@ -108,6 +108,21 @@ def test_a_failed_pass_with_a_matching_input_hash_is_not_evidence(cfg):
     assert finding.status == "missing"
 
 
+def test_an_affected_result_is_never_floor_evidence(cfg):
+    floor = ob(FLOOR_ID, "gates:verify")
+    hashes = {g: "h" for g in cfg.gate_sets["verify"]}
+    passed = gates(1, cfg, "t1", tier="affected", input_hash="h")
+    skipped = [{**e, "passed": False, "skipped": True, "reason": "no affected paths"}
+               for e in gates(50, cfg, "t1", tier="affected")]
+    for events in (passed, skipped, passed + skipped):
+        finding = evaluate(cfg, events, [floor], "t1", input_hashes=hashes)[0]
+        assert finding.status == "missing" and "no result on the final tree" in finding.note
+    assert set(missing_gates(cfg, evaluate(cfg, skipped, [floor], "t1"))) == set(cfg.gate_sets["verify"])
+    full = gates(100, cfg, "t1")  # a full-tier result, before or after, still counts
+    assert evaluate(cfg, full + passed, [floor], "t1")[0].status == "satisfied"
+    assert evaluate(cfg, skipped + full, [floor], "t1")[0].evidence == [e["seq"] for e in full]
+
+
 # --------------------------------------------------------------------------- steps
 
 

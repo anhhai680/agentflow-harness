@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from agentflow.config import Gate, load_config
-from agentflow.gates import (GateResult, command_digest, gates_ok, hash_inputs, input_hashes, record_results,
-                             reusable_passes, run_gates, run_gates_reusing, summarize)
+from agentflow.config import Affected, Gate, load_config
+from agentflow.gates import (GateResult, affected_gate, command_digest, deferred_full, gates_ok, hash_inputs,
+                             input_hashes, record_results, reusable_passes, run_gates, run_gates_reusing, summarize)
 from agentflow.guards import snapshot
 from conftest import PYTHON_CONFIG
 
@@ -404,3 +404,147 @@ def test_a_gate_cache_hit_needs_its_key_gate_and_input_hash(run):
         with pytest.raises(EventError, match=missing):
             run.emit("gate_cache_hit", **fields)
     run.emit("gate_cache_hit", key="build/two", gate="api", input_hash="h", **{"from": "build/one"})
+
+
+# --------------------------------------------------------------------------- the affected tier
+
+
+AFFECTED = Affected(run="printf '%s\\n' {paths} > out.txt", paths=["**/*.py"])
+
+
+def _affected(tmp_git, files: list[str], **gate_kw):
+    for rel in files:
+        target = tmp_git / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x = 1\n", encoding="utf-8")
+    gate_kw.setdefault("affected", AFFECTED)
+    return cfg_with({"t": Gate("t", gate_kw.pop("run", "echo full > out.txt"), **gate_kw)})
+
+
+def test_affected_runs_the_template_with_the_changed_python_paths(tmp_git, tmp_path):
+    changed = ["a.py", "src/x.py", "docs/y.md"]
+    cfg = _affected(tmp_git, changed)
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=changed)
+    assert (tmp_git / "out.txt").read_text() == "a.py\nsrc/x.py\n"
+    assert result.passed and result.tier == "affected"
+    assert result.log_path.read_text().startswith("$ printf '%s\\n' a.py src/x.py > out.txt")
+
+
+def test_changed_paths_are_quoted_and_dash_safe(tmp_git, tmp_path):
+    changed = ["$(touch pwned).py", "a b.py", "-rf.py"]
+    cfg = _affected(tmp_git, changed)
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=changed)
+    assert result.passed and result.tier == "affected"
+    assert sorted((tmp_git / "out.txt").read_text().splitlines()) == sorted(["$(touch pwned).py", "a b.py", "./-rf.py"])
+    assert not (tmp_git / "pwned").exists()
+
+
+def test_hostile_names_reach_the_command_as_one_inert_argument_each(tmp_git, tmp_path):
+    changed = ["it's.py", "new\nline.py", "*.py", "`touch pwned2`.py", "a;touch pwned3.py", "{paths}.py", "--x.py",
+               "q\"uote.py", "back\\slash.py", "$HOME.py"]
+    affected = Affected(run="printf '%s\\0' {paths} > out.bin", paths=["**/*.py"])
+    cfg = _affected(tmp_git, changed, affected=affected)
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=changed)
+    assert result.passed
+    got = (tmp_git / "out.bin").read_bytes().decode().split("\0")[:-1]
+    assert sorted(got) == sorted(["./--x.py" if p == "--x.py" else p for p in changed])
+    assert not list(tmp_git.glob("pwned*"))
+
+
+def test_names_outside_the_worktree_are_never_passed(tmp_git, tmp_path):
+    (tmp_path / "outside.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_git / "link.py").symlink_to(tmp_path / "outside.py")  # a symlink out of the worktree
+    gate = Gate("t", "true", affected=Affected(run="echo {paths}", paths=["**"]))
+    for changed in (["../outside.py"], [str(tmp_path / "outside.py")], ["link.py"], ["src/../../outside.py"], [""]):
+        assert affected_gate(gate, changed, tmp_git) is None, changed
+    inside = affected_gate(gate, ["src/app.py", "link.py"], tmp_git)
+    assert inside is not None and inside.run == "echo src/app.py"
+
+
+def test_double_braces_are_literal_and_only_paths_is_replaced(tmp_git):
+    gate = Gate("t", "true", affected=Affected(run="echo {{x}} {paths} {other} ${{HOME}}", paths=["**"]))
+    assert affected_gate(gate, ["src/app.py"], tmp_git).run == "echo {x} src/app.py {other} ${HOME}"
+
+
+def test_a_deleted_path_is_not_passed(tmp_git, tmp_path):
+    cfg = _affected(tmp_git, ["a.py"])
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=["a.py", "gone.py"])
+    assert (tmp_git / "out.txt").read_text() == "a.py\n" and result.tier == "affected"
+
+
+def test_no_matching_path_skips_at_the_affected_tier(tmp_git, tmp_path):
+    cfg = _affected(tmp_git, ["docs/y.md"])
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=["docs/y.md"])
+    assert result.skipped and not result.passed
+    assert (result.reason, result.tier) == ("no affected paths", "affected")
+    assert not (tmp_git / "out.txt").exists()
+
+
+def test_a_gate_without_affected_runs_its_full_command_at_the_affected_tier(tmp_git, tmp_path):
+    cfg = _affected(tmp_git, ["a.py"], affected=None)
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=["a.py"])
+    assert (tmp_git / "out.txt").read_text() == "full\n" and result.tier == "full"
+
+
+def test_the_full_tier_runs_the_full_command(tmp_git, tmp_path):
+    cfg = _affected(tmp_git, ["a.py"])
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", changed=["a.py"])
+    assert (tmp_git / "out.txt").read_text() == "full\n" and result.tier == "full"
+
+
+def test_too_many_paths_run_the_full_command(tmp_git, tmp_path):
+    from agentflow.gates import MAX_AFFECTED_PATHS
+
+    assert MAX_AFFECTED_PATHS == 200
+    many = [f"m/t{i:03}.py" for i in range(MAX_AFFECTED_PATHS + 1)]
+    cfg = _affected(tmp_git, many)
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=many)
+    assert (tmp_git / "out.txt").read_text() == "full\n"
+    assert result.passed and result.tier == "full"
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=many[:MAX_AFFECTED_PATHS])
+    assert len((tmp_git / "out.txt").read_text().splitlines()) == MAX_AFFECTED_PATHS and result.tier == "affected"
+
+
+def test_paths_are_relative_to_the_gates_cwd(tmp_git, tmp_path):
+    cfg = _affected(tmp_git, ["api/a.py", "web/b.py"], cwd="api")
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=["api/a.py", "web/b.py"])
+    assert (tmp_git / "api" / "out.txt").read_text() == "a.py\n" and result.tier == "affected"
+    (result,) = run_gates(cfg, ["t"], tmp_git, tmp_path / "logs", tier="affected", changed=["web/b.py"])
+    assert result.skipped and result.reason == "no affected paths"
+
+
+def test_record_results_marks_only_affected_results(run):
+    full = GateResult("a", True, False, "", None, "")
+    affected = GateResult("b", True, False, "", None, "", tier="affected")
+    record_results(run, "review/fix_findings", [full, affected], "T")
+    events = [e for e in run.events.read() if e["type"] == "gate_result"]
+    assert "tier" not in events[0] and events[1]["tier"] == "affected"
+    assert deferred_full(run.events.read()) is True
+    assert deferred_full(events[:1]) is False
+
+
+def test_an_affected_pass_is_never_reused(run, tmp_git, tmp_path):
+    cfg = _affected(tmp_git, ["a.py"], inputs=["**/*.py"])
+    tree = snapshot(tmp_git)
+    first = run_gates_reusing(cfg, run, "review/fix_findings", ["t"], tmp_git, tmp_path / "logs", tree,
+                              tier="affected", changed=["a.py"])
+    record_results(run, "review/fix_findings", first, tree)
+    assert first[0].passed and first[0].tier == "affected" and first[0].input_hash is None
+    (tmp_git / "out.txt").unlink()
+    again = run_gates_reusing(cfg, run, "verify/verify", ["t"], tmp_git, tmp_path / "logs", tree)
+    assert again[0].reused_from is None and again[0].tier == "full"
+    assert (tmp_git / "out.txt").read_text() == "full\n"
+    events = run.events.read()
+    stamped = [{**e, "input_hash": "h"} for e in events if e["type"] == "gate_result"]  # even one that says it matches
+    assert reusable_passes(stamped, [cfg.gates["t"]], tree, {"t": first[0].cmd}, hashes={"t": "h"}) == {}
+    assert not [e for e in events if e["type"] in ("gates_reused", "gate_cache_hit")]
+
+
+def test_a_full_pass_is_reused_at_the_affected_tier(run, tmp_git, tmp_path):
+    cfg = _affected(tmp_git, ["a.py"])
+    tree = snapshot(tmp_git)
+    first = run_gates_reusing(cfg, run, "verify/verify", ["t"], tmp_git, tmp_path / "logs", tree)
+    record_results(run, "verify/verify", first, tree)
+    (again,) = run_gates_reusing(cfg, run, "review/fix_findings", ["t"], tmp_git, tmp_path / "logs", tree,
+                                 tier="affected", changed=["a.py"])
+    assert again.reused_from == "verify/verify" and again.tier == "full"

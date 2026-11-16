@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agentflow.config import load_config, validate
+from agentflow.config import FLOOR_ID, load_config, validate
 from agentflow.gitops import merge_in_progress
 from agentflow.hitl import approve
 from agentflow.pipeline import RunOptions, advance, start
@@ -233,6 +233,30 @@ def test_a_merge_the_gates_never_accept_is_not_committed_or_pushed(flow_repo, gh
     assert run.state["waiting"]["kind"] != "ci_failed"
     assert merge_in_progress(Path(run.state["worktree"]))
     assert not pushed(git, flow_repo, run) and not verbs(gh, "create") and not flow_repo.events(run, "base_synced")
+
+
+def test_an_affected_sync_checks_the_paths_the_merge_brings_and_the_audit_still_runs_in_full(flow_repo, gh, git):
+    def tiered(data):
+        finish = next(s for s in data["phases"]["ship"]["steps"] if s.get("id") == "finish")
+        finish["sync"]["gate_tier"] = "affected"
+
+    flow_repo.configure({**BASE, "conditions": {"eval_required": None},
+                         "gates": {"ok": {"affected": {"run": "printf '%s\\n' {paths} >> ../merge-paths.txt",
+                                                       "paths": ["**/*.py"]}}}}, edit=tiered)
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="ship"))
+    own_work(flow_repo, run, {"mine.py": "mine = 1\n"})
+    target_moves(flow_repo, git, {"upstream.py": "theirs = 1\n", "notes.txt": "n\n"})
+    assert go(flow_repo, run) == "done"
+    results = [e for e in flow_repo.events(run, "gate_result") if e["gate"] == "ok"]
+    merge = [e for e in results if e.get("tier") == "affected"]
+    assert len(merge) == 1 and merge[0]["passed"]
+    seen = Path(run.state["worktree"]).parent / "merge-paths.txt"  # beside the worktree, so the merge stays clean
+    assert seen.read_text(encoding="utf-8") == "upstream.py\n"  # what the merge brings, not the branch's own mine.py
+    (checked,) = flow_repo.events(run, "conformance_checked")
+    full = [e for e in results if "tier" not in e and e.get("tree") == checked["tree"]]
+    assert full, "the audit ran the verify gate in full on the final tree"
+    floor = next(o for o in checked["obligations"] if o["id"] == FLOOR_ID)  # a ship-only run lacks the others
+    assert floor["status"] == "satisfied" and set(floor["evidence"]) == {e["seq"] for e in full}
 
 
 def test_a_pack_without_an_eval_condition_checks_the_merge_without_the_eval_gate(flow_repo, gh, git):

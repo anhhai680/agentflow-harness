@@ -11,6 +11,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 - `gates.<name>.group` and `gates.<name>.resource`: gates of different groups run at the same time (each group in set order), and gates that share a resource never overlap within a run. Gates with no group run in order as before, and leaving early kills every group's processes.
 - `gates.<name>.inputs`: a gate that passed in the run is not run again while none of the files its globs match has changed, even on another tree, and `conformance` accepts that pass as floor evidence on the final tree only when the gate's input hash there is equal. New `gate_cache_hit` event, `gate_result.input_hash`, and the `gate_cache_hit_rate` signal. Without `inputs`, nothing changes.
+- `gates.<name>.affected` and `phases.<name>.steps[].gate_tier`: a step at `gate_tier: affected` runs each gate's `affected` command (`{run, paths}`) on the files it changed, each name shell-quoted, and skips a gate none of them matches; above 200 paths the gate runs in full. The engine defaults put `review/fix_findings`, `ship/finish.sync` and `ship/ci.fix` at that tier. Such a result carries `gate_result.tier: "affected"` and is never reused, never floor evidence and never a full-suite run, so the full `verify` set still runs on the final tree. Without `affected`, nothing changes.
 
 ## [2.8] - 2026-11-16
 

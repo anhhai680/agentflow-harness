@@ -1037,3 +1037,17 @@ def test_gate_inputs_are_protected(shipped):
     with pytest.raises(Refused, match="protected"):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(old, 'floor:        {run: "true", inputs: ["api/**"]}', 1),
                             repo=REPO)
+
+
+def test_gate_affected_and_gate_tier_are_protected(shipped):
+    _, sha = config_edit.read(shipped)
+    old = 'floor:        {run: "true"}'
+    assert old in SHIPPED
+    affected = 'floor:        {run: "true", affected: {run: "true {paths}", paths: ["**/*.py"]}}'
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=SHIPPED.replace(old, affected, 1), repo=REPO)
+    step = 'when: refine_round, gates: verify, fix_loop: true, commit: true, message: "Fix findings"}'
+    assert SHIPPED.count(step) == 1
+    tiered = step.replace("gates: verify,", "gates: verify, gate_tier: affected,")
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=SHIPPED.replace(step, tiered, 1), repo=REPO)

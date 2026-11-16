@@ -1701,3 +1701,61 @@ def test_a_verify_gate_without_inputs_warns_only_once_a_pack_uses_inputs(tmp_cfg
     assert all(w[1] == f"`{w[0].split('.', 1)[1]}` has no `inputs`, so it runs again after every change" for w in found)
     both = {"gates": {name: {"inputs": ["api/**"]} for name in verify}}
     assert inputs_warnings(both) == []
+
+
+# --------------------------------------------------------------------------- the affected tier
+
+
+def test_affected_allows_only_the_paths_placeholder(tmp_cfg):
+    def affected(value):
+        return {"gates": {"floor": {"run": "true", "affected": value}}}
+
+    cfg = load_config(tmp_cfg(affected({"run": "pytest {paths}", "paths": ["tests/**/test_*.py"]})))
+    assert (cfg.gates["floor"].affected.run, cfg.gates["floor"].affected.paths) == ("pytest {paths}", ["tests/**/test_*.py"])
+    assert load_config(tmp_cfg()).gates["floor"].affected is None
+    assert load_config(tmp_cfg(affected({"run": "pytest {paths}"}))).gates["floor"].affected.paths == ["**"]
+    with_inputs = {"gates": {"floor": {"run": "true", "inputs": ["api/**"], "affected": {"run": "pytest {paths}"}}}}
+    assert load_config(tmp_cfg(with_inputs)).gates["floor"].affected.paths == ["api/**"]
+    for good in ("pytest {paths}", "pytest", "echo {{x}} ${{HOME}} {paths} {paths}"):
+        found = errors(issues_for(tmp_cfg, affected({"run": good, "paths": ["**/*.py"]})))
+        assert ("error", "gates.floor.affected.run") not in found, good
+    for bad in ("", "  ", "pytest {changed}", "pytest {}", "pytest {paths!r}", "pytest {paths:>3}", "pytest {0}",
+                "pytest {paths.x}", "pytest { paths}", "echo ${HOME}", "pytest {paths", "pytest }"):
+        found = errors(issues_for(tmp_cfg, affected({"run": bad, "paths": ["**/*.py"]})))
+        assert ("error", "gates.floor.affected.run") in found, bad
+    for bad in ([], [""], ["/abs/**"], ["../up/**"], ["a/../b"], ["ok", 3]):
+        found = errors(issues_for(tmp_cfg, affected({"run": "pytest {paths}", "paths": bad})))
+        assert ("error", "gates.floor.affected.paths") in found, bad
+    for bad in ("pytest {paths}", {"paths": ["**"]}, {"run": 3}, {"run": "x", "paths": "**"}, {"run": "x", "other": 1}):
+        with pytest.raises(ConfigError, match="gates.floor.affected"):
+            load_config(tmp_cfg(affected(bad)))
+
+
+def test_gate_tier_needs_gates(tmp_cfg):
+    def tier(step_id: str, value):
+        def edit(data):
+            phase_step(data, "verify", step_id)["gate_tier"] = value
+        return edit
+
+    cfg = load_config(tmp_cfg(tier("fix_findings", "affected")))
+    assert phase_step_of(cfg, "verify", "fix_findings").gate_tier == "affected"
+    assert phase_step_of(load_config(tmp_cfg()), "verify", "fix_findings").gate_tier == "full"
+    assert not [e for e in errors(issues_for(tmp_cfg, tier("fix_findings", "affected"))) if e[1].endswith(".gate_tier")]
+    assert not [e for e in errors(issues_for(tmp_cfg, tier("plan_fixes", "full"))) if e[1].endswith(".gate_tier")]
+    found = [i for i in issues_for(tmp_cfg, tier("plan_fixes", "affected")) if i.path.endswith(".gate_tier")]
+    assert found and all(i.level == "error" and "needs a step with `gates`" in i.message for i in found)  # each use of the anchor
+    for bad in ("fast", "", 1, True):
+        assert [e for e in errors(issues_for(tmp_cfg, tier("fix_findings", bad))) if e[1].endswith(".gate_tier")], bad
+
+
+def phase_step_of(cfg, phase: str, step_id: str):
+    return next(s for s in cfg.phases[phase].steps if s.id == step_id)
+
+
+def test_the_engine_defaults_mark_the_fix_steps_affected(sparse_repo):
+    cfg = _sparse_config(sparse_repo)
+    assert phase_step_of(cfg, "review", "fix_findings").gate_tier == "affected"
+    assert phase_step_of(cfg, "ship", "finish").sync.gate_tier == "affected"
+    assert phase_step_of(cfg, "ship", "ci").fix.gate_tier == "affected"
+    assert phase_step_of(cfg, "verify", "verify").gate_tier == "full"
+    assert phase_step_of(cfg, "build", "fix").gate_tier == "full"
