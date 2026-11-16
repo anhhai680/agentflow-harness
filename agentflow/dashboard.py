@@ -14,6 +14,9 @@ Routes:
   and after the runs that carried it); `GET /api/events` (SSE: every run's new events, runs created
   later included; with `?quiet=1` each `agent_turn` becomes an `agent_activity` message, at most one every
   `QUIET_EVERY_S` per run session, and a newer one replaces a waiting one, so the last turn is never lost).
+- `GET /api/runs/<id>/artifacts`, `/artifact?path=&sha=` (`sha` a revision of `path` or `head`),
+  `/artifact/diff?path=&from=&to=` and `/findings`: the run's spec, plan and other committed files, read from git
+  and capped at `dashboard.artifact_max_kb`; a path outside the run's artifact list is a 404.
 - `POST /api/runs/<id>/{approve,reject,answer,pause,resume,done,cancel,retry}` with a JSON body. Each action
   calls the same function as the CLI with `by="dashboard"`; reject, a complete answer, resume, done, retry and
   an approval inside a phase then start `flow.py resume <id>` detached (D13), unless a runner already holds
@@ -67,6 +70,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from agentflow import backlog, config_edit, hitl, module_queue, pack, preflight
+from agentflow.artifacts import (
+    NotFound,
+    artifact_diff,
+    artifact_max_bytes,
+    read_artifact,
+    run_artifacts,
+    run_findings,
+)
 from agentflow.config import Config, ConfigError, _finite, for_lane, load_config
 from agentflow.events import EventError, lock_state
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
@@ -86,6 +97,7 @@ MIN_TOKEN_CHARS = 22  # 128 bits of token_urlsafe
 RUN_ID = re.compile(r"^[0-9]{8}-[0-9]{4}-[a-z0-9]+(?:-[a-z0-9]+)*$")
 RUN_ID_MAX = 120
 RUN_ROUTE = re.compile(r"^/api/runs/([^/]+)$")
+ARTIFACT_ROUTE = re.compile(r"^/api/runs/([^/]+)/(artifacts|artifact|artifact/diff|findings)$")
 ACTION_ROUTE = re.compile(r"^/api/runs/([^/]+)/([a-z]+)$")
 TEXT_MAX = backlog.TEXT_MAX
 BACKLOG_ROUTES = ("/api/backlog", "/api/backlog/start", "/api/backlog/remove")
@@ -454,6 +466,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._scorecard(query)
         elif path == "/api/lessons":
             self._json(200, lessons_view(self.server.repo, self.server.cfg))
+        elif match := ARTIFACT_ROUTE.match(path):
+            self._artifact_get(match.group(1), match.group(2), query)
         elif match := RUN_ROUTE.match(path):
             run = self._run(match.group(1))
             if run is None:
@@ -462,6 +476,36 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, run_detail(run, self.server.cfg, raw=(query.get("raw") or [""])[0] == "1"))
         else:
             self._error(404, "not found")
+
+    def _artifact_get(self, run_id: str, what: str, query: dict) -> None:
+        """The artifact routes (see the module docstring): everything a browser names is checked against git's own
+        record of the run, never the filesystem."""
+        run = self._run(run_id)
+        if run is None:
+            self._error(404, "no such run")
+            return
+        wanted = {"artifact": ("path", "sha"), "artifact/diff": ("path", "from", "to")}.get(what, ())
+        args = []
+        for name in wanted:
+            values = query.get(name) or []
+            if len(values) != 1:
+                self._error(400, f"send exactly one {name}")
+                return
+            args.append(values[0])
+        repo, cfg = self.server.repo, self.server.cfg
+        try:
+            if what == "artifacts":
+                result: Any = run_artifacts(run, repo)
+            elif what == "findings":
+                result = run_findings(run)
+            elif what == "artifact":
+                result = read_artifact(run, repo, *args, artifact_max_bytes(cfg))
+            else:
+                result = artifact_diff(run, repo, *args, artifact_max_bytes(cfg))
+        except NotFound as exc:
+            self._error(404, str(exc))
+            return
+        self._json(200, result)
 
     def _metrics(self, query: dict) -> None:
         lane = (query.get("lane") or [None])[0] or None

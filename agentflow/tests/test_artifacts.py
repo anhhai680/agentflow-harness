@@ -5,7 +5,15 @@ from __future__ import annotations
 import pytest
 from conftest import run_git
 
-from agentflow.artifacts import NotFound, artifact_diff, artifact_max_bytes, artifact_tabs, read_artifact, run_artifacts
+from agentflow.artifacts import (
+    NotFound,
+    artifact_diff,
+    artifact_max_bytes,
+    artifact_tabs,
+    read_artifact,
+    run_artifacts,
+    run_findings,
+)
 
 
 def test_artifacts_list_each_revision_by_phase(spec_run):
@@ -247,3 +255,40 @@ def test_an_event_log_that_cannot_be_read_lists_nothing_and_reads_not_found(spec
         artifact_diff(spec_run.run, spec_run.repo, "docs/specs/x.md", newest, "head", 512 * 1024)
     monkeypatch.undo()
     assert run_artifacts(spec_run.run, spec_run.repo) != []  # the failed read was not cached
+
+
+def test_findings_come_by_step_and_round_with_the_newest_open(flow_repo):
+    run = flow_repo.new_run()
+    run.emit("step_findings", key="define/spec_review", tree="", findings=[
+        {"severity": "HIGH", "file": "docs/specs/x.md", "line": "34-40", "text": "Scope 3 contradicts the code"}])
+    run.emit("step_findings", key="define/spec_review", tree="", findings=[
+        {"severity": "medium", "file": "docs/specs/x.md", "line": 65, "title": "Locks", "detail": "after row locks"},
+        {"severity": "low", "file": "docs/specs/x.md", "line": "L0"}, {"text": "no file"}])
+    rows = run_findings(run)
+    assert [(r["round"], r["open"]) for r in rows] == [(1, False), (2, True)]
+    assert rows[0]["findings"][0] == {"severity": "high", "file": "docs/specs/x.md", "line": 34,
+                                      "text": "Scope 3 contradicts the code"}
+    assert [f["line"] for f in rows[1]["findings"]] == [65, None, None]
+    assert rows[1]["findings"][0]["text"] == "Locks after row locks"
+    assert rows[1]["label"] and rows[1]["key"] == "define/spec_review" and rows[1]["ts"]
+
+
+def test_findings_line_and_severity_are_cleaned(flow_repo):
+    run = flow_repo.new_run()
+    run.emit("step_findings", key="define/spec_review", tree="", findings=[
+        {"line": "L34", "severity": 3}, {"line": 0}, {"line": -2}, {"line": True}, {"line": "x"}, {"line": 7.5},
+        "a bare string"])
+    (row,) = run_findings(run)
+    assert [f["line"] for f in row["findings"]] == [34, None, None, None, None, None, None]
+    assert [f["severity"] for f in row["findings"]] == [None] * 7
+    assert row["findings"][-1]["text"] == "a bare string"
+
+
+def test_findings_keep_review_results_apart_by_key(flow_repo):
+    run = flow_repo.new_run()
+    run.emit("step_findings", key="define/spec_review", tree="", findings=[{"text": "a"}])
+    run.emit("review_result", key="build/task_1/review", round=2, findings=[{"text": "b"}], blocking=0)
+    run.emit("review_result", key="build/task_1/review", round=3, findings=[], blocking=0)
+    rows = run_findings(run)
+    assert [(r["key"], r["round"], r["open"]) for r in rows] == [
+        ("define/spec_review", 1, True), ("build/task_1/review", 2, False), ("build/task_1/review", 3, True)]

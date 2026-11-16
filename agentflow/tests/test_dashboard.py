@@ -1771,3 +1771,64 @@ def test_the_page_shows_the_retro_banner_from_safe_text_only():
     source = page_source()
     assert 'id="retro-due"' in source and "data.retro_due" in source and '"agentflow retro"' in source
     assert "innerHTML" not in source
+
+
+def test_the_spec_routes_read_through_the_artifact_list(dash, spec_run):
+    rid = spec_run.run.id
+    listed = payload(dash.get(f"/api/runs/{rid}/artifacts")[2])
+    spec = next(a for a in listed if a["path"] == "docs/specs/x.md")
+    r1, r2 = spec["revisions"][0]["sha"], spec["revisions"][1]["sha"]
+    got = payload(dash.get(f"/api/runs/{rid}/artifact?path=docs/specs/x.md&sha={r2}")[2])
+    assert got["sha"] == r2 and got["lines"] > 0
+    diff = payload(dash.get(f"/api/runs/{rid}/artifact/diff?path=docs/specs/x.md&from={r1}&to={r2}")[2])
+    assert "+Scope 3 says another" in diff["diff"]
+    assert payload(dash.get(f"/api/runs/{rid}/findings")[2]) == []
+
+
+def test_head_reads_the_branch_tip_after_a_new_commit(dash, spec_run):
+    rid = spec_run.run.id
+    path = f"/api/runs/{rid}/artifact?path=docs/specs/x.md&sha=head"
+    before = payload(dash.get(path)[2])["sha"]
+    new = spec_run.commit("define/spec_reconcile", write={"docs/specs/x.md": "# X\n\nlater\n"})
+    after = payload(dash.get(path)[2])
+    assert before != new and after["sha"] == new
+
+
+@pytest.mark.parametrize("query", ["path=..%2F..%2Fstate.json&sha=head", "path=README.md&sha=head",
+                                   "path=docs%2Fspecs%2Fx.md&sha=" + "0" * 40])
+def test_the_artifact_route_refuses_what_is_not_listed(dash, spec_run, query):
+    assert dash.get(f"/api/runs/{spec_run.run.id}/artifact?{query}")[0] == 404
+
+
+@pytest.mark.parametrize("route", ["artifacts", "artifact?path=docs%2Fspecs%2Fx.md&sha=head",
+                                   "artifact/diff?path=docs%2Fspecs%2Fx.md&from=head&to=head", "findings"])
+def test_the_artifact_routes_keep_the_refusal_matrix(dash, spec_run, route):
+    rid = spec_run.run.id
+    assert dash.get(f"/api/runs/{rid}/{route}", token=None)[0] == 403
+    assert dash.get(f"/api/runs/{rid}/{route}", headers={"Host": "evil.example"})[0] == 403
+    assert dash.get(f"/api/runs/{rid}/{route}", headers={"Origin": "http://evil.example"})[0] == 403
+    assert dash.get(f"/api/runs/20261030-0000-feature-nope/{route}")[0] == 404
+    assert dash.post(f"/api/runs/{rid}/{route}")[0] == 404
+    link = runs_root(dash.flow.root) / "20261030-0000-feature-link"
+    link.symlink_to(spec_run.run.dir, target_is_directory=True)
+    assert dash.get(f"/api/runs/{link.name}/{route}")[0] == 404
+
+
+def test_a_missing_or_doubled_parameter_is_a_400(dash, spec_run):
+    rid = spec_run.run.id
+    status, _, body = dash.get(f"/api/runs/{rid}/artifact?path=docs%2Fspecs%2Fx.md")
+    assert status == 400 and payload(body)["error"] == "send exactly one sha"
+    assert dash.get(f"/api/runs/{rid}/artifact?path=a&path=b&sha=head")[0] == 400
+    assert dash.get(f"/api/runs/{rid}/artifact/diff?path=a&from=head")[0] == 400
+
+
+def test_a_big_artifact_is_cut_to_the_configured_cap(dash, spec_run):
+    dash.server.cfg.dashboard["artifact_max_kb"] = 16
+    big = spec_run.commit("define/spec_reconcile", write={"docs/specs/x.md": ("x" * 39 + "\n") * 3000})
+    got = payload(dash.get(f"/api/runs/{spec_run.run.id}/artifact?path=docs%2Fspecs%2Fx.md&sha={big}")[2])
+    assert got["truncated"] is True and len(got["text"].encode()) <= 16 * 1024
+
+
+def test_run_detail_names_the_artifact_tabs_its_lane_walks(dash):
+    run = awaiting(dash.flow)
+    assert payload(dash.get(f"/api/runs/{run.id}")[2])["artifact_tabs"] == ["spec", "plan"]

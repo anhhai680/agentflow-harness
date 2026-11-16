@@ -4,6 +4,7 @@
   `step_committed` of that phase whose commit touched it). Cached per event log, like `views._METRICS_CACHE`.
 - `read_artifact(run, repo, path, sha, max_bytes)`: one revision of one listed file, cut at a line past the cap.
 - `artifact_diff(run, repo, path, from_sha, to_sha, max_bytes)`: `git diff` between two revisions of one file.
+- `run_findings(run)`: the findings of each reviewed step and round (`step_findings`, `review_result`), newest open.
 - `artifact_max_bytes(cfg)` is the cap (`dashboard.artifact_max_kb`), and `artifact_tabs(phases)` the kinds a lane has.
 
 What a browser may ask for is allow-listed: the path must be one of the run's listed files and the sha one of that
@@ -22,6 +23,7 @@ import subprocess
 import threading
 from pathlib import Path
 
+from agentflow.autonomy import as_finding, finding_text
 from agentflow.config import Config
 from agentflow.gitops import GIT_READ_TIMEOUT_S
 from agentflow.guards import HARDENED
@@ -384,3 +386,57 @@ def artifact_diff(run: Run, repo: Path, path: str, from_sha: str, to_sha: str, m
     except NotFound:
         raise _lost(new) from None
     return {"path": entry["path"], "from": old, "to": new, "diff": _cut(data, cut), "truncated": cut}
+
+
+# -- findings
+
+_DIGITS = re.compile(r"\d+")
+
+
+def _line(value: object) -> int | None:
+    """A line number: an int above 0, or the first run of digits in a string. Anything else is None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        found = _DIGITS.search(value)
+        value = int(found.group()) if found else None
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _finding(raw: object) -> dict:
+    finding = as_finding(raw)
+    severity, file = finding.get("severity"), finding.get("file")
+    return {"severity": severity.lower() if isinstance(severity, str) and severity else None,
+            "file": file if isinstance(file, str) and file else None,
+            "line": _line(finding.get("line")), "text": finding_text(finding)}
+
+
+def run_findings(run: Run) -> list[dict]:
+    """`[{key, label, round, ts, open, findings: [{severity, file, line, text}]}]`, in event order.
+
+    One row per `step_findings` (its `round` is its 1-based position among that key's) and per `review_result`
+    (its own `round`); `open` marks the newest row of each key. An event log that cannot be read lists nothing."""
+    from agentflow.views import step_title  # views imports this module, so it is imported here, not at the top
+
+    try:
+        events = run.events.read()
+    except OSError:
+        return []
+    rows: list[dict] = []
+    counts: dict[str, int] = {}
+    for ev in sorted(events, key=lambda e: e.get("seq", 0)):
+        key, kind = ev.get("key"), ev.get("type")
+        if kind not in ("step_findings", "review_result") or not isinstance(key, str):
+            continue
+        if kind == "step_findings":
+            counts[key] = counts.get(key, 0) + 1
+            round_ = counts[key]
+        else:
+            round_ = ev.get("round") if isinstance(ev.get("round"), int) else 0
+        found = ev.get("findings")
+        rows.append({"key": key, "label": step_title(key), "round": round_, "ts": ev.get("ts"), "open": False,
+                     "findings": [_finding(f) for f in found] if isinstance(found, list) else []})
+    newest: dict[str, dict] = {row["key"]: row for row in rows}
+    for row in newest.values():
+        row["open"] = True
+    return rows
