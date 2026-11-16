@@ -450,3 +450,272 @@ def test_a_gh_error_at_the_timeout_with_the_watch_off_stops_as_today(flow_repo, 
     run = to_ship(flow_repo)
     assert go(flow_repo, run) == "waiting_human"
     assert "HTTP 502" in run.state["waiting"]["summary"] and not flow_repo.events(run, "run_held")
+
+
+# --------------------------------------------------------------------------- the early draft pull request (`ci.early_pr_after`)
+
+EARLY = {**PIPE, "ci": {**PIPE["ci"], "early_pr_after": "verify"}}
+EARLY_KEY = "verify/early_pr"
+REVIEW = "review/branch_review"
+
+
+def origin_hook(flow, name: str, body: str) -> None:
+    """A server-side hook in the fixture's bare `origin` (`--no-verify` skips only the pusher's own hooks)."""
+    hook = flow.origin / "hooks" / name
+    hook.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+
+def count_pushes(flow, run) -> Path:
+    """Each push to `origin` appends how many events the run had logged by then."""
+    log = flow.origin.parent / "pushes.log"
+    origin_hook(flow, "post-receive", f"wc -l < '{run.dir / 'events.jsonl'}' >> '{log}'")
+    return log
+
+
+def position(run, etype: str, **fields) -> int:
+    """The 1-based line of the first `etype` event whose fields match."""
+    for index, event in enumerate(run.events.read(), 1):
+        if event["type"] == etype and all(event.get(k) == v for k, v in fields.items()):
+            return index
+    raise AssertionError(f"no {etype} {fields}")
+
+
+def test_the_draft_pr_opens_when_verify_is_approved(flow_repo, gh):
+    from agentflow.feature_lane import render_pr_body
+
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    assert go(flow_repo, run) == "done"
+    opened = flow_repo.events(run, "pr_opened")
+    assert len(opened) == 1 and opened[0]["early"] is True
+    assert opened[0]["key"] == EARLY_KEY and opened[0]["url"] == URL
+    assert position(run, "phase_approved", phase="verify") < position(run, "pr_opened")
+    assert position(run, "pr_opened") < position(run, "agent_started", step=REVIEW)
+    create = [c for c in gh.calls() if c[:2] == ["pr", "create"]]
+    assert len(create) == 1 and "--draft" in create[0]
+    assert render_pr_body(run, early=True).splitlines()[0] == (
+        "Early draft: review is still running. The runner audits conformance and updates this description before it "
+        "marks the pull request ready.")
+    assert not render_pr_body(run).startswith("Early draft")
+
+
+def test_finish_updates_the_early_pr_instead_of_opening_one(flow_repo, gh, git, tmp_path):
+    from conftest import land_on_origin
+
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    land_on_origin(flow_repo, tmp_path, {"docs/landed.md": "landed\n"})  # `finish` merges it: a new commit to push
+    pushes = count_pushes(flow_repo, run)
+    assert go(flow_repo, run) == "done"
+    calls = gh.calls()
+    before_ci = calls[: next(i for i, c in enumerate(calls) if c[:2] == ["pr", "checks"])]
+    assert len([c for c in calls if c[:2] == ["pr", "create"]]) == 1
+    edits = [c for c in before_ci if c[:2] == ["pr", "edit"]]  # the `ci` step's own edit comes after its checks
+    assert len(edits) == 1 and edits[0][2] == URL and "--body-file" in edits[0]
+    counts = [int(line) for line in pushes.read_text(encoding="utf-8").split()]
+    assert len(counts) == 2  # the early push and the push at `finish`
+    assert counts[0] < position(run, "conformance_checked") <= counts[1]
+    updated = flow_repo.events(run, "pr_updated")
+    assert len(updated) == 1 and updated[0]["key"] == "ship/finish" and updated[0]["url"] == URL
+    worktree = Path(run.state["worktree"])
+    pushed = git(flow_repo.origin, "rev-parse", run.state["branch"]).strip()
+    assert updated[0]["sha"] == git(worktree, "rev-parse", "HEAD").strip() == pushed
+    assert flow_repo.events(run, "base_synced")  # the merge `finish` brought in is on the updated pull request
+    assert len(flow_repo.events(run, "pr_opened")) == 1
+    assert run.state["steps"]["ship/finish"]["status"] == "done"
+    executor = flow_repo.executor(run)  # `finish` again, as a resume would: its own `pr_updated` says it is done
+    ship = flow_repo.cfg.phases["ship"]
+    finish = next(step for step in ship.steps if step.type == "finish")
+    assert executor.run_finish(ship, finish, "ship/finish") == "done"
+    assert len([c for c in gh.calls() if c[:2] in (["pr", "create"], ["pr", "edit"])]) == 3  # create + 2 edits, as before
+    assert len(pushes.read_text(encoding="utf-8").split()) == 2
+
+
+def test_no_early_pr_for_a_run_that_stops_before_finish(flow_repo, gh):
+    flow_repo.configure(EARLY, autopilot=True)
+    flow_repo.script({RED: [GOOD_TEST], "build/fix": [FIXED]})
+    run = start(flow_repo.cfg, flow_repo.root, "bug", {"task": "x"}, RunOptions(to_phase="verify"))
+    assert go(flow_repo, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    go(flow_repo, run)
+    assert run.state["phases"]["verify"]["status"] == "approved"
+    assert not flow_repo.events(run, "pr_opened") and not flow_repo.events(run, "early_pr_failed")
+    assert not gh.did("pr", "create")
+
+
+@pytest.mark.parametrize("down", ["gh", "push"])
+def test_a_failed_early_pr_never_stops_the_run(flow_repo, gh, monkeypatch, down):
+    if down == "gh":
+        monkeypatch.setenv("FAKE_GH_FAIL_ONCE", "pr create")
+    else:
+        marker = flow_repo.origin.parent / "refused"
+        origin_hook(flow_repo, "pre-receive",
+                    f"if [ ! -e '{marker}' ]; then touch '{marker}'; echo 'remote down' >&2; exit 1; fi")
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    assert go(flow_repo, run) == "done"
+    failed = flow_repo.events(run, "early_pr_failed")
+    assert len(failed) == 1 and failed[0]["phase"] == "verify"
+    assert ("failing once" if down == "gh" else "remote down") in failed[0]["reason"]
+    assert "\n" not in failed[0]["reason"]
+    assert not flow_repo.events(run, "hitl_raised")
+    opened = flow_repo.events(run, "pr_opened")
+    assert len(opened) == 1 and opened[0]["key"] == "ship/finish" and "early" not in opened[0]
+    assert position(run, "early_pr_failed") < position(run, "agent_started", step=REVIEW)
+    assert not flow_repo.events(run, "pr_updated")
+    assert gh.did("pr", "ready", URL)
+
+
+def test_ci_watches_the_early_pr(flow_repo, gh):
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    assert go(flow_repo, run) == "done"
+    (opened,) = flow_repo.events(run, "pr_opened")
+    assert opened["early"] is True
+    assert [e["url"] for e in flow_repo.events(run, "ci_watching")] == [opened["url"]]
+    assert flow_repo.events(run, "pr_marked_ready")[0]["url"] == opened["url"]
+
+
+def test_no_early_pr_when_the_key_is_empty(flow_repo, gh):
+    gh.play(PASS)
+    run = to_ship(flow_repo, {**PIPE, "ci": {**PIPE["ci"], "early_pr_after": ""}})
+    pushes = count_pushes(flow_repo, run)
+    assert go(flow_repo, run) == "done"
+    (opened,) = flow_repo.events(run, "pr_opened")
+    assert opened["key"] == "ship/finish" and "early" not in opened
+    assert not flow_repo.events(run, "pr_updated") and not flow_repo.events(run, "early_pr_failed")
+    assert len(pushes.read_text(encoding="utf-8").split()) == 1
+
+
+def test_dry_run_shows_the_early_pr(flow_repo, capsys):
+    from agentflow.flow import main
+
+    line = "  ⇪ early draft PR: git push origin <branch>; gh pr create --draft"
+    flow_repo.configure(EARLY, autopilot=True)
+    assert main(["run", "bug", "--task", "x", "--dry-run", "--config", str(flow_repo.cfg.path)]) == 0
+    out = capsys.readouterr().out
+    assert out.count(line) == 1
+    assert out.index("verify/verify") < out.index(line) < out.index("\nreview:")
+    flow_repo.configure(PIPE, autopilot=True)
+    assert main(["run", "bug", "--task", "x", "--dry-run", "--config", str(flow_repo.cfg.path)]) == 0
+    assert "early draft PR" not in capsys.readouterr().out
+
+
+def skip_finish(data: dict) -> None:
+    """A pack whose `finish` does not run (a `when:` that never holds here) while its `ci` step still does."""
+    next(step for step in data["phases"]["ship"]["steps"] if step.get("type") == "finish")["when"] = "refine_round"
+
+
+def head_reads(gh) -> list[list[str]]:
+    return [c for c in gh.calls() if c[:2] == ["pr", "view"] and "headRefOid" in c]
+
+
+def test_ci_never_takes_an_early_pr_that_finish_did_not_update(flow_repo, gh):
+    gh.play(PASS)
+    flow_repo.configure(EARLY, autopilot=True, edit=skip_finish)
+    flow_repo.script({RED: [GOOD_TEST], "build/fix": [FIXED]})
+    run = start(flow_repo.cfg, flow_repo.root, "bug", {"task": "x"}, RunOptions())
+    assert go(flow_repo, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    assert go(flow_repo, run) == "waiting_human"
+    assert flow_repo.events(run, "pr_opened")[0]["early"] is True and not flow_repo.events(run, "pr_updated")
+    waiting = run.state["waiting"]
+    assert waiting["key"] == "ship/ci" and "`finish` has not opened one" in waiting["summary"]
+    assert not gh.did("pr", "ready") and not gh.did("pr", "checks") and not flow_repo.events(run, "pr_marked_ready")
+
+
+def test_a_stale_head_with_green_checks_is_never_a_pass(flow_repo, gh, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_HEAD", "0" * 40)  # GitHub still shows the early push
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    assert go(flow_repo, run) == "waiting_human"
+    waiting = run.state["waiting"]
+    assert waiting["key"] == "ship/ci" and "0000000000" in waiting["summary"]
+    assert flow_repo.events(run, "pr_updated")[0]["sha"][:12] in waiting["summary"]
+    assert head_reads(gh) and not gh.did("pr", "checks")  # a stale head's checks are not read at all
+    assert not gh.did("pr", "ready") and not flow_repo.events(run, "pr_marked_ready")
+
+
+def test_a_matching_head_with_green_checks_is_marked_ready(flow_repo, gh):
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    assert go(flow_repo, run) == "done"
+    assert head_reads(gh) and gh.did("pr", "ready", URL)
+
+
+def test_without_an_early_pr_the_head_is_never_read(flow_repo, gh):
+    gh.play(PASS)
+    run = to_ship(flow_repo)
+    assert go(flow_repo, run) == "done"
+    assert not head_reads(gh) and gh.did("pr", "ready", URL)
+
+
+def test_a_failing_pr_body_is_an_early_pr_failure_with_no_push(flow_repo, gh, monkeypatch):
+    from agentflow import feature_lane
+
+    real = feature_lane.render_pr_body
+
+    def render(run, plan=None, *, early=False):
+        if early:
+            raise ValueError("body broke\nsecond line")
+        return real(run, plan, early=early)
+
+    monkeypatch.setattr(feature_lane, "render_pr_body", render)
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    pushes = count_pushes(flow_repo, run)
+    assert go(flow_repo, run) == "done"
+    (failed,) = flow_repo.events(run, "early_pr_failed")
+    assert failed["reason"] == "body broke second line"
+    counts = [int(line) for line in pushes.read_text(encoding="utf-8").split()]
+    assert len(counts) == 1 and counts[0] > position(run, "early_pr_failed")  # only `finish` pushed
+    assert flow_repo.events(run, "pr_opened")[0]["key"] == "ship/finish"
+
+
+def remerge_after_finish(flow, run, tmp_path, monkeypatch, *, head_stays: bool = False) -> None:
+    """GitHub calls the updated early PR conflicting once, while the target moves: `confirm_mergeable` merges it
+    again and pushes. `head_stays`: GitHub keeps showing the commit `finish` pushed."""
+    from conftest import land_on_origin
+    from agentflow.sync_lane import SyncLane
+
+    verdicts = iter(["CONFLICTING", "MERGEABLE"])
+
+    def mergeable(self, url):
+        verdict = next(verdicts, "MERGEABLE")
+        if verdict == "CONFLICTING":
+            land_on_origin(flow, tmp_path, {"docs/later.md": "later\n"})
+            if head_stays:
+                monkeypatch.setenv("FAKE_GH_HEAD", flow.events(run, "pr_updated")[-1]["sha"])
+        return verdict
+
+    monkeypatch.setattr(SyncLane, "_mergeable", mergeable)
+
+
+def test_ci_follows_the_re_merge_push_of_an_early_pr(flow_repo, gh, tmp_path, monkeypatch, git):
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    remerge_after_finish(flow_repo, run, tmp_path, monkeypatch)
+    assert go(flow_repo, run) == "done"
+    updated, again = flow_repo.events(run, "pr_updated")[0], flow_repo.events(run, "base_synced")[-1]
+    assert again["seq"] > updated["seq"] and again["sha"] != updated["sha"]
+    assert again["sha"] == git(flow_repo.origin, "rev-parse", run.state["branch"]).strip()
+    assert head_reads(gh) and gh.did("pr", "ready", URL)
+
+
+def test_a_head_left_behind_the_re_merge_is_never_a_pass(flow_repo, gh, tmp_path, monkeypatch):
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    remerge_after_finish(flow_repo, run, tmp_path, monkeypatch, head_stays=True)
+    assert go(flow_repo, run) == "waiting_human"
+    waiting = run.state["waiting"]
+    assert waiting["key"] == "ship/ci" and flow_repo.events(run, "base_synced")[-1]["sha"][:12] in waiting["summary"]
+    assert not gh.did("pr", "checks") and not gh.did("pr", "ready")
+
+
+def test_an_early_pr_with_no_pushed_sha_is_stale(flow_repo, gh):
+    flow_repo.configure(EARLY)
+    executor = flow_repo.executor()
+    executor._early = True
+    assert "no pushed commit" in executor._stale_head(URL)
+    assert not head_reads(gh)  # nothing to compare with: GitHub is not even asked

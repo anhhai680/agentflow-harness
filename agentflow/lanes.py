@@ -924,21 +924,30 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             names = [g.name for g in resolve_gates(self.cfg, sr.step.gates)]
             first = [n for n in dict.fromkeys(self._last_fix_gates(sr)) if n in names] if sr.fixes else []
             log_dir = self.run.gate_log_dir(sr.key)
+            tiered = self._gate_tier(sr, tree)
             if first:
-                results = run_gates_reusing(self.cfg, self.run, sr.key, first, self.worktree, log_dir, tree)
+                results = run_gates_reusing(self.cfg, self.run, sr.key, first, self.worktree, log_dir, tree, **tiered)
                 if gates_ok(results):
                     rest = [n for n in names if n not in first]
                     if rest:
-                        results += run_gates_reusing(self.cfg, self.run, sr.key, rest, self.worktree, log_dir, tree)
+                        results += run_gates_reusing(self.cfg, self.run, sr.key, rest, self.worktree, log_dir, tree,
+                                                     **tiered)
                 else:
                     self.run.emit("gates_deferred", key=sr.key, tree=tree, gates=[n for n in names if n not in first])
             else:
-                results = run_gates_reusing(self.cfg, self.run, sr.key, names, self.worktree, log_dir, tree)
+                results = run_gates_reusing(self.cfg, self.run, sr.key, names, self.worktree, log_dir, tree, **tiered)
         if sr.step.checks:
             docs = self.cfg.project.docs
             results += run_doc_checks(sr.step.checks, self.worktree, sr.start_head, docs["idea"], docs["decisions"])
         record_results(self.run, sr.key, results, tree, with_tail=True)
         return [] if gates_ok(results) else [r for r in results if not (r.passed or r.skipped)]
+
+    def _gate_tier(self, sr: _StepRun, tree: str) -> dict:
+        """`run_gates_reusing`'s `tier` and `changed` for the step: at `gate_tier: affected`, the paths that differ
+        between the commit the step started on and `tree`. A step with no start commit runs the full tier."""
+        if sr.step.gate_tier != "affected" or not sr.start_head:
+            return {"tier": "full", "changed": ()}
+        return {"tier": "affected", "changed": changed_paths(self.worktree, sr.start_head, tree)}
 
     def _last_fix_gates(self, sr: _StepRun) -> list[str]:
         """The gates the step's latest `fix_attempt` named: the ones its fix was for."""

@@ -1612,6 +1612,19 @@ def test_ci_watch_max_h_defaults_off_and_may_be_left_out(sparse_repo, tmp_cfg):
     assert "watch_max_h" not in owned.ci and not errors(validate(owned, tmp_cfg().parent.parent))
 
 
+def test_early_pr_after_must_name_a_phase_before_finish(sparse_repo, tmp_cfg):
+    assert load_config(pack.pack_config(sparse_repo)).ci["early_pr_after"] == ""  # the engine layer: off
+    owned = load_config(tmp_cfg())  # a pack that writes its own `ci` without the key: off too
+    assert "early_pr_after" not in owned.ci and not errors(validate(owned, tmp_cfg().parent.parent))
+    for bad in ("ship", "nope", 3, True, ["verify"]):
+        found = issues_for(tmp_cfg, {"ci": {"early_pr_after": bad}})
+        assert [i.path for i in found if i.level == "error"] == ["ci.early_pr_after"], bad
+    found = issues_for(tmp_cfg, {"ci": {"early_pr_after": "ship"}})
+    assert "before the phase" in next(i.message for i in found if i.path == "ci.early_pr_after")
+    for good in ("", "verify", "review", "define"):
+        assert not errors(issues_for(tmp_cfg, {"ci": {"early_pr_after": good}})), good
+
+
 def test_ci_watch_max_h_must_be_finite_and_zero_or_more(tmp_cfg):
     for bad in (-1, float("inf"), float("nan"), 721, 10**400, True):
         found = issues_for(tmp_cfg, {"ci": {"watch_max_h": bad}})
@@ -1648,3 +1661,183 @@ def test_watchdog_no_progress_min_is_capped_at_a_day(tmp_cfg):
     assert [i.path for i in found if i.level == "error"] == ["watchdog.no_progress_min"]
     for good in (0, 0.02, 10, 1440):  # no floor for a small positive value: the watchdog's own tests use 0.02
         assert not errors(issues_for(tmp_cfg, {"watchdog": {"no_progress_min": good}})), good
+
+
+# --------------------------------------------------------------------------- gate groups and resources
+
+
+def test_gate_group_and_resource_are_names(tmp_cfg):
+    cfg = load_config(tmp_cfg({"gates": {"floor": {"run": "true", "group": "api", "resource": "db.1"}}}))
+    assert (cfg.gates["floor"].group, cfg.gates["floor"].resource) == ("api", "db.1")
+    assert load_config(tmp_cfg()).gates["floor"].group is None
+    found = errors(issues_for(tmp_cfg, {"gates": {"floor": {"run": "true", "group": "a b", "resource": ""}}}))
+    assert ("error", "gates.floor.group") in found
+    assert ("error", "gates.floor.resource") in found
+    assert ("error", "gates.floor.group") not in errors(
+        issues_for(tmp_cfg, {"gates": {"floor": {"run": "true", "group": "api", "resource": "db"}}}))
+
+
+def test_a_grouped_setup_gate_is_a_warning(tmp_cfg):
+    found = _warnings(issues_for(tmp_cfg, {"gates": {"setup_py": {"run": "uv sync", "group": "api"}}}))
+    assert ("gates.setup_py.group", "setup gates start things in order; drop `group`") in found
+    assert not [w for w in _warnings(issues_for(tmp_cfg, {"gates": {"floor": {"run": "true", "group": "api"}}}))
+                if w[0] == "gates.floor.group"]
+
+
+# --------------------------------------------------------------------------- gate inputs
+
+
+def test_gate_inputs_must_be_relative_globs(tmp_cfg):
+    cfg = load_config(tmp_cfg({"gates": {"floor": {"run": "true", "inputs": ["api/**", "pyproject.toml"]}}}))
+    assert cfg.gates["floor"].inputs == ["api/**", "pyproject.toml"]
+    assert load_config(tmp_cfg()).gates["floor"].inputs == []
+    for bad in ([], [""], ["/abs/**"], ["../up/**"], ["a/../b"], ["ok", 3], [" "]):
+        found = errors(issues_for(tmp_cfg, {"gates": {"floor": {"run": "true", "inputs": bad}}}))
+        assert ("error", "gates.floor.inputs") in found, bad
+    assert ("error", "gates.floor.inputs") not in errors(
+        issues_for(tmp_cfg, {"gates": {"floor": {"run": "true", "inputs": ["./api/**"]}}}))
+    with pytest.raises(ConfigError, match="gates.floor.inputs"):  # not a list at all: refused when the pack loads
+        load_config(tmp_cfg({"gates": {"floor": {"run": "true", "inputs": "api/**"}}}))
+
+
+def test_a_verify_gate_without_inputs_warns_only_once_a_pack_uses_inputs(tmp_cfg):
+    def inputs_warnings(patch):
+        return [w for w in _warnings(issues_for(tmp_cfg, patch)) if "has no `inputs`" in w[1]]
+
+    assert inputs_warnings(None) == []  # no gate declares `inputs`: today's packs stay at 0 warnings
+    cfg = load_config(tmp_cfg())
+    verify = cfg.gate_sets["verify"]
+    assert len(verify) >= 2
+    patch = {"gates": {verify[0]: {"inputs": ["api/**"]}}}
+    found = inputs_warnings(patch)
+    assert [w[0] for w in found] == [f"gates.{name}" for name in verify[1:]]
+    assert all(w[1] == f"`{w[0].split('.', 1)[1]}` has no `inputs`, so it runs again after every change" for w in found)
+    both = {"gates": {name: {"inputs": ["api/**"]} for name in verify}}
+    assert inputs_warnings(both) == []
+
+
+# --------------------------------------------------------------------------- the affected tier
+
+
+def test_affected_allows_only_the_paths_placeholder(tmp_cfg):
+    def affected(value):
+        return {"gates": {"floor": {"run": "true", "affected": value}}}
+
+    cfg = load_config(tmp_cfg(affected({"run": "pytest {paths}", "paths": ["tests/**/test_*.py"]})))
+    assert (cfg.gates["floor"].affected.run, cfg.gates["floor"].affected.paths) == ("pytest {paths}", ["tests/**/test_*.py"])
+    assert load_config(tmp_cfg()).gates["floor"].affected is None
+    assert load_config(tmp_cfg(affected({"run": "pytest {paths}"}))).gates["floor"].affected.paths == ["**"]
+    with_inputs = {"gates": {"floor": {"run": "true", "inputs": ["api/**"], "affected": {"run": "pytest {paths}"}}}}
+    assert load_config(tmp_cfg(with_inputs)).gates["floor"].affected.paths == ["api/**"]
+    for good in ("pytest {paths}", "pytest", "echo {{x}} ${{HOME}} {paths} {paths}"):
+        found = errors(issues_for(tmp_cfg, affected({"run": good, "paths": ["**/*.py"]})))
+        assert ("error", "gates.floor.affected.run") not in found, good
+    for bad in ("", "  ", "pytest {changed}", "pytest {}", "pytest {paths!r}", "pytest {paths:>3}", "pytest {0}",
+                "pytest {paths.x}", "pytest { paths}", "echo ${HOME}", "pytest {paths", "pytest }"):
+        found = errors(issues_for(tmp_cfg, affected({"run": bad, "paths": ["**/*.py"]})))
+        assert ("error", "gates.floor.affected.run") in found, bad
+    for bad in ([], [""], ["/abs/**"], ["../up/**"], ["a/../b"], ["ok", 3]):
+        found = errors(issues_for(tmp_cfg, affected({"run": "pytest {paths}", "paths": bad})))
+        assert ("error", "gates.floor.affected.paths") in found, bad
+    for bad in ("pytest {paths}", {"paths": ["**"]}, {"run": 3}, {"run": "x", "paths": "**"}, {"run": "x", "other": 1}):
+        with pytest.raises(ConfigError, match="gates.floor.affected"):
+            load_config(tmp_cfg(affected(bad)))
+
+
+@pytest.mark.parametrize("template", [
+    "echo '{paths}'", 'echo "{paths}"', "echo `{paths}`", "echo $({paths})", "echo $(ls {paths})",
+    'echo "a {paths} b"', "echo ${{x:-{paths}}}", "echo x # {paths}", "echo x{paths}", "echo {paths}x",
+    "cat <<EOF\n{paths}\nEOF", "echo '{paths}' {paths}", "echo \"$(echo ')')\" '{paths}'",
+])
+def test_affected_refuses_a_paths_placeholder_that_is_not_its_own_unquoted_word(tmp_cfg, template):
+    patch = {"gates": {"floor": {"run": "true", "affected": {"run": template, "paths": ["**/*.py"]}}}}
+    assert ("error", "gates.floor.affected.run") in errors(issues_for(tmp_cfg, patch))
+
+
+@pytest.mark.parametrize("template", [
+    "echo {paths}", "pytest {paths} -q", "pytest -q {paths}; echo done", "pytest {paths}|tee log", "a && b {paths}",
+    "echo '#' {paths}", "echo \"it's\" {paths}", "echo $(date) {paths}", "printf '%s\\n' {paths} > out.txt",
+    "echo {{x}} {paths}", "echo ${{HOME}} {paths}", "x <<< y {paths}", "cd api &&\n  pytest {paths}",
+])
+def test_affected_accepts_a_paths_placeholder_that_is_its_own_unquoted_word(tmp_cfg, template):
+    patch = {"gates": {"floor": {"run": "true", "affected": {"run": template, "paths": ["**/*.py"]}}}}
+    assert ("error", "gates.floor.affected.run") not in errors(issues_for(tmp_cfg, patch))
+
+
+# Each of these let a file name run as shell code (`x$(touch PWNED)y.py`) through a `{paths}` the scanner thought safe.
+HOSTILE_TEMPLATES = [
+    "echo \"$(echo '\"')') {paths} \"",  # `'` is ignored while a `"` is open inside `$(...)`
+    "echo \\{paths} \\'",  # an escaped placeholder is still replaced by the renderer
+    "echo $'\\' {paths} \\'",  # ANSI-C quoting
+    "echo \"$(case x in (x) \" {paths} \";; esac)\"",  # a case-pattern `)` closes `$(` early
+    "echo \"`echo`\" {paths}", "echo \"${{x}}\" {paths}", "echo {paths} '", "echo {paths} \"", "echo {paths} $(echo",
+    "echo $(echo # ') x\n) ' {paths} 'y'", "echo {paths} `echo", "echo $(echo (a)) {paths}", "echo \\{{paths}}",
+    "echo x\\{paths}", "echo {paths} $'a'",
+    # A `#` right after an operator or a line continuation starts a comment that hides a quote from the scan.
+    "echo a;#'\n' {paths} \\'", "echo a&&#'\n' {paths} \\'", "echo a|#'\n' {paths} \\'", "(#'\n' {paths} \\'\n)",
+    "echo a \\\n#'\n' {paths} \\'",
+    "echo `true '`'`'\"' {paths} \"'\"'\\'",  # the shell ignores `'` when it looks for the closing backtick
+    "echo `(true)` {paths}",  # an unquoted `(` inside backticks, as inside `$(...)`
+    "echo $[\n{paths} ]", "(( {paths} ))",  # arithmetic reads its words as if double-quoted (found by the fuzz)
+    "echo \"${x:-'}\" {paths} \"'}\"",  # a lone brace: the renderer leaves `${`, whose `'` bash honours inside `"`
+    # The shell deletes a line continuation before it reads tokens, so it can glue `$(`, `$'`, `${` or `<<` together.
+    "echo \"$\\\n( echo \" {paths} \" )\"", "echo $\\\n'\\' {paths} \\'", "cat <\\\n<EOF\n'\nEOF\n' {paths} \\'",
+    "echo \"$\\\n{{x:-\" {paths} \"}}\"",
+]
+
+
+@pytest.mark.parametrize("template", HOSTILE_TEMPLATES)
+def test_affected_refuses_a_template_whose_quoting_could_let_a_name_run(tmp_cfg, template):
+    patch = {"gates": {"floor": {"run": "true", "affected": {"run": template, "paths": ["**/*.py"]}}}}
+    assert ("error", "gates.floor.affected.run") in errors(issues_for(tmp_cfg, patch)), template
+
+
+@pytest.mark.parametrize("template", HOSTILE_TEMPLATES)
+def test_the_scanner_refuses_every_hostile_template(template):
+    from agentflow.config import unquoted_paths_word
+
+    assert not unquoted_paths_word(template), template
+
+
+@pytest.mark.parametrize("template", [
+    "pytest {paths}", "ruff check {paths}", "cmd --flag {paths} | tail -n 5", "cmd {paths} && other",
+    "echo $(date) {paths}", "echo \"$HOME\" '{{x}}' {paths}", "pytest -q {paths} 2>&1", "cd api &&\n  pytest {paths}",
+    "echo a#b {paths}", "echo '#' \"#\" {paths}", "git log --format=%h#%s {paths}", "pytest \\\n  {paths}",
+    "pytest -q \\\n  --tb=short \\\n  {paths}",
+])
+def test_the_scanner_still_accepts_the_ordinary_templates(template):
+    from agentflow.config import unquoted_paths_word
+
+    assert unquoted_paths_word(template), template
+
+
+def test_gate_tier_needs_gates(tmp_cfg):
+    def tier(step_id: str, value):
+        def edit(data):
+            phase_step(data, "verify", step_id)["gate_tier"] = value
+        return edit
+
+    cfg = load_config(tmp_cfg(tier("fix_findings", "affected")))
+    assert phase_step_of(cfg, "verify", "fix_findings").gate_tier == "affected"
+    assert phase_step_of(load_config(tmp_cfg()), "verify", "fix_findings").gate_tier == "full"
+    assert not [e for e in errors(issues_for(tmp_cfg, tier("fix_findings", "affected"))) if e[1].endswith(".gate_tier")]
+    assert not [e for e in errors(issues_for(tmp_cfg, tier("plan_fixes", "full"))) if e[1].endswith(".gate_tier")]
+    found = [i for i in issues_for(tmp_cfg, tier("plan_fixes", "affected")) if i.path.endswith(".gate_tier")]
+    assert found and all(i.level == "error" and "needs a step with `gates`" in i.message for i in found)  # each use of the anchor
+    for bad in ("fast", "", 1, True):
+        assert [e for e in errors(issues_for(tmp_cfg, tier("fix_findings", bad))) if e[1].endswith(".gate_tier")], bad
+
+
+def phase_step_of(cfg, phase: str, step_id: str):
+    return next(s for s in cfg.phases[phase].steps if s.id == step_id)
+
+
+def test_the_engine_defaults_mark_the_fix_steps_affected(sparse_repo):
+    cfg = _sparse_config(sparse_repo)
+    assert phase_step_of(cfg, "review", "fix_findings").gate_tier == "affected"
+    assert phase_step_of(cfg, "ship", "finish").sync.gate_tier == "affected"
+    # `ci.fix` stays full: `ci_lane` pushes right after the fix and no conformance audit follows, so an affected-only
+    # check would ship a tree no full verify has seen.
+    assert phase_step_of(cfg, "ship", "ci").fix.gate_tier == "full"
+    assert phase_step_of(cfg, "verify", "verify").gate_tier == "full"
+    assert phase_step_of(cfg, "build", "fix").gate_tier == "full"

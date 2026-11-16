@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -44,7 +45,7 @@ from agentflow.gitops import (
     push,
     unmerged_paths,
 )
-from agentflow.guards import path_matches, snapshot
+from agentflow.guards import changed_paths, path_matches, snapshot
 from agentflow.hitl import ResultError, raise_hitl, read_result
 
 if TYPE_CHECKING:
@@ -177,7 +178,7 @@ class SyncLane:
             eval_needed, _ = self.decide(phase, "eval_required", f"{key}.eval_required")
             if eval_needed is None:
                 return "stopped"
-        results = self._run_merge_gates(key, names, with_eval=bool(eval_needed))
+        results = self._run_merge_gates(key, names, with_eval=bool(eval_needed), tier=sync.gate_tier)
         if gates_ok(results):
             return "done"
         failed = [r for r in results if not (r.passed or r.skipped)]
@@ -203,12 +204,16 @@ class SyncLane:
                 return "stopped"
         return "done"
 
-    def _run_merge_gates(self, key: str, names: list[str], with_eval: bool) -> list[GateResult]:
+    def _run_merge_gates(self, key: str, names: list[str], with_eval: bool, tier: str = "full") -> list[GateResult]:
+        """The `sync` gates on the merged, uncommitted tree, at `tier` (the `sync` step's `gate_tier`): an affected
+        run takes the paths the merge changed against `HEAD`, the branch before the merge. The eval gate runs in full."""
         results: list[GateResult] = []
         tree = snapshot(self.worktree)
         if names:
+            changed = changed_paths(self.worktree, "HEAD", tree) if tier == "affected" else []
             results += run_gates_reusing(self.cfg, self.run, key, names if len(names) > 1 else names[0],
-                                         self.worktree, self.run.gate_log_dir(key), tree)
+                                         self.worktree, self.run.gate_log_dir(key), tree,
+                                         tier="affected" if tier == "affected" else "full", changed=changed)
         if with_eval:
             results += run_gates_reusing(self.cfg, self.run, key, ["eval"], self.worktree, self.run.gate_log_dir(key),
                                          tree)
@@ -249,15 +254,17 @@ class SyncLane:
     def confirm_mergeable(self, phase: Phase, step: Step, key: str, url: str) -> Outcome:
         """GitHub's verdict on the new pull request. Main may have moved since the fetch: on `CONFLICTING`, bring the
         target in again and push, up to `ci.sync_rounds` times, then a human. "UNKNOWN" and a failed read are not a
-        verdict: the `ci` step is the backstop."""
+        verdict: the `ci` step is the backstop. Such a merge is pushed with no audit after it, so the `sync` step's
+        gates check it at the full tier, whatever its `gate_tier`."""
         rounds = int(self.cfg.ci.get("sync_rounds", DEFAULT_ROUNDS))
+        full = replace(step, sync=replace(step.sync, gate_tier="full")) if step.sync is not None else step
         branch = str(self.run.state.get("branch") or "")
         for attempt in range(rounds + 1):
             if self._mergeable(url) != "CONFLICTING":
                 return "done"
             if attempt == rounds:
                 break
-            if self.run_sync(phase, step, key) != "done":
+            if self.run_sync(phase, full, key) != "done":
                 return "stopped"
             if not self.runner_commits_only(key):
                 return "stopped"

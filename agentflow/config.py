@@ -12,6 +12,7 @@ import math
 import posixpath
 import re
 import shlex
+import string
 import subprocess
 import unicodedata
 from dataclasses import dataclass, field
@@ -59,8 +60,10 @@ AUTONOMY_KEYS = ("non_blocking_severities", "finding_rounds", "resolve_kinds", "
                  "human_question_kinds")
 # The `kind` of a `needs_human` question. `boundary`: the repository's docs reserve the decision for a human.
 QUESTION_KINDS = ("spec_gap", "ambiguity", "conflict", "review_dispute", "boundary", "other")
-CI_KEYS = ("poll_s", "appear_min", "timeout_min", "fix_rounds", "rerun_rounds", "sync_rounds", "watch_max_h")
-CI_OPTIONAL = ("watch_max_h",)  # missing from a pack that writes its own `ci` block: 0 (off)
+CI_KEYS = ("poll_s", "appear_min", "timeout_min", "fix_rounds", "rerun_rounds", "sync_rounds", "watch_max_h",
+           "early_pr_after")
+CI_OPTIONAL = ("watch_max_h", "early_pr_after")  # missing from a pack that writes its own `ci` block: off
+CI_TEXT = ("early_pr_after",)  # the `ci` keys that are not numbers
 CI_WATCH_MAX_H = 720  # `ci.watch_max_h` above this (30 days) is a typo, not a plan
 FLOOR_BLOCKING = ("critical", "high", "medium")  # severities that always block, whatever `non_blocking_severities` lists
 STEP_KEYS = (
@@ -100,6 +103,7 @@ STEP_KEYS = (
     "fix",
     "sync",
     "human_paths",
+    "gate_tier",
 )
 
 
@@ -181,6 +185,7 @@ NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition"
 PREFLIGHT_KEYS = ("enabled",)
 WATCHDOG_KEYS = ("no_progress_min",)
 WATCHDOG_MAX_MIN = 1440  # `watchdog.no_progress_min` above a day is a typo, not a plan
+GATE_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # a gate's `group` or `resource`
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -370,6 +375,108 @@ class Policy:
     disabled: tuple[str, ...] = ()  # engine default ids a layer switched off (and the floor, if nulled), for `validate`
 
 
+GATE_TIERS = ("full", "affected")  # a step's `gate_tier`: the gates' whole commands, or their `affected` ones
+AFFECTED_KEYS = ("run", "paths")
+
+
+_WORD_END = frozenset(" \t\n;&|")  # what may follow `{paths}`: the end of a shell word
+_WORD_CHARS = frozenset(string.ascii_letters + string.digits + "_-./=:+,@%")  # a `#` after one never starts a comment
+
+
+def unquoted_paths_word(run: str) -> bool:
+    """True when every `{paths}` in the `affected.run` template `run` is its own unquoted shell word, so each
+    shell-quoted file name stays one inert argument: never inside `'...'`, `"..."`, `$(...)` or `${...}`, never after
+    an unquoted here-document `<<`, and with only the start, whitespace before it and the end, whitespace, `;`, `&`
+    or `|` after it. `{{` and `}}` are literal braces.
+
+    A small, conservative scan of POSIX shell quoting: a template it cannot read as safe is refused. It fails
+    closed on everything it cannot track rather than mimic the shell's grammar: an escaped `{` (the renderer still
+    replaces `{paths}` after a backslash), a line continuation anywhere but after a blank (the shell deletes it before
+    it reads tokens), a lone `${` (the renderer leaves it as it is), any backtick (the
+    shell ignores quotes when it looks for the closing one), `$'...'`, `$[` and `((` (arithmetic reads its words as
+    if double-quoted), `$(` or `${` opened inside `"..."`, an unquoted `#` anywhere but right after a word character
+    (a comment, after a blank, an operator or a line continuation, hides quotes from the scan), a `#` or an unquoted
+    `(` inside `$(...)` or `${...}` (a comment, a subshell or a case pattern would desync the quote state), and a
+    scan that ends inside a quote or a substitution."""
+    single = double = heredoc = False
+    depth = 0  # open `$(` and `${`
+    prev = ""  # the last character read outside a quote, "" at the start
+    i, n = 0, len(run)
+    while i < n:
+        if single:
+            if run[i] == "'":
+                single = False
+            elif run.startswith("{paths}", i):
+                return False
+            i += 1
+            continue
+        if run.startswith("{{", i):
+            if prev == "$":
+                if double:
+                    return False
+                depth += 1  # `${{` renders `${`
+            prev, i = "{", i + 2
+            continue
+        if run.startswith("}}", i):
+            if depth:
+                depth -= 1
+            prev, i = "}", i + 2
+            continue
+        if run.startswith("{paths}", i):
+            after = run[i + 7:i + 8]
+            if (double or depth or heredoc or prev not in ("", " ", "\t", "\n")
+                    or (after and after not in _WORD_END)):
+                return False
+            prev, i = "}", i + 7
+            continue
+        c = run[i]
+        if c == "`" or (c == "{" and prev == "$"):
+            return False  # a backtick ends whatever quotes say; the renderer leaves a lone `${`, which is not tracked
+        if c == "\\":
+            if run.startswith("\n", i + 1):
+                if prev not in ("", " ", "\t", "\n"):
+                    return False  # the shell deletes a line continuation, so it could glue `$(`, `$'`, `${` or `<<`
+                i += 2  # removed text: what follows starts a word, as after the blank before it
+                continue
+            if run.startswith("{", i + 1):
+                return False  # the renderer still replaces a `{paths}` after a backslash: never read as escaped
+            prev, i = "\\", i + 2  # the escaped character is literal
+            continue
+        if c == "'" and not double:
+            single = True
+        elif c == '"':
+            double = not double
+        elif c == "$" and run.startswith(("$'", "$["), i):
+            return False  # ANSI-C quoting escapes `'` differently; `$[` arithmetic reads `'` as a literal
+        elif c == "$" and run.startswith("$(", i):
+            if double:
+                return False
+            depth, i, prev = depth + 1, i + 2, "("
+            continue
+        elif c == "(" and not double and (depth or run.startswith("((", i)):
+            return False  # a subshell or a case pattern closes `$(` early; `((` is arithmetic in bash
+        elif c == "#" and not double and (depth or prev not in _WORD_CHARS):
+            return False  # a comment (after a blank, an operator or a line continuation) hides quotes from this scan
+        elif c == ")" and depth:
+            depth -= 1
+        elif c == "<" and not double and run.startswith("<<", i) and not run.startswith("<<<", i):
+            heredoc = True
+        elif c == "<" and run.startswith("<<<", i):
+            prev, i = "<", i + 3
+            continue
+        prev = c
+        i += 1
+    return not (single or double or depth)
+
+
+@dataclass(frozen=True)
+class Affected:
+    """A gate's `affected` command: `run` takes the changed files its `paths` globs match, as `{paths}`."""
+
+    run: str
+    paths: list[str]
+
+
 @dataclass
 class Gate:
     name: str
@@ -378,6 +485,10 @@ class Gate:
     when_exists: str | None = None
     baseline: str | None = None  # `red`: it failed on the base branch when the pack was set up (a human fixes or deletes it)
     agent_check: bool = False  # the build prompt lists it as a check the implementer runs itself (`{self_checks}`)
+    group: str | None = None  # gates of different groups run at the same time; one group runs in order (`gates.run_gates`)
+    resource: str | None = None  # gates that share a resource never run at the same time, within one run
+    inputs: list[str] = field(default_factory=list)  # globs of the files the gate reads: its pass holds while none of them changes
+    affected: Affected | None = None  # the command a `gate_tier: affected` step runs instead, on the files it changed
 
 
 @dataclass
@@ -427,6 +538,7 @@ class Step:
     fix: Step | None = None  # a `ci` step: the session that fixes a failed check
     sync: Step | None = None  # a `finish` step: the session that resolves the target branch's conflicts
     human_paths: list[str] = field(default_factory=list)  # a `sync` step: conflicts in these paths are a human's
+    gate_tier: str = "full"  # `affected`: its gates run their `affected` command on the files the step changed
     path: str = ""
 
 
@@ -478,6 +590,11 @@ class Config:
     layer_origins: dict[tuple[str, ...], str] = field(default_factory=dict)  # each leaf of `merged`: its layer's name
     issues: IssuePolicy = field(default_factory=IssuePolicy)  # what a run started from an issue does on GitHub
     policy: Policy = field(default_factory=Policy)  # the obligations a finished run must show evidence for
+
+
+def _holds_finish(steps: list[Step]) -> bool:
+    """Whether a `type: finish` step is among `steps` or inside one of their groups."""
+    return any(step.type == "finish" or _holds_finish(step.steps) for step in steps)
 
 
 def for_lane(steps: list[Step], lane: str) -> list[Step]:
@@ -776,6 +893,7 @@ class _Builder:
             fix=fix,
             sync=sync,
             human_paths=_string_list(raw.get("human_paths", []), _join(path, "human_paths")),
+            gate_tier=raw.get("gate_tier", "full"),  # kept as written: `validate` refuses anything but full or affected
             path=path,
         )
 
@@ -801,12 +919,39 @@ class _Builder:
         return out
 
 
+def _gate_inputs(value: Any, path: str) -> list[str]:
+    """A gate's `inputs` as written (`validate` says what is wrong with it); absent or null is none."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ConfigError(_join(path, "inputs"), "expected a list of globs")
+    return list(value)
+
+
+def _gate_affected(value: Any, path: str, inputs: list[str]) -> Affected | None:
+    """A gate's `affected: {run, paths}`; `paths` defaults to the gate's `inputs`, else `["**"]` (`validate` checks
+    the template and the globs)."""
+    if value is None:
+        return None
+    here = _join(path, "affected")
+    if not isinstance(value, dict):
+        raise ConfigError(here, "expected a mapping with `run` and `paths`")
+    for key in value:
+        if key not in AFFECTED_KEYS:
+            raise ConfigError(_join(here, str(key)), "unknown key: affected has `run` and `paths`")
+    paths = value.get("paths")
+    if paths is not None and not isinstance(paths, list):
+        raise ConfigError(_join(here, "paths"), "expected a list of globs")
+    return Affected(run=_require(value, "run", here, str), paths=list(paths) if paths is not None else list(inputs or ["**"]))
+
+
 def _build_gates(data: dict) -> dict[str, Gate]:
     out: dict[str, Gate] = {}
     for name, raw in data.items():
         path = f"gates.{name}"
         if not isinstance(raw, dict):
             raise ConfigError(path, "expected a mapping")
+        inputs = _gate_inputs(raw.get("inputs"), path)
         out[name] = Gate(
             name=name,
             run=_require(raw, "run", path, str),
@@ -814,6 +959,10 @@ def _build_gates(data: dict) -> dict[str, Gate]:
             when_exists=_optional(raw, "when_exists", path, str, None),
             baseline=raw.get("baseline"),  # kept as written: `validate` refuses anything but red or green
             agent_check=_optional(raw, "agent_check", path, bool, False),
+            group=_optional(raw, "group", path, str, None),
+            resource=_optional(raw, "resource", path, str, None),
+            inputs=inputs,
+            affected=_gate_affected(raw.get("affected"), path, inputs),
         )
     return out
 
@@ -1319,6 +1468,10 @@ class _Validator:
             self.error(_join(p, "on_fail"), f"on_fail must be one of {', '.join(ON_FAIL_VALUES)}")
         if step.gates_first and (step.type != "agent" or not step.gates):
             self.error(_join(p, "gates_first"), "gates_first needs an agent step with `gates`")
+        if not isinstance(step.gate_tier, str) or step.gate_tier not in GATE_TIERS:
+            self.error(_join(p, "gate_tier"), f"gate_tier must be one of {', '.join(GATE_TIERS)}")
+        elif step.gate_tier == "affected" and not step.gates:
+            self.error(_join(p, "gate_tier"), "gate_tier: affected needs a step with `gates`")
         if step.commit not in (True, False, "per_task"):
             self.error(_join(p, "commit"), "commit must be true, false or per_task")
         for lane in step.lanes:
@@ -1590,6 +1743,7 @@ class _Validator:
         elif confirmed is not True:
             self.add("warning", "gates_confirmed", "detected or inherited gates are a proposal: check `gates` and "
                      "`gate_sets`, then set `gates_confirmed: true`")
+        setup_gates = set(self.cfg.gate_sets.get("setup") or [])
         for name, gate in self.cfg.gates.items():
             path = f"gates.{name}"
             if gate.cwd is not None and (posixpath.isabs(gate.cwd) or ".." in gate.cwd.split("/")):
@@ -1597,6 +1751,21 @@ class _Validator:
             if gate.agent_check and (gate.cwd is not None or "\n" in gate.run.strip() or "`" in gate.run):
                 self.error(_join(path, "agent_check"), "an agent check runs from the worktree root as one line, exactly "
                            "as written: drop `cwd` and keep `run` to one line with no backtick, or turn agent_check off")
+            for key in ("group", "resource"):
+                value = getattr(gate, key)
+                if value is not None and GATE_LABEL.fullmatch(value) is None:
+                    self.error(_join(path, key), f"{key} is a name of 1-40 letters, digits, `_`, `.` or `-`")
+            if gate.group is not None and name in setup_gates:
+                self.add("warning", _join(path, "group"), "setup gates start things in order; drop `group`")
+            declared = (self.cfg.raw.get("gates") or {}).get(name)
+            if isinstance(declared, dict) and "inputs" in declared and declared["inputs"] is not None:
+                bad = [p for p in gate.inputs if not isinstance(p, str) or not p.strip() or posixpath.isabs(p)
+                       or ".." in p.split("/")]
+                if not gate.inputs or bad:
+                    self.error(_join(path, "inputs"), "inputs is a non-empty list of globs, each a relative path "
+                               "inside the repository with no `..` part")
+            if gate.affected is not None:
+                self.affected(gate.affected, _join(path, "affected"))
             if gate.baseline is None:
                 continue
             if gate.baseline not in BASELINES:
@@ -1605,6 +1774,11 @@ class _Validator:
                 self.add("warning", _join(path, "baseline"),
                          f"`{name}` failed on `{self.cfg.project.base_branch}` when the pack was set up: "
                          "fix it and remove `baseline`, or delete the gate")
+        if any(gate.inputs for gate in self.cfg.gates.values()):  # a pack that opted in: the gates left out run every time
+            for member in self.cfg.gate_sets.get("verify") or []:
+                gate = self.cfg.gates.get(member)
+                if gate is not None and not gate.inputs:
+                    self.add("warning", f"gates.{member}", f"`{member}` has no `inputs`, so it runs again after every change")
         if not self.cfg.gate_sets.get("verify"):
             self.error("gate_sets.verify", "every pack declares the gates a diff must pass: state them under "
                        "`gates:` and list them in `gate_sets.verify` (a `starter:` can supply them)")
@@ -1612,6 +1786,30 @@ class _Validator:
             for i, member in enumerate(members):
                 if member not in self.cfg.gates:
                     self.error(f"gate_sets.{name}[{i}]", f"'{member}' is not a defined gate")
+
+    def affected(self, affected: Affected, path: str) -> None:
+        """`affected.run` is a non-empty command whose one placeholder is `{paths}` (`{{` and `}}` are braces);
+        `affected.paths` is a non-empty list of relative globs with no `..` part."""
+        run = affected.run
+        try:
+            fields = [(name, spec, conversion) for _, name, spec, conversion in string.Formatter().parse(run)
+                      if name is not None]
+        except ValueError:
+            fields = None
+        if not run.strip() or fields is None or any(f != ("paths", "", None) for f in fields):
+            self.error(_join(path, "run"), "affected.run is a non-empty command whose only placeholder is `{paths}`; "
+                       "write a literal brace as `{{` or `}}`")
+        elif not unquoted_paths_word(run):
+            self.error(_join(path, "run"), "`{paths}` must be its own unquoted word: not inside quotes, "
+                       "`$(...)` or `${...}`, never after a backslash or a here-document, in a template with no "
+                       "backtick, `$'...'`, `$[`, `((`, comment `#` or line continuation after anything but a blank, "
+                       "with its quotes and substitutions balanced, so "
+                       "each file name stays one inert argument")
+        bad = [p for p in affected.paths if not isinstance(p, str) or not p.strip() or posixpath.isabs(p)
+               or ".." in p.split("/")]
+        if not affected.paths or bad:
+            self.error(_join(path, "paths"), "affected.paths is a non-empty list of globs, each a relative path "
+                       "inside the repository with no `..` part")
 
     def bug_lane(self) -> None:
         """The bug lane's red/green check runs the regression test only when a Bash allow rule covers it."""
@@ -1983,6 +2181,8 @@ class _Validator:
                 self.error(f"autonomy.resolve_kinds.{kind}", "attempts must be a whole number of at least 1")
         for key in CI_KEYS:
             value = cfg.ci.get(key)
+            if key in CI_TEXT:
+                continue
             if value is None and key in CI_OPTIONAL:  # a pack that writes its own `ci` block may leave it out: off
                 continue
             if value is None and any(step.type == "ci" for phase in cfg.phases.values() for step in phase.steps):
@@ -1994,6 +2194,22 @@ class _Validator:
         for key in cfg.ci:
             if key not in CI_KEYS:
                 self.error(f"ci.{key}", "unknown ci key")
+        self.early_pr_after()
+
+    def early_pr_after(self) -> None:
+        """`ci.early_pr_after`: empty, or a phase that comes before the phase holding the `finish` step, since the
+        draft pull request it opens early is the one `finish` audits and updates."""
+        after = self.cfg.ci.get("early_pr_after")
+        if after is None or after == "":
+            return
+        names = list(self.cfg.phases)
+        if not isinstance(after, str) or after not in self.cfg.phases:
+            self.error("ci.early_pr_after", f"must be empty or a phase in `phases`: {', '.join(names)}")
+            return
+        holding = [index for index, phase in enumerate(self.cfg.phases.values()) if _holds_finish(phase.steps)]
+        if not holding or names.index(after) >= holding[0]:
+            self.error("ci.early_pr_after", "the early draft pull request opens after this phase, so it must come "
+                       "before the phase that holds the `finish` step")
 
     def non_blocking_severities(self) -> None:
         """The floor: `critical`, `high`, `medium`, an empty severity and a missing one always block."""

@@ -11,6 +11,12 @@ step, plus the step's `forbid`. Each round is:
    a human is told once that nothing is needed. During the watch a `gh` error or no checks is no verdict; past its
    end the hold ends, then the `ci_failed` stop is raised. Every way out of the watch ends the hold, once.
 2. All passing or skipped: refresh the pull request's body, mark it ready, and finish.
+
+A draft opened early (`ci.early_pr_after`, `pr_opened` with `early`) is watched only once `finish` has audited and
+updated it (`pr_updated`); before that the step stops as if no pull request were open. Its checks are read only while
+GitHub's head for it (`headRefOid`) is the sha the runner pushed last (`pr_updated`, the merge `finish` pushes again
+for a conflicting PR, or a fix round's `ci_round`): until then they count as none yet, under the same `appear_min` and
+watch limits, so the early push's checks never pass it.
 3. A failure: run the step's `gates` (the environment), then its `fix` session with the failed jobs' logs. The
    session's own gates hold before the runner commits. A commit is pushed; no commit means the session found
    nothing in the code to change, so the failed jobs run again, at most `ci.rerun_rounds` times.
@@ -36,6 +42,7 @@ from agentflow.gitops import (
     job_log,
     mark_pr_ready,
     pr_checks,
+    pr_head,
     push,
     rerun_failed,
     update_pr_body,
@@ -79,9 +86,10 @@ class CILane:
             return "stopped"
         events = self.run.events.read()
         opened = [e for e in events if e["type"] == "pr_opened"]
-        if not opened:
+        if not opened or (opened[-1].get("early") and not self._finish_took(events)):
             return self._ci_stop(key, "There is no pull request to watch: `finish` has not opened one.")
         url = str(opened[-1]["url"])
+        self._early = bool(opened[-1].get("early"))
         link(self.run)  # a link that failed at `finish` gets another try; a no-op once `issue_linked` is logged
         if any(e["type"] == "pr_marked_ready" for e in events):
             self.run.emit("step_finished", key=key, status="done", summary=f"ready for review: {url}")
@@ -112,6 +120,39 @@ class CILane:
             else:
                 return self._ci_stop(key, f"CI failed ({detail}), and the fix session found nothing in the code to change.",
                                   self._report(key, checks))
+
+    def _finish_took(self, events: list[dict]) -> bool:
+        """`finish` audited the tree and opened or updated the pull request: a `pr_updated`, or a `pr_opened` that is
+        not early, carrying the key of a `finish` step."""
+        keys = _finish_keys(self.cfg)
+        return any(e.get("key") in keys and (e["type"] == "pr_updated"
+                                              or (e["type"] == "pr_opened" and not e.get("early")))
+                   for e in events)
+
+    def _pushed_sha(self) -> str:
+        """The sha the runner pushed last to the pull request: of the `pr_updated`, `pr_opened`, `ci_round` and
+        `base_synced` events (the merge `confirm_mergeable` pushes when GitHub calls the PR conflicting) that carry
+        one, the latest by seq; "" when none does. `finish`'s own merge comes before its `pr_updated`, so it never
+        shadows it. A merge committed but never pushed names a sha GitHub does not show: that is stale, never a pass."""
+        shas = [str(e["sha"]) for e in self.run.events.read()
+                if e["type"] in ("pr_updated", "pr_opened", "ci_round", "base_synced") and e.get("sha")]
+        return shas[-1] if shas else ""
+
+    def _stale_head(self, url: str) -> str:
+        """For an early draft only: why its checks cannot be read yet ("" when they can). GitHub's head for it must
+        be the sha the runner pushed last, or its checks may still be the early push's."""
+        if not self._early:
+            return ""
+        want = self._pushed_sha()
+        if not want:  # `_finish_took` guarantees one for a real early PR: none is never read as a match
+            return f"no pushed commit is recorded for {url}"
+        try:
+            got = pr_head(self.worktree, url)
+        except GhError as exc:
+            return f"GitHub's head for {url} could not be read: {exc}"
+        if got == want:
+            return ""
+        return f"GitHub still shows {url} at {got[:12] or 'no commit'}, not the pushed {want[:12]}"
 
     def _next_session(self, key: str, step: Step) -> int:
         """The next fix session's number. Sessions are counted, not rounds: a round can reuse no finished session,
@@ -153,14 +194,16 @@ class CILane:
                     held = self._end_hold(key, held)
                     return "stopped", "", []
                 waited = (time.monotonic() - started) / 60
+                stale = self._stale_head(url)  # an early draft whose head is not the pushed sha: none yet
                 try:
-                    checks = pr_checks(self.worktree, url)
+                    checks = [] if stale else pr_checks(self.worktree, url)
                     error = ""
                 except GhError as exc:  # GitHub being unreachable for a moment is no verdict on the code
                     checks, error = [], str(exc)
                 if not checks and not error and deadline is None:  # none yet: GitHub has not seen the push, or no CI
                     if waited >= float(settings["appear_min"]):
-                        self._ci_stop(key, f"GitHub reported no checks for {url} after {waited:.0f} minutes.")
+                        what = stale or f"GitHub reported no checks for {url}"
+                        self._ci_stop(key, f"{what} after {waited:.0f} minutes.")
                         return "stopped", "", []
                     continue
                 failed = failed_checks(checks or [])
@@ -173,7 +216,8 @@ class CILane:
                     return "fail", ", ".join(_failed_names(checks)), checks
                 if deadline is not None:  # watching: a `gh` error or no checks (just after a re-run) is no verdict
                     if time.time() >= deadline:
-                        why = error or (f"{len(pending)} check(s) still pending" if checks else "GitHub reported no checks")
+                        why = error or stale or (f"{len(pending)} check(s) still pending" if checks
+                                                 else "GitHub reported no checks")
                         held = self._end_hold(key, held)  # before the stop: `metrics` reads the hold's end as a wait's
                         self._ci_stop(key, f"CI did not settle within {timeout_min} minutes and {watch_h} h of "
                                            f"watching: {why}.")
@@ -195,6 +239,8 @@ class CILane:
         finally:
             if held:
                 self.run.emit("run_hold_ended", key=key)
+
+    _early: bool = False  # the pull request watched is a draft opened early: its head is checked before its checks
 
     def _end_hold(self, key: str, held: bool) -> bool:
         """End the CI watch's hold if one is open; returns the new `held` (False)."""
@@ -283,3 +329,19 @@ class CILane:
 
     def _ci_raise(self, kind: str, key: str, summary: str, extra: str = "") -> None:
         raise_hitl(self.cfg, self.run, kind, key, summary, extra=extra)
+
+
+def _finish_keys(cfg: Config) -> set[str]:
+    """The step keys of every `type: finish` step, inside groups too."""
+    keys: set[str] = set()
+
+    def walk(steps: list[Step], prefix: str) -> None:
+        for step in steps:
+            key = f"{prefix}/{step.id}"
+            if step.type == "finish":
+                keys.add(key)
+            walk(step.steps, key)
+
+    for name, phase in cfg.phases.items():
+        walk(phase.steps, name)
+    return keys

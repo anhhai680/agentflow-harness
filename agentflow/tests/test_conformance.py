@@ -84,6 +84,45 @@ def test_a_skipped_gate_counts_with_its_reason(cfg):
     assert finding.evidence == [e["seq"] for e in events]
 
 
+def test_a_pass_with_the_final_trees_input_hash_is_evidence(cfg):
+    events = gates(1, cfg, "t1", input_hash="h")
+    floor = ob(FLOOR_ID, "gates:verify")
+    finding = evaluate(cfg, events, [floor], "t2", input_hashes={g: "h" for g in cfg.gate_sets["verify"]})[0]
+    assert finding.status == "satisfied" and finding.evidence == [e["seq"] for e in events]
+
+
+def test_a_pass_whose_input_hash_differs_is_not_evidence(cfg):
+    events = gates(1, cfg, "t1", input_hash="h")
+    floor = ob(FLOOR_ID, "gates:verify")
+    finding = evaluate(cfg, events, [floor], "t2", input_hashes={g: "other" for g in cfg.gate_sets["verify"]})[0]
+    assert finding.status == "missing" and "no result on the final tree" in finding.note
+    assert evaluate(cfg, events, [floor], "t2")[0].status == "missing"  # no hashes given: the tree rule alone
+    bare = gates(1, cfg, "t1")  # a result with no `input_hash` never matches
+    assert evaluate(cfg, bare, [floor], "t2", input_hashes={g: "h" for g in cfg.gate_sets["verify"]})[0].status == "missing"
+
+
+def test_a_failed_pass_with_a_matching_input_hash_is_not_evidence(cfg):
+    events = [{**e, "passed": False} for e in gates(1, cfg, "t1", input_hash="h")]
+    floor = ob(FLOOR_ID, "gates:verify")
+    finding = evaluate(cfg, events, [floor], "t2", input_hashes={g: "h" for g in cfg.gate_sets["verify"]})[0]
+    assert finding.status == "missing"
+
+
+def test_an_affected_result_is_never_floor_evidence(cfg):
+    floor = ob(FLOOR_ID, "gates:verify")
+    hashes = {g: "h" for g in cfg.gate_sets["verify"]}
+    passed = gates(1, cfg, "t1", tier="affected", input_hash="h")
+    skipped = [{**e, "passed": False, "skipped": True, "reason": "no affected paths"}
+               for e in gates(50, cfg, "t1", tier="affected")]
+    for events in (passed, skipped, passed + skipped):
+        finding = evaluate(cfg, events, [floor], "t1", input_hashes=hashes)[0]
+        assert finding.status == "missing" and "no result on the final tree" in finding.note
+    assert set(missing_gates(cfg, evaluate(cfg, skipped, [floor], "t1"))) == set(cfg.gate_sets["verify"])
+    full = gates(100, cfg, "t1")  # a full-tier result, before or after, still counts
+    assert evaluate(cfg, full + passed, [floor], "t1")[0].status == "satisfied"
+    assert evaluate(cfg, skipped + full, [floor], "t1")[0].evidence == [e["seq"] for e in full]
+
+
 # --------------------------------------------------------------------------- steps
 
 
@@ -236,6 +275,26 @@ def test_a_fix_that_ran_the_verify_gates_keeps_earlier_evidence(cfg):
     assert [f.status for f in evaluate(cfg, covered, obligations, "t")] == ["satisfied", "satisfied"]
     skipped = base + verify_gates(10, cfg, key, skipped=True, passed=False) + [ev(20, "step_committed", key=key, sha="f")]
     assert [f.status for f in evaluate(cfg, skipped, obligations, "t")] == ["satisfied", "satisfied"]
+
+
+def test_a_fix_whose_verify_gates_were_reused_keeps_earlier_evidence(cfg):
+    """`gates_reused` under the fix's key counts as a pass of each gate it names, in log order: some gates reused and
+    the rest run is coverage; a reused gate whose later result under the key failed is not."""
+    obligations = [ob("verified", "step:verify")]
+    key = "review/fix_findings"
+    names = cfg.gate_sets["verify"]
+    base = [finished(4, "verify/verify")]
+    commit = [ev(30, "step_committed", key=key, sha="f")]
+    reused = [ev(10, "gates_reused", key=key, tree="x", gates=names, **{"from": ["verify/verify"]})]
+    assert evaluate(cfg, base + reused + commit, obligations, "t")[0].status == "satisfied"
+    mixed = [ev(10, "gates_reused", key=key, tree="x", gates=names[1:], **{"from": ["verify/verify"]}),
+             ev(11, "gate_result", key=key, gate=names[0], passed=True, skipped=False, reason="", tree="x")]
+    assert evaluate(cfg, base + mixed + commit, obligations, "t")[0].status == "satisfied"
+    then_failed = reused + [ev(12, "gate_result", key=key, gate=names[0], passed=False, skipped=False, reason="",
+                               tree="y")]
+    assert evaluate(cfg, base + then_failed + commit, obligations, "t")[0].status == "missing"
+    elsewhere = [ev(10, "gates_reused", key="verify/verify", tree="x", gates=names, **{"from": ["build/build"]})]
+    assert evaluate(cfg, base + elsewhere + commit, obligations, "t")[0].status == "missing"
 
 
 def test_a_commit_without_the_verify_gates_still_makes_evidence_stale(cfg):
@@ -755,3 +814,234 @@ def test_an_unparseable_obligation_is_missing_at_finish(flow_repo, gh, git):
     assert advance(run, flow_repo.cfg, RunOptions()) == "done"  # report mode: the gap ships, shown
     typo = next(o for o in last(flow_repo, run, "conformance_checked")["obligations"] if o["id"] == "typo")
     assert typo["status"] == "missing" and typo["note"] == "unrecognised evidence item"
+
+
+def test_audit_reuses_a_pass_by_input_hash(flow_repo, gh, git):
+    from test_feature_lane import SMALL
+
+    from agentflow.gates import input_hashes
+    from agentflow.guards import snapshot
+
+    flow_repo.configure({**SMALL, "gates": {"ok": {"inputs": ["only_here/**"]}}})
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="ship"))
+    worktree = Path(run.state["worktree"])
+    earlier = input_hashes(flow_repo.cfg, [flow_repo.cfg.gates["ok"]], worktree, snapshot(worktree))
+    # the pass is on another tree (the run's code changed since, outside `only_here/**`), and carries the same hash
+    run.emit("gate_result", key="verify/verify", gate="ok", passed=True, skipped=False, reason="", tree="older",
+             input_hash=earlier["ok"])
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    checked = last(flow_repo, run, "conformance_checked")
+    floor = next(o for o in checked["obligations"] if o["id"] == FLOOR_ID)
+    assert floor["status"] == "satisfied" and floor["note"] == ""
+    assert not [e for e in flow_repo.events(run, "gate_result") if e.get("key") == FINISH]
+
+
+# --------------------------------------------------------------------------- the full verify set once, at finish
+
+# A neutral finding: no security keyword, so no security review joins the round.
+TIERED_FINDING = {"severity": "blocking", "file": "src/one.py", "line": 3, "text": "Thiếu kiểm tra giá trị rỗng"}
+DONE = {"status": "done", "summary": "did it"}
+
+
+def tiered(flow_repo, run_cmd: str = "echo fine", sync: dict | None = None, patch: dict | None = None) -> None:
+    """The verify set is one gate, `ok`, whose `inputs` and `affected` paths are `src/**`; both `fix_findings` steps
+    run the affected tier; the run ends at `finish` (no `ci` step), whose `sync` step gets `sync` on top. `patch`
+    goes on top of the config."""
+    def edit(data: dict) -> None:
+        for phase in ("verify", "review"):
+            for step in data["phases"][phase]["steps"]:
+                if isinstance(step, dict) and step.get("id") == "fix_findings":
+                    step["gate_tier"] = "affected"
+        data["phases"]["ship"]["steps"] = [s for s in data["phases"]["ship"]["steps"] if s.get("type") != "ci"]
+        next(s for s in data["phases"]["ship"]["steps"] if s.get("type") == "finish")["sync"].update(sync or {})
+
+    gate = {"run": run_cmd, "inputs": ["src/**"], "affected": {"run": "true {paths}", "paths": ["src/**"]}}
+    config = {"gate_sets": {"build": ["ok"], "verify": ["ok"], "setup": []}, "gates": {"ok": gate}}
+    for name, value in (patch or {}).items():
+        config[name] = {**config.get(name, {}), **value}
+    flow_repo.configure(config, autopilot=True, edit=edit)
+
+
+def review_fixing(flow_repo, path: str, extra: dict | None = None) -> None:
+    flow_repo.script({BRANCH_REVIEW: [review(TIERED_FINDING), review()],
+                      "review/fix_findings": [{"write": {path: "x = 2\n"}, "result": DONE}], **(extra or {})})
+
+
+def audit_gate_runs(monkeypatch) -> list:
+    """The `run_gates` calls the conformance audit makes."""
+    import agentflow.conformance as conformance
+
+    calls: list = []
+    real = conformance.run_gates
+
+    def recording(cfg, names, *args, **kwargs):
+        calls.append(names)
+        return real(cfg, names, *args, **kwargs)
+
+    monkeypatch.setattr(conformance, "run_gates", recording)
+    return calls
+
+
+def test_a_tiered_run_runs_the_full_suite_once(flow_repo, gh, git, monkeypatch):
+    """The verify step runs the full set; the review's fix lands outside the gate's `inputs`, so its gates reuse that
+    pass (no gate result under its key), and its commit still counts as verified work: nothing goes stale."""
+    from datetime import UTC, datetime
+
+    from agentflow.metrics import run_metrics
+    from agentflow.signals import run_signals
+
+    tiered(flow_repo, patch={"policy": {"enforce": "block"}})
+    review_fixing(flow_repo, "docs/note.md")  # outside the gate's `inputs`
+    audited = audit_gate_runs(monkeypatch)
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="verify"))
+    run.emit("phase_approved", phase="plan", by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done", run.state["waiting"]
+    events = run.events.read()
+    assert not [e for e in events if e["type"] == "gate_result" and e["key"] == "review/fix_findings"]
+    reused = [e for e in events if e["type"] == "gates_reused" and e["key"] == "review/fix_findings"]
+    assert reused and reused[-1]["gates"] == ["ok"]
+    assert [e for e in events if e["type"] == "step_committed" and e["key"] == "review/fix_findings"]
+    assert run_signals(events, run_metrics(events, datetime.now(UTC)), full_suite=["ok"])["full_suite_runs"] == 1
+    assert last(flow_repo, run, "conformance_checked")["passed"] is True
+    assert audited == [] and pushed(git, flow_repo, run) and len(created(gh)) == 1
+
+
+def test_a_fix_with_no_earlier_full_pass_runs_the_full_set_once_at_finish(flow_repo, gh, git, monkeypatch):
+    from datetime import UTC, datetime
+
+    from agentflow.metrics import run_metrics
+    from agentflow.signals import run_signals
+
+    tiered(flow_repo)
+    review_fixing(flow_repo, "docs/note.md")  # outside the gate's `inputs`
+    audited = audit_gate_runs(monkeypatch)
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="review"))
+    other_evidence(run)
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done", run.state["waiting"]
+    events = run.events.read()
+    fixed = [e for e in events if e["type"] == "gate_result" and e["key"] == "review/fix_findings"]
+    assert [(e["gate"], e.get("tier"), e["skipped"]) for e in fixed] == [("ok", "affected", True)]
+    assert run_signals(events, run_metrics(events, datetime.now(UTC)), full_suite=["ok"])["full_suite_runs"] == 1
+    assert [e["gate"] for e in events if e["type"] == "gate_result" and e["key"] == FINISH] == ["ok"]
+    assert last(flow_repo, run, "conformance_checked")["passed"] is True
+    assert audited == [] and pushed(git, flow_repo, run) and len(created(gh)) == 1
+
+
+def test_a_fix_inside_the_inputs_runs_the_full_set_again_at_finish(flow_repo, gh, git, monkeypatch):
+    from agentflow.gates import input_hashes
+
+    tiered(flow_repo)
+    review_fixing(flow_repo, "src/x.py")  # inside the gate's `inputs`
+    audited = audit_gate_runs(monkeypatch)
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="verify"))
+    run.emit("phase_approved", phase="plan", by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done", run.state["waiting"]
+    tree = final_tree(git, run)
+    at_finish = [e for e in flow_repo.events(run, "gate_result") if e.get("key") == FINISH and e["gate"] == "ok"]
+    assert len(at_finish) == 1 and "tier" not in at_finish[0] and at_finish[0]["passed"]
+    worktree = Path(run.state["worktree"])
+    assert at_finish[0]["input_hash"] == input_hashes(flow_repo.cfg, [flow_repo.cfg.gates["ok"]], worktree, tree)["ok"]
+    assert audited == []  # the final check gave the audit its evidence
+    checked = last(flow_repo, run, "conformance_checked")
+    floor = next(o for o in checked["obligations"] if o["id"] == FLOOR_ID)
+    assert checked["passed"] is True and floor["evidence"] == [at_finish[0]["seq"]]
+    assert pushed(git, flow_repo, run)
+
+
+def test_a_final_check_failure_goes_to_the_sync_session_and_is_committed(flow_repo, gh, git):
+    tiered(flow_repo, run_cmd="test -f fixed.txt")  # the full command fails until `fixed.txt` exists
+    review_fixing(flow_repo, "src/x.py", {
+        f"{FINISH}/final_fix": [{"write": {"fixed.txt": "ok\n"}, "result": {"status": "done", "summary": "fixed"}}]})
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="review"))
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done", run.state["waiting"]
+    events = run.events.read()
+    assert not [e for e in events if e["type"] == "hitl_raised"]
+    failed = [e for e in events if e["type"] == "gate_result" and e["key"] == FINISH]
+    assert [(e["gate"], e["passed"]) for e in failed] == [("ok", False)]
+    (commit,) = [e for e in events if e["type"] == "step_committed" and e["key"] == f"{FINISH}/final_fix"]
+    (opened,) = [e for e in events if e["type"] == "pr_opened"]
+    assert commit["seq"] < opened["seq"]
+    worktree = Path(run.state["worktree"])
+    assert git(worktree, "log", "-1", "--format=%s").strip() == "Fix what the full verify run found"
+    assert git(worktree, "rev-parse", "HEAD").strip() == commit["sha"]
+    assert "fixed.txt" in git(flow_repo.origin, "ls-tree", "--name-only", run.state["branch"])
+    assert [c["step"] for c in flow_repo.calls()].count(f"{FINISH}/final_fix") == 1
+
+
+def test_without_a_deferred_run_finish_is_unchanged(flow_repo, gh, git):
+    run = begin_finish(flow_repo)  # no step ran the affected tier
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    events = run.events.read()
+    assert not [e for e in events if "final_fix" in str(e.get("key") or "")]
+    start_seq = next(e["seq"] for e in events if e["type"] == "phase_started")
+    assert [e["type"] for e in events if e["seq"] >= start_seq] == [
+        "phase_started", "gate_result", "conformance_checked", "pr_opened", "step_finished", "phase_approved",
+        "handoff_written", "run_finished"]
+
+
+def test_a_final_check_failure_with_no_fix_session_is_a_gate_failed_stop(flow_repo, gh, git):
+    tiered(flow_repo, run_cmd="test -f fixed.txt", sync={"fix_loop": False})
+    review_fixing(flow_repo, "src/x.py")
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="review"))
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    raised = last(flow_repo, run, "hitl_raised")
+    assert raised["kind"] == "gate_failed" and raised["key"] == FINISH and "would push: ok" in raised["summary"]
+    assert f"{FINISH}/final_fix" not in [c["step"] for c in flow_repo.calls()]
+    assert flow_repo.events(run, "conformance_checked") == [] and not pushed(git, flow_repo, run)
+
+
+def test_a_final_fix_with_a_reused_gate_keeps_the_earlier_evidence_in_block_mode(flow_repo, gh, git):
+    """Verify set `[ok, other]`. `ok` fails only once the review's fix exists and until `fixed.txt` does; `other`'s
+    inputs never change, so every later step reuses its first pass. The final fix's commit is verified work (`ok`
+    ran, `other` was reused), so the verify step and the review still count, and block mode lets the push go."""
+    tiered(flow_repo, run_cmd="test -f fixed.txt || test ! -f src/x.py", patch={
+        "gate_sets": {"verify": ["ok", "other"]}, "gates": {"other": {"run": "echo other", "inputs": ["lib/**"]}},
+        "policy": {"enforce": "block"}})
+    review_fixing(flow_repo, "src/x.py", {
+        f"{FINISH}/final_fix": [{"write": {"fixed.txt": "ok\n"}, "result": {"status": "done", "summary": "fixed"}}]})
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="verify"))
+    run.emit("phase_approved", phase="plan", by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done", run.state["waiting"]
+    events = run.events.read()
+    fix = f"{FINISH}/final_fix"
+    assert [(e["gate"], e["passed"]) for e in events if e["type"] == "gate_result" and e["key"] == fix] == [("ok", True)]
+    assert any(e["type"] == "gates_reused" and e["key"] == fix and e["gates"] == ["other"] for e in events)
+    assert [e for e in events if e["type"] == "step_committed" and e["key"] == fix]
+    checked = last(flow_repo, run, "conformance_checked")
+    assert checked["passed"] is True, checked["obligations"]
+    assert pushed(git, flow_repo, run)
+
+
+def test_a_stopped_final_fix_resumes_on_approval_and_reaches_a_pull_request(flow_repo, gh, git):
+    fix = f"{FINISH}/final_fix"
+    tiered(flow_repo, run_cmd="test -f fixed.txt")
+    trying = {"write": {"notes/try.txt": "tried\n"}, "result": {"status": "done", "summary": "tried"}}
+    review_fixing(flow_repo, "src/x.py", {
+        fix: [trying, trying, trying, {"write": {"fixed.txt": "ok\n"}, "result": {"status": "done", "summary": "fixed"}}]})
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="review"))
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    waiting = run.state["waiting"]
+    assert waiting["kind"] == "fix_attempts_exhausted" and waiting["key"] == fix
+    assert (Path(run.state["worktree"]) / "notes" / "try.txt").is_file()  # the session's edits are still uncommitted
+    approve(run, fix, by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done", run.state["waiting"]
+    events = run.events.read()
+    assert [e["kind"] for e in events if e["type"] == "hitl_raised"] == ["fix_attempts_exhausted"]
+    (commit,) = [e for e in events if e["type"] == "step_committed" and e["key"] == fix]
+    (opened,) = [e for e in events if e["type"] == "pr_opened"]
+    assert commit["seq"] < opened["seq"] and "fixed.txt" in git(flow_repo.origin, "ls-tree", "--name-only",
+                                                                  run.state["branch"])
+
+
+def test_a_final_check_that_fails_after_the_final_fix_is_done_is_a_gate_failed_stop(flow_repo, gh, git):
+    fix = f"{FINISH}/final_fix"
+    tiered(flow_repo, run_cmd="test -f fixed.txt")
+    review_fixing(flow_repo, "src/x.py")
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="review"))
+    run.emit("step_started", key=fix, phase="ship")
+    run.emit("step_finished", key=fix, status="done", summary="an earlier final fix")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    raised = last(flow_repo, run, "hitl_raised")
+    assert raised["kind"] == "gate_failed" and raised["key"] == FINISH and "would push: ok" in raised["summary"]
+    assert fix not in [c["step"] for c in flow_repo.calls()]
+    assert flow_repo.events(run, "conformance_checked") == [] and not pushed(git, flow_repo, run)

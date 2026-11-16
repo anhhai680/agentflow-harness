@@ -482,7 +482,8 @@ class _Loop:
         return False, None
 
     def hand_off(self, names: list[str], index: int, executor: Executor) -> None:
-        """After `phase_approved`: write the handoff and compare the skill footer with the route."""
+        """After `phase_approved`: write the handoff and compare the skill footer with the route; last, when
+        `ci.early_pr_after` names this phase, open the draft pull request (`open_early_pr`, which never stops)."""
         name = names[index]
         path = write_handoff(self.cfg, self.run, name)
         footers = [e for e in self.run.events.read() if e["type"] == "skill_footer" and e.get("phase") == name]
@@ -491,6 +492,8 @@ class _Loop:
         if got and expected and got.lstrip("/") != expected.lstrip("/"):
             self.run.emit("footer_mismatch", phase=name, expected=expected, got=got)
         self.run.emit("handoff_written", phase=name, path=str(path))
+        if self.cfg.ci.get("early_pr_after") == name:
+            executor.open_early_pr(name)
 
 
 def retried(events: list[dict], phase: str) -> bool:
@@ -809,5 +812,7 @@ def dry_run(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptio
             print("  (all steps skipped)", file=out)
         elif needs_approval(phase):
             print(f"⏸ {name}_approved", file=out)
+        if ran and cfg.ci.get("early_pr_after") == name:
+            print("  ⇪ early draft PR: git push origin <branch>; gh pr create --draft", file=out)
         if name == opts.to_phase:
             break

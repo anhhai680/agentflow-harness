@@ -134,7 +134,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 30
+    assert len(FAMILIES) == 31
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -315,6 +315,15 @@ def test_full_suite_runs_counts_each_batch_on_the_same_step():
     assert run_signals(evs, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 2
 
 
+def test_an_affected_batch_is_not_a_full_suite_run():
+    affected = [{**_gate("review/fix_findings", g, True), "tier": "affected"} for g in VERIFY]
+    assert run_signals(affected, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 0
+    mixed = [_gate("ship/ci/fix-1", "lint", True), {**_gate("ship/ci/fix-1", "unit", True), "tier": "affected"}]
+    assert run_signals(mixed, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 0
+    full = [_gate("verify/verify", g, True) for g in VERIFY]
+    assert run_signals(affected + full, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 1
+
+
 def test_full_suite_runs_reads_old_gate_results():
     old = [{"seq": 1, "type": "gate_result", "key": "verify/verify", "gate": g, "passed": True} for g in VERIFY]
     assert run_signals(old, EMPTY_METRICS, full_suite=VERIFY)["full_suite_runs"] == 1
@@ -329,3 +338,14 @@ def test_the_throughput_families_are_plain_lower_signals():
     for family in ("lead_time_h", "human_blocked_share", "full_suite_runs"):
         assert FAMILIES[family] == ("lower", False) and parse_target(family) == (family, None)
     assert "full_suite_runs" in COUNT_FAMILIES and "lead_time_h" not in COUNT_FAMILIES
+
+
+def test_gate_cache_hit_rate():
+    ran = [_gate("verify/verify", g, True) for g in ("a", "b", "c")] + [_gate("verify/verify", "d", False, skipped=True)]
+    reused = [_ev("gates_reused", key="ship/finish", gates=["a"])]
+    assert run_signals(ran + reused, EMPTY_METRICS)["gate_cache_hit_rate"] == 0.25  # 1 reused of 1 + 3 that ran
+    assert "gate_cache_hit_rate" not in run_signals([], EMPTY_METRICS)
+    assert "gate_cache_hit_rate" not in run_signals([_gate("verify/verify", "d", False, skipped=True)], EMPTY_METRICS)
+    assert run_signals(ran, EMPTY_METRICS)["gate_cache_hit_rate"] == 0.0
+    assert parse_target("gate_cache_hit_rate") == ("gate_cache_hit_rate", None)
+    assert parse_target("gate_cache_hit_rate:x") is None

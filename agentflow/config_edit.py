@@ -177,6 +177,8 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("ci", "rerun_rounds"), "Rerun rounds", _INT),
         (("ci", "watch_max_h"), "Watch pending checks after the timeout for (h, 0 = stop)",
          {"kind": "number", "min": 0, "max": 720}),
+        (("ci", "early_pr_after"), "Open the draft PR after phase (empty = at finish)",
+         {"kind": "text", "allow_empty": True}),
     ]),
     ("Human in the loop", "Reminders and parking.", [
         (("hitl", "remind_after_h"), "Remind after (h)", _NUM),

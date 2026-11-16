@@ -125,6 +125,22 @@ def test_the_form_sets_the_ci_watch(shipped):
             form(shipped, (["ci", "watch_max_h"], bad))
 
 
+def test_the_form_sets_the_early_pr_phase(shipped):
+    proposal = form(shipped, (["ci", "early_pr_after"], "verify"))
+    assert not proposal.errors, proposal.errors
+    assert changed_lines(proposal.diff) == ["+  early_pr_after: verify"]
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).ci["early_pr_after"] == "verify"
+    proposal = form(shipped, (["ci", "early_pr_after"], ""))
+    assert not proposal.errors, proposal.errors  # empty: the draft PR opens at `finish`, as it always has
+    proposal = form(shipped, (["ci", "early_pr_after"], "nope"))
+    assert [i.path for i in proposal.errors] == ["ci.early_pr_after"]
+    with pytest.raises(EditError):
+        config_edit.save(shipped, proposal)
+    with pytest.raises(EditError):
+        form(shipped, (["ci", "early_pr_after"], "two\nlines"))
+
+
 def test_the_form_sets_the_board_refresh(shipped):
     proposal = form(shipped, (["dashboard", "board_refresh_s"], 5))
     assert not proposal.errors, proposal.errors
@@ -250,6 +266,16 @@ def test_the_form_refuses_switching_refinement_off(shipped):
     assert listed != SHIPPED
     proposal = config_edit.propose(shipped, sha, text=listed, repo=REPO)
     assert "autonomy.non_blocking_severities" in [i.path for i in proposal.errors]
+
+
+def test_gate_groups_are_protected(shipped):
+    _, sha = config_edit.read(shipped)
+    old = 'floor:        {run: "true"}'
+    assert old in SHIPPED
+    for extra in ("group: api", "resource: db"):
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=SHIPPED.replace(old, f'floor:        {{run: "true", {extra}}}', 1),
+                                repo=REPO)
 
 
 def test_reconciles_blocks_on_findings_and_the_doubt_skill_are_protected(shipped):
@@ -1018,3 +1044,26 @@ def test_the_issues_section_refuses_bad_values(sparse_repo, key, value):
     except EditError:
         return
     assert proposal.errors
+
+
+def test_gate_inputs_are_protected(shipped):
+    _, sha = config_edit.read(shipped)
+    old = 'floor:        {run: "true"}'
+    assert old in SHIPPED
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=SHIPPED.replace(old, 'floor:        {run: "true", inputs: ["api/**"]}', 1),
+                            repo=REPO)
+
+
+def test_gate_affected_and_gate_tier_are_protected(shipped):
+    _, sha = config_edit.read(shipped)
+    old = 'floor:        {run: "true"}'
+    assert old in SHIPPED
+    affected = 'floor:        {run: "true", affected: {run: "true {paths}", paths: ["**/*.py"]}}'
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=SHIPPED.replace(old, affected, 1), repo=REPO)
+    step = 'when: refine_round, gates: verify, fix_loop: true, commit: true, message: "Fix findings"}'
+    assert SHIPPED.count(step) == 1
+    tiered = step.replace("gates: verify,", "gates: verify, gate_tier: affected,")
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=SHIPPED.replace(step, tiered, 1), repo=REPO)

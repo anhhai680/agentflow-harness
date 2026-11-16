@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agentflow.config import load_config, validate
+from agentflow.config import FLOOR_ID, load_config, validate
 from agentflow.gitops import merge_in_progress
 from agentflow.hitl import approve
 from agentflow.pipeline import RunOptions, advance, start
@@ -235,6 +235,30 @@ def test_a_merge_the_gates_never_accept_is_not_committed_or_pushed(flow_repo, gh
     assert not pushed(git, flow_repo, run) and not verbs(gh, "create") and not flow_repo.events(run, "base_synced")
 
 
+def test_an_affected_sync_checks_the_paths_the_merge_brings_and_the_audit_still_runs_in_full(flow_repo, gh, git):
+    def tiered(data):
+        finish = next(s for s in data["phases"]["ship"]["steps"] if s.get("id") == "finish")
+        finish["sync"]["gate_tier"] = "affected"
+
+    flow_repo.configure({**BASE, "conditions": {"eval_required": None},
+                         "gates": {"ok": {"affected": {"run": "printf '%s\\n' {paths} >> ../merge-paths.txt",
+                                                       "paths": ["**/*.py"]}}}}, edit=tiered)
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="ship"))
+    own_work(flow_repo, run, {"mine.py": "mine = 1\n"})
+    target_moves(flow_repo, git, {"upstream.py": "theirs = 1\n", "notes.txt": "n\n"})
+    assert go(flow_repo, run) == "done"
+    results = [e for e in flow_repo.events(run, "gate_result") if e["gate"] == "ok"]
+    merge = [e for e in results if e.get("tier") == "affected"]
+    assert len(merge) == 1 and merge[0]["passed"]
+    seen = Path(run.state["worktree"]).parent / "merge-paths.txt"  # beside the worktree, so the merge stays clean
+    assert seen.read_text(encoding="utf-8") == "upstream.py\n"  # what the merge brings, not the branch's own mine.py
+    (checked,) = flow_repo.events(run, "conformance_checked")
+    full = [e for e in results if "tier" not in e and e.get("tree") == checked["tree"]]
+    assert full, "the audit ran the verify gate in full on the final tree"
+    floor = next(o for o in checked["obligations"] if o["id"] == FLOOR_ID)  # a ship-only run lacks the others
+    assert floor["status"] == "satisfied" and set(floor["evidence"]) == {e["seq"] for e in full}
+
+
 def test_a_pack_without_an_eval_condition_checks_the_merge_without_the_eval_gate(flow_repo, gh, git):
     """`eval_required` is a pack's condition, not the engine's: a pack that defines none never runs the eval gate."""
     run = begin(flow_repo, {"conditions": {"eval_required": None}})
@@ -263,6 +287,39 @@ def test_a_pull_request_that_stays_conflicting_is_a_humans(flow_repo, gh, git, m
     assert go(flow_repo, run) == "waiting_human"
     assert run.state["waiting"]["kind"] == "blocked" and "still conflicts" in run.state["waiting"]["summary"]
     assert len(verbs(gh, "view")) == 3  # the first look and one per `ci.sync_rounds`
+
+
+def test_a_merge_after_the_audit_runs_the_sync_gates_in_full(flow_repo, gh, git, monkeypatch):
+    """`sync` runs at the affected tier, but the merge that follows a `CONFLICTING` verdict on the open pull
+    request is pushed with no audit after it: its gates run in full."""
+    from agentflow.sync_lane import SyncLane
+
+    def tiered(data):
+        next(s for s in data["phases"]["ship"]["steps"] if s.get("id") == "finish")["sync"]["gate_tier"] = "affected"
+
+    flow_repo.configure({**BASE, "conditions": {"eval_required": None},
+                         "gates": {"ok": {"affected": {"run": "true {paths}", "paths": ["**/*.py"]}}}}, edit=tiered)
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="ship"))
+    own_work(flow_repo, run, {"mine.py": "mine = 1\n"})
+    target_moves(flow_repo, git, {"upstream.py": "theirs = 1\n"})
+    verdicts = iter(["CONFLICTING", "MERGEABLE"])
+
+    def mergeable(self, url):  # the target moves again while the pull request is opened
+        verdict = next(verdicts)
+        if verdict == "CONFLICTING":
+            target_moves(flow_repo, git, {"later.py": "later = 1\n"})
+        return verdict
+
+    monkeypatch.setattr(SyncLane, "_mergeable", mergeable)
+    assert go(flow_repo, run) == "done"
+    events = run.events.read()
+    opened = next(e["seq"] for e in events if e["type"] == "pr_opened")
+    first, again = [e for e in events if e["type"] == "base_synced"]
+    assert again["seq"] > opened and on_origin(git, flow_repo, run, "later.py") == "later = 1\n"
+    before = [e for e in events if e["type"] == "gate_result" and e["gate"] == "ok" and e["seq"] < first["seq"]]
+    assert [e.get("tier") for e in before] == ["affected"]  # the merge inside `finish`, before the audit
+    remerge = [e for e in events if e["type"] == "gate_result" and opened < e["seq"] < again["seq"]]
+    assert remerge and all("tier" not in e and e["passed"] for e in remerge)
 
 
 def test_an_unclear_verdict_is_left_to_ci(flow_repo, gh, git, monkeypatch):
