@@ -151,6 +151,14 @@ def test_the_form_sets_the_board_refresh(shipped):
             form(shipped, (["dashboard", "board_refresh_s"], bad))
 
 
+def test_the_form_sets_the_artifact_cap(shipped):
+    config_edit.save(shipped, form(shipped, (["dashboard", "artifact_max_kb"], 1024)))
+    assert load_config(shipped).dashboard["artifact_max_kb"] == 1024
+    for bad in (8, 10000):
+        with pytest.raises(EditError):
+            form(shipped, (["dashboard", "artifact_max_kb"], bad))
+
+
 def test_an_optional_text_field_set_to_null_removes_the_key(shipped):
     proposal = form(shipped, (["phases", "verify", "model"], None))
     assert changed_lines(proposal.diff) == ["-    model: sonnet"]
