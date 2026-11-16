@@ -1028,3 +1028,12 @@ def test_the_issues_section_refuses_bad_values(sparse_repo, key, value):
     except EditError:
         return
     assert proposal.errors
+
+
+def test_gate_inputs_are_protected(shipped):
+    _, sha = config_edit.read(shipped)
+    old = 'floor:        {run: "true"}'
+    assert old in SHIPPED
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=SHIPPED.replace(old, 'floor:        {run: "true", inputs: ["api/**"]}', 1),
+                            repo=REPO)

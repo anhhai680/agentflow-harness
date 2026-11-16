@@ -84,6 +84,30 @@ def test_a_skipped_gate_counts_with_its_reason(cfg):
     assert finding.evidence == [e["seq"] for e in events]
 
 
+def test_a_pass_with_the_final_trees_input_hash_is_evidence(cfg):
+    events = gates(1, cfg, "t1", input_hash="h")
+    floor = ob(FLOOR_ID, "gates:verify")
+    finding = evaluate(cfg, events, [floor], "t2", input_hashes={g: "h" for g in cfg.gate_sets["verify"]})[0]
+    assert finding.status == "satisfied" and finding.evidence == [e["seq"] for e in events]
+
+
+def test_a_pass_whose_input_hash_differs_is_not_evidence(cfg):
+    events = gates(1, cfg, "t1", input_hash="h")
+    floor = ob(FLOOR_ID, "gates:verify")
+    finding = evaluate(cfg, events, [floor], "t2", input_hashes={g: "other" for g in cfg.gate_sets["verify"]})[0]
+    assert finding.status == "missing" and "no result on the final tree" in finding.note
+    assert evaluate(cfg, events, [floor], "t2")[0].status == "missing"  # no hashes given: the tree rule alone
+    bare = gates(1, cfg, "t1")  # a result with no `input_hash` never matches
+    assert evaluate(cfg, bare, [floor], "t2", input_hashes={g: "h" for g in cfg.gate_sets["verify"]})[0].status == "missing"
+
+
+def test_a_failed_pass_with_a_matching_input_hash_is_not_evidence(cfg):
+    events = [{**e, "passed": False} for e in gates(1, cfg, "t1", input_hash="h")]
+    floor = ob(FLOOR_ID, "gates:verify")
+    finding = evaluate(cfg, events, [floor], "t2", input_hashes={g: "h" for g in cfg.gate_sets["verify"]})[0]
+    assert finding.status == "missing"
+
+
 # --------------------------------------------------------------------------- steps
 
 
@@ -755,3 +779,23 @@ def test_an_unparseable_obligation_is_missing_at_finish(flow_repo, gh, git):
     assert advance(run, flow_repo.cfg, RunOptions()) == "done"  # report mode: the gap ships, shown
     typo = next(o for o in last(flow_repo, run, "conformance_checked")["obligations"] if o["id"] == "typo")
     assert typo["status"] == "missing" and typo["note"] == "unrecognised evidence item"
+
+
+def test_audit_reuses_a_pass_by_input_hash(flow_repo, gh, git):
+    from test_feature_lane import SMALL
+
+    from agentflow.gates import input_hashes
+    from agentflow.guards import snapshot
+
+    flow_repo.configure({**SMALL, "gates": {"ok": {"inputs": ["only_here/**"]}}})
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="ship"))
+    worktree = Path(run.state["worktree"])
+    earlier = input_hashes(flow_repo.cfg, [flow_repo.cfg.gates["ok"]], worktree, snapshot(worktree))
+    # the pass is on another tree (the run's code changed since, outside `only_here/**`), and carries the same hash
+    run.emit("gate_result", key="verify/verify", gate="ok", passed=True, skipped=False, reason="", tree="older",
+             input_hash=earlier["ok"])
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    checked = last(flow_repo, run, "conformance_checked")
+    floor = next(o for o in checked["obligations"] if o["id"] == FLOOR_ID)
+    assert floor["status"] == "satisfied" and floor["note"] == ""
+    assert not [e for e in flow_repo.events(run, "gate_result") if e.get("key") == FINISH]

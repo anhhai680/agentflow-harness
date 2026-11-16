@@ -134,7 +134,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 30
+    assert len(FAMILIES) == 31
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -329,3 +329,14 @@ def test_the_throughput_families_are_plain_lower_signals():
     for family in ("lead_time_h", "human_blocked_share", "full_suite_runs"):
         assert FAMILIES[family] == ("lower", False) and parse_target(family) == (family, None)
     assert "full_suite_runs" in COUNT_FAMILIES and "lead_time_h" not in COUNT_FAMILIES
+
+
+def test_gate_cache_hit_rate():
+    ran = [_gate("verify/verify", g, True) for g in ("a", "b", "c")] + [_gate("verify/verify", "d", False, skipped=True)]
+    reused = [_ev("gates_reused", key="ship/finish", gates=["a"])]
+    assert run_signals(ran + reused, EMPTY_METRICS)["gate_cache_hit_rate"] == 0.25  # 1 reused of 1 + 3 that ran
+    assert "gate_cache_hit_rate" not in run_signals([], EMPTY_METRICS)
+    assert "gate_cache_hit_rate" not in run_signals([_gate("verify/verify", "d", False, skipped=True)], EMPTY_METRICS)
+    assert run_signals(ran, EMPTY_METRICS)["gate_cache_hit_rate"] == 0.0
+    assert parse_target("gate_cache_hit_rate") == ("gate_cache_hit_rate", None)
+    assert parse_target("gate_cache_hit_rate:x") is None

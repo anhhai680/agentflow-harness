@@ -29,6 +29,8 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   stay true to it, so it keeps meaning time spent waiting on a person with no work going. `full_suite_runs` counts
   the batches of gate results (consecutive `gate_result` events of one step) that ran every gate of the
   `full_suite` passed in, skipped and failed results included; it is present only when `full_suite` is non-empty.
+  `gate_cache_hit_rate` is the gates named by `gates_reused` events over those plus the `gate_result`s that were not
+  skipped (0..1); it is present only when that total is above 0, and a rate has no true 0 to read as when absent.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
 
@@ -76,6 +78,7 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "lead_time_h": ("lower", False),          # hours from the run's start to its pull request marked ready
     "human_blocked_share": ("lower", False),  # share of wall time spent waiting on a person with no work started
     "full_suite_runs": ("lower", False),      # times the whole verify gate set ran, in one batch of gate results
+    "gate_cache_hit_rate": ("higher", False),  # gate results reused, over those reused plus those that ran
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
@@ -219,6 +222,12 @@ def _full_suite_runs(events: list[dict], full_suite: Collection[str]) -> int:
     return runs + close()
 
 
+def _gate_cache_hit_rate(events: list[dict]) -> dict[str, float]:
+    reused = sum(len(ev.get("gates") or []) for ev in events if ev.get("type") == "gates_reused")
+    ran = sum(1 for ev in events if ev.get("type") == "gate_result" and ev.get("gate") and not ev.get("skipped"))
+    return {"gate_cache_hit_rate": reused / (reused + ran)} if reused + ran else {}
+
+
 def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str] = ()) -> dict[str, float]:
     """The signals of one run, only for what the run did. `metrics` is `metrics.run_metrics` for the same run.
     `full_suite` names the gates of the verify set; with it, `full_suite_runs` is present."""
@@ -301,6 +310,7 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
         out["human_blocked_share"] = round(float((metrics.get("buckets") or {}).get("human") or 0.0) / wall, 4)
     if full_suite:
         out["full_suite_runs"] = _full_suite_runs(events, full_suite)
+    out.update(_gate_cache_hit_rate(events))
     return out
 
 

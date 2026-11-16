@@ -381,6 +381,7 @@ class Gate:
     agent_check: bool = False  # the build prompt lists it as a check the implementer runs itself (`{self_checks}`)
     group: str | None = None  # gates of different groups run at the same time; one group runs in order (`gates.run_gates`)
     resource: str | None = None  # gates that share a resource never run at the same time, within one run
+    inputs: list[str] = field(default_factory=list)  # globs of the files the gate reads: its pass holds while none of them changes
 
 
 @dataclass
@@ -804,6 +805,15 @@ class _Builder:
         return out
 
 
+def _gate_inputs(value: Any, path: str) -> list[str]:
+    """A gate's `inputs` as written (`validate` says what is wrong with it); absent or null is none."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ConfigError(_join(path, "inputs"), "expected a list of globs")
+    return list(value)
+
+
 def _build_gates(data: dict) -> dict[str, Gate]:
     out: dict[str, Gate] = {}
     for name, raw in data.items():
@@ -819,6 +829,7 @@ def _build_gates(data: dict) -> dict[str, Gate]:
             agent_check=_optional(raw, "agent_check", path, bool, False),
             group=_optional(raw, "group", path, str, None),
             resource=_optional(raw, "resource", path, str, None),
+            inputs=_gate_inputs(raw.get("inputs"), path),
         )
     return out
 
@@ -1609,6 +1620,13 @@ class _Validator:
                     self.error(_join(path, key), f"{key} is a name of 1-40 letters, digits, `_`, `.` or `-`")
             if gate.group is not None and name in setup_gates:
                 self.add("warning", _join(path, "group"), "setup gates start things in order; drop `group`")
+            declared = (self.cfg.raw.get("gates") or {}).get(name)
+            if isinstance(declared, dict) and "inputs" in declared and declared["inputs"] is not None:
+                bad = [p for p in gate.inputs if not isinstance(p, str) or not p.strip() or posixpath.isabs(p)
+                       or ".." in p.split("/")]
+                if not gate.inputs or bad:
+                    self.error(_join(path, "inputs"), "inputs is a non-empty list of globs, each a relative path "
+                               "inside the repository with no `..` part")
             if gate.baseline is None:
                 continue
             if gate.baseline not in BASELINES:
@@ -1617,6 +1635,11 @@ class _Validator:
                 self.add("warning", _join(path, "baseline"),
                          f"`{name}` failed on `{self.cfg.project.base_branch}` when the pack was set up: "
                          "fix it and remove `baseline`, or delete the gate")
+        if any(gate.inputs for gate in self.cfg.gates.values()):  # a pack that opted in: the gates left out run every time
+            for member in self.cfg.gate_sets.get("verify") or []:
+                gate = self.cfg.gates.get(member)
+                if gate is not None and not gate.inputs:
+                    self.add("warning", f"gates.{member}", f"`{member}` has no `inputs`, so it runs again after every change")
         if not self.cfg.gate_sets.get("verify"):
             self.error("gate_sets.verify", "every pack declares the gates a diff must pass: state them under "
                        "`gates:` and list them in `gate_sets.verify` (a `starter:` can supply them)")

@@ -1669,3 +1669,35 @@ def test_a_grouped_setup_gate_is_a_warning(tmp_cfg):
     assert ("gates.setup_py.group", "setup gates start things in order; drop `group`") in found
     assert not [w for w in _warnings(issues_for(tmp_cfg, {"gates": {"floor": {"run": "true", "group": "api"}}}))
                 if w[0] == "gates.floor.group"]
+
+
+# --------------------------------------------------------------------------- gate inputs
+
+
+def test_gate_inputs_must_be_relative_globs(tmp_cfg):
+    cfg = load_config(tmp_cfg({"gates": {"floor": {"run": "true", "inputs": ["api/**", "pyproject.toml"]}}}))
+    assert cfg.gates["floor"].inputs == ["api/**", "pyproject.toml"]
+    assert load_config(tmp_cfg()).gates["floor"].inputs == []
+    for bad in ([], [""], ["/abs/**"], ["../up/**"], ["a/../b"], ["ok", 3], [" "]):
+        found = errors(issues_for(tmp_cfg, {"gates": {"floor": {"run": "true", "inputs": bad}}}))
+        assert ("error", "gates.floor.inputs") in found, bad
+    assert ("error", "gates.floor.inputs") not in errors(
+        issues_for(tmp_cfg, {"gates": {"floor": {"run": "true", "inputs": ["./api/**"]}}}))
+    with pytest.raises(ConfigError, match="gates.floor.inputs"):  # not a list at all: refused when the pack loads
+        load_config(tmp_cfg({"gates": {"floor": {"run": "true", "inputs": "api/**"}}}))
+
+
+def test_a_verify_gate_without_inputs_warns_only_once_a_pack_uses_inputs(tmp_cfg):
+    def inputs_warnings(patch):
+        return [w for w in _warnings(issues_for(tmp_cfg, patch)) if "has no `inputs`" in w[1]]
+
+    assert inputs_warnings(None) == []  # no gate declares `inputs`: today's packs stay at 0 warnings
+    cfg = load_config(tmp_cfg())
+    verify = cfg.gate_sets["verify"]
+    assert len(verify) >= 2
+    patch = {"gates": {verify[0]: {"inputs": ["api/**"]}}}
+    found = inputs_warnings(patch)
+    assert [w[0] for w in found] == [f"gates.{name}" for name in verify[1:]]
+    assert all(w[1] == f"`{w[0].split('.', 1)[1]}` has no `inputs`, so it runs again after every change" for w in found)
+    both = {"gates": {name: {"inputs": ["api/**"]} for name in verify}}
+    assert inputs_warnings(both) == []

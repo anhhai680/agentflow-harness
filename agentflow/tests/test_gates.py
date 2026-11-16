@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from agentflow.config import Gate, load_config
-from agentflow.gates import GateResult, command_digest, gates_ok, reusable_passes, run_gates, summarize
+from agentflow.gates import (GateResult, command_digest, gates_ok, hash_inputs, input_hashes, record_results,
+                             reusable_passes, run_gates, run_gates_reusing, summarize)
+from agentflow.guards import snapshot
 from conftest import PYTHON_CONFIG
 
 
@@ -303,3 +305,95 @@ def test_leaving_early_kills_every_groups_process(tmp_git, tmp_path, monkeypatch
                 break
             assert time.monotonic() < deadline, f"process {pid} is still alive"
             time.sleep(0.05)
+
+
+# --------------------------------------------------------------------------- reuse by input hash
+
+
+def test_hash_inputs_ignores_paths_outside_the_globs():
+    entries = [("api/a.py", "100644", "aaa"), ("web/b.ts", "100644", "bbb")]
+    base = hash_inputs(entries, ["api/**"], "cmd")
+    assert len(base) == 16
+    assert hash_inputs([entries[0], ("web/b.ts", "100644", "other")], ["api/**"], "cmd") == base
+    assert hash_inputs([("api/a.py", "100644", "changed"), entries[1]], ["api/**"], "cmd") != base
+    assert hash_inputs([entries[1]], ["api/**"], "cmd") != base  # the matching entry removed
+    assert hash_inputs([("api/a.py", "100755", "aaa"), entries[1]], ["api/**"], "cmd") != base  # the mode counts
+
+
+def test_hash_inputs_follows_the_command():
+    entries = [("api/a.py", "100644", "aaa")]
+    assert hash_inputs(entries, ["api/**"], "one") != hash_inputs(entries, ["api/**"], "two")
+    assert hash_inputs(entries, ["api/**"], "one") == hash_inputs(list(reversed(entries)), ["api/**"], "one")
+
+
+def test_input_hashes_count_untracked_files(tmp_git):
+    cfg = cfg_with({"api": Gate("api", "true", inputs=["api/**"]), "plain": "true"})
+    gates = list(cfg.gates.values())
+    (tmp_git / "api").mkdir()
+    (tmp_git / "api" / "a.py").write_text("a = 1\n", encoding="utf-8")
+    first = input_hashes(cfg, gates, tmp_git, snapshot(tmp_git))
+    assert set(first) == {"api"}  # a gate with no `inputs` is absent
+    (tmp_git / "api" / "new.py").write_text("n = 1\n", encoding="utf-8")  # untracked
+    second = input_hashes(cfg, gates, tmp_git, snapshot(tmp_git))
+    assert second["api"] != first["api"]
+    (tmp_git / "README.md").write_text("changed\n", encoding="utf-8")  # outside the globs
+    assert input_hashes(cfg, gates, tmp_git, snapshot(tmp_git)) == second
+
+
+def _two_trees(run, cfg, tmp_git, tmp_path, name="api"):
+    (tmp_git / "api").mkdir()
+    (tmp_git / "api" / "a.py").write_text("a = 1\n", encoding="utf-8")
+    tree_a = snapshot(tmp_git)
+    first = run_gates_reusing(cfg, run, "build/one", [name], tmp_git, tmp_path / "logs", tree_a)
+    record_results(run, "build/one", first, tree_a)
+    (tmp_git / "web").mkdir()
+    (tmp_git / "web" / "x.ts").write_text("export {}\n", encoding="utf-8")
+    tree_b = snapshot(tmp_git)
+    second = run_gates_reusing(cfg, run, "build/two", [name], tmp_git, tmp_path / "logs", tree_b)
+    record_results(run, "build/two", second, tree_b)
+    return first, second, tree_a, tree_b
+
+
+def test_a_change_outside_a_gates_inputs_reuses_its_pass(run, tmp_git, tmp_path):
+    cfg = cfg_with({"api": Gate("api", "true", inputs=["api/**"])})
+    first, second, tree_a, tree_b = _two_trees(run, cfg, tmp_git, tmp_path)
+    assert tree_a != tree_b
+    assert first[0].reused_from is None and first[0].input_hash
+    assert second[0].reused_from == "build/one" and second[0].passed
+    events = run.events.read()
+    results = [e for e in events if e["type"] == "gate_result" and e["gate"] == "api"]
+    assert len(results) == 1 and results[0]["input_hash"] == first[0].input_hash
+    [hit] = [e for e in events if e["type"] == "gate_cache_hit"]
+    assert (hit["gate"], hit["from"], hit["input_hash"], hit["key"]) == ("api", "build/one", first[0].input_hash, "build/two")
+    [reused] = [e for e in events if e["type"] == "gates_reused"]
+    assert reused["gates"] == ["api"]
+
+
+def test_a_gate_without_inputs_is_not_reused_on_another_tree(run, tmp_git, tmp_path):
+    cfg = cfg_with({"api": "true"})
+    first, second, _, _ = _two_trees(run, cfg, tmp_git, tmp_path)
+    assert first[0].input_hash is None and second[0].reused_from is None
+    events = run.events.read()
+    assert len([e for e in events if e["type"] == "gate_result" and e["gate"] == "api"]) == 2
+    assert not [e for e in events if e["type"] in ("gate_cache_hit", "gates_reused")]
+    assert all("input_hash" not in e for e in events if e["type"] == "gate_result")
+
+
+def test_a_change_inside_a_gates_inputs_runs_it_again(run, tmp_git, tmp_path):
+    cfg = cfg_with({"api": Gate("api", "true", inputs=["api/**"])})
+    _two_trees(run, cfg, tmp_git, tmp_path)
+    (tmp_git / "api" / "a.py").write_text("a = 2\n", encoding="utf-8")
+    tree_c = snapshot(tmp_git)
+    (third,) = run_gates_reusing(cfg, run, "build/three", ["api"], tmp_git, tmp_path / "logs", tree_c)
+    assert third.reused_from is None
+
+
+def test_a_gate_cache_hit_needs_its_key_gate_and_input_hash(run):
+    from agentflow.events import EventError
+
+    for missing in ("key", "gate", "input_hash"):
+        fields = {"key": "build/two", "gate": "api", "input_hash": "h", "from": "build/one"}
+        del fields[missing]
+        with pytest.raises(EventError, match=missing):
+            run.emit("gate_cache_hit", **fields)
+    run.emit("gate_cache_hit", key="build/two", gate="api", input_hash="h", **{"from": "build/one"})

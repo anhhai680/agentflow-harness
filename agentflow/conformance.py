@@ -3,7 +3,8 @@
 `evaluate` is pure: nothing in it reads a file or the clock. It takes the run's events, the obligations that apply
 and the tree that will be pushed, and returns one finding per obligation. Evidence counts only when it comes after
 the last code change that makes it stale (steps, expectations; see `_staling`) or was made on exactly the final
-tree (gates). Events from older runs
+tree (gates), or by a gate whose `input_hash` there equals the one on the result (the files it declares as `inputs`
+are the same). Events from older runs
 carry no `tree`, so every reader uses `.get` and a missing tree is no evidence.
 
 `audit` is the one impure entry point: `finish` calls it before the push. It snapshots the final tree, runs the
@@ -14,6 +15,7 @@ trees only: no step summary or finding text, which are model text, ever reaches 
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -21,7 +23,7 @@ from typing import Literal
 from agentflow.autonomy import AUTO_BY, blocking_of
 from agentflow.conditions import Ctx
 from agentflow.config import CONFORMANCE_FAILED, Config, Evidence, Obligation
-from agentflow.gates import failure_report, gates_ok, record_results, run_gates
+from agentflow.gates import failure_report, gates_ok, input_hashes, record_results, run_gates
 from agentflow.gitops import GitError, dirty_paths, merge_in_progress
 from agentflow.guards import snapshot
 from agentflow.hitl import clean_fact, raise_hitl
@@ -101,7 +103,8 @@ def _last(candidates: list[dict]) -> dict | None:
     return max(candidates, key=lambda e: e["seq"], default=None)
 
 
-def _gates(cfg: Config, events: list[dict], set_name: str, final_tree: str) -> _Item:
+def _gates(cfg: Config, events: list[dict], set_name: str, final_tree: str,
+           hashes: Mapping[str, str] | None = None) -> _Item:
     names = cfg.gate_sets.get(set_name)
     if not names:
         return _Item(False, note=f"no gate set '{set_name}'")
@@ -109,8 +112,9 @@ def _gates(cfg: Config, events: list[dict], set_name: str, final_tree: str) -> _
     notes: list[str] = []
     unmet: list[str] = []
     for name in names:
-        result = _last([e for e in events if e.get("type") == "gate_result" and e.get("gate") == name
-                        and final_tree and e.get("tree") == final_tree])
+        wanted = (hashes or {}).get(name)
+        result = _last([e for e in events if e.get("type") == "gate_result" and e.get("gate") == name and final_tree
+                        and (e.get("tree") == final_tree or (e.get("input_hash") and e.get("input_hash") == wanted))])
         if result is None:
             unmet.append(f"{name}: no result on the final tree")
         elif result.get("skipped"):
@@ -174,9 +178,10 @@ def _red_then_green(cfg: Config, events: list[dict], changes: list[dict]) -> _It
     return _Item(False, note="no red check followed by a green one after the last code change", phase=phase)
 
 
-def _item(cfg: Config, events: list[dict], evidence: Evidence, final_tree: str, changes: list[dict]) -> _Item:
+def _item(cfg: Config, events: list[dict], evidence: Evidence, final_tree: str, changes: list[dict],
+          hashes: Mapping[str, str] | None = None) -> _Item:
     if evidence.kind == "gates":
-        return _gates(cfg, events, evidence.arg, final_tree)
+        return _gates(cfg, events, evidence.arg, final_tree, hashes)
     if evidence.kind == "step":
         return _step(cfg, events, evidence.arg, changes)
     if evidence.kind == "approval":
@@ -200,13 +205,16 @@ def _waiver(events: list[dict], unmet: list[_Item]) -> Finding | None:
 
 
 def evaluate(cfg: Config, events: list[dict], obligations: list[Obligation], final_tree: str,
-             not_applicable: list[Obligation] = ()) -> list[Finding]:
+             not_applicable: list[Obligation] = (), *, input_hashes: Mapping[str, str] | None = None) -> list[Finding]:
     """One finding per obligation (those that apply first, then `not_applicable` ones, in order), from `events` alone.
 
     An obligation is satisfied when every `require` item is. One that is not is `waived` when a human marked the
     run done and each unmet item belongs to a phase that mark-done skipped; `gates:` items never are, so the floor
     is never waived. Otherwise it is `missing`, with a note for each unmet item. An obligation with no evidence
-    items is `missing`: it fails closed, never vacuously met."""
+    items is `missing`: it fails closed, never vacuously met.
+
+    A gate's result counts when its `tree` is `final_tree`, or when it carries an `input_hash` equal to
+    `input_hashes[gate]`, the gate's hash on the final tree (only a gate with `inputs` has one)."""
     changes = _staling(cfg, events)
     findings: list[Finding] = []
     for obligation in obligations:
@@ -214,7 +222,7 @@ def evaluate(cfg: Config, events: list[dict], obligations: list[Obligation], fin
         if not obligation.require:
             findings.append(Finding(obligation.id, require, "missing", [], "no evidence items"))
             continue
-        items = [_item(cfg, events, evidence, final_tree, changes) for evidence in obligation.require]
+        items = [_item(cfg, events, evidence, final_tree, changes, input_hashes) for evidence in obligation.require]
         unmet = [item for item in items if not item.ok]
         evidence = sorted({seq for item in items for seq in item.evidence})
         if not unmet:
@@ -273,7 +281,8 @@ def audit(cfg: Config, run: Run, worktree: Path, ctx: Ctx, key: str) -> bool:
     applying = [obligation for obligation, _ in applicable(cfg, ctx, lane)]
     ids = {obligation.id for obligation in applying}
     others = [obligation for obligation in cfg.policy.obligations.values() if obligation.id not in ids]
-    findings = evaluate(cfg, run.events.read(), applying, tree, others)
+    hashes = input_hashes(cfg, list(cfg.gates.values()), worktree, tree)
+    findings = evaluate(cfg, run.events.read(), applying, tree, others, input_hashes=hashes)
     names = missing_gates(cfg, findings)
     if names:
         results = run_gates(cfg, names, worktree, run.gate_log_dir(key))
@@ -284,7 +293,7 @@ def audit(cfg: Config, run: Run, worktree: Path, ctx: Ctx, key: str) -> bool:
                        f"Gates failed on the tree {key} would push: {', '.join(r.name for r in failed)}.",
                        extra=failure_report(failed))
             return False
-        findings = evaluate(cfg, run.events.read(), applying, tree, others)
+        findings = evaluate(cfg, run.events.read(), applying, tree, others, input_hashes=hashes)
     missing = [f.id for f in findings if f.status == "missing"]
     enforce = "report" if cfg.policy.enforce == "report" else "block"  # an unknown mode fails closed
     run.emit("conformance_checked", key=key, tree=tree, enforce=enforce, passed=not missing,

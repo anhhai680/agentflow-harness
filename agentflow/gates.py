@@ -24,6 +24,12 @@ Reuse (`run_gates_reusing`): a gate that already passed in this run on exactly t
 same command (`run`, `cwd`, `when_exists` and `defaults.env`, as the `cmd` digest on its `gate_result`), is not run
 again: the earlier pass is the evidence, the rule `conformance` already holds the final tree to. A failure, a skip,
 an event with no `tree` or no `cmd`, and the `setup` set's gates (they start things) are never reused.
+
+Inputs: a gate with `inputs` globs is also reused across trees. Its `input_hash` (`hash_inputs`) covers its command
+digest and the mode and blob of every file of the tree its globs match, untracked files included and ignored files
+never (so a gate that reads an ignored file must not declare `inputs`). A fresh result carries it; a pass whose
+`input_hash` equals the gate's hash on the tree about to be gated stands for it, and `conformance` accepts the same
+pass as evidence on the final tree only when the hash there is equal too.
 """
 
 from __future__ import annotations
@@ -46,7 +52,7 @@ from typing import TYPE_CHECKING
 
 from agentflow import run_env, safeio
 from agentflow.config import Config, Gate
-from agentflow.guards import snapshot
+from agentflow.guards import HARDENED, path_matches, snapshot
 
 if TYPE_CHECKING:
     from agentflow.state import Run
@@ -65,6 +71,7 @@ class GateResult:
     duration_s: float = 0.0  # wall time the gate ran, for the run metrics
     cmd: str = ""  # `command_digest` of what ran; "" for a doc check
     reused_from: str | None = None  # the step key of the earlier pass this result stands for (`run_gates_reusing`)
+    input_hash: str | None = None  # `hash_inputs` of the gate's `inputs` on the tree it ran on; None for a gate with none
 
 
 def _resolve(cfg: Config, names: str | list[str]) -> list[Gate]:
@@ -186,6 +193,41 @@ def command_digest(gate: Gate, env: Mapping[str, str] | None) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 
+def hash_inputs(entries: list[tuple[str, str, str]], patterns: list[str], cmd: str) -> str:
+    """What a gate's result depends on: its command digest and the files its `inputs` globs match. Pure.
+
+    `entries` are `(path, mode, blob)` of a tree. The hash is the sha256 (16 hex characters) of `cmd`, then one
+    `<mode> <blob> <path>` line for each entry that matches any pattern, sorted by path."""
+    digest = hashlib.sha256(f"{cmd}\n".encode())
+    for path, mode, blob in sorted(entries):
+        if any(path_matches(path, pattern) for pattern in patterns):
+            digest.update(f"{mode} {blob} {path}\n".encode())
+    return digest.hexdigest()[:16]
+
+
+def input_hashes(cfg: Config, gates: list[Gate], cwd: Path, tree: str) -> dict[str, str]:
+    """Gate name -> `hash_inputs` on `tree`, for each of `gates` that declares `inputs` (the others are absent).
+
+    One `git ls-tree` reads the tree, and nothing else is read: the files are those of the tree, untracked ones
+    included (a `guards.snapshot` holds them), ignored ones never. When git cannot read the tree no gate has a
+    hash, so nothing is reused or accepted by input."""
+    declared = [g for g in gates if g.inputs]
+    if not declared or not tree:
+        return {}
+    proc = subprocess.run(["git", *HARDENED, "ls-tree", "-r", "-z", "--full-tree", tree], cwd=cwd,
+                          capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=False)
+    if proc.returncode != 0:
+        return {}
+    entries: list[tuple[str, str, str]] = []
+    for line in proc.stdout.split("\0"):
+        meta, tab, path = line.partition("\t")
+        fields = meta.split()
+        if tab and len(fields) == 3:
+            entries.append((path, fields[0], fields[2]))
+    env = cfg.defaults.env
+    return {g.name: hash_inputs(entries, g.inputs, command_digest(g, env)) for g in declared}
+
+
 def _run_one(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min: float,
              env: dict[str, str] | None = None, env_base: Mapping[str, str] | None = None,
              live: _Live | None = None) -> GateResult:
@@ -286,19 +328,26 @@ def setup_gate_names(cfg: Config) -> set[str]:
 
 
 def reusable_passes(events: list[dict], gates: list[Gate], tree: str | None, digests: Mapping[str, str],
-                    never: set[str] | frozenset[str] = frozenset()) -> dict[str, dict]:
-    """Gate name -> the latest `gate_result` that passed (not skipped) on exactly `tree` with the digest in `digests`.
+                    never: set[str] | frozenset[str] = frozenset(),
+                    hashes: Mapping[str, str] | None = None) -> dict[str, dict]:
+    """Gate name -> the latest `gate_result` that passed (not skipped) on exactly `tree` with the digest in `digests`,
+    or, for a gate in `hashes` (its input hash on `tree`), whose `input_hash` equals that one, on whatever tree.
 
     Pure. A gate in `never`, an event with no `tree` or no `cmd` (older runs), a failure and a skip never count."""
     if not tree:
         return {}
     wanted = {g.name for g in gates if g.name not in never and g.name in digests}
+    hashes = hashes or {}
     found: dict[str, dict] = {}
     for e in events:
         if e.get("type") != "gate_result" or not e.get("passed") or e.get("skipped"):
             continue
         name = e.get("gate")
-        if name in wanted and e.get("tree") == tree and e.get("cmd") and e.get("cmd") == digests[name]:
+        if name not in wanted:
+            continue
+        same_tree = e.get("tree") == tree and e.get("cmd") and e.get("cmd") == digests[name]
+        same_inputs = bool(e.get("input_hash")) and e.get("input_hash") == hashes.get(name)
+        if same_tree or same_inputs:
             found[name] = e
     return found
 
@@ -309,22 +358,31 @@ def run_gates_reusing(cfg: Config, run: Run, key: str, names: str | list[str], c
 
     The results keep the gates' order; a reused one is a pass with `reused_from` set, its old log and no tail.
     One `gates_reused` event names them (`record_results` writes no `gate_result` for a reused result, so the
-    run's evidence stays one event per gate actually run)."""
+    run's evidence stays one event per gate actually run).
+
+    A gate with `inputs` also reuses a pass from another tree when the files its `inputs` match are the same
+    (`input_hashes`): its fresh result carries the `input_hash`, and a pass taken from another tree is told in a
+    `gate_cache_hit` event."""
     gates = _resolve(cfg, names)
     env = cfg.defaults.env
     digests = {g.name: command_digest(g, env) for g in gates}
-    reused = reusable_passes(run.events.read(), gates, tree, digests, setup_gate_names(cfg))
+    hashes = input_hashes(cfg, gates, cwd, tree) if tree else {}
+    reused = reusable_passes(run.events.read(), gates, tree, digests, setup_gate_names(cfg), hashes)
     fresh = iter(run_gates(cfg, [g.name for g in gates if g.name not in reused], cwd, log_dir)
                  if len(reused) < len(gates) else [])
     results: list[GateResult] = []
     for g in gates:
         e = reused.get(g.name)
         if e is None:
-            results.append(next(fresh))
+            result = next(fresh)
+            results.append(replace(result, input_hash=hashes[g.name]) if g.name in hashes else result)
             continue
         log = Path(e["log"]) if e.get("log") else None
         results.append(GateResult(g.name, True, False, f"reused: passed on this tree in {e.get('key')}", log, "",
-                                  cmd=digests[g.name], reused_from=str(e.get("key"))))
+                                  cmd=digests[g.name], reused_from=str(e.get("key")), input_hash=hashes.get(g.name)))
+    for name, e in sorted(reused.items()):
+        if e.get("tree") != tree:  # a pass taken from another tree: the gate's inputs are what made it the same check
+            run.emit("gate_cache_hit", key=key, gate=name, input_hash=hashes[name], **{"from": str(e.get("key"))})
     if reused:
         run.emit("gates_reused", key=key, tree=tree, gates=sorted(reused),
                  **{"from": sorted({str(e.get("key")) for e in reused.values()})})
@@ -338,7 +396,7 @@ def gates_ok(results: list[GateResult]) -> bool:
 
 def record_results(run: Run, key: str, results: list[GateResult], tree: str, *, with_tail: bool = False) -> None:
     """Write one `gate_result` per result that ran, each stamped with the `tree` (a `guards.snapshot`) the gates ran
-    on and the gate's `cmd` digest (a reused result writes none).
+    on, the gate's `cmd` digest and, for a gate with `inputs`, its `input_hash` (a reused result writes none).
 
     The caller snapshots the worktree before the gates run. `with_tail` adds a `tail` to every event: a failed
     gate's output tail (the fix loop's and the retro's evidence), `""` for a gate that passed or was skipped."""
@@ -349,6 +407,8 @@ def record_results(run: Run, key: str, results: list[GateResult], tree: str, *, 
                 "log": str(r.log_path) if r.log_path else None, "duration_s": r.duration_s, "tree": tree}
         if r.cmd:
             data["cmd"] = r.cmd
+        if r.input_hash is not None:
+            data["input_hash"] = r.input_hash
         if with_tail:  # "" for a gate that passed or was skipped
             data["tail"] = "" if (r.passed or r.skipped) else r.tail
         run.emit("gate_result", **data)
