@@ -401,3 +401,72 @@ def flow_repo(tmp_path: Path, fake: FakeAgent, tmp_cfg: Callable[..., Path], mon
     run_git(root, "checkout", "-q", "next")
     monkeypatch.chdir(root)
     return FlowRepo(root, origin, fake, tmp_cfg)
+
+
+class SpecRun:
+    """A feature run whose commits are real, in a linked worktree on `flow/feature/crm` (see `spec_run`)."""
+
+    BRANCH = "flow/feature/crm"
+
+    def __init__(self, run, repo: Path, worktree: Path) -> None:
+        self.run = run
+        self.repo = repo
+        self.worktree = worktree
+
+    def revisions(self, path: str) -> list[dict]:
+        """`path`'s revisions as `artifacts.run_artifacts` lists them."""
+        from agentflow.artifacts import run_artifacts
+
+        return next(a for a in run_artifacts(self.run, self.repo) if a["path"] == path)["revisions"]
+
+    def head(self) -> str:
+        return run_git(self.worktree, "rev-parse", "HEAD").strip()
+
+    def commit(self, key: str, write: dict[str, str] | None = None, link: dict[str, str] | None = None,
+               delete: list[str] | None = None) -> str:
+        """Change the worktree (`write` {path: text}, `link` {path: symlink target}, `delete` [path]), commit it,
+        emit `step_committed` for `key` with the new sha, and return that sha."""
+        for rel, text in (write or {}).items():
+            target = self.worktree / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink():
+                target.unlink()
+            target.write_text(text, encoding="utf-8")
+        for rel, dest in (link or {}).items():
+            target = self.worktree / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() or target.is_symlink():
+                target.unlink()
+            target.symlink_to(dest)
+        for rel in delete or []:
+            (self.worktree / rel).unlink()
+        run_git(self.worktree, "add", "-A")
+        run_git(self.worktree, "commit", "-q", "-m", key)
+        sha = self.head()
+        self.run.emit("step_committed", key=key, sha=sha, summary=key)
+        return sha
+
+
+@pytest.fixture
+def spec_run(flow_repo: FlowRepo, tmp_path: Path) -> SpecRun:
+    """A feature run in a linked worktree on branch flow/feature/crm. define committed docs/specs/x.md three times:
+    define/draft ("Scope 3 says one thing", plus notes.md), define/spec_reconcile after a phase_rejected round 1
+    ("Scope 3 says another"), and define/spec_reconcile again after round 2 (another line added, the Scope line kept).
+    Then phase_approved define, phase_started plan, and plan/plan committed docs/plans/x.md."""
+    run = flow_repo.new_run()
+    worktree = tmp_path / "wt"
+    run_git(flow_repo.root, "worktree", "add", "-q", "-b", SpecRun.BRANCH, str(worktree))
+    spec = SpecRun(run, flow_repo.root, worktree)
+    base = spec.head()
+    run.emit("run_updated", branch=SpecRun.BRANCH, worktree=str(worktree), base_sha=base)
+    run.emit("phase_started", phase="define", start_sha=base)
+    spec.commit("define/draft", write={"docs/specs/x.md": "# X\n\nScope 3 says one thing\n", "notes.md": "notes\n"})
+    run.emit("phase_rejected", phase="define", round=1, note="say another thing")
+    spec.commit("define/spec_reconcile", write={"docs/specs/x.md": "# X\n\nScope 3 says another\n"})
+    run.emit("phase_rejected", phase="define", round=2, note="add a line")
+    spec.commit("define/spec_reconcile",
+                write={"docs/specs/x.md": "# X\n\nScope 3 says another\nScope 4 is new\n"})
+    run.emit("phase_approved", phase="define", by="me")
+    run.emit("phase_started", phase="plan", start_sha=spec.head())
+    spec.commit("plan/plan", write={"docs/plans/x.md": "# Plan\n\n- [ ] Task 1\n"})
+    return spec
