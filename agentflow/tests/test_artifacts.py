@@ -119,3 +119,131 @@ def test_the_cap_comes_from_the_config_and_survives_a_bad_value(flow_repo):
 def test_artifact_tabs_follow_the_lane_phases():
     assert artifact_tabs(["define", "plan", "build"]) == ["spec", "plan"]
     assert artifact_tabs(["define", "build"]) == ["spec"] and artifact_tabs(["build"]) == []
+
+
+# -- fix round 1
+
+
+def test_a_filename_holding_the_record_mark_cannot_rewrite_another_commits_files(spec_run):
+    draft = spec_run.revisions("docs/specs/x.md")[0]["sha"]
+    before = {a["path"]: [r["sha"] for r in a["revisions"]] for a in run_artifacts(spec_run.run, spec_run.repo)}
+    odd = f"a\x01{draft}"
+    newest = spec_run.commit("define/spec_reconcile", write={odd: "x\n", "b.md": "b\n", "c.md": "c\n",
+                                                              f"\x01{draft}": "y\n"})
+    after = {a["path"]: [r["sha"] for r in a["revisions"]] for a in run_artifacts(spec_run.run, spec_run.repo)}
+    for path, shas in before.items():
+        assert after[path] == shas  # every earlier revision still lists its own files
+    for path in (odd, f"\x01{draft}", "b.md", "c.md"):
+        assert after[path] == [newest]
+
+
+def test_a_listing_git_could_not_finish_is_not_cached_and_not_retried_per_commit(spec_run, monkeypatch):
+    from agentflow import artifacts
+
+    real, calls = artifacts._git, []
+
+    def stalled(repo, *args, limit=None):
+        if "log" in args:
+            calls.append(args)
+            raise artifacts._GitTimeout("git timed out")
+        return real(repo, *args, limit=limit)
+
+    spec_run.run.emit("note", text="a fresh event log, so no cached listing")
+    monkeypatch.setattr(artifacts, "_git", stalled)
+    assert run_artifacts(spec_run.run, spec_run.repo) == []
+    assert len(calls) == 1  # one stalled batch call, no per-sha fallback behind it
+    monkeypatch.setattr(artifacts, "_git", real)
+    assert {a["path"] for a in run_artifacts(spec_run.run, spec_run.repo)} == {
+        "docs/specs/x.md", "notes.md", "docs/plans/x.md"}
+
+
+def _fake_git(tmp_path, monkeypatch, body: str):
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    script = bin_dir / "git"
+    script.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+
+
+def test_a_git_that_floods_stderr_does_not_stall_a_read(tmp_path, monkeypatch):
+    import time
+
+    from agentflow import artifacts
+
+    _fake_git(tmp_path, monkeypatch, "head -c 2000000 /dev/zero >&2; printf ok")
+    monkeypatch.setattr(artifacts, "GIT_READ_TIMEOUT_S", 5)
+    started = time.monotonic()
+    assert artifacts._git(tmp_path, "cat-file", "blob", "f" * 40, limit=100) == (b"ok", False)
+    assert artifacts._git(tmp_path, "ls-tree") == (b"ok", False)
+    assert time.monotonic() - started < 4
+
+
+def test_a_git_that_hangs_times_out_and_is_reaped(tmp_path, monkeypatch):
+    from agentflow import artifacts
+
+    _fake_git(tmp_path, monkeypatch, "printf partial; exec sleep 30")
+    monkeypatch.setattr(artifacts, "GIT_READ_TIMEOUT_S", 0.3)
+    seen = []
+    real_popen = artifacts.subprocess.Popen
+
+    def popen(*args, **kwargs):
+        seen.append(real_popen(*args, **kwargs))
+        return seen[-1]
+
+    monkeypatch.setattr(artifacts.subprocess, "Popen", popen)
+    for limit in (None, 1 << 20):
+        with pytest.raises(artifacts._GitTimeout):
+            artifacts._git(tmp_path, "cat-file", "blob", "f" * 40, limit=limit)
+    assert all(p.returncode is not None and p.stdout.closed for p in seen)
+
+
+def test_a_cut_read_reaps_git(tmp_path, monkeypatch):
+    from agentflow import artifacts
+
+    _fake_git(tmp_path, monkeypatch, "head -c 5000000 /dev/zero")
+    seen = []
+    real_popen = artifacts.subprocess.Popen
+    monkeypatch.setattr(artifacts.subprocess, "Popen",
+                        lambda *a, **k: seen.append(real_popen(*a, **k)) or seen[-1])
+    out, cut = artifacts._git(tmp_path, "cat-file", "blob", "f" * 40, limit=1000)
+    assert cut is True and len(out) == 1000
+    assert seen[0].returncode is not None and seen[0].stdout.closed
+
+
+def test_the_cache_survives_an_entry_evicted_by_another_thread(spec_run, monkeypatch):
+    from agentflow import artifacts
+
+    class Racy(dict):  # another thread empties it between any check and any read
+        def __contains__(self, key):
+            return True
+
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __len__(self):
+            return 10 ** 6
+
+        def __iter__(self):
+            return iter(())
+
+    monkeypatch.setattr(artifacts, "_CACHE", Racy())
+    assert {a["path"] for a in run_artifacts(spec_run.run, spec_run.repo)} == {
+        "docs/specs/x.md", "notes.md", "docs/plans/x.md"}
+
+
+def test_an_event_log_that_cannot_be_read_lists_nothing_and_reads_not_found(spec_run, monkeypatch):
+    newest = spec_run.revisions("docs/specs/x.md")[-1]["sha"]
+    spec_run.run.emit("note", text="a fresh event log, so no cached listing")
+
+    def gone(*args, **kwargs):
+        raise PermissionError("events.jsonl")
+
+    monkeypatch.setattr(spec_run.run.events, "read", gone)
+    assert run_artifacts(spec_run.run, spec_run.repo) == []
+    with pytest.raises(NotFound):
+        read_artifact(spec_run.run, spec_run.repo, "docs/specs/x.md", newest, 512 * 1024)
+    with pytest.raises(NotFound):
+        artifact_diff(spec_run.run, spec_run.repo, "docs/specs/x.md", newest, "head", 512 * 1024)
+    monkeypatch.undo()
+    assert run_artifacts(spec_run.run, spec_run.repo) != []  # the failed read was not cached

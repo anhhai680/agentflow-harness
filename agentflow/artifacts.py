@@ -35,11 +35,16 @@ HEAD = "head"
 
 _CACHE: dict[tuple, list[dict]] = {}  # run_artifacts by (repo, events file, size, mtime_ns)
 _CACHE_MAX = 128
+_CACHE_LOCK = threading.Lock()  # the dashboard's request threads share the cache
 _CHUNK = 64 << 10
 
 
 class NotFound(LookupError):
     """What the dashboard answers 404 with; the message is the page's text."""
+
+
+class _GitTimeout(NotFound):
+    """Git timed out, could not start or could not be read: a passing failure, so a listing it hit is not cached."""
 
 
 def artifact_max_bytes(cfg: Config) -> int:
@@ -60,12 +65,14 @@ def artifact_tabs(phases: list[str]) -> list[str]:
 
 def _git(repo: Path, *args: str, limit: int | None = None) -> tuple[bytes, bool]:
     """`(stdout, cut)` of a read-only `git <args>`. With `limit`, at most `limit` bytes are read; past that the
-    process is killed and `cut` is True. A non-zero exit, a timeout or a git that cannot start raises `NotFound`."""
+    process is killed and `cut` is True. A non-zero exit raises `NotFound`; a timeout or a git that cannot start or
+    be read raises `_GitTimeout` (a `NotFound` too). stderr is discarded, so git can never stall on it, and the
+    process is always reaped and its pipe closed, whatever ends the call."""
     try:
         proc = subprocess.Popen(["git", *HARDENED, *args], cwd=repo, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError as exc:
-        raise NotFound("git could not run") from exc
+        raise _GitTimeout("git could not run") from exc
     timed_out = threading.Event()
 
     def expire() -> None:
@@ -76,10 +83,10 @@ def _git(repo: Path, *args: str, limit: int | None = None) -> tuple[bytes, bool]
     timer.start()
     cut = False
     try:
+        assert proc.stdout is not None
         if limit is None:
-            out, _ = proc.communicate()
+            out = proc.stdout.read()
         else:
-            assert proc.stdout is not None
             parts: list[bytes] = []
             got = 0
             while got <= limit:
@@ -93,34 +100,52 @@ def _git(repo: Path, *args: str, limit: int | None = None) -> tuple[bytes, bool]
                 cut = True
                 out = out[:limit]
                 proc.kill()
-            proc.communicate()
-    except (OSError, ValueError) as exc:
-        proc.kill()
         proc.wait()
-        raise NotFound("git failed") from exc
+    except (OSError, ValueError) as exc:
+        raise _GitTimeout("git could not be read") from exc
     finally:
         timer.cancel()
-    if timed_out.is_set() or (not cut and proc.returncode != 0):
+        if proc.returncode is None:
+            proc.kill()
+            proc.wait()
+        if proc.stdout is not None:
+            proc.stdout.close()
+    if timed_out.is_set():
+        raise _GitTimeout("git timed out")
+    if not cut and proc.returncode != 0:
         raise NotFound("git failed")
     return out, cut
 
 
-def _commits_files(repo: Path, shas: list[str]) -> dict[str, list[str]]:
-    """`{sha: [path, ...]}` for the commits git still has, from one `git log --no-walk`; a commit git cannot read
-    (the one call fails) falls back to one call per sha, dropping those that fail."""
+def _commits_files(repo: Path, shas: list[str]) -> tuple[dict[str, list[str]], bool]:
+    """`({sha: [path, ...]}, complete)` for the requested commits git still has, keyed by the requested sha.
+
+    One `git log --no-walk=unsorted` first. Its records are trusted only when they come back exactly one per
+    requested sha, in the requested order, with no record mark (`\\x01`) inside any path; otherwise (or when the call
+    fails because a commit is gone) each sha gets its own call, which is parsed without splitting on that mark, and
+    those that fail are dropped. `complete` is False when git timed out or could not run: the caller must not cache
+    what it got. After a timeout no further call is made, so one listing waits at most one timeout."""
     if not shas:
-        return {}
+        return {}, True
     try:
-        return _parse_log(_log(repo, shas))
+        batch = _parse_batch(_log(repo, shas), shas)
+    except _GitTimeout:
+        return {}, False
     except NotFound:
-        pass
+        batch = None
+    if batch is not None:
+        return batch, True
     found: dict[str, list[str]] = {}
     for sha in shas:
         try:
-            found.update(_parse_log(_log(repo, [sha])))
+            paths = _parse_one(_log(repo, [sha]), sha)
+        except _GitTimeout:
+            return found, False
         except NotFound:
             continue
-    return found
+        if paths is not None:
+            found[sha] = paths
+    return found, True
 
 
 def _log(repo: Path, shas: list[str]) -> bytes:
@@ -129,24 +154,48 @@ def _log(repo: Path, shas: list[str]) -> bytes:
     return out
 
 
-def _parse_log(out: bytes) -> dict[str, list[str]]:
-    """Records split on `\\x01`: a sha, then NUL-separated paths (the first after a newline)."""
-    found: dict[str, list[str]] = {}
-    for record in out.split(b"\x01"):
-        fields = record.split(b"\0")
-        sha = fields[0].decode("ascii", errors="replace").strip()
-        if not SHA.match(sha):
+def _paths(raw: bytes) -> list[str]:
+    """The NUL-separated paths after a record's sha (the first after a newline); a non-UTF-8 one is left out."""
+    if raw.startswith(b"\n"):
+        raw = raw[1:]
+    paths: list[str] = []
+    for name in raw.split(b"\0"):
+        if not name:
             continue
-        paths: list[str] = []
-        for i, raw in enumerate(fields[1:]):
-            if i == 0 and raw.startswith(b"\n"):
-                raw = raw[1:]
-            if not raw:
-                continue
-            try:
-                paths.append(raw.decode("utf-8"))
-            except UnicodeDecodeError:
-                continue  # a path the page could not name back is left out
+        try:
+            paths.append(name.decode("utf-8"))
+        except UnicodeDecodeError:
+            continue  # a path the page could not name back is left out
+    return paths
+
+
+def _sha_of(head: bytes, requested: str) -> bool:
+    full = head.decode("ascii", errors="replace")
+    return bool(SHA.match(full)) and full.startswith(requested)
+
+
+def _parse_one(out: bytes, sha: str) -> list[str] | None:
+    """One commit's record: `\\x01<sha>\\0`, then its paths. Split on NUL only, never on the record mark."""
+    if not out.startswith(b"\x01"):
+        return None
+    head, sep, rest = out[1:].partition(b"\0")
+    if not sep or not _sha_of(head, sha):
+        return None
+    return _paths(rest)
+
+
+def _parse_batch(out: bytes, shas: list[str]) -> dict[str, list[str]] | None:
+    """The batch's records, or `None` when they are not exactly one per sha in order (a path held a record mark)."""
+    if out.count(b"\x01") != len(shas):
+        return None
+    records = out.split(b"\x01")
+    if records[0] != b"":
+        return None
+    found: dict[str, list[str]] = {}
+    for sha, record in zip(shas, records[1:], strict=True):
+        paths = _parse_one(b"\x01" + record, sha)
+        if paths is None:
+            return None
         found[sha] = paths
     return found
 
@@ -164,19 +213,33 @@ def _cache_token(run: Run, repo: Path) -> tuple | None:
 
 
 def run_artifacts(run: Run, repo: Path) -> list[dict]:
-    """`[{path, phase, kind, revisions: [{sha, step, label, round, ts}]}]`, by phase order, then path."""
+    """`[{path, phase, kind, revisions: [{sha, step, label, round, ts}]}]`, by phase order, then path.
+
+    An event log that cannot be read lists nothing (`[]`, as a missing one does), so a read or diff of it is
+    `NotFound`. A listing is cached only when its log was read and git answered every call."""
     token = _cache_token(run, repo)
-    if token is not None and token in _CACHE:
-        return copy.deepcopy(_CACHE[token])
-    listing = _list(run.events.read(), Path(repo))
     if token is not None:
-        while len(_CACHE) >= _CACHE_MAX:
-            _CACHE.pop(next(iter(_CACHE)))
-        _CACHE[token] = listing
+        with _CACHE_LOCK:
+            hit = _CACHE.get(token)
+        if hit is not None:
+            return copy.deepcopy(hit)
+    try:
+        events = run.events.read()
+    except OSError:
+        return []
+    listing, complete = _list(events, Path(repo))
+    if token is not None and complete:
+        with _CACHE_LOCK:
+            while len(_CACHE) >= _CACHE_MAX:
+                oldest = next(iter(_CACHE), None)
+                if oldest is None:
+                    break
+                _CACHE.pop(oldest, None)
+            _CACHE[token] = listing
     return copy.deepcopy(listing)
 
 
-def _list(events: list[dict], repo: Path) -> list[dict]:
+def _list(events: list[dict], repo: Path) -> tuple[list[dict], bool]:
     phases: list[str] = []
     for ev in events:
         phase = ev.get("phase")
@@ -200,8 +263,8 @@ def _list(events: list[dict], repo: Path) -> list[dict]:
         commits.append({"phase": phase, "sha": sha, "step": key, "label": f"{last} r{round_}" if round_ > 0 else last,
                         "round": round_, "ts": ev.get("ts")})
     if not commits:
-        return []
-    files = _commits_files(repo, list(dict.fromkeys(c["sha"] for c in commits)))
+        return [], True
+    files, complete = _commits_files(repo, list(dict.fromkeys(c["sha"] for c in commits)))
     entries: dict[str, dict] = {}
     for commit in commits:
         for path in files.get(commit["sha"], []):
@@ -213,7 +276,7 @@ def _list(events: list[dict], repo: Path) -> list[dict]:
                 continue
             entry["revisions"].append({k: commit[k] for k in ("sha", "step", "label", "round", "ts")})
     order = {phase: i for i, phase in enumerate(phases)}
-    return sorted(entries.values(), key=lambda e: (order[e["phase"]], e["path"]))
+    return sorted(entries.values(), key=lambda e: (order[e["phase"]], e["path"])), complete
 
 
 # -- reading
