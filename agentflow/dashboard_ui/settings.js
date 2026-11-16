@@ -165,13 +165,6 @@ async function loadSettings() {
   }
 }
 
-function diffNode(text) {
-  const lines = text.replace(/\n$/, "").split("\n").map((line) => el("span", {
-    class: line.startsWith("@@") ? "d-hunk" : line.startsWith("+") && !line.startsWith("+++") ? "d-add"
-      : line.startsWith("-") && !line.startsWith("---") ? "d-del" : null, text: line + "\n" }));
-  return el("pre", { class: "diff" }, lines);
-}
-
 async function reviewSettings() {
   const d = settings.data;
   if (!d) return;

@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- A run's page in the dashboard has Spec and Plan tabs: each revision `define` and `plan` committed, rendered or raw, a diff with the previous one, and the review findings by round with a dot on their line.
 - A dashboard approval of a phase records the spec and plan revisions the page showed (`viewed` on `phase_approved`). The CLI's approvals are unchanged.
 - `dashboard.artifact_max_kb` (512 by default, 16–8192): the largest spec, plan revision or diff the dashboard loads.
 - `gates.<name>.group` and `gates.<name>.resource`: gates of different groups run at the same time (each group in set order), and gates that share a resource never overlap within a run. Gates with no group run in order as before, and leaving early kills every group's processes.

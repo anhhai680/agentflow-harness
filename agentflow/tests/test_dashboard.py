@@ -946,7 +946,7 @@ def test_hidden_wins_over_an_author_display_rule():
 def test_runs_have_hash_routes():
     source = page_source()
     for needle in ('"#/run/"', "hashchange", "function parseRoute", "function routeHash",
-                   'RUN_TABS = ["overview", "activity", "gates", "files"]'):
+                   'RUN_TABS = ["overview", "spec", "plan", "activity", "gates", "files"]'):
         assert needle in source, needle
 
 
@@ -1425,7 +1425,8 @@ def test_a_pack_without_a_backlog_block_still_syncs_its_issues(idash, monkeypatc
 
 def test_the_page_names_no_lane_phase_or_path(bdash):
     """The page is framework code: lanes, phases and the form fields all come from the board data."""
-    source = page_source()
+    # the two tab lists name the artifact tabs (`plan` is a tab id there, as `define`'s `spec` is); nothing else may
+    source = "\n".join(line for line in page_source().splitlines() if "RUN_TABS = [" not in line and "ARTIFACT_KINDS = [" not in line)
     cfg = bdash.flow.cfg
     for word in [*cfg.lanes, "CAPABILITY-MAP", "docs/", "origin/", "flow/"]:
         assert not re.search(rf"(?<![A-Za-z-]){re.escape(word)}(?![A-Za-z-])", source), word
@@ -1855,3 +1856,17 @@ def test_a_big_artifact_is_cut_to_the_configured_cap(dash, spec_run):
 def test_run_detail_names_the_artifact_tabs_its_lane_walks(dash):
     run = awaiting(dash.flow)
     assert payload(dash.get(f"/api/runs/{run.id}")[2])["artifact_tabs"] == ["spec", "plan"]
+
+
+def test_the_run_page_has_spec_and_plan_tabs_only_where_the_lane_walks_them():
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    assert 'RUN_TABS = ["overview", "spec", "plan", "activity", "gates", "files"]' in run_js
+    assert "visibleTabs(detail)" in run_js and "artifact_tabs" in (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+
+
+def test_the_spec_tab_reads_the_artifact_routes_and_says_when_there_is_none():
+    art = (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+    for needle in ("/artifacts", "/artifact?path=", "/artifact/diff?path=", "/findings", "has not committed one",
+                   "Showing the first", "Copy path", "as merged", "Diff with previous"):
+        assert needle in art, needle
+    assert UI_SCRIPTS.index("run.js") < UI_SCRIPTS.index("artifact.js") < UI_SCRIPTS.index("main.js")

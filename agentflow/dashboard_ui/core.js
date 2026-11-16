@@ -206,6 +206,13 @@ function ago(seconds) {
   return Math.floor(minutes / 60) + " h " + (minutes % 60) + " min";
 }
 
+function diffNode(text) {
+  const lines = text.replace(/\n$/, "").split("\n").map((line) => el("span", {
+    class: line.startsWith("@@") ? "d-hunk" : line.startsWith("+") && !line.startsWith("+++") ? "d-add"
+      : line.startsWith("-") && !line.startsWith("---") ? "d-del" : null, text: line + "\n" }));
+  return el("pre", { class: "diff" }, lines);
+}
+
 const money = (value) => (typeof value === "number" ? "$" + value.toFixed(2) : "-");
 // " / soft · hard" for a run with a soft budget, " / budget" for one started before it, "" for none.
 const limits = (soft, hard) => (hard ? " / " + (soft ? money(soft) + " · " : "") + money(hard) : "");

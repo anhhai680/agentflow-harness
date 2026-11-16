@@ -215,3 +215,26 @@ def test_nesting_is_capped_at_32_levels():
     assert js(["markdown.js"], depth, ">" * 5000 + " x") <= 40
     assert js(["markdown.js"], depth, "[" * 5000 + "x" + "](a)" * 5000) <= 40
     assert js(["markdown.js"], depth, "\n".join(" " * d + "- x" for d in range(300))) <= 100
+
+
+def test_a_finding_on_line_34_marks_line_34_raw_and_its_block_rendered():
+    text = "\n".join(["# T", ""] + ["" if n in (32, 36) else f"line {n}" for n in range(3, 41)])  # 33–35 is one paragraph
+    rows = [{"open": True, "findings": [{"severity": "high", "file": "s.md", "line": 34, "text": "x"},
+                                        {"severity": "low", "file": "s.md", "line": 34, "text": "y"},
+                                        {"severity": "high", "file": "s.md", "line": 999, "text": "past the end"},
+                                        {"severity": "high", "file": "other.md", "line": 3, "text": "z"}]},
+            {"open": False, "findings": [{"severity": "critical", "file": "s.md", "line": 3, "text": "old"}]}]
+    assert js(["artifact.js"], "rawMarks(args.rows, 's.md')", {"rows": rows}) == {"34": "high", "999": "high"}
+    marks = js(["markdown.js", "artifact.js"], "gutterMarks(parseMarkdown(args.text), args.rows, 's.md')",
+               {"text": text, "rows": rows})
+    block = next(b for b in js(["markdown.js"], "parseMarkdown(args)", text) if b["line"] <= 34 <= b["end"])
+    assert marks == {str(block["line"]): "high"}
+
+
+def test_the_default_artifact_is_the_markdown_file_with_most_revisions():
+    files = [{"path": "a.txt", "kind": "spec", "revisions": [1, 2, 3]}, {"path": "b.md", "kind": "spec", "revisions": [1]},
+             {"path": "c.md", "kind": "spec", "revisions": [1, 2]}, {"path": "p.md", "kind": "plan", "revisions": [1]}]
+    assert js(["artifact.js"], "pickArtifact(args, 'spec', null).path", files) == "c.md"
+    assert js(["artifact.js"], "pickArtifact(args, 'spec', 'b.md').path", files) == "b.md"
+    assert js(["artifact.js"], "pickArtifact(args, 'spec', 'p.md').path", files) == "c.md"
+    assert js(["artifact.js"], "pickArtifact(args, 'plan', null) && 1", []) is None
