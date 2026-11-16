@@ -283,11 +283,11 @@ git commit -m "List, read and diff a run's artifacts from its own commits in git
 - Test: `agentflow/tests/test_artifacts.py` and `agentflow/tests/test_dashboard.py`.
 
 **Interfaces:**
-- Consumes: Task 2's functions and `NotFound`, and `autonomy.step_title`, `finding_text` and `as_finding`.
+- Consumes: Task 2's functions and `NotFound`, `views.step_title`, and `autonomy.finding_text` and `as_finding`.
 - Produces:
   - `artifacts.run_findings(run: Run) -> list[dict]` returns `[{key, label, round, ts, open, findings: [{severity, file, line, text}]}]`:
     - one row per `step_findings` event (`round` is its 1-based position among that key's `step_findings`), and one per `review_result` event (its own `round`), in `seq` order;
-    - `label` is `autonomy.step_title(key)`;
+    - `label` is `views.step_title(key)` (import it inside the function: `views` imports `artifacts`);
     - `open` is True only on the newest row of each key;
     - `severity` is lower-cased text or `null`;
     - `text` is `finding_text(f)`.
