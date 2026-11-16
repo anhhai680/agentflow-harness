@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- A dashboard approval of a phase records the spec and plan revisions the page showed (`viewed` on `phase_approved`). The CLI's approvals are unchanged.
 - `dashboard.artifact_max_kb` (512 by default, 16–8192): the largest spec, plan revision or diff the dashboard loads.
 - `gates.<name>.group` and `gates.<name>.resource`: gates of different groups run at the same time (each group in set order), and gates that share a resource never overlap within a run. Gates with no group run in order as before, and leaving early kills every group's processes.
 - `gates.<name>.inputs`: a gate that passed in the run is not run again while none of the files its globs match has changed, even on another tree, and `conformance` accepts that pass as floor evidence on the final tree only when the gate's input hash there is equal. A step whose verify gates were reused still counts as verified work, so its commit leaves the earlier `step:` evidence standing. New `gate_cache_hit` event, `gate_result.input_hash`, and the `gate_cache_hit_rate` signal. Without `inputs`, nothing changes.

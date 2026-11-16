@@ -22,6 +22,7 @@ Routes:
   an approval inside a phase then start `flow.py resume <id>` detached (D13), unless a runner already holds
   the run's lock. A phase approval starts nothing: the phase rests as ready until a human continues it
   (`resume`) or marks it done (`done`, which ends in the draft pull request) (D16).
+  An approve body may carry `viewed: [{path, sha}]`, the revisions the page showed, recorded on `phase_approved`.
   An action the run is not in a state for (a second approve, a live runner) answers 409 with the reason.
 - `POST /api/backlog` (add a card: `lane`, `fields`, `after`, `to_phase`), `POST /api/backlog/start` (`module` or
   `item`: `card:<id>`, `module:<id>` or a synced `issue:<number>`) and `POST /api/backlog/remove` (`item`, a card
@@ -71,6 +72,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from agentflow import backlog, config_edit, hitl, module_queue, pack, preflight
 from agentflow.artifacts import (
+    SHA,
     NotFound,
     artifact_diff,
     artifact_max_bytes,
@@ -164,13 +166,31 @@ def _rests(run: Run, cfg: Config) -> bool:
     return not following or following[0].needs_approval
 
 
+VIEWED_MAX = 100
+VIEWED_PATH_MAX = 1024
+
+
+def _viewed(body: dict) -> list[dict] | None:
+    """The optional `viewed: [{path, sha}]` of an approval: informational, so only its shape is checked."""
+    viewed = body.get("viewed")
+    if viewed is None:
+        return None
+    if (not isinstance(viewed, list) or len(viewed) > VIEWED_MAX
+            or not all(isinstance(v, dict) and set(v) == {"path", "sha"} and isinstance(v["path"], str)
+                       and 1 <= len(v["path"]) <= VIEWED_PATH_MAX and isinstance(v["sha"], str)
+                       and SHA.match(v["sha"]) for v in viewed)):
+        raise BadRequest("viewed must be a list of {path, sha}")
+    return viewed
+
+
 def _approve(run: Run, body: dict, cfg: Config) -> tuple[dict, bool]:
+    viewed = _viewed(body)
     budget = body.get("budget")
     if budget is not None and (isinstance(budget, bool) or not isinstance(budget, (int, float))
                                or not math.isfinite(budget)):
         raise BadRequest("budget must be a finite number")
     rested = hitl.approve(run, _text(body, "target") or _default_target(run), BY, budget=budget, hold=_rests(run, cfg),
-                          note=_text(body, "note"), budget_step=cfg.defaults.run_budget_usd)
+                          note=_text(body, "note"), budget_step=cfg.defaults.run_budget_usd, viewed=viewed)
     return {}, not rested
 
 

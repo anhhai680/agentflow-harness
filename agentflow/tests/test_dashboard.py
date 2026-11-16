@@ -462,6 +462,23 @@ def test_dashboard_approve_equals_cli(dash):
     assert status == 409 and dash.spawned == []
 
 
+def test_approve_records_what_the_page_showed(dash):
+    run = awaiting(dash.flow, phase="define")
+    viewed = [{"path": "docs/specs/x.md", "sha": "a" * 40}]
+    assert dash.post(f"/api/runs/{run.id}/approve", {"viewed": viewed})[0] == 200
+    (event,) = [e for e in run.events.read() if e["type"] == "phase_approved"]
+    assert event["viewed"] == viewed and event["by"] == "dashboard"
+
+
+@pytest.mark.parametrize("viewed", ["x", [{"path": "a"}], [{"path": "a", "sha": "zz"}],
+                                    [{"path": "", "sha": "a" * 40}], [{"path": "a", "sha": "a" * 40, "x": 1}],
+                                    [{"path": "a", "sha": "a" * 40}] * 101])
+def test_a_malformed_viewed_is_a_400_and_approves_nothing(dash, viewed):
+    run = awaiting(dash.flow, phase="define")
+    assert dash.post(f"/api/runs/{run.id}/approve", {"viewed": viewed})[0] == 400
+    assert not [e for e in run.events.read() if e["type"] == "phase_approved"]
+
+
 def test_approving_a_phase_rests_the_card_where_it_is(dash):
     run = awaiting(dash.flow, phase="define")
     assert dash.post(f"/api/runs/{run.id}/approve")[0] == 200
