@@ -843,7 +843,7 @@ class FeatureLane:
         if not branch or branch in (self.cfg.project.base_branch, self.cfg.project.fork_from):
             return
         key = f"{phase}/{EARLY_PR}"
-        try:
+        try:  # every failure is `early_pr_failed`: this must never stop or crash the run
             dirty = dirty_paths(self.worktree)
             if dirty:
                 raise GitError(f"uncommitted changes in {', '.join(dirty[:5])}")
@@ -852,10 +852,10 @@ class FeatureLane:
             if foreign:
                 raise GitError(f"the branch holds commits the runner will not push: {foreign[0]}")
             sha = head(self.worktree)
+            body = self.write_pr_body(early=True)  # before the push: a body that cannot be written pushes nothing
             push(self.worktree, branch, sha=sha)
-            body = self.write_pr_body(early=True)
             url = create_draft_pr(self.worktree, self.cfg.project.fork_from, branch, self._pr_title(), body)
-        except (GitError, GhError, OSError, subprocess.CalledProcessError) as exc:
+        except Exception as exc:  # noqa: BLE001 - not KeyboardInterrupt or SystemExit, which still end the runner
             self.run.emit("early_pr_failed", phase=phase, reason=clean_fact(str(exc) or type(exc).__name__))
             return
         self.run.emit("pr_opened", url=url, key=key, early=True)

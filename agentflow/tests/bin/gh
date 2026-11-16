@@ -5,7 +5,8 @@ Every call appends its argv as one JSON list to `$FAKE_GH_LOG` (when set). `pr c
 URL (`$FAKE_GH_URL`, default https://github.com/example/repo/pull/1); `pr view ... --json state`
 prints `{"state": "$FAKE_GH_STATE"}` (default OPEN); `pr view ... --json mergeable,...` plays the next entry of the
 comma-separated `$FAKE_GH_MERGEABLE` (the last one repeating; default MERGEABLE; the place is kept in
-`$FAKE_GH_LOG.mergeable`); `issue view N ...` prints `$FAKE_GH_ISSUE` (default
+`$FAKE_GH_LOG.mergeable`); `pr view ... --json headRefOid` prints `{"headRefOid": ...}`: `$FAKE_GH_HEAD` when set, else the sha `origin` has for
+the branch checked out where `gh` runs (an empty string when it has none); `issue view N ...` prints `$FAKE_GH_ISSUE` (default
 an issue titled `Issue N`); `pr checks` plays the next entry of the JSON list in the file `$FAKE_GH_CHECKS`
 (`{"checks": [...], "exit": 8, "stderr": "..."}`, the last one repeating; the place is kept in `<file>.cursor`);
 anything else prints `$FAKE_GH_JSON` (default `[]`). `$FAKE_GH_FAIL` makes every call fail with exit 1.
@@ -73,6 +74,15 @@ if os.environ.get("FAKE_GH_NO_LABEL") and args[:2] == ["issue", "edit"] and "--a
         sys.exit(1)
 if args[:2] == ["pr", "create"]:
     print(os.environ.get("FAKE_GH_URL", "https://github.com/example/repo/pull/1"))
+elif args[:2] == ["pr", "view"] and "--json" in args and args[args.index("--json") + 1:][:1] == ["headRefOid"]:
+    sha = os.environ.get("FAKE_GH_HEAD")
+    if sha is None:
+        import subprocess
+
+        branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip()
+        remote = subprocess.run(["git", "ls-remote", "origin", f"refs/heads/{branch}"], capture_output=True, text=True)
+        sha = (remote.stdout.split() or [""])[0]
+    print(json.dumps({"headRefOid": sha}))
 elif args[:2] == ["pr", "checks"] and os.environ.get("FAKE_GH_CHECKS"):
     path = os.environ["FAKE_GH_CHECKS"]
     with open(path, encoding="utf-8") as handle:

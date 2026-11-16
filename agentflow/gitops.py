@@ -132,6 +132,18 @@ def update_pr_body(worktree: Path, url: str, body_file: Path) -> None:
         raise GhError(proc.stderr.strip() or f"gh exited {proc.returncode}")
 
 
+def pr_head(worktree: Path, url: str) -> str:
+    """The sha GitHub has for the pull request's head (`headRefOid`), "" when it names none. Reads only."""
+    proc = _gh(["pr", "view", url, "--json", "headRefOid"], Path(worktree))
+    if proc.returncode != 0:
+        raise GhError(proc.stderr.strip() or f"gh exited {proc.returncode}")
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError as exc:
+        raise GhError(f"gh printed invalid JSON: {exc}") from exc
+    return str((data or {}).get("headRefOid") or "") if isinstance(data, dict) else ""
+
+
 def pr_mergeable(worktree: Path, url: str) -> str:
     """GitHub's verdict on merging the pull request into its target: `MERGEABLE`, `CONFLICTING` or `UNKNOWN`
     (GitHub has not worked it out yet). Reads only."""

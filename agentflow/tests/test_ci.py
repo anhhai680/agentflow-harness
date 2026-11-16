@@ -600,3 +600,74 @@ def test_dry_run_shows_the_early_pr(flow_repo, capsys):
     flow_repo.configure(PIPE, autopilot=True)
     assert main(["run", "bug", "--task", "x", "--dry-run", "--config", str(flow_repo.cfg.path)]) == 0
     assert "early draft PR" not in capsys.readouterr().out
+
+
+def skip_finish(data: dict) -> None:
+    """A pack whose `finish` does not run (a `when:` that never holds here) while its `ci` step still does."""
+    next(step for step in data["phases"]["ship"]["steps"] if step.get("type") == "finish")["when"] = "refine_round"
+
+
+def head_reads(gh) -> list[list[str]]:
+    return [c for c in gh.calls() if c[:2] == ["pr", "view"] and "headRefOid" in c]
+
+
+def test_ci_never_takes_an_early_pr_that_finish_did_not_update(flow_repo, gh):
+    gh.play(PASS)
+    flow_repo.configure(EARLY, autopilot=True, edit=skip_finish)
+    flow_repo.script({RED: [GOOD_TEST], "build/fix": [FIXED]})
+    run = start(flow_repo.cfg, flow_repo.root, "bug", {"task": "x"}, RunOptions())
+    assert go(flow_repo, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    assert go(flow_repo, run) == "waiting_human"
+    assert flow_repo.events(run, "pr_opened")[0]["early"] is True and not flow_repo.events(run, "pr_updated")
+    waiting = run.state["waiting"]
+    assert waiting["key"] == "ship/ci" and "`finish` has not opened one" in waiting["summary"]
+    assert not gh.did("pr", "ready") and not gh.did("pr", "checks") and not flow_repo.events(run, "pr_marked_ready")
+
+
+def test_a_stale_head_with_green_checks_is_never_a_pass(flow_repo, gh, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_HEAD", "0" * 40)  # GitHub still shows the early push
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    assert go(flow_repo, run) == "waiting_human"
+    waiting = run.state["waiting"]
+    assert waiting["key"] == "ship/ci" and "0000000000" in waiting["summary"]
+    assert flow_repo.events(run, "pr_updated")[0]["sha"][:12] in waiting["summary"]
+    assert head_reads(gh) and not gh.did("pr", "checks")  # a stale head's checks are not read at all
+    assert not gh.did("pr", "ready") and not flow_repo.events(run, "pr_marked_ready")
+
+
+def test_a_matching_head_with_green_checks_is_marked_ready(flow_repo, gh):
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    assert go(flow_repo, run) == "done"
+    assert head_reads(gh) and gh.did("pr", "ready", URL)
+
+
+def test_without_an_early_pr_the_head_is_never_read(flow_repo, gh):
+    gh.play(PASS)
+    run = to_ship(flow_repo)
+    assert go(flow_repo, run) == "done"
+    assert not head_reads(gh) and gh.did("pr", "ready", URL)
+
+
+def test_a_failing_pr_body_is_an_early_pr_failure_with_no_push(flow_repo, gh, monkeypatch):
+    from agentflow import feature_lane
+
+    real = feature_lane.render_pr_body
+
+    def render(run, plan=None, *, early=False):
+        if early:
+            raise ValueError("body broke\nsecond line")
+        return real(run, plan, early=early)
+
+    monkeypatch.setattr(feature_lane, "render_pr_body", render)
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    pushes = count_pushes(flow_repo, run)
+    assert go(flow_repo, run) == "done"
+    (failed,) = flow_repo.events(run, "early_pr_failed")
+    assert failed["reason"] == "body broke second line"
+    counts = [int(line) for line in pushes.read_text(encoding="utf-8").split()]
+    assert len(counts) == 1 and counts[0] > position(run, "early_pr_failed")  # only `finish` pushed
+    assert flow_repo.events(run, "pr_opened")[0]["key"] == "ship/finish"
