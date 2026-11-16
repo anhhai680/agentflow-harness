@@ -1773,6 +1773,13 @@ HOSTILE_TEMPLATES = [
     "echo \"`echo`\" {paths}", "echo \"${{x}}\" {paths}", "echo {paths} '", "echo {paths} \"", "echo {paths} $(echo",
     "echo $(echo # ') x\n) ' {paths} 'y'", "echo {paths} `echo", "echo $(echo (a)) {paths}", "echo \\{{paths}}",
     "echo x\\{paths}", "echo {paths} $'a'",
+    # A `#` right after an operator or a line continuation starts a comment that hides a quote from the scan.
+    "echo a;#'\n' {paths} \\'", "echo a&&#'\n' {paths} \\'", "echo a|#'\n' {paths} \\'", "(#'\n' {paths} \\'\n)",
+    "echo a \\\n#'\n' {paths} \\'",
+    "echo `true '`'`'\"' {paths} \"'\"'\\'",  # the shell ignores `'` when it looks for the closing backtick
+    "echo `(true)` {paths}",  # an unquoted `(` inside backticks, as inside `$(...)`
+    "echo $[\n{paths} ]", "(( {paths} ))",  # arithmetic reads its words as if double-quoted (found by the fuzz)
+    "echo \"${x:-'}\" {paths} \"'}\"",  # a lone brace: the renderer leaves `${`, whose `'` bash honours inside `"`
 ]
 
 
@@ -1791,7 +1798,8 @@ def test_the_scanner_refuses_every_hostile_template(template):
 
 @pytest.mark.parametrize("template", [
     "pytest {paths}", "ruff check {paths}", "cmd --flag {paths} | tail -n 5", "cmd {paths} && other",
-    "echo $(date) {paths}", "echo \"$HOME\" '{{x}}' {paths}", "pytest -q {paths} 2>&1",
+    "echo $(date) {paths}", "echo \"$HOME\" '{{x}}' {paths}", "pytest -q {paths} 2>&1", "cd api &&\n  pytest {paths}",
+    "echo a#b {paths}", "echo '#' \"#\" {paths}", "git log --format=%h#%s {paths}",
 ])
 def test_the_scanner_still_accepts_the_ordinary_templates(template):
     from agentflow.config import unquoted_paths_word

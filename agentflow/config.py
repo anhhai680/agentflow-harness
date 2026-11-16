@@ -380,31 +380,28 @@ AFFECTED_KEYS = ("run", "paths")
 
 
 _WORD_END = frozenset(" \t\n;&|")  # what may follow `{paths}`: the end of a shell word
+_WORD_CHARS = frozenset(string.ascii_letters + string.digits + "_-./=:+,@%")  # a `#` after one never starts a comment
 
 
 def unquoted_paths_word(run: str) -> bool:
     """True when every `{paths}` in the `affected.run` template `run` is its own unquoted shell word, so each
-    shell-quoted file name stays one inert argument: never inside `'...'`, `"..."`, backticks, `$(...)` or `${...}`,
-    never after an unquoted `#` on its line or after an unquoted here-document `<<`, and with only the start,
-    whitespace before it and the end, whitespace, `;`, `&` or `|` after it. `{{` and `}}` are literal braces.
+    shell-quoted file name stays one inert argument: never inside `'...'`, `"..."`, `$(...)` or `${...}`, never after
+    an unquoted here-document `<<`, and with only the start, whitespace before it and the end, whitespace, `;`, `&`
+    or `|` after it. `{{` and `}}` are literal braces.
 
     A small, conservative scan of POSIX shell quoting: a template it cannot read as safe is refused. It fails
-    closed on everything it cannot track: an escaped `{` (the renderer still replaces `{paths}` after a backslash),
-    `$'...'`, `$(`, `${` or a backtick opened inside `"..."`, a `#` or an unquoted `(` inside `$(...)` or backticks (a
-    comment, a subshell or a case pattern would desync the quote state), and a scan that ends inside a quote,
-    `$(...)` or backticks."""
-    single = double = backtick = comment = heredoc = False
+    closed on everything it cannot track rather than mimic the shell's grammar: an escaped `{` (the renderer still
+    replaces `{paths}` after a backslash), a lone `${` (the renderer leaves it as it is), any backtick (the
+    shell ignores quotes when it looks for the closing one), `$'...'`, `$[` and `((` (arithmetic reads its words as
+    if double-quoted), `$(` or `${` opened inside `"..."`, an unquoted `#` anywhere but right after a word character
+    (a comment, after a blank, an operator or a line continuation, hides quotes from the scan), a `#` or an unquoted
+    `(` inside `$(...)` or `${...}` (a comment, a subshell or a case pattern would desync the quote state), and a
+    scan that ends inside a quote or a substitution."""
+    single = double = heredoc = False
     depth = 0  # open `$(` and `${`
     prev = ""  # the last character read outside a quote, "" at the start
     i, n = 0, len(run)
     while i < n:
-        if comment:
-            if run.startswith("{paths}", i):
-                return False  # a newline in a name would end the comment and run the rest
-            if run[i] == "\n":
-                comment, prev = False, "\n"
-            i += 1
-            continue
         if single:
             if run[i] == "'":
                 single = False
@@ -426,12 +423,14 @@ def unquoted_paths_word(run: str) -> bool:
             continue
         if run.startswith("{paths}", i):
             after = run[i + 7:i + 8]
-            if (double or backtick or depth or heredoc or prev not in ("", " ", "\t", "\n")
+            if (double or depth or heredoc or prev not in ("", " ", "\t", "\n")
                     or (after and after not in _WORD_END)):
                 return False
             prev, i = "}", i + 7
             continue
         c = run[i]
+        if c == "`" or (c == "{" and prev == "$"):
+            return False  # a backtick ends whatever quotes say; the renderer leaves a lone `${`, which is not tracked
         if c == "\\":
             if run.startswith("{", i + 1):
                 return False  # the renderer still replaces a `{paths}` after a backslash: never read as escaped
@@ -441,25 +440,19 @@ def unquoted_paths_word(run: str) -> bool:
             single = True
         elif c == '"':
             double = not double
-        elif c == "`":
-            if double:
-                return False
-            backtick = not backtick
-        elif c == "$" and run.startswith("$'", i):
-            return False  # ANSI-C quoting escapes `'` differently
+        elif c == "$" and run.startswith(("$'", "$["), i):
+            return False  # ANSI-C quoting escapes `'` differently; `$[` arithmetic reads `'` as a literal
         elif c == "$" and run.startswith("$(", i):
             if double:
                 return False
             depth, i, prev = depth + 1, i + 2, "("
             continue
-        elif c == "(" and depth and not double:
-            return False  # a subshell or a case pattern: its `)` would close the `$(` early
-        elif c == "#" and not double and (depth or backtick):
-            return False  # a comment inside a substitution hides quotes from this scan
+        elif c == "(" and not double and (depth or run.startswith("((", i)):
+            return False  # a subshell or a case pattern closes `$(` early; `((` is arithmetic in bash
+        elif c == "#" and not double and (depth or prev not in _WORD_CHARS):
+            return False  # a comment (after a blank, an operator or a line continuation) hides quotes from this scan
         elif c == ")" and depth:
             depth -= 1
-        elif c == "#" and not double and not backtick and not depth and prev in ("", " ", "\t", "\n"):
-            comment = True
         elif c == "<" and not double and run.startswith("<<", i) and not run.startswith("<<<", i):
             heredoc = True
         elif c == "<" and run.startswith("<<<", i):
@@ -467,7 +460,7 @@ def unquoted_paths_word(run: str) -> bool:
             continue
         prev = c
         i += 1
-    return not (single or double or backtick or depth)
+    return not (single or double or depth)
 
 
 @dataclass(frozen=True)
@@ -1801,10 +1794,10 @@ class _Validator:
             self.error(_join(path, "run"), "affected.run is a non-empty command whose only placeholder is `{paths}`; "
                        "write a literal brace as `{{` or `}}`")
         elif not unquoted_paths_word(run):
-            self.error(_join(path, "run"), "`{paths}` must be its own unquoted word: not inside quotes, backticks, "
-                       "`$(...)` or `${...}`, never after a backslash or beside `$'...'`, and not after a `#` or a "
-                       "here-document, with its quotes and substitutions balanced, so each file name stays one "
-                       "inert argument")
+            self.error(_join(path, "run"), "`{paths}` must be its own unquoted word: not inside quotes, "
+                       "`$(...)` or `${...}`, never after a backslash or a here-document, in a template with no "
+                       "backtick, `$'...'`, `$[`, `((` or comment `#`, with its quotes and substitutions balanced, so "
+                       "each file name stays one inert argument")
         bad = [p for p in affected.paths if not isinstance(p, str) or not p.strip() or posixpath.isabs(p)
                or ".." in p.split("/")]
         if not affected.paths or bad:

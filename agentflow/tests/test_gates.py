@@ -505,6 +505,64 @@ def test_an_accepted_template_runs_no_hostile_name(tmp_git, template):
     assert not (tmp_git / "PWNED").exists()
 
 
+_FUZZ_FRAGMENTS = ("'", '"', "`", "\\", "$(", ")", "(", "${{", "}}", "{{", "#", ";", "&", "|", "\n", " ", " ", "$'",
+                   "case x in ", "esac", "echo ", "a", "<<", "((", "$[", "]", "\\\n", "&&", ";;", "=", "<(", "$\"",
+                   "x)", "${", "}", "{", "if ", "then ", "fi", "for i in ", "do ", "done", "[[ ", " ]]", "!", "*",
+                   "<<<", "%", "/", ":", "-")
+_FUZZ_NAMES = ["x$(touch PWNED)y.py", "q'$(touch PWNED)'q.py", "d\"$(touch PWNED)\"d.py", "b`touch PWNED`b.py"]
+
+
+def _fuzz_template(rng) -> str:
+    def pick() -> str:
+        return "".join(rng.choice(_FUZZ_FRAGMENTS) for _ in range(rng.randint(0, 7)))
+
+    return pick() + rng.choice([" ", " ", "\n", ""]) + "{paths}" + rng.choice([" ", "", ";", "\n", "|", "&"]) + pick()
+
+
+def test_no_template_the_scanner_accepts_lets_a_hostile_name_run(tmp_path):
+    """Differential check of `unquoted_paths_word` against real shells: random templates of shell metacharacters,
+    the ones the scanner accepts rendered with hostile names and run under each shell present; none may run a name."""
+    import random
+    import shutil
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor
+
+    from agentflow.config import unquoted_paths_word
+    from agentflow.gates import _render_affected
+
+    shells = list(dict.fromkeys(s for s in ("/bin/sh", "/bin/dash", "/bin/bash", shutil.which("bash"))
+                                if s and os.path.exists(s)))
+    rng = random.Random(20261116)
+    accepted: list[str] = []
+    for _ in range(40000):
+        template = _fuzz_template(rng)
+        if unquoted_paths_word(template):
+            accepted.append(template)
+            if len(accepted) == 400:
+                break
+
+    def run(job: tuple[int, str]) -> list[str]:
+        index, template = job
+        bad = []
+        for k, sh in enumerate(shells):
+            cwd = tmp_path / f"{index}-{k}"
+            cwd.mkdir()
+            try:
+                subprocess.run([sh, "-c", _render_affected(template, _FUZZ_NAMES)], cwd=cwd, capture_output=True,
+                               stdin=subprocess.DEVNULL, timeout=5, check=False,
+                               env={"PATH": "/usr/bin:/bin", "HOME": str(cwd)})
+            except subprocess.TimeoutExpired:
+                bad.append(f"{template!r} hangs {sh}")
+            if (cwd / "PWNED").exists():
+                bad.append(f"{template!r} runs a name under {sh}")
+        return bad
+
+    assert len(accepted) == 400 and shells
+    with ThreadPoolExecutor(8) as pool:
+        found = [line for bad in pool.map(run, enumerate(accepted)) for line in bad]
+    assert not found, "\n".join(found)
+
+
 def test_a_rendered_command_over_the_byte_limit_runs_the_full_command(tmp_git, tmp_path):
     from agentflow.gates import MAX_AFFECTED_COMMAND_BYTES, MAX_AFFECTED_PATHS
 
