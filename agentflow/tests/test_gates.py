@@ -326,6 +326,13 @@ def test_hash_inputs_follows_the_command():
     assert hash_inputs(entries, ["api/**"], "one") == hash_inputs(list(reversed(entries)), ["api/**"], "one")
 
 
+def test_a_path_holding_a_newline_cannot_collide_with_two_entries():
+    two = [("api/a", "100644", "X"), ("api/b", "100644", "Y")]
+    one = [("api/a\n100644 Y api/b", "100644", "X")]  # git allows a newline in a file name
+    for patterns in (["api/**"], ["**"]):
+        assert hash_inputs(two, patterns, "cmd") != hash_inputs(one, patterns, "cmd")
+
+
 def test_input_hashes_count_untracked_files(tmp_git):
     cfg = cfg_with({"api": Gate("api", "true", inputs=["api/**"]), "plain": "true"})
     gates = list(cfg.gates.values())

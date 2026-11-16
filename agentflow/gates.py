@@ -197,11 +197,11 @@ def hash_inputs(entries: list[tuple[str, str, str]], patterns: list[str], cmd: s
     """What a gate's result depends on: its command digest and the files its `inputs` globs match. Pure.
 
     `entries` are `(path, mode, blob)` of a tree. The hash is the sha256 (16 hex characters) of `cmd`, then one
-    `<mode> <blob> <path>` line for each entry that matches any pattern, sorted by path."""
+    `<mode> <blob> <path>` record (ended by NUL, which no path holds) for each entry that matches any pattern, sorted by path."""
     digest = hashlib.sha256(f"{cmd}\n".encode())
     for path, mode, blob in sorted(entries):
         if any(path_matches(path, pattern) for pattern in patterns):
-            digest.update(f"{mode} {blob} {path}\n".encode())
+            digest.update(f"{mode} {blob} {path}\0".encode())  # NUL ends a record: a path never holds one
     return digest.hexdigest()[:16]
 
 
