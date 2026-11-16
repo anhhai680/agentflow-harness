@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -129,3 +130,88 @@ def test_markdown_nodes_builds_dom_from_the_tree(tmp_path):
     assert pre["tag"] == "pre" and pre["kids"][0]["text"] == "<i>raw</i>"
     cell = table["kids"][0]["kids"][0]["kids"][0]
     assert cell["tag"] == "th" and cell["attrs"]["class"] == "al-center"
+
+
+# --- the output for ordinary Markdown does not change -------------------------------------------------------------
+
+FIXTURES = Path(__file__).parent / "fixtures" / "markdown"
+
+
+def test_ordinary_markdown_parses_to_the_pinned_tree():
+    text = (FIXTURES / "sample.md").read_text(encoding="utf-8")
+    assert js(["markdown.js"], "parseMarkdown(args)", text) == json.loads((FIXTURES / "sample.json").read_text(encoding="utf-8"))
+
+
+# --- no input freezes the page or overflows the stack ---------------------------------------------------------------
+
+SIZE = 512 * 1024  # the default artifact cap
+BOUND_S = 3.0      # generous: the shapes below take a fraction of a second, and were minutes before the fix
+REALISTIC = ("# Heading #\n\nSome **bold** text with `code` and a [link](docs/x.md) and _em_ words here.\n\n- item one\n"
+             "- item **two**\n  - nested `x`\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```py\nx = 1\n```\n\n> quote line\n\n")
+
+
+def repeated(unit: str, size: int = SIZE, sep: str = "") -> str:
+    return sep.join([unit] * (size // (len(unit) + len(sep)) + 1))
+
+
+# Each case parses, then builds the DOM, and reports the time taken inside node (so the start-up of node doesn't count).
+TIMED = ("(function(){const t=Date.now();const nodes=markdownNodes(parseMarkdown(args));"
+         "return {ms:Date.now()-t,count:nodes.length};})()")
+
+SLOW_SHAPES = {
+    "realistic": REALISTIC * (SIZE // len(REALISTIC) + 1),
+    "underscore": repeated("_a "), "underscore_lines": repeated("_a ", sep="\n"), "star": repeated("*a "),
+    "double_star": repeated("**a "), "bracket": repeated("[a "), "bracket_paren": repeated("[a]("),
+    "backtick": repeated("`a "), "nested_marks": "*_" * (SIZE // 4) + "x" + "_*" * (SIZE // 4),
+    "heading_regex": "# a" + " " * 80_000 + "x", "heading_tabs": "# a" + " \t" * 40_000 + "x",
+    "delim_regex": "a|b\n" + " " * 80_000 + "x|", "rule_regex": "-" + " -" * 40_000 + " x", "list_regex": " " * 80_000 + "x",
+    "table": "| a | b |\n|---|---|\n" + repeated("| 1 | 2 |", sep="\n"), "list_items": repeated("- item", sep="\n"),
+    "quote_lines": repeated("> x", sep="\n"),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(SLOW_SHAPES))
+def test_parsing_a_large_or_hostile_input_stays_fast(shape, tmp_path):
+    fake = tmp_path / "fake_dom.js"
+    fake.write_text(FAKE_DOM, encoding="utf-8")
+    out = js([str(fake), "markdown.js"], TIMED, SLOW_SHAPES[shape])
+    assert out["count"] >= 1
+    assert out["ms"] < BOUND_S * 1000, f"{shape} took {out['ms']} ms"
+
+
+COLLECT = ("(function(){const texts=[];const walk=(n)=>{if(n===null||n===undefined)return;if(typeof n==='string'){texts.push(n);return;}"
+           "if(n.t==='text'||n.t==='code'||n.t==='pre'){texts.push(n.v);}for(const c of (n.c||[]))walk(c);};"
+           "const blocks=parseMarkdown(args);for(const b of blocks)walk(b);"
+           "const dom=[];const dwalk=(n)=>{if(n.text)dom.push(n.text);for(const k of (n.kids||[]))dwalk(k);};"
+           "for(const n of markdownNodes(blocks))dwalk(n);"
+           "return {tree:texts.join(''),dom:dom.join(''),blocks:blocks.length};})()")
+
+DEEP_SHAPES = {
+    "quote_markers": ">" * 100_000 + " x",
+    "quote_markers_spaced": "> " * 50_000 + "x",
+    "quote_lines": "\n".join(">" * (d + 1) + " x" for d in range(1500)),
+    "list_indents": "\n".join(" " * d + "- x" for d in range(2000)),
+    "list_indents_by_two": "\n".join(" " * (2 * d) + "- x" for d in range(1000)),
+    "nested_links": "[" * 100_000 + "x" + "](a)" * 100_000,
+    "nested_brackets": "[" * 100_000 + "x" + "]" * 100_000,
+    "nested_emphasis": "*_" * 50_000 + "x" + "_*" * 50_000,
+    "nested_strong": "**a " * 50_000 + "x" + " a**" * 50_000,
+    "mixed": "> - " * 5_000 + "[**_x_**](a)",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(DEEP_SHAPES))
+def test_deep_nesting_never_throws_and_keeps_the_text(shape, tmp_path):
+    fake = tmp_path / "fake_dom.js"
+    fake.write_text(FAKE_DOM, encoding="utf-8")
+    out = js([str(fake), "markdown.js"], COLLECT, DEEP_SHAPES[shape])  # check=True: a RangeError fails the test
+    assert out["blocks"] >= 1
+    assert "x" in out["tree"] and "x" in out["dom"]  # (a link ref adds its path to the DOM, so the two differ there)
+
+
+def test_nesting_is_capped_at_32_levels():
+    depth = ("(function(){let d=0;const walk=(n,k)=>{d=Math.max(d,k);for(const c of (n.c||[]))walk(c,k+1);};"
+             "for(const b of parseMarkdown(args))walk(b,1);return d;})()")
+    assert js(["markdown.js"], depth, ">" * 5000 + " x") <= 40
+    assert js(["markdown.js"], depth, "[" * 5000 + "x" + "](a)" * 5000) <= 40
+    assert js(["markdown.js"], depth, "\n".join(" " * d + "- x" for d in range(300))) <= 100
