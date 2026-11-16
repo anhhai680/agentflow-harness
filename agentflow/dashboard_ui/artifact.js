@@ -10,6 +10,8 @@ const SEVERITY_RANK = ["critical", "high", "medium", "low"];
 const ARTIFACT_KINDS = ["spec", "plan"];
 const isArtifactTab = (tab) => ARTIFACT_KINDS.includes(tab);
 const HEAD_SHA = "head";
+const NOTE_MAX = 16384;  // equal to dashboard.TEXT_MAX: the longest note the server takes
+const VIEWED_CAP = 100;  // dashboard.VIEWED_MAX
 
 // ---- pure helpers: no DOM, so a test runs them under node
 
@@ -65,6 +67,14 @@ function docChoice(ready, failure, hasShown) {
   return "loading";
 }
 
+// The reject note of a reader's line comments: sorted by line, blank ones dropped, whitespace collapsed. The only place
+// the note's format lives. No comment, no note.
+function composeNote(path, sha, comments) {
+  const lines = (comments || []).map((c) => [c[0], String(c[1]).replace(/\s+/g, " ").trim()]).filter((c) => c[1]).sort((a, b) => a[0] - b[0]);
+  if (!lines.length) return "";
+  return ["Comments on " + path + " at " + String(sha).slice(0, 7) + ":"].concat(lines.map((c) => "L" + c[0] + ": " + c[1])).join("\n");
+}
+
 // RUN_TABS minus Spec and Plan where the lane does not walk them.
 function visibleTabs(detail) {
   const has = (detail && detail.artifact_tabs) || [];
@@ -77,7 +87,7 @@ function artifactState(runId, kind) {
   let st = ui.artifact;
   if (!st || st.runId !== runId) {
     st = ui.artifact = { runId: runId, kind: kind, path: null, sha: null, mode: "rendered", texts: new Map(), diffs: new Map(),
-      list: null, findings: null, findingsError: null, shown: null, error: null, inflight: false, failed: new Map(), busy: new Set() };
+      list: null, findings: null, findingsError: null, shown: null, error: null, inflight: false, failed: new Map(), busy: new Set(), crev: 0 };
   } else if (st.kind !== kind) {  // another tab of the same run: its own pick, and a fresh list
     st.kind = kind; st.path = null; st.sha = null; st.mode = "rendered"; st.list = null; st.error = null; st.shown = null;
   }
@@ -137,12 +147,65 @@ async function fetchOnce(st, cache, key, url, what) {
   redrawArtifact(st.runId);  // a failure too: the document part falls back to the last one drawn, or says why
 }
 
+// ---- what the reader did: line comments and the revisions viewed. Kept in `ui`, outside every node, so a re-render rebuilds them.
+
+const commentKey = (runId, path, sha) => runId + "\0" + path + "\0" + sha;
+
+function commentsFor(runId, path, sha) {
+  const key = commentKey(runId, path, sha);
+  let map = ui.comments.get(key);
+  if (!map) { map = new Map(); ui.comments.set(key, map); }
+  return map;
+}
+
+const commentPairs = (map) => Array.from(map.entries());
+const countComments = (map) => commentPairs(map).filter((c) => c[1].trim()).length;
+
+function recordViewed(runId, path, sha) {
+  let seen = ui.viewed.get(runId);
+  if (!seen) { seen = new Map(); ui.viewed.set(runId, seen); }
+  const key = path + "\0" + sha;
+  if (!seen.has(key)) seen.set(key, { path: path, sha: sha });
+}
+
+// What `approve` sends as `viewed`: only what the server accepts (a sha of 7-64 hex digits, a path of 1-1024 characters, at most 100).
+function viewedList(runId) {
+  const seen = ui.viewed.get(runId);
+  if (!seen) return [];
+  const ok = (v) => /^[0-9a-f]{7,64}$/.test(v.sha) && v.path.length >= 1 && v.path.length <= 1024;
+  return Array.from(seen.values()).filter(ok).slice(-VIEWED_CAP).map((v) => ({ path: v.path, sha: v.sha }));
+}
+
 // ---- drawing
 
 const dotNode = (severity) => el("span", { class: "sev" + (severity ? " sev-" + severity : ""), title: severity || null, "aria-hidden": "true" });
 
 function chip(text, onclick, pressed, extra) {
   return el("button", Object.assign({ type: "button", class: "chip", text: text, onclick: onclick, "aria-pressed": pressed ? "true" : "false" }, extra || {}));
+}
+
+// A gutter cell: the line (or the block's start line) a click comments on.
+function gutterNode(d, st, line) {
+  const open = () => openComment(st, d, line);
+  const cell = el("span", { class: "gutter clickable", text: String(line), role: "button", tabindex: "0", title: "Comment on line " + line });
+  cell.addEventListener("click", open);
+  cell.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); open(); } });
+  return cell;
+}
+
+function openComment(st, d, line) {
+  const map = commentsFor(st.runId, d.path, d.rsha);
+  if (!map.has(line)) { map.set(line, ""); st.crev += 1; redrawArtifact(st.runId); }
+  const box = $("run-body").querySelector('.art-comment[data-line="' + line + '"] textarea');
+  if (box) box.focus();
+}
+
+function commentBox(d, st, line, map) {
+  const area = el("textarea", { "aria-label": "Comment on line " + line, placeholder: "Comment on line " + line, spellcheck: "true" });
+  area.value = map.get(line) || "";
+  area.addEventListener("input", () => { map.set(line, area.value); syncDecision(); });
+  return el("div", { class: "art-comment", "data-line": String(line) }, area,
+    el("button", { type: "button", class: "chip", text: "Remove", onclick: () => { map.delete(line); st.crev += 1; redrawArtifact(st.runId); } }));
 }
 
 function docNode(d, st) {
@@ -153,16 +216,18 @@ function docNode(d, st) {
     return box;
   }
   const text = st.texts.get(d.path + "@" + d.sha).text || "";
+  const comments = commentsFor(st.runId, d.path, d.rsha);
+  const withBox = (line, row) => { if (comments.has(line)) row.append(commentBox(d, st, line, comments)); return row; };
   if (d.mode === "raw") {
     text.replace(/\n$/, "").split("\n").forEach((line, i) => {
-      box.append(el("div", { class: "art-row", "data-line": String(i + 1) },
-        el("span", { class: "gutter", text: String(i + 1) }), dotNode(d.raw[i + 1]), el("code", { class: "art-raw", text: line })));
+      box.append(withBox(i + 1, el("div", { class: "art-row", "data-line": String(i + 1) },
+        gutterNode(d, st, i + 1), dotNode(d.raw[i + 1]), el("code", { class: "art-raw", text: line }))));
     });
     return box;
   }
   for (const block of parseMarkdown(text)) {
-    box.append(el("div", { class: "art-row", "data-line": String(block.line) },
-      el("span", { class: "gutter", text: String(block.line) }), dotNode(d.gutter[block.line]), el("div", { class: "art-block" }, markdownNodes([block]))));
+    box.append(withBox(block.line, el("div", { class: "art-row", "data-line": String(block.line) },
+      gutterNode(d, st, block.line), dotNode(d.gutter[block.line]), el("div", { class: "art-block" }, markdownNodes([block])))));
   }
   return box;
 }
@@ -230,6 +295,48 @@ function headNode(d) {
     d.truncated ? el("span", { class: "st-wait", text: "Showing the first " + d.shownKb + " KB of " + d.path + "." }) : null);
 }
 
+// ---- the decision bar, under the document it decides on
+
+function noteOfShown(st) {
+  const shown = st.shown && st.shown.data;
+  if (!shown || shown.mode === "diff" || !shown.rsha) return { count: 0, note: "" };
+  const map = commentsFor(st.runId, shown.path, shown.rsha);
+  return { count: countComments(map), note: composeNote(shown.path, shown.rsha, commentPairs(map)) };
+}
+
+const requestLabel = (n) => "Request changes (" + n + (n === 1 ? " comment)" : " comments)");
+
+// Typing in a comment box changes the count and the note without a redraw, which would take the caret away.
+function syncDecision() {
+  const st = ui.artifact;
+  const body = $("run-body");
+  if (!st || !body) return;
+  const { count, note } = noteOfShown(st);
+  const button = body.querySelector(".art-decision [data-role=request]");
+  if (button) button.textContent = requestLabel(count);
+  const pre = body.querySelector(".art-decision pre.art-decision-note");
+  if (pre) pre.textContent = note;
+}
+
+function requestChanges(detail) {
+  const st = ui.artifact;
+  const note = st ? noteOfShown(st).note : "";
+  if (Array.from(note).length > NOTE_MAX) { toast("The comments make a note of " + Array.from(note).length + " characters, over the " + NOTE_MAX + " the server takes: shorten them"); return; }
+  withDecision(detail, "reject", (item) => rejectDialog(item.run_id, needTarget(item), note));
+}
+
+function decisionNode(d) {
+  const detail = () => (ui.run && ui.run.detail && ui.run.detail.run_id === d.runId ? ui.run.detail : null);
+  if (d.waiting) {
+    return el("div", { class: "art-decision" }, el("strong", { text: "Waiting on you: approve " + d.phase }),
+      el("button", { type: "button", class: "primary", text: "Approve " + d.kind, onclick: () => { const x = detail(); if (x) withDecision(x, "approve", approveFlow); } }),
+      d.canReject ? el("button", { type: "button", "data-role": "request", text: requestLabel(d.count), onclick: () => { const x = detail(); if (x) requestChanges(x); } }) : null);
+  }
+  return el("div", { class: "art-decision" }, el("strong", { text: "This phase is no longer waiting on you" }),
+    el("span", { class: "muted", text: " Your comments are kept here as text you can select:" }),
+    el("pre", { class: "art-decision-note", text: d.note }));
+}
+
 function artifactNote(key, text) {
   return [entry(key, text, (t) => el("p", { class: "muted art-note", text: t }))];
 }
@@ -284,11 +391,20 @@ function artifactEntries(detail, kind, sub) {
     fetchOnce(st, st.texts, textKey, artifactQuery(file.path, sha), file.path);
     body = choose(st.texts, textKey, file.path, () => {
       const blocks = mode === "rendered" ? parseMarkdown(loaded.text || "") : [];
+      const rsha = loaded.sha || sha;  // the resolved sha: `head` is the run branch's tip
+      recordViewed(st.runId, file.path, rsha);
       return draw("art:doc:" + textKey + ":" + mode,
-        { mode: mode, path: file.path, sha: sha, raw: mode === "raw" ? rawMarks(rows, file.path) : {}, gutter: mode === "rendered" ? gutterMarks(blocks, rows, file.path) : {} });
+        { mode: mode, path: file.path, sha: sha, rsha: rsha, crev: st.crev, raw: mode === "raw" ? rawMarks(rows, file.path) : {}, gutter: mode === "rendered" ? gutterMarks(blocks, rows, file.path) : {} });
     });
   }
   parts.push(body);
   parts.push(entry("art:findings", { rows: rows, path: file.path, kind: kind, error: st.findings === null ? st.findingsError : null }, findingsNode));
+  const waiting = !!(detail.waiting && detail.waiting.kind === "phase_approval" && detail.waiting.phase === file.phase);
+  const decided = noteOfShown(st);
+  const count = decided.count;
+  if (waiting || count) {
+    parts.push(entry("art:decision", { runId: detail.run_id, phase: file.phase, kind: kind, waiting: waiting, count: count, note: decided.note,
+      canReject: (detail.actions || []).includes("reject") }, decisionNode));
+  }
   return parts;
 }

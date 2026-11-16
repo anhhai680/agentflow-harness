@@ -15,7 +15,7 @@ const TOKEN = (function () {
   return token;
 })();
 
-const ui = { view: "board", peek: null, run: null, board: null, agents: null, workflow: null, dragging: null, doneOpen: false };
+const ui = { view: "board", peek: null, run: null, board: null, agents: null, workflow: null, dragging: null, doneOpen: false, comments: new Map(), viewed: new Map() };
 const $ = (id) => document.getElementById(id);
 const workLabel = (lane) => (ui.board && ui.board.lane_labels[lane]) || lane;  // a lane with no label, or an old run's, shows its name
 

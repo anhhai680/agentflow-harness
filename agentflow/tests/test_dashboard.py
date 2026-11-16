@@ -1877,3 +1877,17 @@ def test_a_failed_findings_read_is_shown_not_swallowed():
     assert ".catch(() => null)" not in art
     assert "Could not load the findings: " in art and "Could not refresh the findings: " in art
     assert "Could not read " in art and "art:doc-error" in art  # a failed first read says why in the tab
+
+
+def test_the_note_cap_matches_the_server():
+    from agentflow.dashboard import TEXT_MAX
+    assert f"NOTE_MAX = {TEXT_MAX}" in (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+
+
+def test_a_phase_approval_from_the_page_sends_what_was_viewed():
+    board_js = (UI_DIR / "board.js").read_text(encoding="utf-8")
+    flow = board_js[board_js.index("function approveFlow"):board_js.index("function needNode")]
+    assert "viewedList(item.run_id)" in flow and "viewed" in flow
+    art = (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+    assert "ui.viewed" in art and "ui.comments" in art and "no longer waiting on you" in art
+    assert "function rejectDialog(runId, target, initial" in (UI_DIR / "dialogs.js").read_text(encoding="utf-8")

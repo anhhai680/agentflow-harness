@@ -30,8 +30,9 @@ function dialog(title, body, onOk, okText, wide) {
   dlg.showModal();
 }
 
-function rejectDialog(runId, target) {
+function rejectDialog(runId, target, initial = "") {
   const note = el("textarea", { id: "reject-note", placeholder: "What should change? The phase runs again with this note." });
+  note.value = initial;
   dialog("Reject " + target + " (" + runId + ")", [el("label", { for: "reject-note", text: "Note" }), note], () => {
     if (!note.value.trim()) { toast("A rejection needs a note"); return false; }
     return act(runId, "reject", { target: target, note: note.value });

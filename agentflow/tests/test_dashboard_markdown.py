@@ -247,3 +247,10 @@ def test_a_failed_read_keeps_the_last_document_or_says_why_and_never_waits_forev
     assert choice(False, "HTTP 500", True) == "stale"  # the last text stays; the toast says why
     assert choice(False, "HTTP 500", False) == "error"  # nothing drawn yet: an error note, not "Loading…"
     assert choice(False, "", False) == "error"  # an empty reason is still a failure
+
+
+def test_comments_compose_into_one_line_anchored_note():
+    note = js(["artifact.js"], "composeNote('docs/specs/x.md', 'abcdef0123', args)",
+              [[65, "repeat loop\n takes  locks"], [34, "Scope 3 contradicts the code"], [50, "  "]])
+    assert note == ("Comments on docs/specs/x.md at abcdef0:\n"
+                    "L34: Scope 3 contradicts the code\nL65: repeat loop takes locks")

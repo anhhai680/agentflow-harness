@@ -315,7 +315,12 @@ function approveFlow(item) {
     if (required && !note.trim()) { toast("Approving " + item.key + " needs a note: it blocked again with nothing changed"); return; }
     act(item.run_id, "approve", note.trim() ? { target: target, note: note.trim() } : { target: target });
   } else if (confirm("Approve " + item.key + " for " + item.run_id + "?")) {
-    act(item.run_id, "approve", { target: target });
+    const body = { target: target };
+    if (item.kind === "phase_approval") {
+      const viewed = viewedList(item.run_id);  // the spec and plan revisions this page showed; informational
+      if (viewed.length) body.viewed = viewed;
+    }
+    act(item.run_id, "approve", body);
   }
 }
 
