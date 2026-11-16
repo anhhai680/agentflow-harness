@@ -125,6 +125,22 @@ def test_the_form_sets_the_ci_watch(shipped):
             form(shipped, (["ci", "watch_max_h"], bad))
 
 
+def test_the_form_sets_the_early_pr_phase(shipped):
+    proposal = form(shipped, (["ci", "early_pr_after"], "verify"))
+    assert not proposal.errors, proposal.errors
+    assert changed_lines(proposal.diff) == ["+  early_pr_after: verify"]
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).ci["early_pr_after"] == "verify"
+    proposal = form(shipped, (["ci", "early_pr_after"], ""))
+    assert not proposal.errors, proposal.errors  # empty: the draft PR opens at `finish`, as it always has
+    proposal = form(shipped, (["ci", "early_pr_after"], "nope"))
+    assert [i.path for i in proposal.errors] == ["ci.early_pr_after"]
+    with pytest.raises(EditError):
+        config_edit.save(shipped, proposal)
+    with pytest.raises(EditError):
+        form(shipped, (["ci", "early_pr_after"], "two\nlines"))
+
+
 def test_the_form_sets_the_board_refresh(shipped):
     proposal = form(shipped, (["dashboard", "board_refresh_s"], 5))
     assert not proposal.errors, proposal.errors

@@ -184,6 +184,7 @@ ci:
   rerun_rounds: 1
   sync_rounds: 2
   watch_max_h: 0  # hours to watch checks still pending after timeout_min (a hold, no queue slot); 0 = stop for a human
+  early_pr_after: ""  # a phase: push and open the draft PR once it is approved, so CI runs while review does; "" = at finish
 
 phases:
   define:

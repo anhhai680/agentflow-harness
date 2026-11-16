@@ -1612,6 +1612,19 @@ def test_ci_watch_max_h_defaults_off_and_may_be_left_out(sparse_repo, tmp_cfg):
     assert "watch_max_h" not in owned.ci and not errors(validate(owned, tmp_cfg().parent.parent))
 
 
+def test_early_pr_after_must_name_a_phase_before_finish(sparse_repo, tmp_cfg):
+    assert load_config(pack.pack_config(sparse_repo)).ci["early_pr_after"] == ""  # the engine layer: off
+    owned = load_config(tmp_cfg())  # a pack that writes its own `ci` without the key: off too
+    assert "early_pr_after" not in owned.ci and not errors(validate(owned, tmp_cfg().parent.parent))
+    for bad in ("ship", "nope", 3, True, ["verify"]):
+        found = issues_for(tmp_cfg, {"ci": {"early_pr_after": bad}})
+        assert [i.path for i in found if i.level == "error"] == ["ci.early_pr_after"], bad
+    found = issues_for(tmp_cfg, {"ci": {"early_pr_after": "ship"}})
+    assert "before the phase" in next(i.message for i in found if i.path == "ci.early_pr_after")
+    for good in ("", "verify", "review", "define"):
+        assert not errors(issues_for(tmp_cfg, {"ci": {"early_pr_after": good}})), good
+
+
 def test_ci_watch_max_h_must_be_finite_and_zero_or_more(tmp_cfg):
     for bad in (-1, float("inf"), float("nan"), 721, 10**400, True):
         found = issues_for(tmp_cfg, {"ci": {"watch_max_h": bad}})

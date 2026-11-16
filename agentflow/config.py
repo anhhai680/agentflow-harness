@@ -60,8 +60,10 @@ AUTONOMY_KEYS = ("non_blocking_severities", "finding_rounds", "resolve_kinds", "
                  "human_question_kinds")
 # The `kind` of a `needs_human` question. `boundary`: the repository's docs reserve the decision for a human.
 QUESTION_KINDS = ("spec_gap", "ambiguity", "conflict", "review_dispute", "boundary", "other")
-CI_KEYS = ("poll_s", "appear_min", "timeout_min", "fix_rounds", "rerun_rounds", "sync_rounds", "watch_max_h")
-CI_OPTIONAL = ("watch_max_h",)  # missing from a pack that writes its own `ci` block: 0 (off)
+CI_KEYS = ("poll_s", "appear_min", "timeout_min", "fix_rounds", "rerun_rounds", "sync_rounds", "watch_max_h",
+           "early_pr_after")
+CI_OPTIONAL = ("watch_max_h", "early_pr_after")  # missing from a pack that writes its own `ci` block: off
+CI_TEXT = ("early_pr_after",)  # the `ci` keys that are not numbers
 CI_WATCH_MAX_H = 720  # `ci.watch_max_h` above this (30 days) is a typo, not a plan
 FLOOR_BLOCKING = ("critical", "high", "medium")  # severities that always block, whatever `non_blocking_severities` lists
 STEP_KEYS = (
@@ -571,6 +573,11 @@ class Config:
     layer_origins: dict[tuple[str, ...], str] = field(default_factory=dict)  # each leaf of `merged`: its layer's name
     issues: IssuePolicy = field(default_factory=IssuePolicy)  # what a run started from an issue does on GitHub
     policy: Policy = field(default_factory=Policy)  # the obligations a finished run must show evidence for
+
+
+def _holds_finish(steps: list[Step]) -> bool:
+    """Whether a `type: finish` step is among `steps` or inside one of their groups."""
+    return any(step.type == "finish" or _holds_finish(step.steps) for step in steps)
 
 
 def for_lane(steps: list[Step], lane: str) -> list[Step]:
@@ -2155,6 +2162,8 @@ class _Validator:
                 self.error(f"autonomy.resolve_kinds.{kind}", "attempts must be a whole number of at least 1")
         for key in CI_KEYS:
             value = cfg.ci.get(key)
+            if key in CI_TEXT:
+                continue
             if value is None and key in CI_OPTIONAL:  # a pack that writes its own `ci` block may leave it out: off
                 continue
             if value is None and any(step.type == "ci" for phase in cfg.phases.values() for step in phase.steps):
@@ -2166,6 +2175,22 @@ class _Validator:
         for key in cfg.ci:
             if key not in CI_KEYS:
                 self.error(f"ci.{key}", "unknown ci key")
+        self.early_pr_after()
+
+    def early_pr_after(self) -> None:
+        """`ci.early_pr_after`: empty, or a phase that comes before the phase holding the `finish` step, since the
+        draft pull request it opens early is the one `finish` audits and updates."""
+        after = self.cfg.ci.get("early_pr_after")
+        if after is None or after == "":
+            return
+        names = list(self.cfg.phases)
+        if not isinstance(after, str) or after not in self.cfg.phases:
+            self.error("ci.early_pr_after", f"must be empty or a phase in `phases`: {', '.join(names)}")
+            return
+        holding = [index for index, phase in enumerate(self.cfg.phases.values()) if _holds_finish(phase.steps)]
+        if not holding or names.index(after) >= holding[0]:
+            self.error("ci.early_pr_after", "the early draft pull request opens after this phase, so it must come "
+                       "before the phase that holds the `finish` step")
 
     def non_blocking_severities(self) -> None:
         """The floor: `critical`, `high`, `medium`, an empty severity and a missing one always block."""

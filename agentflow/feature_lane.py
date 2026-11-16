@@ -48,6 +48,11 @@ commit body. The pull request lists every answer the runner took itself (`by: ru
 `run_finish` first brings the latest `origin/<fork_from>` into the branch (`sync_lane`), then refuses
 uncommitted changes, pushes the branch (never forced) and opens a draft pull request against `fork_from` whose
 body, `runs/<run>/pr.md`, comes from `render_pr_body`, and checks GitHub finds it conflict-free.
+
+With `ci.early_pr_after: <phase>`, `open_early_pr` pushes the branch and opens that draft pull request as soon as the
+phase is approved, so CI runs while review does. It is a draft only: `finish` still audits the final tree, then
+pushes it and updates the pull request's body (`pr_updated`) instead of opening one, and only the `ci` step marks it
+ready. An early pull request that cannot be opened is `early_pr_failed`, never a stop: `finish` opens it as usual.
 """
 
 from __future__ import annotations
@@ -63,7 +68,7 @@ from agentflow import sources, verification
 from agentflow.autonomy import AUTO_BY, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
-from agentflow.config import Config, Phase, Step, brief_files
+from agentflow.config import Config, Phase, Step, brief_files, for_lane
 from agentflow.conformance import audit, clean_tree, render_section
 from agentflow.doubt import RECONCILE
 from agentflow.flow_control import current_refine, refine_note_block, refine_subject
@@ -75,8 +80,10 @@ from agentflow.gitops import (
     NothingToCommit,
     commit,
     create_draft_pr,
+    dirty_paths,
     head,
     push,
+    update_pr_body,
 )
 from agentflow.guards import changed_paths, snapshot
 from agentflow.hitl import ResultError, clean_fact, notify_run, raise_hitl, read_result
@@ -93,6 +100,9 @@ DONE_STATUSES = ("done", "unchanged")
 SUMMARY_MAX = 60
 FINAL_FIX = "final_fix"  # `finish`'s session that fixes what the full verify run on the final tree found
 FINAL_FIX_MESSAGE = "Fix what the full verify run found"
+EARLY_PR = "early_pr"  # the key suffix of the draft pull request opened before `finish`: `<phase>/early_pr`
+EARLY_LINE = ("Early draft: review is still running. The runner audits conformance and updates this description "
+              "before it marks the pull request ready.")
 DEFAULT_RECORD = {"spec_gap": "record_step", "ambiguity": "commit_body", "review_dispute": "commit_body",
                   "boundary": "commit_body"}
 
@@ -761,11 +771,13 @@ class FeatureLane:
             return "stopped"
         branch = str(self.run.state.get("branch") or "")
         target = self.cfg.project.fork_from
-        opened = [e for e in self.run.events.read() if e["type"] == "pr_opened" and e.get("key") == key]
-        if opened:
+        events = self.run.events.read()
+        opened = [e for e in events if e["type"] in ("pr_opened", "pr_updated") and e.get("key") == key]
+        if opened:  # this step's own pull request, opened or updated; an early one (`<phase>/early_pr`) is not it
             link(self.run)  # a runner stopped between `pr_opened` and its link links on resume; a no-op once linked
             self.run.emit("step_finished", key=key, status="done", summary=f"draft pull request {opened[-1]['url']}")
             return "done"
+        early = [e for e in events if e["type"] == "pr_opened" and e.get("early")]
         if branch in (self.cfg.project.base_branch, target):
             raise_hitl(self.cfg, self.run, "blocked", key,
                        f"{branch} is the base branch: finish pushes a run's own branch, never the pull request's target.")
@@ -792,18 +804,74 @@ class FeatureLane:
         if not self._unmoved(key, sha) or not clean_tree(self.cfg, self.run, self.worktree, key):
             return "stopped"
         body = self.write_pr_body()
-        try:
-            push(self.worktree, branch, sha=sha)
-            url = create_draft_pr(self.worktree, target, branch, self._pr_title(), body)
-        except (GitError, GhError) as exc:
-            raise_hitl(self.cfg, self.run, "blocked", key, f"Could not push {branch} or open the pull request: {exc}")
-            return "stopped"
-        self.run.emit("pr_opened", url=url, key=key)
+        if early:  # the draft opened early: push the audited tree and bring its description up to date
+            url = str(early[-1]["url"])
+            try:
+                push(self.worktree, branch, sha=sha)
+                update_pr_body(self.worktree, url, body)
+            except (GitError, GhError) as exc:
+                raise_hitl(self.cfg, self.run, "blocked", key, f"Could not push {branch} or update {url}: {exc}")
+                return "stopped"
+            self.run.emit("pr_updated", url=url, key=key, sha=sha)
+        else:
+            try:
+                push(self.worktree, branch, sha=sha)
+                url = create_draft_pr(self.worktree, target, branch, self._pr_title(), body)
+            except (GitError, GhError) as exc:
+                raise_hitl(self.cfg, self.run, "blocked", key, f"Could not push {branch} or open the pull request: {exc}")
+                return "stopped"
+            self.run.emit("pr_opened", url=url, key=key)
         link(self.run)  # as soon as the PR exists, before a conflict or a CI stop can park the run
         if self.confirm_mergeable(phase, step, key, url) != "done":
             return "stopped"
         self.run.emit("step_finished", key=key, status="done", summary=f"draft pull request {url}")
         return "done"
+
+    def open_early_pr(self, phase: str) -> None:
+        """Push the branch and open the draft pull request now that `phase` is approved (`ci.early_pr_after`), so CI
+        runs while the later phases do. Nothing when a pull request is already open, when the run walks no `finish`
+        step (its lane, or a `--to` before it), or on the base branch. It is a draft only and no evidence: `finish`
+        still audits the final tree, pushes it and updates the body, and only the `ci` step marks it ready. A dirty
+        tree, a commit the runner did not make, a failed push or a failed `gh pr create` is `early_pr_failed`, never
+        a stop: `finish` opens the pull request the usual way."""
+        self.run.refresh()
+        state = self.run.state
+        events = self.run.events.read()
+        branch = str(state.get("branch") or "")
+        if any(e["type"] == "pr_opened" for e in events) or not self._walks_finish():
+            return
+        if not branch or branch in (self.cfg.project.base_branch, self.cfg.project.fork_from):
+            return
+        key = f"{phase}/{EARLY_PR}"
+        try:
+            dirty = dirty_paths(self.worktree)
+            if dirty:
+                raise GitError(f"uncommitted changes in {', '.join(dirty[:5])}")
+            base = str(state.get("base_sha") or "")
+            foreign = foreign_commits(self.run, self.cfg, self.worktree, base) if base else ["no base commit recorded"]
+            if foreign:
+                raise GitError(f"the branch holds commits the runner will not push: {foreign[0]}")
+            sha = head(self.worktree)
+            push(self.worktree, branch, sha=sha)
+            body = self.write_pr_body(early=True)
+            url = create_draft_pr(self.worktree, self.cfg.project.fork_from, branch, self._pr_title(), body)
+        except (GitError, GhError, OSError, subprocess.CalledProcessError) as exc:
+            self.run.emit("early_pr_failed", phase=phase, reason=clean_fact(str(exc) or type(exc).__name__))
+            return
+        self.run.emit("pr_opened", url=url, key=key, early=True)
+        link(self.run)
+
+    def _walks_finish(self) -> bool:
+        """Whether this run reaches a `finish` step: its lane walks one, in a phase at or before any `--to`."""
+        lane = str(self.run.state.get("pipeline") or "")
+        names = list(self.cfg.phases)
+        to = (self.run.state.get("options") or {}).get("to_phase")
+        last = names.index(to) if to in names else len(names) - 1
+
+        def holds(steps: list[Step]) -> bool:
+            return any(step.type == "finish" or holds(step.steps) for step in for_lane(steps, lane))
+
+        return any(holds(self.cfg.phases[name].steps) for name in names[: last + 1])
 
     def final_check(self, phase: Phase, step: Step, key: str) -> Outcome:
         """The full `verify` set, once, on the committed tree `finish` is about to audit and push, when some step ran
@@ -850,9 +918,10 @@ class FeatureLane:
                    f"HEAD moved from {sha[:12]} to {now[:40]} during the conformance audit; nothing was pushed.")
         return False
 
-    def write_pr_body(self) -> Path:
+    def write_pr_body(self, early: bool = False) -> Path:
         body = self.run.dir / "pr.md"
-        body.write_text(render_pr_body(self.run, plan=self.ctx.values.get("plan") or None), encoding="utf-8")
+        body.write_text(render_pr_body(self.run, plan=self.ctx.values.get("plan") or None, early=early),
+                        encoding="utf-8")
         return body
 
     def runner_commits_only(self, key: str) -> bool:
@@ -990,9 +1059,10 @@ def issue_line(params: dict) -> str | None:
     return f"{'Refs' if params.get('issue_epic') else 'Closes'} #{params['issue']}"
 
 
-def render_pr_body(run: Run, plan: str | None = None) -> str:
+def render_pr_body(run: Run, plan: str | None = None, *, early: bool = False) -> str:
     """The draft pull request's body: plan link, spend vs budget, gate summary, the verification story, the conformance audit, skipped steps and reasons,
-    effort changes with reasons, footer mismatches, refine rounds, then the attribution line."""
+    effort changes with reasons, footer mismatches, refine rounds, then the attribution line. `early`: the body of a
+    draft opened before `finish` (`ci.early_pr_after`), whose first line says review is still running."""
     run.refresh()
     state = run.state
     branch = state.get("branch") or "?"
@@ -1016,6 +1086,7 @@ def render_pr_body(run: Run, plan: str | None = None) -> str:
     refines += [f"- Doubt review: {n} reconcile round(s) on {phase}" for phase, n in reconciled.items()]
     marked = state.get("marked_done")
     parts = [
+        EARLY_LINE if early else None,
         f"Opened by agentflow run `{run.id}` ({state.get('pipeline')}) from branch `{branch}`.",
         issue_line(state.get("params") or {}),
         f"Marked done after `{marked['phase']}` by {marked['by']}: the phases under Skipped steps did not run."

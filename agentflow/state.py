@@ -860,6 +860,8 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "environment_waiting": ("key", "digest"),
     "environment_rechecked": ("key", "ok"),
     "gate_cache_hit": ("key", "gate", "input_hash"),
+    "early_pr_failed": ("phase",),
+    "pr_updated": ("url", "key"),
 }
 TEXT_FIELDS = ("key", "step", "phase", "model", "kind")
 HANDLER_ERRORS = (KeyError, TypeError, AttributeError, ValueError, IndexError)
