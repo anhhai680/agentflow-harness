@@ -238,3 +238,12 @@ def test_the_default_artifact_is_the_markdown_file_with_most_revisions():
     assert js(["artifact.js"], "pickArtifact(args, 'spec', 'b.md').path", files) == "b.md"
     assert js(["artifact.js"], "pickArtifact(args, 'spec', 'p.md').path", files) == "c.md"
     assert js(["artifact.js"], "pickArtifact(args, 'plan', null) && 1", []) is None
+
+
+def test_a_failed_read_keeps_the_last_document_or_says_why_and_never_waits_forever():
+    choice = lambda *a: js(["artifact.js"], "docChoice(...args)", list(a))  # noqa: E731
+    assert choice(True, None, False) == "ready" and choice(True, "boom", True) == "ready"
+    assert choice(False, None, True) == "loading" and choice(False, None, False) == "loading"
+    assert choice(False, "HTTP 500", True) == "stale"  # the last text stays; the toast says why
+    assert choice(False, "HTTP 500", False) == "error"  # nothing drawn yet: an error note, not "Loading…"
+    assert choice(False, "", False) == "error"  # an empty reason is still a failure

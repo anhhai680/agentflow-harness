@@ -57,6 +57,14 @@ function gutterMarks(blocks, rows, path) {
   return marks;
 }
 
+// What the document part shows. `ready`: the wanted text is in hand. Else a failed read keeps the last drawn document
+// (`stale`, with the toast saying why) or, with none drawn yet, says so (`error`); a read still going is `loading`.
+function docChoice(ready, failure, hasShown) {
+  if (ready) return "ready";
+  if (failure !== null && failure !== undefined) return hasShown ? "stale" : "error";
+  return "loading";
+}
+
 // RUN_TABS minus Spec and Plan where the lane does not walk them.
 function visibleTabs(detail) {
   const has = (detail && detail.artifact_tabs) || [];
@@ -69,9 +77,9 @@ function artifactState(runId, kind) {
   let st = ui.artifact;
   if (!st || st.runId !== runId) {
     st = ui.artifact = { runId: runId, kind: kind, path: null, sha: null, mode: "rendered", texts: new Map(), diffs: new Map(),
-      list: null, findings: [], error: null, inflight: false, failed: new Set(), busy: new Set() };
+      list: null, findings: null, findingsError: null, shown: null, error: null, inflight: false, failed: new Map(), busy: new Set() };
   } else if (st.kind !== kind) {  // another tab of the same run: its own pick, and a fresh list
-    st.kind = kind; st.path = null; st.sha = null; st.mode = "rendered"; st.list = null; st.error = null;
+    st.kind = kind; st.path = null; st.sha = null; st.mode = "rendered"; st.list = null; st.error = null; st.shown = null;
   }
   return st;
 }
@@ -89,11 +97,15 @@ async function loadArtifacts(runId) {
   st.failed.clear();  // a refresh tries a failed read again
   try {
     const base = runPath(runId);
-    const [list, findings] = await Promise.all([api(base + "/artifacts"), api(base + "/findings").catch(() => null)]);
+    let findingsFailure = null;
+    const [list, findings] = await Promise.all([api(base + "/artifacts"), api(base + "/findings").catch((err) => { findingsFailure = err.message; return null; })]);
     if (ui.artifact !== st) return;
     st.list = Array.isArray(list) ? list : [];
-    if (Array.isArray(findings)) st.findings = findings;
     st.error = null;
+    if (Array.isArray(findings)) { st.findings = findings; st.findingsError = null; }
+    else if (st.findings !== null) toast("Could not refresh the findings: " + (findingsFailure || "unreadable response"));  // the last ones stay
+    else st.findingsError = findingsFailure || "unreadable response";
+
   } catch (err) {
     if (ui.artifact !== st) return;
     if (st.list) toast("Could not refresh the " + st.kind + ": " + err.message);
@@ -117,13 +129,12 @@ async function fetchOnce(st, cache, key, url, what) {
     cache.set(key, result);
   } catch (err) {
     if (ui.artifact !== st) return;
-    st.failed.add(key);
+    st.failed.set(key, err.message);
     toast("Could not read " + what + ": " + err.message);
-    return;
   } finally {
     st.busy.delete(key);
   }
-  redrawArtifact(st.runId);
+  redrawArtifact(st.runId);  // a failure too: the document part falls back to the last one drawn, or says why
 }
 
 // ---- drawing
@@ -191,6 +202,7 @@ function findingsNode(d) {
       !here.length && !other.length ? el("p", { class: "muted", text: "No findings." }) : null));
   }
   return el("aside", { class: "art-findings" }, el("h3", { text: "Review findings" }),
+    d.error ? el("p", { class: "muted", text: "Could not load the findings: " + d.error }) :
     sections.length ? sections : el("p", { class: "muted", text: "No review has run on this " + d.kind + " yet." }));
 }
 
@@ -245,7 +257,7 @@ function artifactEntries(detail, kind, sub) {
   const mode = st.mode;
   const paths = st.list.filter((a) => a.kind === kind).map((a) => a.path);
   const loaded = sha ? st.texts.get(file.path + "@" + sha) : null;
-  const rows = st.findings;
+  const rows = st.findings || [];
   const parts = [];
   const shown = loaded;
   parts.push(entry("art:head", { kind: kind, path: file.path, paths: paths, revisions: revisions, sha: sha, merged: merged, mode: mode, previous: previous,
@@ -253,24 +265,30 @@ function artifactEntries(detail, kind, sub) {
     shownKb: shown ? Math.floor(new TextEncoder().encode(shown.text || "").length / 1024) : 0 }, headNode));
   if (!sha) return [...parts, ...artifactNote("art:nodoc", "This " + kind + " has no revision to show.")];
   let body;
+  const note = (key, text) => entry(key, text, (t) => el("p", { class: "muted art-note", text: t }));
+  const draw = (key, data) => { st.shown = { key: key, data: data }; return entry(key, data, (d) => docNode(d, st)); };
+  const choose = (cache, cacheKey, what, make) => {
+    const failure = st.failed.has(cacheKey) ? st.failed.get(cacheKey) : null;
+    const choice = docChoice(cache.has(cacheKey), failure, !!st.shown);
+    if (choice === "ready") return make();
+    if (choice === "stale") return entry(st.shown.key, st.shown.data, (d) => docNode(d, st));  // the same key and sig: the node stays
+    if (choice === "error") return note("art:doc-error", "Could not read " + what + ": " + failure);
+    return note("art:wait", "Loading " + what + "…");
+  };
   if (mode === "diff") {
     const diffKey = file.path + "@" + previous + ".." + sha;
     fetchOnce(st, st.diffs, diffKey, diffQuery(file.path, previous, sha), "the diff");
-    body = st.diffs.has(diffKey)
-      ? entry("art:doc:" + diffKey + ":diff", { mode: "diff", diffKey: diffKey, path: file.path }, (d) => docNode(d, st))
-      : entry("art:wait", "Loading the diff…", (t) => el("p", { class: "muted art-note", text: t }));
+    body = choose(st.diffs, diffKey, "the diff", () => draw("art:doc:" + diffKey + ":diff", { mode: "diff", diffKey: diffKey, path: file.path }));
   } else {
-    fetchOnce(st, st.texts, file.path + "@" + sha, artifactQuery(file.path, sha), file.path);
-    if (loaded) {
+    const textKey = file.path + "@" + sha;
+    fetchOnce(st, st.texts, textKey, artifactQuery(file.path, sha), file.path);
+    body = choose(st.texts, textKey, file.path, () => {
       const blocks = mode === "rendered" ? parseMarkdown(loaded.text || "") : [];
-      body = entry("art:doc:" + file.path + "@" + sha + ":" + mode,
-        { mode: mode, path: file.path, sha: sha, raw: mode === "raw" ? rawMarks(rows, file.path) : {}, gutter: mode === "rendered" ? gutterMarks(blocks, rows, file.path) : {} },
-        (d) => docNode(d, st));
-    } else {
-      body = entry("art:wait", "Loading " + file.path + "…", (t) => el("p", { class: "muted art-note", text: t }));
-    }
+      return draw("art:doc:" + textKey + ":" + mode,
+        { mode: mode, path: file.path, sha: sha, raw: mode === "raw" ? rawMarks(rows, file.path) : {}, gutter: mode === "rendered" ? gutterMarks(blocks, rows, file.path) : {} });
+    });
   }
   parts.push(body);
-  parts.push(entry("art:findings", { rows: rows, path: file.path, kind: kind }, findingsNode));
+  parts.push(entry("art:findings", { rows: rows, path: file.path, kind: kind, error: st.findings === null ? st.findingsError : null }, findingsNode));
   return parts;
 }

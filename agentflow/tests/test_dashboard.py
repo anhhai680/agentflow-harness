@@ -1870,3 +1870,10 @@ def test_the_spec_tab_reads_the_artifact_routes_and_says_when_there_is_none():
                    "Showing the first", "Copy path", "as merged", "Diff with previous"):
         assert needle in art, needle
     assert UI_SCRIPTS.index("run.js") < UI_SCRIPTS.index("artifact.js") < UI_SCRIPTS.index("main.js")
+
+
+def test_a_failed_findings_read_is_shown_not_swallowed():
+    art = (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+    assert ".catch(() => null)" not in art
+    assert "Could not load the findings: " in art and "Could not refresh the findings: " in art
+    assert "Could not read " in art and "art:doc-error" in art  # a failed first read says why in the tab
