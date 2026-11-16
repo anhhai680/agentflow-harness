@@ -428,6 +428,12 @@ def test_every_ui_file_is_listed():
     assert UI_SCRIPTS[0] == "core.js" and UI_SCRIPTS[-1] == "main.js"
 
 
+def test_markdown_loads_before_the_run_page():
+    assert UI_SCRIPTS.index("markdown.js") < UI_SCRIPTS.index("run.js")
+    assert UI_SCRIPTS.index("markdown.js") == UI_SCRIPTS.index("dialogs.js") + 1
+    assert "innerHTML" not in (UI_DIR / "markdown.js").read_text(encoding="utf-8")
+
+
 def test_ui_scripts_need_no_token_but_keep_the_host_check(dash):
     status, headers, body = dash.get("/ui/core.js", token=None)
     assert status == 200 and headers["content-type"] == "text/javascript; charset=utf-8"

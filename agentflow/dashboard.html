@@ -144,6 +144,21 @@ dialog .row > * { flex: 1; }
 .checks label { display: flex; gap: 4px; align-items: center; font-weight: 400; }
 #settings-yaml { width: 100%; min-height: 70vh; font: 12px/1.45 ui-monospace, Menlo, monospace; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; tab-size: 2; white-space: pre; overflow: auto; }
 .diff .d-add { color: var(--ok); } .diff .d-del { color: var(--bad); } .diff .d-hunk { color: var(--accent); }
+/* rendered Markdown (markdown.js) and the line gutter beside a block's source lines */
+.md { overflow-wrap: anywhere; line-height: 1.5; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 14px 0 6px; line-height: 1.25; }
+.md h1 { font-size: 20px; } .md h2 { font-size: 17px; } .md h3 { font-size: 15px; } .md h4, .md h5, .md h6 { font-size: 13px; }
+.md p, .md ul, .md ol { margin: 6px 0; } .md ul, .md ol { padding-left: 22px; }
+.md code { background: var(--chip); padding: 1px 4px; border-radius: 4px; font: 12px ui-monospace, Menlo, monospace; }
+.md pre code { background: none; padding: 0; }
+.md blockquote { margin: 8px 0; padding: 2px 12px; border-left: 3px solid var(--line); color: var(--muted); }
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+.md table { border-collapse: collapse; margin: 8px 0; display: block; overflow-x: auto; }
+.md th, .md td { border: 1px solid var(--line); padding: 4px 8px; vertical-align: top; }
+.md th { background: var(--chip); text-align: left; }
+.md .al-left { text-align: left; } .md .al-center { text-align: center; } .md .al-right { text-align: right; }
+.md a { color: var(--accent); } .md .md-ref code { color: var(--muted); }
+.gutter { color: var(--muted); font: 11px ui-monospace, Menlo, monospace; user-select: none; text-align: right; padding-right: 8px; }
 dialog.wide { width: min(980px, 96vw); }
 /* time and cost: one fixed colour per bucket (validated categorical slots 1-6, runner a neutral grey) */
 :root { --b-agent: #2a78d6; --b-gates: #eb6834; --b-human: #1baf7a; --b-ci: #eda100; --b-hold: #e87ba4; --b-down: #008300; --b-runner: #a3a3a0; }
