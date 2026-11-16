@@ -35,11 +35,11 @@ from pathlib import Path
 
 from agentflow.config import CONFORMANCE_FAILED, RETRO_PIPELINE, Config, ConfigError, load_config
 from agentflow.config_trust import run_config_path
-from agentflow import pack, safeio, sizing
+from agentflow import hitl, pack, safeio, sizing
 from agentflow.events import lock_state, parse_iso
 from agentflow.gitops import GitError, commits_between, dirty_paths
 from agentflow.issue_status import link, release
-from agentflow.state import TERMINAL, Run
+from agentflow.state import TERMINAL, Run, display_status
 
 FLOW = Path(__file__).resolve().parent / "flow.py"
 KILL_GRACE_S = 5.0
@@ -48,7 +48,9 @@ POLL_S = 0.05
 AWAIT_POLL_S = 0.5  # each look runs `ps`, and the wait can last a whole step
 START_SLACK_S = 2.0  # `ps` reports start times in whole seconds
 
-__all__ = ["ControlError", "attach", "cancel", "mark_done", "pause", "resume", "retry", "run_config", "spawn_resume",
+RUN_ACTIONS = ("approve", "answer", "reject", "resume", "done", "pause", "retry", "cancel")  # the dashboard's, in order
+
+__all__ = ["ControlError", "RUN_ACTIONS", "attach", "available_actions", "cancel", "mark_done", "pause", "resume", "retry", "run_config", "spawn_resume",
            "wait_for_agents"]
 
 
@@ -344,6 +346,56 @@ def retry(run: Run, key: str | None, by: str, reason: str | None = None) -> str:
             run.emit("hitl_approved", by=by, key=waiting["key"], kind=waiting["kind"], summary=waiting.get("summary", ""))
         run.emit("step_retry", by=by, key=key, reason=reason)
     return key
+
+
+# --------------------------------------------------------------------------- what a run's state allows
+
+
+def available_actions(run: Run) -> list[str]:
+    """The `RUN_ACTIONS` this run's state allows now, in that order: each rule mirrors the refusal its action makes,
+    so a listed action is never refused for the run's state and an unlisted one would be. Read-only: it emits
+    nothing and takes no lock, so the answer is as fresh as the state `run` last read."""
+    state = run.state
+    status = state["status"]
+    if status in TERMINAL:
+        return []
+    retro = state.get("pipeline") == RETRO_PIPELINE
+    waiting = state["waiting"]
+    item = hitl.pending_item(run)
+    listed = set()
+    if waiting is not None and not retro:
+        if not waiting.get("questions"):
+            listed.add("approve")
+        if waiting.get("kind") not in (hitl.ENVIRONMENT, "preflight_failed"):  # `hitl.reject` refuses these
+            listed.add("reject")
+    if item is not None and item.get("questions") and not retro:
+        listed.add("answer")
+    if not retro and (status in ("paused", "ready") or display_status(run) == "stalled"):
+        listed.add("resume")
+    if status == "ready" and state["ready"] is not None and state["worktree"]:
+        worktree = Path(state["worktree"])
+        try:
+            if worktree.is_dir() and _has_work(worktree, str(state["base_sha"] or "")):
+                listed.add("done")
+        except ControlError:
+            pass
+    if status not in ("paused", "ready"):
+        listed.add("pause")
+    if status != "ready" and not retro and _retryable(run):
+        listed.add("retry")
+    listed.add("cancel")
+    return [action for action in RUN_ACTIONS if action in listed]
+
+
+def _retryable(run: Run) -> bool:
+    """Whether `retry` would take the run's newest failed step: no runner is live, and the run does not wait on
+    that step for an approval or an answer."""
+    failed = [k for k, row in run.state["steps"].items() if row.get("status") == "failed"]
+    if not failed or lock_state(run.dir) == "live":
+        return False
+    waiting = run.state["waiting"]
+    return not (waiting is not None and waiting.get("key") == failed[-1]
+                and (waiting.get("kind") == "phase_approval" or waiting.get("questions")))
 
 
 # --------------------------------------------------------------------------- attach and spawn

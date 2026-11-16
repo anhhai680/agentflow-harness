@@ -7,8 +7,13 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [2.8] - 2026-11-16
+
 ### Added
 
+- Each run has its own page in the dashboard (`#/run/<id>/<tab>`), with a stage rail, a waiting banner, Overview, Activity, Gates and Files tabs, and only the buttons the run's state allows. A card's click opens it, and Space opens a short peek.
+- `dashboard.board_refresh_s` (2 by default, 0.5–60): the most often the dashboard refetches the Board while events arrive.
+- `/api/events?quiet=1` sends each agent session's turns as one `agent_activity` message (last tool, context %) at most every 2 s, the newest always delivered. The dashboard page uses it.
 - `watchdog.no_progress_min` (0, off, by default; a finite number up to 1440) ends a step's agent session whose stream has been quiet for that many minutes and stops it as `step_timeout` (`watchdog_fired`), which a resolver may settle. While a tool call is open, and always for Codex, the limit is at least `defaults.gate_timeout_min`.
 - `preflight.enabled` (off by default) checks the machine once before a run's first phase: each program of the lane's gates is on `PATH` and starts `--version`, Docker answers when a gate runs it, and the `setup` gate set passes. A failure is one `preflight_failed` stop before any agent runs, approved without a note because approving runs preflight again; a pass is cached for the day.
 - A resolver may name its stop's cause in `stop_class` (`environment`, `flaky`, `guard_false_positive`, `spec_gap`, `impact`, `repeated_failure`), recorded once per session as `stop_classified`. For `flaky`, when the resolver changed nothing, the runner reruns each failed gate alone twice and records one `flaky:` run fact if they all pass. Each rerun is the whole gate, and the engine's resolve prompt asks for `stop_class` by default, so a `flaky` claim on a `verify` gate that runs the full suite costs two more runs of that suite. A stop whose resolve attempts are used is recorded as `repeated_failure`.
@@ -17,6 +22,9 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Changed
 
+- Dashboard live updates no longer rebuild what you are reading. Open sections, the scroll position and dialogs survive them. The Board refetches at most every `dashboard.board_refresh_s`, and an open Run page refetches only its own run.
+- The dashboard's Board reuses an unchanged run's phase times, today's spend and time and cost, keyed by its event log's size and mtime, instead of recomputing them on every refresh; a live run's are recomputed at least every 30 s. Each refresh still loads every run's state from its log.
+- `GET /api/runs/<id>` no longer embeds the run's whole `state.json`: it returns the fields the page shows, plus `actions` (what the run's state allows now), `label`, `stage_rail` and `live_agents`. `?raw=1` returns the old payload for debugging.
 - A `blocked_repeat` stop that comes back after a human's approval says so in its notification and its inbox item, with how many approvals it has outlived (`times` on `hitl_raised` and in the wait). The stop and its refusal of a plain approval are unchanged.
 
 ## [2.7] - 2026-11-15

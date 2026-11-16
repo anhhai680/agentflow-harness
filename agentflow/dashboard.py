@@ -5,13 +5,15 @@ Routes:
 - `GET /` (exactly `/`) is the page shell: it holds no run data, so it needs no token. `agentflow dashboard`
   prints `http://127.0.0.1:<port>/#token=<token>`; the fragment never reaches the server or its log, and
   the page keeps the token in `sessionStorage`, so a reload works. Every other route needs the token.
+- `GET /ui/<name>.js`, the page's scripts, from a fixed list; they hold no run data, so they need no token.
 - `GET /api/info` (the harness name and the engine version the page shows in its header),
   `GET /api/board` (every lane, or `?lane=<name>`), `GET /api/workflow`, `GET /api/agents`,
-  `GET /api/runs/<id>` (the card detail, its time and cost included), `GET /api/scorecard` (the Metrics tab's scorecard), `GET /api/metrics` (time and cost over
+  `GET /api/runs/<id>` (the run's facts, steps, actions, stage rail, time and cost; `?raw=1` adds its whole `state.json`), `GET /api/scorecard` (the Metrics tab's scorecard), `GET /api/metrics` (time and cost over
   the runs started in `?from=YYYY-MM-DD&to=YYYY-MM-DD`, this month by default, or `?all=1`; `&lane=<name>`
   narrows it; a bad date is a 400); `GET /api/lessons` (every lesson with its evidence and its target signal before
   and after the runs that carried it); `GET /api/events` (SSE: every run's new events, runs created
-  later included).
+  later included; with `?quiet=1` each `agent_turn` becomes an `agent_activity` message, at most one every
+  `QUIET_EVERY_S` per run session, and a newer one replaces a waiting one, so the last turn is never lost).
 - `POST /api/runs/<id>/{approve,reject,answer,pause,resume,done,cancel,retry}` with a JSON body. Each action
   calls the same function as the CLI with `by="dashboard"`; reject, a complete answer, resume, done, retry and
   an approval inside a phase then start `flow.py resume <id>` detached (D13), unless a runner already holds
@@ -39,8 +41,8 @@ It can approve checkpoints and start agents, so it is locked down:
 - POST bodies are `application/json` objects of at most 64 KB (the config routes: the config's size limit plus
   64 KB); run ids must have the run-id shape and name
   an existing run directory, and files are read only through the run's own paths, size-capped;
-- every response is `no-store`, `nosniff`, `no-referrer`, not frameable, with a strict CSP (the page's one
-  script and style carry a fresh nonce); JSON escapes `<`, `>` and `&`, and the page renders all run text
+- every response is `no-store`, `nosniff`, `no-referrer`, not frameable, with a strict CSP (the page's
+  scripts and style carry a fresh nonce); JSON escapes `<`, `>` and `&`, and the page renders all run text
   with `textContent`;
 - the terminal log names each refused request's status and, when it has one, its `error` text on one line,
   cut to `LOG_REASON_MAX` characters; the token never appears in it.
@@ -65,7 +67,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from agentflow import backlog, config_edit, hitl, module_queue, pack, preflight
-from agentflow.config import Config, ConfigError, for_lane, load_config
+from agentflow.config import Config, ConfigError, _finite, for_lane, load_config
 from agentflow.events import EventError, lock_state
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
 from agentflow.scorecard import scorecard_view
@@ -73,7 +75,12 @@ from agentflow.state import Run, runs_root
 from agentflow.views import agents_view, board, lessons_view, metrics_view, run_detail, workflow_view
 
 PAGE = Path(__file__).resolve().with_name("dashboard.html")
+UI_DIR = Path(__file__).resolve().with_name("dashboard_ui")
+UI_SCRIPTS = ("core.js", "dialogs.js", "board.js", "drawer.js", "run.js", "workflow.js", "agents.js", "metrics.js", "lessons.js",
+              "settings.js", "main.js")  # in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
+UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024
+DEFAULT_BOARD_REFRESH_S = 2.0  # the most often the page refetches the Board while events arrive
 LOG_REASON_MAX = 200  # the characters of a refused request's `error` its log line keeps
 MIN_TOKEN_CHARS = 22  # 128 bits of token_urlsafe
 RUN_ID = re.compile(r"^[0-9]{8}-[0-9]{4}-[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -88,6 +95,8 @@ BACKLOG_LOG = "backlog"  # the `run_id` the live stream gives backlog events
 REFRESH_EVERY_S = 60.0
 SSE_POLL_S = 0.25
 SSE_PING_S = 15.0
+QUIET_EVERY_S = 2.0  # the least gap between two `agent_activity` messages of one session on a quiet stream
+QUIET_FORGET_S = 300.0  # a session's last send is forgotten after this long, so a long stream keeps no history
 REMIND_EVERY_S = 60.0
 BY = "dashboard"
 API_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
@@ -391,6 +400,15 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._send(403, b"", "text/plain; charset=utf-8")
             return
+        match = UI_ROUTE.fullmatch(urlsplit(self.path).path)
+        if match:  # the page's scripts carry no run data, so they need no token, but the same-site check stays
+            if not self._same_site():
+                self._send(403, b"", "text/plain; charset=utf-8")
+            elif match.group(1) not in UI_SCRIPTS:
+                self._error(404, "not found")
+            else:
+                self._send(200, (UI_DIR / match.group(1)).read_bytes(), "text/javascript; charset=utf-8")
+            return
         self._handle(self._get)
 
     def do_POST(self) -> None:
@@ -417,13 +435,17 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, board(self.server.repo, self.server.cfg, lane))
         elif path == "/api/info":
-            self._json(200, {"name": "agentflow-harness", "version": pack.ENGINE_VERSION})
+            refresh = self.server.cfg.dashboard.get("board_refresh_s", DEFAULT_BOARD_REFRESH_S)
+            if not _finite(refresh) or not 0.5 <= refresh <= 60:  # a hand-edited value never reaches the page
+                refresh = DEFAULT_BOARD_REFRESH_S
+            self._json(200, {"name": "agentflow-harness", "version": pack.ENGINE_VERSION,
+                             "board_refresh_s": float(refresh)})
         elif path == "/api/workflow":
             self._json(200, workflow_view(self.server.cfg))
         elif path == "/api/agents":
             self._json(200, agents_view(self.server.repo, self.server.cfg))
         elif path == "/api/events":
-            self._events()
+            self._events(quiet=query.get("quiet") == ["1"])
         elif path == "/api/config":
             self._json(200, config_edit.form_fields(self.server.cfg.path))
         elif path == "/api/metrics":
@@ -437,7 +459,7 @@ class _Handler(BaseHTTPRequestHandler):
             if run is None:
                 self._error(404, "no such run")
                 return
-            self._json(200, run_detail(run, self.server.cfg))
+            self._json(200, run_detail(run, self.server.cfg, raw=(query.get("raw") or [""])[0] == "1"))
         else:
             self._error(404, "not found")
 
@@ -475,7 +497,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _page(self) -> None:
         nonce = secrets.token_urlsafe(18)
-        html = PAGE.read_text(encoding="utf-8").replace("{{NONCE}}", nonce)
+        tags = "\n".join('<script nonce="{{NONCE}}" src="/ui/%s"></script>' % name for name in UI_SCRIPTS)
+        html = PAGE.read_text(encoding="utf-8").replace("{{SCRIPTS}}", tags).replace("{{NONCE}}", nonce)
         self._send(200, html.encode("utf-8"), "text/html; charset=utf-8", PAGE_CSP.format(n=nonce))
 
     def _post(self, path: str, query: dict) -> None:
@@ -617,7 +640,7 @@ class _Handler(BaseHTTPRequestHandler):
         return body
 
     # -- server-sent events
-    def _events(self) -> None:
+    def _events(self, quiet: bool = False) -> None:
         # The starting point is fixed before the 200 goes out: a client that acts as soon as it sees the
         # response must get the events it causes, so nothing written after this line counts as old.
         root = runs_root(self.server.repo)
@@ -631,16 +654,31 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(b": connected\n\n")
         self.wfile.flush()
         pinged = time.monotonic()
+        last_sent: dict[tuple[str, str], float] = {}  # quiet only: when each session's activity last went out
+        pending: dict[tuple[str, str], bytes] = {}  # quiet only: the newest activity message still waiting
         while not self.server.stopping.is_set():
             sent = False
             for path in self._logs(root):
                 name = path.parent.name
                 for event in self._new_events(path, offsets, name):
+                    if quiet and event.get("type") == "agent_turn":
+                        sent |= self._coalesce(name, event, last_sent, pending)
+                        continue
                     self.wfile.write(b"data: " + _json_bytes({"run_id": name, "event": event}) + b"\n\n")
                     sent = True
             for event in self._new_events(root / "backlog.jsonl", offsets, BACKLOG_LOG):
                 self.wfile.write(b"data: " + _json_bytes({"run_id": BACKLOG_LOG, "event": event}) + b"\n\n")
                 sent = True
+            if pending:
+                now = time.monotonic()
+                for key in [k for k in pending if now - last_sent[k] >= QUIET_EVERY_S]:
+                    self.wfile.write(pending.pop(key))
+                    last_sent[key] = now
+                    sent = True
+            if last_sent:
+                now = time.monotonic()
+                for key in [k for k, at in last_sent.items() if k not in pending and now - at > QUIET_FORGET_S]:
+                    del last_sent[key]
             if not sent and time.monotonic() - pinged > SSE_PING_S:
                 self.wfile.write(b": ping\n\n")
                 sent = True
@@ -648,6 +686,23 @@ class _Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 pinged = time.monotonic()
             self.server.stopping.wait(SSE_POLL_S)
+
+    def _coalesce(self, run_id: str, event: dict, last_sent: dict, pending: dict) -> bool:
+        """Turn one `agent_turn` into an `agent_activity` message: send it now when its session has been quiet
+        for `QUIET_EVERY_S`, or keep it (replacing an older waiting one) for the stream loop to send. Returns
+        whether it wrote anything."""
+        key = (run_id, str(event.get("session_id")))
+        message = b"data: " + _json_bytes({"run_id": run_id, "event": {
+            "type": "agent_activity", "session_id": event.get("session_id"), "key": event.get("key"),
+            "last_tool": event.get("last_tool"), "context_pct": event.get("context_pct"),
+            "ts": event.get("ts")}}) + b"\n\n"
+        now = time.monotonic()
+        if key not in pending and (key not in last_sent or now - last_sent[key] >= QUIET_EVERY_S):
+            self.wfile.write(message)
+            last_sent[key] = now
+            return True
+        pending[key] = message
+        return False
 
     @staticmethod
     def _size(path: Path) -> int:

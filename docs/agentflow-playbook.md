@@ -324,7 +324,7 @@ The runner fixes what a review finds by itself: `plan_fixes` makes the plan, `fi
 
 **The machine stays awake while a runner works.** On macOS the runner holds `caffeinate -i` and on Linux `systemd-inhibit --what=idle:sleep`, both tied to the runner's process, and lets go as soon as the run stops for you or ends. `agentflow doctor` warns when neither exists. Set `AGENTFLOW_NO_KEEPAWAKE=1` to turn it off.
 
-The dashboard's Workflow tab shows every phase with its steps, skills, model and gates, from `config.yaml`, with a badge only on a step that one kind of work runs. To see exactly which steps a run walks, open its drawer. The Board's Backlog column is not a phase: it holds capability-map modules the queue hasn't started, the cards added on the page and the synced GitHub issues, so they have no run yet. Dragging only works on ready cards.
+The dashboard's Workflow tab shows every phase with its steps, skills, model and gates, from `config.yaml`, with a badge only on a step that one kind of work runs. To see exactly which steps a run walks, open its Run page. The Board's Backlog column is not a phase: it holds capability-map modules the queue hasn't started, the cards added on the page and the synced GitHub issues, so they have no run yet. Dragging only works on ready cards.
 
 Approving a stop **never** lets a failing gate, a passing red test or a forbidden change through. It resumes the step and checks again.
 
@@ -517,7 +517,7 @@ A live run sees a change to any layer file between its phases: the runner takes 
 - `phase_approval`: the refine prompt and what an approval page shows. Protected.
 - `checkpoints`: who answers each inner checkpoint. Not protected.
 - `hitl`: notifications, reminders and where decisions are recorded. Not protected, except `hitl.notify`.
-- `dashboard`: host, port and the Backlog. Not protected, except `dashboard.host`. `dashboard.backlog.new_task` may list `issue` for the `module_lane` too; in a capability map that needs `dashboard.backlog.module_row`, since such a card adds the row `issue-<N>`.
+- `dashboard`: host, port and the Backlog. Not protected, except `dashboard.host`. `dashboard.board_refresh_s` (2 by default, 0.5–60) is the most often the page refetches the Board while events arrive. `dashboard.backlog.new_task` may list `issue` for the `module_lane` too; in a capability map that needs `dashboard.backlog.module_row`, since such a card adds the row `issue-<N>`.
 
 ## 15. Lessons and retros
 
@@ -576,7 +576,7 @@ The diff is `.agentflow/lessons.md` alone, and the runner refuses to open the PR
 - **Dropped** lists each proposal the runner refused, and why.
 
 All the text the model wrote is in code spans, so it cannot add headings, links or mentions. Before you merge:
-1. **Check the evidence.** Each source is `<run id>#<seq>`. Open the run with `agentflow status <run id>`, the dashboard drawer (the Lessons tab links each source), or the `seq` line of the run's `events.jsonl`. Check that the event shows what the lesson claims.
+1. **Check the evidence.** Each source is `<run id>#<seq>`. Open the run with `agentflow status <run id>`, the dashboard's Run page (the Lessons tab links each source), or the `seq` line of the run's `events.jsonl`. Check that the event shows what the lesson claims.
 2. **Check the rule.** It should be something an agent can do differently, not a one-off. A cause in a setting belongs in the config, not in a lesson.
 3. **Check the target.** It should be a signal the rule should move, so that the next retro can tell whether the lesson helped. A lesson marked `engine candidate: yes` may hold in any project. Promote it by hand in an engine change to `agentflow/lessons.md`, which takes an `E-` id.
 4. **Read Dropped.** Many dropped sources mean the session cited events that do not exist. Use it as a reason to read the rest more carefully.
