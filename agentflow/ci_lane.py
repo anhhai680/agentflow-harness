@@ -14,8 +14,9 @@ step, plus the step's `forbid`. Each round is:
 
 A draft opened early (`ci.early_pr_after`, `pr_opened` with `early`) is watched only once `finish` has audited and
 updated it (`pr_updated`); before that the step stops as if no pull request were open. Its checks are read only while
-GitHub's head for it (`headRefOid`) is the sha the runner pushed last (`pr_updated` or a fix round's `ci_round`): until
-then they count as none yet, under the same `appear_min` and watch limits, so the early push's checks never pass it.
+GitHub's head for it (`headRefOid`) is the sha the runner pushed last (`pr_updated`, the merge `finish` pushes again
+for a conflicting PR, or a fix round's `ci_round`): until then they count as none yet, under the same `appear_min` and
+watch limits, so the early push's checks never pass it.
 3. A failure: run the step's `gates` (the environment), then its `fix` session with the failed jobs' logs. The
    session's own gates hold before the runner commits. A commit is pushed; no commit means the session found
    nothing in the code to change, so the failed jobs run again, at most `ci.rerun_rounds` times.
@@ -129,10 +130,12 @@ class CILane:
                    for e in events)
 
     def _pushed_sha(self) -> str:
-        """The sha the runner pushed last to the pull request: the latest `pr_updated`, `pr_opened` or `ci_round`
-        that carries one; "" when none does."""
+        """The sha the runner pushed last to the pull request: of the `pr_updated`, `pr_opened`, `ci_round` and
+        `base_synced` events (the merge `confirm_mergeable` pushes when GitHub calls the PR conflicting) that carry
+        one, the latest by seq; "" when none does. `finish`'s own merge comes before its `pr_updated`, so it never
+        shadows it. A merge committed but never pushed names a sha GitHub does not show: that is stale, never a pass."""
         shas = [str(e["sha"]) for e in self.run.events.read()
-                if e["type"] in ("pr_updated", "pr_opened", "ci_round") and e.get("sha")]
+                if e["type"] in ("pr_updated", "pr_opened", "ci_round", "base_synced") and e.get("sha")]
         return shas[-1] if shas else ""
 
     def _stale_head(self, url: str) -> str:
@@ -141,8 +144,8 @@ class CILane:
         if not self._early:
             return ""
         want = self._pushed_sha()
-        if not want:
-            return ""
+        if not want:  # `_finish_took` guarantees one for a real early PR: none is never read as a match
+            return f"no pushed commit is recorded for {url}"
         try:
             got = pr_head(self.worktree, url)
         except GhError as exc:

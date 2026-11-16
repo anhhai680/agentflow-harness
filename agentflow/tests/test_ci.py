@@ -671,3 +671,51 @@ def test_a_failing_pr_body_is_an_early_pr_failure_with_no_push(flow_repo, gh, mo
     counts = [int(line) for line in pushes.read_text(encoding="utf-8").split()]
     assert len(counts) == 1 and counts[0] > position(run, "early_pr_failed")  # only `finish` pushed
     assert flow_repo.events(run, "pr_opened")[0]["key"] == "ship/finish"
+
+
+def remerge_after_finish(flow, run, tmp_path, monkeypatch, *, head_stays: bool = False) -> None:
+    """GitHub calls the updated early PR conflicting once, while the target moves: `confirm_mergeable` merges it
+    again and pushes. `head_stays`: GitHub keeps showing the commit `finish` pushed."""
+    from conftest import land_on_origin
+    from agentflow.sync_lane import SyncLane
+
+    verdicts = iter(["CONFLICTING", "MERGEABLE"])
+
+    def mergeable(self, url):
+        verdict = next(verdicts, "MERGEABLE")
+        if verdict == "CONFLICTING":
+            land_on_origin(flow, tmp_path, {"docs/later.md": "later\n"})
+            if head_stays:
+                monkeypatch.setenv("FAKE_GH_HEAD", flow.events(run, "pr_updated")[-1]["sha"])
+        return verdict
+
+    monkeypatch.setattr(SyncLane, "_mergeable", mergeable)
+
+
+def test_ci_follows_the_re_merge_push_of_an_early_pr(flow_repo, gh, tmp_path, monkeypatch, git):
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    remerge_after_finish(flow_repo, run, tmp_path, monkeypatch)
+    assert go(flow_repo, run) == "done"
+    updated, again = flow_repo.events(run, "pr_updated")[0], flow_repo.events(run, "base_synced")[-1]
+    assert again["seq"] > updated["seq"] and again["sha"] != updated["sha"]
+    assert again["sha"] == git(flow_repo.origin, "rev-parse", run.state["branch"]).strip()
+    assert head_reads(gh) and gh.did("pr", "ready", URL)
+
+
+def test_a_head_left_behind_the_re_merge_is_never_a_pass(flow_repo, gh, tmp_path, monkeypatch):
+    gh.play(PASS)
+    run = to_ship(flow_repo, EARLY)
+    remerge_after_finish(flow_repo, run, tmp_path, monkeypatch, head_stays=True)
+    assert go(flow_repo, run) == "waiting_human"
+    waiting = run.state["waiting"]
+    assert waiting["key"] == "ship/ci" and flow_repo.events(run, "base_synced")[-1]["sha"][:12] in waiting["summary"]
+    assert not gh.did("pr", "checks") and not gh.did("pr", "ready")
+
+
+def test_an_early_pr_with_no_pushed_sha_is_stale(flow_repo, gh):
+    flow_repo.configure(EARLY)
+    executor = flow_repo.executor()
+    executor._early = True
+    assert "no pushed commit" in executor._stale_head(URL)
+    assert not head_reads(gh)  # nothing to compare with: GitHub is not even asked
