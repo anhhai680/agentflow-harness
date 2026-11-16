@@ -7,6 +7,8 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [2.8] - 2026-11-16
+
 ### Added
 
 - Each run has its own page in the dashboard (`#/run/<id>/<tab>`), with a stage rail, a waiting banner, Overview, Activity, Gates and Files tabs, and only the buttons the run's state allows. A card's click opens it, and Space opens a short peek.
