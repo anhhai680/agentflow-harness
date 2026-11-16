@@ -91,6 +91,8 @@ TASK_KEY = re.compile(r"/task-\d+/(implement|review)$")
 TASK_N = re.compile(r"/task-(\d+)/")
 DONE_STATUSES = ("done", "unchanged")
 SUMMARY_MAX = 60
+FINAL_FIX = "final_fix"  # `finish`'s session that fixes what the full verify run on the final tree found
+FINAL_FIX_MESSAGE = "Fix what the full verify run found"
 DEFAULT_RECORD = {"spec_gap": "record_step", "ambiguity": "commit_body", "review_dispute": "commit_body",
                   "boundary": "commit_body"}
 
@@ -768,6 +770,9 @@ class FeatureLane:
             raise_hitl(self.cfg, self.run, "blocked", key,
                        f"{branch} is the base branch: finish pushes a run's own branch, never the pull request's target.")
             return "stopped"
+        if step.sync is not None and self._final_fix_open(key):  # a stopped final fix resumes first: its edits are
+            if self._final_fix(phase, step.sync, key, None) != "done":  # still in the work tree, uncommitted
+                return "stopped"
         if not clean_tree(self.cfg, self.run, self.worktree, key, resume_merge=True):  # a half-done sync resumes
             return "stopped"
         if self.run_sync(phase, step, key) != "done":
@@ -805,25 +810,33 @@ class FeatureLane:
         only the affected tier (`gates.deferred_full`). A pass (or a pass reused for this tree or these inputs) is
         "done", and its results are the audit's evidence. A failure goes to a session of the `sync` step, at the
         full tier, whose gates and fix loop decide and whose work the runner commits (`<key>/final_fix`); with no
-        such session to run, or once it is already done, it is the audit's `gate_failed` stop. "stopped" = a human."""
+        such session to run, or once it is already done, it is the audit's `gate_failed` stop. "stopped" = a human.
+        A final fix that stopped is resumed by `run_finish` before anything else (`_final_fix_open`)."""
         tree = snapshot(self.worktree)
         results = run_gates_reusing(self.cfg, self.run, key, "verify", self.worktree, self.run.gate_log_dir(key), tree)
         record_results(self.run, key, results, tree)
         if gates_ok(results):
             return "done"
         failed = [r for r in results if not (r.passed or r.skipped)]
-        sync = step.sync
-        fix_key = f"{key}/final_fix"
-        done = (self.run.state["steps"].get(fix_key) or {}).get("status") in DONE_STATUSES
-        if sync is not None and sync.fix_loop and not done:
-            fixer = dataclasses.replace(sync, gate_tier="full", commit=True, message="Fix what the full verify run found")
-            return self.run_agent_step(self._plain(phase), fixer, fix_key,
-                                       extra={"sync_report": self._sync_report([], "")}, role=sync.role,
-                                       fix_first=failed)
+        done = (self.run.state["steps"].get(f"{key}/{FINAL_FIX}") or {}).get("status") in DONE_STATUSES
+        if step.sync is not None and step.sync.fix_loop and not done:
+            return self._final_fix(phase, step.sync, key, failed)
         raise_hitl(self.cfg, self.run, "gate_failed", key,
                    f"Gates failed on the tree {key} would push: {', '.join(r.name for r in failed)}.",
                    extra=failure_report(failed))
         return "stopped"
+
+    def _final_fix(self, phase: Phase, sync: Step, key: str, failed: list | None) -> Outcome:
+        """Run `<key>/final_fix`, a session of the `sync` step that checks the `verify` set at the full tier and whose
+        work the runner commits; `failed` starts it in its fix loop, None resumes it (or starts it again)."""
+        fixer = dataclasses.replace(sync, gates="verify", gate_tier="full", commit=True, message=FINAL_FIX_MESSAGE)
+        return self.run_agent_step(self._plain(phase), fixer, f"{key}/{FINAL_FIX}",
+                                   extra={"sync_report": self._sync_report([], "")}, role=sync.role, fix_first=failed)
+
+    def _final_fix_open(self, key: str) -> bool:
+        """`<key>/final_fix` started and is not finished (a stop, an approval or a retry left it open)."""
+        rec = self.run.state["steps"].get(f"{key}/{FINAL_FIX}")
+        return rec is not None and rec.get("status") not in (*DONE_STATUSES, "skipped")
 
     def _unmoved(self, key: str, sha: str) -> bool:
         """HEAD is still `sha`, the commit the audit checked (a gate it ran could have committed); False = stopped."""

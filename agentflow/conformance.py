@@ -70,7 +70,9 @@ def last_code_change(events: list[dict]) -> int:
 
 def _verify_covered(cfg: Config, events: list[dict]) -> set[str]:
     """The step keys whose last result for every gate of `gate_sets.verify` passed or was skipped, under that same
-    key: the runner ran the verify gates on that step's work."""
+    key: the runner ran the verify gates on that step's work. A gate a `gates_reused` event names counts as a pass
+    under that event's key, at its place in the log: reuse takes only a full-tier pass that holds for the step's tree
+    (the same tree, or the same input hash), so the gate's result on that work is known without running it."""
     names = list(cfg.gate_sets.get("verify") or [])
     if not names:
         return set()
@@ -78,6 +80,9 @@ def _verify_covered(cfg: Config, events: list[dict]) -> set[str]:
     for e in events:
         if e.get("type") == "gate_result" and e.get("key"):
             last[(str(e.get("key")), str(e.get("gate")))] = e
+        elif e.get("type") == "gates_reused" and e.get("key"):
+            for gate in e.get("gates") or []:
+                last[(str(e.get("key")), str(gate))] = {"passed": True}
     keys = {key for key, _ in last}
     return {key for key in keys
             if all((r := last.get((key, name))) is not None and (r.get("passed") or r.get("skipped")) for name in names)}

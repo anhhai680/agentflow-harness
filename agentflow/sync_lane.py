@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -253,15 +254,17 @@ class SyncLane:
     def confirm_mergeable(self, phase: Phase, step: Step, key: str, url: str) -> Outcome:
         """GitHub's verdict on the new pull request. Main may have moved since the fetch: on `CONFLICTING`, bring the
         target in again and push, up to `ci.sync_rounds` times, then a human. "UNKNOWN" and a failed read are not a
-        verdict: the `ci` step is the backstop."""
+        verdict: the `ci` step is the backstop. Such a merge is pushed with no audit after it, so the `sync` step's
+        gates check it at the full tier, whatever its `gate_tier`."""
         rounds = int(self.cfg.ci.get("sync_rounds", DEFAULT_ROUNDS))
+        full = replace(step, sync=replace(step.sync, gate_tier="full")) if step.sync is not None else step
         branch = str(self.run.state.get("branch") or "")
         for attempt in range(rounds + 1):
             if self._mergeable(url) != "CONFLICTING":
                 return "done"
             if attempt == rounds:
                 break
-            if self.run_sync(phase, step, key) != "done":
+            if self.run_sync(phase, full, key) != "done":
                 return "stopped"
             if not self.runner_commits_only(key):
                 return "stopped"

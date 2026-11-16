@@ -289,6 +289,39 @@ def test_a_pull_request_that_stays_conflicting_is_a_humans(flow_repo, gh, git, m
     assert len(verbs(gh, "view")) == 3  # the first look and one per `ci.sync_rounds`
 
 
+def test_a_merge_after_the_audit_runs_the_sync_gates_in_full(flow_repo, gh, git, monkeypatch):
+    """`sync` runs at the affected tier, but the merge that follows a `CONFLICTING` verdict on the open pull
+    request is pushed with no audit after it: its gates run in full."""
+    from agentflow.sync_lane import SyncLane
+
+    def tiered(data):
+        next(s for s in data["phases"]["ship"]["steps"] if s.get("id") == "finish")["sync"]["gate_tier"] = "affected"
+
+    flow_repo.configure({**BASE, "conditions": {"eval_required": None},
+                         "gates": {"ok": {"affected": {"run": "true {paths}", "paths": ["**/*.py"]}}}}, edit=tiered)
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"}, RunOptions(from_phase="ship"))
+    own_work(flow_repo, run, {"mine.py": "mine = 1\n"})
+    target_moves(flow_repo, git, {"upstream.py": "theirs = 1\n"})
+    verdicts = iter(["CONFLICTING", "MERGEABLE"])
+
+    def mergeable(self, url):  # the target moves again while the pull request is opened
+        verdict = next(verdicts)
+        if verdict == "CONFLICTING":
+            target_moves(flow_repo, git, {"later.py": "later = 1\n"})
+        return verdict
+
+    monkeypatch.setattr(SyncLane, "_mergeable", mergeable)
+    assert go(flow_repo, run) == "done"
+    events = run.events.read()
+    opened = next(e["seq"] for e in events if e["type"] == "pr_opened")
+    first, again = [e for e in events if e["type"] == "base_synced"]
+    assert again["seq"] > opened and on_origin(git, flow_repo, run, "later.py") == "later = 1\n"
+    before = [e for e in events if e["type"] == "gate_result" and e["gate"] == "ok" and e["seq"] < first["seq"]]
+    assert [e.get("tier") for e in before] == ["affected"]  # the merge inside `finish`, before the audit
+    remerge = [e for e in events if e["type"] == "gate_result" and opened < e["seq"] < again["seq"]]
+    assert remerge and all("tier" not in e and e["passed"] for e in remerge)
+
+
 def test_an_unclear_verdict_is_left_to_ci(flow_repo, gh, git, monkeypatch):
     monkeypatch.setenv("FAKE_GH_MERGEABLE", "UNKNOWN")
     run = begin(flow_repo)
