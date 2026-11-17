@@ -134,7 +134,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 31
+    assert len(FAMILIES) == 32
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
