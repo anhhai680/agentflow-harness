@@ -2086,3 +2086,12 @@ def test_the_inbox_is_a_tab_with_a_badge_and_no_browser_prompts():
     assert "prompt(" not in inbox and "confirm(" not in inbox
     assert '"inbox"' in (UI_DIR / "main.js").read_text(encoding="utf-8")
     assert "inbox_legacy" in (UI_DIR / "board.js").read_text(encoding="utf-8")
+
+
+def test_inbox_shortcuts_stay_out_of_text_fields_and_approve_takes_two_presses():  # Review Focus 4
+    inbox = (UI_DIR / "inbox.js").read_text(encoding="utf-8")
+    handler = inbox[inbox.index("function inboxKey"):inbox.index("\n}\n", inbox.index("function inboxKey"))]
+    for needle in ("INPUT", "TEXTAREA", "SELECT", "isContentEditable", "dlg", "4000", "armed"):
+        assert needle in handler, needle
+    assert "Press a again to approve" in inbox and "Dismiss" in inbox and "readOnly" in inbox
+

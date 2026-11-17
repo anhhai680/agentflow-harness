@@ -248,3 +248,45 @@ def test_a_partial_answer_keeps_its_draft_and_others_forget_it():
     # `/answer` succeeds with complete: false when a question is still blank; the draft must keep the picks
     assert js(["inbox.js"], "inboxForgets('answer')", None) is False
     assert js(["inbox.js"], "['approve', 'reject'].map(inboxForgets)", None) == [True, True]
+
+
+def test_items_group_by_run_or_by_kind():
+    items = [{"run_id": "r1", "run_label": "a", "group": "stop", "key": "1"},
+             {"run_id": "r2", "run_label": "b", "group": "approval", "key": "2"},
+             {"run_id": "r1", "run_label": "a", "group": "question", "key": "3"}]
+    by_run = js(["inbox.js"], "groupItems(args, 'run').map(g => [g.label, g.items.map(i => i.key)])", items)
+    by_kind = js(["inbox.js"], "groupItems(args, 'kind').map(g => [g.label, g.items.map(i => i.key)])", items)
+    assert by_run == [["a", ["1", "3"]], ["b", ["2"]]]
+    assert by_kind == [["Approvals", ["2"]], ["Questions", ["3"]], ["Stops", ["1"]]]
+    assert js(["inbox.js"], "groupItems(args, 'kind').map(g => g.key)", items[:1]) == ["stop"]
+    assert js(["inbox.js"], "groupItems(args, 'run')", []) == []
+
+
+def test_a_card_decided_elsewhere_says_by_whom():                  # spec Verification U4, Review Focus 3
+    item = {"run_id": "r", "kind": "phase_approval", "phase": "define", "key": "define_approved"}
+    recent = [{"run_id": "r", "phase": "define", "key": None, "action": "approved", "by": "alex",
+               "ts": "2026-11-16T14:02:10+00:00"}]
+    text = js(["inbox.js"], "goneText(args.item, args.recent)", {"item": item, "recent": recent})
+    assert text.startswith("Approved from the CLI by alex at ")
+    assert js(["inbox.js"], "goneText(args, [])", item) == "No longer waiting on you"
+
+
+def test_the_gone_text_names_where_and_picks_the_newest_matching_entry():
+    stop = {"run_id": "r", "kind": "blocked", "key": "build/build/task-1/implement"}
+    other = {"run_id": "r2", "key": "build/build/task-1/implement", "action": "answered", "by": "zed", "ts": "2026-11-16T15:00:00+00:00"}
+    mine = lambda action, by, ts: {"run_id": "r", "key": stop["key"], "phase": "build", "action": action, "by": by, "ts": ts}  # noqa: E731
+    pick = "goneText(args.item, args.recent)"
+    got = js(["inbox.js"], pick, {"item": stop, "recent": [other, mine("approved", "dashboard", "2026-11-16T14:00:00+00:00")]})
+    assert got.startswith("Approved from the dashboard at ") and len(got.split(" at ")[1]) == 5
+    got = js(["inbox.js"], pick, {"item": stop, "recent": [mine("answered", "runner", "2026-11-16T14:00:00+00:00")]})
+    assert got.startswith("Answered by the runner at ")
+    got = js(["inbox.js"], pick, {"item": stop, "recent": [mine("rejected", "sam", "2026-11-16T14:00:00+00:00"),
+                                                           mine("approved", "alex", "2026-11-16T14:05:00+00:00")]})
+    assert got.startswith("Approved from the CLI by alex at ")  # the newest entry of the two
+    assert js(["inbox.js"], pick, {"item": stop, "recent": [other]}) == "No longer waiting on you"  # another run's key
+    approval = {"run_id": "r", "kind": "phase_approval", "phase": "build", "key": "build_approved"}
+    assert js(["inbox.js"], pick, {"item": approval, "recent": [mine("approved", "sam", "2026-11-16T14:00:00+00:00")]}) == \
+        "No longer waiting on you"  # a phase approval matches its phase's entry, not a step's key inside that phase
+    phase_entry = {"run_id": "r", "key": "build", "phase": "build", "action": "rejected", "by": "sam", "ts": "2026-11-16T14:00:00+00:00"}
+    assert js(["inbox.js"], pick, {"item": approval, "recent": [phase_entry]}).startswith("Rejected from the CLI by sam at ")
+

@@ -112,6 +112,7 @@ const VIEWS = ["inbox", "board", "workflow", "agents", "metrics", "lessons", "se
 // `view` is a header tab's name, or "run" for the Run page, which no tab marks.
 function show(view) {
   ui.view = view;
+  setInboxKeys(view === "inbox");
   for (const name of VIEWS) {
     $(name + "-view").hidden = view !== name;
     $("tab-" + name).setAttribute("aria-pressed", String(view === name));
@@ -144,6 +145,7 @@ for (const name of VIEWS) $("tab-" + name).addEventListener("click", () => {
   else location.hash = "#/" + name;
 });
 $("new-task").addEventListener("click", newTaskDialog);
+initInbox();
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("dlg").open) closePeek(); });
 window.addEventListener("hashchange", route);
 if (!location.hash) {  // a first visit, or the #token= the boot removed: the tab this browser showed last

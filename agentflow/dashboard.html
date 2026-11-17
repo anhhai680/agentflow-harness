@@ -261,6 +261,10 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
 /* the Inbox: one card per decision */
 .icard { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--wait); border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; overflow-wrap: anywhere; }
 .icard.stop { border-left-color: var(--bad); } .icard.question { border-left-color: var(--accent); } .icard.armed { border-color: var(--warn); border-left-color: var(--warn); }
+.icard.focused { outline: 2px solid var(--accent); outline-offset: 1px; }
+.icard.gone { border-left-color: var(--muted); }
+.i-gone { font-weight: 600; margin: 6px 0; } .i-armed { color: var(--warn); font-weight: 600; margin: 4px 0; }
+#inbox-bar { align-items: center; margin-bottom: 4px; } #inbox-hint { margin: 4px 0 10px; font-size: 12px; }
 .i-head { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; }
 .i-title { font-size: 15px; margin: 0; }
 .i-summary { margin: 6px 0; }
@@ -292,6 +296,12 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
 </header>
 <main>
   <section id="inbox-view" hidden>
+    <div id="inbox-bar" class="moves">
+      <span class="muted">Group by</span>
+      <button id="inbox-group-run" type="button" aria-pressed="true">Run</button>
+      <button id="inbox-group-kind" type="button" aria-pressed="false">Kind</button>
+    </div>
+    <p id="inbox-hint" class="muted">j/k move · o open · a approve (press twice) · r request changes</p>
     <div id="inbox-list"></div>
   </section>
   <section id="board-view">
