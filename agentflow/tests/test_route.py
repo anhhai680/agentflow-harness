@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
-
 import pytest
 
 from agentflow import route
@@ -62,13 +60,25 @@ def test_no_answers_fall_back_to_l():
     assert route.decide(route.facts_from({"answers": {"risk": "no"}}, False), None) == ("L", "fallback")
 
 
-def test_facts_from_parses_answers_and_roundtrips_as_event():
+def test_facts_from_normalizes_answers_and_as_event_has_the_plan_keys():
     raw = {"answers": {k: v.upper() for k, v in NO.items()}, "tasks_expected": 2, "files_expected": 1}
     f = route.facts_from(raw, True)
     assert f == route.Facts(answers=NO, tasks=2, files=1, security=True)
-    event = f.as_event()
-    assert event["security"] is True and event["answers"] == NO
-    assert dataclasses.is_dataclass(f)
+    assert f.as_event() == {"answers": NO, "tasks": 2, "files": 1, "security": True}
+    assert route.facts_from({}, False).as_event() == {"answers": None, "tasks": None, "files": None, "security": False}
+
+
+def test_unsure_mechanical_is_not_xs():
+    assert route.pick(facts(mechanical="unsure", files=1, tasks=1)) == "S"
+
+
+def test_unknown_files_with_known_tasks_gives_s_not_xs():
+    assert route.pick(facts(mechanical="yes", files=None, tasks=2)) == "S"
+
+
+def test_zero_tasks_is_a_small_change():
+    assert route.pick(facts(tasks=0)) == "S"
+    assert route.pick(facts(mechanical="yes", files=0, tasks=0)) == "XS"
 
 
 def test_a_proposal_only_raises():

@@ -44,7 +44,7 @@ class Facts:
 
     def as_event(self) -> dict:
         return {"answers": dict(self.answers) if self.answers is not None else None,
-                "tasks_expected": self.tasks, "files_expected": self.files, "security": self.security}
+                "tasks": self.tasks, "files": self.files, "security": self.security}
 
 
 def _estimate(value: object) -> int | None:
@@ -91,7 +91,7 @@ def decide(facts: Facts, proposed: object) -> tuple[str, str]:
 
 
 def upgrade(current: str, *, tasks: int | None, risk: bool, security: bool) -> str | None:
-    """The profile the plan's real size calls for, when it is higher than `current`; never a lower one."""
+    """The profile the plan's real size calls for, when it is higher than `current` (a name in ROUTE_PROFILES); never a lower one."""
     if security or risk or (tasks is not None and tasks >= L_MIN_TASKS):
         target = "L"
     elif tasks is not None and tasks > S_MAX_TASKS:
