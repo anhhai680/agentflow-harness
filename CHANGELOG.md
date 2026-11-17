@@ -25,6 +25,11 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 - The run detail's 16 KB transcript tail (`transcript`, `transcript_file`); the Agents tab's transcript viewer replaces it.
 
+### Fixed
+
+- A spec whose answered questions sit under a plain `Resolved:` line (or a `### Resolved` heading) no longer counts them as open: the default `spec_has_open_questions` stops at any of these, and the `record_decision` prompt files a recorded answer under a bold `**Resolved (...)**` heading.
+- A repeat group whose round asked no questions while its `until` condition still fails stops for a human after that round instead of running the same round again, and its `max_rounds` stop names the condition (`not spec_has_open_questions`, not `inline condition`) and says why it still fails.
+
 ## [2.9] - 2026-11-17
 
 ### Added
