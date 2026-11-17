@@ -1943,3 +1943,14 @@ def test_the_plan_tab_has_a_tasks_mode():
     for needle in ("/plan", "blocks: ", "independent: ", "No plan for this run yet", "Open decision", "ui.plan"):
         assert needle in plan_js, needle
     assert UI_SCRIPTS.index("artifact.js") < UI_SCRIPTS.index("plan.js") < UI_SCRIPTS.index("main.js")
+
+
+def test_the_files_tab_lists_the_run_documents_and_the_changes():
+    files_js = (UI_DIR / "files.js").read_text(encoding="utf-8")
+    for needle in ("/files", "/files?name=", "/changes", "/changes?path=", "Changes since the base",
+                   "No branch yet", "Showing the first", "Transcript tail", "Step records", "ui.files"):
+        assert needle in files_js, needle
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    files_branch = run_js[run_js.index('tab === "files"'):run_js.index("}", run_js.index('tab === "files"'))]
+    assert "fileEntries(" in files_branch and '"file:handoff"' not in run_js and '"file:progress"' not in run_js
+    assert UI_SCRIPTS.index("plan.js") < UI_SCRIPTS.index("files.js") < UI_SCRIPTS.index("main.js")

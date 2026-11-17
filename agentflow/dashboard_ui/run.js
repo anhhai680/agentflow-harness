@@ -202,11 +202,7 @@ function runTabEntries(detail, tab, sub) {
       entry("reviews", reviews, (text) => section("Review findings", text, false, "reviews"))];
   }
   if (tab === "files") {
-    const file = (key, title, text) => entry(key, { title: title, text: text }, (f) => section(f.title, f.text, false, key));
-    return [file("file:progress", "progress.md", detail.progress),
-      file("file:handoff", "handoff.md", detail.handoff),
-      file("file:transcript", "Transcript tail" + (detail.transcript_file ? " (" + detail.transcript_file + ")" : ""), detail.transcript),
-      file("file:records", "Step records", recordsText(detail))];
+    return fileEntries(detail, sub);
   }
   const current = sub ? null : detail.facts.phase;  // with nothing named, the phase the run is in starts open
   const asked = decisionData(detail);

@@ -48,3 +48,27 @@ def test_a_task_row_reads_its_numbers():
     assert js(["plan.js"], "args.map(reviewText)", [None, {"skipped": True}, {"blocking": 2}, {"blocking": 0}]) == \
         ["—", "skipped", "2 blocking", "✓ 0"]
     assert js(["plan.js"], "statusText(args)", T(3, "waiting", blocked_by=[2])) == "○ waiting on 2"
+
+
+FILES = [{"name": "issue.md", "group": "request", "size": 6}, {"name": "handoffs/plan.md", "group": "handoffs", "size": 2048},
+         {"name": "handoffs/build.md", "group": "handoffs", "size": 20000}, {"name": "pr.md", "group": "pull request", "size": 10}]
+
+
+def test_the_file_list_groups_in_order_and_sizes_read_short():
+    groups = js(["files.js"], "groupFiles(args).map(g => [g.group, g.files.map(f => f.name)])", FILES)
+    assert groups == [["request", ["issue.md"]], ["handoffs", ["handoffs/plan.md", "handoffs/build.md"]], ["pull request", ["pr.md"]]]
+    assert js(["files.js"], "args.map(fileSize)", [0, 6, 2048, 20000, 3 * 1024 * 1024]) == ["0 B", "6 B", "2.0 KB", "19.5 KB", "3.0 MB"]
+
+
+def test_the_chosen_file_defaults_to_the_first():
+    assert js(["files.js"], "pickFile(args[0], args[1])", [FILES, None]) == "issue.md"
+    assert js(["files.js"], "pickFile(args[0], args[1])", [FILES, "handoffs/build.md"]) == "handoffs/build.md"
+    assert js(["files.js"], "pickFile(args[0], args[1])", [[], None]) is None
+
+
+def test_the_changes_summary_totals_added_and_deleted():
+    changes = {"files": [{"path": "a", "status": "M", "added": 3, "deleted": 1}, {"path": "b", "status": "A", "added": None, "deleted": None},
+                         {"path": "c", "status": "D", "added": 0, "deleted": 7}]}
+    assert js(["files.js"], "changesSummary(args)", changes) == "Changes since the base: 3 files, +3 −8"
+    assert js(["files.js"], "changesSummary(args)", {"files": [{"path": "a", "status": "M", "added": 1, "deleted": 0}]}) == \
+        "Changes since the base: 1 file, +1 −0"
