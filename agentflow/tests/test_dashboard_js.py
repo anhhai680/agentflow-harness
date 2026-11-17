@@ -242,3 +242,9 @@ def test_a_rejection_needs_a_note():
     assert js(["inbox.js"], "rejectPayload(args, 'cut scope')", item) == {"ok": True, "body": {"target": "define", "note": "cut scope"}}
     stop = {"kind": "blocked", "key": "build/x"}
     assert js(["inbox.js"], "rejectPayload(args, 'no')", stop)["body"]["target"] == "build/x"
+
+
+def test_a_partial_answer_keeps_its_draft_and_others_forget_it():
+    # `/answer` succeeds with complete: false when a question is still blank; the draft must keep the picks
+    assert js(["inbox.js"], "inboxForgets('answer')", None) is False
+    assert js(["inbox.js"], "['approve', 'reject'].map(inboxForgets)", None) == [True, True]

@@ -114,13 +114,19 @@ function armOrSend(key, send) {
   return false;
 }
 
-// Run a decision's action once at a time. A success forgets the draft; the refresh that follows drops the card.
+// Whether a sent action's draft is forgotten once it succeeded. An answer is kept: `/answer` also succeeds when a question
+// is still blank (`complete: false`), and the card rebuilt from the changed inbox text must still hold what was chosen
+// and written, or the next Answer would post the agent's recommendation over it. A completed answer leaves the view,
+// and renderInbox drops the draft of an item no longer in it.
+const inboxForgets = (action) => action !== "answer";
+
+// Run a decision's action once at a time. A success forgets the draft (see inboxForgets); the refresh that follows drops the card.
 async function inboxSend(item, action, body) {
   const key = inboxItemKey(item);
   if (ui.inbox.busy.has(key)) return;
   ui.inbox.busy.add(key);
   try {
-    if (await act(item.run_id, action, body)) ui.inbox.drafts.delete(key);
+    if ((await act(item.run_id, action, body)) && inboxForgets(action)) ui.inbox.drafts.delete(key);
   } finally {
     ui.inbox.busy.delete(key);
     redrawInbox();
