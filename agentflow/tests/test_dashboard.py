@@ -317,7 +317,6 @@ def test_a_card_shows_the_soft_and_the_hard_budget(dash):
 
 def test_board_and_run_detail(dash):
     planning = awaiting(dash.flow, "staff-auth")
-    run_dir = planning.dir
     planning.progress_path().write_text("# Tiến độ\n\n- bước 1 xong\n", encoding="utf-8")
     status, _, body = dash.get("/api/board")
     data = payload(body)
