@@ -14,6 +14,8 @@ Routes:
   and after the runs that carried it); `GET /api/events` (SSE: every run's new events, runs created
   later included; with `?quiet=1` each `agent_turn` becomes an `agent_activity` message, at most one every
   `QUIET_EVERY_S` per run session, and a newer one replaces a waiting one, so the last turn is never lost).
+- `GET /api/inbox` (each decision waiting on a person, titled, with its context, blast radius and allowed actions; the
+  held and stalled runs to watch; the decisions of the last 30 minutes). A query parameter is ignored.
 - `GET /api/runs/<id>/artifacts`, `/artifact?path=&sha=` (`sha` a revision of `path` or `head`),
   `/artifact/diff?path=&from=&to=` and `/findings`: the run's spec, plan and other committed files, read from git
   and capped at `dashboard.artifact_max_kb`; a path outside the run's artifact list is a 404.
@@ -89,6 +91,7 @@ from agentflow.artifacts import (
 )
 from agentflow.config import Config, ConfigError, _finite, for_lane, load_config
 from agentflow.events import EventError, lock_state
+from agentflow.inbox_view import inbox_view
 from agentflow.plan_view import run_plan
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
 from agentflow.run_files import list_files, read_file
@@ -501,6 +504,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._scorecard(query)
         elif path == "/api/lessons":
             self._json(200, lessons_view(self.server.repo, self.server.cfg))
+        elif path == "/api/inbox":
+            self._json(200, inbox_view(self.server.repo, self.server.cfg, datetime.now(UTC)))
         elif match := TRANSCRIPT_ROUTE.match(path):
             self._transcript_get(match.group(1), match.group(2), query)
         elif match := ARTIFACT_ROUTE.match(path):

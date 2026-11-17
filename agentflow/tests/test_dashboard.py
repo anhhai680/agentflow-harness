@@ -393,6 +393,28 @@ def test_untrusted_text_is_escaped_in_json(dash):
     assert payload(body)["facts"]["refine"]["note"] == note
 
 
+def test_the_inbox_lists_each_decision(dash):
+    run = awaiting(dash.flow, phase="define")
+    view = payload(dash.get("/api/inbox")[2])
+    (item,) = view["items"]
+    assert item["run_id"] == run.id and item["title"] == "Approve the spec" and item["approve_note"] == "none"
+    assert view["counts"] == {"approval": 1, "question": 0, "stop": 0, "watch": 0}
+
+
+def test_the_inbox_needs_the_token_and_our_host(dash):
+    assert dash.get("/api/inbox", token=None)[0] == 403
+    assert dash.get("/api/inbox", headers={"Host": "evil.example"})[0] == 403
+    assert dash.post("/api/inbox")[0] == 404
+
+
+def test_untrusted_inbox_text_is_escaped_in_json(dash):
+    run = dash.flow.new_run()
+    run.emit("phase_started", phase="build")
+    hitl.raise_hitl(dash.flow.cfg, run, "blocked", "build/x", "<script>alert(1)</script>")
+    body = dash.get("/api/inbox")[2]
+    assert b"<script>" not in body and b"\\u003cscript\\u003e" in body
+
+
 def test_page_is_served_with_a_nonce_and_no_unsafe_dom_sinks(dash):
     status, headers, body = dash.get("/", token=None)
     assert status == 200 and headers["content-type"].startswith("text/html")
