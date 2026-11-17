@@ -14,7 +14,8 @@ def test_every_document_of_the_run_is_listed_by_group(flow_repo):
                        "handoffs/define.md": "d\n", "handoffs/build.md": "b\n", "refine/plan-1.md": "r\n"}.items():
         (run.dir / name).parent.mkdir(parents=True, exist_ok=True)
         (run.dir / name).write_text(text, encoding="utf-8")
-    run.emit("phase_approved", phase="define"); run.emit("phase_approved", phase="build")
+    run.emit("phase_approved", phase="define")
+    run.emit("phase_approved", phase="build")
     assert [(f["group"], f["name"]) for f in list_files(run)] == [
         ("request", "issue.md"), ("handoffs", "handoffs/define.md"), ("handoffs", "handoffs/build.md"),
         ("refine", "refine/plan-1.md"), ("pull request", "pr.md"), ("notes", "handoff.md")]
@@ -44,7 +45,8 @@ def test_symlinks_are_never_followed(flow_repo, tmp_path):                      
     run = flow_repo.new_run()
     (tmp_path / "secret.md").write_text("secret\n", encoding="utf-8")
     (run.dir / "pr.md").symlink_to(tmp_path / "secret.md")
-    (tmp_path / "hand").mkdir(); (tmp_path / "hand" / "build.md").write_text("x\n", encoding="utf-8")
+    (tmp_path / "hand").mkdir()
+    (tmp_path / "hand" / "build.md").write_text("x\n", encoding="utf-8")
     (run.dir / "handoffs").symlink_to(tmp_path / "hand", target_is_directory=True)
     for name in ("pr.md", "handoffs/build.md"):
         with pytest.raises(NotFound):
