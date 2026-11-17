@@ -122,7 +122,9 @@ def test_turns_true_shows_each_turn_and_no_fold():
 
 def test_a_fold_wholly_before_the_cursor_is_kept_and_one_after_it_is_not():
     events = [ev(1, "agent_turn"), ev(2, "agent_turn"), ev(3, "step_started", key="k"), ev(4, "agent_turn"), ev(5, "agent_turn")]
-    folds = lambda page: [(e["first_seq"], e["seq"]) for e in page["entries"] if e["type"] == "agent_activity"]
+    def folds(page):
+        return [(e["first_seq"], e["seq"]) for e in page["entries"] if e["type"] == "agent_activity"]
+
     assert folds(activity_page(events, 3, (), 10, turns=False)) == [(1, 2)]
     assert folds(activity_page(events, None, (), 10, turns=False)) == [(4, 5), (1, 2)]
     assert folds(activity_page(events, 4, (), 10, turns=False)) == [(1, 2)]
