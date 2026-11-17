@@ -129,7 +129,7 @@ conditions:                    # evaluated by the runner from files and git, nev
     check: section_items
     file: "{spec}"
     section: '^## Open Questions'
-    stop_at: ['^\*\*Resolved']
+    stop_at: ['^(\*\*|#+ )?Resolved\b']   # `**Resolved (...)**`, a plain `Resolved:` or a `### Resolved` heading
     none_patterns: ['^(- )?None\b']
     min: 1
     on_unknown: false

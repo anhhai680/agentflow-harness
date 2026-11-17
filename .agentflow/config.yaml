@@ -117,7 +117,7 @@ conditions:                     # evaluated by the runner from files and git, ne
     check: section_items                      # counts open items in one section
     file: "{spec}"
     section: '^## Open Questions'
-    stop_at: ['^\*\*Resolved']                # resolved lists don't count
+    stop_at: ['^(\*\*|#+ )?Resolved\b']     # resolved lists don't count, bold, plain or a heading
     none_patterns: ['^(- )?None\b']
     min: 1
     on_unknown: false                         # a proposal with no Open Questions section has none to grill
