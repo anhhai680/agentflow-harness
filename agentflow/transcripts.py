@@ -34,8 +34,8 @@ def _cut(text: object, limit: int) -> str:
 def _json(value: object) -> str:
     try:
         return json.dumps(value, indent=2, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        return str(value)
+    except (TypeError, ValueError, RecursionError):
+        return "(too deeply nested to show)"
 
 
 def _tool_line(name: str, data: object) -> str:
@@ -126,13 +126,18 @@ def parse_lines(lines: list[bytes]) -> list[dict]:
             continue
         try:
             event = json.loads(text)
-        except ValueError:
+        except (ValueError, RecursionError):
             event = None
         if not isinstance(event, dict):
             wait = None
             turns.append({"kind": "raw", "text": _cut(text, IO_MAX)})
             continue
-        found = _turns_of(event)
+        try:
+            found = _turns_of(event)
+        except RecursionError:
+            wait = None
+            turns.append({"kind": "raw", "text": _cut(text, IO_MAX)})
+            continue
         if found is None:
             seconds = event.get("elapsed_time_seconds")
             seconds = seconds if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) else None

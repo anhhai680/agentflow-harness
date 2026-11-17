@@ -141,3 +141,13 @@ def test_read_range_seeks_and_keeps_the_head_rules(tmp_path):
     assert read_range(tmp_path, tmp_path / "none", 0, 3) is None
     (tmp_path / "l").symlink_to(tmp_path / "f")
     assert read_range(tmp_path, tmp_path / "l", 0, 3) is None
+
+
+def test_a_deeply_nested_line_becomes_a_capped_raw_turn_not_an_error():
+    deep = b"[" * 100000 + b"]" * 100000
+    nested_input = b'{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t", "name": "X", "input": ' \
+        + deep + b"}]}}"
+    nested_unknown = b'{"type": "brand_new_type", "x": ' + deep + b"}"
+    turns = parse_lines([deep, nested_input, nested_unknown, L({"type": "result", "result": "ok"})])
+    assert turns[0]["kind"] == "raw" and len(turns[0]["text"]) < transcripts.IO_MAX + 100
+    assert turns[-1]["kind"] == "result" and len(turns) == 4
