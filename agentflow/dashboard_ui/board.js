@@ -95,6 +95,20 @@ function patchActivity(runId, event) {
   }
 }
 
+// One small segment per phase of the card's lane, classed strip-<state>; the phase the run is in also carries its task.
+function stripNode(card) {
+  return el("div", { class: "strip", role: "img", "aria-label": "Phase progress" }, card.strip.map((seg) =>
+    el("span", { class: "strip-seg strip-" + seg.state, title: seg.phase + ": " + seg.state },
+      seg.phase === card.phase && card.task ? el("span", { class: "strip-task", text: card.task }) : null)));
+}
+
+// "● needs you · 12 min": the card waits on a person, and for how long.
+function needsYouNode(card) {
+  const since = Date.parse(card.waiting.since || "");
+  const when = Number.isNaN(since) ? "" : " · " + ago(Math.max(0, (Date.now() - since) / 1000));
+  return el("div", { class: "needs-you", text: "● needs you" + when, title: card.waiting.summary || null });
+}
+
 function cardNode(card) {
   const many = card.agents && card.agents.length > 1;
   const agent = many
@@ -104,7 +118,7 @@ function cardNode(card) {
     ? el("div", { class: "sub", title: card.agent.reason ? "effort: " + card.agent.reason : null },
         (card.agent.model || "?") + " · " + (card.agent.effort || "?") + arrow(card.agent.arrow))
     : el("div", { class: "sub", text: "no agent" });
-  const where = card.task ? "Task " + card.task + " ▸ " + (card.step || "").split("/").pop() : (card.step || "not started");
+  const where = card.task ? "Task " + card.task + " ▸ " + (card.step || "").split("/").pop() : (card.step_label || "not started");
   const gates = el("div", { class: "sub" }, card.gates.map((g) =>
     el("span", { class: g.skipped ? "gate-skip" : g.passed ? "gate-ok" : "gate-bad", text: (g.skipped ? "– " : g.passed ? "✓ " : "✗ ") + g.gate + " " })));
   // A refine round's implementer changed nothing, so its task was not reviewed again.
@@ -115,6 +129,8 @@ function cardNode(card) {
     "data-run": card.run_id, onclick: () => goRun(card.run_id) },
     el("div", { class: "title", text: card.module }),
     el("div", { class: "sub", text: where }),
+    card.strip && card.strip.length ? stripNode(card) : null,
+    card.waiting ? needsYouNode(card) : null,
     el("span", { class: "badge peekable", text: card.badge, title: "Peek (Space)", onclick: (ev) => { ev.stopPropagation(); openPeek(card.run_id); } }),
     card.refine_round ? el("span", { class: "badge", text: "refine " + card.refine_round }) : null,
     agent,

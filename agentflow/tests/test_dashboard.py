@@ -21,7 +21,7 @@ from agentflow.config import RETRO_PIPELINE
 from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
-from agentflow.views import _badge, step_title
+from agentflow.views import _badge, _strip, lane_phases, step_title
 from conftest import PYTHON_CONFIG, L, awaiting, run_git, session_with_transcript
 
 TOKEN = "k3y-" + "x" * 40
@@ -2142,3 +2142,50 @@ def test_the_activity_tab_pages_the_log_with_filters_and_raw_lines():
     run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
     assert "detail.recent" in run_js and "detail.timeline" not in page_source() and "function describe" not in page_source()
     assert UI_SCRIPTS.index("activity.js") == UI_SCRIPTS.index("inbox.js") + 1
+
+
+def test_a_card_has_a_strip_and_a_needs_you_marker(dash):
+    awaiting(dash.flow, phase="plan")
+    card = card_of(dash)
+    phases = [s["phase"] for s in card["strip"]]
+    states = {s["phase"]: s["state"] for s in card["strip"]}
+    assert phases == lane_phases(dash.flow.cfg, "feature")
+    assert states["plan"] == "waiting" and card["waiting"]["since"]
+    assert all(states[p] == "todo" for p in phases[phases.index("plan") + 1:])
+    assert card["ended_at"] is None
+
+
+def test_a_finished_card_has_an_end_time_and_a_done_strip(dash):
+    run = dash.flow.new_run()
+    run.emit("phase_started", phase="define")
+    run.emit("phase_approved", phase="define", by="me")
+    run.emit("run_finished")
+    card = card_of(dash)
+    assert card["ended_at"] and {s["phase"]: s["state"] for s in card["strip"]}["define"] == "done"
+
+
+def test_the_strip_states_follow_the_phase_rows_in_order():
+    phases = ["define", "plan", "build", "verify", "review", "ship"]
+    state = {"phase": "build", "waiting": {"phase": "plan"}, "phases": {
+        "define": {"status": "done"}, "plan": {"status": "running"}, "build": {"status": "running"},
+        "verify": {"status": "failed"}, "review": {"status": "skipped"}}}
+    assert {s["phase"]: s["state"] for s in _strip(state, phases)} == {
+        "define": "done", "plan": "waiting", "build": "current", "verify": "failed", "review": "skipped",
+        "ship": "todo"}
+    assert _strip({"phase": None, "phases": {"plan": {"status": "awaiting_approval"}}}, phases)[1]["state"] == "waiting"
+    assert _strip({"phase": "plan", "phases": {}}, phases)[1]["state"] == "current"
+    assert _strip({"phases": {"define": {"status": "approved"}}}, ["define"]) == [{"phase": "define", "state": "done"}]
+
+
+def test_a_card_names_its_issue_and_its_step_in_words(dash):
+    run = dash.flow.new_run({"module": "crm"})
+    run.emit("phase_started", phase="build")
+    run.emit("step_started", key="build/build/task-9/implement", phase="build")
+    card = card_of(dash)
+    assert card["step_label"] == step_title(card["step"]) and card["issue"] is None
+
+
+def test_the_card_draws_its_strip_and_marker():
+    board = (UI_DIR / "board.js").read_text(encoding="utf-8")
+    for needle in ("card.strip", "strip-", "needs you", "step_label"):
+        assert needle in board, needle
