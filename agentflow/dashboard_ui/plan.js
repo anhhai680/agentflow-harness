@@ -81,7 +81,7 @@ function reviewText(review) {
 function planState(runId) {
   if (!ui.plan) ui.plan = { filter: "all", group: "status" };
   const st = ui.plan;
-  if (st.runId !== runId) { st.runId = runId; st.data = null; st.error = null; st.inflight = false; st.scrolled = null; }
+  if (st.runId !== runId) { st.runId = runId; st.data = null; st.error = null; st.inflight = false; st.scrolled = null; st.linked = null; }
   return st;
 }
 
@@ -170,6 +170,14 @@ function taskNode(d) {
     el("summary", {}, cells), stop, el("div", { class: "plan-body" }, taskBody(t)));
 }
 
+// The filter a deep link to `task-<n>` needs: "all" when the current filter hides that task, else the filter itself.
+function filterForTask(tasks, filter, sub) {
+  const m = /^task-(\d+)$/.exec(sub || "");
+  if (!m) return filter;
+  const t = (tasks || []).find((x) => x.n === Number(m[1]));
+  return t && !filterTasks([t], filter).length ? "all" : filter;
+}
+
 // The Tasks mode's parts, keyed: rows patch by `task-<n>`, so an open row and the scroll survive a refresh.
 function planEntries(detail, plan, sub) {
   const st = planState(detail.run_id);
@@ -177,6 +185,7 @@ function planEntries(detail, plan, sub) {
   if (plan.path === null || plan.path === undefined) return [planNote("plan:none", "No plan for this run yet.", runId)];
   const tasks = plan.tasks || [];
   if (!tasks.length) return [planNote("plan:empty", "The runner found no `### Task N:` heading in " + plan.path + ".", runId)];
+  if (st.linked !== sub) { st.linked = sub; st.filter = filterForTask(tasks, st.filter, sub); }  // once per link: a later filter choice stands
   const independent = ranges(tasks.filter((t) => t.status === "independent").map((t) => t.n));
   const parts = [entry("plan:head", { summary: taskSummary(plan), filter: st.filter, group: st.group, runId: runId }, headerNode)];
   const shown = filterTasks(tasks, st.filter);

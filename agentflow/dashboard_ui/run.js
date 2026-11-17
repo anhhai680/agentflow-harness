@@ -264,6 +264,10 @@ function openRun(id, tab, sub) {
   else if (!same) renderRunNote("Loading " + id + "…");
   loadRun(id);
   if (reopensArtifact(prev, id, tab, ui.artifact)) loadArtifacts(id);  // revisions and findings that came meanwhile
+  if (same && prev.tab !== tab) {  // the tasks and the files change while a stopped run sends no event: fetch them again on return
+    if (tab === PLAN_TAB && ui.plan && ui.plan.runId === id && planMode(sub, !!(ui.plan.data && ui.plan.data.started)) === "tasks") loadPlan(id);
+    if (tab === FILES_TAB && ui.files && ui.files.runId === id) { ui.files.error = null; loadFiles(id); }  // a first-load error gets its retry here
+  }
 }
 
 function showRun(detail) {

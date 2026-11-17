@@ -72,3 +72,26 @@ def test_the_changes_summary_totals_added_and_deleted():
     assert js(["files.js"], "changesSummary(args)", changes) == "Changes since the base: 3 files, +3 −8"
     assert js(["files.js"], "changesSummary(args)", {"files": [{"path": "a", "status": "M", "added": 1, "deleted": 0}]}) == \
         "Changes since the base: 1 file, +1 −0"
+
+
+def test_a_deep_link_to_a_hidden_task_resets_the_filter():
+    tasks = PLAN["tasks"]
+    pick = "filterForTask(args[0], args[1], args[2])"
+    assert js(["plan.js"], pick, [tasks, "stopped", "task-1"]) == "all"
+    assert js(["plan.js"], pick, [tasks, "stopped", "task-2"]) == "stopped"
+    assert js(["plan.js"], pick, [tasks, "stopped", "tasks"]) == "stopped"
+    assert js(["plan.js"], pick, [tasks, "stopped", "task-99"]) == "stopped"
+
+
+def test_the_truncation_note_counts_bytes_rounded_up():
+    kb = "shownKb(args)"
+    assert js(["artifact.js", "files.js"], kb, "a" * 1025) == 2
+    assert js(["artifact.js", "files.js"], kb, "é" * 1024) == 2   # 2048 bytes, 1024 chars
+    assert js(["artifact.js", "files.js"], kb, "") == 1
+
+
+def test_only_a_run_without_a_branch_reads_no_branch_yet():
+    none = "changesNone(args)"
+    assert js(["files.js"], none, {"facts": {"branch": None}}) is True
+    assert js(["files.js"], none, {"facts": {"branch": "flow/x"}}) is False
+    assert js(["files.js"], none, None) is True  # no detail to say otherwise: the old answer

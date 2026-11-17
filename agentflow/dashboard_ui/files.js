@@ -36,6 +36,12 @@ function changesSummary(changes) {
   return "Changes since the base: " + files.length + (files.length === 1 ? " file" : " files") + ", +" + added + " −" + deleted;
 }
 
+// The KB the truncation note names: the bytes of the text shown, as the server counts them, rounded up.
+const shownKb = (text) => Math.max(1, Math.ceil(utf8Bytes(text) / 1024));
+
+// True when a 404 from /changes means the run has no branch (the other 404s have a message of their own).
+const changesNone = (detail) => !(detail && detail.facts && detail.facts.branch);
+
 const countsText = (f) => (f.added === null || f.added === undefined ? "binary" : "+" + f.added + " −" + (f.deleted || 0));
 
 // ---- state: per run. Texts by name, diffs by `path@head`, so an open diff survives a refresh and a new head refetches.
@@ -92,7 +98,7 @@ async function loadFiles(runId) {
   if (list.err) { if (st.list) toast("Could not refresh the files: " + list.err.message); else st.error = list.err.message; }
   else { st.list = Array.isArray(list.data) ? list.data : []; st.error = null; }
   if (changes.err) {
-    if (changes.err.status === 404) { st.changes = null; st.changesError = "none"; }
+    if (changes.err.status === 404) { st.changes = null; st.changesError = changesNone(ui.run && ui.run.detail) ? "none" : changes.err.message; }
     else if (st.changes) toast("Could not refresh the changes: " + changes.err.message);
     else st.changesError = changes.err.message;
   } else { st.changes = changes.data; st.changesError = null; }
@@ -126,9 +132,9 @@ function listNode(d) {
 function fileDocNode(d) {
   const markdown = /\.md$/i.test(d.name);
   const raw = d.mode === "raw" || !markdown;
-  const toggle = markdown ? el("button", { type: "button", class: "chip", text: raw ? "Rendered" : "Raw", "aria-pressed": "false",
+  const toggle = markdown ? el("button", { type: "button", class: "chip", text: raw ? "Rendered" : "Raw", "aria-pressed": raw ? "true" : "false",
     onclick: () => { if (ui.files) { ui.files.mode = raw ? "rendered" : "raw"; redrawFiles(ui.files.runId); } } }) : null;
-  const kb = Math.max(1, Math.round(d.text.length / 1024));
+  const kb = shownKb(d.text);
   return el("section", { class: "files-doc" },
     el("div", { class: "files-doc-head" }, el("strong", { text: d.name }), el("span", { class: "muted", text: " " + fileSize(d.size) + " " }), toggle,
       d.truncated ? el("span", { class: "st-wait", text: "Showing the first " + kb + " KB." }) : null),

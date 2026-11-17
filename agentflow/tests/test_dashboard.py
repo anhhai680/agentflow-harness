@@ -1929,6 +1929,14 @@ def test_returning_to_an_artifact_tab_refetches_its_list_and_findings():
     assert "reopensArtifact(prev, id, tab, ui.artifact)" in opener and "loadArtifacts(id)" in opener
 
 
+def test_returning_to_the_plan_or_files_tab_refetches_it():
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    opener = run_js[run_js.index("function openRun"):run_js.index("function showRun")]
+    assert "loadPlan(id)" in opener and "loadFiles(id)" in opener and "PLAN_TAB" in opener and "FILES_TAB" in opener
+    files_js = (UI_DIR / "files.js").read_text(encoding="utf-8")
+    assert "changesNone(" in files_js and "aria-pressed\": raw ? \"true\"" in files_js
+
+
 def test_a_phase_approval_from_the_page_sends_what_was_viewed():
     board_js = (UI_DIR / "board.js").read_text(encoding="utf-8")
     flow = board_js[board_js.index("function approveFlow"):board_js.index("function needNode")]
