@@ -365,7 +365,7 @@ function requestChanges(detail) {
   withDecision(detail, "reject", (item) => rejectDialog(item.run_id, needTarget(item), note));
 }
 
-function decisionNode(d) {
+function artifactDecisionNode(d) {
   const detail = () => (ui.run && ui.run.detail && ui.run.detail.run_id === d.runId ? ui.run.detail : null);
   if (d.waiting) {
     return el("div", { class: "art-decision" }, el("strong", { text: "Waiting on you: approve " + d.phase }),
@@ -449,7 +449,7 @@ function artifactEntries(detail, kind, sub) {
   const count = decided.count;
   if (waiting || count) {
     parts.push(entry("art:decision", { runId: detail.run_id, phase: file.phase, kind: kind, waiting: waiting, count: count, note: decided.note,
-      canReject: (detail.actions || []).includes("reject") }, decisionNode));
+      canReject: (detail.actions || []).includes("reject") }, artifactDecisionNode));
   }
   return parts;
 }

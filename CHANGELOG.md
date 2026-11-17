@@ -28,6 +28,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Fixed
 
+- The run page's Overview and the drawer draw a waiting decision again; the Spec and Plan tabs' approve bar had taken over its drawing function.
 - The Backlog no longer shows a module `issue-<N>` whose GitHub issue is closed: such a module is done as `issue closed` once `gh` says so, unless a run of it is live (asked once, then recorded; `agentflow backlog undone` overrides it). Before, a closed issue's module stayed when its run directory was gone, since the branch checked for a merge lacked the issue title's slug.
 - A plan names its spec for the "plan complete on <branch>" reason with a plain `Spec:` label or a Markdown link (`**Spec:** [SPEC-x](…/SPEC-x.md)`) too, not only with a backticked path after `**Spec:**`.
 - The Spec and Plan tabs refetch their revisions and findings when you come back to them, flag a cut diff (and round its size up), keep your line comments in **Request changes** while you look at a diff, and list only the findings of their own phase or on their own files. A finding's line that is negative or longer than nine digits no longer breaks the findings panel.

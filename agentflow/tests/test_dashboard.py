@@ -1954,3 +1954,16 @@ def test_the_files_tab_lists_the_run_documents_and_the_changes():
     files_branch = run_js[run_js.index('tab === "files"'):run_js.index("}", run_js.index('tab === "files"'))]
     assert "fileEntries(" in files_branch and '"file:handoff"' not in run_js and '"file:progress"' not in run_js
     assert UI_SCRIPTS.index("plan.js") < UI_SCRIPTS.index("files.js") < UI_SCRIPTS.index("main.js")
+
+
+def test_no_two_ui_scripts_declare_the_same_top_level_name():
+    # every script shares one global scope: a later declaration silently replaces an earlier one
+    decl = re.compile(r"^(?:async\s+function\s*\*?|function\s*\*?|const|let|class)\s+([A-Za-z_$][\w$]*)", re.M)
+    seen: dict[str, str] = {}
+    clashes = []
+    for name in UI_SCRIPTS:
+        for found in decl.findall((UI_DIR / name).read_text(encoding="utf-8")):
+            if found in seen and seen[found] != name:
+                clashes.append(f"{found}: {seen[found]} and {name}")
+            seen.setdefault(found, name)
+    assert not clashes, clashes

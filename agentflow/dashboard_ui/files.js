@@ -123,7 +123,7 @@ function listNode(d) {
       el("span", { class: "muted", text: " " + fileSize(f.size) })))))));
 }
 
-function docNode(d) {
+function fileDocNode(d) {
   const markdown = /\.md$/i.test(d.name);
   const raw = d.mode === "raw" || !markdown;
   const toggle = markdown ? el("button", { type: "button", class: "chip", text: raw ? "Rendered" : "Raw", "aria-pressed": "false",
@@ -180,7 +180,7 @@ function fileEntries(detail, sub) {
   else parts.push(entry("files:list", { groups: groupFiles(st.list), runId: detail.run_id, name: name }, listNode));
   if (name) {
     const text = st.texts.get(name);
-    if (text) parts.push(entry("files:doc:" + name, { name: name, text: text.text || "", size: text.size, truncated: !!text.truncated, mode: st.mode }, docNode));
+    if (text) parts.push(entry("files:doc:" + name, { name: name, text: text.text || "", size: text.size, truncated: !!text.truncated, mode: st.mode }, fileDocNode));
     else {
       fetchText(st, name);
       const failure = st.failed.get(name);
