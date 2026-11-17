@@ -169,3 +169,10 @@ def test_a_reopened_session_drops_a_page_read_before_it_was_closed():
     })()""", None)
     assert got["paths"][1:] == ["/api/runs/r1/sessions/s1/transcript?after=500", "/api/runs/r1/sessions/s1/transcript?after=0"]
     assert got["after"] == {"open": "s1", "loaded": True, "next": 500, "turns": ["first"]}
+
+
+def test_agents_group_by_run_with_idle_rows_first():
+    rows = [{"run_id": "r1", "module": "a", "idle": False, "age_s": 50}, {"run_id": "r2", "module": "b", "idle": False, "age_s": 9},
+            {"run_id": "r1", "module": "a", "idle": True, "age_s": 10}]
+    got = js(["agents.js"], "agentsByRun(args).map(g => [g.run_id, g.rows.map(r => r.age_s)])", rows)
+    assert got == [["r1", [10, 50]], ["r2", [9]]]

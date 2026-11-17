@@ -13,6 +13,10 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 - The Plan tab's Tasks mode lists each plan task with its status, tries, review and cost, groups the tasks by status or by dependency wave, and shows what a blocked or parked task holds up and which tasks could go on without it.
 - A run's Agents tab lists every session the run started (attempts, resolvers and sizers labelled in words) with model, effort, cost, exit and result, and opens each one's transcript as a readable conversation that follows a live session.
 
+### Changed
+
+- A Board card lists every live agent of its run, not just the newest, and the Agents tab groups agents by run, puts idle ones first and opens each one's transcript.
+
 ### Removed
 
 - The run detail's 16 KB transcript tail (`transcript`, `transcript_file`); the Agents tab's transcript viewer replaces it.

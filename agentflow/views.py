@@ -249,6 +249,35 @@ def _badge(state: dict, status: str, column: str) -> str:
     return BADGES.get(status, status)
 
 
+def _session_of(sessions: list[dict], row: dict) -> dict | None:
+    """The session of `sessions` (newest first) that `row` (an `agents` row of the state) belongs to: the same
+    `session_id`, else the same `pid`, a live one preferred."""
+    for field in ("session_id", "pid"):
+        value = row.get(field)
+        if value is None:
+            continue
+        found = [s for s in sessions if s.get(field) == value]
+        if found:
+            return next((s for s in found if s.get("live")), found[0])
+    return None
+
+
+def _card_agents(run: Run, live: list[dict]) -> list[dict]:
+    """Every live agent of `run` in start order: `{label, model, effort, arrow, reason, session}`."""
+    if not live:
+        return []
+    from agentflow.sessions import run_sessions  # sessions imports views
+    state = run.state
+    sessions = run_sessions(run)
+    out = []
+    for session in reversed([s for s in sessions if s.get("live")]):
+        row = next((r for r in live if _session_of([session], r)), {})
+        out.append({"label": session["label"], "model": session.get("model"), "effort": session.get("effort"),
+                    "arrow": row.get("effort_changed"), "reason": _effort_reason(state, session.get("key") or ""),
+                    "session": session["id"]})
+    return out
+
+
 def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metrics: dict) -> dict:
     state = run.state
     phases = list(cfg.phases)
@@ -276,6 +305,7 @@ def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metri
         "badge": _badge(state, status, column),
         "refine_round": (state.get("refine") or {}).get("round"),
         "agent": agent,
+        "agents": _card_agents(run, live),
         "context_pct": live[-1].get("context_pct") if live else None,
         "spend": round(float(state.get("spend_usd") or 0.0) + sum(float(r.get("spend") or 0.0) for r in live), 6),
         "budget": state.get("budget_usd"),
@@ -540,7 +570,8 @@ def stage_rail(state: dict, workflow: list[dict], metrics: dict) -> list[dict]:
 # --------------------------------------------------------------------------- agents
 
 
-def _agent_row(run: Run, row: dict, digest: dict, now: datetime, fixes_of: int | None, idle_min: float) -> dict:
+def _agent_row(run: Run, row: dict, digest: dict, now: datetime, fixes_of: int | None, idle_min: float,
+               sessions: list[dict] | None = None) -> dict:
     state = run.state
     key = str(row.get("step") or "")
     phase = row.get("phase") or (key.split("/")[0] if key else None)
@@ -555,8 +586,11 @@ def _agent_row(run: Run, row: dict, digest: dict, now: datetime, fixes_of: int |
     if rollovers:
         place += f" · rollover {rollovers}"
     quiet = _age(now, row.get("last_activity"))
+    session = _session_of(sessions or [], row)
     return {
         "run_id": run.id,
+        "session": session["id"] if session else None,
+        "label": session["label"] if session else step_title(key),
         "module": _label(state, run.id),
         "pipeline": state.get("pipeline"),
         "phase": phase,
@@ -579,6 +613,7 @@ def _agent_row(run: Run, row: dict, digest: dict, now: datetime, fixes_of: int |
         "spend": row.get("spend"),
         "age_s": _age(now, row.get("started_at")),
         "last_activity": row.get("last_activity"),
+        "quiet_s": quiet,
         "last_tool": row.get("last_tool"),
         "idle": quiet is not None and quiet > idle_min * 60,
         "pid": row.get("pid"),
@@ -599,10 +634,13 @@ def agents_view(repo: Path, cfg: Config | None = None, now: datetime | None = No
     exited: list[dict] = []
     window = exited_min * 60
     for run in list_runs(repo):
-        digest = _digest(run, now)
+        from agentflow.sessions import run_sessions  # sessions imports views
+        events = run.events.read()
+        digest = _digest(run, now, events)
+        sessions = run_sessions(run, events)
         live_sessions = set()
         for row in run.state.get("agents", {}).values():
-            shown = _agent_row(run, row, digest, now, fixes_of, idle_min)
+            shown = _agent_row(run, row, digest, now, fixes_of, idle_min, sessions)
             if _alive(row.get("pid")):
                 live.append(shown)
                 if row.get("session_id"):
@@ -617,7 +655,7 @@ def agents_view(repo: Path, cfg: Config | None = None, now: datetime | None = No
             age = _age(now, row.get("exited_at"))
             if age is None or age > window:
                 continue
-            shown = _agent_row(run, row, digest, now, fixes_of, idle_min)
+            shown = _agent_row(run, row, digest, now, fixes_of, idle_min, sessions)
             latest[session or ("pid", index)] = {**shown, "status": f"exit {row.get('exit_code')}", "idle": False,
                                                  "exit_code": row.get("exit_code"), "exited_at": row.get("exited_at")}
         exited.extend(latest.values())

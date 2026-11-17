@@ -2018,3 +2018,20 @@ def test_the_transcript_route_refuses_bad_ids_and_cursors(dash, tail, status):
 def test_the_transcript_route_refuses_a_cursor_inside_a_line(dash):
     run, sid = session_with_transcript(dash.flow, raw=[L({"type": "result", "result": "ok"})])
     assert dash.get(f"/api/runs/{run.id}/sessions/{sid}/transcript?after=3")[0] == 400
+
+
+def test_a_card_lists_every_live_agent(dash, monkeypatch):
+    run = awaiting(dash.flow)
+    monkeypatch.setattr("agentflow.views._alive", lambda pid: True)
+    for pid, key in ((61, "build/build/task-10/implement"), (62, "build/build/task-8/review")):
+        run.emit("agent_started", step=key, pid=pid, agent="claude", model="sonnet", effort="high", role="build")
+    assert [a["label"] for a in card_of(dash)["agents"]] == ["Task 10 · implement · attempt 1",
+                                                              "Task 8 · review · attempt 1"]
+
+
+def test_a_global_agent_row_links_to_its_session(dash, monkeypatch):
+    run = awaiting(dash.flow)
+    monkeypatch.setattr("agentflow.views._alive", lambda pid: True)
+    ev = run.emit("agent_started", step="plan/plan", pid=71, agent="claude", model="opus", effort="high", role="plan")
+    (row,) = payload(dash.get("/api/agents")[2])["live"]
+    assert row["session"] == f"s{ev['seq']}" and row["label"] == "plan · attempt 1"

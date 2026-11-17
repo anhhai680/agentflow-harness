@@ -96,7 +96,11 @@ function patchActivity(runId, event) {
 }
 
 function cardNode(card) {
-  const agent = card.agent
+  const many = card.agents && card.agents.length > 1;
+  const agent = many
+    ? el("div", { class: "sub", title: card.agents.map((a) => a.label + ": " + (a.model || "?") + " · " + (a.effort || "?")).join("\n"),
+        text: card.agents.length + " agents: " + card.agents.map((a) => a.label).join(", ") })
+    : card.agent
     ? el("div", { class: "sub", title: card.agent.reason ? "effort: " + card.agent.reason : null },
         (card.agent.model || "?") + " · " + (card.agent.effort || "?") + arrow(card.agent.arrow))
     : el("div", { class: "sub", text: "no agent" });
