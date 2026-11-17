@@ -49,7 +49,7 @@ function decisionItem(detail, action) {
 function withDecision(detail, action, flow) {
   const item = decisionItem(detail, action);
   if (item) flow(item);
-  else toast("Nothing to " + action + " now: the Board's Needs human list has it once it is raised");
+  else toast("Nothing to " + action + " now: the Inbox has it once it is raised");
 }
 
 // The only Pause, Resume, Retry, Mark done and Cancel buttons on the Run page and the peek. Which ones show, and in

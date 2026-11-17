@@ -119,7 +119,15 @@ function goneText(item, recent) {
   if (!verb) return INBOX_NONE;
   const where = best.by === "dashboard" ? "from the dashboard" : best.by === "runner" ? "by the runner" : "from the CLI" + (best.by ? " by " + best.by : "");
   const when = Number.isNaN(Date.parse(best.ts || "")) ? null : new Date(best.ts);
-  return verb + " " + where + (when ? " at " + inboxTwo(when.getHours()) + ":" + inboxTwo(when.getMinutes()) : "");
+  const at = when ? " at " + inboxTwo(when.getHours()) + ":" + inboxTwo(when.getMinutes()) : "";
+  if (best.by === "questions.md") return "Answered in questions.md" + at;  // the answers were filled into the file
+  return verb + " " + where + at;
+}
+
+// Whether `live` is a new raise under the key of the kept card `kept` (its `since` differs), so what was typed on the
+// kept card does not carry over to it.
+function inboxReturned(kept, live) {
+  return !!kept && !!live && kept.since !== live.since;
 }
 
 // Whether a reader wrote anything on the card: a note, a request for changes, or an answer of their own words.
@@ -465,7 +473,11 @@ function inboxKeepGone(view, prev) {
     });
   }
   for (const [key, g] of Array.from(ui.inbox.gone.entries())) {
-    if (live.has(key)) { ui.inbox.gone.delete(key); continue; }  // it came back: the live card takes over
+    if (live.has(key)) {  // it came back: the live card takes over, with a fresh draft when it is a new raise
+      if (inboxReturned(g.item, view.items.find((i) => inboxItemKey(i) === key))) { ui.inbox.drafts.delete(key); ui.inbox.sent.delete(key); }
+      ui.inbox.gone.delete(key);
+      continue;
+    }
     const text = goneText(g.item, view.recent);
     if (text !== INBOX_NONE || g.text === INBOX_NONE) g.text = text;  // what once said who decided is not forgotten when `recent` moves on
   }

@@ -32,6 +32,9 @@ RECENT_S = 30 * 60
 DECISIONS = ("approve", "answer", "reject")
 _CLI = re.compile(r"`agentflow\s")
 _BLANK_LINE = re.compile(r"\n[ \t]*\n")
+_BACKTICKED = re.compile(r"`[^`]*`")
+_LIST_MARK = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+", re.M)
+CLI_PROSE_WORDS = 6  # a paragraph with more words than this outside its commands is guidance, not just a command
 _RECENT_ACTIONS = {"phase_approved": "approved", "hitl_approved": "approved", "checkpoint_cleared": "approved",
                    "hitl_answered": "answered", "phase_rejected": "rejected"}
 _STOP_TITLES = {
@@ -49,14 +52,22 @@ _STOP_TITLES = {
 }
 
 
+def _prose_words(paragraph: str) -> int:
+    rest = _LIST_MARK.sub("", _BACKTICKED.sub(" ", paragraph))
+    return len(re.findall(r"\w+", rest))
+
+
 def split_cli(text: str) -> tuple[str, list[str]]:
-    """`text` without its CLI paragraphs, and those paragraphs. A paragraph is CLI when it holds a backticked
-    `agentflow <command>`: the dashboard has buttons for it."""
+    """`text` without its command paragraphs, and the paragraphs that hold a backticked `agentflow <command>` (the
+    dashboard has buttons for those). A paragraph that is mostly a command (at most `CLI_PROSE_WORDS` words of prose
+    around it) leaves the text; one that also carries guidance stays in the text and is listed as well."""
     body: list[str] = []
     cli: list[str] = []
     for paragraph in _BLANK_LINE.split(text):
         if _CLI.search(paragraph):
             cli.append(paragraph.strip())
+            if _prose_words(paragraph) > CLI_PROSE_WORDS:
+                body.append(paragraph)
         else:
             body.append(paragraph)
     return "\n\n".join(body), cli
@@ -82,7 +93,9 @@ def approve_note(item: dict) -> str:
     """Whether an approval takes a note, as `hitl.approve` decides: `none` (it refuses one, or there is no approval),
     `required` or `optional`."""
     kind = item.get("kind")
-    if kind == "phase_approval" or kind in hitl.CLEARED_BY_APPROVE or kind == "preflight_failed" \
+    # An environment stop takes no note here: a note makes `autonomy.recheck_environment` skip its machine recheck,
+    # so only the CLI's `--note` overrides it.
+    if kind == "phase_approval" or kind in hitl.CLEARED_BY_APPROVE or kind in ("preflight_failed", hitl.ENVIRONMENT) \
             or item.get("questions"):
         return "none"
     return "required" if kind == "blocked_repeat" else "optional"

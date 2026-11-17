@@ -271,6 +271,21 @@ def test_a_card_decided_elsewhere_says_by_whom():                  # spec Verifi
     assert js(["inbox.js"], "goneText(args, [])", item) == "No longer waiting on you"
 
 
+def test_an_answer_filled_into_questions_md_is_named_as_such():
+    item = {"run_id": "r", "kind": "parked", "key": "build/x"}
+    recent = [{"run_id": "r", "phase": "build", "key": "build/x", "action": "approved", "by": "questions.md",
+               "ts": "2026-11-16T14:02:10+00:00"}]
+    text = js(["inbox.js"], "goneText(args.item, args.recent)", {"item": item, "recent": recent})
+    assert text.startswith("Answered in questions.md at ") and "CLI" not in text
+
+
+def test_a_key_that_comes_back_as_a_new_item_drops_the_old_draft():
+    pair = {"kept": {"since": "2026-11-16T10:00:00+00:00"}, "live": {"since": "2026-11-16T11:00:00+00:00"}}
+    assert js(["inbox.js"], "inboxReturned(args.kept, args.live)", pair) is True
+    same = {"kept": pair["kept"], "live": dict(pair["kept"])}
+    assert js(["inbox.js"], "inboxReturned(args.kept, args.live)", same) is False
+
+
 def test_the_gone_text_names_where_and_picks_the_newest_matching_entry():
     stop = {"run_id": "r", "kind": "blocked", "key": "build/build/task-1/implement"}
     other = {"run_id": "r2", "key": "build/build/task-1/implement", "action": "answered", "by": "zed", "ts": "2026-11-16T15:00:00+00:00"}

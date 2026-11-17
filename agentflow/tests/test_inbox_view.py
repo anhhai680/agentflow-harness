@@ -25,7 +25,7 @@ def test_items_have_titles_in_words(item, title):
 
 @pytest.mark.parametrize("kind, questions, expected", [
     ("phase_approval", [], "none"), ("checkpoint", [], "none"), ("preflight_failed", [], "none"),
-    ("blocked_repeat", [], "required"), ("blocked", [], "optional"), ("needs_human", [{"id": "q"}], "none")])
+    ("blocked_repeat", [], "required"), ("blocked", [], "optional"), (hitl.ENVIRONMENT, [], "none"), ("needs_human", [{"id": "q"}], "none")])
 def test_the_note_follows_what_hitl_approve_accepts(kind, questions, expected):  # Review Focus 1
     assert approve_note({"kind": kind, "questions": questions}) == expected
 
@@ -33,6 +33,14 @@ def test_the_note_follows_what_hitl_approve_accepts(kind, questions, expected): 
 def test_cli_lines_are_split_off():
     body, cli = split_cli("# r: k\n\nfloor_guard fails.\n\nRun `agentflow approve r k --note \"…\"` to go on.\n\nMore.")
     assert body == "# r: k\n\nfloor_guard fails.\n\nMore." and cli == ["Run `agentflow approve r k --note \"…\"` to go on."]
+
+
+def test_a_paragraph_with_guidance_stays_in_the_text_and_is_listed_as_cli():
+    how = ("Revert or fix the files yourself, then `agentflow approve r build/x` restarts the step in a fresh session "
+           "(the runner checks the tree again first); `agentflow reject r build/x --note \"...\"` sends the phase back.")
+    body, cli = split_cli(f"# r: x\n\nfloor_guard fails.\n\n{how}\n\nRun `agentflow retry r x` now.")
+    assert how in body and "Run `agentflow retry r x` now." not in body
+    assert cli == [how, "Run `agentflow retry r x` now."]
 
 
 def test_a_parked_question_and_a_wait_are_two_cards(flow_repo):  # Review Focus 2
