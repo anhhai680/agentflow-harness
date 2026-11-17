@@ -1425,8 +1425,9 @@ def test_a_pack_without_a_backlog_block_still_syncs_its_issues(idash, monkeypatc
 
 def test_the_page_names_no_lane_phase_or_path(bdash):
     """The page is framework code: lanes, phases and the form fields all come from the board data."""
-    # the two tab lists name the artifact tabs (`plan` is a tab id there, as `define`'s `spec` is); nothing else may
-    source = "\n".join(line for line in page_source().splitlines() if "RUN_TABS = [" not in line and "ARTIFACT_KINDS = [" not in line)
+    # the two tab lists and `PLAN_TAB` name the artifact tabs (`plan` is a tab id there, as `define`'s `spec` is); nothing else may
+    source = "\n".join(line for line in page_source().splitlines() if "RUN_TABS = [" not in line and "ARTIFACT_KINDS = [" not in line
+                        and "PLAN_TAB = " not in line)
     cfg = bdash.flow.cfg
     for word in [*cfg.lanes, "CAPABILITY-MAP", "docs/", "origin/", "flow/"]:
         assert not re.search(rf"(?<![A-Za-z-]){re.escape(word)}(?![A-Za-z-])", source), word
@@ -1935,3 +1936,10 @@ def test_a_phase_approval_from_the_page_sends_what_was_viewed():
     art = (UI_DIR / "artifact.js").read_text(encoding="utf-8")
     assert "ui.viewed" in art and "ui.comments" in art and "no longer waiting on you" in art
     assert "function rejectDialog(runId, target, initial" in (UI_DIR / "dialogs.js").read_text(encoding="utf-8")
+
+
+def test_the_plan_tab_has_a_tasks_mode():
+    plan_js = (UI_DIR / "plan.js").read_text(encoding="utf-8")
+    for needle in ("/plan", "blocks: ", "independent: ", "No plan for this run yet", "Open decision", "ui.plan"):
+        assert needle in plan_js, needle
+    assert UI_SCRIPTS.index("artifact.js") < UI_SCRIPTS.index("plan.js") < UI_SCRIPTS.index("main.js")

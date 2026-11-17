@@ -470,3 +470,23 @@ def spec_run(flow_repo: FlowRepo, tmp_path: Path) -> SpecRun:
     run.emit("phase_started", phase="plan", start_sha=spec.head())
     spec.commit("plan/plan", write={"docs/plans/x.md": "# Plan\n\n- [ ] Task 1\n"})
     return spec
+
+
+# ---- the dashboard JS under node: each file runs in a bare context (no DOM), then one expression is read back
+NODE = shutil.which("node")
+LOADER = ("const fs=require('fs'),vm=require('vm');const ctx=vm.createContext({});"
+          "for (const f of JSON.parse(process.argv[1])) vm.runInContext(fs.readFileSync(f,'utf8'),ctx);"
+          "ctx.args=JSON.parse(fs.readFileSync(0,'utf8'));"
+          "process.stdout.write(JSON.stringify(vm.runInContext(process.argv[2],ctx)));")
+
+
+def js(files: list[str], expr: str, args) -> object:
+    out = subprocess.run([NODE, "-e", LOADER, json.dumps([str(ENGINE / "dashboard_ui" / f) for f in files]), expr],
+                         input=json.dumps(args), capture_output=True, text=True, check=True, timeout=30)
+    return json.loads(out.stdout)
+
+
+def walk(nodes):
+    for node in nodes:
+        yield node
+        yield from walk(node.get("c") or [])
