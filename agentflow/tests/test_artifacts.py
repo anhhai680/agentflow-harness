@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import pytest
-from conftest import run_git
+from conftest import land_on_origin, run_git
 
 from agentflow.artifacts import (
     NotFound,
     artifact_diff,
     artifact_max_bytes,
     artifact_tabs,
+    change_diff,
     read_artifact,
     run_artifacts,
+    run_changes,
     run_findings,
 )
 
@@ -301,3 +303,37 @@ def test_findings_keep_review_results_apart_by_key(flow_repo):
     rows = run_findings(run)
     assert [(r["key"], r["round"], r["open"]) for r in rows] == [
         ("define/spec_review", 1, True), ("build/task_1/review", 2, False), ("build/task_1/review", 3, True)]
+
+
+def test_changes_are_the_runs_own_files_since_its_base(spec_run, flow_repo):
+    got = run_changes(spec_run.run, spec_run.repo, flow_repo.cfg)
+    assert {f["path"] for f in got["files"]} == {"docs/specs/x.md", "notes.md", "docs/plans/x.md"}
+    assert all(f["status"] == "A" and f["added"] > 0 for f in got["files"]) and got["complete"] is True
+    diff = change_diff(spec_run.run, spec_run.repo, flow_repo.cfg, "docs/specs/x.md", 512 * 1024)
+    assert "+Scope 3 says another" in diff["diff"]
+
+
+def test_a_merge_of_the_base_branch_brings_no_foreign_files_into_changes(spec_run, flow_repo, tmp_path):
+    land_on_origin(flow_repo, tmp_path, {"upstream.txt": "theirs\n"})
+    run_git(spec_run.worktree, "merge", "-q", "--no-edit", f"origin/{flow_repo.cfg.project.fork_from}")
+    paths = {f["path"] for f in run_changes(spec_run.run, spec_run.repo, flow_repo.cfg)["files"]}
+    assert "upstream.txt" not in paths and "docs/specs/x.md" in paths
+
+
+def test_a_binary_change_has_no_line_counts(spec_run, flow_repo):
+    with open(spec_run.worktree / "blob.bin", "wb") as fh:
+        fh.write(bytes(range(256)))
+    spec_run.commit("plan/binary")
+    row = next(f for f in run_changes(spec_run.run, spec_run.repo, flow_repo.cfg)["files"] if f["path"] == "blob.bin")
+    assert row["added"] is None and row["deleted"] is None
+
+
+@pytest.mark.parametrize("path", ["upstream.txt", "../x", "README.md", "-p"])
+def test_a_diff_of_a_path_not_in_the_changes_is_not_found(spec_run, flow_repo, path):
+    with pytest.raises(NotFound):
+        change_diff(spec_run.run, spec_run.repo, flow_repo.cfg, path, 1024)
+
+
+def test_a_run_with_no_branch_has_no_changes(flow_repo):
+    with pytest.raises(NotFound, match="no branch"):
+        run_changes(flow_repo.new_run(), flow_repo.root, flow_repo.cfg)
