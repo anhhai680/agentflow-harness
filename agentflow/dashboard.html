@@ -159,6 +159,30 @@ dialog .row > * { flex: 1; }
 .md .al-left { text-align: left; } .md .al-center { text-align: center; } .md .al-right { text-align: right; }
 .md a { color: var(--accent); } .md .md-ref code { color: var(--muted); }
 .gutter { color: var(--muted); font: 11px ui-monospace, Menlo, monospace; user-select: none; text-align: right; padding-right: 8px; }
+/* the Agents tab: the session list, and one session's transcript as turns with folds */
+.sessions-head { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin-bottom: 4px; }
+.sessions-head .chips { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.sessions-group { margin: 12px 0 2px; font-size: 13px; color: var(--muted); }
+.session-row { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; margin: 3px 0; display: grid; gap: 4px; overflow-wrap: anywhere; }
+.session-row.clickable { cursor: pointer; } .session-row.clickable:hover { border-color: var(--accent); }
+.session-row.session-live { border-left: 3px solid var(--accent); }
+.session-line { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.session-mark { white-space: nowrap; font-size: 12px; } .session-label { font-weight: 600; }
+.session-summary { font-style: italic; } .session-tool { font: 12px ui-monospace, Menlo, monospace; }
+.session-back { margin: 0 0 6px; }
+.turn { margin: 6px 0; overflow-wrap: anywhere; }
+.turn-sub { margin-left: 24px; padding-left: 8px; border-left: 2px solid var(--line); }
+.turn-text { white-space: pre-wrap; margin: 6px 0; line-height: 1.5; }
+.turn-fold { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; }
+.turn-fold > summary { cursor: pointer; overflow-wrap: anywhere; } .turn-fold > summary code { font-size: 12px; }
+.turn-thinking > summary { color: var(--muted); font-style: italic; }
+.turn-wait { font-size: 12px; margin: 2px 0; }
+.turn-raw { margin: 4px 0; }
+pre.turn-error { color: var(--bad); }
+.turn-result { background: var(--panel); border: 1px solid var(--ok); border-radius: 6px; padding: 6px 10px; }
+.turn-result.turn-result-error { border-color: var(--bad); }
+.turns-end { margin: 10px 0; }
+.turns-below { position: sticky; bottom: 12px; display: block; margin: 8px auto 0; box-shadow: 0 2px 10px rgba(0,0,0,.2); }
 /* the Spec and Plan tabs: a head row, the document beside the findings */
 #run-body.art-tab { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 320px); gap: 12px; align-items: start; }
 #run-body.art-tab > .art-head, #run-body.art-tab > .art-note, #run-body.art-tab > .art-decision { grid-column: 1 / -1; }

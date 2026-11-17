@@ -11,6 +11,15 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 - The Files tab shows the run's own documents in full (`issue.md`, each phase's handoff, refine notes, `pr.md`, `progress.md`), and the branch's changes since it left the base with a diff per file: the pull request's diff, readable before the pull request exists.
 - The Plan tab's Tasks mode lists each plan task with its status, tries, review and cost, groups the tasks by status or by dependency wave, and shows what a blocked or parked task holds up and which tasks could go on without it.
+- A run's Agents tab lists every session the run started (attempts, resolvers and sizers labelled in words) with model, effort, cost, exit and result, and opens each one's transcript as a readable conversation that follows a live session.
+
+### Changed
+
+- A Board card lists every live agent of its run, not just the newest, and the Agents tab groups agents by run, puts idle ones first and opens each one's transcript.
+
+### Removed
+
+- The run detail's 16 KB transcript tail (`transcript`, `transcript_file`); the Agents tab's transcript viewer replaces it.
 
 ## [2.9] - 2026-11-17
 

@@ -27,6 +27,8 @@ Routes:
   (`resume`) or marks it done (`done`, which ends in the draft pull request) (D16).
   An approve body may carry `viewed: [{path, sha}]`, the revisions the page showed, recorded on `phase_approved`.
   An action the run is not in a state for (a second approve, a live runner) answers 409 with the reason.
+- `GET /api/runs/<id>/sessions` (every agent session of the run) and `/sessions/<s…>/transcript?after=<byte>` (its
+  transcript as turns, in whole-line pages of at most `dashboard.artifact_max_kb`).
 - `POST /api/backlog` (add a card: `lane`, `fields`, `after`, `to_phase`), `POST /api/backlog/start` (`module` or
   `item`: `card:<id>`, `module:<id>` or a synced `issue:<number>`) and `POST /api/backlog/remove` (`item`, a card
   only: a synced issue leaves Backlog when it is closed or loses its label). A start re-checks that the card is not blocked and has no
@@ -91,13 +93,16 @@ from agentflow.plan_view import run_plan
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
 from agentflow.run_files import list_files, read_file
 from agentflow.scorecard import scorecard_view
+from agentflow.sessions import run_sessions
 from agentflow.state import Run, runs_root
+from agentflow.transcripts import transcript_page
 from agentflow.views import agents_view, board, lessons_view, metrics_view, run_detail, workflow_view
 
 PAGE = Path(__file__).resolve().with_name("dashboard.html")
 UI_DIR = Path(__file__).resolve().with_name("dashboard_ui")
-UI_SCRIPTS = ("core.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js", "workflow.js", "agents.js", "metrics.js", "lessons.js",
-              "settings.js", "main.js")  # in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
+# in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
+UI_SCRIPTS = ("core.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js",
+              "sessions.js", "workflow.js", "agents.js", "metrics.js", "lessons.js", "settings.js", "main.js")
 UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024
 DEFAULT_BOARD_REFRESH_S = 2.0  # the most often the page refetches the Board while events arrive
@@ -106,7 +111,9 @@ MIN_TOKEN_CHARS = 22  # 128 bits of token_urlsafe
 RUN_ID = re.compile(r"^[0-9]{8}-[0-9]{4}-[a-z0-9]+(?:-[a-z0-9]+)*$")
 RUN_ID_MAX = 120
 RUN_ROUTE = re.compile(r"^/api/runs/([^/]+)$")
-ARTIFACT_ROUTE = re.compile(r"^/api/runs/([^/]+)/(artifacts|artifact|artifact/diff|findings|plan|files|changes)$")
+ARTIFACT_ROUTE = re.compile(r"^/api/runs/([^/]+)/(artifacts|artifact|artifact/diff|findings|plan|files|changes|sessions)$")
+TRANSCRIPT_ROUTE = re.compile(r"^/api/runs/([^/]+)/sessions/([^/]+)/transcript$")
+CURSOR = re.compile(r"[0-9]{1,15}")
 ACTION_ROUTE = re.compile(r"^/api/runs/([^/]+)/([a-z]+)$")
 TEXT_MAX = backlog.TEXT_MAX
 BACKLOG_ROUTES = ("/api/backlog", "/api/backlog/start", "/api/backlog/remove")
@@ -493,6 +500,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._scorecard(query)
         elif path == "/api/lessons":
             self._json(200, lessons_view(self.server.repo, self.server.cfg))
+        elif match := TRANSCRIPT_ROUTE.match(path):
+            self._transcript_get(match.group(1), match.group(2), query)
         elif match := ARTIFACT_ROUTE.match(path):
             self._artifact_get(match.group(1), match.group(2), query)
         elif match := RUN_ROUTE.match(path):
@@ -503,6 +512,27 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, run_detail(run, self.server.cfg, raw=(query.get("raw") or [""])[0] == "1"))
         else:
             self._error(404, "not found")
+
+    def _transcript_get(self, run_id: str, session: str, query: dict) -> None:
+        """One session's transcript as a page of turns. `after` is checked before the session is looked up, and
+        the session id only ever reaches `transcript_page`, which resolves it against the run's own events."""
+        run = self._run(run_id)
+        if run is None:
+            self._error(404, "no such run")
+            return
+        values = query.get("after") or ["0"]
+        if len(values) != 1 or not CURSOR.fullmatch(values[0]) or not values[0].isascii():
+            self._error(400, "after must be a non-negative whole number, sent once")
+            return
+        try:
+            result = transcript_page(run, session, int(values[0]), artifact_max_bytes(self.server.cfg))
+        except NotFound as exc:
+            self._error(404, str(exc))
+            return
+        except ValueError as exc:
+            self._error(400, str(exc))
+            return
+        self._json(200, result)
 
     def _artifact_get(self, run_id: str, what: str, query: dict) -> None:
         """The artifact routes (see the module docstring): everything a browser names is checked against git's own
@@ -534,6 +564,8 @@ class _Handler(BaseHTTPRequestHandler):
             elif what == "changes":
                 result = (change_diff(run, repo, cfg, *args, artifact_max_bytes(cfg)) if args
                           else run_changes(run, repo, cfg))
+            elif what == "sessions":
+                result = run_sessions(run)
             elif what == "artifact":
                 result = read_artifact(run, repo, *args, artifact_max_bytes(cfg))
             else:

@@ -173,9 +173,7 @@ function changesEntry(st) {
 
 function fileEntries(detail, sub) {
   const st = filesState(detail.run_id);
-  const tail = [entry("files:transcript", { title: "Transcript tail" + (detail.transcript_file ? " (" + detail.transcript_file + ")" : ""), text: detail.transcript },
-    (f) => section(f.title, f.text, false, "files:transcript")),
-  entry("files:records", { title: "Step records", text: recordsText(detail) }, (f) => section(f.title, f.text, false, "files:records"))];
+  const tail = [entry("files:records", { title: "Step records", text: recordsText(detail) }, (f) => section(f.title, f.text, false, "files:records"))];
   if (st.list === null) {
     if (!st.error) loadFiles(detail.run_id);
     return [note("files:list", st.error ? "Could not load the files: " + st.error : "Loading the files…"), changesEntry(st), ...tail];

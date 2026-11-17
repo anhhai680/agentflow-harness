@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import pytest
-from conftest import NODE, js
+from conftest import NODE, js, js_async
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not on PATH")
 
@@ -95,3 +95,103 @@ def test_only_a_run_without_a_branch_reads_no_branch_yet():
     assert js(["files.js"], none, {"facts": {"branch": None}}) is True
     assert js(["files.js"], none, {"facts": {"branch": "flow/x"}}) is False
     assert js(["files.js"], none, None) is True  # no detail to say otherwise: the old answer
+
+
+def test_tool_results_attach_to_their_call_across_pages():
+    have = js(["sessions.js"], "mergeTurns([], args)", [{"kind": "tool", "id": "t1", "line": "Bash: ls"},
+                                                       {"kind": "wait", "records": 2, "seconds": 5}])
+    merged = js(["sessions.js"], "mergeTurns(args.have, args.page)",
+                {"have": have, "page": [{"kind": "wait", "records": 3, "seconds": 40},
+                                        {"kind": "tool_result", "id": "t1", "text": "a b", "is_error": False},
+                                        {"kind": "tool_result", "id": "zz", "text": "orphan", "is_error": True}]})
+    assert merged[0]["result"] == "a b" and merged[1] == {"kind": "wait", "records": 5, "seconds": 40}
+    assert [t["kind"] for t in merged] == ["tool", "wait", "tool_result"]
+    assert js(["sessions.js"], "waitText(args)", {"kind": "wait", "records": 4, "seconds": None}) == "waited (4 updates)"
+
+
+def test_sessions_group_live_first_then_by_phase_and_filter():
+    rows = [{"id": "s9", "phase": "build", "live": True, "exit_code": None, "role": "build"},
+            {"id": "s8", "phase": "build", "live": False, "exit_code": 1, "role": "build"},
+            {"id": "s5", "phase": "plan", "live": False, "exit_code": 0, "role": "plan"},
+            {"id": "s3", "phase": "build", "live": False, "exit_code": 0, "role": "review"}]
+    groups = js(["sessions.js"], "groupSessions(args).map(g => [g.phase, g.rows.map(r => r.id)])", rows)
+    assert groups == [["live", ["s9"]], ["build", ["s8", "s3"]], ["plan", ["s5"]]]
+    failed = js(["sessions.js"], "filterSessions(args, {phase: null, role: null, failed: true}).map(r => r.id)", rows)
+    assert failed == ["s8"]
+
+
+# A fake `api` whose answers the test hands out one by one: each call waits on its own deferred promise.
+READS = """
+var ui = {run: null, sessions: null};
+var toast = () => {};
+var runPath = (id) => "/api/runs/" + id;
+var calls = [];
+var api = (path) => new Promise((resolve) => calls.push({path: path, resolve: resolve}));
+const tick = async () => { for (let i = 0; i < 20; i++) await null; };  // the vm has no timers: let the reads settle
+const page = (texts, next) => ({turns: texts.map((t) => ({kind: "text", text: t})), next: next, size: 900, done: false});
+const shown = (st) => ({open: st.open, loaded: st.loaded, next: st.next, turns: st.turns.map((t) => t.text)});
+"""
+
+
+def test_a_session_opened_while_another_is_read_is_read_too():
+    got = js_async(["sessions.js"], READS + """(async () => {
+        const st = sessionsState("r1");
+        openTranscript(st, "s1");
+        openTranscript(st, "s2");  // s1's read is still out
+        const paths = calls.map((c) => c.path);
+        calls[0].resolve(page(["from s1"], 500));
+        await tick();
+        const meanwhile = shown(st);
+        calls[calls.length - 1].resolve(page(["from s2"], 300));
+        await tick();
+        return {paths: paths, meanwhile: meanwhile, after: shown(st)};
+    })()""", None)
+    assert got["paths"] == ["/api/runs/r1/sessions/s1/transcript?after=0", "/api/runs/r1/sessions/s2/transcript?after=0"]
+    assert got["meanwhile"] == {"open": "s2", "loaded": False, "next": 0, "turns": []}  # s1's page is not s2's
+    assert got["after"] == {"open": "s2", "loaded": True, "next": 300, "turns": ["from s2"]}
+
+
+def test_a_reopened_session_drops_a_page_read_before_it_was_closed():
+    got = js_async(["sessions.js"], READS + """(async () => {
+        const st = sessionsState("r1");
+        openTranscript(st, "s1");
+        calls[0].resolve(page(["first"], 500));
+        await tick();
+        readTranscript(st, false);  // a follow read from 500, still out when the reader leaves
+        openTranscript(st, null);
+        openTranscript(st, "s1");  // read again from the start
+        const paths = calls.map((c) => c.path);
+        calls[1].resolve(page(["late"], 900));
+        await tick();
+        if (calls[2]) calls[2].resolve(page(["first"], 500));  // no third read: the reopened session is stranded
+        await tick();
+        return {paths: paths, after: shown(st)};
+    })()""", None)
+    assert got["paths"][1:] == ["/api/runs/r1/sessions/s1/transcript?after=500", "/api/runs/r1/sessions/s1/transcript?after=0"]
+    assert got["after"] == {"open": "s1", "loaded": True, "next": 500, "turns": ["first"]}
+
+
+def test_load_more_is_not_offered_when_a_read_finds_no_complete_line():
+    got = js_async(["sessions.js"], READS + """(async () => {
+        const st = sessionsState("r1");
+        openTranscript(st, "s1");
+        calls[0].resolve(page(["a"], 500));
+        await tick();
+        const first = st.stalled;
+        readTranscript(st, false);  // the last line has no newline yet: nothing comes back and `next` stays
+        calls[1].resolve({turns: [], next: 500, size: 900, done: false});
+        await tick();
+        const stuck = st.stalled;
+        readTranscript(st, false);
+        calls[2].resolve(page(["b"], 900));
+        await tick();
+        return {first: first, stuck: stuck, moved: st.stalled};
+    })()""", None)
+    assert got == {"first": False, "stuck": True, "moved": False}
+
+
+def test_agents_group_by_run_with_idle_rows_first():
+    rows = [{"run_id": "r1", "module": "a", "idle": False, "age_s": 50}, {"run_id": "r2", "module": "b", "idle": False, "age_s": 9},
+            {"run_id": "r1", "module": "a", "idle": True, "age_s": 10}]
+    got = js(["agents.js"], "agentsByRun(args).map(g => [g.run_id, g.rows.map(r => r.age_s)])", rows)
+    assert got == [["r1", [10, 50]], ["r2", [9]]]

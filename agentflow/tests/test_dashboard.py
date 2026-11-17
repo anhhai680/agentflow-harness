@@ -22,7 +22,7 @@ from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
 from agentflow.views import _badge, step_title
-from conftest import PYTHON_CONFIG, run_git
+from conftest import PYTHON_CONFIG, L, run_git, session_with_transcript
 
 TOKEN = "k3y-" + "x" * 40
 AGENTFLOW = Path(__file__).resolve().parents[1]
@@ -317,10 +317,7 @@ def test_a_card_shows_the_soft_and_the_hard_budget(dash):
 
 def test_board_and_run_detail(dash):
     planning = awaiting(dash.flow, "staff-auth")
-    run_dir = planning.dir
     planning.progress_path().write_text("# Tiến độ\n\n- bước 1 xong\n", encoding="utf-8")
-    (run_dir / "transcripts").mkdir(exist_ok=True)
-    (run_dir / "transcripts" / "plan__plan.1.jsonl").write_text('{"type": "result"}\n' * 5000, encoding="utf-8")
     status, _, body = dash.get("/api/board")
     data = payload(body)
     assert status == 200 and [c["column"] for c in data["cards"]] == ["plan"]
@@ -330,7 +327,7 @@ def test_board_and_run_detail(dash):
     detail = payload(body)
     assert status == 200 and detail["run_id"] == planning.id
     assert "Tiến độ" in detail["progress"]
-    assert len(detail["transcript"]) <= 16 * 1024 and detail["transcript"].endswith('{"type": "result"}\n')
+    assert detail["session_count"] == 0 and "transcript" not in detail and "transcript_file" not in detail
     assert [e["type"] for e in detail["timeline"]][-1] == "phase_approval_raised"
     assert detail["attach"] == f"agentflow attach {planning.id}"
 
@@ -946,7 +943,7 @@ def test_hidden_wins_over_an_author_display_rule():
 def test_runs_have_hash_routes():
     source = page_source()
     for needle in ('"#/run/"', "hashchange", "function parseRoute", "function routeHash",
-                   'RUN_TABS = ["overview", "spec", "plan", "activity", "gates", "files"]'):
+                   'RUN_TABS = ["overview", "spec", "plan", "agents", "activity", "gates", "files"]'):
         assert needle in source, needle
 
 
@@ -1894,7 +1891,7 @@ def test_run_detail_names_the_artifact_tabs_its_lane_walks(dash):
 
 def test_the_run_page_has_spec_and_plan_tabs_only_where_the_lane_walks_them():
     run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
-    assert 'RUN_TABS = ["overview", "spec", "plan", "activity", "gates", "files"]' in run_js
+    assert 'RUN_TABS = ["overview", "spec", "plan", "agents", "activity", "gates", "files"]' in run_js
     assert "visibleTabs(detail)" in run_js and "artifact_tabs" in (UI_DIR / "artifact.js").read_text(encoding="utf-8")
 
 
@@ -1956,12 +1953,23 @@ def test_the_plan_tab_has_a_tasks_mode():
 def test_the_files_tab_lists_the_run_documents_and_the_changes():
     files_js = (UI_DIR / "files.js").read_text(encoding="utf-8")
     for needle in ("/files", "/files?name=", "/changes", "/changes?path=", "Changes since the base",
-                   "No branch yet", "Showing the first", "Transcript tail", "Step records", "ui.files"):
+                   "No branch yet", "Showing the first", "Step records", "ui.files"):
         assert needle in files_js, needle
     run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
     files_branch = run_js[run_js.index('tab === "files"'):run_js.index("}", run_js.index('tab === "files"'))]
     assert "fileEntries(" in files_branch and '"file:handoff"' not in run_js and '"file:progress"' not in run_js
     assert UI_SCRIPTS.index("plan.js") < UI_SCRIPTS.index("files.js") < UI_SCRIPTS.index("main.js")
+
+
+def test_the_run_page_has_an_agents_tab_with_a_transcript_viewer():
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    assert 'RUN_TABS = ["overview", "spec", "plan", "agents", "activity", "gates", "files"]' in run_js
+    s = (UI_DIR / "sessions.js").read_text(encoding="utf-8")
+    for needle in ("/sessions", "/transcript?after=", "Load more", "No transcript was written",
+                   "Following this session live", "New turns below", "ui.sessions"):
+        assert needle in s, needle
+    main = (UI_DIR / "main.js").read_text(encoding="utf-8")
+    assert "transcriptFollow(" in main
 
 
 def test_no_two_ui_scripts_declare_the_same_top_level_name():
@@ -1975,3 +1983,59 @@ def test_no_two_ui_scripts_declare_the_same_top_level_name():
                 clashes.append(f"{found}: {seen[found]} and {name}")
             seen.setdefault(found, name)
     assert not clashes, clashes
+
+
+def test_the_agents_routes_answer(dash):
+    run, sid = session_with_transcript(dash.flow, raw=[L({"type": "result", "result": "ok"})])
+    (row,) = payload(dash.get(f"/api/runs/{run.id}/sessions")[2])
+    assert row["id"] == sid and row["transcript"] is True
+    page = payload(dash.get(f"/api/runs/{run.id}/sessions/{sid}/transcript")[2])
+    assert [t["kind"] for t in page["turns"]] == ["result"] and page["done"] is True
+    assert payload(dash.get(f"/api/runs/{run.id}")[2])["session_count"] == 1
+    assert "transcript" not in payload(dash.get(f"/api/runs/{run.id}")[2])
+
+
+@pytest.mark.parametrize("route", ["sessions", "sessions/s1/transcript", "sessions/s1/transcript?after=0"])
+def test_the_agents_routes_keep_the_refusal_matrix(dash, route):
+    run, _ = session_with_transcript(dash.flow, raw=[L({"type": "result", "result": "ok"})])
+    assert_refusal_matrix(dash, run, route)
+
+
+@pytest.mark.parametrize("tail, status", [("sessions/s999/transcript", 404),
+                                          ("sessions/..%2F..%2Fstate.json/transcript", 404),
+                                          ("sessions/s1/transcript?after=-1", 400),
+                                          ("sessions/s1/transcript?after=x", 400),
+                                          ("sessions/s1/transcript?after=%2B1", 400),
+                                          ("sessions/s1/transcript?after=1_0", 400),
+                                          ("sessions/s1/transcript?after=%D9%A1", 400),
+                                          ("sessions/s1/transcript?after=0&after=1", 400)])
+def test_the_transcript_route_refuses_bad_ids_and_cursors(dash, tail, status):
+    run, _ = session_with_transcript(dash.flow, raw=[L({"type": "result", "result": "ok"})])
+    assert dash.get(f"/api/runs/{run.id}/{tail}")[0] == status
+
+
+def test_the_transcript_route_refuses_a_cursor_inside_a_line(dash):
+    run, sid = session_with_transcript(dash.flow, raw=[L({"type": "result", "result": "ok"})])
+    assert dash.get(f"/api/runs/{run.id}/sessions/{sid}/transcript?after=3")[0] == 400
+
+
+def test_a_card_lists_every_live_agent(dash, monkeypatch):
+    run = awaiting(dash.flow)
+    monkeypatch.setattr("agentflow.views._alive", lambda pid: True)
+    for pid, key in ((61, "build/build/task-10/implement"), (62, "build/build/task-8/review")):
+        run.emit("agent_started", step=key, pid=pid, agent="claude", model="sonnet", effort="high", role="build")
+    assert [a["label"] for a in card_of(dash)["agents"]] == ["Task 10 · implement · attempt 1",
+                                                              "Task 8 · review · attempt 1"]
+
+
+def test_a_card_for_a_run_with_no_live_agent_has_none(dash):
+    awaiting(dash.flow)
+    assert card_of(dash)["agents"] == []
+
+
+def test_a_global_agent_row_links_to_its_session(dash, monkeypatch):
+    run = awaiting(dash.flow)
+    monkeypatch.setattr("agentflow.views._alive", lambda pid: True)
+    ev = run.emit("agent_started", step="plan/plan", pid=71, agent="claude", model="opus", effort="high", role="plan")
+    (row,) = payload(dash.get("/api/agents")[2])["live"]
+    assert row["session"] == f"s{ev['seq']}" and row["label"] == "plan · attempt 1"

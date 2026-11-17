@@ -486,7 +486,38 @@ def js(files: list[str], expr: str, args) -> object:
     return json.loads(out.stdout)
 
 
+ASYNC_LOADER = LOADER.replace("process.stdout.write(JSON.stringify(vm.runInContext(process.argv[2],ctx)));",
+                              "Promise.resolve(vm.runInContext(process.argv[2],ctx))"
+                              ".then((v)=>process.stdout.write(JSON.stringify(v)));")
+
+
+def js_async(files: list[str], expr: str, args) -> object:
+    """`js`, for an expression that returns a promise: what it resolves to."""
+    assert ASYNC_LOADER != LOADER
+    out = subprocess.run([NODE, "-e", ASYNC_LOADER, json.dumps([str(ENGINE / "dashboard_ui" / f) for f in files]), expr],
+                         input=json.dumps(args), capture_output=True, text=True, check=True, timeout=30)
+    return json.loads(out.stdout)
+
+
 def walk(nodes):
     for node in nodes:
         yield node
         yield from walk(node.get("c") or [])
+
+
+def L(obj) -> bytes:
+    return json.dumps(obj).encode()
+
+
+def session_with_transcript(flow_repo, lines=0, width=0, raw=None, tail=b""):
+    run, key = flow_repo.new_run(), "build/build/task-1/implement"
+    run.emit("agent_started", step=key, pid=None, agent="claude", model="sonnet", effort="high", role="build",
+             session_id="x1", sizer=False)
+    run.emit("agent_exited", session_id="x1", exit_code=0, cost=0.0, key=key)
+    body = b"".join(L({"type": "assistant", "message": {"content": [{"type": "text", "text": "w" * width}]}}) + b"\n"
+                    for _ in range(lines))
+    body += b"".join(r + b"\n" for r in raw or []) + tail
+    path = run.transcript_path(key, 1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    return run, "s2"
