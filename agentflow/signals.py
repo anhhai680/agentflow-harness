@@ -21,6 +21,9 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   and `doubt_misread:<p>` read the last `doubt_settled` of a phase (the findings its doubt review first raised, the
   reconcile rounds, the findings still open, and the dispositions given since the last human round). They are
   present only for a phase that has one, and reconcile rounds are not counted in `refine_rounds:<p>`.
+  `informed_approval:<p>` is the share of a person's approvals of the phase whose `viewed` (the revisions the
+  dashboard showed) covers every newest revision the phase produced. A CLI approval counts as uninformed, and an
+  approval of a phase that produced nothing isn't counted. Present only for a phase with a counted approval.
   Sizer calls (events with `sizer`) are no step's turns, and their cost is not a step's cost.
   `lead_time_h` is the hours from `run_started` to `pr_marked_ready` (present only for a run that has both).
   `human_blocked_share` is the metrics `human` bucket over the run's wall time, 0..1 (present only when the run has
@@ -78,6 +81,7 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "lead_time_h": ("lower", False),          # hours from the run's start to its pull request marked ready
     "human_blocked_share": ("lower", False),  # share of wall time spent waiting on a person with no work started
     "full_suite_runs": ("lower", False),      # times the whole verify gate set ran, in one batch of gate results
+    "informed_approval": ("higher", True),    # a phase: share of a person's approvals that viewed what it produced
     "gate_cache_hit_rate": ("higher", False),  # gate results reused, over those reused plus those that ran
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
@@ -231,6 +235,15 @@ def _gate_cache_hit_rate(events: list[dict]) -> dict[str, float]:
     return {"gate_cache_hit_rate": reused / (reused + ran)} if reused + ran else {}
 
 
+def _informed(ev: dict) -> bool:
+    """Whether a `phase_approved` viewed every newest revision its phase produced: a non-empty `produced` that is a
+    subset of `viewed`, by `(path, sha)`. An approval that recorded neither (the CLI's) is not informed."""
+    def pairs(value: object) -> set[tuple[Any, Any]]:
+        return {(i.get("path"), i.get("sha")) for i in value if isinstance(i, dict)} if isinstance(value, list) else set()
+    produced = pairs(ev.get("produced"))
+    return bool(produced) and produced <= pairs(ev.get("viewed"))
+
+
 def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str] = ()) -> dict[str, float]:
     """The signals of one run, only for what the run did. `metrics` is `metrics.run_metrics` for the same run.
     `full_suite` names the gates of the verify set; with it, `full_suite_runs` is present."""
@@ -242,6 +255,7 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
     plain: Counter[str] = Counter()
     audit: dict | None = None
     settled: dict[str, dict] = {}
+    approvals: dict[str, list[bool]] = {}
     for ev in events:
         etype = ev.get("type")
         if etype == "fix_attempt":
@@ -278,6 +292,9 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
                 level, source = decided.get(str(ev["key"]), (None, None))
                 if level in ("low", "medium") and source != "fallback":
                     counts["undersized"][phase] += 1
+        elif etype == "phase_approved":
+            if (phase := ev.get("phase")) and ev.get("by") != RUNNER and ev.get("produced") != []:
+                approvals.setdefault(str(phase), []).append(_informed(ev))
         elif etype == "conformance_checked":
             audit = ev
         elif etype in ("ci_round", "rolled_over", "progress_not_updated"):
@@ -295,6 +312,7 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
         for family, field in DOUBT_FIELDS:
             if isinstance(ev.get(field), (int, float)) and not isinstance(ev.get(field), bool):
                 out[f"{family}:{phase}"] = ev[field]
+    out.update({f"informed_approval:{phase}": round(sum(flags) / len(flags), 4) for phase, flags in approvals.items()})
     out.update(_turns(events))
     out.update(_gate_time(events))
     if audit is not None:  # the last audit only, and only for a run that was audited

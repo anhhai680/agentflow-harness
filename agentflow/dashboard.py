@@ -27,7 +27,7 @@ Routes:
   an approval inside a phase then start `flow.py resume <id>` detached (D13), unless a runner already holds
   the run's lock. A phase approval starts nothing: the phase rests as ready until a human continues it
   (`resume`) or marks it done (`done`, which ends in the draft pull request) (D16).
-  An approve body may carry `viewed: [{path, sha}]`, the revisions the page showed, recorded on `phase_approved`.
+  An approve body may carry `viewed: [{path, sha}]`, the revisions the page showed, recorded on `phase_approved` with `produced`, the newest revision of each artifact the phase made.
   An action the run is not in a state for (a second approve, a live runner) answers 409 with the reason.
 - `GET /api/runs/<id>/sessions` (every agent session of the run) and `/sessions/<s…>/transcript?after=<byte>` (its
   transcript as turns, in whole-line pages of at most `dashboard.artifact_max_kb`).
@@ -200,14 +200,30 @@ def _viewed(body: dict) -> list[dict] | None:
     return viewed
 
 
-def _approve(run: Run, body: dict, cfg: Config) -> tuple[dict, bool]:
+def _produced(run: Run, repo: Path, target: str) -> list[dict] | None:
+    """What the phase `target` names produced, as `[{path, sha}]` of each artifact's newest revision, when the run
+    waits on that phase's approval. None for any other approval, or when the artifacts cannot be listed."""
+    waiting = run.state["waiting"] or {}
+    if waiting.get("kind") != "phase_approval" or target not in (waiting.get("phase"), waiting.get("key")):
+        return None
+    try:
+        listing = run_artifacts(run, repo)
+    except NotFound:
+        return None
+    return [{"path": a["path"], "sha": a["revisions"][-1]["sha"]}
+            for a in listing if a["phase"] == waiting["phase"] and a.get("revisions")]
+
+
+def _approve(run: Run, body: dict, cfg: Config, repo: Path | None = None) -> tuple[dict, bool]:
     viewed = _viewed(body)
     budget = body.get("budget")
     if budget is not None and (isinstance(budget, bool) or not isinstance(budget, (int, float))
                                or not math.isfinite(budget)):
         raise BadRequest("budget must be a finite number")
-    rested = hitl.approve(run, _text(body, "target") or _default_target(run), BY, budget=budget, hold=_rests(run, cfg),
-                          note=_text(body, "note"), budget_step=cfg.defaults.run_budget_usd, viewed=viewed)
+    target = _text(body, "target") or _default_target(run)
+    rested = hitl.approve(run, target, BY, budget=budget, hold=_rests(run, cfg), note=_text(body, "note"),
+                          budget_step=cfg.defaults.run_budget_usd, viewed=viewed,
+                          produced=_produced(run, repo, target) if repo is not None else None)
     return {}, not rested
 
 
@@ -636,7 +652,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             action = match.group(2)
-            result, go_on = _approve(run, body, self.server.cfg) if action == "approve" else ACTIONS[action](run, body)
+            if action == "approve":
+                result, go_on = _approve(run, body, self.server.cfg, self.server.repo)
+            else:
+                result, go_on = ACTIONS[action](run, body)
         except CONFLICTS as exc:
             self._error(409, str(exc))
             return

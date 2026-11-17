@@ -497,6 +497,15 @@ def test_approve_records_what_the_page_showed(dash):
     assert event["viewed"] == viewed and event["by"] == "dashboard"
 
 
+def test_a_dashboard_phase_approval_records_what_the_phase_produced(dash, spec_run):
+    spec_run.run.emit("phase_approval_raised", phase="plan", round=0, summary="plan is done")
+    newest = spec_run.revisions("docs/plans/x.md")[-1]["sha"]
+    viewed = [{"path": "docs/plans/x.md", "sha": newest}]
+    assert dash.post(f"/api/runs/{spec_run.run.id}/approve", {"viewed": viewed})[0] == 200
+    event = [e for e in spec_run.run.events.read() if e["type"] == "phase_approved"][-1]
+    assert event["produced"] == viewed and event["viewed"] == viewed
+
+
 @pytest.mark.parametrize("viewed", ["x", [{"path": "a"}], [{"path": "a", "sha": "zz"}],
                                     [{"path": "", "sha": "a" * 40}], [{"path": "a", "sha": "a" * 40, "x": 1}],
                                     [{"path": "a", "sha": "a" * 40}] * 101])
