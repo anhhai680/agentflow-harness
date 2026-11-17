@@ -274,6 +274,8 @@ def _reopen_hint(module: str, reason: str) -> str | None:
                 "and it comes back to Backlog")
     if reason in (finished.SPEC_SAYS, finished.BY_HAND):
         return f"run `agentflow backlog undone {module}`"
+    if reason == finished.ISSUE_CLOSED:
+        return f"reopen its issue, then run `agentflow backlog undone {module}`"
     return None
 
 
@@ -913,8 +915,8 @@ def mark_done(cfg: Config, repo: Path, module: str, by: str) -> list[str]:
 
 
 def mark_not_done(cfg: Config, repo: Path, module: str, by: str) -> list[str]:
-    """Take a hand mark off `module`, or, with none, veto the origin evidence that says it is done (a merged
-    module stays done). The lines to print; the errors are those of `mark_done`, less the live run."""
+    """Take a hand mark off `module`, or, with none, veto the origin evidence or closed issue that says it is done (a
+    merged module stays done). The lines to print; the errors are those of `mark_done`, less the live run."""
     repo = Path(repo)
     _known_module(cfg, repo, module)
     marks, error = finished.read_marks(repo)
@@ -925,7 +927,7 @@ def mark_not_done(cfg: Config, repo: Path, module: str, by: str) -> list[str]:
         message = f"{module} hand mark removed"
     else:
         finished.veto(repo, module, by)
-        message = f"{module} marked not done by hand: origin evidence is ignored"
+        message = f"{module} marked not done by hand: origin evidence and a closed issue are ignored"
     return [message, *_reassess(cfg, repo)]
 
 

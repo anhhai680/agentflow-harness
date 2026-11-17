@@ -1172,6 +1172,115 @@ def test_a_corrupt_marks_file_lets_origin_evidence_make_no_new_done(dq, tmp_path
     assert [m for m in messages if finished.MARKS in m and "unreadable" in m]
 
 
+class Issues:
+    """`issue_is_closed` that records the issue numbers it was asked about and answers `answer`."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.answer: tuple[bool | None, str] = (True, "")
+
+    def __call__(self, cfg, repo, number: str) -> tuple[bool | None, str]:
+        self.calls.append(number)
+        return self.answer
+
+
+@pytest.fixture
+def iq(dq, monkeypatch):
+    """`dq` with an issue-backed module `issue-7` in the map and `issue_is_closed` counted (`iq.issues`)."""
+    write(dq.root, "docs/specs/CAPABILITY-MAP.md", MAP + "| `issue-7` | GitHub issue #7 | — | SPEC-issue-7 |\n")
+    commit_all(dq.root)
+    dq.issues = Issues()
+    monkeypatch.setattr(module_queue, "issue_is_closed", dq.issues)
+    return dq
+
+
+def test_a_closed_issue_finishes_its_issue_module_and_is_not_asked_again(iq):
+    from agentflow import finished
+
+    entries = assess(iq)
+    assert (entries["issue-7"]["status"], entries["issue-7"]["done_reason"]) == ("done", finished.ISSUE_CLOSED)
+    assert iq.issues.calls == ["7"]  # only the issue-backed module is asked about
+    iq.issues.answer = (None, "gh is down")
+    assert assess(iq)["issue-7"]["done_reason"] == finished.ISSUE_CLOSED  # recorded: gh is not asked again
+    assert iq.issues.calls == ["7"]
+    assert finished.recorded(iq.root)["issue-7"] == finished.ISSUE_CLOSED
+
+
+def test_an_open_or_unknown_issue_leaves_its_module_in_backlog_without_a_problem(iq):
+    iq.issues.answer = (False, "")
+    assert assess(iq)["issue-7"]["status"] == "backlog"
+    iq.issues.answer = (None, "gh is down")
+    found = module_queue.assess_modules(iq.cfg, iq.root)
+    entry = {e["id"]: e for e in found.entries}["issue-7"]
+    assert entry["status"] == "backlog" and not entry.get("blocked")  # nothing a person must do
+    assert iq.issues.calls == ["7", "7"]
+
+
+def test_a_finished_plan_whose_branch_is_not_merged_falls_through_to_the_closed_issue(iq):
+    from agentflow import finished
+
+    write(iq.root, "docs/plans/2026-10-28-issue-7-fix-it.md", PLAN_DONE)  # the runner's branch had a title slug
+    iq.merges.answer = (False, "")
+    assert assess(iq)["issue-7"]["done_reason"] == finished.ISSUE_CLOSED
+    assert iq.merges.calls == ["flow/feature/issue-7"] and iq.issues.calls == ["7"]
+
+
+def test_a_veto_reopens_a_closed_issue_module_and_stops_asking(iq):
+    from agentflow import finished
+
+    assert assess(iq)["issue-7"]["done_reason"] == finished.ISSUE_CLOSED
+    finished.veto(iq.root, "issue-7", "pat")
+    assert "issue-7" not in finished.recorded(iq.root)
+    entry = assess(iq)["issue-7"]
+    assert entry["status"] == "backlog" and "done_reason" not in entry
+    assert iq.issues.calls == ["7"]  # vetoed: GitHub is not asked again
+
+
+def test_a_corrupt_marks_file_makes_no_new_done_from_a_closed_issue(iq):
+    from agentflow import finished
+
+    runs_root(iq.root).mkdir(parents=True, exist_ok=True)
+    (runs_root(iq.root) / finished.MARKS).write_text("{", encoding="utf-8")
+    assert assess(iq)["issue-7"]["status"] == "backlog"  # a veto may hide in the file
+    assert iq.issues.calls == []
+
+
+def test_a_live_run_on_an_issue_module_is_not_asked_about(iq):
+    from types import SimpleNamespace
+
+    from agentflow import finished, sources
+
+    view = module_queue.origin_view(iq.cfg, iq.root)
+    node, marks = sources.ModuleNode("issue-7", []), finished.read_marks(iq.root)
+    for status, asked in (("running", False), ("awaiting_approval", False), ("failed", True), ("done", True)):
+        iq.issues.calls.clear()
+        run = SimpleNamespace(state={"status": status}, id="r1")
+        reason, _ = module_queue.done_reason(iq.cfg, iq.root, node, run, {}, view, {"issue-7"}, marks)
+        assert (reason == finished.ISSUE_CLOSED, iq.issues.calls == ["7"]) == (asked, asked), status
+
+
+@pytest.mark.parametrize("module, number", [("issue-7", "7"), ("issue-1234567890", "1234567890"), ("issue-07", None),
+                                            ("issue-0", None), ("issue-7-x", None), ("crm", None), ("issue-", None)])
+def test_issue_of_module_reads_only_the_derived_issue_module_id(module, number):
+    assert module_queue.issue_of_module(module) == number
+
+
+@pytest.mark.parametrize("reply, answer", [('{"state": "CLOSED"}', True), ('{"state": "OPEN"}', False),
+                                           ('{"title": "x"}', None), ('[]', None), ('{"state": 1}', None)])
+def test_issue_is_closed_reads_the_state_gh_prints(fr, monkeypatch, reply, answer):
+    monkeypatch.setenv("FAKE_GH_ISSUE", reply)
+    closed, why = module_queue.issue_is_closed(fr.cfg, fr.root, "7")
+    assert closed is answer and (why if answer is None else True)
+    logged = [json.loads(line) for line in (Path(os.environ["FAKE_GH_LOG"])).read_text().splitlines()]
+    assert logged == [["issue", "view", "7", "--json", "state"]]
+
+
+def test_issue_is_closed_is_unknown_when_gh_fails(fr, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_FAIL", "1")
+    closed, why = module_queue.issue_is_closed(fr.cfg, fr.root, "7")
+    assert closed is None and "failing as asked" in why
+
+
 # --------------------------------------------------------------------------- retro due
 
 

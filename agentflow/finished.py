@@ -29,6 +29,7 @@ LOCK = "done_marks.lock"
 BY_HAND = "done by hand"
 SPEC_SAYS = "spec says done"
 MERGED = "merged"
+ISSUE_CLOSED = "issue closed"  # an `issue-<N>` module whose GitHub issue #N is closed
 
 _STATES = ("done", "not_done")
 
@@ -42,6 +43,12 @@ def from_origin(reason: str) -> bool:
     """Whether `reason` comes from origin evidence (`SPEC_SAYS` or `plan_complete`): the reasons a veto overrides. A
     merge (`MERGED`) and a hand mark (`BY_HAND`) are not."""
     return reason == SPEC_SAYS or reason.startswith(plan_complete(""))
+
+
+def vetoable(reason: str) -> bool:
+    """Whether a veto overrides a Done for `reason`: origin evidence, and a closed issue (it may be reopened). A merge
+    and a hand mark are not."""
+    return from_origin(reason) or reason == ISSUE_CLOSED
 
 
 def _unreadable(path: Path, why: str) -> str:
@@ -129,9 +136,9 @@ def recorded(repo: Path) -> dict[str, str]:
 
     The last assessment's done entries in `QUEUE_FILE` (a missing reason, from before reasons were kept, is
     `MERGED`; a broken file counts as none), less an entry done by hand whose mark is gone and an entry done by
-    origin evidence (`from_origin`) with a live veto, plus every live done mark as `BY_HAND`. A veto ignores origin
-    evidence only: a module done as `MERGED` stays done. When the marks file cannot be read, the entries stay as recorded,
-    so a module marked done by hand stays done."""
+    origin evidence or a closed issue (`vetoable`) with a live veto, plus every live done mark as `BY_HAND`. A veto
+    never undoes a merge: a module done as `MERGED` stays done. When the marks file cannot be read, the entries stay
+    as recorded, so a module marked done by hand stays done."""
     try:
         data = json.loads((runs_root(repo) / QUEUE_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -147,7 +154,7 @@ def recorded(repo: Path) -> dict[str, str]:
         return done
     for module, reason in list(done.items()):
         state = (marks.get(module) or {}).get("state")
-        if (state == "not_done" and from_origin(reason)) or (reason == BY_HAND and state != "done"):
+        if (state == "not_done" and vetoable(reason)) or (reason == BY_HAND and state != "done"):
             del done[module]
     for module, mark_ in marks.items():
         if mark_["state"] == "done":
@@ -155,5 +162,5 @@ def recorded(repo: Path) -> dict[str, str]:
     return done
 
 
-__all__ = ["BY_HAND", "LOCK", "MARKS", "MERGED", "QUEUE_FILE", "SPEC_SAYS", "from_origin", "mark", "plan_complete",
-           "read_marks", "recorded", "unmark", "veto"]
+__all__ = ["BY_HAND", "ISSUE_CLOSED", "LOCK", "MARKS", "MERGED", "QUEUE_FILE", "SPEC_SAYS", "from_origin", "mark",
+           "plan_complete", "read_marks", "recorded", "unmark", "veto", "vetoable"]

@@ -20,6 +20,7 @@ def _queue(repo: Path, modules: list[dict]) -> None:
 def test_reasons_are_the_words_the_backlog_shows():
     assert (finished.BY_HAND, finished.SPEC_SAYS, finished.MERGED) == ("done by hand", "spec says done", "merged")
     assert finished.plan_complete("next") == "plan complete on next"
+    assert finished.ISSUE_CLOSED == "issue closed"
 
 
 def test_mark_veto_and_unmark_round_trip(tmp_git):
@@ -88,20 +89,25 @@ def test_recorded_merges_queue_entries_and_live_marks(tmp_git):
         {"id": "f", "status": "done", "done_reason": finished.BY_HAND},  # still marked
         {"id": "h", "status": "done", "done_reason": finished.SPEC_SAYS},              # vetoed since
         {"id": "i", "status": "done", "done_reason": finished.plan_complete("next")},  # vetoed since
+        {"id": "j", "status": "done", "done_reason": finished.ISSUE_CLOSED},           # vetoed since
+        {"id": "k", "status": "done", "done_reason": finished.ISSUE_CLOSED},
     ])
-    for module in ("e", "h", "i"):
+    for module in ("e", "h", "i", "j"):
         finished.veto(tmp_git, module, "pat")
     finished.mark(tmp_git, "f", "pat")
     finished.mark(tmp_git, "g", "pat")  # marked after the last assessment
     assert finished.recorded(tmp_git) == {
         "a": finished.SPEC_SAYS, "b": finished.MERGED, "e": finished.MERGED, "f": finished.BY_HAND,
-        "g": finished.BY_HAND,
+        "g": finished.BY_HAND, "k": finished.ISSUE_CLOSED,
     }
 
 
 def test_from_origin_names_the_reasons_a_veto_overrides():
     assert finished.from_origin(finished.SPEC_SAYS) and finished.from_origin(finished.plan_complete("main"))
-    assert not any(finished.from_origin(r) for r in (finished.MERGED, finished.BY_HAND, "", "plan complete"))
+    assert not any(finished.from_origin(r) for r in (finished.MERGED, finished.BY_HAND, finished.ISSUE_CLOSED, "",
+                                                     "plan complete"))
+    assert all(finished.vetoable(r) for r in (finished.SPEC_SAYS, finished.plan_complete("main"), finished.ISSUE_CLOSED))
+    assert not any(finished.vetoable(r) for r in (finished.MERGED, finished.BY_HAND, ""))
 
 
 def test_recorded_keeps_hand_marked_entries_when_the_marks_file_is_unreadable(tmp_git):

@@ -339,7 +339,7 @@ agentflow queue --max-parallel 2          # loop, every --interval seconds (30):
 agentflow queue --once                    # one tick, for cron
 ```
 
-A module is done when its plan is fully checked and its PR is merged. The queue starts ready modules in `docs/specs/CAPABILITY-MAP.md` order, never above `--max-parallel`. A run that is waiting for you, paused or held keeps its slot but does not block the others. The one exception is a run held on `ci_pending` (watching CI checks still pending, `ci.watch_max_h`): it frees its slot while it waits. The queue prints `queue: <module> blocked — <reason>` once per change: an unauthenticated `gh`, a failed, cancelled or crashed run, a start that failed, an unknown dependency, a dependency cycle. Failed and crashed runs are never restarted automatically. Only one `agentflow queue` runs at a time, and its start output goes to `<state dir>/runs/queue.log`.
+A module is done when its plan is fully checked and its PR is merged. A module `issue-<N>` (an issue-backed run's) is also done, as `issue closed`, once issue #N is closed on GitHub and no run of it is live; `agentflow backlog undone` overrides that, as it does origin evidence. The queue starts ready modules in `docs/specs/CAPABILITY-MAP.md` order, never above `--max-parallel`. A run that is waiting for you, paused or held keeps its slot but does not block the others. The one exception is a run held on `ci_pending` (watching CI checks still pending, `ci.watch_max_h`): it frees its slot while it waits. The queue prints `queue: <module> blocked — <reason>` once per change: an unauthenticated `gh`, a failed, cancelled or crashed run, a start that failed, an unknown dependency, a dependency cycle. Failed and crashed runs are never restarted automatically. Only one `agentflow queue` runs at a time, and its start output goes to `<state dir>/runs/queue.log`.
 
 ## 10. Cheat sheet
 
@@ -369,8 +369,8 @@ agentflow dashboard                                 # token is in the URL fragme
 agentflow queue --max-parallel 2
 agentflow queue --include-specs                     # a pack with work_source specs: queue every spec file's module
 agentflow backlog done <module> [--by NAME]         # mark a module finished by hand (refused while it has a live run)
-agentflow backlog undone <module> [--by NAME]       # remove that hand mark; with none, ignore the origin evidence that
-                                                    #   says it is done (a merged module stays done)
+agentflow backlog undone <module> [--by NAME]       # remove that hand mark; with none, ignore the origin evidence or
+                                                    #   closed issue that says it is done (a merged module stays done)
 agentflow retro [--since YYYY-MM-DD]                # lessons from the runs ended since the last finished retro, as a
                                                     #   draft PR that changes only .agentflow/lessons.md (section 15)
 agentflow retro --dry-run                           # print the digest and the session's prompt; creates nothing
