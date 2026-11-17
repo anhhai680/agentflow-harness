@@ -486,6 +486,19 @@ def js(files: list[str], expr: str, args) -> object:
     return json.loads(out.stdout)
 
 
+ASYNC_LOADER = LOADER.replace("process.stdout.write(JSON.stringify(vm.runInContext(process.argv[2],ctx)));",
+                              "Promise.resolve(vm.runInContext(process.argv[2],ctx))"
+                              ".then((v)=>process.stdout.write(JSON.stringify(v)));")
+
+
+def js_async(files: list[str], expr: str, args) -> object:
+    """`js`, for an expression that returns a promise: what it resolves to."""
+    assert ASYNC_LOADER != LOADER
+    out = subprocess.run([NODE, "-e", ASYNC_LOADER, json.dumps([str(ENGINE / "dashboard_ui" / f) for f in files]), expr],
+                         input=json.dumps(args), capture_output=True, text=True, check=True, timeout=30)
+    return json.loads(out.stdout)
+
+
 def walk(nodes):
     for node in nodes:
         yield node

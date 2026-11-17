@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import pytest
-from conftest import NODE, js
+from conftest import NODE, js, js_async
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not on PATH")
 
@@ -118,3 +118,54 @@ def test_sessions_group_live_first_then_by_phase_and_filter():
     assert groups == [["live", ["s9"]], ["build", ["s8", "s3"]], ["plan", ["s5"]]]
     failed = js(["sessions.js"], "filterSessions(args, {phase: null, role: null, failed: true}).map(r => r.id)", rows)
     assert failed == ["s8"]
+
+
+# A fake `api` whose answers the test hands out one by one: each call waits on its own deferred promise.
+READS = """
+var ui = {run: null, sessions: null};
+var toast = () => {};
+var runPath = (id) => "/api/runs/" + id;
+var calls = [];
+var api = (path) => new Promise((resolve) => calls.push({path: path, resolve: resolve}));
+const tick = async () => { for (let i = 0; i < 20; i++) await null; };  // the vm has no timers: let the reads settle
+const page = (texts, next) => ({turns: texts.map((t) => ({kind: "text", text: t})), next: next, size: 900, done: false});
+const shown = (st) => ({open: st.open, loaded: st.loaded, next: st.next, turns: st.turns.map((t) => t.text)});
+"""
+
+
+def test_a_session_opened_while_another_is_read_is_read_too():
+    got = js_async(["sessions.js"], READS + """(async () => {
+        const st = sessionsState("r1");
+        openTranscript(st, "s1");
+        openTranscript(st, "s2");  // s1's read is still out
+        const paths = calls.map((c) => c.path);
+        calls[0].resolve(page(["from s1"], 500));
+        await tick();
+        const meanwhile = shown(st);
+        calls[calls.length - 1].resolve(page(["from s2"], 300));
+        await tick();
+        return {paths: paths, meanwhile: meanwhile, after: shown(st)};
+    })()""", None)
+    assert got["paths"] == ["/api/runs/r1/sessions/s1/transcript?after=0", "/api/runs/r1/sessions/s2/transcript?after=0"]
+    assert got["meanwhile"] == {"open": "s2", "loaded": False, "next": 0, "turns": []}  # s1's page is not s2's
+    assert got["after"] == {"open": "s2", "loaded": True, "next": 300, "turns": ["from s2"]}
+
+
+def test_a_reopened_session_drops_a_page_read_before_it_was_closed():
+    got = js_async(["sessions.js"], READS + """(async () => {
+        const st = sessionsState("r1");
+        openTranscript(st, "s1");
+        calls[0].resolve(page(["first"], 500));
+        await tick();
+        readTranscript(st, false);  // a follow read from 500, still out when the reader leaves
+        openTranscript(st, null);
+        openTranscript(st, "s1");  // read again from the start
+        const paths = calls.map((c) => c.path);
+        calls[1].resolve(page(["late"], 900));
+        await tick();
+        if (calls[2]) calls[2].resolve(page(["first"], 500));  // no third read: the reopened session is stranded
+        await tick();
+        return {paths: paths, after: shown(st)};
+    })()""", None)
+    assert got["paths"][1:] == ["/api/runs/r1/sessions/s1/transcript?after=500", "/api/runs/r1/sessions/s1/transcript?after=0"]
+    assert got["after"] == {"open": "s1", "loaded": True, "next": 500, "turns": ["first"]}

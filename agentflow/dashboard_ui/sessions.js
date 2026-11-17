@@ -85,15 +85,17 @@ function sessionsState(runId) {
   if (!st || st.runId !== runId) {
     st = ui.sessions = { runId: runId, rows: null, filter: { phase: null, role: null, failed: false }, open: null, turns: [], next: 0,
       size: 0, done: false, missing: false, session: null, loaded: false, error: null, turnsError: null, inflight: false, reading: false,
-      below: false };
+      below: false, epoch: 0 };
   }
   return st;
 }
 
-// Show `sid`'s transcript from its start (null: the list). A session opened again is read again.
+// Show `sid`'s transcript from its start (null: the list). A session opened again is read again. Each opening is a
+// new epoch: a read still out from an earlier one is dropped when it answers, and does not hold up this one's reads.
 function openTranscript(st, sid) {
   if (st.open === sid) return;
-  Object.assign(st, { open: sid, turns: [], next: 0, size: 0, done: false, missing: false, session: null, loaded: false, turnsError: null, below: false });
+  Object.assign(st, { open: sid, turns: [], next: 0, size: 0, done: false, missing: false, session: null, loaded: false, turnsError: null, below: false,
+    epoch: st.epoch + 1, reading: false });
   if (sid) readTranscript(st, false);
 }
 
@@ -126,21 +128,26 @@ async function loadSessions(runId) {
 }
 
 // The next page of the open transcript, from `next`, appended. `follow`: keep the page at its bottom afterwards.
+// A page that answers after the session was closed or opened again (another epoch), or after `next` moved, is dropped.
 async function readTranscript(st, follow) {
   const sid = st.open;
   if (!sid || st.reading) return;
   st.reading = true;
+  const epoch = st.epoch;
+  const after = st.next;
+  const current = () => ui.sessions === st && st.epoch === epoch && st.open === sid && st.next === after;
   let page = null;
   try {
-    page = await api(runPath(st.runId) + "/sessions/" + encodeURIComponent(sid) + "/transcript?after=" + st.next);
+    page = await api(runPath(st.runId) + "/sessions/" + encodeURIComponent(sid) + "/transcript?after=" + after);
   } catch (err) {
-    if (ui.sessions === st && st.open === sid) {
+    if (current()) {
       if (st.loaded) toast("Could not read more of the transcript: " + err.message);
       else st.turnsError = err.message;
     }
   }
+  if (st.epoch !== epoch) return;  // `reading` is the newer epoch's now
   st.reading = false;
-  if (ui.sessions !== st || st.open !== sid) return;
+  if (!current()) return;
   const grew = !!page && ((page.turns || []).length > 0 || page.next !== st.next);
   if (page) {
     st.turns = mergeTurns(st.turns, page.turns || []);
