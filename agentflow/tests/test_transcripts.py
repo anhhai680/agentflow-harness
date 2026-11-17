@@ -8,24 +8,7 @@ from agentflow import transcripts
 from agentflow.run_files import read_range
 from agentflow.sessions import find_session, transcript_file
 from agentflow.transcripts import parse_lines, transcript_page
-
-
-def L(obj) -> bytes:
-    return json.dumps(obj).encode()
-
-
-def session_with_transcript(flow_repo, lines=0, width=0, raw=None, tail=b""):
-    run, key = flow_repo.new_run(), "build/build/task-1/implement"
-    run.emit("agent_started", step=key, pid=None, agent="claude", model="sonnet", effort="high", role="build",
-             session_id="x1", sizer=False)
-    run.emit("agent_exited", session_id="x1", exit_code=0, cost=0.0, key=key)
-    body = b"".join(L({"type": "assistant", "message": {"content": [{"type": "text", "text": "w" * width}]}}) + b"\n"
-                    for _ in range(lines))
-    body += b"".join(r + b"\n" for r in raw or []) + tail
-    path = run.transcript_path(key, 1)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(body)
-    return run, "s2"
+from conftest import L, session_with_transcript
 
 
 def test_turns_read_like_a_conversation():

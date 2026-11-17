@@ -658,13 +658,6 @@ def _tail(root: Path, path: Path, limit: int = TAIL_BYTES) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _newest(folder: Path, pattern: str) -> Path | None:
-    if folder.is_symlink() or not folder.is_dir():
-        return None
-    files = [p for p in folder.glob(pattern) if p.is_file() and not p.is_symlink()]
-    return max(files, key=lambda p: p.stat().st_mtime_ns) if files else None
-
-
 def run_detail(run: Run, cfg: Config, raw: bool = False) -> dict:
     """What the run page shows (see the module docstring); `raw` adds the whole `state.json`."""
     state = run.state
@@ -676,7 +669,7 @@ def run_detail(run: Run, cfg: Config, raw: bool = False) -> dict:
             gates.append({"key": key, "gate": entry.get("gate"), "passed": entry.get("passed"),
                           "skipped": entry.get("skipped"),
                           "log_tail": _tail(root, Path(log), GATE_TAIL_BYTES) if isinstance(log, str) and log else ""})
-    transcript = _newest(root / "transcripts", "*.jsonl")
+    events = run.events.read()
     waiting = state.get("waiting") or {}
     workflow = run_workflow(run, cfg)
     metrics = run_metrics_view(run, cfg)
@@ -707,7 +700,8 @@ def run_detail(run: Run, cfg: Config, raw: bool = False) -> dict:
         "live_agents": [{"label": step_title(str(row.get("step") or "")), "key": row.get("step"),
                          "model": row.get("model"), "effort": row.get("effort"), "session_id": row.get("session_id")}
                         for row in _live_agents(state)],
-        "timeline": run.events.read()[-TIMELINE_MAX:],
+        "session_count": sum(1 for e in events if e.get("type") == "agent_started"),
+        "timeline": events[-TIMELINE_MAX:],
         "workflow": workflow,
         "gates": gates,
         "reviews": state.get("reviews") or {},
@@ -715,8 +709,6 @@ def run_detail(run: Run, cfg: Config, raw: bool = False) -> dict:
         "progress": _tail(run.agent_dir, run.progress_path()),  # the agent's notes, in its workspace
         "handoff": _tail(root, run.handoff_path()),
         "inbox": _tail(root, run.inbox_path(waiting["key"])) if waiting.get("key") else "",
-        "transcript": _tail(root, transcript) if transcript else "",
-        "transcript_file": transcript.name if transcript else None,
         "attach": f"agentflow attach {run.id}",
         "artifact_tabs": artifact_tabs(lane_phases(cfg, str(state.get("pipeline") or ""))),
     }
