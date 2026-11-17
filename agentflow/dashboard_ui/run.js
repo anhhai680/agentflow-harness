@@ -5,8 +5,8 @@
 // Every view has a URL: `#/<view>` for a header tab, `#/run/<id>[/<tab>[/<sub>]]` for one run. A reload or Back
 // lands where the reader was. `sub` names a phase, `decision` or a file the tab opens and scrolls to.
 
-const RUN_TABS = ["overview", "spec", "plan", "activity", "gates", "files"];
-const RUN_TAB_LABEL = { overview: "Overview", spec: "Spec", plan: "Plan", activity: "Activity", gates: "Gates", files: "Files" };
+const RUN_TABS = ["overview", "spec", "plan", "agents", "activity", "gates", "files"];
+const RUN_TAB_LABEL = { overview: "Overview", spec: "Spec", plan: "Plan", agents: "Agents", activity: "Activity", gates: "Gates", files: "Files" };
 const DECISION_ACTIONS = ["approve", "answer", "reject"];
 const RAIL_MARK = { done: "✓", approved: "✓", failed: "✗", waiting: "◆", awaiting_approval: "◆", running: "●", refining: "●", skipped: "–" };
 
@@ -148,10 +148,11 @@ function bannerNodes(detail) {
   ];
 }
 
-function attachNode(detail) {
-  const attach = el("input", { type: "text", value: detail.attach, readonly: "readonly", "aria-label": "attach command" });
+// The command that attaches a terminal to a live session, with a Copy button: drawn on each live row of the Agents tab.
+function attachNode(command) {
+  const attach = el("input", { type: "text", value: command, readonly: "readonly", "aria-label": "attach command" });
   const copy = el("button", { type: "button", text: "Copy", onclick: () => {
-    navigator.clipboard.writeText(detail.attach).then(() => toast("Copied: run it in your terminal"), () => { attach.select(); toast("Press Ctrl-C / ⌘C to copy"); });
+    navigator.clipboard.writeText(command).then(() => toast("Copied: run it in your terminal"), () => { attach.select(); toast("Press Ctrl-C / ⌘C to copy"); });
   } });
   return el("div", { class: "attach" }, attach, copy);
 }
@@ -204,6 +205,7 @@ function runTabEntries(detail, tab, sub) {
   if (tab === "files") {
     return fileEntries(detail, sub);
   }
+  if (tab === SESSIONS_TAB) return sessionEntries(detail, sub);
   const current = sub ? null : detail.facts.phase;  // with nothing named, the phase the run is in starts open
   const asked = decisionData(detail);
   const decision = asked.waiting || asked.actions.length ? [entry("decision", asked, () => decisionNode(detail))] : [];
@@ -220,8 +222,10 @@ function renderRunTab(detail, tab, sub) {
   patchChildren(body, runTabEntries(detail, tab, sub), entryKey, entryNode);
   if (isArtifactTab(tab)) return;
   if (tab === "activity") patchTimeline(childByKey(body, "timeline"), detail.timeline);
-  else if (tab !== "gates" && tab !== "files") patchTimeline(childByKey(body, "recent"), detail.timeline.slice(-10));
+  else if (tab !== "gates" && tab !== "files" && tab !== SESSIONS_TAB) patchTimeline(childByKey(body, "recent"), detail.timeline.slice(-10));
 }
+
+const runTabLabel = (detail, tab) => (tab === SESSIONS_TAB ? "Agents (" + detail.session_count + ")" : RUN_TAB_LABEL[tab]);
 
 function renderRun(detail) {
   const run = ui.run;
@@ -229,9 +233,9 @@ function renderRun(detail) {
   $("run-banner").hidden = !detail.waiting;
   $("run-banner").replaceChildren(...(detail.waiting ? bannerNodes(detail) : []));
   $("run-rail").replaceChildren(stageRailNode(detail.stage_rail, detail.run_id));
-  $("run-actions").replaceChildren(...actionNodes(detail, detail.actions.filter((a) => !DECISION_ACTIONS.includes(a))), attachNode(detail));
+  $("run-actions").replaceChildren(...actionNodes(detail, detail.actions.filter((a) => !DECISION_ACTIONS.includes(a))));
   $("run-tabs").replaceChildren(...visibleTabs(detail).map((tab) => el("a", {
-    href: routeHash({ view: "run", run: detail.run_id, tab: tab }), text: RUN_TAB_LABEL[tab], "aria-current": tab === run.tab ? "page" : null,
+    href: routeHash({ view: "run", run: detail.run_id, tab: tab }), text: runTabLabel(detail, tab), "aria-current": tab === run.tab ? "page" : null,
   })));
   renderRunTab(detail, run.tab, run.sub);
 }
@@ -267,6 +271,7 @@ function openRun(id, tab, sub) {
   if (same && prev.tab !== tab) {  // the tasks and the files change while a stopped run sends no event: fetch them again on return
     if (tab === PLAN_TAB && ui.plan && ui.plan.runId === id && planMode(sub, !!(ui.plan.data && ui.plan.data.started)) === "tasks") loadPlan(id);
     if (tab === FILES_TAB && ui.files && ui.files.runId === id) { ui.files.error = null; loadFiles(id); }  // a first-load error gets its retry here
+    if (tab === SESSIONS_TAB && ui.sessions && ui.sessions.runId === id) { ui.sessions.error = null; loadSessions(id); }  // sessions that started meanwhile
   }
 }
 

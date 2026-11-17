@@ -944,7 +944,7 @@ def test_hidden_wins_over_an_author_display_rule():
 def test_runs_have_hash_routes():
     source = page_source()
     for needle in ('"#/run/"', "hashchange", "function parseRoute", "function routeHash",
-                   'RUN_TABS = ["overview", "spec", "plan", "activity", "gates", "files"]'):
+                   'RUN_TABS = ["overview", "spec", "plan", "agents", "activity", "gates", "files"]'):
         assert needle in source, needle
 
 
@@ -1892,7 +1892,7 @@ def test_run_detail_names_the_artifact_tabs_its_lane_walks(dash):
 
 def test_the_run_page_has_spec_and_plan_tabs_only_where_the_lane_walks_them():
     run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
-    assert 'RUN_TABS = ["overview", "spec", "plan", "activity", "gates", "files"]' in run_js
+    assert 'RUN_TABS = ["overview", "spec", "plan", "agents", "activity", "gates", "files"]' in run_js
     assert "visibleTabs(detail)" in run_js and "artifact_tabs" in (UI_DIR / "artifact.js").read_text(encoding="utf-8")
 
 
@@ -1960,6 +1960,17 @@ def test_the_files_tab_lists_the_run_documents_and_the_changes():
     files_branch = run_js[run_js.index('tab === "files"'):run_js.index("}", run_js.index('tab === "files"'))]
     assert "fileEntries(" in files_branch and '"file:handoff"' not in run_js and '"file:progress"' not in run_js
     assert UI_SCRIPTS.index("plan.js") < UI_SCRIPTS.index("files.js") < UI_SCRIPTS.index("main.js")
+
+
+def test_the_run_page_has_an_agents_tab_with_a_transcript_viewer():
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    assert 'RUN_TABS = ["overview", "spec", "plan", "agents", "activity", "gates", "files"]' in run_js
+    s = (UI_DIR / "sessions.js").read_text(encoding="utf-8")
+    for needle in ("/sessions", "/transcript?after=", "Load more", "No transcript was written",
+                   "Following this session live", "New turns below", "ui.sessions"):
+        assert needle in s, needle
+    main = (UI_DIR / "main.js").read_text(encoding="utf-8")
+    assert "transcriptFollow(" in main
 
 
 def test_no_two_ui_scripts_declare_the_same_top_level_name():

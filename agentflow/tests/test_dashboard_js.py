@@ -95,3 +95,26 @@ def test_only_a_run_without_a_branch_reads_no_branch_yet():
     assert js(["files.js"], none, {"facts": {"branch": None}}) is True
     assert js(["files.js"], none, {"facts": {"branch": "flow/x"}}) is False
     assert js(["files.js"], none, None) is True  # no detail to say otherwise: the old answer
+
+
+def test_tool_results_attach_to_their_call_across_pages():
+    have = js(["sessions.js"], "mergeTurns([], args)", [{"kind": "tool", "id": "t1", "line": "Bash: ls"},
+                                                       {"kind": "wait", "records": 2, "seconds": 5}])
+    merged = js(["sessions.js"], "mergeTurns(args.have, args.page)",
+                {"have": have, "page": [{"kind": "wait", "records": 3, "seconds": 40},
+                                        {"kind": "tool_result", "id": "t1", "text": "a b", "is_error": False},
+                                        {"kind": "tool_result", "id": "zz", "text": "orphan", "is_error": True}]})
+    assert merged[0]["result"] == "a b" and merged[1] == {"kind": "wait", "records": 5, "seconds": 40}
+    assert [t["kind"] for t in merged] == ["tool", "wait", "tool_result"]
+    assert js(["sessions.js"], "waitText(args)", {"kind": "wait", "records": 4, "seconds": None}) == "waited (4 updates)"
+
+
+def test_sessions_group_live_first_then_by_phase_and_filter():
+    rows = [{"id": "s9", "phase": "build", "live": True, "exit_code": None, "role": "build"},
+            {"id": "s8", "phase": "build", "live": False, "exit_code": 1, "role": "build"},
+            {"id": "s5", "phase": "plan", "live": False, "exit_code": 0, "role": "plan"},
+            {"id": "s3", "phase": "build", "live": False, "exit_code": 0, "role": "review"}]
+    groups = js(["sessions.js"], "groupSessions(args).map(g => [g.phase, g.rows.map(r => r.id)])", rows)
+    assert groups == [["live", ["s9"]], ["build", ["s8", "s3"]], ["plan", ["s5"]]]
+    failed = js(["sessions.js"], "filterSessions(args, {phase: null, role: null, failed: true}).map(r => r.id)", rows)
+    assert failed == ["s8"]

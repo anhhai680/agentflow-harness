@@ -100,8 +100,9 @@ from agentflow.views import agents_view, board, lessons_view, metrics_view, run_
 
 PAGE = Path(__file__).resolve().with_name("dashboard.html")
 UI_DIR = Path(__file__).resolve().with_name("dashboard_ui")
-UI_SCRIPTS = ("core.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js", "workflow.js", "agents.js", "metrics.js", "lessons.js",
-              "settings.js", "main.js")  # in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
+# in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
+UI_SCRIPTS = ("core.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js",
+              "sessions.js", "workflow.js", "agents.js", "metrics.js", "lessons.js", "settings.js", "main.js")
 UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024
 DEFAULT_BOARD_REFRESH_S = 2.0  # the most often the page refetches the Board while events arrive
