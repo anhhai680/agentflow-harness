@@ -19,6 +19,10 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 - When a step ran the affected tier, `finish` runs the full `verify` set once on the committed tree it is about to audit and push, reusing any pass that still holds there, so the audit has its evidence. A failure goes to a session of the `sync` step at the full tier (`ship/finish/final_fix`, with its fix loop), and the runner commits its fix before the audit, and a stopped `final_fix` session resumes on approval before anything else in `finish`. With no `sync` fix loop, or once that session is done, it is the audit's usual `gate_failed` stop. A run with no affected-tier result finishes as before.
 - `ci.early_pr_after` (`""`, off, by default): the runner pushes the branch and opens the draft pull request as soon as the named phase is approved (`pr_opened` with `early: true`), so CI runs while review does. It is a draft only: `finish` still audits the final tree, then pushes it and updates the description (`pr_updated`) instead of opening another, and marking it ready still needs the audit and a green CI: the `ci` step watches it only after `finish` updated it, and reads its checks only while its head on GitHub is the sha the runner pushed last, the merge `finish` pushes again for a conflicting pull request included. A GitHub or push failure then is `early_pr_failed` and never stops the run; `finish` opens the pull request as usual. `validate` wants a phase before the one holding `finish`.
 
+### Fixed
+
+- The Spec and Plan tabs refetch their revisions and findings when you come back to them, flag a cut diff (and round its size up), keep your line comments in **Request changes** while you look at a diff, and list only the findings of their own phase or on their own files. A finding's line that is negative or longer than nine digits no longer breaks the findings panel.
+
 ## [2.8] - 2026-11-16
 
 ### Added

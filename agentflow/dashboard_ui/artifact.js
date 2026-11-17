@@ -75,6 +75,44 @@ function composeNote(path, sha, comments) {
   return ["Comments on " + path + " at " + String(sha).slice(0, 7) + ":"].concat(lines.map((c) => "L" + c[0] + ": " + c[1])).join("\n");
 }
 
+// Whether opening `tab` of run `id` refetches the list and findings kept from an earlier visit (`st`): the reader comes
+// back to an artifact tab from another tab, view or run, so what changed meanwhile shows. Another file or a scroll
+// target on the same tab does not. The reader's picked revision stays while the list still has it.
+function reopensArtifact(prev, id, tab, st) {
+  if (!isArtifactTab(tab) || !st || st.runId !== id) return false;
+  return !(prev && prev.id === id && prev.tab === tab);
+}
+
+// The UTF-8 length of `s`, as the server counts it (a lone surrogate is U+FFFD's 3 bytes).
+function utf8Bytes(s) {
+  let n = 0;
+  for (const ch of s) { const c = ch.codePointAt(0); n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4; }
+  return n;
+}
+
+// The head's "Showing the first N KB" for the document the mode draws: the text (`text`, a read of /artifact) in
+// Rendered and Raw, the diff (`diff`, a read of /artifact/diff) in Diff; either is undefined while it is read. N rounds
+// up, so a cut just under a 16 KB cap reads 16 KB.
+function sizeNote(mode, text, diff) {
+  const doc = mode === "diff" ? diff : text;
+  if (!doc || !doc.truncated) return { truncated: false, kb: 0 };
+  return { truncated: true, kb: Math.ceil(utf8Bytes(String((mode === "diff" ? doc.diff : doc.text) || "")) / 1024) };
+}
+
+// The resolved sha of the revision a read shows (a text's `sha`, a diff's `to`), else the one asked for. `head` is the
+// run branch's tip, which only a read resolves.
+function shownSha(asked, read) {
+  const got = read && (typeof read.to === "string" && read.to ? read.to : read.sha);
+  return typeof got === "string" && got ? got : asked;
+}
+
+// The findings rows for an artifact of `phase` whose files are `paths`: the rows of that phase's steps, and any other
+// row with a finding on one of those files. A step's key starts with its phase.
+function findingRows(rows, phase, paths) {
+  return (rows || []).filter((row) => String(row.key || "").split("/")[0] === phase
+    || (row.findings || []).some((f) => paths.includes(f.file)));
+}
+
 // RUN_TABS minus Spec and Plan where the lane does not walk them.
 function visibleTabs(detail) {
   const has = (detail && detail.artifact_tabs) || [];
@@ -292,14 +330,15 @@ function headNode(d) {
       navigator.clipboard.writeText(d.path).then(() => toast("Copied " + d.path), () => toast("Press Ctrl-C / ⌘C to copy " + d.path));
     } }),
     d.lines !== null ? el("span", { class: "muted", text: d.lines + " lines" }) : null,
-    d.truncated ? el("span", { class: "st-wait", text: "Showing the first " + d.shownKb + " KB of " + d.path + "." }) : null);
+    d.truncated ? el("span", { class: "st-wait", text: "Showing the first " + d.shownKb + " KB of " + (d.mode === "diff" ? "the diff of " : "") + d.path + "." }) : null);
 }
 
 // ---- the decision bar, under the document it decides on
 
+// The comments on the drawn document's revision: in Diff, the revision diffed to (the selected one).
 function noteOfShown(st) {
   const shown = st.shown && st.shown.data;
-  if (!shown || shown.mode === "diff" || !shown.rsha) return { count: 0, note: "" };
+  if (!shown || !shown.rsha) return { count: 0, note: "" };
   const map = commentsFor(st.runId, shown.path, shown.rsha);
   return { count: countComments(map), note: composeNote(shown.path, shown.rsha, commentPairs(map)) };
 }
@@ -364,12 +403,12 @@ function artifactEntries(detail, kind, sub) {
   const mode = st.mode;
   const paths = st.list.filter((a) => a.kind === kind).map((a) => a.path);
   const loaded = sha ? st.texts.get(file.path + "@" + sha) : null;
-  const rows = st.findings || [];
+  const diffKey = file.path + "@" + previous + ".." + sha;
+  const rows = findingRows(st.findings, file.phase, paths);
   const parts = [];
-  const shown = loaded;
+  const size = sizeNote(mode, loaded, mode === "diff" ? st.diffs.get(diffKey) : null);
   parts.push(entry("art:head", { kind: kind, path: file.path, paths: paths, revisions: revisions, sha: sha, merged: merged, mode: mode, previous: previous,
-    lines: shown ? shown.lines : null, truncated: !!(shown && shown.truncated),
-    shownKb: shown ? Math.floor(new TextEncoder().encode(shown.text || "").length / 1024) : 0 }, headNode));
+    lines: loaded ? loaded.lines : null, truncated: size.truncated, shownKb: size.kb }, headNode));
   if (!sha) return [...parts, ...artifactNote("art:nodoc", "This " + kind + " has no revision to show.")];
   let body;
   const note = (key, text) => entry(key, text, (t) => el("p", { class: "muted art-note", text: t }));
@@ -383,15 +422,15 @@ function artifactEntries(detail, kind, sub) {
     return note("art:wait", "Loading " + what + "…");
   };
   if (mode === "diff") {
-    const diffKey = file.path + "@" + previous + ".." + sha;
     fetchOnce(st, st.diffs, diffKey, diffQuery(file.path, previous, sha), "the diff");
-    body = choose(st.diffs, diffKey, "the diff", () => draw("art:doc:" + diffKey + ":diff", { mode: "diff", diffKey: diffKey, path: file.path }));
+    body = choose(st.diffs, diffKey, "the diff", () => draw("art:doc:" + diffKey + ":diff",
+      { mode: "diff", diffKey: diffKey, path: file.path, rsha: shownSha(sha, st.diffs.get(diffKey)) }));
   } else {
     const textKey = file.path + "@" + sha;
     fetchOnce(st, st.texts, textKey, artifactQuery(file.path, sha), file.path);
     body = choose(st.texts, textKey, file.path, () => {
       const blocks = mode === "rendered" ? parseMarkdown(loaded.text || "") : [];
-      const rsha = loaded.sha || sha;  // the resolved sha: `head` is the run branch's tip
+      const rsha = shownSha(sha, loaded);  // the resolved sha: `head` is the run branch's tip
       recordViewed(st.runId, file.path, rsha);
       return draw("art:doc:" + textKey + ":" + mode,
         { mode: mode, path: file.path, sha: sha, rsha: rsha, crev: st.crev, raw: mode === "raw" ? rawMarks(rows, file.path) : {}, gutter: mode === "rendered" ? gutterMarks(blocks, rows, file.path) : {} });

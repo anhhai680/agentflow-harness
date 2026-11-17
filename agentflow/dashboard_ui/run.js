@@ -267,6 +267,7 @@ function openRun(id, tab, sub) {
   if (same && prev.detail) showRun(prev.detail);
   else if (!same) renderRunNote("Loading " + id + "…");
   loadRun(id);
+  if (reopensArtifact(prev, id, tab, ui.artifact)) loadArtifacts(id);  // revisions and findings that came meanwhile
 }
 
 function showRun(detail) {

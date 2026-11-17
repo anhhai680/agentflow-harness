@@ -390,17 +390,20 @@ def artifact_diff(run: Run, repo: Path, path: str, from_sha: str, to_sha: str, m
 
 # -- findings
 
-_DIGITS = re.compile(r"\d+")
+_DIGITS = re.compile(r"-?\d+")
+_LINE_MAX = 999_999_999  # nine digits: past any file, and `int()` never sees a long string
 
 
 def _line(value: object) -> int | None:
-    """A line number: an int above 0, or the first run of digits in a string. Anything else is None."""
+    """A line number: an int in 1.._LINE_MAX, or the first run of digits in a string (`"34-40"` is 34). A negative
+    number (`"-5"`, `"L-5"`), a run of more than nine digits, or anything else is None. Never raises."""
     if isinstance(value, bool):
         return None
     if isinstance(value, str):
         found = _DIGITS.search(value)
-        value = int(found.group()) if found else None
-    return value if isinstance(value, int) and value > 0 else None
+        digits = found.group() if found else "-"
+        value = int(digits) if not digits.startswith("-") and len(digits) <= len(str(_LINE_MAX)) else None
+    return value if isinstance(value, int) and 0 < value <= _LINE_MAX else None
 
 
 def _finding(raw: object) -> dict:

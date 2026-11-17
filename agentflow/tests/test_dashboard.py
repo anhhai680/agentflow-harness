@@ -1884,6 +1884,17 @@ def test_the_note_cap_matches_the_server():
     assert f"NOTE_MAX = {TEXT_MAX}" in (UI_DIR / "artifact.js").read_text(encoding="utf-8")
 
 
+def test_the_viewed_cap_matches_the_server():
+    from agentflow.dashboard import VIEWED_MAX
+    assert f"VIEWED_CAP = {VIEWED_MAX}" in (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+
+
+def test_returning_to_an_artifact_tab_refetches_its_list_and_findings():
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    opener = run_js[run_js.index("function openRun"):run_js.index("function showRun")]
+    assert "reopensArtifact(prev, id, tab, ui.artifact)" in opener and "loadArtifacts(id)" in opener
+
+
 def test_a_phase_approval_from_the_page_sends_what_was_viewed():
     board_js = (UI_DIR / "board.js").read_text(encoding="utf-8")
     flow = board_js[board_js.index("function approveFlow"):board_js.index("function needNode")]

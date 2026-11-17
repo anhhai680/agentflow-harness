@@ -254,3 +254,67 @@ def test_comments_compose_into_one_line_anchored_note():
               [[65, "repeat loop\n takes  locks"], [34, "Scope 3 contradicts the code"], [50, "  "]])
     assert note == ("Comments on docs/specs/x.md at abcdef0:\n"
                     "L34: Scope 3 contradicts the code\nL65: repeat loop takes locks")
+
+
+def test_coming_back_to_an_artifact_tab_refetches_and_moving_within_it_does_not():
+    reopens = "reopensArtifact(args.prev, 'r1', args.tab, args.st)"
+    st = {"runId": "r1", "list": []}
+    case = lambda prev, tab, state=st: js(["artifact.js"], reopens, {"prev": prev, "tab": tab, "st": state})  # noqa: E731
+    assert case({"id": "r1", "tab": "overview"}, "spec") is True  # Spec -> Overview -> Spec
+    assert case(None, "spec") is True  # Spec -> Board -> the same run's Spec
+    assert case({"id": "r2", "tab": "spec"}, "spec") is True  # from another run
+    assert case({"id": "r1", "tab": "spec"}, "spec") is False  # another file or a scroll target on the same tab
+    assert case({"id": "r1", "tab": "overview"}, "gates") is False  # not an artifact tab
+    assert case(None, "spec", {"runId": "r2", "list": []}) is False  # no state of this run: the tab loads it anyway
+    assert case(None, "spec", None) is False
+    assert case(None, "spec", {"runId": "r1", "list": None, "error": "HTTP 500"}) is True  # a failed first load is tried again
+
+
+def test_the_viewed_list_drops_an_unresolved_head_and_keeps_the_newest_up_to_the_cap():
+    expr = ("this.ui = {viewed: new Map()};"
+            "recordViewed('r', 'p.md', 'head');"
+            "for (let i = 0; i < 150; i++) recordViewed('r', 'p.md', i.toString(16).padStart(7, '0'));"
+            "recordViewed('r', 'p.md', 'head');"
+            "viewedList('r')")
+    got = js(["artifact.js"], expr, None)
+    assert len(got) == 100 and all(v["sha"] != "head" for v in got)
+    assert got[0] == {"path": "p.md", "sha": format(50, "07x")} and got[-1] == {"path": "p.md", "sha": format(149, "07x")}
+    assert js(["artifact.js"], "this.ui = {viewed: new Map()}; viewedList('none')", None) == []
+
+
+def test_the_size_note_is_the_drawn_documents_and_rounds_up():
+    note = lambda mode, text, diff: js(["artifact.js"], "sizeNote(...args)", [mode, text, diff])  # noqa: E731
+    text = {"text": "x" * 16383, "truncated": True}
+    diff = {"diff": "+y\n" * 10, "truncated": False}
+    assert note("rendered", text, diff) == {"truncated": True, "kb": 16}  # 16383 bytes reads 16 KB, not 15
+    assert note("raw", text, diff) == {"truncated": True, "kb": 16}
+    assert note("diff", text, diff) == {"truncated": False, "kb": 0}  # the diff drawn is whole
+    assert note("diff", None, {"diff": "é" * 8192 + "+", "truncated": True}) == {"truncated": True, "kb": 17}  # UTF-8 bytes
+    assert note("rendered", {"text": "x", "truncated": False}, {"diff": "", "truncated": True}) == {"truncated": False, "kb": 0}
+    assert note("diff", text, None) == {"truncated": False, "kb": 0}  # the diff is still being read
+
+
+def test_request_changes_in_diff_mode_carries_the_selected_revisions_comments():
+    full = "a" * 40
+    expr = ("this.ui = {comments: new Map()};"
+            "commentsFor('r', 'p.md', args.full).set(3, 'tighten this');"
+            "commentsFor('r', 'p.md', 'b'.repeat(40)).set(5, 'on another revision');"
+            "const data = {mode: 'diff', path: 'p.md', rsha: shownSha('head', {to: args.full, diff: ''})};"
+            "noteOfShown({runId: 'r', shown: {key: 'k', data: data}})")
+    got = js(["artifact.js"], expr, {"full": full})
+    assert got == {"count": 1, "note": "Comments on p.md at aaaaaaa:\nL3: tighten this"}
+    assert js(["artifact.js"], "shownSha('head', {sha: args})", full) == full
+    assert js(["artifact.js"], "shownSha(args, undefined)", full) == full
+
+
+def test_the_findings_are_the_artifacts_phases_or_on_its_files():
+    rows = [{"key": "define/spec_review", "findings": [{"file": "docs/specs/x.md"}]},
+            {"key": "plan/plan_review", "findings": [{"file": "docs/plans/x.md"}]},
+            {"key": "build/task_1/review", "findings": [{"file": "src/a.py"}]},
+            {"key": "build/task_2/review", "findings": [{"file": "src/b.py"}, {"file": "docs/plans/x.md", "line": 3}]},
+            {"key": "plan/plan_review", "findings": []}]
+    keys = js(["artifact.js"], "findingRows(args, 'plan', ['docs/plans/x.md']).map((r) => r.key)", rows)
+    assert keys == ["plan/plan_review", "build/task_2/review", "plan/plan_review"]
+    assert js(["artifact.js"], "findingRows(args, 'define', ['docs/specs/x.md']).map((r) => r.key)", rows) == [
+        "define/spec_review"]
+    assert js(["artifact.js"], "findingRows(null, 'define', []).length", None) == 0

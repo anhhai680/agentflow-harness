@@ -284,6 +284,15 @@ def test_findings_line_and_severity_are_cleaned(flow_repo):
     assert row["findings"][-1]["text"] == "a bare string"
 
 
+def test_a_negative_or_overlong_line_is_none_and_never_raises(flow_repo):
+    run = flow_repo.new_run()
+    run.emit("step_findings", key="define/spec_review", tree="", findings=[
+        {"line": "-5"}, {"line": "L-5"}, {"line": "9" * 5000}, {"line": "L" + "1" * 10}, {"line": 10 ** 12},
+        {"line": "34"}, {"line": "34-40"}, {"line": "L34"}, {"line": "see 12"}, {"line": 999_999_999}])
+    (row,) = run_findings(run)
+    assert [f["line"] for f in row["findings"]] == [None, None, None, None, None, 34, 34, 34, 12, 999_999_999]
+
+
 def test_findings_keep_review_results_apart_by_key(flow_repo):
     run = flow_repo.new_run()
     run.emit("step_findings", key="define/spec_review", tree="", findings=[{"text": "a"}])
