@@ -1864,3 +1864,93 @@ def test_dashboard_inbox_legacy_is_true_or_false(tmp_cfg):
         found = issues_for(tmp_cfg, {"dashboard": {"inbox_legacy": bad}})
         assert [i.path for i in found if i.level == "error"] == ["dashboard.inbox_legacy"], bad
     assert not errors(issues_for(tmp_cfg, {"dashboard": {"inbox_legacy": True}}))
+
+
+# --------------------------------------------------------------------------- route profiles
+
+
+def with_route(route: dict, doubt: bool = True):
+    """A `tmp_cfg` patch: the python pack (with the doubt review, so `plan` has three feature steps) and `route`."""
+    def patch(data: dict) -> None:
+        if doubt:
+            with_doubt(data)
+        data["route"] = route
+    return patch
+
+
+def route_issues(tmp_cfg, route: dict, doubt: bool = True) -> list[Issue]:
+    return issues_for(tmp_cfg, with_route(route, doubt))
+
+
+def test_route_defaults_are_off_with_the_grid(sparse_repo):
+    cfg = load_config(pack.pack_config(sparse_repo))
+    assert cfg.route.mode == "off"
+    assert cfg.route.lanes == ["feature"]
+    assert set(cfg.route.profiles) == {"XS", "S", "M", "L"}
+    assert cfg.route.profiles["S"].doubt_rounds == {"define": 1, "plan": 1}
+    assert cfg.route.profiles["XS"].per_task_review is False
+    assert cfg.route.profiles["XS"].skip == ("define/grill_open_questions", "define/spec_review", "plan/plan_review")
+    assert cfg.route.profiles["L"].per_task_review is True
+
+
+def test_the_default_grid_validates_clean(sparse_repo):
+    cfg = load_config(pack.pack_config(sparse_repo))
+    assert [i for i in validate(cfg, sparse_repo) if "route" in i.path] == []
+
+
+def test_the_python_pack_has_no_profiles(tmp_cfg):
+    cfg = load_config(tmp_cfg())
+    assert cfg.route.profiles == {}
+    assert cfg.route.mode == "off"
+
+
+@pytest.mark.parametrize("route, path, text", [
+    ({"mode": "sometimes"}, "route.mode", "off, observe, on"),
+    ({"lanes": ["nope"]}, "route.lanes", "unknown lane"),
+    ({"profiles": {"XL": {}}}, "route.profiles.XL", "XS, S, M, L"),
+    ({"profiles": {"S": {"grill": 1}}}, "route.profiles.S.grill", "skip, doubt_rounds, per_task_review"),
+    ({"profiles": {"S": {"skip": ["define/nope"]}}}, "route.profiles.S.skip", "no step 'nope'"),
+    ({"profiles": {"S": {"skip": ["nope/draft"]}}}, "route.profiles.S.skip", "not a phase"),
+    ({"profiles": {"S": {"skip": ["draft"]}}}, "route.profiles.S.skip", "<phase>/<id>"),
+    ({"profiles": {"S": {"skip": ["build/build"]}}}, "route.profiles.S.skip", "foreach"),
+    ({"profiles": {"S": {"doubt_rounds": {"define": 0}}}}, "route.profiles.S.doubt_rounds.define",
+     "the engine floor keeps at least one round"),
+    ({"profiles": {"S": {"doubt_rounds": {"nope": 1}}}}, "route.profiles.S.doubt_rounds.nope", "not a phase"),
+    ({"profiles": {"S": {"per_task_review": "no"}}}, "route.profiles.S.per_task_review", "true or false"),
+])
+def test_route_rejects_bad_values(tmp_cfg, route, path, text):
+    found = [i for i in route_issues(tmp_cfg, route) if i.level == "error" and i.path == path]
+    assert found, route_issues(tmp_cfg, route)
+    assert text in found[0].message
+
+
+def test_a_profile_may_not_drop_an_obligation(tmp_cfg):
+    found = route_issues(tmp_cfg, {"profiles": {"S": {"skip": ["verify/verify"]}}})
+    messages = [i.message for i in found if i.level == "error" and i.path == "route.profiles.S.skip"]
+    assert any("skipping verify/verify drops the obligation verified" in m for m in messages), found
+    found = route_issues(tmp_cfg, {"profiles": {"S": {"skip": ["ship/finish"]}}})
+    assert ("error", "route.profiles.S.skip") in errors(found)
+
+
+def test_a_profile_may_skip_a_step_no_obligation_needs(tmp_cfg):
+    found = route_issues(tmp_cfg, {"profiles": {"S": {"skip": ["define/contracts"]}}})
+    assert errors(found) == []
+    # an obligation for a lane the route does not cover does not protect the step: `red_then_green` is a bug lane's
+    found = route_issues(tmp_cfg, {"lanes": ["bug"], "profiles": {"S": {"skip": ["verify/verify"]}}})
+    assert ("error", "route.profiles.S.skip") in errors(found)  # `verified` covers bug too
+
+
+def test_skipping_every_plan_step_drops_plan_approved(tmp_cfg):
+    every = ["plan/plan", "plan/plan_reconcile", "plan/plan_review"]
+    found = route_issues(tmp_cfg, {"profiles": {"S": {"skip": every}}})
+    assert any(i.level == "error" and "plan_approved" in i.message for i in found), found
+    found = route_issues(tmp_cfg, {"profiles": {"S": {"skip": ["plan/plan_review"]}}})
+    assert errors(found) == []
+
+
+def test_route_on_with_no_profiles_warns(tmp_cfg):
+    found = route_issues(tmp_cfg, {"mode": "on"})
+    assert [i.message for i in found if i.path == "route.profiles"] == [
+        "route.mode is on but route.profiles is empty: every profile runs the full route"]
+    assert errors(found) == []
+    assert not [i for i in route_issues(tmp_cfg, {"mode": "off"}) if i.path == "route.profiles"]

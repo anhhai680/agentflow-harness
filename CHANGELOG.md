@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- `route`: profiles `XS`, `S`, `M` and `L` that skip steps, cap doubt rounds and drop per-task review, off by default (`route.mode`: `off`, `observe` or `on`). The engine ships the grid, `validate` keeps every obligation and the `finish` and `ci` steps out of a profile's reach, and the Settings form edits `route.mode`.
 - The Board filters by lane, status, "needs me" and a search over module, issue and branch, kept in the URL, and Done shows the newest `dashboard.done_shown` cards first with **Show all**.
 - Board cards show a phase progress strip, a "needs you" marker with how long it has waited, the live agent count and the step in words.
 - `dashboard.done_shown` (10 by default, 1–1000): how many Done cards the Board shows before **Show all**.

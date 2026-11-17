@@ -176,6 +176,15 @@ autonomy:
     red_test_passes: 2
     review_unresolved: 1
 
+route:                         # size a run at its start; a profile drops ceremony, never an obligation
+  mode: "off"                  # off | observe (decide and record a profile, run the full route) | on (apply it)
+  lanes: [feature]             # the lanes whose runs are sized
+  profiles:                    # smallest first; a pack that writes `phases:` writes its own `route`
+    XS: {skip: [define/grill_open_questions, define/spec_review, plan/plan_review], per_task_review: false}
+    S:  {doubt_rounds: {define: 1, plan: 1}, per_task_review: false}
+    M:  {doubt_rounds: {define: 2, plan: 1}}
+    L:  {}
+
 ci:
   poll_s: 60
   appear_min: 5

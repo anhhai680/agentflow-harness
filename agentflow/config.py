@@ -15,6 +15,7 @@ import shlex
 import string
 import subprocess
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -375,6 +376,26 @@ class Policy:
     disabled: tuple[str, ...] = ()  # engine default ids a layer switched off (and the floor, if nulled), for `validate`
 
 
+ROUTE_PROFILES = ("XS", "S", "M", "L")  # smallest first
+ROUTE_MODES = ("off", "observe", "on")
+ROUTE_PROFILE_KEYS = ("skip", "doubt_rounds", "per_task_review")
+
+
+@dataclass(frozen=True)
+class RouteProfile:
+    """What one size of change drops from its route: steps (`<phase>/<id>`), doubt rounds above a cap, per-task review."""
+    skip: tuple[str, ...] = ()
+    doubt_rounds: Mapping[str, int] = field(default_factory=dict)  # a phase: the most doubt rounds it gets
+    per_task_review: bool = True
+
+
+@dataclass
+class Route:
+    mode: str = "off"  # off | observe (decide and record a profile, run the full route) | on (apply it)
+    lanes: list[str] = field(default_factory=lambda: ["feature"])  # the lanes whose runs are sized
+    profiles: dict[str, RouteProfile] = field(default_factory=dict)
+
+
 GATE_TIERS = ("full", "affected")  # a step's `gate_tier`: the gates' whole commands, or their `affected` ones
 AFFECTED_KEYS = ("run", "paths")
 
@@ -590,6 +611,7 @@ class Config:
     layer_origins: dict[tuple[str, ...], str] = field(default_factory=dict)  # each leaf of `merged`: its layer's name
     issues: IssuePolicy = field(default_factory=IssuePolicy)  # what a run started from an issue does on GitHub
     policy: Policy = field(default_factory=Policy)  # the obligations a finished run must show evidence for
+    route: Route = field(default_factory=Route)  # how much ceremony a run's route gets (`route.py` reads it)
 
 
 def _holds_finish(steps: list[Step]) -> bool:
@@ -1113,6 +1135,35 @@ def _switched_off(project: dict, merged: dict) -> tuple[str, ...]:
     return tuple(ids)
 
 
+def _build_route(raw: Any) -> Route:
+    """The `route` block as data. A wrong shape is an error here; a wrong value inside a profile (an unknown key, a
+    skip entry that names no step, a round count below 1) is left for `validate` to name, so it reads the text."""
+    if raw is None:
+        return Route()
+    if not isinstance(raw, dict):
+        raise ConfigError("route", "expected a mapping with `mode`, `lanes` and `profiles`")
+    profiles_raw = _optional(raw, "profiles", "route", dict, {})
+    profiles: dict[str, RouteProfile] = {}
+    for name, entry in profiles_raw.items():
+        path = f"route.profiles.{name}"
+        if entry is None:
+            entry = {}
+        if not isinstance(entry, dict):
+            raise ConfigError(path, "expected a mapping with `skip`, `doubt_rounds` and `per_task_review`")
+        skip = entry.get("skip")
+        rounds = entry.get("doubt_rounds")
+        review = entry.get("per_task_review", True)
+        profiles[str(name)] = RouteProfile(
+            skip=tuple(item for item in skip if isinstance(item, str)) if isinstance(skip, list) else (),
+            doubt_rounds={str(k): v for k, v in rounds.items() if isinstance(v, int) and not isinstance(v, bool)}
+            if isinstance(rounds, dict) else {},
+            per_task_review=review if isinstance(review, bool) else True,
+        )
+    return Route(mode=str(raw.get("mode", "off")),
+                 lanes=_string_list(raw.get("lanes", ["feature"]), "route.lanes"),
+                 profiles=profiles)
+
+
 def _build_policy(policy: dict, disabled: tuple[str, ...]) -> Policy:
     """The obligations, in layer order, then the engine floor, whatever the layers say. An evidence item that does
     not parse becomes `UNRECOGNISED`, which `conformance.evaluate` never counts as met, so a typo fails closed;
@@ -1248,6 +1299,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
         merged=merged,
         layer_origins=layer_origins,
         policy=_build_policy(policy, disabled),
+        route=_build_route(raw.get("route")),
     )
 
 
@@ -2123,6 +2175,103 @@ class _Validator:
                         self.add("warning" if engine else "error", at,
                                  f"'{evidence.arg}' is not a phase with needs_approval: true{off}")
 
+    def route(self) -> None:
+        """`route`: read from the text of the config, so a value the dataclass had to smooth over (an unknown key, a
+        round count of 0) is still named. A profile may not remove what an obligation needs as evidence."""
+        cfg = self.cfg
+        raw = cfg.raw.get("route")
+        if not isinstance(raw, dict):
+            return
+        mode = raw.get("mode", "off")
+        if mode not in ROUTE_MODES:
+            hint = " (quote it: YAML reads a bare `off` as false)" if mode is False else ""
+            self.error("route.mode", f"must be one of {', '.join(ROUTE_MODES)}{hint}")
+        for lane in cfg.route.lanes:
+            if lane not in cfg.lanes:
+                self.error("route.lanes", f"unknown lane '{lane}'; known: {', '.join(cfg.lanes)}")
+        profiles = raw.get("profiles")
+        if mode != "off" and not profiles:
+            self.add("warning", "route.profiles",
+                     "route.mode is on but route.profiles is empty: every profile runs the full route")
+        if not isinstance(profiles, dict):
+            return
+        route_lanes = [lane for lane in cfg.route.lanes if lane in cfg.lanes]
+        # what an obligation that covers a route lane needs: step ids, and phases whose approval it requires
+        needed_steps: dict[str, str] = {}
+        needed_phases: dict[str, str] = {}
+        for ob in cfg.policy.obligations.values():
+            if ob.lanes and not any(lane in ob.lanes for lane in route_lanes):
+                continue
+            for evidence in ob.require:
+                if evidence.kind == "step":
+                    needed_steps.setdefault(evidence.arg, ob.id)
+                elif evidence.kind == "approval":
+                    needed_phases.setdefault(evidence.arg, ob.id)
+        for name, entry in profiles.items():
+            where = f"route.profiles.{name}"
+            if name not in ROUTE_PROFILES:
+                self.error(where, f"a profile is one of {', '.join(ROUTE_PROFILES)}")
+            if not isinstance(entry, dict):
+                continue
+            for key in entry:
+                if key not in ROUTE_PROFILE_KEYS:
+                    self.error(_join(where, str(key)), f"unknown profile key; a profile has {', '.join(ROUTE_PROFILE_KEYS)}")
+            if "skip" in entry:
+                self._route_skip(_join(where, "skip"), entry["skip"], route_lanes, needed_steps, needed_phases)
+            if "doubt_rounds" in entry:
+                rounds = entry["doubt_rounds"]
+                if not isinstance(rounds, dict):
+                    self.error(_join(where, "doubt_rounds"), "doubt_rounds maps a phase to the most doubt rounds it gets")
+                    rounds = {}
+                for phase, count in rounds.items():
+                    at = _join(_join(where, "doubt_rounds"), str(phase))
+                    if phase not in cfg.phases:
+                        self.error(at, f"'{phase}' is not a phase; known: {', '.join(cfg.phases)}")
+                    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                        self.error(at, "rounds must be a whole number, 1 or more: the engine floor keeps at least one round")
+            if "per_task_review" in entry and not isinstance(entry["per_task_review"], bool):
+                self.error(_join(where, "per_task_review"), "per_task_review must be true or false")
+
+    def _route_skip(self, where: str, skip: Any, route_lanes: list[str], needed_steps: dict[str, str],
+                    needed_phases: dict[str, str]) -> None:
+        """One profile's `skip` list: each entry names a top-level step of a phase that no obligation, no `finish`
+        or `ci` step and no `foreach` step depends on, and no phase an approval is required for is left empty."""
+        cfg = self.cfg
+        if not isinstance(skip, list):
+            self.error(where, "skip is a list of `<phase>/<id>` entries")
+            return
+        skipped: dict[str, set[str]] = {}
+        for entry in skip:
+            phase_name, sep, step_id = entry.partition("/") if isinstance(entry, str) else ("", "", "")
+            if not sep or not phase_name or not step_id:
+                self.error(where, f"'{entry}' is not `<phase>/<id>`")
+                continue
+            phase = cfg.phases.get(phase_name)
+            if phase is None:
+                self.error(where, f"'{entry}': '{phase_name}' is not a phase; known: {', '.join(cfg.phases)}")
+                continue
+            step = next((s for s in phase.steps if s.id == step_id), None)
+            if step is None:
+                self.error(where, f"'{entry}': no step '{step_id}' in {phase_name}; a profile skips a top-level step")
+            elif step.type in ("finish", "ci"):
+                self.error(where, f"skipping {entry} is refused: the `{step.type}` step ends every run")
+            elif step.foreach:
+                self.error(where, f"skipping {entry} is refused: a `foreach` step is the build itself, which a "
+                           "profile trims by `per_task_review`")
+            elif step_id in needed_steps:
+                self.error(where, f"skipping {entry} drops the obligation {needed_steps[step_id]}")
+            else:
+                skipped.setdefault(phase_name, set()).add(step_id)
+        for phase_name, ids in skipped.items():
+            if phase_name not in needed_phases:
+                continue
+            for lane in route_lanes:
+                walked = {s.id for s in for_lane(cfg.phases[phase_name].steps, lane)}
+                if walked and walked <= ids:
+                    self.error(where, f"skipping {', '.join(f'{phase_name}/{i}' for i in sorted(ids))} drops the "
+                               f"obligation {needed_phases[phase_name]}: nothing of {phase_name} would run for {lane}")
+                    break
+
     def lessons(self) -> None:
         """The pack's lessons file (beside the config): each malformed entry, unknown phase and unknown target is
         a warning, since a bad entry is only left out of prompts. A passed `review_by` is never one, so the date
@@ -2399,6 +2548,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.policy()
     v.approval()
     v.autonomy()
+    v.route()
     v.overlays()
     v.dashboard()
     v.templates()

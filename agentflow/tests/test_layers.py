@@ -443,3 +443,14 @@ def test_a_null_obligation_switches_a_default_off():
     engine = L("engine", {"policy": {"obligations": {"a": {"require": ["step:verify"]}}}})
     merged, _ = merge([engine, L("project", {"policy": {"obligations": {"a": None}}})])
     assert merged["policy"]["obligations"] == {}
+
+
+def test_a_pack_that_writes_phases_drops_the_default_route():
+    low = L("engine", {**workflow(), "route": {"mode": "off", "profiles": {"S": {"per_task_review": False}}}})
+    high = L("project", {"lanes": {"bug": {"phases": ["fix"]}}, "phases": {"fix": {"steps": [{"skill": "f"}]}}})
+    merged, origins = merge([low, high])
+    assert "route" not in merged and not any(k[0] == "route" for k in origins)
+    assert "route" in layers.WORKFLOW_KEYS
+    own = L("project", {**high.data, "route": {"mode": "observe"}})
+    merged, _ = merge([low, own])
+    assert merged["route"] == {"mode": "observe"}  # the pack's own, with none of the default grid
