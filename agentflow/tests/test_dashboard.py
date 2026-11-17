@@ -338,7 +338,7 @@ def test_board_and_run_detail(dash):
     assert status == 200 and detail["run_id"] == planning.id
     assert "Tiến độ" in detail["progress"]
     assert detail["session_count"] == 0 and "transcript" not in detail and "transcript_file" not in detail
-    assert [e["type"] for e in detail["timeline"]][-1] == "phase_approval_raised"
+    assert detail["recent"][0]["type"] == "phase_approval_raised"
     assert detail["attach"] == f"agentflow attach {planning.id}"
 
 
@@ -2103,3 +2103,33 @@ def test_inbox_shortcuts_stay_out_of_text_fields_and_approve_takes_two_presses()
         assert needle in handler, needle
     assert "Press a again to approve" in inbox and "Dismiss" in inbox and "readOnly" in inbox
 
+
+
+def test_the_events_route_pages_the_whole_log(dash):
+    run = awaiting(dash.flow)
+    for n in range(30):
+        run.emit("gate_result", key="plan/plan", gate=f"g{n}", passed=True)
+    page = payload(dash.get(f"/api/runs/{run.id}/events?limit=10&kinds=gates")[2])
+    assert len(page["entries"]) == 10 and page["total"] == 30
+    rest = payload(dash.get(f"/api/runs/{run.id}/events?limit=50&kinds=gates&before={page['before']}")[2])
+    assert len(rest["entries"]) == 20 and rest["before"] is None
+
+
+@pytest.mark.parametrize("query", ["before=0", "before=x", "limit=0", "limit=501", "kinds=nope", "kinds=gates&kinds=stops",
+                                   "turns=yes", "limit=1&limit=2", "before=1&before=2", "turns=1&turns=1"])
+def test_the_events_route_refuses_bad_parameters(dash, query):
+    run = awaiting(dash.flow)
+    status, _, body = dash.get(f"/api/runs/{run.id}/events?{query}")
+    assert status == 400 and query.split("=")[0] in payload(body)["error"]
+
+
+def test_the_events_route_keeps_the_refusal_matrix(dash):
+    run = awaiting(dash.flow)
+    assert_refusal_matrix(dash, run, "events")
+
+
+def test_run_detail_carries_ten_recent_sentences_not_the_raw_timeline(dash):
+    run = awaiting(dash.flow)
+    detail = payload(dash.get(f"/api/runs/{run.id}")[2])
+    assert "timeline" not in detail and detail["recent"][0]["headline"] == "plan is done and waits for approval"
+    assert len(detail["recent"]) <= 10

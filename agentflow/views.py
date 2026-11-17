@@ -7,7 +7,7 @@
 - `agents_view(repo, cfg)`: every live agent process across runs, one row each (subagents nested), and
   the ones that exited in the last `dashboard.agents.show_exited_min` minutes.
 - `run_detail(run, cfg, raw)`: one run's facts, what it waits on, its steps' records, the actions its state
-  allows now, a label, a stage rail, its timeline, its walk of the workflow (`run_workflow`), its time and
+  allows now, a label, a stage rail, its 10 newest sentences (`recent`), its walk of the workflow (`run_workflow`), its time and
   cost (`run_metrics_view`) and size-capped tails of its files, read only through the run's own paths (no
   symlinks, nothing outside the run directory). `raw` adds the whole `state.json` for debugging.
 - `step_title(key)`: a step key in words (`Task 9 · implement · resolver 2`); `stage_rail` is one entry per phase.
@@ -32,6 +32,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from agentflow.activity import activity_page
 from agentflow.artifacts import artifact_tabs
 from agentflow.config import RETRO_PIPELINE, Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.events import parse_iso
@@ -53,7 +54,7 @@ STEP_STATUS = {"done": "done", "unchanged": "done", "skipped": "skipped", "faile
                "sizing": "running", "compacting": "running", "waiting_human": "waiting", "parked": "waiting"}
 TAIL_BYTES = 16 * 1024
 GATE_TAIL_BYTES = 8 * 1024
-TIMELINE_MAX = 300
+RECENT_SENTENCES = 10  # the newest sentences `run_detail` carries; the events route serves the rest
 DEFAULT_IDLE_MIN = 5
 DEFAULT_EXITED_MIN = 10
 DEFAULT_DONE_DAYS = 0  # 0 keeps every Done card: history stays until a developer deletes `runs/`
@@ -741,7 +742,7 @@ def run_detail(run: Run, cfg: Config, raw: bool = False) -> dict:
                          "model": row.get("model"), "effort": row.get("effort"), "session_id": row.get("session_id")}
                         for row in _live_agents(state)],
         "session_count": sum(1 for e in events if e.get("type") == "agent_started"),
-        "timeline": events[-TIMELINE_MAX:],
+        "recent": activity_page(events, None, (), RECENT_SENTENCES, turns=False)["entries"],
         "workflow": workflow,
         "gates": gates,
         "reviews": state.get("reviews") or {},

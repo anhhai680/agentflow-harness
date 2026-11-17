@@ -22,6 +22,8 @@ Routes:
 - `GET /api/runs/<id>/plan` (the plan's tasks with status, attempts, review, cost and blast radius),
   `/files[?name=]` (the run's documents, from a fixed list of names) and `/changes[?path=]` (the branch's own
   changes since it left the base, and one file's diff); a name or path outside what the server listed is a 404.
+- `GET /api/runs/<id>/events?before=&kinds=&limit=&turns=` (the run's whole log as sentences, newest first, by kind, in
+  pages by `seq`; `limit` is 1 to 500, 200 by default; a bad or doubled parameter is a 400 naming it).
 - `POST /api/runs/<id>/{approve,reject,answer,pause,resume,done,cancel,retry}` with a JSON body. Each action
   calls the same function as the CLI with `by="dashboard"`; reject, a complete answer, resume, done, retry and
   an approval inside a phase then start `flow.py resume <id>` detached (D13), unless a runner already holds
@@ -77,7 +79,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from agentflow import backlog, config_edit, hitl, module_queue, pack, preflight
+from agentflow import activity, backlog, config_edit, hitl, module_queue, pack, preflight
 from agentflow.artifacts import (
     SHA,
     NotFound,
@@ -115,9 +117,11 @@ MIN_TOKEN_CHARS = 22  # 128 bits of token_urlsafe
 RUN_ID = re.compile(r"^[0-9]{8}-[0-9]{4}-[a-z0-9]+(?:-[a-z0-9]+)*$")
 RUN_ID_MAX = 120
 RUN_ROUTE = re.compile(r"^/api/runs/([^/]+)$")
-ARTIFACT_ROUTE = re.compile(r"^/api/runs/([^/]+)/(artifacts|artifact|artifact/diff|findings|plan|files|changes|sessions)$")
+ARTIFACT_ROUTE = re.compile(r"^/api/runs/([^/]+)/(artifacts|artifact|artifact/diff|findings|plan|files|changes|sessions|events)$")
 TRANSCRIPT_ROUTE = re.compile(r"^/api/runs/([^/]+)/sessions/([^/]+)/transcript$")
 CURSOR = re.compile(r"[0-9]{1,15}")
+EVENTS_LIMIT_DEFAULT = 200
+EVENTS_LIMIT_MAX = 500
 ACTION_ROUTE = re.compile(r"^/api/runs/([^/]+)/([a-z]+)$")
 TEXT_MAX = backlog.TEXT_MAX
 BACKLOG_ROUTES = ("/api/backlog", "/api/backlog/start", "/api/backlog/remove")
@@ -567,6 +571,9 @@ class _Handler(BaseHTTPRequestHandler):
         if run is None:
             self._error(404, "no such run")
             return
+        if what == "events":
+            self._events_get(run, query)
+            return
         wanted = {"artifact": ("path", "sha"), "artifact/diff": ("path", "from", "to"),
                   "files": ("name",) if "name" in query else (),
                   "changes": ("path",) if "path" in query else ()}.get(what, ())
@@ -600,6 +607,37 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(404, str(exc))
             return
         self._json(200, result)
+
+    def _events_get(self, run: Run, query: dict) -> None:
+        """One page of the run's own log as sentences. Every parameter is sent at most once and checked first."""
+        values: dict[str, str | None] = {}
+        for name in ("before", "kinds", "limit", "turns"):
+            sent = query.get(name) or []
+            if len(sent) > 1:
+                self._error(400, f"{name} must be sent once")
+                return
+            values[name] = sent[0] if sent else None
+        before = None
+        if values["before"] is not None:
+            if not CURSOR.fullmatch(values["before"]) or not values["before"].isascii() or int(values["before"]) < 1:
+                self._error(400, "before must be a positive whole number")
+                return
+            before = int(values["before"])
+        limit = EVENTS_LIMIT_DEFAULT
+        if values["limit"] is not None:
+            text = values["limit"]
+            if not CURSOR.fullmatch(text) or not text.isascii() or not 1 <= int(text) <= EVENTS_LIMIT_MAX:
+                self._error(400, f"limit must be a whole number from 1 to {EVENTS_LIMIT_MAX}")
+                return
+            limit = int(text)
+        kinds = tuple(k for k in (values["kinds"] or "").split(",") if k)
+        if any(k not in activity.KINDS for k in kinds):
+            self._error(400, f"kinds must be a comma list of {', '.join(activity.KINDS)}")
+            return
+        if values["turns"] not in (None, "0", "1"):
+            self._error(400, "turns must be 0 or 1")
+            return
+        self._json(200, activity.activity_page(run.events.read(), before, kinds, limit, values["turns"] == "1"))
 
     def _metrics(self, query: dict) -> None:
         lane = (query.get("lane") or [None])[0] or None
