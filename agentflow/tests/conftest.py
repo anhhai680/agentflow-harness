@@ -472,6 +472,44 @@ def spec_run(flow_repo: FlowRepo, tmp_path: Path) -> SpecRun:
     return spec
 
 
+def awaiting(flow_repo: FlowRepo, module: str = "crm", phase: str = "plan"):
+    """A feature run for `module` that raised `phase`'s approval and waits on it."""
+    run = flow_repo.new_run({"module": module})
+    run.emit("phase_started", phase=phase)
+    run.emit("phase_approval_raised", phase=phase, round=0, summary=f"Phase {phase} is done")
+    return run
+
+
+PLAN5 = """# P
+### Task 1: One
+- [x] done
+### Task 2: Two
+**Depends on:** Task 1
+### Task 3: Three
+**Depends on:** Task 2
+### Task 4: Four
+**Depends on:** Task 2
+### Task 5: Five
+**Depends on:** Task 1
+"""
+
+
+@pytest.fixture
+def building(spec_run: SpecRun) -> SpecRun:
+    """spec_run (U1), plus the plan docs/plans/2026-11-16-crm.md, task 1 committed and task 2 blocked."""
+    spec_run.commit("plan/plan", write={"docs/plans/2026-11-16-crm.md": PLAN5})
+    run, p = spec_run.run, "build/build"
+    run.emit("phase_started", phase="build", start_sha=spec_run.head())
+    run.emit("step_started", key=f"{p}/task-1/implement")
+    run.emit("agent_started", key=f"{p}/task-1/implement", session_id="s1", pid=1, model="sonnet", effort="high")
+    run.emit("agent_exited", session_id="s1", exit_code=0, cost=1.25)
+    sha = spec_run.commit(f"{p}/task-1", write={"one.py": "x = 1\n"})
+    run.emit("task_committed", key=f"{p}/task-1", n=1, title="One", sha=sha, round=0)
+    run.emit("step_started", key=f"{p}/task-2/implement")
+    run.emit("hitl_raised", kind="blocked", key=f"{p}/task-2/implement/resolve-2", summary="floor_guard fails")
+    return spec_run
+
+
 # ---- the dashboard JS under node: each file runs in a bare context (no DOM), then one expression is read back
 NODE = shutil.which("node")
 LOADER = ("const fs=require('fs'),vm=require('vm');const ctx=vm.createContext({});"

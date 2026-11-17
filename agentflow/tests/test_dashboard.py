@@ -22,7 +22,7 @@ from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
 from agentflow.views import _badge, step_title
-from conftest import PYTHON_CONFIG, L, run_git, session_with_transcript
+from conftest import PYTHON_CONFIG, L, awaiting, run_git, session_with_transcript
 
 TOKEN = "k3y-" + "x" * 40
 AGENTFLOW = Path(__file__).resolve().parents[1]
@@ -82,13 +82,6 @@ def dash(flow_repo, monkeypatch):
     yield Dash(server, server.server_address[1], flow_repo, spawned)
     server.close()
     thread.join(timeout=5)
-
-
-def awaiting(flow_repo, module: str = "crm", phase: str = "plan") -> Run:
-    run = flow_repo.new_run({"module": module})
-    run.emit("phase_started", phase=phase)
-    run.emit("phase_approval_raised", phase=phase, round=0, summary=f"Phase {phase} is done")
-    return run
 
 
 def ready(flow_repo, module: str = "crm", phase: str = "plan", lane: str = "feature") -> Run:

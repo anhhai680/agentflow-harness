@@ -762,10 +762,11 @@ def remind_due(cfg: Config, repo: Path, now: datetime | None = None) -> list[str
     return due
 
 
-def inbox_items(repo: Path) -> list[dict]:
-    """One dict per thing a human can act on: each run's wait, then its parked questions (kind `parked`)."""
+def inbox_items(repo: Path, runs: list[Run] | None = None) -> list[dict]:
+    """One dict per thing a human can act on: each run's wait, then its parked questions (kind `parked`).
+    `runs` are the runs to read when the caller has loaded them already; else every run of `repo`."""
     items = []
-    for run in list_runs(repo):
+    for run in list_runs(repo) if runs is None else runs:
         waiting = run.state["waiting"]
         if run.state["status"] in TERMINAL:
             continue

@@ -1,39 +1,8 @@
 """plan_view: a run's plan tasks joined with its state (dashboard slice U2)."""
 
-import pytest
-
 from agentflow.plan_view import _under, dependents, run_plan, waves
 from agentflow.sources import parse_plan_text
-from agentflow.tests.conftest import run_git
-
-PLAN5 = """# P
-### Task 1: One
-- [x] done
-### Task 2: Two
-**Depends on:** Task 1
-### Task 3: Three
-**Depends on:** Task 2
-### Task 4: Four
-**Depends on:** Task 2
-### Task 5: Five
-**Depends on:** Task 1
-"""
-
-
-@pytest.fixture
-def building(spec_run):
-    """spec_run (U1), plus the plan docs/plans/2026-11-16-crm.md, task 1 committed and task 2 blocked."""
-    spec_run.commit("plan/plan", write={"docs/plans/2026-11-16-crm.md": PLAN5})
-    run, p = spec_run.run, "build/build"
-    run.emit("phase_started", phase="build", start_sha=spec_run.head())
-    run.emit("step_started", key=f"{p}/task-1/implement")
-    run.emit("agent_started", key=f"{p}/task-1/implement", session_id="s1", pid=1, model="sonnet", effort="high")
-    run.emit("agent_exited", session_id="s1", exit_code=0, cost=1.25)
-    sha = spec_run.commit(f"{p}/task-1", write={"one.py": "x = 1\n"})
-    run.emit("task_committed", key=f"{p}/task-1", n=1, title="One", sha=sha, round=0)
-    run.emit("step_started", key=f"{p}/task-2/implement")
-    run.emit("hitl_raised", kind="blocked", key=f"{p}/task-2/implement/resolve-2", summary="floor_guard fails")
-    return spec_run
+from agentflow.tests.conftest import PLAN5, run_git
 
 
 def test_a_blocked_task_names_what_it_holds_up(building, flow_repo):  # spec Verification U2

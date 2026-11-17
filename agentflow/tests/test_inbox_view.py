@@ -1,0 +1,87 @@
+"""inbox_view: each inbox item as a titled decision (dashboard slice U4)."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import pytest
+from conftest import awaiting
+
+from agentflow import hitl
+from agentflow.inbox_view import approve_note, inbox_view, item_title, split_cli
+
+
+@pytest.mark.parametrize("item, title", [
+    ({"kind": "phase_approval", "phase": "define", "key": "define_approved", "questions": []}, "Approve the spec"),
+    ({"kind": "phase_approval", "phase": "verify", "key": "verify_approved", "questions": []}, "Approve verify"),
+    ({"kind": "blocked", "key": "build/build/task-9/implement", "questions": []}, "Task 9 · implement is blocked"),
+    ({"kind": "parked", "key": "build/build/task-4/implement", "questions": [{"id": "q1"}, {"id": "q2"}]},
+     "Answer 2 questions (Task 4 · implement)"),
+    ({"kind": "dirty_tree", "key": "ship/finish", "questions": []}, "ship · finish stopped (dirty_tree)"),
+])
+def test_items_have_titles_in_words(item, title):
+    assert item_title(item) == title
+
+
+@pytest.mark.parametrize("kind, questions, expected", [
+    ("phase_approval", [], "none"), ("checkpoint", [], "none"), ("preflight_failed", [], "none"),
+    ("blocked_repeat", [], "required"), ("blocked", [], "optional"), ("needs_human", [{"id": "q"}], "none")])
+def test_the_note_follows_what_hitl_approve_accepts(kind, questions, expected):  # Review Focus 1
+    assert approve_note({"kind": kind, "questions": questions}) == expected
+
+
+def test_cli_lines_are_split_off():
+    body, cli = split_cli("# r: k\n\nfloor_guard fails.\n\nRun `agentflow approve r k --note \"…\"` to go on.\n\nMore.")
+    assert body == "# r: k\n\nfloor_guard fails.\n\nMore." and cli == ["Run `agentflow approve r k --note \"…\"` to go on."]
+
+
+def test_a_parked_question_and_a_wait_are_two_cards(flow_repo):  # Review Focus 2
+    run = flow_repo.new_run()
+    run.emit("phase_started", phase="build")
+    run.emit("step_parked", key="build/build/task-4/implement", summary="which db?", questions=[
+        {"id": "q1", "question": "Which db?", "options": [{"key": "A", "label": "pg", "recommended": True}],
+         "evidence": [], "kind": "choice"}])
+    run.emit("hitl_raised", kind="blocked", key="build/build/task-9/implement", summary="floor_guard")
+    items = inbox_view(flow_repo.root, flow_repo.cfg, datetime.now(UTC))["items"]
+    assert sorted((i["kind"], i["actions"]) for i in items) == [("blocked", ["approve", "reject"]),
+                                                               ("parked", ["answer"])]
+
+
+def test_a_decision_made_elsewhere_is_listed_as_recent(flow_repo):  # Review Focus 3
+    run = awaiting(flow_repo, phase="define")
+    hitl.approve(run, "define", by="alex")
+    (recent,) = inbox_view(flow_repo.root, flow_repo.cfg, datetime.now(UTC))["recent"]
+    assert (recent["phase"], recent["action"], recent["by"]) == ("define", "approved", "alex")
+
+
+def test_a_missing_inbox_file_keeps_the_summary_and_a_huge_one_is_cut(flow_repo):  # Review Focus 5
+    run = flow_repo.new_run()
+    run.emit("phase_started", phase="build")
+    run.emit("hitl_raised", kind="blocked", key="build/x", summary="why")
+    (item,) = inbox_view(flow_repo.root, flow_repo.cfg, datetime.now(UTC))["items"]
+    assert item["summary"] == "why" and item["text"] == "" and item["cli"] == []
+    run.inbox_path("build/x").parent.mkdir(parents=True, exist_ok=True)
+    run.inbox_path("build/x").write_text("x\n" * 400_000, encoding="utf-8")
+    flow_repo.cfg.dashboard["artifact_max_kb"] = 16
+    (item,) = inbox_view(flow_repo.root, flow_repo.cfg, datetime.now(UTC))["items"]
+    assert item["text_truncated"] is True and len(item["text"].encode()) <= 16 * 1024
+
+
+def test_a_stop_in_a_plan_task_carries_its_blast_radius(building, flow_repo):  # U2's `building` fixture
+    (item,) = inbox_view(building.repo, flow_repo.cfg, datetime.now(UTC))["items"]
+    assert item["blast_radius"]["task"] == 2 and item["blast_radius"]["blocks"] == [3, 4]
+    assert item["blast_radius"]["independent"] == [5]
+
+
+def test_a_phase_approval_carries_its_artifacts(spec_run, flow_repo):  # U1's `spec_run`
+    spec_run.run.emit("phase_approval_raised", phase="plan", round=0, summary="plan is done")
+    (item,) = inbox_view(spec_run.repo, flow_repo.cfg, datetime.now(UTC))["items"]
+    assert [(a["path"], a["kind"]) for a in item["artifacts"]] == [("docs/plans/x.md", "plan")]
+
+
+def test_held_and_stalled_runs_are_watched_without_buttons(flow_repo):
+    run = flow_repo.new_run()
+    run.emit("phase_started", phase="build")
+    run.emit("run_held", key="build/x", reason="usage limit", until="2026-11-16T18:00:00+00:00")
+    (row,) = inbox_view(flow_repo.root, flow_repo.cfg, datetime.now(UTC))["watch"]
+    assert row["reason"] == "held" and "usage limit" in row["text"]
