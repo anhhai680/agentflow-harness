@@ -195,3 +195,50 @@ def test_agents_group_by_run_with_idle_rows_first():
             {"run_id": "r1", "module": "a", "idle": True, "age_s": 10}]
     got = js(["agents.js"], "agentsByRun(args).map(g => [g.run_id, g.rows.map(r => r.age_s)])", rows)
     assert got == [["r1", [10, 50]], ["r2", [9]]]
+
+
+def test_a_repeated_block_cannot_be_approved_without_a_note():   # spec Verification U4, Review Focus 1
+    item = {"run_id": "r", "kind": "blocked_repeat", "key": "build/x", "approve_note": "required"}
+    refused = js(["inbox.js"], "approvePayload(args, {note: '   '})", item)
+    assert refused["ok"] is False and "blocked again" in refused["error"]
+    assert js(["inbox.js"], "approvePayload(args, {note: 'fixed the fixture'})", item) == \
+        {"ok": True, "body": {"target": "build/x", "note": "fixed the fixture"}}
+
+
+def test_a_phase_approval_never_sends_a_note():
+    item = {"run_id": "r", "kind": "phase_approval", "phase": "define", "key": "define_approved", "approve_note": "none"}
+    assert js(["inbox.js"], "approvePayload(args, {note: 'x'})", item) == {"ok": True, "body": {"target": "define"}}
+
+
+def test_an_optional_note_is_sent_only_when_written():
+    item = {"run_id": "r", "kind": "blocked", "key": "build/x", "approve_note": "optional"}
+    assert js(["inbox.js"], "approvePayload(args, {note: ' '})", item) == {"ok": True, "body": {"target": "build/x"}}
+    assert js(["inbox.js"], "approvePayload(args, {note: ' go '})", item) == \
+        {"ok": True, "body": {"target": "build/x", "note": "go"}}
+
+
+def test_a_phase_approval_carries_what_the_page_showed():
+    item = {"run_id": "r", "kind": "phase_approval", "phase": "plan", "key": "plan_approved", "approve_note": "none"}
+    got = js(["inbox.js"], "(viewedList = (id) => [{path: 'p.md', sha: 'abcdef1', run: id}], approvePayload(args, {note: ''}))", item)
+    assert got == {"ok": True, "body": {"target": "plan", "viewed": [{"path": "p.md", "sha": "abcdef1", "run": "r"}]}}
+
+
+def test_questions_start_on_their_recommended_option():           # spec Verification U4
+    qs = [{"id": "q1", "options": [{"key": "A"}, {"key": "B", "recommended": True}]}, {"id": "q2", "options": []}]
+    assert js(["inbox.js"], "answerDefaults(args)", qs) == {"q1": "B", "q2": ""}
+
+
+def test_an_answer_posts_its_own_key_and_prefers_written_text():  # Review Focus 2
+    item = {"key": "build/build/task-4/implement"}
+    got = js(["inbox.js"], "answerPayload(args, {q1: {choice: 'B', other: ''}, q2: {choice: '', other: ' pg '}})", item)
+    assert got == {"ok": True, "body": {"key": "build/build/task-4/implement", "answers": {"q1": "B", "q2": "pg"}}}
+    empty = js(["inbox.js"], "answerPayload(args, {q1: {choice: '', other: ' '}})", item)
+    assert empty == {"ok": False, "error": "Choose or write at least one answer."}
+
+
+def test_a_rejection_needs_a_note():
+    item = {"kind": "phase_approval", "phase": "define", "key": "define_approved"}
+    assert js(["inbox.js"], "rejectPayload(args, ' ')", item) == {"ok": False, "error": "A rejection needs a note."}
+    assert js(["inbox.js"], "rejectPayload(args, 'cut scope')", item) == {"ok": True, "body": {"target": "define", "note": "cut scope"}}
+    stop = {"kind": "blocked", "key": "build/x"}
+    assert js(["inbox.js"], "rejectPayload(args, 'no')", stop)["body"]["target"] == "build/x"

@@ -479,7 +479,9 @@ def test_dashboard_approve_equals_cli(dash):
     hitl.approve(cli_run, "plan", by="someone", hold=True)
     status, _, body = dash.post(f"/api/runs/{web_run.id}/approve", {"target": "plan"})
     assert status == 200 and payload(body)["resumed"] is False
-    assert new_events(web_run, web_after) == new_events(cli_run, cli_after)
+    web_events = new_events(web_run, web_after)
+    assert web_events[0].pop("produced") == []  # the page records what the phase produced; the CLI records nothing
+    assert web_events == new_events(cli_run, cli_after)
     assert [e["by"] for e in web_run.events.read(after_seq=web_after)] == ["dashboard", "dashboard"]
     web_run.refresh()
     assert web_run.state["phases"]["plan"]["status"] == "approved" and web_run.state["waiting"] is None
@@ -2072,3 +2074,15 @@ def test_a_global_agent_row_links_to_its_session(dash, monkeypatch):
     ev = run.emit("agent_started", step="plan/plan", pid=71, agent="claude", model="opus", effort="high", role="plan")
     (row,) = payload(dash.get("/api/agents")[2])["live"]
     assert row["session"] == f"s{ev['seq']}" and row["label"] == "plan · attempt 1"
+
+
+def test_the_inbox_is_a_tab_with_a_badge_and_no_browser_prompts():
+    page = page_source()
+    assert 'id="tab-inbox"' in page and 'id="inbox-count"' in page and 'id="inbox-view"' in page
+    inbox = (UI_DIR / "inbox.js").read_text(encoding="utf-8")
+    for needle in ("/api/inbox", "Approve and resume", "Request changes", "CLI equivalent", "Facts the resolvers found",
+                   "(recommended)", "Confirm approve", "Watch", "ui.inbox"):
+        assert needle in inbox, needle
+    assert "prompt(" not in inbox and "confirm(" not in inbox
+    assert '"inbox"' in (UI_DIR / "main.js").read_text(encoding="utf-8")
+    assert "inbox_legacy" in (UI_DIR / "board.js").read_text(encoding="utf-8")
