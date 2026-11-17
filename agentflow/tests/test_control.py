@@ -257,6 +257,50 @@ def test_checkpoint_without_questions_clears_itself(flow_repo):
     assert flow_repo.events(run, "hitl_raised") == []
 
 
+def test_repeat_stops_early_when_a_round_asked_nothing(flow_repo):
+    """The until condition says questions are open but the grill asked none: round 2 would read the same files."""
+    flow_repo.configure(CONDS)
+    run = flow_repo.new_run()
+    group = Step(id="g", type="group", repeat={"until": {"not": "yes"}, "max_rounds": 3}, steps=grill_steps())
+    assert run_steps(flow_repo, [group]) == ("stopped", True)
+    assert called_steps(flow_repo) == ["build/g/r1/grill", "build/g/r1/apply"]
+    (raised,) = flow_repo.events(run, "hitl_raised")
+    assert raised["kind"] == "max_rounds" and raised["key"] == "build/g"
+    assert raised["summary"].startswith("`not yes` still does not hold after round 1 of build/g, whose questions step")
+    assert "(not (yes = true: " in raised["summary"]
+
+    assert run_steps(flow_repo, [group]) == ("stopped", True)  # waiting: no second round, no second stop
+    assert len(flow_repo.calls()) == 2 and len(flow_repo.events(run, "hitl_raised")) == 1
+
+    approve(run, "build/g", by="me")
+    assert run_steps(flow_repo, [group, agent("after")]) == ("done", True)
+    assert called_steps(flow_repo)[2:] == ["build/after"]
+
+
+def test_repeat_goes_on_after_a_round_that_asked(flow_repo):
+    flow_repo.configure(CONDS)
+    run = flow_repo.new_run()
+    flow_repo.script({"build/g/r1/grill": [{"result": {"status": "done", "summary": "asked", "questions": [QUESTION]}}]})
+    group = Step(id="g", type="group", repeat={"until": "no", "max_rounds": 2}, steps=grill_steps())
+    assert run_steps(flow_repo, [group])[0] == "stopped"
+    assert answer(run, "build/g/r1/answers", {"q1": "A"}, by="me") is True
+    assert run_steps(flow_repo, [group]) == ("stopped", True)
+    assert called_steps(flow_repo) == ["build/g/r1/grill", "build/g/r1/apply", "build/g/r2/grill", "build/g/r2/apply"]
+    raised = flow_repo.events(run, "hitl_raised")[-1]
+    assert raised["kind"] == "max_rounds" and "after 2 rounds of build/g (no = false: " in raised["summary"]
+
+
+def test_condition_label_names_compositions():
+    from agentflow.flow_control import condition_label
+
+    assert condition_label("a") == "a"
+    assert condition_label({"not": "a"}) == "not a"
+    assert condition_label({"any": ["a", {"not": "b"}]}) == "any of (a, not b)"
+    assert condition_label({"all": ["a", "b"]}) == "all of (a, b)"
+    assert condition_label({"not": {"check": "command", "run": "true"}}) == "inline condition"
+    assert condition_label({"any": ["a", {"check": "command", "run": "true"}]}) == "inline condition"
+
+
 def test_plain_checkpoint_waits_for_approve(flow_repo):
     run = flow_repo.new_run()
     steps = [Step(id="doubt_offer", type="checkpoint", name="doubt_offer"), agent("after")]

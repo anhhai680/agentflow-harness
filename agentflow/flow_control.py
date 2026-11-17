@@ -86,9 +86,24 @@ def halted(status: str | None) -> bool:
     return status in TERMINAL or status == "paused"
 
 
+INLINE = "inline condition"
+NO_QUESTIONS = "no questions to answer"
+
+
 def condition_label(cond: Any) -> str:
-    """A condition's name for logs and questions: the name itself, or `inline condition`."""
-    return cond if isinstance(cond, str) else "inline condition"
+    """A condition's name for logs and questions: the name itself, a composition of names spelled out
+    (`not spec_has_open_questions`, `any of (a, b)`), or `inline condition` for anything with an inline check."""
+    if isinstance(cond, str):
+        return cond
+    if isinstance(cond, dict) and "not" in cond:
+        inner = condition_label(cond["not"])
+        return INLINE if inner == INLINE else f"not {inner}"
+    for kind in ("any", "all"):
+        members = cond.get(kind) if isinstance(cond, dict) else None
+        if isinstance(members, list) and members:
+            labels = [condition_label(m) for m in members]
+            return INLINE if INLINE in labels else f"{kind} of ({', '.join(labels)})"
+    return INLINE
 
 
 def _yes_no(text: str) -> bool | None:
@@ -569,17 +584,31 @@ class StepControl:
             later = f"{key}/r{round_ + 1}/"
             if round_ < rounds and any(k.startswith(later) for k in self.run.state["steps"]):
                 continue  # the next round already began: this round's `until` was decided then
-            value, _reason = self.decide(phase, until, f"{prefix}.until")
+            value, reason = self.decide(phase, until, f"{prefix}.until")
             if value is None:
                 return "stopped", ran
             if value:
                 return "done", ran
-        if self._waiting_on(key):
-            return "stopped", ran
-        label = condition_label(until)
-        raise_hitl(self.cfg, self.run, "max_rounds", key,
-                   f"`{label}` still does not hold after {rounds} rounds of {key}. Approve to go on as it is.")
-        return "stopped", ran
+            if round_ < rounds and self._asked_nothing(step, prefix):
+                # the round's questions step found nothing to ask, so the next round would read the same files
+                # and ask nothing again: the condition and the questions step disagree, which a human settles
+                return self._stop_rounds(key, until, f"after round {round_} of {key}, whose questions step asked "
+                                                      f"none, so another round would not change it", reason), ran
+        return self._stop_rounds(key, until, f"after {rounds} rounds of {key}", reason), ran
+
+    def _asked_nothing(self, group: Step, prefix: str) -> bool:
+        """Whether this round of `group` had an `answered_file` checkpoint whose latest clearing had no questions
+        (only the latest counts: a phase sent back runs the round again under the same keys)."""
+        keys = {f"{prefix}/{s.id}" for s in group.steps if s.type == "checkpoint" and s.wait_for == "answered_file"}
+        latest = {e["key"]: e for e in self.run.events.read() if e["type"] == "checkpoint_cleared" and e.get("key") in keys}
+        return any(e.get("reason") == NO_QUESTIONS for e in latest.values())
+
+    def _stop_rounds(self, key: str, until: Any, when: str, reason: str) -> Outcome:
+        """The repeat group `key` stops for a human (`max_rounds`): `until` still does not hold."""
+        if not self._waiting_on(key):
+            raise_hitl(self.cfg, self.run, "max_rounds", key,
+                       f"`{condition_label(until)}` still does not hold {when} ({reason}). Approve to go on as it is.")
+        return "stopped"
 
     # ------------------------------------------------------------------ checkpoints
 
@@ -618,7 +647,7 @@ class StepControl:
         """Cleared once every `Answer:` in questions.md is filled (in the file, or via `agentflow answer`)."""
         questions = question_objects(rendered["questions"]) if rendered else []
         if not questions:
-            self.run.emit("checkpoint_cleared", key=key, reason="no questions to answer", answers={})
+            self.run.emit("checkpoint_cleared", key=key, reason=NO_QUESTIONS, answers={})
             return "done"
         path = self.run.questions_path()
         if not path.exists():

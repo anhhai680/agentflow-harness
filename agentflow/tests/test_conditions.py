@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 from agentflow.conditions import CondResult, Ctx, evaluate, explain, fmt, make_ctx, plan_warnings
 from agentflow.config import resolve_model
 from agentflow.gitops import GhError, gh_json
@@ -183,6 +184,19 @@ def test_section_items_match_filter(cfg, tmp_path):
     r = evaluate(cfg, "idea_doc_question_open", ctx)
     assert r.value is False
     assert "0 open" in r.reason
+
+
+@pytest.mark.parametrize("heading", ["Resolved:", "**Resolved (2026-11-17, grilling)**", "### Resolved"])
+def test_default_open_questions_stop_at_any_resolved_heading(cfg, tmp_path, heading):
+    """A recorded answer filed under a plain `Resolved:` line is not an open question (the engine default)."""
+    defaults = Path(__file__).resolve().parents[1] / "defaults" / "config.yaml"
+    check = yaml.safe_load(defaults.read_text(encoding="utf-8"))["conditions"]["spec_has_open_questions"]
+    spec = tmp_path / "docs" / "specs" / "SPEC-x.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text(f"# Spec\n\n## Open Questions\n\nNone open.\n\n{heading}\n\n- **Q1 (answered A): a key.** Decided.\n\n"
+                    "## Next\n", encoding="utf-8")
+    r = evaluate(cfg, check, make_ctx(cfg, tmp_path, "feature", {"module": "x", "spec": "docs/specs/SPEC-x.md"}))
+    assert r.value is False and r.reason == "0 open items, 1 resolved"
 
 
 # ------------------------------------------------------------------ composition
