@@ -157,12 +157,10 @@ function attachNode(command) {
   return el("div", { class: "attach" }, attach, copy);
 }
 
-// A timeline, newest first, patched line by line (keyed by `seq`): lines already shown stay as they are.
-function patchTimeline(list, events) {
-  patchChildren(list, events.slice().reverse(), (e) => "seq:" + e.seq, (e) => el("li", { text: describe(e) }));
+// Overview's "Recent activity": the run's newest sentences, newest first (the server's `recent`).
+function recentNode(recent) {
+  return el("ol", { class: "timeline" }, (recent || []).map((e) => el("li", {}, sentenceNodes(e))));
 }
-
-const timelineShell = () => el("ol", { class: "timeline" });
 
 function gateNode(g) {
   const mark = g.skipped ? "– " : g.passed ? "✓ " : "✗ ";
@@ -193,9 +191,7 @@ function phaseNode(phase, open) {
 function runTabEntries(detail, tab, sub) {
   const heading = (key, text, cls) => entry(key, { text: text, cls: cls }, (h) => el("h3", { class: h.cls, text: h.text }));
   if (isArtifactTab(tab)) return artifactEntries(detail, tab, sub);
-  if (tab === "activity") {
-    return [heading("title", "Timeline (" + detail.timeline.length + " events)"), entry("timeline", null, timelineShell)];
-  }
+  if (tab === ACTIVITY_TAB) return activityEntries(detail);
   if (tab === "gates") {
     const reviews = Object.keys(detail.reviews).length ? JSON.stringify(detail.reviews, null, 2) : "";
     return [heading("title", "Gates"),
@@ -213,16 +209,13 @@ function runTabEntries(detail, tab, sub) {
     heading("workflow", "Workflow", "wf-title"),
     ...detail.workflow.map((phase) => entry("phase:" + phase.name, phase, (p) => phaseNode(p, p.name === current))),
     entry("metrics", detail.metrics, metricsSection),
-    heading("recent-title", "Recent activity", "wf-title"), entry("recent", null, timelineShell)];
+    heading("recent-title", "Recent activity", "wf-title"), entry("recent", detail.recent, recentNode)];
 }
 
 function renderRunTab(detail, tab, sub) {
   const body = $("run-body");
   body.classList.toggle("art-tab", isArtifactTab(tab));
   patchChildren(body, runTabEntries(detail, tab, sub), entryKey, entryNode);
-  if (isArtifactTab(tab)) return;
-  if (tab === "activity") patchTimeline(childByKey(body, "timeline"), detail.timeline);
-  else if (tab !== "gates" && tab !== "files" && tab !== SESSIONS_TAB) patchTimeline(childByKey(body, "recent"), detail.timeline.slice(-10));
 }
 
 const runTabLabel = (detail, tab) => (tab === SESSIONS_TAB ? "Agents (" + detail.session_count + ")" : RUN_TAB_LABEL[tab]);
@@ -272,6 +265,7 @@ function openRun(id, tab, sub) {
     if (tab === PLAN_TAB && ui.plan && ui.plan.runId === id && planMode(sub, !!(ui.plan.data && ui.plan.data.started)) === "tasks") loadPlan(id);
     if (tab === FILES_TAB && ui.files && ui.files.runId === id) { ui.files.error = null; loadFiles(id); }  // a first-load error gets its retry here
     if (tab === SESSIONS_TAB && ui.sessions && ui.sessions.runId === id) { ui.sessions.error = null; loadSessions(id); }  // sessions that started meanwhile
+    if (tab === ACTIVITY_TAB) loadActivity(id, false);  // the events that came meanwhile: the newest page, merged
   }
 }
 

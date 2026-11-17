@@ -305,3 +305,16 @@ def test_the_gone_text_names_where_and_picks_the_newest_matching_entry():
     phase_entry = {"run_id": "r", "key": "build", "phase": "build", "action": "rejected", "by": "sam", "ts": "2026-11-16T14:00:00+00:00"}
     assert js(["inbox.js"], pick, {"item": approval, "recent": [phase_entry]}).startswith("Rejected from the CLI by sam at ")
 
+
+
+def test_the_activity_query_reads_its_state():
+    q = lambda s: js(["activity.js"], "activityQuery(args)", s)  # noqa: E731
+    assert q({"filter": "all", "before": None, "turns": False}) == "?limit=200"
+    assert q({"filter": "decisions", "before": 812, "turns": True}) == "?limit=200&kinds=decisions&before=812&turns=1"
+
+
+def test_pages_merge_by_seq_newest_first_without_duplicates():
+    have = [{"seq": 9, "headline": "old"}, {"seq": 5}]
+    got = js(["activity.js"], "mergePages(args.have, args.page).map(e => [e.seq, e.headline || ''])",
+             {"have": have, "page": [{"seq": 12}, {"seq": 9, "headline": "new"}]})
+    assert got == [[12, ""], [9, "new"], [5, ""]]

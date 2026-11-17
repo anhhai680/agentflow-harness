@@ -41,6 +41,7 @@ async function refreshRunsNow() {
     if (isArtifactTab(ui.run.tab)) jobs.push(loadArtifacts(ui.run.id));  // new revisions and findings
     if (ui.run.tab === PLAN_TAB && planMode(ui.run.sub, true) === "tasks") jobs.push(loadPlan(ui.run.id));  // the task board
     if (ui.run.tab === FILES_TAB) jobs.push(loadFiles(ui.run.id));  // the documents and the branch's changes
+    if (ui.run.tab === ACTIVITY_TAB) jobs.push(loadActivity(ui.run.id, false));  // the newest page, merged into the lines shown
     if (ui.run.tab === SESSIONS_TAB) { jobs.push(loadSessions(ui.run.id)); transcriptCatchUp(); }  // the sessions, and an open live transcript
   }
   if (ui.peek && dirty.runs.has(ui.peek)) jobs.push(loadPeek(ui.peek));

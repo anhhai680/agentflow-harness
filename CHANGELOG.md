@@ -21,6 +21,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 - Decisions waiting on you move from the Board's Needs-human list to an Inbox tab with a count in the header. Each card has a title in words, the inbox text with its CLI lines folded away, the facts and artifacts it needs, what a stop holds up, and forms in place of the browser's prompt boxes. `dashboard.inbox_legacy: true` brings the old list back.
 - A Board card lists every live agent of its run, not just the newest, and the Agents tab groups agents by run, puts idle ones first and opens each one's transcript.
+- A run's Activity tab tells its whole log as sentences ("Task 9 · implement finished: …", "You approved define"), filtered to Decisions, Agents, Gates, Commits or Stops. It folds agent turns into "Agent active 14 min, 37 tool calls", pages back to the first event, and shows each line's raw JSON on demand. The run detail no longer sends its last 300 raw events.
 
 ### Removed
 

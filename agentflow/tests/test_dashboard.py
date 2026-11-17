@@ -2133,3 +2133,12 @@ def test_run_detail_carries_ten_recent_sentences_not_the_raw_timeline(dash):
     detail = payload(dash.get(f"/api/runs/{run.id}")[2])
     assert "timeline" not in detail and detail["recent"][0]["headline"] == "plan is done and waits for approval"
     assert len(detail["recent"]) <= 10
+
+
+def test_the_activity_tab_pages_the_log_with_filters_and_raw_lines():
+    a = (UI_DIR / "activity.js").read_text(encoding="utf-8")
+    for needle in ("/events", "Load older", "The first event of this run.", "Show agent turns", "Raw", "ui.activity"):
+        assert needle in a, needle
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    assert "detail.recent" in run_js and "detail.timeline" not in page_source() and "function describe" not in page_source()
+    assert UI_SCRIPTS.index("activity.js") == UI_SCRIPTS.index("inbox.js") + 1
