@@ -512,14 +512,19 @@ def building(spec_run: SpecRun) -> SpecRun:
 
 # ---- the dashboard JS under node: each file runs in a bare context (no DOM), then one expression is read back
 NODE = shutil.which("node")
-LOADER = ("const fs=require('fs'),vm=require('vm');const ctx=vm.createContext({});"
+LOADER = ("const fs=require('fs'),vm=require('vm');const ctx=vm.createContext({URLSearchParams});"
           "for (const f of JSON.parse(process.argv[1])) vm.runInContext(fs.readFileSync(f,'utf8'),ctx);"
           "ctx.args=JSON.parse(fs.readFileSync(0,'utf8'));"
           "process.stdout.write(JSON.stringify(vm.runInContext(process.argv[2],ctx)));")
 
 
+def _js_paths(files: list[str]) -> str:
+    """The files to load: a name is read from `dashboard_ui/`, an absolute path (a test stub) as it is."""
+    return json.dumps([f if Path(f).is_absolute() else str(ENGINE / "dashboard_ui" / f) for f in files])
+
+
 def js(files: list[str], expr: str, args) -> object:
-    out = subprocess.run([NODE, "-e", LOADER, json.dumps([str(ENGINE / "dashboard_ui" / f) for f in files]), expr],
+    out = subprocess.run([NODE, "-e", LOADER, _js_paths(files), expr],
                          input=json.dumps(args), capture_output=True, text=True, check=True, timeout=30)
     return json.loads(out.stdout)
 
@@ -532,7 +537,7 @@ ASYNC_LOADER = LOADER.replace("process.stdout.write(JSON.stringify(vm.runInConte
 def js_async(files: list[str], expr: str, args) -> object:
     """`js`, for an expression that returns a promise: what it resolves to."""
     assert ASYNC_LOADER != LOADER
-    out = subprocess.run([NODE, "-e", ASYNC_LOADER, json.dumps([str(ENGINE / "dashboard_ui" / f) for f in files]), expr],
+    out = subprocess.run([NODE, "-e", ASYNC_LOADER, _js_paths(files), expr],
                          input=json.dumps(args), capture_output=True, text=True, check=True, timeout=30)
     return json.loads(out.stdout)
 

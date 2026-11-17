@@ -21,7 +21,7 @@ from agentflow.config import RETRO_PIPELINE
 from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
-from agentflow.views import _badge, step_title
+from agentflow.views import _badge, _strip, lane_phases, step_title
 from conftest import PYTHON_CONFIG, L, awaiting, run_git, session_with_transcript
 
 TOKEN = "k3y-" + "x" * 40
@@ -123,7 +123,7 @@ def test_info_names_the_engine_version(dash):
     status, headers, body = dash.get("/api/info")
     assert status == 200 and headers["content-type"].startswith("application/json")
     assert json.loads(body) == {"name": "agentflow-harness", "version": pack.ENGINE_VERSION, "board_refresh_s": 2.0,
-                               "inbox_legacy": False}
+                               "inbox_legacy": False, "done_shown": 10}
     assert dash.get("/api/info", token=None)[0] == 403
     page = page_source()
     assert 'id="version"' in page and "/api/info" in page
@@ -135,6 +135,14 @@ def test_info_says_whether_the_legacy_inbox_is_on(dash):
     assert payload(dash.get("/api/info")[2])["inbox_legacy"] is False
     dash.server.cfg.dashboard["inbox_legacy"] = True
     assert payload(dash.get("/api/info")[2])["inbox_legacy"] is True
+
+
+def test_info_carries_how_many_done_cards_show(dash):
+    assert payload(dash.get("/api/info")[2])["done_shown"] == 10
+    dash.server.cfg.dashboard["done_shown"] = 0
+    assert payload(dash.get("/api/info")[2])["done_shown"] == 10
+    dash.server.cfg.dashboard["done_shown"] = 3
+    assert payload(dash.get("/api/info")[2])["done_shown"] == 3
 
 
 def test_info_carries_the_board_refresh(dash):
@@ -330,7 +338,7 @@ def test_board_and_run_detail(dash):
     assert status == 200 and detail["run_id"] == planning.id
     assert "Tiến độ" in detail["progress"]
     assert detail["session_count"] == 0 and "transcript" not in detail and "transcript_file" not in detail
-    assert [e["type"] for e in detail["timeline"]][-1] == "phase_approval_raised"
+    assert detail["recent"][0]["type"] == "phase_approval_raised"
     assert detail["attach"] == f"agentflow attach {planning.id}"
 
 
@@ -2095,3 +2103,96 @@ def test_inbox_shortcuts_stay_out_of_text_fields_and_approve_takes_two_presses()
         assert needle in handler, needle
     assert "Press a again to approve" in inbox and "Dismiss" in inbox and "readOnly" in inbox
 
+
+
+def test_the_events_route_pages_the_whole_log(dash):
+    run = awaiting(dash.flow)
+    for n in range(30):
+        run.emit("gate_result", key="plan/plan", gate=f"g{n}", passed=True)
+    page = payload(dash.get(f"/api/runs/{run.id}/events?limit=10&kinds=gates")[2])
+    assert len(page["entries"]) == 10 and page["total"] == 30
+    rest = payload(dash.get(f"/api/runs/{run.id}/events?limit=50&kinds=gates&before={page['before']}")[2])
+    assert len(rest["entries"]) == 20 and rest["before"] is None
+
+
+@pytest.mark.parametrize("query", ["before=0", "before=x", "limit=0", "limit=501", "kinds=nope", "kinds=gates&kinds=stops",
+                                   "turns=yes", "limit=1&limit=2", "before=1&before=2", "turns=1&turns=1"])
+def test_the_events_route_refuses_bad_parameters(dash, query):
+    run = awaiting(dash.flow)
+    status, _, body = dash.get(f"/api/runs/{run.id}/events?{query}")
+    assert status == 400 and query.split("=")[0] in payload(body)["error"]
+
+
+def test_the_events_route_keeps_the_refusal_matrix(dash):
+    run = awaiting(dash.flow)
+    assert_refusal_matrix(dash, run, "events")
+
+
+def test_run_detail_carries_ten_recent_sentences_not_the_raw_timeline(dash):
+    run = awaiting(dash.flow)
+    detail = payload(dash.get(f"/api/runs/{run.id}")[2])
+    assert "timeline" not in detail and detail["recent"][0]["headline"] == "plan is done and waits for approval"
+    assert len(detail["recent"]) <= 10
+
+
+def test_the_activity_tab_pages_the_log_with_filters_and_raw_lines():
+    a = (UI_DIR / "activity.js").read_text(encoding="utf-8")
+    for needle in ("/events", "Load older", "The first event of this run.", "Show agent turns", "Raw", "ui.activity"):
+        assert needle in a, needle
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    assert "detail.recent" in run_js and "detail.timeline" not in page_source() and "function describe" not in page_source()
+    assert UI_SCRIPTS.index("activity.js") == UI_SCRIPTS.index("inbox.js") + 1
+
+
+def test_a_card_has_a_strip_and_a_needs_you_marker(dash):
+    awaiting(dash.flow, phase="plan")
+    card = card_of(dash)
+    phases = [s["phase"] for s in card["strip"]]
+    states = {s["phase"]: s["state"] for s in card["strip"]}
+    assert phases == lane_phases(dash.flow.cfg, "feature")
+    assert states["plan"] == "waiting" and card["waiting"]["since"]
+    assert all(states[p] == "todo" for p in phases[phases.index("plan") + 1:])
+    assert card["ended_at"] is None
+
+
+def test_a_finished_card_has_an_end_time_and_a_done_strip(dash):
+    run = dash.flow.new_run()
+    run.emit("phase_started", phase="define")
+    run.emit("phase_approved", phase="define", by="me")
+    run.emit("run_finished")
+    card = card_of(dash)
+    assert card["ended_at"] and {s["phase"]: s["state"] for s in card["strip"]}["define"] == "done"
+
+
+def test_the_strip_states_follow_the_phase_rows_in_order():
+    phases = ["define", "plan", "build", "verify", "review", "ship"]
+    state = {"phase": "build", "waiting": {"phase": "plan"}, "phases": {
+        "define": {"status": "done"}, "plan": {"status": "running"}, "build": {"status": "running"},
+        "verify": {"status": "failed"}, "review": {"status": "skipped"}}}
+    assert {s["phase"]: s["state"] for s in _strip(state, phases)} == {
+        "define": "done", "plan": "waiting", "build": "current", "verify": "failed", "review": "skipped",
+        "ship": "todo"}
+    assert _strip({"phase": None, "phases": {"plan": {"status": "awaiting_approval"}}}, phases)[1]["state"] == "waiting"
+    assert _strip({"phase": "plan", "phases": {}}, phases)[1]["state"] == "current"
+    assert _strip({"phases": {"define": {"status": "approved"}}}, ["define"]) == [{"phase": "define", "state": "done"}]
+
+
+def test_a_card_names_its_issue_and_its_step_in_words(dash):
+    run = dash.flow.new_run({"module": "crm"})
+    run.emit("phase_started", phase="build")
+    run.emit("step_started", key="build/build/task-9/implement", phase="build")
+    card = card_of(dash)
+    assert card["step_label"] == step_title(card["step"]) and card["issue"] is None
+
+
+def test_the_card_draws_its_strip_and_marker():
+    board = (UI_DIR / "board.js").read_text(encoding="utf-8")
+    for needle in ("card.strip", "strip-", "needs you", "step_label"):
+        assert needle in board, needle
+
+
+def test_the_board_says_when_filters_hide_every_card():
+    board = (UI_DIR / "board.js").read_text(encoding="utf-8")
+    assert "No card matches these filters" in board and "Clear filters" in board and "Show all (" in board
+    assert "new RegExp" not in board and "history.replaceState" in board
+    assert 'id="board-filters"' in (UI_DIR.parent / "dashboard.html").read_text(encoding="utf-8")

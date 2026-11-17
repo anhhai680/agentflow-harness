@@ -187,6 +187,7 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
     ("Dashboard", "The page reads these at once; a new port needs a dashboard restart.", [
         (("dashboard", "port"), "Port (restart)", {"kind": "int", "min": 0, "max": 65535}),
         (("dashboard", "show_done_days"), "Show done cards for (days, 0 = always)", _INT),
+        (("dashboard", "done_shown"), "Done cards shown before Show all", {"kind": "int", "min": 1, "max": 1000}),
         (("dashboard", "board_refresh_s"), "Refresh the Board at most every (s)", {"kind": "number", "min": 0.5, "max": 60}),
         (("dashboard", "artifact_max_kb"), "Largest spec, plan or diff the page loads (KB)", {"kind": "int", "min": 16, "max": 8192}),
         (("dashboard", "inbox_legacy"), "Also show the old Needs-human list at the bottom of the Board", {"kind": "bool"}),

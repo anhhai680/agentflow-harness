@@ -7,7 +7,7 @@
 - `agents_view(repo, cfg)`: every live agent process across runs, one row each (subagents nested), and
   the ones that exited in the last `dashboard.agents.show_exited_min` minutes.
 - `run_detail(run, cfg, raw)`: one run's facts, what it waits on, its steps' records, the actions its state
-  allows now, a label, a stage rail, its timeline, its walk of the workflow (`run_workflow`), its time and
+  allows now, a label, a stage rail, its 10 newest sentences (`recent`), its walk of the workflow (`run_workflow`), its time and
   cost (`run_metrics_view`) and size-capped tails of its files, read only through the run's own paths (no
   symlinks, nothing outside the run directory). `raw` adds the whole `state.json` for debugging.
 - `step_title(key)`: a step key in words (`Task 9 · implement · resolver 2`); `stage_rail` is one entry per phase.
@@ -32,6 +32,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from agentflow.activity import activity_page
 from agentflow.artifacts import artifact_tabs
 from agentflow.config import RETRO_PIPELINE, Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.events import parse_iso
@@ -53,7 +54,7 @@ STEP_STATUS = {"done": "done", "unchanged": "done", "skipped": "skipped", "faile
                "sizing": "running", "compacting": "running", "waiting_human": "waiting", "parked": "waiting"}
 TAIL_BYTES = 16 * 1024
 GATE_TAIL_BYTES = 8 * 1024
-TIMELINE_MAX = 300
+RECENT_SENTENCES = 10  # the newest sentences `run_detail` carries; the events route serves the rest
 DEFAULT_IDLE_MIN = 5
 DEFAULT_EXITED_MIN = 10
 DEFAULT_DONE_DAYS = 0  # 0 keeps every Done card: history stays until a developer deletes `runs/`
@@ -118,8 +119,11 @@ def _digest(run: Run, today: datetime, events: list[dict] | None = None) -> dict
     fixes: dict[str, int] = {}
     counted: dict[str, float] = {}
     spend_today = 0.0
+    last_ts = None
     for event in run.events.read() if events is None else events:
         etype, key = event.get("type"), event.get("key")
+        if event.get("ts"):
+            last_ts = str(event["ts"])
         if etype == "phase_started" and event.get("phase"):
             started[str(event["phase"])] = str(event.get("ts"))
         elif etype in ("step_started", "hitl_approved", "step_retry") and key:
@@ -131,7 +135,31 @@ def _digest(run: Run, today: datetime, events: list[dict] | None = None) -> dict
             ts = parse_iso(event.get("ts"))
             if ts is not None and ts.astimezone().date() == today.astimezone().date():
                 spend_today += added
-    return {"phase_started": started, "fixes": fixes, "spend_today": round(spend_today, 6)}
+    return {"phase_started": started, "fixes": fixes, "spend_today": round(spend_today, 6), "last_ts": last_ts}
+
+
+def _strip(state: dict, phases: list[str]) -> list[dict]:
+    """One `{phase, state}` per lane phase, in order, for a card's progress strip. `state` is the first that holds:
+    `waiting` (a human is asked about it), `done`, `skipped`, `failed`, `current`, else `todo`."""
+    rows = state.get("phases") or {}
+    waiting_phase = (state.get("waiting") or {}).get("phase")
+    out = []
+    for phase in phases:
+        status = (rows.get(phase) or {}).get("status")
+        if waiting_phase == phase or status == "awaiting_approval":
+            mark = "waiting"
+        elif status in ("approved", "done"):
+            mark = "done"
+        elif status == "skipped":
+            mark = "skipped"
+        elif status == "failed":
+            mark = "failed"
+        elif status in ("running", "refining") or state.get("phase") == phase:
+            mark = "current"
+        else:
+            mark = "todo"
+        out.append({"phase": phase, "state": mark})
+    return out
 
 
 def _step_label(state: dict, key: str) -> str:
@@ -293,13 +321,18 @@ def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metri
     task = state.get("task") or {}
     since = digest["phase_started"].get(phase or "")
     waiting = state.get("waiting")
+    step = state.get("step")
+    issue = (state.get("params") or {}).get("issue")
     return {
         "run_id": run.id,
         "lane": state.get("pipeline"),
         "module": _label(state, run.id),
         "column": column,
         "phase": phase,
-        "step": state.get("step"),
+        "step": step,
+        "step_label": step_title(step) if step else None,
+        "issue": str(issue) if issue not in (None, "") else None,
+        "strip": _strip(state, lane_phases(cfg, state.get("pipeline") or "")),
         "task": f"{task['n']}/{task['of']}" if task.get("n") and task.get("of") else None,
         "status": status,
         "badge": _badge(state, status, column),
@@ -314,7 +347,8 @@ def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metri
         "review_skipped": _review_skips(state),
         "phase_since": since,
         "time_in_phase_s": _age(now, since),
-        "waiting": {k: waiting.get(k) for k in ("kind", "key", "summary")} if waiting else None,
+        "waiting": {k: waiting.get(k) for k in ("kind", "key", "summary", "since")} if waiting else None,
+        "ended_at": digest.get("last_ts") if state.get("status") in TERMINAL else None,
         "branch": state.get("branch"),
         "pr_url": state.get("pr_url"),
         "pr_link": _pr_link(state),
@@ -741,7 +775,7 @@ def run_detail(run: Run, cfg: Config, raw: bool = False) -> dict:
                          "model": row.get("model"), "effort": row.get("effort"), "session_id": row.get("session_id")}
                         for row in _live_agents(state)],
         "session_count": sum(1 for e in events if e.get("type") == "agent_started"),
-        "timeline": events[-TIMELINE_MAX:],
+        "recent": activity_page(events, None, (), RECENT_SENTENCES, turns=False)["entries"],
         "workflow": workflow,
         "gates": gates,
         "reviews": state.get("reviews") or {},

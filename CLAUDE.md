@@ -30,6 +30,7 @@ uv run --no-project --with pyyaml --with pytest pytest "agentflow/tests/test_pac
 # The pack's gates (.agentflow/config.yaml): `portability` gates build, and `engine_tests` (the full suite) gates verify
 uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_portability.py --import-mode=prepend -q
 
+uvx ruff@0.17.4 check .                        # lint: CI runs this exact command (rules in pyproject.toml [tool.ruff.lint]); keep the pin equal to .github/workflows/ci.yml
 uv tool install --reinstall --from . agentflow # install (or refresh) the packaged tool from this checkout
 bin/agentflow validate                         # run after every config edit; it must print "0 warnings"
 bin/agentflow validate --fix [--dry-run]       # repair the warnings validate marks (fixable)
@@ -45,6 +46,8 @@ agentflow init [--starter NAME] [--baseline]   # in another repository: write a 
 ```
 
 The full suite is slow. While you work, run the test files you touched, and run the full suite before you finish.
+
+**Lint is required.** Before you commit, push or call work done, you MUST run `uvx ruff@0.17.4 check .` locally and see `All checks passed!`. CI runs the same command and fails the PR on any error, and tests don't catch lint (an assigned `lambda` in a test, E731, has already broken CI once). This applies to `agentflow/tests/` too. Fix the code instead of adding a `noqa` or loosening the rules in `pyproject.toml`. Run it again after any follow-up edit, even a small one, and don't claim the work passes without it.
 
 ## Changelog
 

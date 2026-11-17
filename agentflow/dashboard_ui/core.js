@@ -15,7 +15,9 @@ const TOKEN = (function () {
   return token;
 })();
 
-const ui = { view: "board", peek: null, run: null, board: null, agents: null, workflow: null, dragging: null, doneOpen: false, comments: new Map(), viewed: new Map(),
+const ui = { view: "board", peek: null, run: null, board: null, agents: null, workflow: null, dragging: null, doneOpen: false,
+  // the Board's filters (the URL's `#/board?…`) and how many Done cards it draws: `dashboard.done_shown`, or all of them
+  boardQuery: { lane: null, status: null, needs: false, q: null }, doneShown: 10, doneAll: false, comments: new Map(), viewed: new Map(),
   // the Inbox: its last view, what was typed per card (outside the nodes), the armed Approve (and when), the focused card
   // (its index in `order`, the cards as shown, and its key), the grouping, the cards kept after a decision made elsewhere
   // (`gone`) and the answers this page sent itself (`sent`)

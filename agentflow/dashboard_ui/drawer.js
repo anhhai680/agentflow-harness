@@ -6,15 +6,6 @@ function section(title, text, open, key) {
   return el("details", { open: open, "data-key": key }, el("summary", { text: title }), el("pre", { text: text || "(empty)" }));
 }
 
-function describe(event) {
-  const bits = [event.ts ? event.ts.slice(11, 19) : "", event.type];
-  for (const key of ["phase", "key", "kind", "status", "gate", "reason", "summary", "note"]) {
-    if (event[key] !== undefined && event[key] !== null && event[key] !== "") bits.push(key + "=" + (typeof event[key] === "string" ? event[key] : JSON.stringify(event[key])));
-  }
-  if (event.by && event.by !== "runner") bits.push("by " + event.by);
-  return bits.join("  ");
-}
-
 // Space on a card, or a click on its badge: the card's facts and the decision it waits on, without leaving the Board.
 function openPeek(runId) {
   ui.peek = runId;

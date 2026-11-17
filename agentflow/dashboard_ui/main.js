@@ -41,6 +41,7 @@ async function refreshRunsNow() {
     if (isArtifactTab(ui.run.tab)) jobs.push(loadArtifacts(ui.run.id));  // new revisions and findings
     if (ui.run.tab === PLAN_TAB && planMode(ui.run.sub, true) === "tasks") jobs.push(loadPlan(ui.run.id));  // the task board
     if (ui.run.tab === FILES_TAB) jobs.push(loadFiles(ui.run.id));  // the documents and the branch's changes
+    if (ui.run.tab === ACTIVITY_TAB) jobs.push(loadActivity(ui.run.id, false));  // the newest page, merged into the lines shown
     if (ui.run.tab === SESSIONS_TAB) { jobs.push(loadSessions(ui.run.id)); transcriptCatchUp(); }  // the sessions, and an open live transcript
   }
   if (ui.peek && dirty.runs.has(ui.peek)) jobs.push(loadPeek(ui.peek));
@@ -136,6 +137,10 @@ function route() {
     return;
   }
   ui.run = null;
+  if (where.view === "board") {  // the URL's filters; a filter written by the bar is already in `ui.boardQuery`
+    ui.boardQuery = where.query;
+    if (ui.board) renderBoard(ui.board);
+  }
   show(where.view);
 }
 
@@ -146,6 +151,7 @@ for (const name of VIEWS) $("tab-" + name).addEventListener("click", () => {
 });
 $("new-task").addEventListener("click", newTaskDialog);
 initInbox();
+initBoardFilters();
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("dlg").open) closePeek(); });
 window.addEventListener("hashchange", route);
 if (!location.hash) {  // a first visit, or the #token= the boot removed: the tab this browser showed last
@@ -161,6 +167,10 @@ async function loadInfo() {
     $("version").textContent = "v" + info.version;
     $("version").title = info.name + " " + info.version;
     $("version").hidden = false;
+    if (Number.isInteger(info.done_shown) && info.done_shown > 0 && info.done_shown !== ui.doneShown) {
+      ui.doneShown = info.done_shown;
+      if (ui.board) renderBoard(ui.board);
+    }
     const legacy = info.inbox_legacy === true;
     if (legacy !== ui.inboxLegacy) { ui.inboxLegacy = legacy; if (ui.board) renderBoard(ui.board); }
   } catch (err) { console.warn("agentflow: info unavailable", err); }  // the badge is optional; the refresh keeps 2 s

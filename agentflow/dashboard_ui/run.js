@@ -10,21 +10,47 @@ const RUN_TAB_LABEL = { overview: "Overview", spec: "Spec", plan: "Plan", agents
 const DECISION_ACTIONS = ["approve", "answer", "reject"];
 const RAIL_MARK = { done: "✓", approved: "✓", failed: "✗", waiting: "◆", awaiting_approval: "◆", running: "●", refining: "●", skipped: "–" };
 
+// The Board's filters ride in the hash as `#/board?lane=<lane>&status=<status>&needs=1&q=<text>`. `lane` and `status` stay
+// text (the Board ignores a value it does not know); `needs` is true only for "1"; other parameters are dropped.
+const BOARD_PARAMS = ["lane", "status", "needs", "q"];
+
+function boardQuery(search) {
+  const params = new URLSearchParams(search || "");
+  const text = (name) => (params.has(name) ? params.get(name) : null);
+  return { lane: text("lane"), status: text("status"), needs: params.get("needs") === "1", q: text("q") };
+}
+
 function parseRoute(hash) {
-  const board = { view: "board", run: null, tab: null, sub: null };
+  const board = { view: "board", run: null, tab: null, sub: null, query: boardQuery("") };
   if (!/^#\//.test(hash || "")) return board;
+  const mark = hash.indexOf("?");
+  const search = mark < 0 ? "" : hash.slice(mark + 1);
   let parts;
-  try { parts = hash.slice(2).split("/").map(decodeURIComponent); } catch (err) { return board; }  // a malformed % escape
+  try { parts = (mark < 0 ? hash : hash.slice(0, mark)).slice(2).split("/").map(decodeURIComponent); } catch (err) { return board; }  // a malformed % escape
   if (parts[0] === "run" && parts[1]) {
     const known = RUN_TABS.includes(parts[2]);
     return { view: "run", run: parts[1], tab: known ? parts[2] : "overview", sub: known && parts[3] ? parts[3] : null };
   }
-  if (parts.length === 1 && VIEWS.includes(parts[0])) return { view: parts[0], run: null, tab: null, sub: null };
+  if (parts.length === 1 && VIEWS.includes(parts[0])) {
+    const route = { view: parts[0], run: null, tab: null, sub: null };
+    if (parts[0] === "board") route.query = boardQuery(search);
+    return route;
+  }
   return board;
 }
 
 function routeHash(route) {
-  if (route.view !== "run") return "#/" + encodeURIComponent(route.view || "board");
+  if (route.view === "board" || !route.view) {
+    const query = route.query || {};
+    const params = new URLSearchParams();
+    for (const name of BOARD_PARAMS) {
+      const value = query[name];
+      if (name === "needs" ? value === true : typeof value === "string" && value !== "") params.set(name, name === "needs" ? "1" : value);
+    }
+    const text = params.toString();
+    return "#/board" + (text ? "?" + text : "");
+  }
+  if (route.view !== "run") return "#/" + encodeURIComponent(route.view);
   const parts = [route.run, route.tab || "overview"];
   if (route.sub) parts.push(route.sub);
   return "#/run/" + parts.map(encodeURIComponent).join("/");
@@ -157,12 +183,10 @@ function attachNode(command) {
   return el("div", { class: "attach" }, attach, copy);
 }
 
-// A timeline, newest first, patched line by line (keyed by `seq`): lines already shown stay as they are.
-function patchTimeline(list, events) {
-  patchChildren(list, events.slice().reverse(), (e) => "seq:" + e.seq, (e) => el("li", { text: describe(e) }));
+// Overview's "Recent activity": the run's newest sentences, newest first (the server's `recent`).
+function recentNode(recent) {
+  return el("ol", { class: "timeline" }, (recent || []).map((e) => el("li", {}, sentenceNodes(e))));
 }
-
-const timelineShell = () => el("ol", { class: "timeline" });
 
 function gateNode(g) {
   const mark = g.skipped ? "– " : g.passed ? "✓ " : "✗ ";
@@ -193,9 +217,7 @@ function phaseNode(phase, open) {
 function runTabEntries(detail, tab, sub) {
   const heading = (key, text, cls) => entry(key, { text: text, cls: cls }, (h) => el("h3", { class: h.cls, text: h.text }));
   if (isArtifactTab(tab)) return artifactEntries(detail, tab, sub);
-  if (tab === "activity") {
-    return [heading("title", "Timeline (" + detail.timeline.length + " events)"), entry("timeline", null, timelineShell)];
-  }
+  if (tab === ACTIVITY_TAB) return activityEntries(detail);
   if (tab === "gates") {
     const reviews = Object.keys(detail.reviews).length ? JSON.stringify(detail.reviews, null, 2) : "";
     return [heading("title", "Gates"),
@@ -213,16 +235,13 @@ function runTabEntries(detail, tab, sub) {
     heading("workflow", "Workflow", "wf-title"),
     ...detail.workflow.map((phase) => entry("phase:" + phase.name, phase, (p) => phaseNode(p, p.name === current))),
     entry("metrics", detail.metrics, metricsSection),
-    heading("recent-title", "Recent activity", "wf-title"), entry("recent", null, timelineShell)];
+    heading("recent-title", "Recent activity", "wf-title"), entry("recent", detail.recent, recentNode)];
 }
 
 function renderRunTab(detail, tab, sub) {
   const body = $("run-body");
   body.classList.toggle("art-tab", isArtifactTab(tab));
   patchChildren(body, runTabEntries(detail, tab, sub), entryKey, entryNode);
-  if (isArtifactTab(tab)) return;
-  if (tab === "activity") patchTimeline(childByKey(body, "timeline"), detail.timeline);
-  else if (tab !== "gates" && tab !== "files" && tab !== SESSIONS_TAB) patchTimeline(childByKey(body, "recent"), detail.timeline.slice(-10));
 }
 
 const runTabLabel = (detail, tab) => (tab === SESSIONS_TAB ? "Agents (" + detail.session_count + ")" : RUN_TAB_LABEL[tab]);
@@ -272,6 +291,7 @@ function openRun(id, tab, sub) {
     if (tab === PLAN_TAB && ui.plan && ui.plan.runId === id && planMode(sub, !!(ui.plan.data && ui.plan.data.started)) === "tasks") loadPlan(id);
     if (tab === FILES_TAB && ui.files && ui.files.runId === id) { ui.files.error = null; loadFiles(id); }  // a first-load error gets its retry here
     if (tab === SESSIONS_TAB && ui.sessions && ui.sessions.runId === id) { ui.sessions.error = null; loadSessions(id); }  // sessions that started meanwhile
+    if (tab === ACTIVITY_TAB) loadActivity(id, false);  // the events that came meanwhile: the newest page, merged
   }
 }
 

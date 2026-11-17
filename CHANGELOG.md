@@ -9,6 +9,9 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- The Board filters by lane, status, "needs me" and a search over module, issue and branch, kept in the URL, and Done shows the newest `dashboard.done_shown` cards first with **Show all**.
+- Board cards show a phase progress strip, a "needs you" marker with how long it has waited, the live agent count and the step in words.
+- `dashboard.done_shown` (10 by default, 1–1000): how many Done cards the Board shows before **Show all**.
 - The Inbox groups decisions by run or by kind, takes `j`/`k`/`o`/`a`/`r` from the keyboard (approve takes two presses), and keeps a card you were typing on when the decision is made elsewhere, saying who made it.
 - `informed_approval:<phase>` in signals, `agentflow scorecard` and the Metrics tab: the share of a person's phase approvals that viewed every newest revision the phase produced on the dashboard.
 - `dashboard.inbox_legacy` (false by default): also show the old Needs-human list at the bottom of the Board (the Inbox tab stays), for one release.
@@ -20,6 +23,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 - Decisions waiting on you move from the Board's Needs-human list to an Inbox tab with a count in the header. Each card has a title in words, the inbox text with its CLI lines folded away, the facts and artifacts it needs, what a stop holds up, and forms in place of the browser's prompt boxes. `dashboard.inbox_legacy: true` brings the old list back.
 - A Board card lists every live agent of its run, not just the newest, and the Agents tab groups agents by run, puts idle ones first and opens each one's transcript.
+- A run's Activity tab tells its whole log as sentences ("Task 9 · implement finished: …", "You approved define"), filtered to Decisions, Agents, Gates, Commits or Stops. It folds agent turns into "Agent active 14 min, 37 tool calls", pages back to the first event, and shows each line's raw JSON on demand. The run detail no longer sends its last 300 raw events.
 
 ### Removed
 
