@@ -448,7 +448,7 @@ class _Loop:
             self.run.emit("phase_approved", by=AUTO_BY, phase=name, sha=head(self.worktree))
             self.hand_off(names, index, executor)
             return None
-        if finding_rounds(self.run, name) < round_limit(self.cfg):
+        if finding_rounds(self.run, name) < round_limit(self.cfg, name, self.run.state.get("route")):
             open_refine(self.run, name, AUTO_BY, findings_note(blocking))
             return self.phase(names, index)
         raise_phase_approval(self.cfg, self.run, name)

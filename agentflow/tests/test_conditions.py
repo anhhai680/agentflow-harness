@@ -692,6 +692,43 @@ def test_explain_runs_nested_group_steps_when_the_group_runs(cfg, tmp_path):
     assert by_key["define/grill_open_questions/answers"].model is None
 
 
+def with_profiles(cfg, **profiles):
+    from agentflow.config import Route, RouteProfile
+
+    return dataclasses.replace(cfg, route=Route(profiles={name: RouteProfile(**entry) for name, entry in profiles.items()}))
+
+
+def test_explain_with_a_profile_marks_its_skips(cfg, tmp_path):
+    cfg = with_profiles(cfg, XS={"skip": ("define/grill_open_questions", "plan/plan")}, L={})
+    ctx = make_ctx(cfg, fixture_repo(tmp_path, "SPEC-demo.md"), "feature", {"module": "demo"})
+    by_key = lines_by_key(explain(cfg, "feature", ctx, profile="XS"))
+    for key in ("define/grill_open_questions", "plan/plan"):
+        assert (by_key[key].verdict, by_key[key].reason) == ("skip", "route profile XS")
+    assert "define/grill_open_questions/grill" not in by_key  # a skipped group lists no steps
+    assert by_key["define/draft"] == lines_by_key(explain(cfg, "feature", ctx))["define/draft"]
+    assert by_key["build/build"].verdict == "run"
+    full = lines_by_key(explain(cfg, "feature", ctx, profile="L"))
+    assert full["define/grill_open_questions"].verdict == "run" and full["plan/plan"].verdict == "run"
+    with pytest.raises(ValueError, match="no route profile 'M' in route.profiles; defined: XS, L"):
+        explain(cfg, "feature", ctx, profile="M")
+
+
+def test_explain_without_a_profile_is_unchanged(cfg, tmp_path):
+    cfg = with_profiles(cfg, XS={"skip": ("define/grill_open_questions",)})
+    ctx = make_ctx(cfg, fixture_repo(tmp_path, "SPEC-demo.md"), "feature", {"module": "demo"})
+    assert explain(cfg, "feature", ctx, profile=None) == explain(cfg, "feature", ctx)
+    assert explain(cfg, "feature", ctx, {"plan": "fable"}, None) == explain(cfg, "feature", ctx, {"plan": "fable"})
+
+
+def test_cli_explain_profile_names_the_defined_profiles(capsys, monkeypatch, pack_repo_python):
+    from agentflow import flow
+
+    monkeypatch.chdir(pack_repo_python)
+    assert flow.main(["explain", "feature", "--module", "greet", "--profile", "XS"]) == 1
+    out = capsys.readouterr().out
+    assert "error:" in out and "no route profile 'XS'" in out and "route.profiles defines none" in out
+
+
 def test_explain_unknown_pipeline_raises(cfg):
     ctx = make_ctx(cfg, PACK, "feature", {"module": "greet"})
     with pytest.raises(ValueError, match="unknown lane 'nope'"):

@@ -688,7 +688,7 @@ def cmd_explain(args: argparse.Namespace) -> int:
         cfg = _load_cfg(args)
         overrides = _parse_models(args.model, cfg.phases)
         ctx = make_ctx(cfg, _find_repo(), args.lane, params)
-        lines = explain(cfg, args.lane, ctx, overrides)
+        lines = explain(cfg, args.lane, ctx, overrides, args.profile)
         warnings = plan_warnings(ctx)
     except _human_errors() as exc:
         print(f"error: {exc}")
@@ -1032,6 +1032,8 @@ def _since_date(text: str):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from agentflow.config import ROUTE_PROFILES
+
     parser = argparse.ArgumentParser(prog="agentflow", description="Run the repo's agent workflow, from idea to ship.")
     sub = parser.add_subparsers(dest="command", required=True)
     ini = sub.add_parser("init", help="write a sparse pack for this repository from what it holds (base branch, "
@@ -1134,6 +1136,8 @@ def build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--topic", help="a design topic")
     exp.add_argument("--issue", help="a bug or issue reference")
     exp.add_argument("--model", action="append", default=[], metavar="PHASE=MODEL", help="override one phase's model")
+    exp.add_argument("--profile", choices=ROUTE_PROFILES,
+                     help="show the steps this route profile skips (one of the pack's route.profiles)")
     exp.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     exp.set_defaults(func=cmd_explain)
 

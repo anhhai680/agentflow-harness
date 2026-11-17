@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from agentflow import preflight
+from agentflow import preflight, route
 from agentflow.commit_checks import runner_head
 from agentflow.config import FLOOR_BLOCKING, QUESTION_KINDS, Config, Phase, Step
 from agentflow.flow_control import halted
@@ -71,11 +71,15 @@ def is_blocking(cfg: Config, finding: dict) -> bool:
     return name not in allowed
 
 
-def round_limit(cfg: Config) -> int:
+def round_limit(cfg: Config, phase: str | None = None, record: dict | None = None) -> int:
     """How many refine rounds the runner may open on a phase's blocking findings: `autonomy.finding_rounds`, but at
-    least 1, and 1 for a value that is not a whole number or is missing (a workflow that drops the `autonomy` block)."""
+    least 1, and 1 for a value that is not a whole number or is missing (a workflow that drops the `autonomy` block).
+    With `phase`, the run's applied route profile (`record`, its last `route_profile`) may lower it to its
+    `doubt_rounds` cap for that phase; never raise it, and never below 1."""
     value = cfg.autonomy.get("finding_rounds")
-    return max(value, 1) if isinstance(value, int) and not isinstance(value, bool) else 1
+    limit = max(value, 1) if isinstance(value, int) and not isinstance(value, bool) else 1
+    cap = route.round_cap(cfg, record, phase) if phase is not None else None
+    return max(min(limit, cap), 1) if cap is not None else limit
 
 
 def as_finding(raw: object) -> dict:
