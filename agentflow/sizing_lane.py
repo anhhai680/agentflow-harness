@@ -458,15 +458,16 @@ class SizingLane:
         return out
 
     def _sizer_call(self, key: str, prompt: str, agent: Agent, model: str, effort: str, phase: str, role: str,
-                    turns: int, timeout_s: int) -> tuple[dict | None, list[str]]:
+                    turns: int, timeout_s: int, add_dirs: list[Path] | None = None) -> tuple[dict | None, list[str]]:
         """One fresh read-only session: its parsed answer (None when it gave none) and what it changed. Never holds,
-        reminds or stops: an interruption, a timeout or an exception gives no answer."""
+        reminds or stops: an interruption, a timeout or an exception gives no answer. `add_dirs` are the directories
+        outside the worktree it may read (the run's workspace, for a triage that names the run's inputs)."""
         before = self._repo_state()
         self.run.emit("sizer_started", key=key, **before)
         call = AgentCall(
             prompt=prompt, model=model, effort=effort, cwd=self.worktree, run_id=self.run.id, step_key=key,
             result_path=self.run.agent_result_path(key), transcript_path=self.run.transcript_path(key, 1),
-            add_dirs=[], runs_root=self.run.dir.parent, timeout_s=timeout_s,
+            add_dirs=list(add_dirs or []), runs_root=self.run.dir.parent, timeout_s=timeout_s,
             resume_session=None,  # always fresh: a resumed Codex session keeps its own sandbox
             agent_profile=None, context_window=self.context_window_for(key, model), env=self.cfg.defaults.env,
             env_base=run_env.base(self.cfg), forbidden_paths=list(self.cfg.guardrails.forbidden_paths),

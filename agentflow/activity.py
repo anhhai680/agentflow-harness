@@ -24,7 +24,7 @@ KINDS = ("decisions", "agents", "gates", "commits", "stops")
 _DECISIONS = (
     "checkpoint_cleared", "condition_decided", "condition_kept", "stop_classified", "effort_decided", "effort_escalated",
     "resolve_finished", "doubt_settled", "findings_reconciled", "plan_batched", "budget_scaled", "run_marked_done",
-    "decision_recorded",
+    "decision_recorded", "route_profile",
 )
 _BY_KIND = {
     "agents": (
@@ -141,6 +141,12 @@ def _sentence(event: dict) -> tuple[str, str]:
         return f"The runner took {_text(event.get('condition'))} as {_bool_word(event.get('value'))} for {step}", ""
     if etype == "stop_classified":
         return f"The runner classified {step}'s stop as {_text(event.get('stop_class'))}", ""
+    if etype == "route_profile":
+        by = _text(event.get("proposed_by"))
+        if event.get("upgraded_from"):
+            return (f"Upgraded the route from {_text(event.get('upgraded_from'))} to {_text(event.get('profile'))} "
+                    f"({by})"), _detail(event.get("reason"))
+        return f"Sized the route as {_text(event.get('profile'))} ({by})", _detail(event.get("reason"))
     if etype == "resolve_finished":
         return f"Resolver for {step} finished", _detail(event.get("summary"))
     if etype == "run_started":

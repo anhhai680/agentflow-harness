@@ -172,6 +172,8 @@ PROMPT_PLACEHOLDERS = frozenset(
         # sizer prompts (`sizing_lane.py`)
         "task_card",
         "task_cards",
+        # the triage prompt (`route_lane.py`)
+        "route_card",
     }
 )
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",

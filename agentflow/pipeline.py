@@ -322,6 +322,10 @@ class _Loop:
         first = self.opts.from_phase or names[0]
         if self.cfg.preflight.enabled and self.preflight(f"{first}/{preflight.PREFLIGHT_STEP}"):
             return "waiting_human"
+        if self.cfg.route.mode != "off":  # off builds nothing: the run is today's, byte for byte
+            executor = self.executor()
+            if executor.route_due() and executor.size_route(first) == "stopped":
+                return self.status()
         for index in range(names.index(first), len(names)):
             name = names[index]
             outcome = self.phase(names, index)

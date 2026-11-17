@@ -78,6 +78,7 @@ def initial_state() -> dict:
         "gates": {},
         "reviews": {},
         "effort_changes": [],
+        "route": None,  # the last `route_profile`: the run's route profile (`route.py` reads it)
         "footer_mismatches": [],
         "failure": None,
         "options": {},
@@ -397,6 +398,14 @@ def _on_plan_sized(state: dict, ev: dict) -> None:
 
 def _on_sizer_finished(state: dict, ev: dict) -> None:
     """Read from the log, not from the state."""
+
+
+ROUTE_FIELDS = ("profile", "applied", "proposed_by", "upgraded_from", "facts", "reason")
+
+
+def _on_route_profile(state: dict, ev: dict) -> None:
+    """The last one wins: a mid-flight upgrade replaces the triage's profile."""
+    state["route"] = {name: copy.deepcopy(ev.get(name)) for name in ROUTE_FIELDS}
 
 
 def _on_effort_refused(state: dict, ev: dict) -> None:
@@ -782,6 +791,7 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "sizer_started": _on_sizer_started,
     "plan_sized": _on_plan_sized,
     "sizer_finished": _on_sizer_finished,
+    "route_profile": _on_route_profile,
     "compacted": _on_compacted,
     "rolled_over": _on_rolled_over,
     "subagent_started": _on_subagent_started,
@@ -834,6 +844,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "sizer_started": ("key",),
     "plan_sized": ("key",),
     "sizer_finished": ("key",),
+    "route_profile": ("profile",),
     "permission_denied": ("key",),
     "progress_not_updated": ("key",),
     "checkpoint_reused": ("key",),
