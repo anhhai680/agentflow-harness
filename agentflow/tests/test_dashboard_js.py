@@ -195,3 +195,113 @@ def test_agents_group_by_run_with_idle_rows_first():
             {"run_id": "r1", "module": "a", "idle": True, "age_s": 10}]
     got = js(["agents.js"], "agentsByRun(args).map(g => [g.run_id, g.rows.map(r => r.age_s)])", rows)
     assert got == [["r1", [10, 50]], ["r2", [9]]]
+
+
+def test_a_repeated_block_cannot_be_approved_without_a_note():   # spec Verification U4, Review Focus 1
+    item = {"run_id": "r", "kind": "blocked_repeat", "key": "build/x", "approve_note": "required"}
+    refused = js(["inbox.js"], "approvePayload(args, {note: '   '})", item)
+    assert refused["ok"] is False and "blocked again" in refused["error"]
+    assert js(["inbox.js"], "approvePayload(args, {note: 'fixed the fixture'})", item) == \
+        {"ok": True, "body": {"target": "build/x", "note": "fixed the fixture"}}
+
+
+def test_a_phase_approval_never_sends_a_note():
+    item = {"run_id": "r", "kind": "phase_approval", "phase": "define", "key": "define_approved", "approve_note": "none"}
+    assert js(["inbox.js"], "approvePayload(args, {note: 'x'})", item) == {"ok": True, "body": {"target": "define"}}
+
+
+def test_an_optional_note_is_sent_only_when_written():
+    item = {"run_id": "r", "kind": "blocked", "key": "build/x", "approve_note": "optional"}
+    assert js(["inbox.js"], "approvePayload(args, {note: ' '})", item) == {"ok": True, "body": {"target": "build/x"}}
+    assert js(["inbox.js"], "approvePayload(args, {note: ' go '})", item) == \
+        {"ok": True, "body": {"target": "build/x", "note": "go"}}
+
+
+def test_a_phase_approval_carries_what_the_page_showed():
+    item = {"run_id": "r", "kind": "phase_approval", "phase": "plan", "key": "plan_approved", "approve_note": "none"}
+    got = js(["inbox.js"], "(viewedList = (id) => [{path: 'p.md', sha: 'abcdef1', run: id}], approvePayload(args, {note: ''}))", item)
+    assert got == {"ok": True, "body": {"target": "plan", "viewed": [{"path": "p.md", "sha": "abcdef1", "run": "r"}]}}
+
+
+def test_questions_start_on_their_recommended_option():           # spec Verification U4
+    qs = [{"id": "q1", "options": [{"key": "A"}, {"key": "B", "recommended": True}]}, {"id": "q2", "options": []}]
+    assert js(["inbox.js"], "answerDefaults(args)", qs) == {"q1": "B", "q2": ""}
+
+
+def test_an_answer_posts_its_own_key_and_prefers_written_text():  # Review Focus 2
+    item = {"key": "build/build/task-4/implement"}
+    got = js(["inbox.js"], "answerPayload(args, {q1: {choice: 'B', other: ''}, q2: {choice: '', other: ' pg '}})", item)
+    assert got == {"ok": True, "body": {"key": "build/build/task-4/implement", "answers": {"q1": "B", "q2": "pg"}}}
+    empty = js(["inbox.js"], "answerPayload(args, {q1: {choice: '', other: ' '}})", item)
+    assert empty == {"ok": False, "error": "Choose or write at least one answer."}
+
+
+def test_a_rejection_needs_a_note():
+    item = {"kind": "phase_approval", "phase": "define", "key": "define_approved"}
+    assert js(["inbox.js"], "rejectPayload(args, ' ')", item) == {"ok": False, "error": "A rejection needs a note."}
+    assert js(["inbox.js"], "rejectPayload(args, 'cut scope')", item) == {"ok": True, "body": {"target": "define", "note": "cut scope"}}
+    stop = {"kind": "blocked", "key": "build/x"}
+    assert js(["inbox.js"], "rejectPayload(args, 'no')", stop)["body"]["target"] == "build/x"
+
+
+def test_a_partial_answer_keeps_its_draft_and_others_forget_it():
+    # `/answer` succeeds with complete: false when a question is still blank; the draft must keep the picks
+    assert js(["inbox.js"], "inboxForgets('answer')", None) is False
+    assert js(["inbox.js"], "['approve', 'reject'].map(inboxForgets)", None) == [True, True]
+
+
+def test_items_group_by_run_or_by_kind():
+    items = [{"run_id": "r1", "run_label": "a", "group": "stop", "key": "1"},
+             {"run_id": "r2", "run_label": "b", "group": "approval", "key": "2"},
+             {"run_id": "r1", "run_label": "a", "group": "question", "key": "3"}]
+    by_run = js(["inbox.js"], "groupItems(args, 'run').map(g => [g.label, g.items.map(i => i.key)])", items)
+    by_kind = js(["inbox.js"], "groupItems(args, 'kind').map(g => [g.label, g.items.map(i => i.key)])", items)
+    assert by_run == [["a", ["1", "3"]], ["b", ["2"]]]
+    assert by_kind == [["Approvals", ["2"]], ["Questions", ["3"]], ["Stops", ["1"]]]
+    assert js(["inbox.js"], "groupItems(args, 'kind').map(g => g.key)", items[:1]) == ["stop"]
+    assert js(["inbox.js"], "groupItems(args, 'run')", []) == []
+
+
+def test_a_card_decided_elsewhere_says_by_whom():                  # spec Verification U4, Review Focus 3
+    item = {"run_id": "r", "kind": "phase_approval", "phase": "define", "key": "define_approved"}
+    recent = [{"run_id": "r", "phase": "define", "key": None, "action": "approved", "by": "alex",
+               "ts": "2026-11-16T14:02:10+00:00"}]
+    text = js(["inbox.js"], "goneText(args.item, args.recent)", {"item": item, "recent": recent})
+    assert text.startswith("Approved from the CLI by alex at ")
+    assert js(["inbox.js"], "goneText(args, [])", item) == "No longer waiting on you"
+
+
+def test_an_answer_filled_into_questions_md_is_named_as_such():
+    item = {"run_id": "r", "kind": "parked", "key": "build/x"}
+    recent = [{"run_id": "r", "phase": "build", "key": "build/x", "action": "approved", "by": "questions.md",
+               "ts": "2026-11-16T14:02:10+00:00"}]
+    text = js(["inbox.js"], "goneText(args.item, args.recent)", {"item": item, "recent": recent})
+    assert text.startswith("Answered in questions.md at ") and "CLI" not in text
+
+
+def test_a_key_that_comes_back_as_a_new_item_drops_the_old_draft():
+    pair = {"kept": {"since": "2026-11-16T10:00:00+00:00"}, "live": {"since": "2026-11-16T11:00:00+00:00"}}
+    assert js(["inbox.js"], "inboxReturned(args.kept, args.live)", pair) is True
+    same = {"kept": pair["kept"], "live": dict(pair["kept"])}
+    assert js(["inbox.js"], "inboxReturned(args.kept, args.live)", same) is False
+
+
+def test_the_gone_text_names_where_and_picks_the_newest_matching_entry():
+    stop = {"run_id": "r", "kind": "blocked", "key": "build/build/task-1/implement"}
+    other = {"run_id": "r2", "key": "build/build/task-1/implement", "action": "answered", "by": "zed", "ts": "2026-11-16T15:00:00+00:00"}
+    mine = lambda action, by, ts: {"run_id": "r", "key": stop["key"], "phase": "build", "action": action, "by": by, "ts": ts}  # noqa: E731
+    pick = "goneText(args.item, args.recent)"
+    got = js(["inbox.js"], pick, {"item": stop, "recent": [other, mine("approved", "dashboard", "2026-11-16T14:00:00+00:00")]})
+    assert got.startswith("Approved from the dashboard at ") and len(got.split(" at ")[1]) == 5
+    got = js(["inbox.js"], pick, {"item": stop, "recent": [mine("answered", "runner", "2026-11-16T14:00:00+00:00")]})
+    assert got.startswith("Answered by the runner at ")
+    got = js(["inbox.js"], pick, {"item": stop, "recent": [mine("rejected", "sam", "2026-11-16T14:00:00+00:00"),
+                                                           mine("approved", "alex", "2026-11-16T14:05:00+00:00")]})
+    assert got.startswith("Approved from the CLI by alex at ")  # the newest entry of the two
+    assert js(["inbox.js"], pick, {"item": stop, "recent": [other]}) == "No longer waiting on you"  # another run's key
+    approval = {"run_id": "r", "kind": "phase_approval", "phase": "build", "key": "build_approved"}
+    assert js(["inbox.js"], pick, {"item": approval, "recent": [mine("approved", "sam", "2026-11-16T14:00:00+00:00")]}) == \
+        "No longer waiting on you"  # a phase approval matches its phase's entry, not a step's key inside that phase
+    phase_entry = {"run_id": "r", "key": "build", "phase": "build", "action": "rejected", "by": "sam", "ts": "2026-11-16T14:00:00+00:00"}
+    assert js(["inbox.js"], pick, {"item": approval, "recent": [phase_entry]}).startswith("Rejected from the CLI by sam at ")
+

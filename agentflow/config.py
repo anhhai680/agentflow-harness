@@ -2242,6 +2242,8 @@ class _Validator:
         if "artifact_max_kb" in self.cfg.dashboard and (
                 not isinstance(cap, int) or isinstance(cap, bool) or not 16 <= cap <= 8192):
             self.error("dashboard.artifact_max_kb", "must be a whole number of KB, from 16 to 8192")
+        if "inbox_legacy" in self.cfg.dashboard and not isinstance(self.cfg.dashboard["inbox_legacy"], bool):
+            self.error("dashboard.inbox_legacy", "must be true or false")
         if "backlog" in self.cfg.dashboard:
             self.backlog(self.cfg.dashboard["backlog"])
 

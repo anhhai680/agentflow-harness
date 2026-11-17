@@ -599,7 +599,7 @@ def answer(run: Run, key: str, answers: dict[str, str], by: str, record: bool = 
 
 def approve(run: Run, target: str, by: str, budget: float | None = None, hold: bool = False,
             note: str | None = None, budget_step: float | None = None,
-            viewed: list[dict] | None = None) -> bool:
+            viewed: list[dict] | None = None, produced: list[dict] | None = None) -> bool:
     """Approve a phase (`plan` or `plan_approved`), clear an inner checkpoint, or resume a runner stop.
 
     `hold` rests an approved phase as ready (`phase_ready`) instead of leaving the run to go on, and True is
@@ -617,7 +617,9 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
     blocked again with nothing changed, so a plain approval would only repeat that.
 
     `viewed` (`[{path, sha}]`, the artifact revisions the dashboard page showed) is informational: a phase approval
-    records it on `phase_approved` when it is not empty, and any other approval ignores it. Nothing reads it back.
+    records it on `phase_approved` when it is not empty, and any other approval ignores it.
+    `produced` (`[{path, sha}]`, the newest revision of each artifact the phase produced) is recorded the same way
+    when it is not None, an empty list included: that says the phase produced nothing. `signals` reads both back.
     """
     note = nfc(note).strip() if note else None
     if budget is not None and not math.isfinite(budget):
@@ -641,7 +643,8 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
         if kind == "phase":
             if budget is not None:
                 run.emit("run_updated", by=by, budget_usd=budget)
-            run.emit("phase_approved", by=by, phase=name, **({"viewed": viewed} if viewed else {}))
+            run.emit("phase_approved", by=by, phase=name, **({"viewed": viewed} if viewed else {}),
+                     **({"produced": produced} if produced is not None else {}))
             if hold:
                 run.emit("phase_ready", by=by, phase=name)
             return run.state["status"] == "ready"
@@ -762,10 +765,11 @@ def remind_due(cfg: Config, repo: Path, now: datetime | None = None) -> list[str
     return due
 
 
-def inbox_items(repo: Path) -> list[dict]:
-    """One dict per thing a human can act on: each run's wait, then its parked questions (kind `parked`)."""
+def inbox_items(repo: Path, runs: list[Run] | None = None) -> list[dict]:
+    """One dict per thing a human can act on: each run's wait, then its parked questions (kind `parked`).
+    `runs` are the runs to read when the caller has loaded them already; else every run of `repo`."""
     items = []
-    for run in list_runs(repo):
+    for run in list_runs(repo) if runs is None else runs:
         waiting = run.state["waiting"]
         if run.state["status"] in TERMINAL:
             continue

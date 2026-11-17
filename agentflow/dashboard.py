@@ -14,6 +14,8 @@ Routes:
   and after the runs that carried it); `GET /api/events` (SSE: every run's new events, runs created
   later included; with `?quiet=1` each `agent_turn` becomes an `agent_activity` message, at most one every
   `QUIET_EVERY_S` per run session, and a newer one replaces a waiting one, so the last turn is never lost).
+- `GET /api/inbox` (each decision waiting on a person, titled, with its context, blast radius and allowed actions; the
+  held and stalled runs to watch; the decisions of the last 30 minutes). A query parameter is ignored.
 - `GET /api/runs/<id>/artifacts`, `/artifact?path=&sha=` (`sha` a revision of `path` or `head`),
   `/artifact/diff?path=&from=&to=` and `/findings`: the run's spec, plan and other committed files, read from git
   and capped at `dashboard.artifact_max_kb`; a path outside the run's artifact list is a 404.
@@ -25,7 +27,7 @@ Routes:
   an approval inside a phase then start `flow.py resume <id>` detached (D13), unless a runner already holds
   the run's lock. A phase approval starts nothing: the phase rests as ready until a human continues it
   (`resume`) or marks it done (`done`, which ends in the draft pull request) (D16).
-  An approve body may carry `viewed: [{path, sha}]`, the revisions the page showed, recorded on `phase_approved`.
+  An approve body may carry `viewed: [{path, sha}]`, the revisions the page showed, recorded on `phase_approved` with `produced`, the newest revision of each artifact the phase made.
   An action the run is not in a state for (a second approve, a live runner) answers 409 with the reason.
 - `GET /api/runs/<id>/sessions` (every agent session of the run) and `/sessions/<s…>/transcript?after=<byte>` (its
   transcript as turns, in whole-line pages of at most `dashboard.artifact_max_kb`).
@@ -89,6 +91,7 @@ from agentflow.artifacts import (
 )
 from agentflow.config import Config, ConfigError, _finite, for_lane, load_config
 from agentflow.events import EventError, lock_state
+from agentflow.inbox_view import inbox_view
 from agentflow.plan_view import run_plan
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
 from agentflow.run_files import list_files, read_file
@@ -102,7 +105,7 @@ PAGE = Path(__file__).resolve().with_name("dashboard.html")
 UI_DIR = Path(__file__).resolve().with_name("dashboard_ui")
 # in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
 UI_SCRIPTS = ("core.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js",
-              "sessions.js", "workflow.js", "agents.js", "metrics.js", "lessons.js", "settings.js", "main.js")
+              "sessions.js", "inbox.js", "workflow.js", "agents.js", "metrics.js", "lessons.js", "settings.js", "main.js")
 UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024
 DEFAULT_BOARD_REFRESH_S = 2.0  # the most often the page refetches the Board while events arrive
@@ -197,14 +200,30 @@ def _viewed(body: dict) -> list[dict] | None:
     return viewed
 
 
-def _approve(run: Run, body: dict, cfg: Config) -> tuple[dict, bool]:
+def _produced(run: Run, repo: Path, target: str) -> list[dict] | None:
+    """What the phase `target` names produced, as `[{path, sha}]` of each artifact's newest revision, when the run
+    waits on that phase's approval. None for any other approval, or when the artifacts cannot be listed."""
+    waiting = run.state["waiting"] or {}
+    if waiting.get("kind") != "phase_approval" or target not in (waiting.get("phase"), waiting.get("key")):
+        return None
+    try:
+        listing = run_artifacts(run, repo)
+    except NotFound:
+        return None
+    return [{"path": a["path"], "sha": a["revisions"][-1]["sha"]}
+            for a in listing if a["phase"] == waiting["phase"] and a.get("revisions")]
+
+
+def _approve(run: Run, body: dict, cfg: Config, repo: Path | None = None) -> tuple[dict, bool]:
     viewed = _viewed(body)
     budget = body.get("budget")
     if budget is not None and (isinstance(budget, bool) or not isinstance(budget, (int, float))
                                or not math.isfinite(budget)):
         raise BadRequest("budget must be a finite number")
-    rested = hitl.approve(run, _text(body, "target") or _default_target(run), BY, budget=budget, hold=_rests(run, cfg),
-                          note=_text(body, "note"), budget_step=cfg.defaults.run_budget_usd, viewed=viewed)
+    target = _text(body, "target") or _default_target(run)
+    rested = hitl.approve(run, target, BY, budget=budget, hold=_rests(run, cfg), note=_text(body, "note"),
+                          budget_step=cfg.defaults.run_budget_usd, viewed=viewed,
+                          produced=_produced(run, repo, target) if repo is not None else None)
     return {}, not rested
 
 
@@ -485,7 +504,8 @@ class _Handler(BaseHTTPRequestHandler):
             if not _finite(refresh) or not 0.5 <= refresh <= 60:  # a hand-edited value never reaches the page
                 refresh = DEFAULT_BOARD_REFRESH_S
             self._json(200, {"name": "agentflow-harness", "version": pack.ENGINE_VERSION,
-                             "board_refresh_s": float(refresh)})
+                             "board_refresh_s": float(refresh),
+                             "inbox_legacy": self.server.cfg.dashboard.get("inbox_legacy") is True})
         elif path == "/api/workflow":
             self._json(200, workflow_view(self.server.cfg))
         elif path == "/api/agents":
@@ -500,6 +520,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._scorecard(query)
         elif path == "/api/lessons":
             self._json(200, lessons_view(self.server.repo, self.server.cfg))
+        elif path == "/api/inbox":
+            self._json(200, inbox_view(self.server.repo, self.server.cfg, datetime.now(UTC)))
         elif match := TRANSCRIPT_ROUTE.match(path):
             self._transcript_get(match.group(1), match.group(2), query)
         elif match := ARTIFACT_ROUTE.match(path):
@@ -630,7 +652,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             action = match.group(2)
-            result, go_on = _approve(run, body, self.server.cfg) if action == "approve" else ACTIONS[action](run, body)
+            if action == "approve":
+                result, go_on = _approve(run, body, self.server.cfg, self.server.repo)
+            else:
+                result, go_on = ACTIONS[action](run, body)
         except CONFLICTS as exc:
             self._error(409, str(exc))
             return

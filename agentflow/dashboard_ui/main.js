@@ -4,20 +4,23 @@
 
 // The stream says what changed; the page refetches only that, at most every `boardRefreshMs`. `dirty` is cleared when
 // a fetch starts, so an event that arrives during it marks it again and earns one more round.
-const dirty = { board: true, agents: true, runs: new Set() };
+const dirty = { board: true, agents: true, inbox: false, runs: new Set() };
 let boardRefreshMs = 2000;  // `/api/info`'s board_refresh_s, once it answers
 
 async function refreshBoardNow() {
   const wantBoard = dirty.board;
   const wantAgents = ui.view === "agents" || dirty.agents;
   const wantWorkflow = !ui.workflow;  // fetched once, and again after Settings saves the config
+  const wantInbox = ui.view === "inbox" && (wantBoard || dirty.inbox);  // with the Board's round, while the Inbox is shown
   dirty.board = false;
+  dirty.inbox = false;
   if (wantAgents) dirty.agents = false;
-  if (!wantBoard && !wantAgents && !wantWorkflow) return;
+  if (!wantBoard && !wantAgents && !wantWorkflow && !wantInbox) return;
   try {
-    const [boardData, agentsData, workflow] = await Promise.all([wantBoard ? api("/api/board") : null,
-      wantAgents ? api("/api/agents") : null, wantWorkflow ? api("/api/workflow") : null]);
-    if (boardData) renderBoard(boardData);
+    const [boardData, agentsData, workflow, inboxData] = await Promise.all([wantBoard ? api("/api/board") : null,
+      wantAgents ? api("/api/agents") : null, wantWorkflow ? api("/api/workflow") : null, wantInbox ? api("/api/inbox") : null]);
+    if (boardData) { renderBoard(boardData); setInboxBadge(boardData.needs_human.length); }
+    if (inboxData) renderInbox(inboxData);
     if (agentsData) renderAgents(agentsData);
     if (workflow) { ui.workflow = workflow; renderWorkflow(); }
     if (wantBoard && ui.view === "metrics") loadMetrics();
@@ -25,6 +28,7 @@ async function refreshBoardNow() {
   } catch (err) {
     if (wantBoard) dirty.board = true;  // the next round tries again
     if (wantAgents) dirty.agents = true;
+    if (wantInbox) dirty.inbox = true;
     $("summary").textContent = "Could not load: " + err.message;
   }
 }
@@ -103,11 +107,12 @@ function connect() {
   };
 }
 
-const VIEWS = ["board", "workflow", "agents", "metrics", "lessons", "settings"];
+const VIEWS = ["inbox", "board", "workflow", "agents", "metrics", "lessons", "settings"];
 
 // `view` is a header tab's name, or "run" for the Run page, which no tab marks.
 function show(view) {
   ui.view = view;
+  setInboxKeys(view === "inbox");
   for (const name of VIEWS) {
     $(name + "-view").hidden = view !== name;
     $("tab-" + name).setAttribute("aria-pressed", String(view === name));
@@ -119,6 +124,7 @@ function show(view) {
   if (view === "metrics") loadMetrics();
   if (view === "lessons" && TOKEN) loadLessons();
   if (view === "agents" && TOKEN) boardRefresh();  // the Agents table is fetched while it is shown
+  if (view === "inbox" && TOKEN) { dirty.inbox = true; boardRefresh(); }  // so is the Inbox
 }
 
 // The hash is the page's place: a tab's `#/<view>` or a run's `#/run/<id>/<tab>`, so a reload and Back keep it.
@@ -139,6 +145,7 @@ for (const name of VIEWS) $("tab-" + name).addEventListener("click", () => {
   else location.hash = "#/" + name;
 });
 $("new-task").addEventListener("click", newTaskDialog);
+initInbox();
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("dlg").open) closePeek(); });
 window.addEventListener("hashchange", route);
 if (!location.hash) {  // a first visit, or the #token= the boot removed: the tab this browser showed last
@@ -154,6 +161,8 @@ async function loadInfo() {
     $("version").textContent = "v" + info.version;
     $("version").title = info.name + " " + info.version;
     $("version").hidden = false;
+    const legacy = info.inbox_legacy === true;
+    if (legacy !== ui.inboxLegacy) { ui.inboxLegacy = legacy; if (ui.board) renderBoard(ui.board); }
   } catch (err) { console.warn("agentflow: info unavailable", err); }  // the badge is optional; the refresh keeps 2 s
 }
 

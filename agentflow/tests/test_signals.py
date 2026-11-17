@@ -134,7 +134,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 31
+    assert len(FAMILIES) == 32
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -349,3 +349,21 @@ def test_gate_cache_hit_rate():
     assert run_signals(ran, EMPTY_METRICS)["gate_cache_hit_rate"] == 0.0
     assert parse_target("gate_cache_hit_rate") == ("gate_cache_hit_rate", None)
     assert parse_target("gate_cache_hit_rate:x") is None
+
+
+def _approved(phase, by="dashboard", **kw):
+    return _ev("phase_approved", phase=phase, **{**kw, "by": by})
+
+
+def test_informed_approval_is_the_share_of_human_approvals_that_viewed_every_newest_revision():
+    spec = {"path": "s.md", "sha": "a" * 40}
+    events = [_approved("define", produced=[spec], viewed=[spec, {"path": "x", "sha": "b" * 40}]),
+              _approved("define", produced=[spec], viewed=[]),
+              _approved("plan", by="alex"),                       # the CLI: no produced -> counted, not informed
+              _approved("plan", produced=[]),                     # nothing produced -> not counted
+              _approved("build", by="runner", produced=[spec])]   # the runner's -> never counted
+    got = run_signals(events, EMPTY_METRICS)
+    assert got["informed_approval:define"] == 0.5 and got["informed_approval:plan"] == 0.0
+    assert "informed_approval:build" not in got
+    assert parse_target("informed_approval:define") == ("informed_approval", "define")
+    assert "informed_approval" not in COUNT_FAMILIES and FAMILIES["informed_approval"] == ("higher", True)

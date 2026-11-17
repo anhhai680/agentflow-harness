@@ -235,8 +235,9 @@ def _restarted(events: list[dict], tkey: str, n: int) -> bool:
     return committed >= 0 and started > committed
 
 
-def run_plan(run: Run, repo: Path, cfg: Config) -> dict:
-    """The run's plan as `{path, sha, truncated, started, prefix, summary, tasks}` (see the module doc)."""
+def run_plan(run: Run, repo: Path, cfg: Config, events: list[dict] | None = None) -> dict:
+    """The run's plan as `{path, sha, truncated, started, prefix, summary, tasks}` (see the module doc).
+    `events` are the run's events when the caller has read them already."""
     repo = Path(repo)
     state = run.state
     steps = state.get("steps", {})
@@ -261,7 +262,7 @@ def run_plan(run: Run, repo: Path, cfg: Config) -> dict:
         return {**empty, "path": path, "sha": head or newest}
     tasks = parse_plan_text(text)
     by = {t.n: t for t in tasks}
-    events = _events(run)
+    events = _events(run) if events is None else events
 
     def tkey_of(n: int) -> str | None:
         return f"{prefix}/task-{n}" if prefix is not None else None

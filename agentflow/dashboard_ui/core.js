@@ -15,7 +15,12 @@ const TOKEN = (function () {
   return token;
 })();
 
-const ui = { view: "board", peek: null, run: null, board: null, agents: null, workflow: null, dragging: null, doneOpen: false, comments: new Map(), viewed: new Map() };
+const ui = { view: "board", peek: null, run: null, board: null, agents: null, workflow: null, dragging: null, doneOpen: false, comments: new Map(), viewed: new Map(),
+  // the Inbox: its last view, what was typed per card (outside the nodes), the armed Approve (and when), the focused card
+  // (its index in `order`, the cards as shown, and its key), the grouping, the cards kept after a decision made elsewhere
+  // (`gone`) and the answers this page sent itself (`sent`)
+  inbox: { view: null, drafts: new Map(), armed: null, armedAt: 0, focus: 0, focusKey: null, order: [], group: "run", ids: new Map(),
+    busy: new Set(), gone: new Map(), sent: new Set() }, inboxLegacy: false };
 const $ = (id) => document.getElementById(id);
 const workLabel = (lane) => (ui.board && ui.board.lane_labels[lane]) || lane;  // a lane with no label, or an old run's, shows its name
 

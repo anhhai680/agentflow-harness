@@ -172,3 +172,13 @@ def test_run_row_carries_the_throughput_signals(flow_repo):
     run.emit("run_finished")
     row = scorecard.run_row(run, datetime.now(UTC), full_suite=verify)
     assert row["full_suite_runs"] == 1 and row["lead_time_h"] >= 0 and "human_blocked_share" in row
+
+
+def test_informed_approval_reaches_the_scorecard_row(flow_repo):
+    spec = {"path": "s.md", "sha": "a" * 40}
+    run = flow_repo.new_run()
+    run.emit("phase_started", phase="define")
+    run.emit("phase_approval_raised", phase="define", round=0, summary="s")
+    run.emit("phase_approved", phase="define", by="dashboard", produced=[spec], viewed=[spec])
+    run.emit("run_finished")
+    assert scorecard.run_row(run, datetime.now(UTC))["informed_approval:define"] == 1.0

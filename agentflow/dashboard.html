@@ -258,6 +258,25 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
 .sc-slo td:first-child { border-left: 3px solid var(--bad); }
 .verdict-improved { color: var(--ok); } .verdict-worse { color: var(--bad); } .verdict-muted { color: var(--muted); }
 .chip { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--chip); margin: 2px 4px 2px 0; white-space: nowrap; }
+/* the Inbox: one card per decision */
+.icard { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--wait); border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; overflow-wrap: anywhere; }
+.icard.stop { border-left-color: var(--bad); } .icard.question { border-left-color: var(--accent); } .icard.armed { border-color: var(--warn); border-left-color: var(--warn); }
+.icard.focused { outline: 2px solid var(--accent); outline-offset: 1px; }
+.icard.gone { border-left-color: var(--muted); }
+.i-gone { font-weight: 600; margin: 6px 0; } .i-armed { color: var(--warn); font-weight: 600; margin: 4px 0; }
+#inbox-bar { align-items: center; margin-bottom: 4px; } #inbox-hint { margin: 4px 0 10px; font-size: 12px; }
+.i-head { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; }
+.i-title { font-size: 15px; margin: 0; }
+.i-summary { margin: 6px 0; }
+.i-body details { margin: 6px 0; } .i-body summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.i-body .fold { margin-top: 6px; } .i-body pre { margin: 4px 0; max-height: 240px; overflow: auto; white-space: pre-wrap; font: 12px ui-monospace, Menlo, monospace; }
+.i-art { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 4px 0; }
+.i-form { margin: 8px 0; } .i-label { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.i-form textarea, .i-question input[type=text] { width: 100%; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px; }
+.i-form textarea { min-height: 60px; }
+.i-question { border: 1px solid var(--line); border-radius: 6px; margin: 8px 0; padding: 6px 10px; } .i-question legend { font-weight: 600; padding: 0 4px; }
+.i-opt { display: flex; gap: 6px; align-items: baseline; margin: 3px 0; }
+.i-watch { padding: 3px 0; } .i-watch a { color: var(--accent); }
 </style>
 </head>
 <body>
@@ -266,6 +285,7 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
   <span id="version" class="pill" hidden></span>
   <div id="summary">loading…</div>
   <button id="new-task" type="button" class="primary" hidden>+ New task</button>
+  <button id="tab-inbox" type="button" aria-pressed="false">Inbox <span id="inbox-count"></span></button>
   <button id="tab-board" type="button" aria-pressed="true">Board</button>
   <button id="tab-workflow" type="button" aria-pressed="false">Workflow</button>
   <button id="tab-agents" type="button" aria-pressed="false">Agents</button>
@@ -275,12 +295,21 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
   <span id="live" class="pill">connecting…</span>
 </header>
 <main>
+  <section id="inbox-view" hidden>
+    <div id="inbox-bar" class="moves">
+      <span class="muted">Group by</span>
+      <button id="inbox-group-run" type="button" aria-pressed="true">Run</button>
+      <button id="inbox-group-kind" type="button" aria-pressed="false">Kind</button>
+    </div>
+    <p id="inbox-hint" class="muted">j/k move · o open · a approve (press twice) · r request changes</p>
+    <div id="inbox-list"></div>
+  </section>
   <section id="board-view">
     <div id="sync-note" class="muted" role="status" hidden></div>
     <div id="issues-note" class="muted" role="status" hidden></div>
     <div id="retro-due" class="muted" role="status" hidden></div>
     <div id="columns" class="columns"></div>
-    <h2 class="lane">Needs human</h2>
+    <h2 class="lane" id="needs-title" hidden>Needs human</h2>
     <div id="needs"></div>
   </section>
   <section id="workflow-view" hidden>

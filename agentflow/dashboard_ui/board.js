@@ -304,7 +304,12 @@ function renderBoard(data) {
     patchChildren($("columns"), columns, entryKey, entryNode);
     for (const name of data.columns) patchChildren(childByKey($("columns"), name), columnEntries(data, name), entryKey, entryNode);
   }
-  $("needs").replaceChildren(...(data.needs_human.length ? data.needs_human.map(needNode) : [el("p", { class: "muted", text: "Nothing is waiting on you." })]));
+  $("needs-title").hidden = !ui.inboxLegacy;
+  const waiting = data.needs_human.length;
+  const inbox = waiting === 0 ? el("p", { class: "muted", text: "Nothing is waiting on you." })
+    : el("p", {}, el("a", { href: "#/inbox", text: inboxPlural(waiting, "decision waits", "decisions wait") + " in the Inbox" }));
+  // the old list stays behind `dashboard.inbox_legacy`; otherwise one line points to the Inbox tab
+  $("needs").replaceChildren(...(ui.inboxLegacy ? (waiting ? data.needs_human.map(needNode) : [inbox]) : [inbox]));
 }
 
 // What an approval needs: a blocked stop takes a note (required when it blocked again with nothing changed).

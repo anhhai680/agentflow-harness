@@ -22,7 +22,7 @@ from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
 from agentflow.views import _badge, step_title
-from conftest import PYTHON_CONFIG, L, run_git, session_with_transcript
+from conftest import PYTHON_CONFIG, L, awaiting, run_git, session_with_transcript
 
 TOKEN = "k3y-" + "x" * 40
 AGENTFLOW = Path(__file__).resolve().parents[1]
@@ -84,13 +84,6 @@ def dash(flow_repo, monkeypatch):
     thread.join(timeout=5)
 
 
-def awaiting(flow_repo, module: str = "crm", phase: str = "plan") -> Run:
-    run = flow_repo.new_run({"module": module})
-    run.emit("phase_started", phase=phase)
-    run.emit("phase_approval_raised", phase=phase, round=0, summary=f"Phase {phase} is done")
-    return run
-
-
 def ready(flow_repo, module: str = "crm", phase: str = "plan", lane: str = "feature") -> Run:
     params = {"topic": module} if lane == "design" else {"module": module}
     run = Run.create(flow_repo.cfg, flow_repo.root, lane, params)
@@ -129,10 +122,19 @@ def new_events(run: Run, after: int) -> list[dict]:
 def test_info_names_the_engine_version(dash):
     status, headers, body = dash.get("/api/info")
     assert status == 200 and headers["content-type"].startswith("application/json")
-    assert json.loads(body) == {"name": "agentflow-harness", "version": pack.ENGINE_VERSION, "board_refresh_s": 2.0}
+    assert json.loads(body) == {"name": "agentflow-harness", "version": pack.ENGINE_VERSION, "board_refresh_s": 2.0,
+                               "inbox_legacy": False}
     assert dash.get("/api/info", token=None)[0] == 403
     page = page_source()
     assert 'id="version"' in page and "/api/info" in page
+
+
+def test_info_says_whether_the_legacy_inbox_is_on(dash):
+    assert payload(dash.get("/api/info")[2])["inbox_legacy"] is False
+    dash.server.cfg.dashboard["inbox_legacy"] = "yes"
+    assert payload(dash.get("/api/info")[2])["inbox_legacy"] is False
+    dash.server.cfg.dashboard["inbox_legacy"] = True
+    assert payload(dash.get("/api/info")[2])["inbox_legacy"] is True
 
 
 def test_info_carries_the_board_refresh(dash):
@@ -391,6 +393,28 @@ def test_untrusted_text_is_escaped_in_json(dash):
     assert payload(body)["facts"]["refine"]["note"] == note
 
 
+def test_the_inbox_lists_each_decision(dash):
+    run = awaiting(dash.flow, phase="define")
+    view = payload(dash.get("/api/inbox")[2])
+    (item,) = view["items"]
+    assert item["run_id"] == run.id and item["title"] == "Approve the spec" and item["approve_note"] == "none"
+    assert view["counts"] == {"approval": 1, "question": 0, "stop": 0, "watch": 0}
+
+
+def test_the_inbox_needs_the_token_and_our_host(dash):
+    assert dash.get("/api/inbox", token=None)[0] == 403
+    assert dash.get("/api/inbox", headers={"Host": "evil.example"})[0] == 403
+    assert dash.post("/api/inbox")[0] == 404
+
+
+def test_untrusted_inbox_text_is_escaped_in_json(dash):
+    run = dash.flow.new_run()
+    run.emit("phase_started", phase="build")
+    hitl.raise_hitl(dash.flow.cfg, run, "blocked", "build/x", "<script>alert(1)</script>")
+    body = dash.get("/api/inbox")[2]
+    assert b"<script>" not in body and b"\\u003cscript\\u003e" in body
+
+
 def test_page_is_served_with_a_nonce_and_no_unsafe_dom_sinks(dash):
     status, headers, body = dash.get("/", token=None)
     assert status == 200 and headers["content-type"].startswith("text/html")
@@ -455,7 +479,9 @@ def test_dashboard_approve_equals_cli(dash):
     hitl.approve(cli_run, "plan", by="someone", hold=True)
     status, _, body = dash.post(f"/api/runs/{web_run.id}/approve", {"target": "plan"})
     assert status == 200 and payload(body)["resumed"] is False
-    assert new_events(web_run, web_after) == new_events(cli_run, cli_after)
+    web_events = new_events(web_run, web_after)
+    assert web_events[0].pop("produced") == []  # the page records what the phase produced; the CLI records nothing
+    assert web_events == new_events(cli_run, cli_after)
     assert [e["by"] for e in web_run.events.read(after_seq=web_after)] == ["dashboard", "dashboard"]
     web_run.refresh()
     assert web_run.state["phases"]["plan"]["status"] == "approved" and web_run.state["waiting"] is None
@@ -471,6 +497,15 @@ def test_approve_records_what_the_page_showed(dash):
     assert dash.post(f"/api/runs/{run.id}/approve", {"viewed": viewed})[0] == 200
     (event,) = [e for e in run.events.read() if e["type"] == "phase_approved"]
     assert event["viewed"] == viewed and event["by"] == "dashboard"
+
+
+def test_a_dashboard_phase_approval_records_what_the_phase_produced(dash, spec_run):
+    spec_run.run.emit("phase_approval_raised", phase="plan", round=0, summary="plan is done")
+    newest = spec_run.revisions("docs/plans/x.md")[-1]["sha"]
+    viewed = [{"path": "docs/plans/x.md", "sha": newest}]
+    assert dash.post(f"/api/runs/{spec_run.run.id}/approve", {"viewed": viewed})[0] == 200
+    event = [e for e in spec_run.run.events.read() if e["type"] == "phase_approved"][-1]
+    assert event["produced"] == viewed and event["viewed"] == viewed
 
 
 @pytest.mark.parametrize("viewed", ["x", [{"path": "a"}], [{"path": "a", "sha": "zz"}],
@@ -2039,3 +2074,24 @@ def test_a_global_agent_row_links_to_its_session(dash, monkeypatch):
     ev = run.emit("agent_started", step="plan/plan", pid=71, agent="claude", model="opus", effort="high", role="plan")
     (row,) = payload(dash.get("/api/agents")[2])["live"]
     assert row["session"] == f"s{ev['seq']}" and row["label"] == "plan · attempt 1"
+
+
+def test_the_inbox_is_a_tab_with_a_badge_and_no_browser_prompts():
+    page = page_source()
+    assert 'id="tab-inbox"' in page and 'id="inbox-count"' in page and 'id="inbox-view"' in page
+    inbox = (UI_DIR / "inbox.js").read_text(encoding="utf-8")
+    for needle in ("/api/inbox", "Approve and resume", "Request changes", "CLI equivalent", "Facts the resolvers found",
+                   "(recommended)", "Confirm approve", "Watch", "ui.inbox"):
+        assert needle in inbox, needle
+    assert "prompt(" not in inbox and "confirm(" not in inbox
+    assert '"inbox"' in (UI_DIR / "main.js").read_text(encoding="utf-8")
+    assert "inbox_legacy" in (UI_DIR / "board.js").read_text(encoding="utf-8")
+
+
+def test_inbox_shortcuts_stay_out_of_text_fields_and_approve_takes_two_presses():  # Review Focus 4
+    inbox = (UI_DIR / "inbox.js").read_text(encoding="utf-8")
+    handler = inbox[inbox.index("function inboxKey"):inbox.index("\n}\n", inbox.index("function inboxKey"))]
+    for needle in ("INPUT", "TEXTAREA", "SELECT", "isContentEditable", "dlg", "4000", "armed"):
+        assert needle in handler, needle
+    assert "Press a again to approve" in inbox and "Dismiss" in inbox and "readOnly" in inbox
+

@@ -523,17 +523,19 @@ def normal_finding(raw: object) -> dict:
             "line": _line(finding.get("line")), "text": finding_text(finding)}
 
 
-def run_findings(run: Run) -> list[dict]:
+def run_findings(run: Run, events: list[dict] | None = None) -> list[dict]:
     """`[{key, label, round, ts, open, findings: [{severity, file, line, text}]}]`, in event order.
 
     One row per `step_findings` (its `round` is its 1-based position among that key's) and per `review_result`
-    (its own `round`); `open` marks the newest row of each key. An event log that cannot be read lists nothing."""
+    (its own `round`); `open` marks the newest row of each key. An event log that cannot be read lists nothing.
+    `events` are the run's events when the caller has read them already."""
     from agentflow.views import step_title  # views imports this module, so it is imported here, not at the top
 
-    try:
-        events = run.events.read()
-    except OSError:
-        return []
+    if events is None:
+        try:
+            events = run.events.read()
+        except OSError:
+            return []
     rows: list[dict] = []
     counts: dict[str, int] = {}
     for ev in sorted(events, key=lambda e: e.get("seq", 0)):
