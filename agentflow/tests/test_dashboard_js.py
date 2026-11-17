@@ -171,6 +171,25 @@ def test_a_reopened_session_drops_a_page_read_before_it_was_closed():
     assert got["after"] == {"open": "s1", "loaded": True, "next": 500, "turns": ["first"]}
 
 
+def test_load_more_is_not_offered_when_a_read_finds_no_complete_line():
+    got = js_async(["sessions.js"], READS + """(async () => {
+        const st = sessionsState("r1");
+        openTranscript(st, "s1");
+        calls[0].resolve(page(["a"], 500));
+        await tick();
+        const first = st.stalled;
+        readTranscript(st, false);  // the last line has no newline yet: nothing comes back and `next` stays
+        calls[1].resolve({turns: [], next: 500, size: 900, done: false});
+        await tick();
+        const stuck = st.stalled;
+        readTranscript(st, false);
+        calls[2].resolve(page(["b"], 900));
+        await tick();
+        return {first: first, stuck: stuck, moved: st.stalled};
+    })()""", None)
+    assert got == {"first": False, "stuck": True, "moved": False}
+
+
 def test_agents_group_by_run_with_idle_rows_first():
     rows = [{"run_id": "r1", "module": "a", "idle": False, "age_s": 50}, {"run_id": "r2", "module": "b", "idle": False, "age_s": 9},
             {"run_id": "r1", "module": "a", "idle": True, "age_s": 10}]

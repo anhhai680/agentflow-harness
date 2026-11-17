@@ -113,6 +113,9 @@ def _turns_of(event: dict) -> list[dict] | None:
                 out.append({"kind": "tool_result", "id": block.get("tool_use_id"),
                             "text": _cut(_tool_text(block.get("content")), IO_MAX),
                             "is_error": bool(block.get("is_error")), "parent": parent})
+            else:  # a user text block (the compaction notice) or a block type this parser does not know
+                shown = block.get("text") if btype == "text" and isinstance(block.get("text"), str) else json.dumps(block, ensure_ascii=False)
+                out.append({"kind": "raw", "text": _cut(shown, IO_MAX), "parent": parent})
         return out
     return [{"kind": "raw", "text": _cut(json.dumps(event, ensure_ascii=False), IO_MAX)}]
 

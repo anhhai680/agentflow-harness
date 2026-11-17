@@ -2029,6 +2029,11 @@ def test_a_card_lists_every_live_agent(dash, monkeypatch):
                                                               "Task 8 · review · attempt 1"]
 
 
+def test_a_card_for_a_run_with_no_live_agent_has_none(dash):
+    awaiting(dash.flow)
+    assert card_of(dash)["agents"] == []
+
+
 def test_a_global_agent_row_links_to_its_session(dash, monkeypatch):
     run = awaiting(dash.flow)
     monkeypatch.setattr("agentflow.views._alive", lambda pid: True)

@@ -26,6 +26,18 @@ def test_turns_read_like_a_conversation():
     assert turns[5]["text"] == "3 passed" and turns[6]["cost"] == 0.88
 
 
+def test_user_text_and_unknown_blocks_become_capped_raw_turns():
+    notice = "This session is being continued from a previous conversation"
+    turns = parse_lines([
+        L({"type": "user", "message": {"content": [{"type": "text", "text": notice}]}, "parent_tool_use_id": "p1"}),
+        L({"type": "user", "message": {"content": "a plain string " + "x" * 50000}}),
+        L({"type": "assistant", "message": {"content": [{"type": "redacted_thinking", "data": "abc"}]}})])
+    assert [t["kind"] for t in turns] == ["raw", "raw", "raw"]
+    assert turns[0]["text"] == notice and turns[0]["parent"] == "p1"
+    assert turns[1]["text"].startswith("a plain string") and len(turns[1]["text"]) < 20000
+    assert "redacted_thinking" in turns[2]["text"] and turns[2]["parent"] is None
+
+
 def test_codex_items_and_unknown_lines_become_turns():
     turns = parse_lines([L({"type": "thread.started", "thread_id": "c"}),
                          L({"type": "item.completed", "item": {"type": "command_execution", "command": "ls",

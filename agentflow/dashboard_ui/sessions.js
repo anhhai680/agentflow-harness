@@ -84,7 +84,7 @@ function sessionsState(runId) {
   let st = ui.sessions;
   if (!st || st.runId !== runId) {
     st = ui.sessions = { runId: runId, rows: null, filter: { phase: null, role: null, failed: false }, open: null, turns: [], next: 0,
-      size: 0, done: false, missing: false, session: null, loaded: false, error: null, turnsError: null, inflight: false, reading: false,
+      size: 0, done: false, missing: false, session: null, loaded: false, stalled: false, error: null, turnsError: null, inflight: false, reading: false,
       below: false, epoch: 0 };
   }
   return st;
@@ -94,7 +94,7 @@ function sessionsState(runId) {
 // new epoch: a read still out from an earlier one is dropped when it answers, and does not hold up this one's reads.
 function openTranscript(st, sid) {
   if (st.open === sid) return;
-  Object.assign(st, { open: sid, turns: [], next: 0, size: 0, done: false, missing: false, session: null, loaded: false, turnsError: null, below: false,
+  Object.assign(st, { open: sid, turns: [], next: 0, size: 0, done: false, missing: false, session: null, loaded: false, stalled: false, turnsError: null, below: false,
     epoch: st.epoch + 1, reading: false });
   if (sid) readTranscript(st, false);
 }
@@ -153,6 +153,8 @@ async function readTranscript(st, follow) {
     st.turns = mergeTurns(st.turns, page.turns || []);
     Object.assign(st, { next: page.next || 0, size: page.size || 0, done: !!page.done, missing: !!page.missing, session: page.session || st.session,
       loaded: true, turnsError: null });
+    // Nothing read and `next` did not move: the last line has no newline yet, so "Load more" would do nothing.
+    st.stalled = (page.turns || []).length === 0 && st.next === after;
   }
   redrawSessions(st.runId);
   if (follow && grew) toPageBottom();
@@ -289,7 +291,7 @@ function turnNode(t) {
 function transcriptEnd(st) {
   const row = openSessionRow(st);
   if (st.missing) return sessionNote("turns:end", row && row.live ? "No transcript yet. Following this session live" : "No transcript was written.");
-  if (!st.done && st.next < st.size) {
+  if (!st.done && !st.stalled && st.next < st.size) {
     return entry("turns:end", { left: kbLeft(st) }, (d) => el("div", { class: "turns-end" },
       el("button", { type: "button", text: "Load more (" + d.left + " KB left)", onclick: () => { if (ui.sessions) readTranscript(ui.sessions, false); } })));
   }

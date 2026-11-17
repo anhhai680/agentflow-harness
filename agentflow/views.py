@@ -633,8 +633,10 @@ def agents_view(repo: Path, cfg: Config | None = None, now: datetime | None = No
     live: list[dict] = []
     exited: list[dict] = []
     window = exited_min * 60
+    from agentflow.sessions import run_sessions  # sessions imports views
     for run in list_runs(repo):
-        from agentflow.sessions import run_sessions  # sessions imports views
+        if not run.state.get("agents") and not run.state.get("exited"):
+            continue
         events = run.events.read()
         digest = _digest(run, now, events)
         sessions = run_sessions(run, events)
