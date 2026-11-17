@@ -1824,18 +1824,51 @@ def test_the_artifact_route_refuses_what_is_not_listed(dash, spec_run, query):
     assert dash.get(f"/api/runs/{spec_run.run.id}/artifact?{query}")[0] == 404
 
 
-@pytest.mark.parametrize("route", ["artifacts", "artifact?path=docs%2Fspecs%2Fx.md&sha=head",
-                                   "artifact/diff?path=docs%2Fspecs%2Fx.md&from=head&to=head", "findings"])
-def test_the_artifact_routes_keep_the_refusal_matrix(dash, spec_run, route):
-    rid = spec_run.run.id
+def assert_refusal_matrix(dash, run, route):
+    rid = run.id
     assert dash.get(f"/api/runs/{rid}/{route}", token=None)[0] == 403
     assert dash.get(f"/api/runs/{rid}/{route}", headers={"Host": "evil.example"})[0] == 403
     assert dash.get(f"/api/runs/{rid}/{route}", headers={"Origin": "http://evil.example"})[0] == 403
     assert dash.get(f"/api/runs/20261030-0000-feature-nope/{route}")[0] == 404
     assert dash.post(f"/api/runs/{rid}/{route}")[0] == 404
     link = runs_root(dash.flow.root) / "20261030-0000-feature-link"
-    link.symlink_to(spec_run.run.dir, target_is_directory=True)
+    link.symlink_to(run.dir, target_is_directory=True)
     assert dash.get(f"/api/runs/{link.name}/{route}")[0] == 404
+
+
+@pytest.mark.parametrize("route", ["artifacts", "artifact?path=docs%2Fspecs%2Fx.md&sha=head",
+                                   "artifact/diff?path=docs%2Fspecs%2Fx.md&from=head&to=head", "findings"])
+def test_the_artifact_routes_keep_the_refusal_matrix(dash, spec_run, route):
+    assert_refusal_matrix(dash, spec_run.run, route)
+
+
+def test_the_process_routes_answer(dash, spec_run):
+    rid = spec_run.run.id
+    assert payload(dash.get(f"/api/runs/{rid}/plan")[2])["path"] in ("docs/plans/x.md", None)
+    (spec_run.run.dir / "issue.md").write_text("# Ask\n", encoding="utf-8")
+    assert {"name": "issue.md", "group": "request", "size": 6} in payload(dash.get(f"/api/runs/{rid}/files")[2])
+    assert payload(dash.get(f"/api/runs/{rid}/files?name=issue.md")[2])["text"] == "# Ask\n"
+    changes = payload(dash.get(f"/api/runs/{rid}/changes")[2])
+    assert "docs/specs/x.md" in {f["path"] for f in changes["files"]}
+    diff = payload(dash.get(f"/api/runs/{rid}/changes?path=docs%2Fspecs%2Fx.md")[2])
+    assert "+Scope 3 says another" in diff["diff"]
+
+
+@pytest.mark.parametrize("route", ["plan", "files", "files?name=issue.md", "changes", "changes?path=notes.md"])
+def test_the_process_routes_keep_the_refusal_matrix(dash, spec_run, route):
+    assert_refusal_matrix(dash, spec_run.run, route)
+
+
+@pytest.mark.parametrize("query", ["files?name=..%2Fevents.jsonl", "files?name=state.json",
+                                   "changes?path=..%2F..%2Fetc%2Fpasswd", "changes?path=README.md"])
+def test_the_process_routes_refuse_what_is_not_listed(dash, spec_run, query):
+    assert dash.get(f"/api/runs/{spec_run.run.id}/{query}")[0] == 404
+
+
+def test_a_doubled_name_is_a_400(dash, spec_run):
+    rid = spec_run.run.id
+    assert dash.get(f"/api/runs/{rid}/files?name=pr.md&name=issue.md")[0] == 400
+    assert dash.get(f"/api/runs/{rid}/changes?path=a&path=b")[0] == 400
 
 
 def test_a_missing_or_doubled_parameter_is_a_400(dash, spec_run):
