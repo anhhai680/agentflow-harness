@@ -28,8 +28,8 @@ def _root(run: Run, name: str) -> Path:
     return run.agent_dir if name == "progress.md" else run.dir
 
 
-def _head(root: Path, path: Path, limit: int) -> tuple[bytes, int] | None:
-    """The first `limit` bytes of `path` and its size, or None unless it is a regular file inside `root`
+def _read_at(root: Path, path: Path, start: int, limit: int) -> tuple[bytes, int] | None:
+    """`limit` bytes of `path` from `start` and its size, or None unless it is a regular file inside `root`
     reached without a symlink (on the file or on its folder)."""
     try:
         if path.is_symlink() or path.parent.is_symlink():
@@ -44,7 +44,19 @@ def _head(root: Path, path: Path, limit: int) -> tuple[bytes, int] | None:
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode):
             return None
+        if start > 0:
+            handle.seek(start)
         return handle.read(max(0, limit)), info.st_size
+
+
+def _head(root: Path, path: Path, limit: int) -> tuple[bytes, int] | None:
+    """The first `limit` bytes of `path` and its size, under `_read_at`'s rules."""
+    return _read_at(root, path, 0, limit)
+
+
+def read_range(root: Path, path: Path, start: int, limit: int) -> tuple[bytes, int] | None:
+    """`limit` bytes of `path` from `start` and its size, under `_head`'s rules."""
+    return _read_at(root, path, max(0, start), limit)
 
 
 def _phase_order(run: Run) -> list[str]:
