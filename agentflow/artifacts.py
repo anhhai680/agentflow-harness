@@ -344,31 +344,39 @@ def read_artifact(run: Run, repo: Path, path: str, sha: str, max_bytes: int) -> 
     entry = _entry(run, repo, path)
     full = _resolve(run, repo, entry, sha)
     _check_commit(repo, full)
+    text, cut = read_blob(repo, full, entry["path"], limit)
+    lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+    return {"path": entry["path"], "sha": full, "text": text, "lines": lines, "truncated": cut}
+
+
+def read_blob(repo: Path, sha: str, path: str, max_bytes: int) -> tuple[str, bool]:
+    """`(text, truncated)`: `path` at the commit `sha`, a regular file only, cut after its last newline past
+    `max_bytes`. `NotFound` for a missing path, a symlink, a submodule or a directory, or any git failure."""
+    limit = _check_cap(max_bytes)
+    repo = Path(repo)
     try:
-        out, _ = _git(repo, "--literal-pathspecs", "ls-tree", "-l", "-z", full, "--", entry["path"])
+        out, _ = _git(repo, "--literal-pathspecs", "ls-tree", "-l", "-z", sha, "--", path)
     except NotFound:
-        raise _lost(full) from None
+        raise _lost(sha) from None
     blob = None
     for record in out.split(b"\0"):
         meta, tab, name = record.partition(b"\t")
-        if not tab or name.decode("utf-8", errors="replace") != entry["path"]:
+        if not tab or name.decode("utf-8", errors="replace") != path:
             continue
         fields = meta.split()
         if len(fields) == 4 and fields[0] in (b"100644", b"100755") and fields[1] == b"blob":
             blob = fields[2].decode("ascii", errors="replace")
             break
-        raise NotFound(f"{entry['path']} is not a regular file at {full[:7]}")
+        raise NotFound(f"{path} is not a regular file at {sha[:7]}")
     if blob is None:
-        raise NotFound(f"{entry['path']} does not exist at {full[:7]}")
+        raise NotFound(f"{path} does not exist at {sha[:7]}")
     if not SHA.match(blob):
-        raise NotFound(f"{entry['path']} is not a regular file at {full[:7]}")
+        raise NotFound(f"{path} is not a regular file at {sha[:7]}")
     try:
         data, cut = _git(repo, "cat-file", "blob", blob, limit=limit)
     except NotFound:
-        raise _lost(full) from None
-    text = _cut(data, cut)
-    lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
-    return {"path": entry["path"], "sha": full, "text": text, "lines": lines, "truncated": cut}
+        raise _lost(sha) from None
+    return _cut(data, cut), cut
 
 
 def artifact_diff(run: Run, repo: Path, path: str, from_sha: str, to_sha: str, max_bytes: int) -> dict:
@@ -406,7 +414,8 @@ def _line(value: object) -> int | None:
     return value if isinstance(value, int) and 0 < value <= _LINE_MAX else None
 
 
-def _finding(raw: object) -> dict:
+def normal_finding(raw: object) -> dict:
+    """`{severity, file, line, text}` of one raw finding, normalised for the page."""
     finding = as_finding(raw)
     severity, file = finding.get("severity"), finding.get("file")
     return {"severity": severity.lower() if isinstance(severity, str) and severity else None,
@@ -438,7 +447,7 @@ def run_findings(run: Run) -> list[dict]:
             round_ = ev.get("round") if isinstance(ev.get("round"), int) else 0
         found = ev.get("findings")
         rows.append({"key": key, "label": step_title(key), "round": round_, "ts": ev.get("ts"), "open": False,
-                     "findings": [_finding(f) for f in found] if isinstance(found, list) else []})
+                     "findings": [normal_finding(f) for f in found] if isinstance(found, list) else []})
     newest: dict[str, dict] = {row["key"]: row for row in rows}
     for row in newest.values():
         row["open"] = True
