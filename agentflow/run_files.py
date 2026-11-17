@@ -16,7 +16,7 @@ from .intake import ISSUE_FILE, LOG_FILE, TASK_FILE
 from .state import Run
 
 RUN_FILE = re.compile(r"^(?:issue\.md|task\.md|bug\.log|questions\.md|pr\.md|handoff\.md|progress\.md|"
-                      r"handoffs/[a-z0-9_-]{1,64}\.md|refine/[a-z0-9_-]{1,64}-\d{1,4}\.md)$")
+                      r"handoffs/[a-z0-9_-]{1,64}\.md|refine/[a-z0-9_-]{1,64}-[0-9]{1,4}\.md)$")
 GROUPS = ("request", "handoffs", "refine", "pull request", "notes")
 _REQUEST = (ISSUE_FILE, TASK_FILE, LOG_FILE)
 _NOTES = ("progress.md", "questions.md", "handoff.md")

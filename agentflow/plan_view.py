@@ -199,7 +199,8 @@ def _stop(state: dict, tkey: str) -> dict | None:
     return None
 
 
-def _base_status(task: PlanTask, tkey: str | None, state: dict, committed: set[int]) -> str | None:
+def _base_status(task: PlanTask, tkey: str | None, state: dict, committed: set[int],
+                 restarted: frozenset[int] = frozenset()) -> str | None:
     """The first of `STATUSES` up to `done_before`, or None when the task is `waiting` or later."""
     if tkey is not None:
         wait = state.get("waiting")
@@ -208,7 +209,7 @@ def _base_status(task: PlanTask, tkey: str | None, state: dict, committed: set[i
         if any(_under(k, tkey) for k in state.get("parked", {})):
             return "parked"
         if any(isinstance(a.get("step"), str) and _under(a["step"], tkey) for a in state.get("agents", {}).values()) \
-                or (task.n not in committed  # a committed task's step row can still read `running` until it settles
+                or ((task.n not in committed or task.n in restarted)  # a step started after the commit is a redo
                     and any(r.get("status") == "running" and _under(k, tkey) for k, r in state.get("steps", {}).items())):
             return "running"
         if state.get("steps", {}).get(f"{tkey}/implement", {}).get("status") == "failed":
@@ -220,6 +221,18 @@ def _base_status(task: PlanTask, tkey: str | None, state: dict, committed: set[i
     if task.checked and (tkey is None or not any(_under(k, tkey) for k in state.get("steps", {}))):
         return "done_before"
     return None
+
+
+def _restarted(events: list[dict], tkey: str, n: int) -> bool:
+    """True when the newest `step_started` under `tkey` comes after the task's newest `task_committed`."""
+    started = committed = -1
+    for i, e in enumerate(events):
+        key = e.get("key")
+        if e.get("type") == "step_started" and isinstance(key, str) and _under(key, tkey):
+            started = i
+        elif e.get("type") == "task_committed" and e.get("n") == n and key == tkey:
+            committed = i
+    return committed >= 0 and started > committed
 
 
 def run_plan(run: Run, repo: Path, cfg: Config) -> dict:
@@ -255,7 +268,8 @@ def run_plan(run: Run, repo: Path, cfg: Config) -> dict:
 
     committed = {t.n for t in tasks if tkey_of(t.n) is not None and any(
         e.get("type") == "task_committed" and e.get("n") == t.n and e.get("key") == tkey_of(t.n) for e in events)}
-    base = {t.n: _base_status(t, tkey_of(t.n), state, committed) for t in tasks}
+    restarted = frozenset(t.n for t in tasks if tkey_of(t.n) is not None and _restarted(events, tkey_of(t.n), t.n))
+    base = {t.n: _base_status(t, tkey_of(t.n), state, committed, restarted) for t in tasks}
     stopped = {n for n, s in base.items() if s in ("blocked", "parked")}
     layers = waves(tasks)
     rows = []

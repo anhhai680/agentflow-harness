@@ -85,3 +85,63 @@ def test_a_run_that_started_at_build_finds_its_plan_at_the_branch_head(flow_repo
 def test_no_plan_is_an_empty_list_not_an_error(flow_repo):
     run = flow_repo.new_run()
     assert run_plan(run, flow_repo.root, flow_repo.cfg)["tasks"] == []
+
+
+LADDER = """# P
+### Task 1: Running live
+**Depends on:** none
+- [ ] a
+### Task 2: Failed
+**Depends on:** none
+- [ ] a
+### Task 3: Deferred
+**Depends on:** none
+- [ ] a
+> **Deferred:** later
+### Task 4: Done before
+**Depends on:** none
+- [x] a
+### Task 5: Pending
+**Depends on:** none
+- [ ] a
+### Task 6: Redone after its commit
+**Depends on:** none
+- [ ] a
+### Task 7: Committed
+**Depends on:** none
+- [ ] a
+### Task 8: Parked
+**Depends on:** none
+- [ ] a
+"""
+
+
+def _ladder(spec_run, flow_repo, park):
+    spec_run.commit("plan/plan", write={"docs/plans/2026-11-16-crm.md": LADDER})
+    run, p = spec_run.run, "build/build"
+    run.emit("phase_started", phase="build", start_sha=spec_run.head())
+    run.emit("step_started", key=f"{p}/task-1/implement")
+    run.emit("agent_started", key=f"{p}/task-1/implement", session_id="s1", pid=2, model="sonnet", effort="high")
+    run.emit("step_started", key=f"{p}/task-2/implement")
+    run.emit("step_finished", key=f"{p}/task-2/implement", status="failed")
+    for n in (6, 7):
+        run.emit("step_started", key=f"{p}/task-{n}/implement")
+        run.emit("step_finished", key=f"{p}/task-{n}/implement", status="done")
+        run.emit("task_committed", key=f"{p}/task-{n}", n=n, title="T", sha="a" * 40, round=0)
+    run.emit("step_started", key=f"{p}/task-6/implement")  # a refine round runs it again
+    if park:
+        run.emit("step_started", key=f"{p}/task-8/implement")
+        run.emit("step_parked", key=f"{p}/task-8/implement/resolve-1", kind="needs_human", summary="which db?")
+    plan = run_plan(run, spec_run.repo, flow_repo.cfg)
+    return {t["n"]: t for t in plan["tasks"]}
+
+
+def test_the_status_ladder(spec_run, flow_repo):
+    by = _ladder(spec_run, flow_repo, park=False)
+    assert [by[n]["status"] for n in range(1, 8)] == [
+        "running", "failed", "deferred", "done_before", "pending", "running", "committed"]
+
+
+def test_a_parked_task_carries_its_stop(spec_run, flow_repo):
+    by = _ladder(spec_run, flow_repo, park=True)
+    assert by[8]["status"] == "parked" and by[8]["stop"]["summary"] == "which db?"

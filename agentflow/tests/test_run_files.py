@@ -30,10 +30,14 @@ def test_a_phase_handoff_reads_in_full_past_the_old_16_kb_tail(flow_repo):   # s
 
 
 @pytest.mark.parametrize("name", ["handoffs/../state.json", "refine/x-1.md/..", "HANDOFF.md", "events.jsonl",
-                                  "../events.jsonl", "handoffs/a/b.md", "refine/plan.md", "/etc/passwd", ""])
+                                  "../events.jsonl", "handoffs/a/b.md", "refine/plan.md", "/etc/passwd", "",
+                                  "refine/plan-\u0663.md"])
 def test_names_outside_the_allow_list_are_not_found(flow_repo, name):           # Review Focus 4
+    run = flow_repo.new_run()
+    (run.dir / "refine").mkdir(exist_ok=True)
+    (run.dir / "refine" / "plan-\u0663.md").write_text("x\n", encoding="utf-8")  # it exists: only the name refuses it
     with pytest.raises(NotFound):
-        read_file(flow_repo.new_run(), name, 1024)
+        read_file(run, name, 1024)
 
 
 def test_symlinks_are_never_followed(flow_repo, tmp_path):                      # Review Focus 4

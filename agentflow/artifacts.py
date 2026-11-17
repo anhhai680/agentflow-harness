@@ -448,8 +448,10 @@ def run_changes(run: Run, repo: Path, cfg: Config) -> dict:
     base, head = _changes_range(run, repo, cfg)
     try:
         status, _ = _git(repo, "diff", "--name-status", "-z", "--no-renames", "--no-ext-diff", "--no-textconv",
+                         "--no-color",
                          base, head, "--")
         counts, _ = _git(repo, "diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv",
+                         "--no-color",
                          base, head, "--")
     except NotFound as exc:
         if isinstance(exc, _GitTimeout):
