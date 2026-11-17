@@ -1075,3 +1075,8 @@ def test_gate_affected_and_gate_tier_are_protected(shipped):
     tiered = step.replace("gates: verify,", "gates: verify, gate_tier: affected,")
     with pytest.raises(Refused, match="protected"):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(step, tiered, 1), repo=REPO)
+
+
+def test_the_form_sets_the_inbox_legacy_switch(shipped):
+    config_edit.save(shipped, form(shipped, (["dashboard", "inbox_legacy"], True)))
+    assert load_config(shipped).dashboard["inbox_legacy"] is True

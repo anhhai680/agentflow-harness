@@ -485,7 +485,8 @@ class _Handler(BaseHTTPRequestHandler):
             if not _finite(refresh) or not 0.5 <= refresh <= 60:  # a hand-edited value never reaches the page
                 refresh = DEFAULT_BOARD_REFRESH_S
             self._json(200, {"name": "agentflow-harness", "version": pack.ENGINE_VERSION,
-                             "board_refresh_s": float(refresh)})
+                             "board_refresh_s": float(refresh),
+                             "inbox_legacy": self.server.cfg.dashboard.get("inbox_legacy") is True})
         elif path == "/api/workflow":
             self._json(200, workflow_view(self.server.cfg))
         elif path == "/api/agents":
