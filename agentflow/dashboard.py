@@ -108,6 +108,7 @@ UI_SCRIPTS = ("core.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "
               "sessions.js", "inbox.js", "workflow.js", "agents.js", "metrics.js", "lessons.js", "settings.js", "main.js")
 UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024
+DEFAULT_DONE_SHOWN = 10  # how many Done cards the Board draws before "Show all"
 DEFAULT_BOARD_REFRESH_S = 2.0  # the most often the page refetches the Board while events arrive
 LOG_REASON_MAX = 200  # the characters of a refused request's `error` its log line keeps
 MIN_TOKEN_CHARS = 22  # 128 bits of token_urlsafe
@@ -503,8 +504,11 @@ class _Handler(BaseHTTPRequestHandler):
             refresh = self.server.cfg.dashboard.get("board_refresh_s", DEFAULT_BOARD_REFRESH_S)
             if not _finite(refresh) or not 0.5 <= refresh <= 60:  # a hand-edited value never reaches the page
                 refresh = DEFAULT_BOARD_REFRESH_S
+            shown = self.server.cfg.dashboard.get("done_shown", DEFAULT_DONE_SHOWN)
+            if not isinstance(shown, int) or isinstance(shown, bool) or not 1 <= shown <= 1000:
+                shown = DEFAULT_DONE_SHOWN
             self._json(200, {"name": "agentflow-harness", "version": pack.ENGINE_VERSION,
-                             "board_refresh_s": float(refresh),
+                             "board_refresh_s": float(refresh), "done_shown": shown,
                              "inbox_legacy": self.server.cfg.dashboard.get("inbox_legacy") is True})
         elif path == "/api/workflow":
             self._json(200, workflow_view(self.server.cfg))

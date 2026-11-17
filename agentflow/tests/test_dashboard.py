@@ -123,7 +123,7 @@ def test_info_names_the_engine_version(dash):
     status, headers, body = dash.get("/api/info")
     assert status == 200 and headers["content-type"].startswith("application/json")
     assert json.loads(body) == {"name": "agentflow-harness", "version": pack.ENGINE_VERSION, "board_refresh_s": 2.0,
-                               "inbox_legacy": False}
+                               "inbox_legacy": False, "done_shown": 10}
     assert dash.get("/api/info", token=None)[0] == 403
     page = page_source()
     assert 'id="version"' in page and "/api/info" in page
@@ -135,6 +135,14 @@ def test_info_says_whether_the_legacy_inbox_is_on(dash):
     assert payload(dash.get("/api/info")[2])["inbox_legacy"] is False
     dash.server.cfg.dashboard["inbox_legacy"] = True
     assert payload(dash.get("/api/info")[2])["inbox_legacy"] is True
+
+
+def test_info_carries_how_many_done_cards_show(dash):
+    assert payload(dash.get("/api/info")[2])["done_shown"] == 10
+    dash.server.cfg.dashboard["done_shown"] = 0
+    assert payload(dash.get("/api/info")[2])["done_shown"] == 10
+    dash.server.cfg.dashboard["done_shown"] = 3
+    assert payload(dash.get("/api/info")[2])["done_shown"] == 3
 
 
 def test_info_carries_the_board_refresh(dash):

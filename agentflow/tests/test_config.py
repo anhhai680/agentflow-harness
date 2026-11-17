@@ -1851,6 +1851,14 @@ def test_the_engine_defaults_mark_the_fix_steps_affected(sparse_repo):
     assert phase_step_of(cfg, "build", "fix").gate_tier == "full"
 
 
+def test_dashboard_done_shown_is_a_whole_number_from_1_to_1000(tmp_cfg):
+    for bad in (0, 1001, 2.5, True, "10"):
+        found = issues_for(tmp_cfg, {"dashboard": {"done_shown": bad}})
+        assert [i.path for i in found if i.level == "error"] == ["dashboard.done_shown"], bad
+    for good in (1, 10, 1000):
+        assert not errors(issues_for(tmp_cfg, {"dashboard": {"done_shown": good}})), good
+
+
 def test_dashboard_inbox_legacy_is_true_or_false(tmp_cfg):
     for bad in ("yes", 1, 0):  # a null never reaches the check: the layer merge reads it as "delete the key"
         found = issues_for(tmp_cfg, {"dashboard": {"inbox_legacy": bad}})

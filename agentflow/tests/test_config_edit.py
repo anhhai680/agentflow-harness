@@ -1077,6 +1077,13 @@ def test_gate_affected_and_gate_tier_are_protected(shipped):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(step, tiered, 1), repo=REPO)
 
 
+def test_the_form_sets_how_many_done_cards_show(shipped):
+    config_edit.save(shipped, form(shipped, (["dashboard", "done_shown"], 25)))
+    assert load_config(shipped).dashboard["done_shown"] == 25
+    with pytest.raises(config_edit.EditError):
+        form(shipped, (["dashboard", "done_shown"], 0))
+
+
 def test_the_form_sets_the_inbox_legacy_switch(shipped):
     config_edit.save(shipped, form(shipped, (["dashboard", "inbox_legacy"], True)))
     assert load_config(shipped).dashboard["inbox_legacy"] is True

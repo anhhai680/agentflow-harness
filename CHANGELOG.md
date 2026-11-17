@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- `dashboard.done_shown` (10 by default, 1–1000): how many Done cards the Board shows before **Show all**.
 - The Inbox groups decisions by run or by kind, takes `j`/`k`/`o`/`a`/`r` from the keyboard (approve takes two presses), and keeps a card you were typing on when the decision is made elsewhere, saying who made it.
 - `informed_approval:<phase>` in signals, `agentflow scorecard` and the Metrics tab: the share of a person's phase approvals that viewed every newest revision the phase produced on the dashboard.
 - `dashboard.inbox_legacy` (false by default): also show the old Needs-human list at the bottom of the Board (the Inbox tab stays), for one release.
