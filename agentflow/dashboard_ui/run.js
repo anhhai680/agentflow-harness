@@ -202,11 +202,7 @@ function runTabEntries(detail, tab, sub) {
       entry("reviews", reviews, (text) => section("Review findings", text, false, "reviews"))];
   }
   if (tab === "files") {
-    const file = (key, title, text) => entry(key, { title: title, text: text }, (f) => section(f.title, f.text, false, key));
-    return [file("file:progress", "progress.md", detail.progress),
-      file("file:handoff", "handoff.md", detail.handoff),
-      file("file:transcript", "Transcript tail" + (detail.transcript_file ? " (" + detail.transcript_file + ")" : ""), detail.transcript),
-      file("file:records", "Step records", recordsText(detail))];
+    return fileEntries(detail, sub);
   }
   const current = sub ? null : detail.facts.phase;  // with nothing named, the phase the run is in starts open
   const asked = decisionData(detail);
@@ -268,6 +264,10 @@ function openRun(id, tab, sub) {
   else if (!same) renderRunNote("Loading " + id + "…");
   loadRun(id);
   if (reopensArtifact(prev, id, tab, ui.artifact)) loadArtifacts(id);  // revisions and findings that came meanwhile
+  if (same && prev.tab !== tab) {  // the tasks and the files change while a stopped run sends no event: fetch them again on return
+    if (tab === PLAN_TAB && ui.plan && ui.plan.runId === id && planMode(sub, !!(ui.plan.data && ui.plan.data.started)) === "tasks") loadPlan(id);
+    if (tab === FILES_TAB && ui.files && ui.files.runId === id) { ui.files.error = null; loadFiles(id); }  // a first-load error gets its retry here
+  }
 }
 
 function showRun(detail) {

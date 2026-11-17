@@ -291,6 +291,7 @@ All routes are new and read-only (GET), behind the same token, Host and Origin c
 | `GET /api/runs/<id>/sessions/<session>/transcript?after=<n>` | parsed turns, paginated | `transcripts/*.jsonl` |
 | `GET /api/runs/<id>/events?before=<seq>&kinds=` | events with a `text` sentence, paginated | `events.jsonl` |
 | `GET /api/runs/<id>/files?name=` | `issue.md`, `pr.md`, `handoffs/*.md`, `refine/*.md`, `progress.md`, rendered by the page | the run directory, an allow-list of names |
+| `GET /api/runs/<id>/changes` (added with U2) | `{base, head, files: [{path, status, added, deleted}]}`; with `?path=`, that file's diff, capped | `git diff <merge-base>...<branch>` |
 | `GET /api/inbox` | items with `title`, `context`, `blast_radius`, `actions` | `inbox_items` + the above |
 | `POST /api/runs/<id>/approve` (body extended) | accepts an optional `viewed: [{path, sha}]` and records it on the approval event | `hitl.approve` |
 
@@ -392,6 +393,7 @@ None of them is protected.
 - **U2:**
   - On a 5-task fixture plan where task 2 is blocked and tasks 3 and 4 depend on it, the Plan tab marks task 2 blocked with "blocks: 3, 4" and shows task 5 as independent.
   - The Files tab shows `handoffs/build.md` in full when `handoff.md` exceeds 16 KB.
+  - After a merge of `origin/<fork_from>` into the branch, `/changes` lists only the run's own files.
 - **U3:**
   - A fixture run with 3 sessions on one step (attempt 1, attempt 2, resolver 1) lists all 3 with distinct labels.
   - The transcript route returns parsed turns, and `tool_progress` lines are collapsed.

@@ -35,6 +35,8 @@ async function refreshRunsNow() {
   if (ui.run && ui.run.detail !== null && dirty.runs.has(ui.run.id)) {  // a missing run is not asked again
     jobs.push(loadRun(ui.run.id));
     if (isArtifactTab(ui.run.tab)) jobs.push(loadArtifacts(ui.run.id));  // new revisions and findings
+    if (ui.run.tab === PLAN_TAB && planMode(ui.run.sub, true) === "tasks") jobs.push(loadPlan(ui.run.id));  // the task board
+    if (ui.run.tab === FILES_TAB) jobs.push(loadFiles(ui.run.id));  // the documents and the branch's changes
   }
   if (ui.peek && dirty.runs.has(ui.peek)) jobs.push(loadPeek(ui.peek));
   dirty.runs.clear();  // a run that is not shown is fetched when it is opened

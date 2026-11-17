@@ -344,31 +344,39 @@ def read_artifact(run: Run, repo: Path, path: str, sha: str, max_bytes: int) -> 
     entry = _entry(run, repo, path)
     full = _resolve(run, repo, entry, sha)
     _check_commit(repo, full)
+    text, cut = read_blob(repo, full, entry["path"], limit)
+    lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+    return {"path": entry["path"], "sha": full, "text": text, "lines": lines, "truncated": cut}
+
+
+def read_blob(repo: Path, sha: str, path: str, max_bytes: int) -> tuple[str, bool]:
+    """`(text, truncated)`: `path` at the commit `sha`, a regular file only, cut after its last newline past
+    `max_bytes`. `NotFound` for a missing path, a symlink, a submodule or a directory, or any git failure."""
+    limit = _check_cap(max_bytes)
+    repo = Path(repo)
     try:
-        out, _ = _git(repo, "--literal-pathspecs", "ls-tree", "-l", "-z", full, "--", entry["path"])
+        out, _ = _git(repo, "--literal-pathspecs", "ls-tree", "-l", "-z", sha, "--", path)
     except NotFound:
-        raise _lost(full) from None
+        raise _lost(sha) from None
     blob = None
     for record in out.split(b"\0"):
         meta, tab, name = record.partition(b"\t")
-        if not tab or name.decode("utf-8", errors="replace") != entry["path"]:
+        if not tab or name.decode("utf-8", errors="replace") != path:
             continue
         fields = meta.split()
         if len(fields) == 4 and fields[0] in (b"100644", b"100755") and fields[1] == b"blob":
             blob = fields[2].decode("ascii", errors="replace")
             break
-        raise NotFound(f"{entry['path']} is not a regular file at {full[:7]}")
+        raise NotFound(f"{path} is not a regular file at {sha[:7]}")
     if blob is None:
-        raise NotFound(f"{entry['path']} does not exist at {full[:7]}")
+        raise NotFound(f"{path} does not exist at {sha[:7]}")
     if not SHA.match(blob):
-        raise NotFound(f"{entry['path']} is not a regular file at {full[:7]}")
+        raise NotFound(f"{path} is not a regular file at {sha[:7]}")
     try:
         data, cut = _git(repo, "cat-file", "blob", blob, limit=limit)
     except NotFound:
-        raise _lost(full) from None
-    text = _cut(data, cut)
-    lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
-    return {"path": entry["path"], "sha": full, "text": text, "lines": lines, "truncated": cut}
+        raise _lost(sha) from None
+    return _cut(data, cut), cut
 
 
 def artifact_diff(run: Run, repo: Path, path: str, from_sha: str, to_sha: str, max_bytes: int) -> dict:
@@ -386,6 +394,106 @@ def artifact_diff(run: Run, repo: Path, path: str, from_sha: str, to_sha: str, m
     except NotFound:
         raise _lost(new) from None
     return {"path": entry["path"], "from": old, "to": new, "diff": _cut(data, cut), "truncated": cut}
+
+
+# -- the branch's own changes
+
+CHANGES_MAX = 2000
+
+
+def _rev(repo: Path, ref: str) -> str | None:
+    """The full sha `ref` names as a commit, or None."""
+    try:
+        out, _ = _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    except NotFound:
+        return None
+    tip = out.decode("ascii", errors="replace").strip()
+    return tip if SHA.match(tip) else None
+
+
+def _changes_range(run: Run, repo: Path, cfg: Config) -> tuple[str, str]:
+    """`(base, head)` shas: the run branch's tip, and where it left `origin/<fork_from>` (the merge-base, so a
+    merge of the base branch into the branch brings nothing in; else the run's recorded `base_sha`)."""
+    state = run.state or {}
+    branch = state.get("branch")
+    if not isinstance(branch, str) or not branch or branch.startswith("-") or any(c.isspace() for c in branch):
+        raise NotFound("this run has no branch yet")
+    head = _rev(repo, f"refs/heads/{branch}")
+    if head is None:
+        raise NotFound(f"branch {branch} is no longer in git")
+    base = None
+    fork = cfg.project.fork_from
+    if isinstance(fork, str) and fork and not fork.startswith("-") and not any(c.isspace() for c in fork):
+        upstream = _rev(repo, f"refs/remotes/origin/{fork}")
+        if upstream is not None:
+            try:
+                out, _ = _git(repo, "merge-base", head, upstream)
+            except NotFound:
+                out = b""
+            found = out.decode("ascii", errors="replace").strip()
+            base = found if SHA.match(found) else None
+    if base is None:
+        recorded = state.get("base_sha")
+        base = recorded if isinstance(recorded, str) and SHA.match(recorded) else None
+    if base is None:
+        raise NotFound("this run's base is not known")
+    return base, head
+
+
+def run_changes(run: Run, repo: Path, cfg: Config) -> dict:
+    """`{base, head, complete, files: [{path, status, added, deleted}]}`: what the run branch changed since it left
+    `origin/<fork_from>` (the PR's diff). `status` is A, M, D or T; `added` and `deleted` are None for a binary file.
+    Sorted by path, at most `CHANGES_MAX` (`complete` is False when cut). A non-UTF-8 path is left out."""
+    repo = Path(repo)
+    base, head = _changes_range(run, repo, cfg)
+    try:
+        status, _ = _git(repo, "diff", "--name-status", "-z", "--no-renames", "--no-ext-diff", "--no-textconv",
+                         "--no-color",
+                         base, head, "--")
+        counts, _ = _git(repo, "diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv",
+                         "--no-color",
+                         base, head, "--")
+    except NotFound as exc:
+        if isinstance(exc, _GitTimeout):
+            raise
+        raise _lost(head) from None
+    rows: dict[str, dict] = {}
+    fields = status.split(b"\0")
+    for code, name in zip(fields[0::2], fields[1::2]):
+        letter = code.decode("ascii", errors="replace")[:1]
+        try:
+            path = name.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if letter in ("A", "M", "D", "T"):
+            rows[path] = {"path": path, "status": letter, "added": None, "deleted": None}
+    for record in counts.split(b"\0"):
+        added, _, rest = record.partition(b"\t")
+        deleted, _, name = rest.partition(b"\t")
+        try:
+            row = rows.get(name.decode("utf-8"))
+        except UnicodeDecodeError:
+            continue
+        if row is not None and added.isdigit() and deleted.isdigit():
+            row["added"], row["deleted"] = int(added), int(deleted)
+    files = sorted(rows.values(), key=lambda f: f["path"])
+    return {"base": base, "head": head, "complete": len(files) <= CHANGES_MAX, "files": files[:CHANGES_MAX]}
+
+
+def change_diff(run: Run, repo: Path, cfg: Config, path: str, max_bytes: int) -> dict:
+    """`{path, base, head, diff, truncated}`: `git diff` of one of `run_changes`' files, capped like a read."""
+    limit = _check_cap(max_bytes)
+    repo = Path(repo)
+    listing = run_changes(run, repo, cfg)
+    if not isinstance(path, str) or not any(f["path"] == path for f in listing["files"]):
+        raise NotFound("that path is not a change of this run")  # never echo what a browser sent
+    base, head = listing["base"], listing["head"]
+    try:
+        data, cut = _git(repo, "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--no-color",
+                         "--no-renames", base, head, "--", path, limit=limit)
+    except NotFound:
+        raise _lost(head) from None
+    return {"path": path, "base": base, "head": head, "diff": _cut(data, cut), "truncated": cut}
 
 
 # -- findings
@@ -406,7 +514,8 @@ def _line(value: object) -> int | None:
     return value if isinstance(value, int) and 0 < value <= _LINE_MAX else None
 
 
-def _finding(raw: object) -> dict:
+def normal_finding(raw: object) -> dict:
+    """`{severity, file, line, text}` of one raw finding, normalised for the page."""
     finding = as_finding(raw)
     severity, file = finding.get("severity"), finding.get("file")
     return {"severity": severity.lower() if isinstance(severity, str) and severity else None,
@@ -438,7 +547,7 @@ def run_findings(run: Run) -> list[dict]:
             round_ = ev.get("round") if isinstance(ev.get("round"), int) else 0
         found = ev.get("findings")
         rows.append({"key": key, "label": step_title(key), "round": round_, "ts": ev.get("ts"), "open": False,
-                     "findings": [_finding(f) for f in found] if isinstance(found, list) else []})
+                     "findings": [normal_finding(f) for f in found] if isinstance(found, list) else []})
     newest: dict[str, dict] = {row["key"]: row for row in rows}
     for row in newest.values():
         row["open"] = True

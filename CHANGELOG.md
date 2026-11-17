@@ -7,6 +7,11 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+
+- The Files tab shows the run's own documents in full (`issue.md`, each phase's handoff, refine notes, `pr.md`, `progress.md`), and the branch's changes since it left the base with a diff per file: the pull request's diff, readable before the pull request exists.
+- The Plan tab's Tasks mode lists each plan task with its status, tries, review and cost, groups the tasks by status or by dependency wave, and shows what a blocked or parked task holds up and which tasks could go on without it.
+
 ## [2.9] - 2026-11-17
 
 ### Added
@@ -23,6 +28,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Fixed
 
+- The run page's Overview and the drawer draw a waiting decision again; the Spec and Plan tabs' approve bar had taken over its drawing function.
 - The Backlog no longer shows a module `issue-<N>` whose GitHub issue is closed: such a module is done as `issue closed` once `gh` says so, unless a run of it is live (asked once, then recorded; `agentflow backlog undone` overrides it). Before, a closed issue's module stayed when its run directory was gone, since the branch checked for a merge lacked the issue title's slug.
 - A plan names its spec for the "plan complete on <branch>" reason with a plain `Spec:` label or a Markdown link (`**Spec:** [SPEC-x](…/SPEC-x.md)`) too, not only with a backticked path after `**Spec:**`.
 - The Spec and Plan tabs refetch their revisions and findings when you come back to them, flag a cut diff (and round its size up), keep your line comments in **Request changes** while you look at a diff, and list only the findings of their own phase or on their own files. A finding's line that is negative or longer than nine digits no longer breaks the findings panel.

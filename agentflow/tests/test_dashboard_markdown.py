@@ -2,32 +2,13 @@
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
 
-from agentflow.dashboard import UI_DIR
+from conftest import NODE, LOADER, js, walk  # noqa: F401
 
-NODE = shutil.which("node")
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not on PATH")
-LOADER = ("const fs=require('fs'),vm=require('vm');const ctx=vm.createContext({});"
-          "for (const f of JSON.parse(process.argv[1])) vm.runInContext(fs.readFileSync(f,'utf8'),ctx);"
-          "ctx.args=JSON.parse(fs.readFileSync(0,'utf8'));"
-          "process.stdout.write(JSON.stringify(vm.runInContext(process.argv[2],ctx)));")
-
-
-def js(files: list[str], expr: str, args) -> object:
-    out = subprocess.run([NODE, "-e", LOADER, json.dumps([str(UI_DIR / f) for f in files]), expr],
-                         input=json.dumps(args), capture_output=True, text=True, check=True, timeout=30)
-    return json.loads(out.stdout)
-
-
-def walk(nodes):
-    for node in nodes:
-        yield node
-        yield from walk(node.get("c") or [])
 
 
 HOSTILE = "\n".join([

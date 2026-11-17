@@ -1425,8 +1425,9 @@ def test_a_pack_without_a_backlog_block_still_syncs_its_issues(idash, monkeypatc
 
 def test_the_page_names_no_lane_phase_or_path(bdash):
     """The page is framework code: lanes, phases and the form fields all come from the board data."""
-    # the two tab lists name the artifact tabs (`plan` is a tab id there, as `define`'s `spec` is); nothing else may
-    source = "\n".join(line for line in page_source().splitlines() if "RUN_TABS = [" not in line and "ARTIFACT_KINDS = [" not in line)
+    # the two tab lists and `PLAN_TAB` name the artifact tabs (`plan` is a tab id there, as `define`'s `spec` is); nothing else may
+    source = "\n".join(line for line in page_source().splitlines() if "RUN_TABS = [" not in line and "ARTIFACT_KINDS = [" not in line
+                        and "PLAN_TAB = " not in line)
     cfg = bdash.flow.cfg
     for word in [*cfg.lanes, "CAPABILITY-MAP", "docs/", "origin/", "flow/"]:
         assert not re.search(rf"(?<![A-Za-z-]){re.escape(word)}(?![A-Za-z-])", source), word
@@ -1824,18 +1825,51 @@ def test_the_artifact_route_refuses_what_is_not_listed(dash, spec_run, query):
     assert dash.get(f"/api/runs/{spec_run.run.id}/artifact?{query}")[0] == 404
 
 
-@pytest.mark.parametrize("route", ["artifacts", "artifact?path=docs%2Fspecs%2Fx.md&sha=head",
-                                   "artifact/diff?path=docs%2Fspecs%2Fx.md&from=head&to=head", "findings"])
-def test_the_artifact_routes_keep_the_refusal_matrix(dash, spec_run, route):
-    rid = spec_run.run.id
+def assert_refusal_matrix(dash, run, route):
+    rid = run.id
     assert dash.get(f"/api/runs/{rid}/{route}", token=None)[0] == 403
     assert dash.get(f"/api/runs/{rid}/{route}", headers={"Host": "evil.example"})[0] == 403
     assert dash.get(f"/api/runs/{rid}/{route}", headers={"Origin": "http://evil.example"})[0] == 403
     assert dash.get(f"/api/runs/20261030-0000-feature-nope/{route}")[0] == 404
     assert dash.post(f"/api/runs/{rid}/{route}")[0] == 404
     link = runs_root(dash.flow.root) / "20261030-0000-feature-link"
-    link.symlink_to(spec_run.run.dir, target_is_directory=True)
+    link.symlink_to(run.dir, target_is_directory=True)
     assert dash.get(f"/api/runs/{link.name}/{route}")[0] == 404
+
+
+@pytest.mark.parametrize("route", ["artifacts", "artifact?path=docs%2Fspecs%2Fx.md&sha=head",
+                                   "artifact/diff?path=docs%2Fspecs%2Fx.md&from=head&to=head", "findings"])
+def test_the_artifact_routes_keep_the_refusal_matrix(dash, spec_run, route):
+    assert_refusal_matrix(dash, spec_run.run, route)
+
+
+def test_the_process_routes_answer(dash, spec_run):
+    rid = spec_run.run.id
+    assert payload(dash.get(f"/api/runs/{rid}/plan")[2])["path"] in ("docs/plans/x.md", None)
+    (spec_run.run.dir / "issue.md").write_text("# Ask\n", encoding="utf-8")
+    assert {"name": "issue.md", "group": "request", "size": 6} in payload(dash.get(f"/api/runs/{rid}/files")[2])
+    assert payload(dash.get(f"/api/runs/{rid}/files?name=issue.md")[2])["text"] == "# Ask\n"
+    changes = payload(dash.get(f"/api/runs/{rid}/changes")[2])
+    assert "docs/specs/x.md" in {f["path"] for f in changes["files"]}
+    diff = payload(dash.get(f"/api/runs/{rid}/changes?path=docs%2Fspecs%2Fx.md")[2])
+    assert "+Scope 3 says another" in diff["diff"]
+
+
+@pytest.mark.parametrize("route", ["plan", "files", "files?name=issue.md", "changes", "changes?path=notes.md"])
+def test_the_process_routes_keep_the_refusal_matrix(dash, spec_run, route):
+    assert_refusal_matrix(dash, spec_run.run, route)
+
+
+@pytest.mark.parametrize("query", ["files?name=..%2Fevents.jsonl", "files?name=state.json",
+                                   "changes?path=..%2F..%2Fetc%2Fpasswd", "changes?path=README.md"])
+def test_the_process_routes_refuse_what_is_not_listed(dash, spec_run, query):
+    assert dash.get(f"/api/runs/{spec_run.run.id}/{query}")[0] == 404
+
+
+def test_a_doubled_name_is_a_400(dash, spec_run):
+    rid = spec_run.run.id
+    assert dash.get(f"/api/runs/{rid}/files?name=pr.md&name=issue.md")[0] == 400
+    assert dash.get(f"/api/runs/{rid}/changes?path=a&path=b")[0] == 400
 
 
 def test_a_missing_or_doubled_parameter_is_a_400(dash, spec_run):
@@ -1895,6 +1929,14 @@ def test_returning_to_an_artifact_tab_refetches_its_list_and_findings():
     assert "reopensArtifact(prev, id, tab, ui.artifact)" in opener and "loadArtifacts(id)" in opener
 
 
+def test_returning_to_the_plan_or_files_tab_refetches_it():
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    opener = run_js[run_js.index("function openRun"):run_js.index("function showRun")]
+    assert "loadPlan(id)" in opener and "loadFiles(id)" in opener and "PLAN_TAB" in opener and "FILES_TAB" in opener
+    files_js = (UI_DIR / "files.js").read_text(encoding="utf-8")
+    assert "changesNone(" in files_js and "aria-pressed\": raw ? \"true\"" in files_js
+
+
 def test_a_phase_approval_from_the_page_sends_what_was_viewed():
     board_js = (UI_DIR / "board.js").read_text(encoding="utf-8")
     flow = board_js[board_js.index("function approveFlow"):board_js.index("function needNode")]
@@ -1902,3 +1944,34 @@ def test_a_phase_approval_from_the_page_sends_what_was_viewed():
     art = (UI_DIR / "artifact.js").read_text(encoding="utf-8")
     assert "ui.viewed" in art and "ui.comments" in art and "no longer waiting on you" in art
     assert "function rejectDialog(runId, target, initial" in (UI_DIR / "dialogs.js").read_text(encoding="utf-8")
+
+
+def test_the_plan_tab_has_a_tasks_mode():
+    plan_js = (UI_DIR / "plan.js").read_text(encoding="utf-8")
+    for needle in ("/plan", "blocks: ", "independent: ", "No plan for this run yet", "Open decision", "ui.plan"):
+        assert needle in plan_js, needle
+    assert UI_SCRIPTS.index("artifact.js") < UI_SCRIPTS.index("plan.js") < UI_SCRIPTS.index("main.js")
+
+
+def test_the_files_tab_lists_the_run_documents_and_the_changes():
+    files_js = (UI_DIR / "files.js").read_text(encoding="utf-8")
+    for needle in ("/files", "/files?name=", "/changes", "/changes?path=", "Changes since the base",
+                   "No branch yet", "Showing the first", "Transcript tail", "Step records", "ui.files"):
+        assert needle in files_js, needle
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    files_branch = run_js[run_js.index('tab === "files"'):run_js.index("}", run_js.index('tab === "files"'))]
+    assert "fileEntries(" in files_branch and '"file:handoff"' not in run_js and '"file:progress"' not in run_js
+    assert UI_SCRIPTS.index("plan.js") < UI_SCRIPTS.index("files.js") < UI_SCRIPTS.index("main.js")
+
+
+def test_no_two_ui_scripts_declare_the_same_top_level_name():
+    # every script shares one global scope: a later declaration silently replaces an earlier one
+    decl = re.compile(r"^(?:async\s+function\s*\*?|function\s*\*?|const|let|class)\s+([A-Za-z_$][\w$]*)", re.M)
+    seen: dict[str, str] = {}
+    clashes = []
+    for name in UI_SCRIPTS:
+        for found in decl.findall((UI_DIR / name).read_text(encoding="utf-8")):
+            if found in seen and seen[found] != name:
+                clashes.append(f"{found}: {seen[found]} and {name}")
+            seen.setdefault(found, name)
+    assert not clashes, clashes

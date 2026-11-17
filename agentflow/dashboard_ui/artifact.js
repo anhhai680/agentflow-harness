@@ -322,6 +322,7 @@ function headNode(d) {
   })() : null;
   const previous = d.previous;
   return el("div", { class: "art-head" },
+    d.kind === PLAN_TAB ? chip("Tasks", () => goRun(st.runId, PLAN_TAB, "tasks"), false) : null,
     picker, el("span", { class: "chips" }, chips),
     el("button", { type: "button", class: "chip", text: "Diff with previous", disabled: previous ? null : "disabled", "aria-pressed": d.mode === "diff" ? "true" : "false",
       onclick: () => { st.mode = st.mode === "diff" ? "rendered" : "diff"; redrawArtifact(st.runId); } }),
@@ -364,7 +365,7 @@ function requestChanges(detail) {
   withDecision(detail, "reject", (item) => rejectDialog(item.run_id, needTarget(item), note));
 }
 
-function decisionNode(d) {
+function artifactDecisionNode(d) {
   const detail = () => (ui.run && ui.run.detail && ui.run.detail.run_id === d.runId ? ui.run.detail : null);
   if (d.waiting) {
     return el("div", { class: "art-decision" }, el("strong", { text: "Waiting on you: approve " + d.phase }),
@@ -383,6 +384,11 @@ function artifactNote(key, text) {
 // The tab's parts, keyed: the head, the document and the findings are patched apart, so a refresh that changes only
 // the findings leaves the document (and where the reader scrolled it) alone.
 function artifactEntries(detail, kind, sub) {
+  if (kind === PLAN_TAB) {  // Tasks or Document: planTabEntries answers null for the Document
+    const tasks = planTabEntries(detail, sub);
+    if (tasks) return tasks;
+    if (sub === "document") sub = null;  // the mode's name, not a file
+  }
   const st = artifactState(detail.run_id, kind);
   if (st.list === null) {
     if (st.error) return artifactNote("art:error", "Could not load the " + kind + ": " + st.error);
@@ -443,7 +449,7 @@ function artifactEntries(detail, kind, sub) {
   const count = decided.count;
   if (waiting || count) {
     parts.push(entry("art:decision", { runId: detail.run_id, phase: file.phase, kind: kind, waiting: waiting, count: count, note: decided.note,
-      canReject: (detail.actions || []).includes("reject") }, decisionNode));
+      canReject: (detail.actions || []).includes("reject") }, artifactDecisionNode));
   }
   return parts;
 }

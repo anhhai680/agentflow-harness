@@ -17,6 +17,9 @@ Routes:
 - `GET /api/runs/<id>/artifacts`, `/artifact?path=&sha=` (`sha` a revision of `path` or `head`),
   `/artifact/diff?path=&from=&to=` and `/findings`: the run's spec, plan and other committed files, read from git
   and capped at `dashboard.artifact_max_kb`; a path outside the run's artifact list is a 404.
+- `GET /api/runs/<id>/plan` (the plan's tasks with status, attempts, review, cost and blast radius),
+  `/files[?name=]` (the run's documents, from a fixed list of names) and `/changes[?path=]` (the branch's own
+  changes since it left the base, and one file's diff); a name or path outside what the server listed is a 404.
 - `POST /api/runs/<id>/{approve,reject,answer,pause,resume,done,cancel,retry}` with a JSON body. Each action
   calls the same function as the CLI with `by="dashboard"`; reject, a complete answer, resume, done, retry and
   an approval inside a phase then start `flow.py resume <id>` detached (D13), unless a runner already holds
@@ -76,20 +79,24 @@ from agentflow.artifacts import (
     NotFound,
     artifact_diff,
     artifact_max_bytes,
+    change_diff,
     read_artifact,
     run_artifacts,
+    run_changes,
     run_findings,
 )
 from agentflow.config import Config, ConfigError, _finite, for_lane, load_config
 from agentflow.events import EventError, lock_state
+from agentflow.plan_view import run_plan
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
+from agentflow.run_files import list_files, read_file
 from agentflow.scorecard import scorecard_view
 from agentflow.state import Run, runs_root
 from agentflow.views import agents_view, board, lessons_view, metrics_view, run_detail, workflow_view
 
 PAGE = Path(__file__).resolve().with_name("dashboard.html")
 UI_DIR = Path(__file__).resolve().with_name("dashboard_ui")
-UI_SCRIPTS = ("core.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "workflow.js", "agents.js", "metrics.js", "lessons.js",
+UI_SCRIPTS = ("core.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js", "workflow.js", "agents.js", "metrics.js", "lessons.js",
               "settings.js", "main.js")  # in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
 UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024
@@ -99,7 +106,7 @@ MIN_TOKEN_CHARS = 22  # 128 bits of token_urlsafe
 RUN_ID = re.compile(r"^[0-9]{8}-[0-9]{4}-[a-z0-9]+(?:-[a-z0-9]+)*$")
 RUN_ID_MAX = 120
 RUN_ROUTE = re.compile(r"^/api/runs/([^/]+)$")
-ARTIFACT_ROUTE = re.compile(r"^/api/runs/([^/]+)/(artifacts|artifact|artifact/diff|findings)$")
+ARTIFACT_ROUTE = re.compile(r"^/api/runs/([^/]+)/(artifacts|artifact|artifact/diff|findings|plan|files|changes)$")
 ACTION_ROUTE = re.compile(r"^/api/runs/([^/]+)/([a-z]+)$")
 TEXT_MAX = backlog.TEXT_MAX
 BACKLOG_ROUTES = ("/api/backlog", "/api/backlog/start", "/api/backlog/remove")
@@ -504,7 +511,9 @@ class _Handler(BaseHTTPRequestHandler):
         if run is None:
             self._error(404, "no such run")
             return
-        wanted = {"artifact": ("path", "sha"), "artifact/diff": ("path", "from", "to")}.get(what, ())
+        wanted = {"artifact": ("path", "sha"), "artifact/diff": ("path", "from", "to"),
+                  "files": ("name",) if "name" in query else (),
+                  "changes": ("path",) if "path" in query else ()}.get(what, ())
         args = []
         for name in wanted:
             values = query.get(name) or []
@@ -518,6 +527,13 @@ class _Handler(BaseHTTPRequestHandler):
                 result: Any = run_artifacts(run, repo)
             elif what == "findings":
                 result = run_findings(run)
+            elif what == "plan":
+                result = run_plan(run, repo, cfg)
+            elif what == "files":
+                result = read_file(run, *args, artifact_max_bytes(cfg)) if args else list_files(run)
+            elif what == "changes":
+                result = (change_diff(run, repo, cfg, *args, artifact_max_bytes(cfg)) if args
+                          else run_changes(run, repo, cfg))
             elif what == "artifact":
                 result = read_artifact(run, repo, *args, artifact_max_bytes(cfg))
             else:

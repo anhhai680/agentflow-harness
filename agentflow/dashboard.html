@@ -162,6 +162,27 @@ dialog .row > * { flex: 1; }
 /* the Spec and Plan tabs: a head row, the document beside the findings */
 #run-body.art-tab { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 320px); gap: 12px; align-items: start; }
 #run-body.art-tab > .art-head, #run-body.art-tab > .art-note, #run-body.art-tab > .art-decision { grid-column: 1 / -1; }
+#run-body.art-tab > .plan-part { grid-column: 1 / -1; }
+.plan-head, .plan-note { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
+.plan-head .chips { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.plan-group { margin: 10px 0 2px; font-size: 13px; color: var(--muted); }
+.plan-task { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; margin: 3px 0; }
+.plan-task > summary { display: grid; grid-template-columns: 4ch minmax(0, 1fr) 9ch 14ch 11ch 11ch 6ch; gap: 8px; align-items: baseline; cursor: pointer; }
+.plan-task .plan-title { overflow-wrap: anywhere; }
+.plan-stop { margin: 4px 0 0 4ch; font-size: 12px; }
+.plan-body { margin: 6px 0 4px 4ch; display: grid; gap: 6px; }
+.plan-list { margin: 2px 0; padding-left: 18px; }
+.files-group-name { margin: 10px 0 2px; font-size: 13px; color: var(--muted); }
+.files-names { list-style: none; margin: 0; padding: 0; } .files-names li { padding: 1px 0; overflow-wrap: anywhere; }
+.files-names a[aria-current="page"] { font-weight: 600; }
+.files-doc { margin: 12px 0; } .files-doc-head { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; margin-bottom: 6px; }
+.files-raw { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; max-height: 70vh; overflow: auto; }
+.files-changes { margin: 12px 0; }
+.change { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; margin: 3px 0; }
+.change > summary { cursor: pointer; display: flex; gap: 8px; align-items: baseline; }
+.change-status { font: 12px ui-monospace, Menlo, monospace; min-width: 1.5ch; } .change-path { overflow-wrap: anywhere; }
+.change-diff { margin-top: 6px; overflow-x: auto; }
+@media (max-width: 720px) { .plan-task > summary { grid-template-columns: 4ch minmax(0, 1fr) auto; } }
 .art-head { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; }
 .art-head .chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
 .chip { border-radius: 12px; padding: 2px 10px; font-size: 12px; }
