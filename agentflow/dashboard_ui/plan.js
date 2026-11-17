@@ -166,7 +166,7 @@ function taskNode(d) {
     t.stop && t.stop.summary ? el("span", { text: t.stop.summary + " " }) : null,
     el("span", { class: "muted", text: "blocks: " + (ranges(t.blocks) || "none") + " · independent: " + (d.independent || "none") + " " }),
     el("a", { href: routeHash({ view: "run", run: d.runId, tab: "overview", sub: "decision" }), text: "Open decision" })) : null;
-  return el("details", { class: "plan-task", "data-key": "task-" + t.n },
+  return el("details", { class: "plan-part plan-task", "data-key": "task-" + t.n },
     el("summary", {}, cells), stop, el("div", { class: "plan-body" }, taskBody(t)));
 }
 
