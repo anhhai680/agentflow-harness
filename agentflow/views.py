@@ -32,6 +32,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from agentflow.artifacts import artifact_tabs
 from agentflow.config import RETRO_PIPELINE, Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.events import parse_iso
 from agentflow import lessons as lessons_mod
@@ -717,6 +718,7 @@ def run_detail(run: Run, cfg: Config, raw: bool = False) -> dict:
         "transcript": _tail(root, transcript) if transcript else "",
         "transcript_file": transcript.name if transcript else None,
         "attach": f"agentflow attach {run.id}",
+        "artifact_tabs": artifact_tabs(lane_phases(cfg, str(state.get("pipeline") or ""))),
     }
     if raw:
         detail["state"] = state

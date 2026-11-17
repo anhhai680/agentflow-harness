@@ -32,7 +32,10 @@ async function refreshBoardNow() {
 // Only the open run and the peeked run are refetched, and only when an event of theirs arrived.
 async function refreshRunsNow() {
   const jobs = [];
-  if (ui.run && ui.run.detail !== null && dirty.runs.has(ui.run.id)) jobs.push(loadRun(ui.run.id));  // a missing run is not asked again
+  if (ui.run && ui.run.detail !== null && dirty.runs.has(ui.run.id)) {  // a missing run is not asked again
+    jobs.push(loadRun(ui.run.id));
+    if (isArtifactTab(ui.run.tab)) jobs.push(loadArtifacts(ui.run.id));  // new revisions and findings
+  }
   if (ui.peek && dirty.runs.has(ui.peek)) jobs.push(loadPeek(ui.peek));
   dirty.runs.clear();  // a run that is not shown is fetched when it is opened
   await Promise.all(jobs);

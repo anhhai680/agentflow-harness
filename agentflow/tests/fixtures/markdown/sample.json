@@ -1,0 +1,504 @@
+[
+ {
+  "t": "h1",
+  "line": 1,
+  "end": 1,
+  "c": [
+   {
+    "t": "text",
+    "v": "Title with "
+   },
+   {
+    "t": "code",
+    "v": "code"
+   },
+   {
+    "t": "text",
+    "v": " and "
+   },
+   {
+    "t": "strong",
+    "c": [
+     {
+      "t": "text",
+      "v": "bold"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "t": "h2",
+  "line": 3,
+  "end": 3,
+  "c": [
+   {
+    "t": "text",
+    "v": "Second"
+   }
+  ]
+ },
+ {
+  "t": "h3",
+  "line": 4,
+  "end": 4,
+  "c": [
+   {
+    "t": "text",
+    "v": "Third"
+   }
+  ]
+ },
+ {
+  "t": "h4",
+  "line": 5,
+  "end": 5,
+  "c": [
+   {
+    "t": "text",
+    "v": "Fourth heading"
+   }
+  ]
+ },
+ {
+  "t": "p",
+  "line": 7,
+  "end": 9,
+  "c": [
+   {
+    "t": "text",
+    "v": "Intro paragraph with "
+   },
+   {
+    "t": "em",
+    "c": [
+     {
+      "t": "text",
+      "v": "em"
+     }
+    ]
+   },
+   {
+    "t": "text",
+    "v": ", "
+   },
+   {
+    "t": "em",
+    "c": [
+     {
+      "t": "text",
+      "v": "it"
+     }
+    ]
+   },
+   {
+    "t": "text",
+    "v": ", snake_case_name, "
+   },
+   {
+    "t": "strong",
+    "c": [
+     {
+      "t": "text",
+      "v": "strong"
+     }
+    ]
+   },
+   {
+    "t": "text",
+    "v": ", a "
+   },
+   {
+    "t": "code",
+    "v": "co*de*"
+   },
+   {
+    "t": "text",
+    "v": " span,\na "
+   },
+   {
+    "t": "a",
+    "href": "https://example.com/a",
+    "c": [
+     {
+      "t": "text",
+      "v": "web link"
+     }
+    ]
+   },
+   {
+    "t": "text",
+    "v": ", a "
+   },
+   {
+    "t": "ref",
+    "path": "docs/x.md#s",
+    "c": [
+     {
+      "t": "text",
+      "v": "repo ref"
+     }
+    ]
+   },
+   {
+    "t": "text",
+    "v": ", "
+   },
+   {
+    "t": "text",
+    "v": "bad and <b>raw</b> &lt;x&gt;.\nEscapes: *not em* and 2 * 3 * 4."
+   }
+  ]
+ },
+ {
+  "t": "ul",
+  "line": 11,
+  "end": 17,
+  "c": [
+   {
+    "t": "li",
+    "line": 11,
+    "end": 11,
+    "c": [
+     {
+      "t": "text",
+      "v": "first item"
+     }
+    ]
+   },
+   {
+    "t": "li",
+    "line": 12,
+    "end": 16,
+    "c": [
+     {
+      "t": "text",
+      "v": "second "
+     },
+     {
+      "t": "strong",
+      "c": [
+       {
+        "t": "text",
+        "v": "item"
+       }
+      ]
+     },
+     {
+      "t": "ul",
+      "line": 13,
+      "end": 16,
+      "c": [
+       {
+        "t": "li",
+        "line": 13,
+        "end": 13,
+        "c": [
+         {
+          "t": "text",
+          "v": "nested one"
+         }
+        ]
+       },
+       {
+        "t": "li",
+        "line": 14,
+        "end": 16,
+        "c": [
+         {
+          "t": "text",
+          "v": "nested two"
+         },
+         {
+          "t": "ol",
+          "line": 15,
+          "end": 16,
+          "c": [
+           {
+            "t": "li",
+            "line": 15,
+            "end": 15,
+            "c": [
+             {
+              "t": "text",
+              "v": "deep ordered"
+             }
+            ]
+           },
+           {
+            "t": "li",
+            "line": 16,
+            "end": 16,
+            "c": [
+             {
+              "t": "text",
+              "v": "deeper"
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "t": "li",
+    "line": 17,
+    "end": 17,
+    "c": [
+     {
+      "t": "text",
+      "v": "third"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "t": "ol",
+  "line": 19,
+  "end": 20,
+  "c": [
+   {
+    "t": "li",
+    "line": 19,
+    "end": 19,
+    "c": [
+     {
+      "t": "text",
+      "v": "one"
+     }
+    ]
+   },
+   {
+    "t": "li",
+    "line": 20,
+    "end": 20,
+    "c": [
+     {
+      "t": "text",
+      "v": "two"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "t": "table",
+  "line": 22,
+  "end": 25,
+  "align": [
+   "left",
+   "right",
+   "center"
+  ],
+  "c": [
+   {
+    "t": "thead",
+    "c": [
+     {
+      "t": "tr",
+      "c": [
+       {
+        "t": "th",
+        "align": "left",
+        "c": [
+         {
+          "t": "text",
+          "v": "Name"
+         }
+        ]
+       },
+       {
+        "t": "th",
+        "align": "right",
+        "c": [
+         {
+          "t": "text",
+          "v": "Qty"
+         }
+        ]
+       },
+       {
+        "t": "th",
+        "align": "center",
+        "c": [
+         {
+          "t": "text",
+          "v": "Note"
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "t": "tbody",
+    "c": [
+     {
+      "t": "tr",
+      "c": [
+       {
+        "t": "td",
+        "align": "left",
+        "c": [
+         {
+          "t": "text",
+          "v": "a"
+         }
+        ]
+       },
+       {
+        "t": "td",
+        "align": "right",
+        "c": [
+         {
+          "t": "text",
+          "v": "1"
+         }
+        ]
+       },
+       {
+        "t": "td",
+        "align": "center",
+        "c": [
+         {
+          "t": "code",
+          "v": "x"
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "t": "tr",
+      "c": [
+       {
+        "t": "td",
+        "align": "left",
+        "c": [
+         {
+          "t": "text",
+          "v": "b"
+         }
+        ]
+       },
+       {
+        "t": "td",
+        "align": "right",
+        "c": [
+         {
+          "t": "text",
+          "v": "2"
+         }
+        ]
+       },
+       {
+        "t": "td",
+        "align": "center",
+        "c": [
+         {
+          "t": "ref",
+          "path": "y.md",
+          "c": [
+           {
+            "t": "text",
+            "v": "r"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "t": "blockquote",
+  "line": 27,
+  "end": 30,
+  "c": [
+   {
+    "t": "p",
+    "line": 27,
+    "end": 27,
+    "c": [
+     {
+      "t": "text",
+      "v": "quoted text"
+     }
+    ]
+   },
+   {
+    "t": "ul",
+    "line": 28,
+    "end": 28,
+    "c": [
+     {
+      "t": "li",
+      "line": 28,
+      "end": 28,
+      "c": [
+       {
+        "t": "text",
+        "v": "with a list"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "t": "blockquote",
+    "line": 30,
+    "end": 30,
+    "c": [
+     {
+      "t": "p",
+      "line": 30,
+      "end": 30,
+      "c": [
+       {
+        "t": "text",
+        "v": "and a nested quote"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "t": "hr",
+  "line": 32,
+  "end": 32
+ },
+ {
+  "t": "pre",
+  "line": 34,
+  "end": 37,
+  "v": "def f():\n    return \"<script>\""
+ },
+ {
+  "t": "pre",
+  "line": 39,
+  "end": 41,
+  "v": "tilde fence"
+ },
+ {
+  "t": "p",
+  "line": 43,
+  "end": 43,
+  "c": [
+   {
+    "t": "text",
+    "v": "Last paragraph [unclosed](link and *dangling and `tick"
+   }
+  ]
+ }
+]

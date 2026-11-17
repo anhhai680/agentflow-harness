@@ -147,6 +147,27 @@ def branch_is_merged(cfg: Config, repo: Path, branch: str) -> tuple[bool | None,
     return result.value, result.reason
 
 
+_ISSUE_MODULE = re.compile(r"issue-([1-9][0-9]{0,9})", re.ASCII)  # the module an issue-backed run works on
+
+
+def issue_of_module(module: str) -> str | None:
+    """The issue number of `module` when it is the derived module of an issue-backed run (`issue-<N>`), else None."""
+    match = _ISSUE_MODULE.fullmatch(module)
+    return match.group(1) if match else None
+
+
+def issue_is_closed(cfg: Config, repo: Path, number: str) -> tuple[bool | None, str]:
+    """Whether GitHub issue `number` is closed; `(None, why)` when `gh` cannot tell. Only the state word is read."""
+    try:
+        reply = gitops.gh_json(["issue", "view", number, "--json", "state"], cwd=Path(repo))
+    except gitops.GhError as exc:
+        return None, str(exc)
+    state = reply.get("state") if isinstance(reply, dict) else None
+    if not isinstance(state, str) or state.upper() not in ("OPEN", "CLOSED"):
+        return None, f"gh gave no state for issue #{number}"
+    return state.upper() == "CLOSED", ""
+
+
 def _module_ids(cfg: Config, repo: Path) -> list[str]:
     return [n.id for n in work_source.items(cfg, repo)]
 
@@ -463,7 +484,9 @@ def done_reason(
     `project.docs.done_status` (`SPEC_SAYS`); with no live veto and both origin listings complete, a newest own plan
     on origin read in full, fully ticked and naming the module's spec file (`plan_complete`); a finished newest plan
     (work tree or origin) whose branch `gh` says is merged (`MERGED`; a prior done entry recorded as merged, or from
-    before reasons were kept, is not asked about again). When origin could not be read in full, a prior Done from
+    before reasons were kept, is not asked about again); for an `issue-<N>` module with no live run and no live veto,
+    issue #N that `gh` says is closed (`ISSUE_CLOSED`; recorded, it is not asked about again, and a `gh` that cannot
+    tell is no problem: the module just stays). When origin could not be read in full, a prior Done from
     origin evidence or a merge stays as it was. When the marks file is unreadable, a prior hand mark stays, and
     origin evidence makes no new Done (the file may hold a veto) but keeps an earlier one."""
     by_hand, error = marks
@@ -491,6 +514,9 @@ def done_reason(
     if (trust_origin and spec_name and _origin_complete(view) and plan is not None and _origin_plan_finished(plan)
             and sources.plan_spec(plan.text) == spec_name):
         return finished.plan_complete(view.branch), None
+    issue = issue_of_module(node.id)
+    if issue is not None and prior == finished.ISSUE_CLOSED and not vetoed:
+        return finished.ISSUE_CLOSED, None  # recorded: the issue is not asked about again (a veto reopens it)
     if _plan_finished(cfg, repo, node.id, view, known):
         if prior == finished.MERGED:
             return finished.MERGED, None
@@ -500,6 +526,9 @@ def done_reason(
             return finished.MERGED, None
         if merged is None:
             problem = problem or f"could not tell whether {branch} is merged: {_first_line(why)}"
+    if issue is not None and trust_origin and (run is None or run.state["status"] not in _LIVE):  # trust: no veto
+        if issue_is_closed(cfg, repo, issue)[0] is True:  # unknown is not closed, and needs no person
+            return finished.ISSUE_CLOSED, None
     if prior and (not _origin_complete(view) or error):  # origin, or a veto, could not be read: keep what was
         if prior == finished.MERGED or (finished.from_origin(prior) and not vetoed):
             return prior, None
@@ -1112,6 +1141,7 @@ def spawn_feature_run(
 
 __all__ = [
     "Assessment", "NextAnswer", "OriginView", "QueueBusy", "QueueState", "StartFailed", "assess_modules",
-    "cached_entries", "dependency_view", "done_reason", "format_answer", "known_ids", "origin_view", "own_plans",
-    "module_lane", "next_step", "queue_lock", "queue_tick", "run_queue", "spawn_feature_run", "spawn_run",
+    "cached_entries", "dependency_view", "done_reason", "format_answer", "issue_is_closed", "issue_of_module",
+    "known_ids", "origin_view", "own_plans", "module_lane", "next_step", "queue_lock", "queue_tick", "run_queue",
+    "spawn_feature_run", "spawn_run",
 ]

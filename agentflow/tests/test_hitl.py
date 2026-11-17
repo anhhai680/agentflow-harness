@@ -510,6 +510,26 @@ def test_approve_a_phase(run):
     assert ev["phase"] == "plan" and ev["by"] == "me"
 
 
+def test_the_cli_approval_carries_no_viewed(run):
+    run.emit("phase_started", phase="define")
+    run.emit("phase_approval_raised", phase="define", round=0, summary="s")
+    approve(run, "define", by="me")
+    assert "viewed" not in [e for e in run.events.read() if e["type"] == "phase_approved"][-1]
+
+
+def test_a_phase_approval_records_viewed_only_when_there_is_some(run):
+    viewed = [{"path": "docs/specs/x.md", "sha": "a" * 40}]
+    run.emit("phase_started", phase="define")
+    run.emit("phase_approval_raised", phase="define", round=0, summary="s")
+    approve(run, "define", by="me", viewed=[])
+    assert "viewed" not in [e for e in run.events.read() if e["type"] == "phase_approved"][-1]
+    run.emit("phase_rejected", phase="define", by="me", note="again")
+    run.emit("phase_started", phase="define")
+    run.emit("phase_approval_raised", phase="define", round=1, summary="s")
+    approve(run, "define", by="me", viewed=viewed)
+    assert [e for e in run.events.read() if e["type"] == "phase_approved"][-1]["viewed"] == viewed
+
+
 def test_double_approve_rejected(run):
     run.emit("phase_approval_raised", phase="plan", round=0)
     approve(run, "plan", "me")

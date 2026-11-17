@@ -281,6 +281,22 @@ def test_plan_spec_is_the_basename_of_the_header_spec_path():
     assert sources.plan_spec("# P\n\n**Spec:** " + "x" * 600 + " `a/SPEC-x.md`\n") is None  # past the cut
 
 
+@pytest.mark.parametrize("line, spec", [
+    ("**Spec:** [SPEC-issue-81](../specs/SPEC-issue-81.md) (amends [SPEC-c](../specs/SPEC-c.md))", "SPEC-issue-81.md"),
+    ("Spec: [`docs/specs/SPEC-issue-71.md`](../specs/SPEC-issue-71.md). Lane: a prompt change", "SPEC-issue-71.md"),
+    ("Spec: `docs/specs/SPEC-crm.md`", "SPEC-crm.md"),
+    ("**Spec**: [the spec](../specs/SPEC-crm.md#scope)", "SPEC-crm.md"),  # the anchor is not part of the name
+    ("**Spec:** [SPEC-a](../specs/SPEC-a.md), then `docs/specs/SPEC-b.md`", "SPEC-a.md"),  # the first path wins
+    ("**Spec:** see SPEC-crm", None),
+    ("Specification: `docs/specs/SPEC-crm.md`", None),
+    ("**Goal:** build it ([SPEC-crm](../specs/SPEC-crm.md))", None),  # a link on another line names nothing
+])
+def test_plan_spec_reads_a_link_and_a_plain_spec_label(line, spec):
+    from agentflow import sources
+
+    assert sources.plan_spec(f"# P\n\n{line}\n\n### Task 1: x\n") == spec
+
+
 INTERFACES = ("**Interfaces:**\n- Uses: `app/names.py:12` `normalise(name: str) -> str`\n"
               "- From earlier tasks: none\n- Produces: `app/greet.py` `greet(name: str) -> str`\n")
 

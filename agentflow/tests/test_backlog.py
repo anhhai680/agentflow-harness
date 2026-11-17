@@ -481,6 +481,7 @@ def test_an_issue_with_a_live_run_cannot_be_added_again(bk):
     ("plan complete on main", "add unticked `- [ ]` steps for the new work to its plan on main"),
     ("spec says done", "run `agentflow backlog undone a`"),
     ("done by hand", "run `agentflow backlog undone a`"),
+    ("issue closed", "reopen its issue, then run `agentflow backlog undone a`"),
     ("merged", None),
 ])
 def test_a_new_task_named_after_a_done_module_says_it_is_done_and_how_to_add_work(sbk, monkeypatch, reason, says):
@@ -848,7 +849,7 @@ def test_backlog_undone_removes_a_hand_mark_and_then_records_a_veto(bk, capsys):
     assert "b hand mark removed" in capsys.readouterr().out
     assert finished.read_marks(bk.root)[0] == {} and "module:b" in bk.cards()
     assert main(["backlog", "undone", "b"]) == 0
-    assert "b marked not done by hand: origin evidence is ignored" in capsys.readouterr().out
+    assert "b marked not done by hand: origin evidence and a closed issue are ignored" in capsys.readouterr().out
     assert finished.read_marks(bk.root)[0]["b"]["state"] == "not_done"
 
 

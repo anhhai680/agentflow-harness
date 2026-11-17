@@ -5,8 +5,8 @@
 // Every view has a URL: `#/<view>` for a header tab, `#/run/<id>[/<tab>[/<sub>]]` for one run. A reload or Back
 // lands where the reader was. `sub` names a phase, `decision` or a file the tab opens and scrolls to.
 
-const RUN_TABS = ["overview", "activity", "gates", "files"];
-const RUN_TAB_LABEL = { overview: "Overview", activity: "Activity", gates: "Gates", files: "Files" };
+const RUN_TABS = ["overview", "spec", "plan", "activity", "gates", "files"];
+const RUN_TAB_LABEL = { overview: "Overview", spec: "Spec", plan: "Plan", activity: "Activity", gates: "Gates", files: "Files" };
 const DECISION_ACTIONS = ["approve", "answer", "reject"];
 const RAIL_MARK = { done: "✓", approved: "✓", failed: "✗", waiting: "◆", awaiting_approval: "◆", running: "●", refining: "●", skipped: "–" };
 
@@ -191,6 +191,7 @@ function phaseNode(phase, open) {
 // The tab body is patched by key, so what the reader opened and where they scrolled survive a refresh.
 function runTabEntries(detail, tab, sub) {
   const heading = (key, text, cls) => entry(key, { text: text, cls: cls }, (h) => el("h3", { class: h.cls, text: h.text }));
+  if (isArtifactTab(tab)) return artifactEntries(detail, tab, sub);
   if (tab === "activity") {
     return [heading("title", "Timeline (" + detail.timeline.length + " events)"), entry("timeline", null, timelineShell)];
   }
@@ -219,7 +220,9 @@ function runTabEntries(detail, tab, sub) {
 
 function renderRunTab(detail, tab, sub) {
   const body = $("run-body");
+  body.classList.toggle("art-tab", isArtifactTab(tab));
   patchChildren(body, runTabEntries(detail, tab, sub), entryKey, entryNode);
+  if (isArtifactTab(tab)) return;
   if (tab === "activity") patchTimeline(childByKey(body, "timeline"), detail.timeline);
   else if (tab !== "gates" && tab !== "files") patchTimeline(childByKey(body, "recent"), detail.timeline.slice(-10));
 }
@@ -231,7 +234,7 @@ function renderRun(detail) {
   $("run-banner").replaceChildren(...(detail.waiting ? bannerNodes(detail) : []));
   $("run-rail").replaceChildren(stageRailNode(detail.stage_rail, detail.run_id));
   $("run-actions").replaceChildren(...actionNodes(detail, detail.actions.filter((a) => !DECISION_ACTIONS.includes(a))), attachNode(detail));
-  $("run-tabs").replaceChildren(...RUN_TABS.map((tab) => el("a", {
+  $("run-tabs").replaceChildren(...visibleTabs(detail).map((tab) => el("a", {
     href: routeHash({ view: "run", run: detail.run_id, tab: tab }), text: RUN_TAB_LABEL[tab], "aria-current": tab === run.tab ? "page" : null,
   })));
   renderRunTab(detail, run.tab, run.sub);
@@ -264,6 +267,7 @@ function openRun(id, tab, sub) {
   if (same && prev.detail) showRun(prev.detail);
   else if (!same) renderRunNote("Loading " + id + "…");
   loadRun(id);
+  if (reopensArtifact(prev, id, tab, ui.artifact)) loadArtifacts(id);  // revisions and findings that came meanwhile
 }
 
 function showRun(detail) {

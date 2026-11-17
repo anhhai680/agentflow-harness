@@ -785,7 +785,7 @@ def cmd_retro(args: argparse.Namespace) -> int:
 
 def cmd_backlog(args: argparse.Namespace) -> int:
     """`backlog done <module>` marks a module finished by hand; `backlog undone <module>` takes that mark off, or
-    (with none) vetoes the origin evidence that says it is done."""
+    (with none) vetoes the origin evidence or closed issue that says it is done."""
     from agentflow import backlog
 
     act = backlog.mark_done if args.backlog_command == "done" else backlog.mark_not_done
@@ -1144,8 +1144,8 @@ def build_parser() -> argparse.ArgumentParser:
     blg = sub.add_parser("backlog", help="mark a Backlog module finished (or not) by hand")
     blg_sub = blg.add_subparsers(dest="backlog_command", required=True)
     for verb, text in (("done", "mark a module done by hand (refused while it has a live run)"),
-                       ("undone", "remove a module's hand mark, or with none, ignore the origin evidence that says "
-                                  "it is done")):
+                       ("undone", "remove a module's hand mark, or with none, ignore the origin evidence or closed "
+                                  "issue that says it is done")):
         one = blg_sub.add_parser(verb, help=text)
         one.add_argument("module", help="a module id from the work source")
         one.add_argument("--by", help="who is marking it (default: the current user)")

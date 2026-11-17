@@ -428,6 +428,12 @@ def test_every_ui_file_is_listed():
     assert UI_SCRIPTS[0] == "core.js" and UI_SCRIPTS[-1] == "main.js"
 
 
+def test_markdown_loads_before_the_run_page():
+    assert UI_SCRIPTS.index("markdown.js") < UI_SCRIPTS.index("run.js")
+    assert UI_SCRIPTS.index("markdown.js") == UI_SCRIPTS.index("dialogs.js") + 1
+    assert "innerHTML" not in (UI_DIR / "markdown.js").read_text(encoding="utf-8")
+
+
 def test_ui_scripts_need_no_token_but_keep_the_host_check(dash):
     status, headers, body = dash.get("/ui/core.js", token=None)
     assert status == 200 and headers["content-type"] == "text/javascript; charset=utf-8"
@@ -460,6 +466,23 @@ def test_dashboard_approve_equals_cli(dash):
 
     status, _, body = dash.post(f"/api/runs/{web_run.id}/approve", {"target": "plan"})  # a second actor
     assert status == 409 and dash.spawned == []
+
+
+def test_approve_records_what_the_page_showed(dash):
+    run = awaiting(dash.flow, phase="define")
+    viewed = [{"path": "docs/specs/x.md", "sha": "a" * 40}]
+    assert dash.post(f"/api/runs/{run.id}/approve", {"viewed": viewed})[0] == 200
+    (event,) = [e for e in run.events.read() if e["type"] == "phase_approved"]
+    assert event["viewed"] == viewed and event["by"] == "dashboard"
+
+
+@pytest.mark.parametrize("viewed", ["x", [{"path": "a"}], [{"path": "a", "sha": "zz"}],
+                                    [{"path": "", "sha": "a" * 40}], [{"path": "a", "sha": "a" * 40, "x": 1}],
+                                    [{"path": "a", "sha": "a" * 40}] * 101])
+def test_a_malformed_viewed_is_a_400_and_approves_nothing(dash, viewed):
+    run = awaiting(dash.flow, phase="define")
+    assert dash.post(f"/api/runs/{run.id}/approve", {"viewed": viewed})[0] == 400
+    assert not [e for e in run.events.read() if e["type"] == "phase_approved"]
 
 
 def test_approving_a_phase_rests_the_card_where_it_is(dash):
@@ -923,7 +946,7 @@ def test_hidden_wins_over_an_author_display_rule():
 def test_runs_have_hash_routes():
     source = page_source()
     for needle in ('"#/run/"', "hashchange", "function parseRoute", "function routeHash",
-                   'RUN_TABS = ["overview", "activity", "gates", "files"]'):
+                   'RUN_TABS = ["overview", "spec", "plan", "activity", "gates", "files"]'):
         assert needle in source, needle
 
 
@@ -1402,7 +1425,8 @@ def test_a_pack_without_a_backlog_block_still_syncs_its_issues(idash, monkeypatc
 
 def test_the_page_names_no_lane_phase_or_path(bdash):
     """The page is framework code: lanes, phases and the form fields all come from the board data."""
-    source = page_source()
+    # the two tab lists name the artifact tabs (`plan` is a tab id there, as `define`'s `spec` is); nothing else may
+    source = "\n".join(line for line in page_source().splitlines() if "RUN_TABS = [" not in line and "ARTIFACT_KINDS = [" not in line)
     cfg = bdash.flow.cfg
     for word in [*cfg.lanes, "CAPABILITY-MAP", "docs/", "origin/", "flow/"]:
         assert not re.search(rf"(?<![A-Za-z-]){re.escape(word)}(?![A-Za-z-])", source), word
@@ -1771,3 +1795,110 @@ def test_the_page_shows_the_retro_banner_from_safe_text_only():
     source = page_source()
     assert 'id="retro-due"' in source and "data.retro_due" in source and '"agentflow retro"' in source
     assert "innerHTML" not in source
+
+
+def test_the_spec_routes_read_through_the_artifact_list(dash, spec_run):
+    rid = spec_run.run.id
+    listed = payload(dash.get(f"/api/runs/{rid}/artifacts")[2])
+    spec = next(a for a in listed if a["path"] == "docs/specs/x.md")
+    r1, r2 = spec["revisions"][0]["sha"], spec["revisions"][1]["sha"]
+    got = payload(dash.get(f"/api/runs/{rid}/artifact?path=docs/specs/x.md&sha={r2}")[2])
+    assert got["sha"] == r2 and got["lines"] > 0
+    diff = payload(dash.get(f"/api/runs/{rid}/artifact/diff?path=docs/specs/x.md&from={r1}&to={r2}")[2])
+    assert "+Scope 3 says another" in diff["diff"]
+    assert payload(dash.get(f"/api/runs/{rid}/findings")[2]) == []
+
+
+def test_head_reads_the_branch_tip_after_a_new_commit(dash, spec_run):
+    rid = spec_run.run.id
+    path = f"/api/runs/{rid}/artifact?path=docs/specs/x.md&sha=head"
+    before = payload(dash.get(path)[2])["sha"]
+    new = spec_run.commit("define/spec_reconcile", write={"docs/specs/x.md": "# X\n\nlater\n"})
+    after = payload(dash.get(path)[2])
+    assert before != new and after["sha"] == new
+
+
+@pytest.mark.parametrize("query", ["path=..%2F..%2Fstate.json&sha=head", "path=README.md&sha=head",
+                                   "path=docs%2Fspecs%2Fx.md&sha=" + "0" * 40])
+def test_the_artifact_route_refuses_what_is_not_listed(dash, spec_run, query):
+    assert dash.get(f"/api/runs/{spec_run.run.id}/artifact?{query}")[0] == 404
+
+
+@pytest.mark.parametrize("route", ["artifacts", "artifact?path=docs%2Fspecs%2Fx.md&sha=head",
+                                   "artifact/diff?path=docs%2Fspecs%2Fx.md&from=head&to=head", "findings"])
+def test_the_artifact_routes_keep_the_refusal_matrix(dash, spec_run, route):
+    rid = spec_run.run.id
+    assert dash.get(f"/api/runs/{rid}/{route}", token=None)[0] == 403
+    assert dash.get(f"/api/runs/{rid}/{route}", headers={"Host": "evil.example"})[0] == 403
+    assert dash.get(f"/api/runs/{rid}/{route}", headers={"Origin": "http://evil.example"})[0] == 403
+    assert dash.get(f"/api/runs/20261030-0000-feature-nope/{route}")[0] == 404
+    assert dash.post(f"/api/runs/{rid}/{route}")[0] == 404
+    link = runs_root(dash.flow.root) / "20261030-0000-feature-link"
+    link.symlink_to(spec_run.run.dir, target_is_directory=True)
+    assert dash.get(f"/api/runs/{link.name}/{route}")[0] == 404
+
+
+def test_a_missing_or_doubled_parameter_is_a_400(dash, spec_run):
+    rid = spec_run.run.id
+    status, _, body = dash.get(f"/api/runs/{rid}/artifact?path=docs%2Fspecs%2Fx.md")
+    assert status == 400 and payload(body)["error"] == "send exactly one sha"
+    assert dash.get(f"/api/runs/{rid}/artifact?path=a&path=b&sha=head")[0] == 400
+    assert dash.get(f"/api/runs/{rid}/artifact/diff?path=a&from=head")[0] == 400
+
+
+def test_a_big_artifact_is_cut_to_the_configured_cap(dash, spec_run):
+    dash.server.cfg.dashboard["artifact_max_kb"] = 16
+    big = spec_run.commit("define/spec_reconcile", write={"docs/specs/x.md": ("x" * 39 + "\n") * 3000})
+    got = payload(dash.get(f"/api/runs/{spec_run.run.id}/artifact?path=docs%2Fspecs%2Fx.md&sha={big}")[2])
+    assert got["truncated"] is True and len(got["text"].encode()) <= 16 * 1024
+
+
+def test_run_detail_names_the_artifact_tabs_its_lane_walks(dash):
+    run = awaiting(dash.flow)
+    assert payload(dash.get(f"/api/runs/{run.id}")[2])["artifact_tabs"] == ["spec", "plan"]
+
+
+def test_the_run_page_has_spec_and_plan_tabs_only_where_the_lane_walks_them():
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    assert 'RUN_TABS = ["overview", "spec", "plan", "activity", "gates", "files"]' in run_js
+    assert "visibleTabs(detail)" in run_js and "artifact_tabs" in (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+
+
+def test_the_spec_tab_reads_the_artifact_routes_and_says_when_there_is_none():
+    art = (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+    for needle in ("/artifacts", "/artifact?path=", "/artifact/diff?path=", "/findings", "has not committed one",
+                   "Showing the first", "Copy path", "as merged", "Diff with previous"):
+        assert needle in art, needle
+    assert UI_SCRIPTS.index("run.js") < UI_SCRIPTS.index("artifact.js") < UI_SCRIPTS.index("main.js")
+
+
+def test_a_failed_findings_read_is_shown_not_swallowed():
+    art = (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+    assert ".catch(() => null)" not in art
+    assert "Could not load the findings: " in art and "Could not refresh the findings: " in art
+    assert "Could not read " in art and "art:doc-error" in art  # a failed first read says why in the tab
+
+
+def test_the_note_cap_matches_the_server():
+    from agentflow.dashboard import TEXT_MAX
+    assert f"NOTE_MAX = {TEXT_MAX}" in (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+
+
+def test_the_viewed_cap_matches_the_server():
+    from agentflow.dashboard import VIEWED_MAX
+    assert f"VIEWED_CAP = {VIEWED_MAX}" in (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+
+
+def test_returning_to_an_artifact_tab_refetches_its_list_and_findings():
+    run_js = (UI_DIR / "run.js").read_text(encoding="utf-8")
+    opener = run_js[run_js.index("function openRun"):run_js.index("function showRun")]
+    assert "reopensArtifact(prev, id, tab, ui.artifact)" in opener and "loadArtifacts(id)" in opener
+
+
+def test_a_phase_approval_from_the_page_sends_what_was_viewed():
+    board_js = (UI_DIR / "board.js").read_text(encoding="utf-8")
+    flow = board_js[board_js.index("function approveFlow"):board_js.index("function needNode")]
+    assert "viewedList(item.run_id)" in flow and "viewed" in flow
+    art = (UI_DIR / "artifact.js").read_text(encoding="utf-8")
+    assert "ui.viewed" in art and "ui.comments" in art and "no longer waiting on you" in art
+    assert "function rejectDialog(runId, target, initial" in (UI_DIR / "dialogs.js").read_text(encoding="utf-8")

@@ -2238,6 +2238,10 @@ class _Validator:
         refresh = self.cfg.dashboard.get("board_refresh_s")
         if "board_refresh_s" in self.cfg.dashboard and (not _finite(refresh) or not 0.5 <= refresh <= 60):
             self.error("dashboard.board_refresh_s", "must be a finite number of seconds, from 0.5 to 60")
+        cap = self.cfg.dashboard.get("artifact_max_kb")
+        if "artifact_max_kb" in self.cfg.dashboard and (
+                not isinstance(cap, int) or isinstance(cap, bool) or not 16 <= cap <= 8192):
+            self.error("dashboard.artifact_max_kb", "must be a whole number of KB, from 16 to 8192")
         if "backlog" in self.cfg.dashboard:
             self.backlog(self.cfg.dashboard["backlog"])
 

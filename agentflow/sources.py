@@ -414,12 +414,14 @@ def says_done(text: str, pattern: str) -> bool | None:
     return any(rx.search(line) for line, was_cut in spec_header(text) if not was_cut)
 
 
-_PLAN_SPEC = re.compile(r"^\s*\*\*Spec:\*\*(.*)$")
+_PLAN_SPEC = re.compile(r"^\s*(?:\*\*Spec:\*\*|\*\*Spec\*\*:|Spec:)(.*)$")
+_LINK_TARGET = re.compile(r"\]\(([^()\s]+)\)")  # the target of a Markdown link `[text](target)`
 
 
 def plan_spec(text: str) -> str | None:
-    """The basename of the first backticked path on a `**Spec:**` line of the plan's header (before its first
-    `### Task`, fences left out, each line cut to `LINE_MAX`), or None."""
+    """The basename of the first path on a `**Spec:**` (or plain `Spec:`) line of the plan's header (before its
+    first `### Task`, fences left out, each line cut to `LINE_MAX`), or None. A path is backticked or a Markdown
+    link's target (its `#anchor` dropped); the one that starts first on the line counts."""
     lines = cut_lines(text).splitlines()
     for line, inside in zip(lines, _fence_flags(lines), strict=True):
         if inside:
@@ -427,9 +429,12 @@ def plan_spec(text: str) -> str | None:
         if _TASK_HEADING.match(line):
             break
         match = _PLAN_SPEC.match(line)
-        path = _BACKTICKED.search(match.group(1)) if match else None
-        if path:
-            return path.group(1).strip().rsplit("/", 1)[-1] or None
+        if not match:
+            continue
+        found = [m for m in (_BACKTICKED.search(match.group(1)), _LINK_TARGET.search(match.group(1))) if m]
+        if found:
+            path = min(found, key=lambda m: m.start()).group(1).split("#", 1)[0].strip()
+            return path.rsplit("/", 1)[-1] or None
     return None
 
 

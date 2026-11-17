@@ -15,7 +15,7 @@ const TOKEN = (function () {
   return token;
 })();
 
-const ui = { view: "board", peek: null, run: null, board: null, agents: null, workflow: null, dragging: null, doneOpen: false };
+const ui = { view: "board", peek: null, run: null, board: null, agents: null, workflow: null, dragging: null, doneOpen: false, comments: new Map(), viewed: new Map() };
 const $ = (id) => document.getElementById(id);
 const workLabel = (lane) => (ui.board && ui.board.lane_labels[lane]) || lane;  // a lane with no label, or an old run's, shows its name
 
@@ -204,6 +204,13 @@ function ago(seconds) {
   if (minutes < 1) return "just now";
   if (minutes < 60) return minutes + " min";
   return Math.floor(minutes / 60) + " h " + (minutes % 60) + " min";
+}
+
+function diffNode(text) {
+  const lines = text.replace(/\n$/, "").split("\n").map((line) => el("span", {
+    class: line.startsWith("@@") ? "d-hunk" : line.startsWith("+") && !line.startsWith("+++") ? "d-add"
+      : line.startsWith("-") && !line.startsWith("---") ? "d-del" : null, text: line + "\n" }));
+  return el("pre", { class: "diff" }, lines);
 }
 
 const money = (value) => (typeof value === "number" ? "$" + value.toFixed(2) : "-");

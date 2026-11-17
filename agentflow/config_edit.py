@@ -188,6 +188,7 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("dashboard", "port"), "Port (restart)", {"kind": "int", "min": 0, "max": 65535}),
         (("dashboard", "show_done_days"), "Show done cards for (days, 0 = always)", _INT),
         (("dashboard", "board_refresh_s"), "Refresh the Board at most every (s)", {"kind": "number", "min": 0.5, "max": 60}),
+        (("dashboard", "artifact_max_kb"), "Largest spec, plan or diff the page loads (KB)", {"kind": "int", "min": 16, "max": 8192}),
         (("dashboard", "agents", "show_exited_min"), "Show exited agents for (min)", _INT),
         (("dashboard", "agents", "idle_warn_min"), "Warn when idle for (min)", _INT),
         (("dashboard", "backlog", "sync_base"), "Fast-forward the base branch", {"kind": "bool"}),

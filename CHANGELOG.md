@@ -7,13 +7,25 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [2.9] - 2026-11-17
+
 ### Added
 
+- On the Spec and Plan tabs you can comment on lines. **Request changes** turns the comments into one reject note (`L34: …`) that you edit before it is sent, and **Approve** sits under the document it approves.
+- A run's page in the dashboard has Spec and Plan tabs: each revision `define` and `plan` committed, rendered or raw, a diff with the previous one, and the review findings by round with a dot on their line.
+- A dashboard approval of a phase records the spec and plan revisions the page showed (`viewed` on `phase_approved`). The CLI's approvals are unchanged.
+- `dashboard.artifact_max_kb` (512 by default, 16–8192): the largest spec, plan revision or diff the dashboard loads.
 - `gates.<name>.group` and `gates.<name>.resource`: gates of different groups run at the same time (each group in set order), and gates that share a resource never overlap within a run. Gates with no group run in order as before, and leaving early kills every group's processes.
 - `gates.<name>.inputs`: a gate that passed in the run is not run again while none of the files its globs match has changed, even on another tree, and `conformance` accepts that pass as floor evidence on the final tree only when the gate's input hash there is equal. A step whose verify gates were reused still counts as verified work, so its commit leaves the earlier `step:` evidence standing. New `gate_cache_hit` event, `gate_result.input_hash`, and the `gate_cache_hit_rate` signal. Without `inputs`, nothing changes.
 - `gates.<name>.affected` and `phases.<name>.steps[].gate_tier`: a step at `gate_tier: affected` runs each gate's `affected` command (`{run, paths}`) on the files it changed, each name shell-quoted (`validate` refuses a `{paths}` that is not its own unquoted word), and skips a gate none of them matches; above 200 paths or a 64 KiB command the gate runs in full. The engine defaults put `review/fix_findings` and `ship/finish.sync` at that tier; `ship/ci.fix` stays full, since the `ci` step pushes its fix with no audit after it. For the same reason, the merge `finish` repeats when GitHub calls the open pull request conflicting runs the `sync` gates in full. Such a result carries `gate_result.tier: "affected"` and is never reused, never floor evidence and never a full-suite run, so the full `verify` set still runs on the final tree. Without `affected`, nothing changes.
 - When a step ran the affected tier, `finish` runs the full `verify` set once on the committed tree it is about to audit and push, reusing any pass that still holds there, so the audit has its evidence. A failure goes to a session of the `sync` step at the full tier (`ship/finish/final_fix`, with its fix loop), and the runner commits its fix before the audit, and a stopped `final_fix` session resumes on approval before anything else in `finish`. With no `sync` fix loop, or once that session is done, it is the audit's usual `gate_failed` stop. A run with no affected-tier result finishes as before.
 - `ci.early_pr_after` (`""`, off, by default): the runner pushes the branch and opens the draft pull request as soon as the named phase is approved (`pr_opened` with `early: true`), so CI runs while review does. It is a draft only: `finish` still audits the final tree, then pushes it and updates the description (`pr_updated`) instead of opening another, and marking it ready still needs the audit and a green CI: the `ci` step watches it only after `finish` updated it, and reads its checks only while its head on GitHub is the sha the runner pushed last, the merge `finish` pushes again for a conflicting pull request included. A GitHub or push failure then is `early_pr_failed` and never stops the run; `finish` opens the pull request as usual. `validate` wants a phase before the one holding `finish`.
+
+### Fixed
+
+- The Backlog no longer shows a module `issue-<N>` whose GitHub issue is closed: such a module is done as `issue closed` once `gh` says so, unless a run of it is live (asked once, then recorded; `agentflow backlog undone` overrides it). Before, a closed issue's module stayed when its run directory was gone, since the branch checked for a merge lacked the issue title's slug.
+- A plan names its spec for the "plan complete on <branch>" reason with a plain `Spec:` label or a Markdown link (`**Spec:** [SPEC-x](…/SPEC-x.md)`) too, not only with a backticked path after `**Spec:**`.
+- The Spec and Plan tabs refetch their revisions and findings when you come back to them, flag a cut diff (and round its size up), keep your line comments in **Request changes** while you look at a diff, and list only the findings of their own phase or on their own files. A finding's line that is negative or longer than nine digits no longer breaks the findings panel.
 
 ## [2.8] - 2026-11-16
 

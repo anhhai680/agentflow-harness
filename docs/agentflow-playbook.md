@@ -326,7 +326,7 @@ The runner fixes what a review finds by itself: `plan_fixes` makes the plan, `fi
 
 **The machine stays awake while a runner works.** On macOS the runner holds `caffeinate -i` and on Linux `systemd-inhibit --what=idle:sleep`, both tied to the runner's process, and lets go as soon as the run stops for you or ends. `agentflow doctor` warns when neither exists. Set `AGENTFLOW_NO_KEEPAWAKE=1` to turn it off.
 
-The dashboard's Workflow tab shows every phase with its steps, skills, model and gates, from `config.yaml`, with a badge only on a step that one kind of work runs. To see exactly which steps a run walks, open its Run page. The Board's Backlog column is not a phase: it holds capability-map modules the queue hasn't started, the cards added on the page and the synced GitHub issues, so they have no run yet. Dragging only works on ready cards.
+The dashboard's Workflow tab shows every phase with its steps, skills, model and gates, from `config.yaml`, with a badge only on a step that one kind of work runs. To see exactly which steps a run walks, open its Run page. A run whose lane walks `define` or `plan` also has a Spec or Plan tab there: every revision that phase committed, rendered or raw, a diff with the previous revision, and the review findings by round, with a dot on the line each one names. The Board's Backlog column is not a phase: it holds capability-map modules the queue hasn't started, the cards added on the page and the synced GitHub issues, so they have no run yet. Dragging only works on ready cards.
 
 Approving a stop **never** lets a failing gate, a passing red test or a forbidden change through. It resumes the step and checks again.
 
@@ -339,7 +339,7 @@ agentflow queue --max-parallel 2          # loop, every --interval seconds (30):
 agentflow queue --once                    # one tick, for cron
 ```
 
-A module is done when its plan is fully checked and its PR is merged. The queue starts ready modules in `docs/specs/CAPABILITY-MAP.md` order, never above `--max-parallel`. A run that is waiting for you, paused or held keeps its slot but does not block the others. The one exception is a run held on `ci_pending` (watching CI checks still pending, `ci.watch_max_h`): it frees its slot while it waits. The queue prints `queue: <module> blocked — <reason>` once per change: an unauthenticated `gh`, a failed, cancelled or crashed run, a start that failed, an unknown dependency, a dependency cycle. Failed and crashed runs are never restarted automatically. Only one `agentflow queue` runs at a time, and its start output goes to `<state dir>/runs/queue.log`.
+A module is done when its plan is fully checked and its PR is merged. A module `issue-<N>` (an issue-backed run's) is also done, as `issue closed`, once issue #N is closed on GitHub and no run of it is live; `agentflow backlog undone` overrides that, as it does origin evidence. The queue starts ready modules in `docs/specs/CAPABILITY-MAP.md` order, never above `--max-parallel`. A run that is waiting for you, paused or held keeps its slot but does not block the others. The one exception is a run held on `ci_pending` (watching CI checks still pending, `ci.watch_max_h`): it frees its slot while it waits. The queue prints `queue: <module> blocked — <reason>` once per change: an unauthenticated `gh`, a failed, cancelled or crashed run, a start that failed, an unknown dependency, a dependency cycle. Failed and crashed runs are never restarted automatically. Only one `agentflow queue` runs at a time, and its start output goes to `<state dir>/runs/queue.log`.
 
 ## 10. Cheat sheet
 
@@ -369,8 +369,8 @@ agentflow dashboard                                 # token is in the URL fragme
 agentflow queue --max-parallel 2
 agentflow queue --include-specs                     # a pack with work_source specs: queue every spec file's module
 agentflow backlog done <module> [--by NAME]         # mark a module finished by hand (refused while it has a live run)
-agentflow backlog undone <module> [--by NAME]       # remove that hand mark; with none, ignore the origin evidence that
-                                                    #   says it is done (a merged module stays done)
+agentflow backlog undone <module> [--by NAME]       # remove that hand mark; with none, ignore the origin evidence or
+                                                    #   closed issue that says it is done (a merged module stays done)
 agentflow retro [--since YYYY-MM-DD]                # lessons from the runs ended since the last finished retro, as a
                                                     #   draft PR that changes only .agentflow/lessons.md (section 15)
 agentflow retro --dry-run                           # print the digest and the session's prompt; creates nothing
@@ -525,7 +525,7 @@ A live run sees a change to any layer file between its phases: the runner takes 
 - `phase_approval`: the refine prompt and what an approval page shows. Protected.
 - `checkpoints`: who answers each inner checkpoint. Not protected.
 - `hitl`: notifications, reminders and where decisions are recorded. Not protected, except `hitl.notify`.
-- `dashboard`: host, port and the Backlog. Not protected, except `dashboard.host`. `dashboard.board_refresh_s` (2 by default, 0.5–60) is the most often the page refetches the Board while events arrive. `dashboard.backlog.new_task` may list `issue` for the `module_lane` too; in a capability map that needs `dashboard.backlog.module_row`, since such a card adds the row `issue-<N>`.
+- `dashboard`: host, port and the Backlog. Not protected, except `dashboard.host`. `dashboard.board_refresh_s` (2 by default, 0.5–60) is the most often the page refetches the Board while events arrive. `dashboard.artifact_max_kb` (512 by default, 16–8192) is the largest spec, plan revision or diff the page loads; above it the page shows the head and says so. `dashboard.backlog.new_task` may list `issue` for the `module_lane` too; in a capability map that needs `dashboard.backlog.module_row`, since such a card adds the row `issue-<N>`.
 
 ## 15. Lessons and retros
 

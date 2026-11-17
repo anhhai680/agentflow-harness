@@ -1645,6 +1645,14 @@ def test_dashboard_board_refresh_s_is_half_a_second_to_a_minute(tmp_cfg):
         assert not errors(issues_for(tmp_cfg, {"dashboard": {"board_refresh_s": good}})), good
 
 
+def test_dashboard_artifact_max_kb_is_a_whole_number_from_16_to_8192(tmp_cfg):
+    for bad in (0, 15, 8193, 512.5, True, "512"):
+        found = issues_for(tmp_cfg, {"dashboard": {"artifact_max_kb": bad}})
+        assert [i.path for i in found if i.level == "error"] == ["dashboard.artifact_max_kb"], bad
+    for good in (16, 512, 8192):
+        assert not errors(issues_for(tmp_cfg, {"dashboard": {"artifact_max_kb": good}})), good
+
+
 def test_watchdog_no_progress_min_loads_as_a_float_and_an_oversized_int_as_inf(tmp_cfg):
     """A 400-digit integer never reaches the watcher thread's `limit / 4` as an int: it loads as `inf`, which
     `validate` refuses."""
