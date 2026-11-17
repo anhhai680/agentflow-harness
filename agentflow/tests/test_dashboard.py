@@ -2189,3 +2189,10 @@ def test_the_card_draws_its_strip_and_marker():
     board = (UI_DIR / "board.js").read_text(encoding="utf-8")
     for needle in ("card.strip", "strip-", "needs you", "step_label"):
         assert needle in board, needle
+
+
+def test_the_board_says_when_filters_hide_every_card():
+    board = (UI_DIR / "board.js").read_text(encoding="utf-8")
+    assert "No card matches these filters" in board and "Clear filters" in board and "Show all (" in board
+    assert "new RegExp" not in board and "history.replaceState" in board
+    assert 'id="board-filters"' in (UI_DIR.parent / "dashboard.html").read_text(encoding="utf-8")

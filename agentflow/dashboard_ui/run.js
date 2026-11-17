@@ -10,21 +10,47 @@ const RUN_TAB_LABEL = { overview: "Overview", spec: "Spec", plan: "Plan", agents
 const DECISION_ACTIONS = ["approve", "answer", "reject"];
 const RAIL_MARK = { done: "✓", approved: "✓", failed: "✗", waiting: "◆", awaiting_approval: "◆", running: "●", refining: "●", skipped: "–" };
 
+// The Board's filters ride in the hash as `#/board?lane=<lane>&status=<status>&needs=1&q=<text>`. `lane` and `status` stay
+// text (the Board ignores a value it does not know); `needs` is true only for "1"; other parameters are dropped.
+const BOARD_PARAMS = ["lane", "status", "needs", "q"];
+
+function boardQuery(search) {
+  const params = new URLSearchParams(search || "");
+  const text = (name) => (params.has(name) ? params.get(name) : null);
+  return { lane: text("lane"), status: text("status"), needs: params.get("needs") === "1", q: text("q") };
+}
+
 function parseRoute(hash) {
-  const board = { view: "board", run: null, tab: null, sub: null };
+  const board = { view: "board", run: null, tab: null, sub: null, query: boardQuery("") };
   if (!/^#\//.test(hash || "")) return board;
+  const mark = hash.indexOf("?");
+  const search = mark < 0 ? "" : hash.slice(mark + 1);
   let parts;
-  try { parts = hash.slice(2).split("/").map(decodeURIComponent); } catch (err) { return board; }  // a malformed % escape
+  try { parts = (mark < 0 ? hash : hash.slice(0, mark)).slice(2).split("/").map(decodeURIComponent); } catch (err) { return board; }  // a malformed % escape
   if (parts[0] === "run" && parts[1]) {
     const known = RUN_TABS.includes(parts[2]);
     return { view: "run", run: parts[1], tab: known ? parts[2] : "overview", sub: known && parts[3] ? parts[3] : null };
   }
-  if (parts.length === 1 && VIEWS.includes(parts[0])) return { view: parts[0], run: null, tab: null, sub: null };
+  if (parts.length === 1 && VIEWS.includes(parts[0])) {
+    const route = { view: parts[0], run: null, tab: null, sub: null };
+    if (parts[0] === "board") route.query = boardQuery(search);
+    return route;
+  }
   return board;
 }
 
 function routeHash(route) {
-  if (route.view !== "run") return "#/" + encodeURIComponent(route.view || "board");
+  if (route.view === "board" || !route.view) {
+    const query = route.query || {};
+    const params = new URLSearchParams();
+    for (const name of BOARD_PARAMS) {
+      const value = query[name];
+      if (name === "needs" ? value === true : typeof value === "string" && value !== "") params.set(name, name === "needs" ? "1" : value);
+    }
+    const text = params.toString();
+    return "#/board" + (text ? "?" + text : "");
+  }
+  if (route.view !== "run") return "#/" + encodeURIComponent(route.view);
   const parts = [route.run, route.tab || "overview"];
   if (route.sub) parts.push(route.sub);
   return "#/run/" + parts.map(encodeURIComponent).join("/");

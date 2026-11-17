@@ -137,6 +137,10 @@ function route() {
     return;
   }
   ui.run = null;
+  if (where.view === "board") {  // the URL's filters; a filter written by the bar is already in `ui.boardQuery`
+    ui.boardQuery = where.query;
+    if (ui.board) renderBoard(ui.board);
+  }
   show(where.view);
 }
 
@@ -147,6 +151,7 @@ for (const name of VIEWS) $("tab-" + name).addEventListener("click", () => {
 });
 $("new-task").addEventListener("click", newTaskDialog);
 initInbox();
+initBoardFilters();
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("dlg").open) closePeek(); });
 window.addEventListener("hashchange", route);
 if (!location.hash) {  // a first visit, or the #token= the boot removed: the tab this browser showed last
@@ -162,6 +167,10 @@ async function loadInfo() {
     $("version").textContent = "v" + info.version;
     $("version").title = info.name + " " + info.version;
     $("version").hidden = false;
+    if (Number.isInteger(info.done_shown) && info.done_shown > 0 && info.done_shown !== ui.doneShown) {
+      ui.doneShown = info.done_shown;
+      if (ui.board) renderBoard(ui.board);
+    }
     const legacy = info.inbox_legacy === true;
     if (legacy !== ui.inboxLegacy) { ui.inboxLegacy = legacy; if (ui.board) renderBoard(ui.board); }
   } catch (err) { console.warn("agentflow: info unavailable", err); }  // the badge is optional; the refresh keeps 2 s

@@ -1,6 +1,8 @@
 """The dashboard's plan task board: its pure helpers, run with node and no DOM."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from conftest import NODE, js, js_async
 
@@ -318,3 +320,47 @@ def test_pages_merge_by_seq_newest_first_without_duplicates():
     got = js(["activity.js"], "mergePages(args.have, args.page).map(e => [e.seq, e.headline || ''])",
              {"have": have, "page": [{"seq": 12}, {"seq": 9, "headline": "new"}]})
     assert got == [[12, ""], [9, "new"], [5, ""]]
+
+
+CARDS = [{"run_id": "20261116-0900-feature-crm", "lane": "feature", "status": "running", "module": "crm", "issue": "81",
+          "branch": "flow/feature/crm", "waiting": None},
+         {"run_id": "20261116-0800-bug-auth", "lane": "bug", "status": "waiting_human", "module": "auth[v2]", "issue": None,
+          "branch": "flow/bug/auth", "waiting": {"kind": "blocked"}}]
+VIEWS_STUB = str(Path(__file__).parent / "fixtures" / "js" / "_views_stub.js")
+
+
+@pytest.mark.parametrize("query, expected", [
+    ({}, ["crm", "auth[v2]"]),
+    ({"lane": "bug"}, ["auth[v2]"]),
+    ({"needs": True}, ["auth[v2]"]),
+    ({"q": "#81"}, ["crm"]), ({"q": "81"}, ["crm"]),
+    ({"q": "[v2"}, ["auth[v2]"]), ({"q": "(*"}, []), ({"q": "<b>"}, []),            # a search is plain text
+    ({"status": "nope"}, ["crm", "auth[v2]"]), ({"lane": "nope"}, ["crm", "auth[v2]"]),  # an unknown value filters nothing
+])
+def test_cards_filter_by_lane_status_needs_and_plain_text(query, expected):
+    got = js(["board.js"], "filterCards(args.cards, args.query, ['feature', 'bug'], ['running', 'waiting_human']).map(c => c.module)",
+             {"cards": CARDS, "query": query})
+    assert got == expected
+
+
+def test_the_board_query_round_trips_through_the_hash():
+    parse = lambda h: js([VIEWS_STUB, "run.js"], "parseRoute(args).query", h)  # noqa: E731
+    assert parse("#/board?status=nope&x=1&needs=1&q=a%20b") == {"lane": None, "status": "nope", "needs": True, "q": "a b"}
+    assert parse("#/board?needs=yes")["needs"] is False and parse("#/board") == {"lane": None, "status": None, "needs": False, "q": None}
+    assert js([VIEWS_STUB, "run.js"], "parseRoute(args).view", "#/board?lane=bug") == "board"
+    assert js([VIEWS_STUB, "run.js"], "routeHash({view: 'board', query: {lane: 'bug', needs: true, q: ''}})", None) == "#/board?lane=bug&needs=1"
+    assert js([VIEWS_STUB, "run.js"], "routeHash({view: 'board', query: {lane: 'bug', status: 'running', needs: true, q: 'a b&c'}})", None) == \
+        "#/board?lane=bug&status=running&needs=1&q=a+b%26c"
+    assert js([VIEWS_STUB, "run.js"], "routeHash({view: 'board', query: {}})", None) == "#/board"
+    assert js([VIEWS_STUB, "run.js"], "routeHash({view: 'board'})", None) == "#/board"
+    assert js([VIEWS_STUB, "run.js"], "routeHash({view: 'agents', query: {lane: 'bug'}})", None) == "#/agents"
+    assert js([VIEWS_STUB, "run.js"], "parseRoute(args).view", "#/run/r1/gates") == "run"
+
+
+def test_done_shows_the_newest_first_up_to_the_cap():
+    done = [{"run_id": f"r{i}", "ended_at": f"2026-11-{10 + i:02d}T00:00:00+00:00"} for i in range(5)]
+    got = js(["board.js"], "doneCards(args, 3, false)", done)
+    assert [c["run_id"] for c in got["cards"]] == ["r4", "r3", "r2"] and got["hidden"] == 2
+    assert js(["board.js"], "doneCards(args, 3, true).hidden", done) == 0
+    tied = [{"run_id": "a", "ended_at": None}, {"run_id": "b", "ended_at": None}, {"run_id": "c", "ended_at": "2026-11-10T00:00:00+00:00"}]
+    assert [c["run_id"] for c in js(["board.js"], "doneCards(args, 9, false).cards", tied)] == ["c", "b", "a"]

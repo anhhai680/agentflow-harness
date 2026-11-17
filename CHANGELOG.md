@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- The Board filters by lane, status, "needs me" and a search over module, issue and branch, kept in the URL, and Done shows the newest `dashboard.done_shown` cards first with **Show all**.
 - Board cards show a phase progress strip, a "needs you" marker with how long it has waited, the live agent count and the step in words.
 - `dashboard.done_shown` (10 by default, 1–1000): how many Done cards the Board shows before **Show all**.
 - The Inbox groups decisions by run or by kind, takes `j`/`k`/`o`/`a`/`r` from the keyboard (approve takes two presses), and keeps a card you were typing on when the decision is made elsewhere, saying who made it.

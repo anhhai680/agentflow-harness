@@ -2,6 +2,37 @@
 
 // ------------------------------------------------------------------ board
 
+// What the Board shows is a pure function of the cards and the query in the URL (`#/board?lane=&status=&needs=1&q=`).
+// A search is plain text: lower-cased, one leading `#` dropped, then `includes`. It is never compiled to a pattern.
+
+function filterCards(cards, query, lanes, statuses) {
+  const want = query || {};
+  const lane = want.lane && lanes.includes(want.lane) ? want.lane : null;  // a value the board does not know filters nothing
+  const status = want.status && statuses.includes(want.status) ? want.status : null;
+  let text = String(want.q || "").trim().toLowerCase();
+  if (text.startsWith("#")) text = text.slice(1);
+  return cards.filter((card) => {
+    if (lane && card.lane !== lane) return false;
+    if (status && card.status !== status) return false;
+    if (want.needs === true && !card.waiting) return false;
+    if (!text) return true;
+    return [card.module, card.issue, card.branch, card.run_id].some((field) =>
+      field !== null && field !== undefined && String(field).toLowerCase().includes(text));
+  });
+}
+
+// The Done cards, the newest first (by the time each ended, then by run id), cut to `shown` unless `all`.
+function doneCards(cards, shown, all) {
+  const sorted = cards.slice().sort((a, b) => {
+    const x = a.ended_at || "";
+    const y = b.ended_at || "";
+    if (x !== y) return x < y ? 1 : -1;
+    return a.run_id < b.run_id ? 1 : a.run_id > b.run_id ? -1 : 0;
+  });
+  if (all || sorted.length <= shown) return { cards: sorted, hidden: 0 };
+  return { cards: sorted.slice(0, shown), hidden: sorted.length - shown };
+}
+
 // A ready card moves one phase on, or to Done. The buttons and drag and drop are two ways to the same two actions.
 
 const continueCard = (card) => act(card.run_id, "resume");
@@ -280,8 +311,8 @@ function columnNode(name) {
   return col;
 }
 
-function columnEntries(data, name) {
-  const cards = name === "Backlog" ? [] : data.cards.filter((c) => c.column === name);
+function columnEntries(data, name, shownCards) {
+  const cards = name === "Backlog" ? [] : shownCards.filter((c) => c.column === name);
   const count = name === "Backlog" ? data.backlog.length : cards.length;
   const entries = [entry("col-head", { name: name, count: count }, (head) => el("h2", {}, el("span", { text: head.name }), el("span", { text: String(head.count) })))];
   if (name === "Backlog") {
@@ -290,8 +321,68 @@ function columnEntries(data, name) {
     if ((data.backlog_done || []).length) entries.push(entry("done", data.backlog_done, () => doneNode(data.backlog_done)));
     if ((data.backlog_skipped || []).length) entries.push(entry("skipped", data.backlog_skipped, (names) => el("div", { class: "muted", text: "Not modules: " + names.join(", ") })));
   }
+  if (name === "Done") {
+    const page = doneCards(cards, ui.doneShown, ui.doneAll);
+    entries.push(...page.cards.map((card) => entry(card.run_id, card, cardNode)));
+    if (page.hidden > 0) entries.push(entry("done-more", { total: cards.length }, (more) => el("button", { type: "button", class: "done-more", text: "Show all (" + more.total + ")",
+      onclick: () => { ui.doneAll = true; if (ui.board) renderBoard(ui.board); } })));
+    else if (ui.doneAll && cards.length > ui.doneShown) entries.push(entry("done-less", { shown: ui.doneShown }, (less) => el("button", { type: "button", class: "done-more", text: "Show newest " + less.shown,
+      onclick: () => { ui.doneAll = false; if (ui.board) renderBoard(ui.board); } })));
+    return entries;
+  }
   entries.push(...cards.map((card) => entry(card.run_id, card, cardNode)));
   return entries;
+}
+
+// ------------------------------------------------------------------ the filter bar
+
+// The bar is in the page (`#board-filters`) and is never rebuilt: only its choices of lane and status are patched, and
+// a value is written to a control only when it differs, so the search box keeps its focus and caret across a refresh.
+
+const boardLanes = (data) => Array.from(new Set([...Object.keys(data.lane_labels || {}), ...data.cards.map((c) => c.lane).filter(Boolean)]));
+const boardStatuses = (data) => Array.from(new Set(data.cards.map((c) => c.status).filter(Boolean))).sort();
+
+function setChoices(select, all, values, label) {
+  const want = ["", ...values].join("\n");
+  if (select.getAttribute("data-choices") !== want) {
+    select.setAttribute("data-choices", want);
+    select.replaceChildren(el("option", { value: "", text: all }), ...values.map((v) => el("option", { value: v, text: label(v) })));
+  }
+}
+
+function syncBoardFilters(data) {
+  const query = ui.boardQuery;
+  setChoices($("bf-lane"), "Any lane", boardLanes(data), workLabel);
+  setChoices($("bf-status"), "Any status", boardStatuses(data), (v) => v.replace(/_/g, " "));
+  const text = (node, value) => { if (node.value !== value) node.value = value; };
+  text($("bf-lane"), query.lane || "");
+  text($("bf-status"), query.status || "");
+  text($("bf-q"), query.q || "");
+  $("bf-needs").checked = query.needs === true;
+}
+
+// The query is the URL's: `replaceState` rewrites it without a history entry per keystroke and fires no hashchange.
+function setBoardQuery(patch) {
+  ui.boardQuery = Object.assign({}, ui.boardQuery, patch);
+  history.replaceState(null, "", routeHash({ view: "board", query: ui.boardQuery }));
+  if (ui.board) renderBoard(ui.board);
+}
+
+function initBoardFilters() {
+  $("bf-lane").addEventListener("change", (ev) => setBoardQuery({ lane: ev.target.value || null }));
+  $("bf-status").addEventListener("change", (ev) => setBoardQuery({ status: ev.target.value || null }));
+  $("bf-needs").addEventListener("change", (ev) => setBoardQuery({ needs: ev.target.checked }));
+  $("bf-q").addEventListener("input", (ev) => setBoardQuery({ q: ev.target.value || null }));
+}
+
+function clearBoardFilters() { setBoardQuery({ lane: null, status: null, needs: false, q: null }); }
+
+function emptyResultNote() {
+  const box = $("board-empty");
+  if (box.childElementCount === 0) {  // built once: a focused button survives the live refresh
+    box.replaceChildren(el("p", { class: "muted", text: "No card matches these filters" }),
+      el("button", { type: "button", text: "Clear filters", onclick: clearBoardFilters }));
+  }
 }
 
 // Modules that are finished, with why. One line each and no Start button: the open state survives the SSE re-render.
@@ -308,6 +399,12 @@ function renderBoard(data) {
   const byModel = Object.entries(data.agents_running.by_model).map(([k, v]) => k + " " + v).join(" · ");
   $("summary").textContent = counts + " | agents running " + data.agents_running.total + (byModel ? " (" + byModel + ")" : "") +
     " | today " + money(data.spend_today) + " (budget per run: soft " + money(data.run_budget_usd) + " · hard " + money(data.run_budget_hard_usd) + ")";
+  syncBoardFilters(data);
+  const shown = filterCards(data.cards, ui.boardQuery, boardLanes(data), boardStatuses(data));
+  const noMatch = data.cards.length > 0 && shown.length === 0;
+  $("columns").hidden = noMatch;
+  $("board-empty").hidden = !noMatch;
+  if (noMatch) emptyResultNote();
   const columns = data.columns.map((name) => entry(name, name, columnNode));
   $("new-task").hidden = !Object.keys(data.new_task).length;
   $("sync-note").hidden = !data.sync_note;
@@ -318,7 +415,7 @@ function renderBoard(data) {
   $("retro-due").replaceChildren(...(data.retro_due ? [document.createTextNode("Retro due: " + data.retro_due + " → run "), el("code", { text: "agentflow retro" })] : []));
   if (!ui.dragging) {  // a patch mid-drag would lose the drop highlights; dragend draws what arrived
     patchChildren($("columns"), columns, entryKey, entryNode);
-    for (const name of data.columns) patchChildren(childByKey($("columns"), name), columnEntries(data, name), entryKey, entryNode);
+    for (const name of data.columns) patchChildren(childByKey($("columns"), name), columnEntries(data, name, shown), entryKey, entryNode);
   }
   $("needs-title").hidden = !ui.inboxLegacy;
   const waiting = data.needs_human.length;
