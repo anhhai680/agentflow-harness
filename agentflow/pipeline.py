@@ -50,7 +50,7 @@ from agentflow.autonomy import (
     phase_findings,
     round_limit,
 )
-from agentflow import doubt, pack, preflight, run_env, work_source
+from agentflow import doubt, pack, preflight, route_lane, run_env, work_source
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
@@ -322,9 +322,14 @@ class _Loop:
         first = self.opts.from_phase or names[0]
         if self.cfg.preflight.enabled and self.preflight(f"{first}/{preflight.PREFLIGHT_STEP}"):
             return "waiting_human"
-        if self.cfg.route.mode != "off":  # off builds nothing: the run is today's, byte for byte
+        # A triage in the log is checked whatever the pack says now; off with none builds nothing: today's run.
+        history = route_lane.triage_history(run.events.read(), first)
+        if self.cfg.route.mode != "off" or history:
             executor = self.executor()
-            if executor.route_due() and executor.size_route(first) == "stopped":
+            if executor.route_due():
+                if executor.size_route(first) == "stopped":
+                    return self.status()
+            elif history and executor.route_backstop(first) == "stopped":
                 return self.status()
         for index in range(names.index(first), len(names)):
             name = names[index]

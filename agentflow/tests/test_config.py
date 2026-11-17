@@ -272,6 +272,17 @@ def test_a_step_id_shaped_like_a_sizer_key_is_refused(tmp_cfg, step_id, refused)
     assert (("error", "phases.build.steps[1].review.id") in found) is refused
 
 
+@pytest.mark.parametrize("step_id,refused", [("route", True), ("routes", False), ("reroute", False)])
+def test_the_triage_step_id_is_reserved(tmp_cfg, step_id, refused):
+    def patch(data):
+        phase_step(data, "define", "contracts")["id"] = step_id
+        phase_step(data, "build", "build")["review"]["id"] = step_id if refused else "review-2"
+
+    found = errors(issues_for(tmp_cfg, patch))
+    assert (("error", "phases.define.steps[4].id") in found) is refused
+    assert (("error", "phases.build.steps[1].review.id") in found) is refused
+
+
 def test_user_only_skill_as_step(tmp_cfg):
     def patch(data):
         phase_step(data, "define", "contracts")["skill"] = "writing-for-agents"

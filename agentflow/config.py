@@ -26,6 +26,7 @@ from agentflow import layers, pack
 
 KNOWN_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 SIZER_STEP_ID = re.compile(r"size(?:-\d+)?")  # the last part of a sizer's key (`sizing.is_sizer_key`): no step's id
+ROUTE_STEP_ID = "route"  # the run triage's owner is `<first phase>/route` (`route_lane.py`): no step's id
 RETRO_PIPELINE = "retro"  # the retro run's pipeline name: its runs never count as evidence for or against a lesson
 BUILTIN_CHECKS = (
     "file_exists",
@@ -1434,6 +1435,9 @@ class _Validator:
             elif SIZER_STEP_ID.fullmatch(step.id):
                 self.error(_join(step.path, "id"), f"step id '{step.id}' is reserved: the runner's effort sizers "
                                                    "use `size` and `size-<n>`")
+            elif step.id == ROUTE_STEP_ID:
+                self.error(_join(step.path, "id"), f"step id '{step.id}' is reserved: the runner's triage of a run "
+                                                   f"uses `<phase>/{ROUTE_STEP_ID}`")
             seen.add(step.id)
             if step.review is not None:
                 self.unique_ids([step.review], seen)

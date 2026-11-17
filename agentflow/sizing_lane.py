@@ -185,12 +185,7 @@ class SizingLane:
         # A plan sizer changed the repository: nothing runs, sized or not, until it is back as the sizer found it.
         left = self.sizer_reset_needed(prefix)
         if left:
-            if not self._waiting_on(prefix):
-                shown = ", ".join(left[:sizing.CHANGED_SHOWN])
-                detail = f"reset {shown} first"
-                self.run.emit("guard_tripped", key=prefix, violations=[{"kind": SIZER_EDIT, "detail": detail}])
-                raise_hitl(self.cfg, self.run, "guard_violation", prefix,
-                           f"Guard violation in {prefix}: {SIZER_EDIT}: {detail}")
+            self._sizer_reset_stop(prefix, left)
             return "stopped"
         if not self.check_open_sizers(prefix):  # before any skip: a sizer left open may have changed the repository
             return "stopped"
@@ -525,6 +520,16 @@ class SizingLane:
                       "state back as they were before it ran, then approve: the step is sized again")
         self.run.emit("guard_tripped", key=key, violations=[{"kind": SIZER_EDIT, "detail": detail}],
                       before={name: before.get(name) for name in STATE_FIELDS})
+        raise_hitl(self.cfg, self.run, "guard_violation", key, f"Guard violation in {key}: {SIZER_EDIT}: {detail}")
+
+    def _sizer_reset_stop(self, key: str, left: list[str]) -> None:
+        """Refuse a restart of `key` while `left` (`sizer_reset_needed`) still differs: raise the `sizer_edit` stop
+        again, unless the run is already waiting on it."""
+        if self._waiting_on(key):
+            return
+        shown = ", ".join(left[:sizing.CHANGED_SHOWN])
+        detail = f"reset {shown} first"
+        self.run.emit("guard_tripped", key=key, violations=[{"kind": SIZER_EDIT, "detail": detail}])
         raise_hitl(self.cfg, self.run, "guard_violation", key, f"Guard violation in {key}: {SIZER_EDIT}: {detail}")
 
     def _sizer_trip(self, key: str) -> dict | None:
