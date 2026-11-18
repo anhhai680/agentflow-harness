@@ -668,6 +668,26 @@ def test_a_refused_flag_on_a_resumed_call_is_not_a_failed_resume(flow_repo, quic
     assert "Could not resume" not in raised["summary"]
 
 
+def test_a_cli_that_ignores_the_five_minute_ttl_is_noted_once_and_the_run_goes_on(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"result": DONE, "cache_write_1h": 500}], "build/other": [{"result": DONE, "cache_write_1h": 500}]})
+    assert run_step(flow_repo) == "done"
+    other = make_step(id="other")
+    assert flow_repo.executor(run).run_agent_step(make_phase(other), other, "build/other") == "done"
+    noted = flow_repo.events(run, "cli_setting_ignored")
+    assert [e["setting"] for e in noted] == ["cache_ttl"]
+    assert noted[0]["key"] == KEY and noted[0]["agent"] == "claude"
+    assert run.state["cli_settings_ignored"] == ["cache_ttl"]
+    assert run.state["steps"]["build/other"]["status"] == "done"
+
+
+def test_a_cli_that_honours_the_settings_is_not_noted(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"result": DONE, "cache_write_5m": 500}]})
+    assert run_step(flow_repo) == "done"
+    assert flow_repo.events(run, "cli_setting_ignored") == []
+
+
 def test_a_step_finished_before_the_agent_died_is_not_repeated(flow_repo, quick_holds):
     run = flow_repo.new_run()
     flow_repo.script({KEY: [{"result": DONE, "exit": 1}]})

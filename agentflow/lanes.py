@@ -29,7 +29,7 @@ from typing import Literal, TextIO
 
 from agentflow import lessons as lessons_mod
 from agentflow import doubt, overlays, pack, run_env, sizing, verification, workspace
-from agentflow.agents import CLAUDE_MIN_VERSION, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption
+from agentflow.agents import CLAUDE_MIN_VERSION, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption, ignored_settings
 from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
@@ -793,6 +793,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         if turn.resume is None:
             self._record_lessons(sr, turn)
         outcome = sr.agent.run(call, on_event)
+        self._note_ignored_settings(sr, outcome)
         sr.session = outcome.session_id or turn.resume or sr.session
         window = outcome.context_window
         if window:  # cached under the stream's model id and the alias, so the next call finds it either way
@@ -813,6 +814,16 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if planted:
                 return _Called(outcome, sr.start_tree, planted)
         return _Called(outcome, snapshot(self.worktree))
+
+    def _note_ignored_settings(self, sr: _StepRun, outcome: AgentOutcome) -> None:
+        """Say once per run (`cli_setting_ignored`) when the CLI did not honour `cache_ttl` or `lean`. Only a Claude
+        run call is checked; the run goes on."""
+        spec = self.cfg.agents.get(sr.agent_name)
+        if sr.agent_name != "claude" or spec is None:
+            return
+        for setting in ignored_settings(spec, outcome.usage):
+            if setting not in self.run.state["cli_settings_ignored"]:
+                self.run.emit("cli_setting_ignored", key=sr.key, setting=setting, agent=sr.agent_name)
 
     def _record_lessons(self, sr: _StepRun, turn: _Turn) -> None:
         """A fresh session's prompt carries the lessons: record which ones (and their digest), and which a size

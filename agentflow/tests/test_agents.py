@@ -21,6 +21,7 @@ from agentflow.agents import (
     WATCHDOG_THREAD,
     StreamAccumulator,
     idle_limit,
+    ignored_settings,
     make_agents,
     parse_claude_line,
     parse_codex_line,
@@ -1186,3 +1187,31 @@ def test_a_codex_session_gets_no_claude_env_file(fake, cfg, call, monkeypatch):
     codex = CodexAgent(dataclasses.replace(cfg.agents["codex"], command=fake.command), cfg.context)
     codex.run(dataclasses.replace(call, env_base={"PATH": os.environ["PATH"]}), collect()[1])
     assert "CLAUDE_ENV_FILE" not in seen[STEP]
+
+
+# ------------------------------------------------------------------ a setting the CLI did not honour
+
+
+def _spec(cfg, **changes):
+    return dataclasses.replace(cfg.agents["claude"], **changes)
+
+
+def test_ignored_settings_reads_the_usage_split(cfg):
+    assert ignored_settings(_spec(cfg, cache_ttl="5m"), {"tokens": {"cache_write_1h": 10}}) == ["cache_ttl"]
+    assert ignored_settings(_spec(cfg, cache_ttl="1h"), {"tokens": {"cache_write_5m": 10}}) == ["cache_ttl"]
+    assert ignored_settings(_spec(cfg, lean=True), {"auto_memory": True}) == ["auto_memory"]
+    assert ignored_settings(_spec(cfg), {}) == []
+
+
+def test_ignored_settings_is_quiet_when_the_cli_did_what_was_asked(cfg):
+    assert ignored_settings(_spec(cfg, cache_ttl="5m"), {"tokens": {"cache_write_5m": 10}}) == []
+    assert ignored_settings(_spec(cfg, cache_ttl="1h"), {"tokens": {"cache_write_5m": 10, "cache_write_1h": 4}}) == []
+    assert ignored_settings(_spec(cfg, cache_ttl="1h"), {"tokens": {"cache_write_1h": 4}}) == []
+    assert ignored_settings(_spec(cfg, cache_ttl="cli"), {"tokens": {"cache_write_1h": 4}}) == []
+    assert ignored_settings(_spec(cfg, lean=False), {"auto_memory": True}) == []
+    assert ignored_settings(_spec(cfg, lean=True), {"auto_memory": False}) == []
+
+
+def test_ignored_settings_gives_both_when_both_apply(cfg):
+    usage = {"tokens": {"cache_write_1h": 10}, "auto_memory": True}
+    assert ignored_settings(_spec(cfg, cache_ttl="5m", lean=True), usage) == ["cache_ttl", "auto_memory"]

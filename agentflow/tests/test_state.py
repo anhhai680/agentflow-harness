@@ -172,6 +172,34 @@ def test_context_window_is_cached_per_model(run):
     assert run.state["context_windows"] == {"opus": 1000000}
 
 
+def test_the_state_keeps_the_latest_usage_window_per_window(run):
+    assert run.state["usage_window"] == {} and run.state["cli_settings_ignored"] == []
+    run.emit("usage_window", window="five_hour", utilization=0.31, resets_at=1000, status="allowed")
+    run.emit("usage_window", window="seven_day", utilization=0.2, resets_at=9000, status="allowed")
+    run.emit("usage_window", window="five_hour", utilization=0.46, resets_at=1000, status="allowed_warning", sizer=True)
+    windows = run.state["usage_window"]
+    assert set(windows) == {"five_hour", "seven_day"}
+    assert windows["five_hour"]["utilization"] == 0.46 and windows["five_hour"]["status"] == "allowed_warning"
+    assert windows["five_hour"]["resets_at"] == 1000 and windows["five_hour"]["at"]
+    assert windows["seven_day"]["utilization"] == 0.2
+
+
+def test_a_usage_window_without_a_window_name_is_malformed_not_fatal():
+    one = reduce(initial_state(), {"type": "usage_window", "seq": 1, "utilization": 0.5})
+    assert one["usage_window"] == {} and [m["type"] for m in one["malformed_events"]] == ["usage_window"]
+    two = replay([{"type": "usage_window", "seq": 1, "utilization": 0.5},
+                  {"type": "usage_window", "seq": 2, "window": "five_hour", "utilization": 0.5}])
+    assert set(two["usage_window"]) == {"five_hour"} and len(two["malformed_events"]) == 1
+
+
+def test_a_cli_setting_is_noted_once_in_the_state(run):
+    run.emit("cli_setting_ignored", key="plan/x", setting="cache_ttl", agent="claude")
+    run.emit("cli_setting_ignored", key="plan/y", setting="cache_ttl", agent="claude")
+    run.emit("cli_setting_ignored", key="plan/y", setting="auto_memory", agent="claude")
+    assert run.state["cli_settings_ignored"] == ["cache_ttl", "auto_memory"]
+    assert replay(run.events.read())["cli_settings_ignored"] == ["cache_ttl", "auto_memory"]
+
+
 def test_the_task_total_is_fixed_by_the_first_task_step(run):
     run.emit("phase_started", phase="build", start_sha="aaa")
     run.emit("step_started", key="build/build/task-1/implement", phase="build", task={"n": 1, "of": 4})

@@ -376,6 +376,20 @@ def estimate_cost(prices: dict[str, dict[str, float]], usage_by_message: dict[st
     return total
 
 
+def ignored_settings(spec: AgentSpec, usage: dict) -> list[str]:
+    """The settings of `spec` an invocation's `usage` shows the CLI did not honour: `cache_ttl` when the writes landed
+    in the other lifetime, `auto_memory` when a lean session still loaded the user's memory. Reads `usage` only through
+    `.get`: an empty one (a Codex call, a dry run) gives `[]`."""
+    tokens = usage.get("tokens") or {}
+    write_5m, write_1h = tokens.get("cache_write_5m") or 0, tokens.get("cache_write_1h") or 0
+    out = []
+    if (spec.cache_ttl == "5m" and write_1h > 0) or (spec.cache_ttl == "1h" and write_5m > 0 and not write_1h):
+        out.append("cache_ttl")
+    if spec.lean and usage.get("auto_memory"):
+        out.append("auto_memory")
+    return out
+
+
 def _seed_windows(usage_windows: Any) -> dict[str, tuple[float, str]]:
     """The run's recorded windows (`state.usage_window`: `{window: {"utilization", "status", ...}}`) as
     `StreamAccumulator.windows`. An entry with no number is left out, so its next reading is news."""
