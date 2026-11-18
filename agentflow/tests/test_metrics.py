@@ -450,3 +450,28 @@ def test_aggregate_sorts_step_kinds_by_cost_and_is_empty_with_no_runs():
     assert [r["kind"] for r in out["step_kinds"]] == ["build.implement", "build.review", "build.size"]
     empty = aggregate([])
     assert empty["step_kinds"] == [] and set(empty["usd_split"].values()) == {0.0}
+
+
+def test_a_fake_agent_run_shows_its_exact_split_in_metrics_and_signals(flow_repo):
+    from agentflow.config import Phase, Step
+    from agentflow.signals import run_signals
+
+    run = flow_repo.new_run()
+    step = Step(id="impl", type="agent", skill="test-driven-development", role="build", prompt="step.md")
+    phase = Phase(name="build", agent=None, model="sonnet", skip_if=None, steps=[step])
+    act = {"result": {"status": "done", "summary": "did it"}, "model_id": "claude-sonnet-5-5",
+           "cache_write_1h": 1_000_000, "cache_read": 1_000_000, "output_tokens": 0}
+    flow_repo.script({"build/impl": [act]})
+    assert flow_repo.executor(run).run_agent_step(phase, step, "build/impl") == "done"
+    n_calls = len(flow_repo.events(run, "agent_exited"))
+    assert n_calls >= 1
+    events = run.events.read()
+    m = run_metrics(events, datetime.now(UTC))
+    assert m["usd_split"]["cache_write"] == pytest.approx(4.0 * n_calls)
+    assert m["usd_split"]["cache_read"] == pytest.approx(0.1 * n_calls)
+    s = run_signals(events, m)
+    assert s["cache_write_share"] == pytest.approx(round(4.0 / 4.1, 4), abs=1e-4)
+    kind = step_kind("build/impl")
+    assert m["by_step_kind"][kind]["sessions"] == n_calls
+    assert s[f"session_turns_p90:{kind}"] >= 1
+    assert s["compactions"] == 0 and s["usage_holds"] == 0
