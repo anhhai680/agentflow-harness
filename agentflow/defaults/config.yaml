@@ -26,7 +26,7 @@ agents:
   claude:
     command: [claude]
     base_args: [-p, --output-format, stream-json, --verbose]
-    models: {plan: opus, build: sonnet, mechanical: haiku, review: sonnet, debug: opus}  # fallback when a phase sets no model
+    models: {plan: sonnet, build: sonnet, mechanical: haiku, review: sonnet, debug: sonnet}  # fallback when a phase sets no model
     effort_arg: [--effort, "{effort}"]   # the runner sizes each step's level (see effort:)
     skill_loading: native
     prices:                      # USD per 1M tokens; prices a session Claude never reported a cost for (rollover, timeout)
@@ -58,7 +58,7 @@ preflight:
   enabled: false   # true: check the machine once before a run's first phase (the gates' programs, Docker, `setup`)
 
 watchdog:
-  no_progress_min: 0   # end a session that writes nothing to its stream this many minutes (0 = off; 15 is a safe start)
+  no_progress_min: 15   # end a session that writes nothing to its stream this many minutes (0 = off; 15 is a safe start)
 
 effort:
   sizing: true    # the runner sizes each step before it starts (false: every step runs at default)
@@ -198,7 +198,7 @@ ci:
 phases:
   define:
     needs_approval: true
-    model: {default: opus, build: sonnet}
+    model: {default: sonnet, build: sonnet}
     steps:
       - {id: debug, lanes: [bug], skill: "@skills.map.debug", role: debug, prompt: debug.md}
       - {id: draft, lanes: [feature], skill: "@skills.map.define", role: plan, prompt: spec.md,
@@ -220,7 +220,7 @@ phases:
       - {id: spec_approval, lanes: [feature], gates: [], when: spec_awaits_approval}  # keeps `define` for its approval
   plan:
     needs_approval: true
-    model: {default: opus, build: sonnet}
+    model: {default: sonnet, build: sonnet}
     skip_if: plan_exists_unchecked
     steps:
       - {id: plan, lanes: [feature], skill: "@skills.map.plan", role: plan, prompt: plan.md,
@@ -232,7 +232,7 @@ phases:
   build:
     needs_approval: false
     resolve: true
-    model: {default: sonnet, review: sonnet, plan: opus}
+    model: {default: sonnet, review: sonnet, plan: sonnet}
     skip_if: build_done
     steps:
       - &setup
