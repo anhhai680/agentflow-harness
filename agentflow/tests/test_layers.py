@@ -321,7 +321,7 @@ def test_rows_list_every_leaf_with_its_layer():
     assert ("defaults.run_budget_usd", 9, "user") in rows
     assert ("gates.unit", {"run": "true"}, "project") in rows                 # a whole entry is one row
     assert ("agents.claude.models.build", "opus", "project") in rows
-    assert ("agents.claude.models.plan", "opus", "engine") in rows
+    assert ("agents.claude.models.plan", "sonnet", "engine") in rows
     assert ("hitl.remind_after_h", 2, "project") in rows                      # below an engine `{}`
     assert ("record_step", merged["record_step"], "engine") in rows
     assert ("guardrails.forbidden_paths", [], "engine") in rows               # an empty list is a leaf
@@ -443,3 +443,14 @@ def test_a_null_obligation_switches_a_default_off():
     engine = L("engine", {"policy": {"obligations": {"a": {"require": ["step:verify"]}}}})
     merged, _ = merge([engine, L("project", {"policy": {"obligations": {"a": None}}})])
     assert merged["policy"]["obligations"] == {}
+
+
+def test_a_pack_that_writes_phases_drops_the_default_route():
+    low = L("engine", {**workflow(), "route": {"mode": "off", "profiles": {"S": {"per_task_review": False}}}})
+    high = L("project", {"lanes": {"bug": {"phases": ["fix"]}}, "phases": {"fix": {"steps": [{"skill": "f"}]}}})
+    merged, origins = merge([low, high])
+    assert "route" not in merged and not any(k[0] == "route" for k in origins)
+    assert "route" in layers.WORKFLOW_KEYS
+    own = L("project", {**high.data, "route": {"mode": "observe"}})
+    merged, _ = merge([low, own])
+    assert merged["route"] == {"mode": "observe"}  # the pack's own, with none of the default grid

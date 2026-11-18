@@ -7,7 +7,8 @@ phase whose review found blocking problems (`docs/agentflow-doubt-review-proposa
 - **Dispositions** (`parse_dispositions`, `answered_boundary`, `unresolved`): the reconcile step classifies every
   blocking finding. The runner checks the list and fails closed: whatever it cannot trust stays unresolved.
 - **Stop rules** (`stop_reason`): when another round is not worth opening. Every rule reads only the phase's events
-  since its last human round (`since_human_round`), so a human who rejects the phase gets fresh rounds.
+  since its last human round (`since_human_round`), so a human who rejects the phase gets fresh rounds. `bounded` counts
+  against `autonomy.round_limit`, which the run's applied route profile may lower for the phase, never raise.
 - **What a human sees** (`page_lines`, `handoff_risks`): each finding with its disposition and status.
 
 Pure functions over event lists and the config: nothing here writes a file or an event. `autonomy` imports
@@ -21,6 +22,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from agentflow import route
 from agentflow.config import Config, Phase, Step, for_lane
 from agentflow.hitl import clean_fact
 from agentflow.state import Run
@@ -360,7 +362,7 @@ def stop_reason(cfg: Config, events: list[dict], phase: Phase, lane: str) -> str
             fruitless += 1
     if fruitless >= 2:
         return "theater"
-    return "bounded" if len(rounds) >= round_limit(cfg) else None
+    return "bounded" if len(rounds) >= round_limit(cfg, phase.name, route.last_record(events)) else None
 
 
 # --------------------------------------------------------------------------- what a human sees

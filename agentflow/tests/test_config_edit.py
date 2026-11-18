@@ -556,7 +556,7 @@ def test_form_shows_the_effective_value_its_layer_and_its_help(sparse_repo):
     assert (hard["value"], hard["source"], hard["present"]) == (65, "engine", False)
     assert hard["help"].startswith("hard: the run stops")
     models = fields[("agents", "claude", "models")]
-    assert models["source"] == "engine" and models["value"]["plan"] == "opus" and not models.get("readonly")
+    assert models["source"] == "engine" and models["value"]["plan"] == "sonnet" and not models.get("readonly")
     assert fields[("phases", "build", "resolve")]["value"] is True
     assert fields[("phases", "build", "resolve")]["source"] == "engine"
     assert ("hitl", "remind_after_h") in fields                          # a section the pack never wrote
@@ -1087,3 +1087,27 @@ def test_the_form_sets_how_many_done_cards_show(shipped):
 def test_the_form_sets_the_inbox_legacy_switch(shipped):
     config_edit.save(shipped, form(shipped, (["dashboard", "inbox_legacy"], True)))
     assert load_config(shipped).dashboard["inbox_legacy"] is True
+
+
+def test_route_mode_is_a_form_field(shipped):
+    shipped.write_text(SHIPPED + 'route: {mode: "off"}\n', encoding="utf-8")  # the python pack writes its workflow
+    fields = {tuple(f["key"]): f for section in config_edit.form_fields(shipped)["sections"]
+              for f in section["fields"]}
+    assert fields[("route", "mode")]["options"] == ["off", "observe", "on"]
+    proposal = form(shipped, (["route", "mode"], "observe"))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).route.mode == "observe"
+    with pytest.raises(EditError):
+        form(shipped, (["route", "mode"], "sometimes"))
+
+
+def test_route_profiles_are_protected(shipped):
+    assert "route.profiles" in config_edit.PROTECTED and "route.lanes" in config_edit.PROTECTED
+    for key in (["route", "profiles", "S", "per_task_review"], ["route", "lanes"]):
+        with pytest.raises(Refused):  # the form has no field for it
+            form(shipped, (key, False))
+    _, sha = config_edit.read(shipped)
+    for added in ("route: {profiles: {S: {per_task_review: false}}}\n", "route: {lanes: [feature, bug]}\n"):
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)

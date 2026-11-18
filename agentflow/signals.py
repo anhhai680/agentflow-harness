@@ -32,6 +32,8 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   stay true to it, so it keeps meaning time spent waiting on a person with no work going. `full_suite_runs` counts
   the batches of gate results (consecutive `gate_result` events of one step) that ran every gate of the
   `full_suite` passed in, skipped and failed results included; it is present only when `full_suite` is non-empty.
+  `route_upgrades` counts the `route_profile` events the runner recorded as an upgrade (`upgraded_from` set); it is
+  present only for a run with a `route_profile`.
   `gate_cache_hit_rate` is the gates named by `gates_reused` events over those plus the `gate_result`s that were not
   skipped (0..1); it is present only when that total is above 0, and a rate has no true 0 to read as when absent.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
@@ -83,6 +85,7 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "full_suite_runs": ("lower", False),      # times the whole verify gate set ran, in one batch of gate results
     "informed_approval": ("higher", True),    # a phase: share of a person's approvals that viewed what it produced
     "gate_cache_hit_rate": ("higher", False),  # gate results reused, over those reused plus those that ran
+    "route_upgrades": ("lower", False),       # times the runner raised the run's route profile mid-flight
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
@@ -91,7 +94,7 @@ FAMILIES: dict[str, tuple[str, bool]] = {
 COUNT_FAMILIES = frozenset({"fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections",
                             "ci_rounds", "rollovers", "progress_not_updated", "conformance_missing", "conformance_waived",
                             "gate_reruns", "refine_rounds", "effort_escalations", "undersized",
-                            "sizer_fallbacks", "full_suite_runs"})
+                            "sizer_fallbacks", "full_suite_runs", "route_upgrades"})
 DOUBT_FIELDS = (("doubt_blocking", "first_blocking"), ("doubt_rounds", "rounds"), ("doubt_noise", "noise"),
                 ("doubt_misread", "misread"), ("doubt_open", "open"), ("doubt_actionable", "actionable"))
 RECONCILE = "reconcile"  # `phase_rejected.kind` of a round the runner opens on a doubt review's findings
@@ -254,6 +257,7 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
     decided: dict[str, tuple[Any, Any]] = {}
     plain: Counter[str] = Counter()
     audit: dict | None = None
+    routed = False
     settled: dict[str, dict] = {}
     approvals: dict[str, list[bool]] = {}
     for ev in events:
@@ -297,6 +301,9 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
                 approvals.setdefault(str(phase), []).append(_informed(ev))
         elif etype == "conformance_checked":
             audit = ev
+        elif etype == "route_profile":
+            routed = True
+            plain["route_upgrades"] += int(ev.get("upgraded_from") is not None)
         elif etype in ("ci_round", "rolled_over", "progress_not_updated"):
             plain[{"ci_round": "ci_rounds", "rolled_over": "rollovers"}.get(etype, etype)] += 1
     for key, (_level, source) in decided.items():  # a step's last decision: a retried plan sizer counts once
@@ -305,6 +312,8 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
     for family, found in counts.items():
         out.update({f"{family}:{param}": n for param, n in found.items()})
     out.update({name: plain[name] for name in ("ci_rounds", "rollovers", "progress_not_updated")})
+    if routed:  # only a run that was triaged has a route to upgrade
+        out["route_upgrades"] = plain["route_upgrades"]
     for phase in metrics.get("phases") or []:
         for family in ("fix_attempts", "human_rejections", "refine_rounds"):
             out.setdefault(f"{family}:{phase['phase']}", 0)

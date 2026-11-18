@@ -36,7 +36,9 @@ import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from agentflow import layers
-from agentflow.config import KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ConfigError, Issue, load_config, validate
+from agentflow.config import (
+    KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ROUTE_MODES, ConfigError, Issue, load_config, validate,
+)
 from agentflow.layers import PHASE_FREE_KEYS
 
 __all__ = ["Conflict", "EditError", "Proposal", "Refused", "form_fields", "propose", "read", "save"]
@@ -48,6 +50,7 @@ _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and p
     "version", "engine", "gates", "gates_confirmed", "gate_sets", "guardrails", "conditions", "overlays", "project",
     "phase_approval", "record_step", "resolve_step", "retro_step", "paths", "defaults.env", "defaults.env_inherit", "context.autocompact_env", "context.progress_file",
     "hitl.notify", "dashboard.host", "work_source", "skills", "starter", "policy",
+    "route.lanes", "route.profiles",
 )
 PROTECTED = (
     *_PROTECTED_KEYS,
@@ -168,6 +171,9 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
          {"kind": "list", "options": list(QUESTION_KINDS)}),
         (("autonomy", "revert_forbidden"), "Forbidden-path reverts per step", _INT),
         (("autonomy", "resolve_kinds"), "Resolver sessions per stop kind", {"kind": "map", "value_kind": "int", "min": 1}),
+    ]),
+    ("Route", "How much ceremony a run's route gets, sized at its start.", [
+        (("route", "mode"), "Route profiles", {"kind": "enum", "options": list(ROUTE_MODES)}),
     ]),
     ("CI", "The `ci` step in ship.", [
         (("ci", "poll_s"), "Poll every (s)", _POS),

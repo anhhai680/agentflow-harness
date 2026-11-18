@@ -112,6 +112,16 @@ def decide(answers: dict[str, str] | None, files: int, security: bool, judgement
     return floor(clamp(level, policy.allowed), judgement, policy.allowed), False
 
 
+def review_level(answers: dict[str, str] | None, files: int, security: bool, policy: EffortPolicy) -> str:
+    """A plan task's review level under an applied route profile: `high` only for a task the plan sizer flagged `risk`
+    or under the security overlay, else `medium`; no usable answers keep `decide`'s judgement default. Clamped and
+    floored as a judgement step."""
+    if answers is None:
+        return decide(None, files, security, True, policy)[0]
+    level = "high" if security or flags(answers)["risk"] else "medium"
+    return floor(clamp(level, policy.allowed), True, policy.allowed)
+
+
 def sizer_effort(judgement: bool, allowed: Sequence[str]) -> str:
     return floor(clamp("low", allowed), judgement, allowed)
 

@@ -20,7 +20,9 @@ an `effort_decided` (`plan_sizer` or `fallback`) for each task's implement step 
 with the plan's digest when no task fell back, so ticking boxes sizes nothing again, an edit sizes only the tasks
 that have not started, and a fallback is tried again on the next entry. The sizer is asked only for the tasks with no
 plan-sizer answer for their current text (`task_digest`): one that fell back, a new one or an edited one. A plan
-sizer that changed the repository stops build on the plan's prefix, the same way as a step's sizer.
+sizer that changed the repository stops build on the plan's prefix, the same way as a step's sizer. Under an applied
+route profile (`route.applied`), a task's review is `sizing.review_level`: `high` only for `risk` or the security
+overlay, else `medium`.
 
 Agent text is untrusted: only the six normalized answers and a reason cut to `sizing.REASON_MAX` are kept, and
 neither reaches a commit message.
@@ -34,7 +36,7 @@ import os
 import stat
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import overlays, run_env, safeio, sizing, sources
+from agentflow import overlays, route, run_env, safeio, sizing, sources
 from agentflow.agents import Agent, AgentCall, AgentOutcome, EventCallback
 from agentflow.conditions import fmt
 from agentflow.config import Phase, Step, resolve_model
@@ -185,12 +187,7 @@ class SizingLane:
         # A plan sizer changed the repository: nothing runs, sized or not, until it is back as the sizer found it.
         left = self.sizer_reset_needed(prefix)
         if left:
-            if not self._waiting_on(prefix):
-                shown = ", ".join(left[:sizing.CHANGED_SHOWN])
-                detail = f"reset {shown} first"
-                self.run.emit("guard_tripped", key=prefix, violations=[{"kind": SIZER_EDIT, "detail": detail}])
-                raise_hitl(self.cfg, self.run, "guard_violation", prefix,
-                           f"Guard violation in {prefix}: {SIZER_EDIT}: {detail}")
+            self._sizer_reset_stop(prefix, left)
             return "stopped"
         if not self.check_open_sizers(prefix):  # before any skip: a sizer left open may have changed the repository
             return "stopped"
@@ -256,11 +253,13 @@ class SizingLane:
 
             implement: dict[int, str] = {}
             review: dict[int, str] = {}
+            tiered = route.applied(self.cfg, self.run.state.get("route")) is not None  # risk alone earns `high`
             for task in todo:
                 answers = answered[task.n][0]
                 files, security = facts[task.n]
                 implement[task.n] = sizing.decide(answers, files, security, judgement, policy)[0]
-                review[task.n] = sizing.decide(answers, files, security, True, policy)[0]
+                review[task.n] = (sizing.review_level(answers, files, security, policy) if tiered
+                                  else sizing.decide(answers, files, security, True, policy)[0])
             batch_of = self._batch_of or {}
             for n in implement:
                 members = [m for m in batch_of.get(n) or [] if m in implement]
@@ -458,15 +457,16 @@ class SizingLane:
         return out
 
     def _sizer_call(self, key: str, prompt: str, agent: Agent, model: str, effort: str, phase: str, role: str,
-                    turns: int, timeout_s: int) -> tuple[dict | None, list[str]]:
+                    turns: int, timeout_s: int, add_dirs: list[Path] | None = None) -> tuple[dict | None, list[str]]:
         """One fresh read-only session: its parsed answer (None when it gave none) and what it changed. Never holds,
-        reminds or stops: an interruption, a timeout or an exception gives no answer."""
+        reminds or stops: an interruption, a timeout or an exception gives no answer. `add_dirs` are the directories
+        outside the worktree it may read (the run's workspace, for a triage that names the run's inputs)."""
         before = self._repo_state()
         self.run.emit("sizer_started", key=key, **before)
         call = AgentCall(
             prompt=prompt, model=model, effort=effort, cwd=self.worktree, run_id=self.run.id, step_key=key,
             result_path=self.run.agent_result_path(key), transcript_path=self.run.transcript_path(key, 1),
-            add_dirs=[], runs_root=self.run.dir.parent, timeout_s=timeout_s,
+            add_dirs=list(add_dirs or []), runs_root=self.run.dir.parent, timeout_s=timeout_s,
             resume_session=None,  # always fresh: a resumed Codex session keeps its own sandbox
             agent_profile=None, context_window=self.context_window_for(key, model), env=self.cfg.defaults.env,
             env_base=run_env.base(self.cfg), forbidden_paths=list(self.cfg.guardrails.forbidden_paths),
@@ -524,6 +524,16 @@ class SizingLane:
                       "state back as they were before it ran, then approve: the step is sized again")
         self.run.emit("guard_tripped", key=key, violations=[{"kind": SIZER_EDIT, "detail": detail}],
                       before={name: before.get(name) for name in STATE_FIELDS})
+        raise_hitl(self.cfg, self.run, "guard_violation", key, f"Guard violation in {key}: {SIZER_EDIT}: {detail}")
+
+    def _sizer_reset_stop(self, key: str, left: list[str]) -> None:
+        """Refuse a restart of `key` while `left` (`sizer_reset_needed`) still differs: raise the `sizer_edit` stop
+        again, unless the run is already waiting on it."""
+        if self._waiting_on(key):
+            return
+        shown = ", ".join(left[:sizing.CHANGED_SHOWN])
+        detail = f"reset {shown} first"
+        self.run.emit("guard_tripped", key=key, violations=[{"kind": SIZER_EDIT, "detail": detail}])
         raise_hitl(self.cfg, self.run, "guard_violation", key, f"Guard violation in {key}: {SIZER_EDIT}: {detail}")
 
     def _sizer_trip(self, key: str) -> dict | None:

@@ -14,6 +14,8 @@
   gate steps run their gates (with `fix_loop` or `on_fail: block`, `bug_eval` runs them), `type: commit`
   commits; `foreach: plan_task` and `type: finish` are the feature lane's (`feature_lane`).
 - a step whose `lanes:` tag leaves out this run's lane is not part of the run, so nothing records it;
+- a top-level step the run's applied route profile names in its `skip` (`route.skips`) is recorded as skipped
+  (`route:<profile>`) before its `when` is decided; a `reconciles` step keeps its own check first;
 - a group or foreach in which nothing ran (every child skipped, every plan task ticked) is
   recorded as skipped (`all steps skipped`), so its phase is skipped rather than approved.
 
@@ -30,7 +32,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TextIO
 
-from agentflow import doubt, sources
+from agentflow import doubt, route, sources
 from agentflow.conditions import Ctx, evaluate, fmt, paths_read
 from agentflow.commit_checks import runner_head
 from agentflow.config import RECONCILE_CHANGED, Config, Phase, Step, for_lane
@@ -265,9 +267,13 @@ class StepControl:
 
     def _should_run(self, phase: Phase, step: Step, key: str) -> tuple[bool | None, str | None, str, Any]:
         """`(True|False|None, condition label, reason, the condition itself)`; None means the run stopped to ask.
-        A `reconciles` step runs only in a reconcile round of its phase, never on a first pass or in a human's round."""
+        A `reconciles` step runs only in a reconcile round of its phase, never on a first pass or in a human's round.
+        A top-level step (`<phase>/<id>`) the run's applied route profile skips is skipped before its `when` is decided."""
         if step.reconciles and not doubt.in_reconcile_round(self.run.state, phase.name):
             return False, None, doubt.RECONCILE_ONLY, None
+        profile = route.skips(self.cfg, self.run.state.get("route"), key, step) if key.count("/") == 1 else None
+        if profile is not None:
+            return False, f"route:{profile}", f"route profile {profile} skips it", None
         if step.when is not None:
             value, reason = self.decide(phase, step.when, f"{key}.when")
             if value is None:

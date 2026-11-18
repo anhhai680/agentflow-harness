@@ -874,3 +874,25 @@ def test_sizer_started_sizer_finished_and_plan_sized_change_no_state(run):
 def test_sizer_finished_needs_a_key(run):
     with pytest.raises(EventError):
         run.emit("sizer_finished")
+
+
+# --------------------------------------------------------------------------- route profile
+
+
+def test_route_profile_sets_state_route(run):
+    assert initial_state()["route"] is None and run.state["route"] is None
+    facts = {"answers": None, "tasks": None, "files": None, "security": False}
+    run.emit("route_profile", profile="S", applied=True, proposed_by="rule", upgraded_from=None, facts=facts, reason="a")
+    run.emit("route_profile", profile="M", applied=True, proposed_by="runner", upgraded_from="S", facts=facts, reason="")
+    route = run.state["route"]
+    assert (route["profile"], route["applied"], route["proposed_by"], route["upgraded_from"]) == ("M", True, "runner", "S")
+    assert route["facts"] == facts and route["reason"] == ""
+    assert state_json(run) == replay(run.events.read()) == run.state
+
+
+def test_a_route_profile_without_a_profile_is_refused(run):
+    with pytest.raises(EventError, match="profile"):
+        run.emit("route_profile", applied=True)
+    assert run.state["route"] is None
+    skipped = replay([{"seq": 1, "ts": "2026-11-17T10:00:00.000+00:00", "type": "route_profile", "applied": True}])
+    assert skipped["route"] is None and skipped["malformed_events"]

@@ -272,6 +272,17 @@ def test_a_step_id_shaped_like_a_sizer_key_is_refused(tmp_cfg, step_id, refused)
     assert (("error", "phases.build.steps[1].review.id") in found) is refused
 
 
+@pytest.mark.parametrize("step_id,refused", [("route", True), ("routes", False), ("reroute", False)])
+def test_the_triage_step_id_is_reserved(tmp_cfg, step_id, refused):
+    def patch(data):
+        phase_step(data, "define", "contracts")["id"] = step_id
+        phase_step(data, "build", "build")["review"]["id"] = step_id if refused else "review-2"
+
+    found = errors(issues_for(tmp_cfg, patch))
+    assert (("error", "phases.define.steps[4].id") in found) is refused
+    assert (("error", "phases.build.steps[1].review.id") in found) is refused
+
+
 def test_user_only_skill_as_step(tmp_cfg):
     def patch(data):
         phase_step(data, "define", "contracts")["skill"] = "writing-for-agents"
@@ -686,6 +697,7 @@ FULL_PACKS = {"python": PYTHON_CONFIG, "node": PACKS / "node" / ".agentflow" / "
 # writes its whole workflow, so the engine's workflow never applies to it; only keys outside the workflow it left
 # unset can come from the engine defaults.
 _RETRO_STEP = "the engine's retro step: a retro is the engine's pipeline, so no pack needs to state it"
+_WATCHDOG = "the engine's watchdog default (15 minutes): a pack states it only to change it"
 _POLICY = "the engine's default obligations (verified, reviewed, ...) and the engine floor, which a pack states only to add to"
 INHERITED = {
     "python": {"retro_step": _RETRO_STEP, "policy": _POLICY},
@@ -694,8 +706,9 @@ INHERITED = {
         "agents.codex": "the engine's codex agent, disabled: it runs no step unless the pack enables it",
         "agents.claude.prices": "the engine's price table: it prices only a session Claude reported no cost for",
         "retro_step": _RETRO_STEP,
+        "watchdog.no_progress_min": _WATCHDOG,
     },
-    "this repo": {"retro_step": _RETRO_STEP, "policy": _POLICY},
+    "this repo": {"retro_step": _RETRO_STEP, "policy": _POLICY, "watchdog.no_progress_min": _WATCHDOG},
 }
 # The keys of `defaults`, `context`, `effort` and `recovery` that load_config requires (no code fallback). The engine
 # defaults hold the values the engine's minimum fixture pack (`node`) writes for them.
@@ -1603,7 +1616,7 @@ def test_watchdog_no_progress_min_must_be_zero_or_more(tmp_cfg):
     found = issues_for(tmp_cfg, {"watchdog": {"nope": 1}})
     assert [(i.path, i.message) for i in found if i.level == "error"] == [("watchdog.nope", "unknown watchdog key")]
     assert load_config(tmp_cfg({"watchdog": {"no_progress_min": 12.5}})).watchdog.no_progress_min == 12.5
-    assert load_config(tmp_cfg({"watchdog": None})).watchdog.no_progress_min == 0
+    assert load_config(tmp_cfg({"watchdog": None})).watchdog.no_progress_min == 15  # the engine default
 
 
 def test_ci_watch_max_h_defaults_off_and_may_be_left_out(sparse_repo, tmp_cfg):
@@ -1864,3 +1877,146 @@ def test_dashboard_inbox_legacy_is_true_or_false(tmp_cfg):
         found = issues_for(tmp_cfg, {"dashboard": {"inbox_legacy": bad}})
         assert [i.path for i in found if i.level == "error"] == ["dashboard.inbox_legacy"], bad
     assert not errors(issues_for(tmp_cfg, {"dashboard": {"inbox_legacy": True}}))
+
+
+# --------------------------------------------------------------------------- route profiles
+
+
+def with_route(route: dict, doubt: bool = True):
+    """A `tmp_cfg` patch: the python pack (with the doubt review, so `plan` has three feature steps) and `route`."""
+    def patch(data: dict) -> None:
+        if doubt:
+            with_doubt(data)
+        data["route"] = route
+    return patch
+
+
+def route_issues(tmp_cfg, route: dict, doubt: bool = True) -> list[Issue]:
+    return issues_for(tmp_cfg, with_route(route, doubt))
+
+
+def test_route_defaults_are_off_with_the_grid(sparse_repo):
+    cfg = load_config(pack.pack_config(sparse_repo))
+    assert cfg.route.mode == "off"
+    assert cfg.route.lanes == ["feature"]
+    assert set(cfg.route.profiles) == {"XS", "S", "M", "L"}
+    assert cfg.route.profiles["S"].doubt_rounds == {"define": 1, "plan": 1}
+    assert cfg.route.profiles["XS"].per_task_review is False
+    assert cfg.route.profiles["XS"].skip == ("define/grill_open_questions", "define/spec_review", "plan/plan_review")
+    assert cfg.route.profiles["L"].per_task_review is True
+
+
+def test_the_default_grid_validates_clean(sparse_repo):
+    cfg = load_config(pack.pack_config(sparse_repo))
+    assert [i for i in validate(cfg, sparse_repo) if "route" in i.path] == []
+
+
+def test_the_python_pack_has_no_profiles(tmp_cfg):
+    cfg = load_config(tmp_cfg())
+    assert cfg.route.profiles == {}
+    assert cfg.route.mode == "off"
+
+
+@pytest.mark.parametrize("route, path, text", [
+    ({"mode": "sometimes"}, "route.mode", "off, observe, on"),
+    ({"lanes": ["nope"]}, "route.lanes", "unknown lane"),
+    ({"profiles": {"XL": {}}}, "route.profiles.XL", "XS, S, M, L"),
+    ({"profiles": {"S": {"grill": 1}}}, "route.profiles.S.grill", "skip, doubt_rounds, per_task_review"),
+    ({"profiles": {"S": {"skip": ["define/nope"]}}}, "route.profiles.S.skip", "no step 'nope'"),
+    ({"profiles": {"S": {"skip": ["nope/draft"]}}}, "route.profiles.S.skip", "not a phase"),
+    ({"profiles": {"S": {"skip": ["draft"]}}}, "route.profiles.S.skip", "<phase>/<id>"),
+    ({"profiles": {"S": {"skip": ["build/build"]}}}, "route.profiles.S.skip", "foreach"),
+    ({"profiles": {"S": {"doubt_rounds": {"define": 0}}}}, "route.profiles.S.doubt_rounds.define",
+     "the engine floor keeps at least one round"),
+    ({"profiles": {"S": {"doubt_rounds": {"nope": 1}}}}, "route.profiles.S.doubt_rounds.nope", "not a phase"),
+    ({"profiles": {"S": {"per_task_review": "no"}}}, "route.profiles.S.per_task_review", "true or false"),
+])
+def test_route_rejects_bad_values(tmp_cfg, route, path, text):
+    found = [i for i in route_issues(tmp_cfg, route) if i.level == "error" and i.path == path]
+    assert found, route_issues(tmp_cfg, route)
+    assert text in found[0].message
+
+
+def test_a_profile_may_not_drop_an_obligation(tmp_cfg):
+    found = route_issues(tmp_cfg, {"profiles": {"S": {"skip": ["verify/verify"]}}})
+    messages = [i.message for i in found if i.level == "error" and i.path == "route.profiles.S.skip"]
+    assert any("skipping verify/verify drops the obligation verified" in m for m in messages), found
+    found = route_issues(tmp_cfg, {"profiles": {"S": {"skip": ["ship/finish"]}}})
+    assert ("error", "route.profiles.S.skip") in errors(found)
+
+
+def test_a_profile_may_skip_a_step_no_obligation_needs(tmp_cfg):
+    found = route_issues(tmp_cfg, {"profiles": {"S": {"skip": ["define/contracts"]}}})
+    assert errors(found) == []
+    # an obligation for a lane the route does not cover does not protect the step: `red_then_green` is a bug lane's
+    found = route_issues(tmp_cfg, {"lanes": ["bug"], "profiles": {"S": {"skip": ["verify/verify"]}}})
+    assert ("error", "route.profiles.S.skip") in errors(found)  # `verified` covers bug too
+
+
+def test_skipping_every_plan_step_drops_plan_approved(tmp_cfg):
+    every = ["plan/plan", "plan/plan_reconcile", "plan/plan_review"]
+    found = route_issues(tmp_cfg, {"profiles": {"S": {"skip": every}}})
+    assert any(i.level == "error" and "plan_approved" in i.message for i in found), found
+    found = route_issues(tmp_cfg, {"profiles": {"S": {"skip": ["plan/plan_review"]}}})
+    assert errors(found) == []
+
+
+def test_route_on_with_no_profiles_warns(tmp_cfg):
+    found = route_issues(tmp_cfg, {"mode": "on"})
+    assert [i.message for i in found if i.path == "route.profiles"] == [
+        "route.mode is on but route.profiles is empty: every profile runs the full route"]
+    assert errors(found) == []
+    assert not [i for i in route_issues(tmp_cfg, {"mode": "off"}) if i.path == "route.profiles"]
+
+
+def test_a_bare_yaml_off_keeps_the_route_off_and_still_fails_validate(tmp_cfg):
+    path = tmp_cfg(with_route({"mode": "MODE", "profiles": {"S": {}}}))
+    path.write_text(path.read_text(encoding="utf-8").replace("mode: MODE", "mode: off"), encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.raw["route"]["mode"] is False  # YAML 1.1 reads a bare `off` as false
+    assert cfg.route.mode == "off"
+    found = [i for i in validate(cfg, path.parent.parent) if i.path == "route.mode"]
+    assert [i.level for i in found] == ["error"]
+    assert "quote it" in found[0].message
+    assert not [i for i in validate(cfg, path.parent.parent) if i.path == "route.profiles"]
+
+
+@pytest.mark.parametrize("mode", ["sometimes", True, 1, None])
+def test_a_mode_outside_the_list_runs_as_off(tmp_cfg, mode):
+    cfg = load_config(tmp_cfg(with_route({"mode": mode})))
+    assert cfg.route.mode == "off"
+
+
+def test_a_profile_may_not_skip_a_group_that_holds_an_obligations_step(tmp_cfg):
+    def patch(data: dict) -> None:
+        with_route({"profiles": {"S": {"skip": ["define/grill_open_questions"]}}})(data)
+        data["policy"]["obligations"]["grilled"] = {"lanes": ["feature"], "require": ["step:apply"]}
+    found = issues_for(tmp_cfg, patch)
+    messages = [i.message for i in found if i.level == "error" and i.path == "route.profiles.S.skip"]
+    assert messages == ["skipping define/grill_open_questions drops the obligation grilled"], found
+
+
+def test_a_profile_may_not_skip_a_step_whose_review_is_an_obligations_step(tmp_cfg):
+    def patch(data: dict) -> None:
+        with_route({"profiles": {"S": {"skip": ["define/contracts"]}}})(data)
+        phase_step(data, "define", "contracts")["review"] = {"id": "contracts_check", "role": "review",
+                                                             "prompt": "task_review.md"}
+        data["policy"]["obligations"]["checked"] = {"lanes": ["feature"], "require": ["step:contracts_check"]}
+    found = issues_for(tmp_cfg, patch)
+    messages = [i.message for i in found if i.level == "error" and i.path == "route.profiles.S.skip"]
+    assert messages == ["skipping define/contracts drops the obligation checked"], found
+
+
+@pytest.mark.parametrize("held, text", [("finish", "it holds the `finish` step finish, which ends every run"),
+                                        ("ci", "it holds the `ci` step ci, which ends every run"),
+                                        ("build", "it holds the `foreach` step build, which is the build itself")])
+def test_a_profile_may_not_skip_a_group_that_holds_a_finish_ci_or_foreach_step(tmp_cfg, held, text):
+    def patch(data: dict) -> None:
+        with_route({"profiles": {"S": {"skip": ["ship/wrapped"]}}})(data)
+        source = "build" if held == "build" else "ship"
+        inner = phase_step(data, source, held)
+        data["phases"][source]["steps"].remove(inner)
+        data["phases"]["ship"]["steps"].append({"id": "wrapped", "type": "group", "steps": [inner]})
+    found = issues_for(tmp_cfg, patch)
+    messages = [i.message for i in found if i.level == "error" and i.path == "route.profiles.S.skip"]
+    assert any(m.startswith("skipping ship/wrapped is refused") and text in m for m in messages), found

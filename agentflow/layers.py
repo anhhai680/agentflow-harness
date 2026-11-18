@@ -19,7 +19,7 @@ ENGINE_DEFAULTS = Path(__file__).resolve().parent / "defaults" / "config.yaml"
 STARTERS = Path(__file__).resolve().parent / "starters"  # one directory per starter, each holding a `config.yaml`
 WORKFLOW_KEYS = (
     "lanes", "phases", "conditions", "record_step", "resolve_step", "phase_approval", "checkpoints", "autonomy",
-    "ci", "skills",
+    "ci", "skills", "route",
 )
 PHASE_FREE_KEYS = ("needs_approval", "resolve", "model", "agent")  # the rest of a phase is the workflow itself
 USER_KEYS = (  # dotted patterns of the settings that are personal; `*` matches exactly one segment

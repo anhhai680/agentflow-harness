@@ -50,7 +50,7 @@ from agentflow.autonomy import (
     phase_findings,
     round_limit,
 )
-from agentflow import doubt, pack, preflight, run_env, work_source
+from agentflow import doubt, pack, preflight, route_lane, run_env, work_source
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
@@ -322,6 +322,15 @@ class _Loop:
         first = self.opts.from_phase or names[0]
         if self.cfg.preflight.enabled and self.preflight(f"{first}/{preflight.PREFLIGHT_STEP}"):
             return "waiting_human"
+        # A triage in the log is checked whatever the pack says now; off with none builds nothing: today's run.
+        history = route_lane.triage_history(run.events.read(), first)
+        if self.cfg.route.mode in ("observe", "on") or history:
+            executor = self.executor()
+            if executor.route_due():
+                if executor.size_route(first) == "stopped":
+                    return self.status()
+            elif history and executor.route_backstop(first) == "stopped":
+                return self.status()
         for index in range(names.index(first), len(names)):
             name = names[index]
             outcome = self.phase(names, index)
@@ -393,6 +402,8 @@ class _Loop:
                 if skip:
                     run.emit("phase_skipped", phase=name, reason=reason, via="skip_if", decided_by=executor.last_decided_by)
                     return None
+            if executor.route_record() is not None:  # a plan bigger than the triage said raises the route first
+                executor.reroute(tasks=executor.plan_open_tasks(), risk=False)
             run.emit("phase_started", phase=name, start_sha=head(self.worktree))
         outcome, ran = self.walk(phase, executor)
         if outcome == "stopped":
@@ -439,7 +450,7 @@ class _Loop:
             self.run.emit("phase_approved", by=AUTO_BY, phase=name, sha=head(self.worktree))
             self.hand_off(names, index, executor)
             return None
-        if finding_rounds(self.run, name) < round_limit(self.cfg):
+        if finding_rounds(self.run, name) < round_limit(self.cfg, name, self.run.state.get("route")):
             open_refine(self.run, name, AUTO_BY, findings_note(blocking))
             return self.phase(names, index)
         raise_phase_approval(self.cfg, self.run, name)

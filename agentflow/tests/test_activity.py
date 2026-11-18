@@ -87,6 +87,14 @@ def test_details_and_other_templates():
     assert sentence(ev(8, "pr_opened", url="https://example.test/1")) == ("Draft pull request opened", "https://example.test/1")
 
 
+def test_a_route_profile_reads_as_sized_or_upgraded():
+    assert sentence(ev(1, "route_profile", profile="S", proposed_by="rule", upgraded_from=None, reason="small")) == (
+        "Sized the route as S (rule)", "small")
+    assert sentence(ev(2, "route_profile", profile="M", proposed_by="runner", upgraded_from="S", reason="")) == (
+        "Upgraded the route from S to M (runner)", "")
+    assert in_kind(ev(3, "route_profile", profile="L"), "decisions")
+
+
 def test_gate_result_reads_passed_failed_and_skipped():
     assert sentence(ev(1, "gate_result", gate="g", key="a/b", passed=True))[0] == "Gate g passed on a · b"
     assert sentence(ev(2, "gate_result", gate="g", key="a/b", passed=False))[0] == "Gate g failed on a · b"

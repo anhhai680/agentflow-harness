@@ -16,7 +16,7 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agentflow import finished, pack, sources, work_source
+from agentflow import finished, pack, route, sources, work_source
 from agentflow.config import ON_UNKNOWN_VALUES, Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.doubt import RECONCILE_ONLY
 from agentflow.gitops import GhError, changed_files, gh_json
@@ -512,12 +512,18 @@ def _model_for(cfg: Config, phase: Phase, step: Step, role: str | None, override
 
 
 def _explain_steps(
-    cfg: Config, phase: Phase, steps: list[Step], prefix: str, ctx: Ctx, overrides: dict[str, str]
+    cfg: Config, phase: Phase, steps: list[Step], prefix: str, ctx: Ctx, overrides: dict[str, str],
+    profile: str | None = None,
 ) -> list[ExplainLine]:
     lines: list[ExplainLine] = []
+    skip = cfg.route.profiles[profile].skip if profile is not None else ()
     for step in for_lane(steps, ctx.values["lane"]):
         key = f"{prefix}/{step.id}"
-        verdict, reason = _step_verdict(cfg, step, ctx)
+        # a top-level step: a reconcile step keeps its own check first, and no profile skips finish, ci or foreach
+        if key in skip and not step.reconciles and route.skippable(step):
+            verdict, reason = "skip", f"route profile {profile}"
+        else:
+            verdict, reason = _step_verdict(cfg, step, ctx)
         model = _model_for(cfg, phase, step, step.role, overrides) if step.type == "agent" else None
         lines.append(ExplainLine(phase.name, key, verdict, reason, model))
         if verdict == "skip":
@@ -530,14 +536,19 @@ def _explain_steps(
     return lines
 
 
-def explain(cfg: Config, lane: str, ctx: Ctx, overrides: dict[str, str] | None = None) -> list[ExplainLine]:
+def explain(cfg: Config, lane: str, ctx: Ctx, overrides: dict[str, str] | None = None,
+            profile: str | None = None) -> list[ExplainLine]:
     """What a run of `lane` would do right now, from files and git. Never calls an agent.
 
     Every phase gets a line under its own name (`run`, `skip` or `ask`); a phase that is not
     skipped lists the steps of this lane and, unless it is the workflow's last phase, the
-    `<phase>_approved` stop.
+    `<phase>_approved` stop. With `profile` (a name in `route.profiles`), each step that route profile
+    skips is shown as a `skip` with the reason `route profile <name>`, whatever `route.mode` says.
     """
     check_lane(cfg, lane)
+    if profile is not None and profile not in cfg.route.profiles:
+        defined = f"defined: {', '.join(cfg.route.profiles)}" if cfg.route.profiles else "route.profiles defines none"
+        raise ValueError(f"no route profile {profile!r} in route.profiles; {defined}")
     overrides = overrides or {}
     names = list(cfg.phases)
     lines: list[ExplainLine] = []
@@ -553,7 +564,7 @@ def explain(cfg: Config, lane: str, ctx: Ctx, overrides: dict[str, str] | None =
         lines.append(ExplainLine(name, name, verdict, reason, None))
         if verdict == "skip":
             continue
-        step_lines = _explain_steps(cfg, phase, phase.steps, name, ctx, overrides)
+        step_lines = _explain_steps(cfg, phase, phase.steps, name, ctx, overrides, profile)
         lines.extend(step_lines)
         ran = any(line.verdict in ("run", "ask") for line in step_lines)
         if ran and phase.needs_approval:

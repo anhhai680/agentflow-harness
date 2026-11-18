@@ -9,6 +9,10 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- With `route.mode: observe` or `on`, the runner raises a run's route profile mid-flight when the plan turns out bigger or riskier than the triage said (more than 3 open tasks: `M`; 12 or more, a task the plan sizer flagged `risk`, or the security overlay: `L`), before the phase starts and again once build's plan sizer answers, and never lowers it. Under an applied profile, per-task reviews run at `medium` unless the plan sizer flagged the task `risk` or the task's own files touch the security overlay's paths. The new `route_upgrades` signal counts the upgrades.
+- With `route.mode: on`, the run's route profile applies: the steps in its `skip` are skipped, `doubt_rounds` caps each phase's doubt rounds (never above `autonomy.finding_rounds`, never below 1), and `per_task_review: false` drops the review of a plan task the plan sizer did not flag `risk`, outside the security overlay. `agentflow explain --profile <P>` shows the steps a profile skips.
+- With `route.mode: observe` or `on`, a short read-only triage session sizes a run before its first phase and the runner records the route profile its rule picks (`route_profile`); the session may only propose a larger profile, and a triage that edits the repository stops the run as `sizer_edit`, checked before the first phase even if the pack later turns `route` off. `validate` reserves the step id `route`.
+- `route`: profiles `XS`, `S`, `M` and `L` that skip steps, cap doubt rounds and drop per-task review, off by default (`route.mode`: `off`, `observe` or `on`). The engine ships the grid, `validate` keeps every obligation and the `finish` and `ci` steps out of a profile's reach, and the Settings form edits `route.mode`.
 - The Board filters by lane, status, "needs me" and a search over module, issue and branch, kept in the URL, and Done shows the newest `dashboard.done_shown` cards first with **Show all**.
 - Board cards show a phase progress strip, a "needs you" marker with how long it has waited, the live agent count and the step in words.
 - `dashboard.done_shown` (10 by default, 1–1000): how many Done cards the Board shows before **Show all**.
@@ -21,6 +25,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Changed
 
+- The engine's defaults now use `sonnet` for the `plan` and `debug` fallback models and the define, plan and build phases' planning models, and turn the watchdog on at `watchdog.no_progress_min: 15`. A pack that states its own values is unaffected.
 - Decisions waiting on you move from the Board's Needs-human list to an Inbox tab with a count in the header. Each card has a title in words, the inbox text with its CLI lines folded away, the facts and artifacts it needs, what a stop holds up, and forms in place of the browser's prompt boxes. `dashboard.inbox_legacy: true` brings the old list back.
 - A Board card lists every live agent of its run, not just the newest, and the Agents tab groups agents by run, puts idle ones first and opens each one's transcript.
 - A run's Activity tab tells its whole log as sentences ("Task 9 · implement finished: …", "You approved define"), filtered to Decisions, Agents, Gates, Commits or Stops. It folds agent turns into "Agent active 14 min, 37 tool calls", pages back to the first event, and shows each line's raw JSON on demand. The run detail no longer sends its last 300 raw events.
@@ -31,6 +36,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Fixed
 
+- A bare `route.mode: off` (which YAML reads as false) keeps the route off at run time instead of triaging every run; `validate` still names it. A route profile may no longer skip a group, repeat or step whose nested or `review` step is a `finish`, `ci` or `foreach` step or an obligation's `step:<id>` evidence, and the runner and `explain --profile` never skip a `finish`, `ci` or `foreach` step even in a pack that was not validated.
 - A spec whose answered questions sit under a plain `Resolved:` line (or a `### Resolved` heading) no longer counts them as open: the default `spec_has_open_questions` stops at any of these, and the `record_decision` prompt files a recorded answer under a bold `**Resolved (...)**` heading.
 - A repeat group whose round asked no questions while its `until` condition still fails stops for a human after that round instead of running the same round again, and its `max_rounds` stop names the condition (`not spec_has_open_questions`, not `inline condition`) and says why it still fails.
 

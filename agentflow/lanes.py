@@ -52,6 +52,7 @@ from agentflow.gitops import (CommitRejected, GitError, NothingToCommit, changed
                               commits_between, git_state_changes, head, outside_only, reconcile_baseline)
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, notify_run, park_hitl, raise_hitl, read_result
+from agentflow.route_lane import RouteLane
 from agentflow.run_control import wait_for_agents
 from agentflow.sizing_lane import SizingLane
 from agentflow.sync_lane import SyncLane
@@ -395,7 +396,7 @@ def _violation_text(violations: list[Violation]) -> str:
 # --------------------------------------------------------------------------- executor
 
 
-class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLane):
+class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLane, RouteLane):
     """Runs a run's steps: `run_steps`/`run_step` (control flow, in `flow_control`), plan tasks and
     `finish` (in `feature_lane`), test expectations and fix-looping gate steps (in `bug_eval`) and the
     agent step lifecycle here. `dry_run` prints each agent's command line and calls nothing."""

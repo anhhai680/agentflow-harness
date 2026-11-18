@@ -91,7 +91,7 @@ def test_open_parameter_counts_stay_absent_and_count_families_are_lower_is_bette
     out = run_signals([], EMPTY_METRICS)
     assert not [k for k in out if k.split(":")[0] in ("guard_trips", "permission_denied", "stop")]
     assert COUNT_FAMILIES <= set(FAMILIES) and all(FAMILIES[f][0] == "lower" for f in COUNT_FAMILIES)
-    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 16
+    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 17
 
 
 def test_cost_per_task_divides_by_the_steps_that_called_an_agent():
@@ -134,7 +134,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 32
+    assert len(FAMILIES) == 33
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -367,3 +367,14 @@ def test_informed_approval_is_the_share_of_human_approvals_that_viewed_every_new
     assert "informed_approval:build" not in got
     assert parse_target("informed_approval:define") == ("informed_approval", "define")
     assert "informed_approval" not in COUNT_FAMILIES and FAMILIES["informed_approval"] == ("higher", True)
+
+
+def test_route_upgrades_counts_upgrades():
+    picked = _ev("route_profile", profile="S", applied=True, proposed_by="rule", upgraded_from=None, facts={}, reason="")
+    upgraded = _ev("route_profile", profile="M", applied=True, proposed_by="runner", upgraded_from="S",
+                   facts={"tasks": 9, "risk": False, "security": False}, reason="the plan has 9 tasks")
+    assert run_signals([picked, upgraded], EMPTY_METRICS)["route_upgrades"] == 1
+    assert run_signals([picked], EMPTY_METRICS)["route_upgrades"] == 0
+    assert "route_upgrades" not in run_signals([], EMPTY_METRICS)
+    assert FAMILIES["route_upgrades"] == ("lower", False) and "route_upgrades" in COUNT_FAMILIES
+    assert parse_target("route_upgrades") == ("route_upgrades", None)

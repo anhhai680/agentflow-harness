@@ -3,7 +3,8 @@
 `FeatureLane` is mixed into `lanes.Executor` next to `flow_control.StepControl`.
 
 `run_foreach` (a `foreach: plan_task` step) walks the plan's tasks in order. Before the first task, `size_plan`
-(`sizing_lane`) sizes the open tasks that have not started, and their reviews. A ticked task the run
+(`sizing_lane`) sizes the open tasks that have not started, and their reviews, and `reroute` (`route_lane`) raises the
+run's route profile when the plan or a task the sizer flagged `risk` calls for a larger one. A ticked task the run
 never touched is passed over, and so is a task this run already committed. Each other task runs:
 
 1. the implementer, `<step>/task-<n>/implement`, in a fresh session (a small plan: the previous
@@ -33,7 +34,9 @@ that answers `unchanged`, leaves the tree as its round started, and started from
 work gets no review (`review_skipped`) and no gate run: the task is recorded as committed in the round
 with no commit (`sha: null`).
 
-A small plan has no per-task review. A `needs_human` result with `can_continue_without` (and
+A small plan has no per-task review. Under a route profile with `per_task_review: false` (`route.mode: on`), a task
+the plan sizer did not flag `risk`, outside the security overlay, gets none either: `review_skipped` records it once
+(`route profile <P>`), and the task is committed as a small plan's is. A task with no plan-sizer answers keeps it. A `needs_human` result with `can_continue_without` (and
 `hitl.park_independent`) parks the task: the question is asked without stopping, and tasks that do
 not depend on it (D12, transitively) go on. The run stops for the first parked question only when no
 runnable task remains; the others stay answerable (`state["parked"]`), and one answered while the
@@ -64,7 +67,7 @@ from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import sources, verification
+from agentflow import overlays, route, sizing, sources, verification
 from agentflow.autonomy import AUTO_BY, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
@@ -179,6 +182,8 @@ class FeatureLane:
         self._batch_of = self._batches(phase, step, plan, prefix, small)
         if self.size_plan(phase, step, plan, prefix, small) == "stopped":
             return "stopped"
+        if self.route_record() is not None:  # the plan sizer's answers can raise the route before the first task
+            self.reroute(tasks=self.plan_open_tasks(), risk=self._plan_flags_risk(plan, prefix))
         while True:
             stopped, held, attempted = self._plan_pass(phase, step, plan, rel, prefix, small)
             if stopped:
@@ -438,6 +443,13 @@ class FeatureLane:
         open_findings: list[dict] = []
         review = step.review if not small.get("active") or small.get("review") else None
         last = not batch or task.n == batch[-1].n
+        if review is not None and last and (dropped := self._route_drops_review(tkey, batch, prefix)):
+            review_key = f"{tkey}/review"
+            reason = f"route profile {dropped}"
+            if not any(e["type"] == "review_skipped" and e.get("key") == review_key and e.get("reason") == reason
+                       for e in self.run.events.read()):
+                self.run.emit("review_skipped", key=review_key, reason=reason, round=round_)
+            review = None  # the task commits as a small plan's does with `review: false`
         if round_ and self._changed_nothing(tkey):  # nothing to review or gate: the tree passed before
             review_key = f"{tkey}/review"
             if review is not None and not any(e["type"] == "review_skipped" and e.get("key") == review_key
@@ -459,6 +471,38 @@ class FeatureLane:
             if outcome != "done":
                 return "stopped"
         return self._commit_task(plan, task, tkey, open_findings, round_, gates=impl_step.gates, phase=phase)
+
+    def _route_drops_review(self, tkey: str, batch: list[sources.PlanTask] | None, prefix: str) -> str | None:
+        """The name of the run's applied route profile when it drops this task's review, else None. A task keeps its
+        review under a profile with `per_task_review`, under the security overlay, when the plan sizer flagged `risk`,
+        and when it has no plan-sizer answers (`route.reviews_task`); a batch's one review is kept for any member's."""
+        record = self.run.state.get("route")
+        profile = route.applied(self.cfg, record)
+        if profile is None or profile.per_task_review or not isinstance(record, dict):
+            return None
+        members = [f"{prefix}/task-{t.n}" for t in batch] if batch and prefix else [tkey]
+        sized = self._sized_answers({f"{key}/implement" for key in members})
+        security = overlays.security_path(self.cfg, self.ctx)
+        if any(route.reviews_task(profile, answers, security) for answers in sized.values()):
+            return None
+        return str(record["profile"])
+
+    def _sized_answers(self, keys: set[str]) -> dict[str, dict[str, str] | None]:
+        """Each step key's answers from its latest `effort_decided` (`sizing.parse_answers`), None when it has none."""
+        raw: dict[str, object] = dict.fromkeys(keys)
+        for event in self.run.events.read():
+            if event["type"] == "effort_decided" and event.get("key") in keys:
+                raw[event["key"]] = event.get("answers")
+        return {key: sizing.parse_answers(value) for key, value in raw.items()}
+
+    def _plan_flags_risk(self, plan: Path, prefix: str) -> bool:
+        """Whether the plan sizer flagged `risk` for any open task of `plan`."""
+        try:
+            keys = {f"{prefix}/task-{task.n}/implement" for task in sources.parse_plan(plan) if task.open}
+        except (OSError, ValueError):
+            return False
+        return any(answers is not None and sizing.flags(answers)["risk"]
+                   for answers in self._sized_answers(keys).values())
 
     def _refine_task(self, phase: Phase, step: Step, plan: Path, rel: str, task: sources.PlanTask, tkey: str,
                      small: dict, round_: int) -> Outcome:
