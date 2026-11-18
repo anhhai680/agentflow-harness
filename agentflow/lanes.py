@@ -29,7 +29,7 @@ from typing import Literal, TextIO
 
 from agentflow import lessons as lessons_mod
 from agentflow import doubt, overlays, pack, run_env, sizing, verification, workspace
-from agentflow.agents import CLAUDE_MIN_VERSION, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption, ignored_settings
+from agentflow.agents import CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption, ignored_settings
 from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
@@ -1029,12 +1029,22 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
 
     @staticmethod
     def _refused_flag_summary(sr: _StepRun, flag: str | None) -> str:
-        """A CLI too old for a flag the runner passes: name the flag and both ways out. No retry fixes it."""
+        """The CLI refused a flag before the session started: name it and the way out. No retry fixes it. A flag the
+        runner passes means a CLI too old for it, so the key that drops it comes first and the other key second (the
+        same CLI refuses that one next); any other flag came from the pack's own args."""
         prefix = f"agents.{sr.agent_name}"
-        return (f"The `{sr.agent_name}` CLI refused the flag `{flag}` before the session started: run sessions need "
-                f"Claude Code {CLAUDE_MIN_VERSION} or later. Update the CLI, or turn the flag off: "
-                f"`{prefix}.user_settings: true` (the pack or your user file) drops `{NO_USER_SETTINGS[0]}`, and "
-                f"`{prefix}.lean: false` drops `--exclude-dynamic-system-prompt-sections` and `--strict-mcp-config`.")
+        start = f"The `{sr.agent_name}` CLI refused the flag `{flag}` before the session started"
+        user_settings = f"`{prefix}.user_settings: true` (the pack or your user file) drops `{NO_USER_SETTINGS[0]}`"
+        lean = f"`{prefix}.lean: false` drops {' and '.join(f'`{arg}`' for arg in LEAN_ARGS)}"
+        if flag in LEAN_ARGS:
+            first, second = lean, user_settings
+        elif flag == NO_USER_SETTINGS[0]:
+            first, second = user_settings, lean
+        else:
+            return (f"{start}, and the runner doesn't pass it on its own: check `{prefix}.base_args` and "
+                    f"`{prefix}.effort_arg` for it, and whether this version of the CLI takes it.")
+        return (f"{start}: run sessions need Claude Code {CLAUDE_MIN_VERSION} or later. Update the CLI, or turn the "
+                f"flag off: {first}, and {second}.")
 
     def _stop(self, sr: _StepRun, kind: str, summary: str, extra: str = "") -> Outcome:
         raise_hitl(self.cfg, self.run, kind, sr.key, summary, extra=extra)

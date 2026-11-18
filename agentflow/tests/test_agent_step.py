@@ -657,6 +657,26 @@ def test_a_refused_flag_stops_the_step_naming_the_flag_and_the_fix(flow_repo, qu
     assert run.state["steps"][KEY]["status"] == "waiting_human"
 
 
+def test_a_refused_lean_flag_leads_with_the_lean_key(flow_repo, quick_holds):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"no_init": True, "exit": 1, "stderr": "error: unknown option '--strict-mcp-config'\n"}]})
+    assert run_step(flow_repo) == "stopped"
+    (raised,) = flow_repo.events(run, "hitl_raised")
+    summary = raised["summary"]
+    assert "--strict-mcp-config" in summary and "2.1.327" in summary
+    assert summary.index("lean: false") < summary.index("user_settings: true")
+
+
+def test_a_refused_flag_the_runner_does_not_own_points_at_base_args(flow_repo, quick_holds):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"no_init": True, "exit": 1, "stderr": "error: unknown option '--bogus'\n"}]})
+    assert run_step(flow_repo) == "stopped"
+    (raised,) = flow_repo.events(run, "hitl_raised")
+    summary = raised["summary"]
+    assert raised["kind"] == "blocked" and "--bogus" in summary and "base_args" in summary and "effort_arg" in summary
+    assert "user_settings" not in summary and "lean" not in summary
+
+
 def test_a_refused_flag_on_a_resumed_call_is_not_a_failed_resume(flow_repo, quick_holds):
     run = flow_repo.new_run()
     refused = {"no_init": True, "exit": 1, "stderr": "error: unknown option '--exclude-dynamic-system-prompt-sections'\n"}

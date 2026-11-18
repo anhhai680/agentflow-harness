@@ -179,6 +179,7 @@ PROMPT_PLACEHOLDERS = frozenset(
 )
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
                     "--dangerously-skip-permissions", "--permission-mode")
+RUNNER_FLAGS = ("--setting-sources",)  # set by the runner from `agents.claude.user_settings`, never by base_args
 PERMISSION_MODES = ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions")
 EXPECT_VALUES = ("red", "green")
 ON_FAIL_VALUES = ("block",)
@@ -1799,6 +1800,9 @@ class _Validator:
             for arg in agent.base_args:
                 if arg.split("=", 1)[0] in PERMISSION_FLAGS:
                     self.error(_join(path, "base_args"), f"'{arg}' is not allowed: tool rules come from .claude/settings*.json")
+                elif arg.split("=", 1)[0] in RUNNER_FLAGS:
+                    self.error(_join(path, "base_args"), f"'{arg}' is not allowed: the runner sets it from "
+                               "`agents.claude.user_settings`")
             if agent.permission_mode is not None and agent.permission_mode not in PERMISSION_MODES:
                 self.error(_join(path, "permission_mode"),
                            f"unknown permission_mode '{agent.permission_mode}': use one of {', '.join(PERMISSION_MODES)}")

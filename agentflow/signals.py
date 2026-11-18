@@ -39,10 +39,11 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   `cache_write_share` is the cache-write USD over all the USD of the run (0..1, 4 places; present only when the run
   has USD split by class), `prefix_write_tokens` the median tokens a fresh session wrote for its prefix (present when
   one did), `session_turns_p90:<kind>` the p90 of the turns of a step kind's sessions (present for a kind with turns)
-  and `tool_output_kchars:<kind>` its tool output per session in thousands of characters (present for the same kinds:
-  those with turns). The kind is `metrics.step_kind`, such as `build.implement`. `compactions` counts `compacted` events and
-  `usage_holds` the `run_held` events whose reason is `usage limit` (a CI or outage hold is not one); both are always
-  present. A run from before usage was recorded has none of the other four.
+  and `tool_output_kchars:<kind>` its tool output per session that reached the model (one with turns) in thousands of
+  characters (present for the same kinds: those with turns). The kind is `metrics.step_kind`, such as
+  `build.implement`. `compactions` counts `compacted` events and `usage_holds` the `run_held` events whose reason is
+  `usage limit` (a CI or outage hold is not one); both are always present. A run from before usage was recorded has
+  none of the other four.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
 
@@ -265,8 +266,8 @@ def _informed(ev: dict) -> bool:
 
 def _cost_signals(metrics: dict) -> dict[str, float]:
     """The cache write share of the run's USD, the median prefix write, and per step kind the p90 of its sessions'
-    turns and its tool output per session, all read from the metrics' splits. A key is absent for a run (or a kind)
-    with nothing to measure: a log from before usage was recorded, or a session that never reached a model."""
+    turns and its tool output per session that reached the model, all read from the metrics' splits. A key is absent
+    for a run (or a kind) with nothing to measure: a log from before usage was recorded, or a session that never reached a model."""
     out: dict[str, float] = {}
     split = metrics.get("usd_split") or {}
     total = sum(float(v or 0.0) for v in split.values())
@@ -277,9 +278,10 @@ def _cost_signals(metrics: dict) -> dict[str, float]:
     if prefixes:
         out["prefix_write_tokens"] = statistics.median(prefixes)
     for kind, row in kinds.items():
-        if row.get("turns") and row.get("sessions"):  # a kind with usage: a pre-usage row has sessions and no turns
+        if row.get("turns"):  # a kind with usage: a pre-usage row has sessions and no turns
             out[f"session_turns_p90:{kind}"] = _p90(row["turns"])
-            out[f"tool_output_kchars:{kind}"] = round(float(row.get("tool_output_chars") or 0) / row["sessions"] / 1000, 1)
+            # per session that reached the model (one `turns` entry each): a zero-turn session doesn't dilute it
+            out[f"tool_output_kchars:{kind}"] = round(float(row.get("tool_output_chars") or 0) / len(row["turns"]) / 1000, 1)
     return out
 
 

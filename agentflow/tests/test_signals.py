@@ -396,7 +396,7 @@ COST_METRICS = {
 def test_cost_signals_read_the_metrics_splits():
     s = run_signals([], COST_METRICS)
     assert s["cache_write_share"] == 0.58 and s["prefix_write_tokens"] == 25000
-    assert s["session_turns_p90:build.implement"] == 37 and s["tool_output_kchars:build.implement"] == 25.0
+    assert s["session_turns_p90:build.implement"] == 37 and s["tool_output_kchars:build.implement"] == 5.0
     assert "session_turns_p90:build.review" not in s and "session_turns_p90:build.size" not in s
     assert "tool_output_kchars:build.review" not in s  # a session with no usage has no measured tool output
     assert "tool_output_kchars:build.size" not in s
@@ -409,9 +409,16 @@ def test_a_kind_with_turns_but_no_tool_output_reads_zero():
     assert s["tool_output_kchars:build.review"] == 0.0 and s["session_turns_p90:build.review"] == 9
 
 
+def test_tool_output_is_per_session_that_reached_the_model():
+    metrics = {**EMPTY_METRICS, "by_step_kind": {
+        "build.implement": {"sessions": 3, "turns": [4, 6], "prefix_writes": [], "tool_output_chars": 6000}}}
+    s = run_signals([], metrics)
+    assert s["tool_output_kchars:build.implement"] == 3.0  # the zero-turn session doesn't dilute it to 2.0
+
+
 def test_cache_write_share_is_rounded_to_four_places_and_tool_output_to_one():
     metrics = {**EMPTY_METRICS, "usd_split": {"input": 1.0, "output": 0.0, "cache_read": 1.0, "cache_write": 1.0},
-               "by_step_kind": {"ship.fix": {"sessions": 3, "turns": [1], "prefix_writes": [], "tool_output_chars": 12345}}}
+               "by_step_kind": {"ship.fix": {"sessions": 3, "turns": [1, 1, 1], "prefix_writes": [], "tool_output_chars": 12345}}}
     s = run_signals([], metrics)
     assert s["cache_write_share"] == 0.3333 and s["tool_output_kchars:ship.fix"] == 4.1
     assert "prefix_write_tokens" not in s

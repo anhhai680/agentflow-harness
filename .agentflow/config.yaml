@@ -63,8 +63,6 @@ defaults:
   fix_attempts: 3              # gate failure: the same session is resumed with the gate output
   run_budget_usd: 25           # stop + checkpoint when the run's summed cost crosses it
   task_budget_usd: 1.0         # a feature run's budget grows to spend + this x unticked tasks + 25% of run_budget_usd
-  env:                         # for every agent session and gate of a run; values are strings
-    FORCE_PROMPT_CACHING_5M: "1"   # 5-minute cache writes cost 37.5% less than the 1-hour default; sessions rarely idle
 
 recovery:                       # a usage limit just waits for its reset; these bound everything else
   give_up_h: 24                 # an outage longer than this stops for a human

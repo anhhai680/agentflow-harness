@@ -2054,6 +2054,13 @@ def test_the_cache_keys_on_another_agent_are_a_warning(tmp_cfg, key, value):
     assert found is not None and found.level == "warning" and "only the claude agent" in found.message
 
 
+@pytest.mark.parametrize("args", [["--setting-sources", "user,project"], ["--setting-sources=user"]])
+def test_setting_sources_in_base_args_is_a_validate_error(tmp_cfg, args):
+    found = claude_issue(tmp_cfg, {"agents": {"claude": {"base_args": ["-p", *args]}}}, "agents.claude.base_args")
+    assert found is not None and found.level == "error" and "agents.claude.user_settings" in found.message
+    assert claude_issue(tmp_cfg, {"agents": {"claude": {"base_args": ["-p"]}}}, "agents.claude.base_args") is None
+
+
 def test_a_project_mcp_file_under_lean_is_a_warning(tmp_cfg):
     def write(root: Path) -> None:
         (root / ".mcp.json").write_text("{}", encoding="utf-8")

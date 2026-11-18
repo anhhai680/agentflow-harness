@@ -142,15 +142,18 @@ def claude_config_dir() -> Path:
     return Path(env) if env else Path.home() / ".claude"
 
 
-def _read_user_settings() -> dict:
-    """The user's Claude `settings.json` as a mapping. A missing, unreadable, oversize, symlinked, malformed or
-    non-mapping file is no settings (`{}`). This reads one file and runs no command."""
+def _read_user_settings() -> dict | None:
+    """The user's Claude `settings.json` as a mapping: `{}` when there is none, None when the file is there but was
+    not read (unreadable, oversize, symlinked, not a regular file, not JSON or not a mapping). This reads one file and
+    runs no command."""
     try:
         raw = safeio.read_bytes(claude_config_dir() / "settings.json", MAX_USER_SETTINGS_BYTES)
-        data = json.loads(raw) if raw is not None else None
+        if raw is None:
+            return {}
+        data = json.loads(raw)
     except (OSError, ValueError, RecursionError):  # SymlinkRefused is an OSError; JSON errors are ValueErrors
-        return {}
-    return data if isinstance(data, dict) else {}
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _user_settings_check(cfg: Config) -> Check | None:
@@ -162,6 +165,10 @@ def _user_settings_check(cfg: Config) -> Check | None:
         return None
     name = "claude user settings"
     data = _read_user_settings()
+    if data is None:  # never the path or a value: the user checks the file themselves
+        return Check(name, "ok", "runs skip your user Claude settings; the file was not read (a symlink, too large, not "
+                     "a file or not a JSON mapping), so check it yourself for "
+                     f"{', '.join(f'`{key}`' for key in USER_SETTINGS_RISK_KEYS)}: runs don't apply them")
     risky = [key for key in USER_SETTINGS_RISK_KEYS if key in data]
     if risky:
         return Check(name, "warn",

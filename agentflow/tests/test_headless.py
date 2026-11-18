@@ -9,7 +9,7 @@ import json
 import pytest
 
 from agentflow import lanes
-from agentflow.agents import RUNNER_ONLY_DENY
+from agentflow.agents import RUNNER_ONLY_DENY, AgentCall, ClaudeAgent
 from agentflow.layers import user_config_path
 from agentflow.config import ConfigError, Gate, Phase, Step, load_config, resolve_model
 from agentflow.pack import ENGINE_PROMPTS
@@ -99,9 +99,14 @@ def test_only_the_verify_step_runs_the_e2e_suite_through_the_runner_owned_stack(
     assert "web_e2e" not in {g.name for g in resolve(shipped, "verify")}
 
 
-def test_runs_use_their_own_postgres_port_and_the_short_cache(shipped):
+def test_runs_use_their_own_postgres_port_and_the_short_cache(shipped, tmp_path):
     assert shipped.defaults.env["POSTGRES_HOST_PORT"] != "5432"
-    assert shipped.defaults.env["FORCE_PROMPT_CACHING_5M"] == "1"
+    # the 5-minute cache comes from `agents.claude.cache_ttl`, not from the pack's `defaults.env`
+    assert shipped.agents["claude"].cache_ttl == "5m"
+    call = AgentCall(prompt="p", model="sonnet", effort="medium", cwd=tmp_path, run_id="r", step_key=KEY,
+                     result_path=tmp_path / "result.json", transcript_path=tmp_path / "t.jsonl", add_dirs=[],
+                     timeout_s=60)
+    assert ClaudeAgent(shipped.agents["claude"], shipped.context).env(call)["FORCE_PROMPT_CACHING_5M"] == "1"
 
 
 def test_recording_a_decision_runs_on_sonnet_and_planning_stays_on_opus(shipped):

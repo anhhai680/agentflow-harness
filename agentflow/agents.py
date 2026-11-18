@@ -916,8 +916,12 @@ class ClaudeAgent(_CliAgent):
         return argv
 
     def env(self, call: AgentCall) -> dict[str, str]:
+        """`cache_ttl` other than `cli` owns the TTL variables: the pack's `defaults.env` can't set another one."""
         spec = self.spec
-        return {**super().env(call), **TTL_ENV.get(spec.cache_ttl, {}), **(LEAN_ENV if spec.lean else {})}
+        env = super().env(call)
+        if spec.cache_ttl in TTL_ENV and spec.cache_ttl != "cli":
+            env = {name: value for name, value in env.items() if name not in TTL_VARS}
+        return {**env, **TTL_ENV.get(spec.cache_ttl, {}), **(LEAN_ENV if spec.lean else {})}
 
     def env_drop(self, call: AgentCall) -> tuple[str, ...]:
         """The TTL variables `cache_ttl` doesn't set, so the inherited environment can't override it (none for `cli`)."""

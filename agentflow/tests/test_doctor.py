@@ -351,23 +351,32 @@ def test_doctor_warns_about_an_api_key_helper_without_echoing_it(tmp_cfg, repo, 
     assert check.status == "warn" and "apiKeyHelper" in check.detail and "print-my-secret" not in check.detail
 
 
-@pytest.mark.parametrize("content", [None, "{not json", "[]", "SYMLINK", "x" * (300 * 1024), "null",
-                                     '{"enabledPlugins": [1, 2], "hooks": "nope"}',
+@pytest.mark.parametrize("content", [None, '{"enabledPlugins": [1, 2], "hooks": "nope"}',
                                      '{"enabledPlugins": {"a@x": "yes"}, "hooks": 3}'])
-def test_an_absent_or_unreadable_user_settings_file_is_ok(tmp_cfg, repo, _claude_config_dir, tmp_path, content):
-    if content == "SYMLINK":
-        target = tmp_path / "elsewhere.json"
-        target.write_text('{"env": {"A": "b"}}', encoding="utf-8")
-        (_claude_config_dir / "settings.json").symlink_to(target)
-    elif content is not None:
+def test_an_absent_or_odd_user_settings_file_is_ok(tmp_cfg, repo, _claude_config_dir, content):
+    if content is not None:
         _user_settings(_claude_config_dir, content)
     check = _checks(tmp_cfg, repo)["claude user settings"]
     assert check.status == "ok" and check.detail == "runs skip your user Claude settings"
 
 
-def test_a_directory_in_place_of_the_user_settings_file_is_ok(tmp_cfg, repo, _claude_config_dir):
-    (_claude_config_dir / "settings.json").mkdir()
-    assert _checks(tmp_cfg, repo)["claude user settings"].status == "ok"
+@pytest.mark.parametrize("content", ["{not json", "[]", "SYMLINK", "x" * (300 * 1024), "null", "DIRECTORY"])
+def test_an_unreadable_user_settings_file_is_ok_and_says_it_was_not_read(tmp_cfg, repo, _claude_config_dir, tmp_path,
+                                                                         content):
+    settings = _claude_config_dir / "settings.json"
+    if content == "SYMLINK":
+        target = tmp_path / "elsewhere.json"
+        target.write_text('{"env": {"A": "secret-b"}}', encoding="utf-8")
+        settings.symlink_to(target)
+    elif content == "DIRECTORY":
+        settings.mkdir()
+    else:
+        _user_settings(_claude_config_dir, content)
+    check = _checks(tmp_cfg, repo)["claude user settings"]
+    assert check.status == "ok" and "not read" in check.detail
+    assert all(key in check.detail for key in ("`env`", "`apiKeyHelper`", "`permissions`"))
+    assert str(_claude_config_dir) not in check.detail and "secret-b" not in check.detail
+    assert "elsewhere" not in check.detail
 
 
 def test_no_check_when_runs_keep_the_user_settings(tmp_cfg, repo, _claude_config_dir):

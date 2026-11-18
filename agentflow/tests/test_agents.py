@@ -316,6 +316,14 @@ def test_a_one_hour_cache_ttl_sets_its_variable_and_drops_the_others(cfg, call):
     assert set(agent.env_drop(call)) == {"FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_PROMPT_CACHE_TTL"}
 
 
+def test_the_cache_ttl_wins_over_the_packs_env(cfg, call):
+    call = dataclasses.replace(call, env={"FORCE_PROMPT_CACHING_5M": "1", "KEEP": "x"})
+    env = claude_with(cfg, cache_ttl="1h").env(call)
+    assert {name for name in TTL_VARS if name in env} == {"ENABLE_PROMPT_CACHING_1H"} and env["KEEP"] == "x"
+    env = claude_with(cfg, cache_ttl="cli").env(call)  # `cli`: nothing dropped, nothing added
+    assert {name: env[name] for name in TTL_VARS if name in env} == {"FORCE_PROMPT_CACHING_5M": "1"}
+
+
 def test_a_codex_call_drops_nothing_from_the_environment(codex, call):
     assert codex.env_drop(call) == ()
 
