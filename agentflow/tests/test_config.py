@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from agentflow import pack
-from agentflow.config import ConfigError, Evidence, Issue, load_config, parse_evidence, validate
+from agentflow.config import CACHE_TTLS, ConfigError, Evidence, Issue, load_config, parse_evidence, validate
 from agentflow.flow import main, repo_root
 from conftest import PYTHON_CONFIG, with_doubt
 
@@ -2020,3 +2020,59 @@ def test_a_profile_may_not_skip_a_group_that_holds_a_finish_ci_or_foreach_step(t
     found = issues_for(tmp_cfg, patch)
     messages = [i.message for i in found if i.level == "error" and i.path == "route.profiles.S.skip"]
     assert any(m.startswith("skipping ship/wrapped is refused") and text in m for m in messages), found
+
+
+def claude_issue(tmp_cfg, patch, path: str, prepare=None) -> Issue | None:
+    cfg_path = tmp_cfg(patch)
+    if prepare:
+        prepare(cfg_path.parent.parent)
+    return next((i for i in validate(load_config(cfg_path), cfg_path.parent.parent) if i.path == path), None)
+
+
+def test_claude_starts_on_the_five_minute_cache_lean_and_without_user_settings(tmp_cfg):
+    spec = load_config(tmp_cfg()).agents["claude"]
+    assert (spec.cache_ttl, spec.lean, spec.user_settings) == ("5m", True, False)
+    assert CACHE_TTLS == ("5m", "1h", "cli")
+
+
+def test_the_cache_keys_load_from_the_pack(tmp_cfg):
+    spec = load_config(tmp_cfg({"agents": {"claude": {"cache_ttl": "1h", "lean": False, "user_settings": True}}})).agents["claude"]
+    assert (spec.cache_ttl, spec.lean, spec.user_settings) == ("1h", False, True)
+    with pytest.raises(ConfigError, match=r"agents\.claude\.lean"):
+        load_config(tmp_cfg({"agents": {"claude": {"lean": "yes"}}}))
+
+
+def test_an_unknown_cache_ttl_is_a_validate_error(tmp_cfg):
+    found = claude_issue(tmp_cfg, {"agents": {"claude": {"cache_ttl": "10m"}}}, "agents.claude.cache_ttl")
+    assert found is not None and found.level == "error" and "5m" in found.message
+    assert claude_issue(tmp_cfg, {"agents": {"claude": {"cache_ttl": "1h"}}}, "agents.claude.cache_ttl") is None
+
+
+@pytest.mark.parametrize("key,value", [("cache_ttl", "1h"), ("lean", False), ("user_settings", True)])
+def test_the_cache_keys_on_another_agent_are_a_warning(tmp_cfg, key, value):
+    found = claude_issue(tmp_cfg, {"agents": {"codex": {key: value}}}, f"agents.codex.{key}")
+    assert found is not None and found.level == "warning" and "only the claude agent" in found.message
+
+
+def test_a_project_mcp_file_under_lean_is_a_warning(tmp_cfg):
+    def write(root: Path) -> None:
+        (root / ".mcp.json").write_text("{}", encoding="utf-8")
+
+    assert claude_issue(tmp_cfg, None, "agents.claude.lean") is None  # no `.mcp.json` yet
+    found = claude_issue(tmp_cfg, None, "agents.claude.lean", write)
+    assert found is not None and found.level == "warning" and "--mcp-config" in found.message
+    assert claude_issue(tmp_cfg, {"agents": {"claude": {"lean": False}}}, "agents.claude.lean", write) is None
+
+
+def test_a_review_agent_outside_the_project_is_a_warning_without_user_settings(tmp_cfg):
+    patch = {"overlays": {"security": {"review_agent": "auditor"}}}
+    found = claude_issue(tmp_cfg, patch, "overlays.security.review_agent")
+    assert found is not None and found.level == "warning" and "loads only the project's agents" in found.message
+
+    def add(root: Path) -> None:
+        (root / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
+        (root / ".claude" / "agents" / "auditor.md").write_text("x", encoding="utf-8")
+
+    assert claude_issue(tmp_cfg, patch, "overlays.security.review_agent", add) is None
+    both = {**patch, "agents": {"claude": {"user_settings": True}}}
+    assert claude_issue(tmp_cfg, both, "overlays.security.review_agent") is None

@@ -1111,3 +1111,20 @@ def test_route_profiles_are_protected(shipped):
     for added in ("route: {profiles: {S: {per_task_review: false}}}\n", "route: {lanes: [feature, bug]}\n"):
         with pytest.raises(Refused, match="protected"):
             config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)
+
+
+def test_the_form_sets_the_claude_cache_keys(shipped):
+    for key, value in ((["agents", "claude", "cache_ttl"], "1h"), (["agents", "claude", "lean"], False),
+                       (["agents", "claude", "user_settings"], True)):
+        config_edit.save(shipped, form(shipped, (key, value)))
+    spec = load_config(shipped).agents["claude"]
+    assert (spec.cache_ttl, spec.lean, spec.user_settings) == ("1h", False, True)
+    with pytest.raises(EditError):
+        form(shipped, (["agents", "claude", "cache_ttl"], "10m"))
+
+
+def test_the_codex_section_has_no_claude_cache_fields(shipped):
+    keys = {tuple(f["key"]) for s in config_edit.form_fields(shipped)["sections"] for f in s["fields"]}
+    assert ("agents", "claude", "lean") in keys and ("agents", "codex", "lean") not in keys
+    assert config_edit.AGENT_FREE_KEYS[-3:] == ("cache_ttl", "lean", "user_settings")
+    assert "cache_ttl, lean, user_settings" in " ".join(config_edit.PROTECTED)

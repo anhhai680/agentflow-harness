@@ -454,3 +454,17 @@ def test_a_pack_that_writes_phases_drops_the_default_route():
     own = L("project", {**high.data, "route": {"mode": "observe"}})
     merged, _ = merge([low, own])
     assert merged["route"] == {"mode": "observe"}  # the pack's own, with none of the default grid
+
+
+def test_the_user_file_may_set_claude_user_settings_only():
+    lower = pack_with_agents()
+    user = {"agents": {"claude": {"user_settings": True}}}
+    check_user(user, lower, USER_FILE)
+    merged, origins = merge([L("project", lower), L("user", user)])
+    assert merged["agents"]["claude"]["user_settings"] is True
+    assert origins[("agents", "claude", "user_settings")] == "user"
+    for key in ("agents.claude.cache_ttl", "agents.claude.lean", "agents.codex.user_settings"):
+        with pytest.raises(LayerError) as err:
+            check_user(nested(key), lower, USER_FILE)
+        assert err.value.path == f"{USER_FILE}: {key}"
+        assert err.value.message == "not a personal setting; set it in the pack"
