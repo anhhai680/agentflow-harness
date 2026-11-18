@@ -107,7 +107,7 @@ PAGE = Path(__file__).resolve().with_name("dashboard.html")
 UI_DIR = Path(__file__).resolve().with_name("dashboard_ui")
 # in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
 UI_SCRIPTS = ("core.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js",
-              "sessions.js", "inbox.js", "activity.js", "workflow.js", "agents.js", "metrics.js", "lessons.js", "settings.js", "main.js")
+              "sessions.js", "inbox.js", "activity.js", "workflow.js", "agents.js", "tokens.js", "metrics.js", "lessons.js", "settings.js", "main.js")
 UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024
 DEFAULT_DONE_SHOWN = 10  # how many Done cards the Board draws before "Show all"

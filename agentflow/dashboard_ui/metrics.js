@@ -155,6 +155,12 @@ function stepRows(steps) {
     el("td", {}, s.models.map((m) => el("span", { class: "chip", text: shortModel(m) })))));
 }
 
+// "Of cost on cache writes": only when the runs carry a token-class split (older runs have none).
+function cacheWriteKpi(split) {
+  const sum = split ? Object.values(split).reduce((a, b) => a + b, 0) : 0;
+  return sum > 0 ? [kpi(pct(split.cache_write || 0, sum) + "%", "of cost on cache writes", money(split.cache_write || 0) + " of " + money(sum))] : [];
+}
+
 function renderMetrics() {
   const data = metricsUi.data;
   if (!data) return;
@@ -171,7 +177,8 @@ function renderMetrics() {
     kpi(dur(t.wall_s.p90), "p90 run time"),
     kpi(t.rework_pct + "%", "of cost spent on rework", money(t.rework_cost_usd) + " on fix, re-review and refine rounds"),
     kpi(pct(t.buckets.human || 0, wall) + "%", "of time waiting on a human", dur(t.buckets.human)),
-    kpi(pct(t.buckets.down || 0, wall) + "%", "of time with no runner going", dur(t.buckets.down))));
+    kpi(pct(t.buckets.down || 0, wall) + "%", "of time with no runner going", dur(t.buckets.down)),
+    ...cacheWriteKpi(t.usd_split)));
   if (!t.runs) {
     body.push(el("p", { class: "muted", text: "No run started in this range." }));
     $("met-body").replaceChildren(...body);
@@ -191,6 +198,11 @@ function renderMetrics() {
     el("td", { text: m.phase }), el("td", { text: shortModel(m.model) }), el("td", { class: "num", text: m.sessions }),
     el("td", { class: "num", text: dur(m.agent_s) }), el("td", { class: "num", text: money(m.cost_usd) }),
     el("td", { class: "num", text: pct(m.cost_usd, phaseCost[m.phase]) + "%" }))), [2, 3, 4, 5]));
+  if (t.step_kinds && t.step_kinds.length) {
+    body.push(el("h2", { class: "lane", text: "Where the tokens go" }));
+    body.push(table(["Step kind", "Sessions", "Cost", "Cache writes", "Cache reads", "Output", "Turns p50 · p90", "Prefix write p50", "Tool output"],
+      tokenRows(t.step_kinds).map((cells) => el("tr", {}, ...cells.map((text, i) => el("td", { class: i ? "num" : "", text })))), [1, 2, 3, 4, 5, 6, 7, 8]));
+  }
   body.push(el("h2", { class: "lane", text: "Runs" }));
   const widest = Math.max(1, ...data.runs.map((r) => r.metrics.wall_s));
   body.push(table(["Started", "Run", "Work", "Status", "Time", "Time by bucket", "Cost", "Phases (time · cost · model·effort)"], data.runs.map((r) => {

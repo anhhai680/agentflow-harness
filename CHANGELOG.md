@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- The Metrics tab shows what share of cost went on cache writes, and a "Where the tokens go" table by step kind (sessions, cost by token class, turns p50 and p90, prefix write, tool-output size).
 - Six cost signals join the vocabulary a lesson can target (`cache_write_share`, `prefix_write_tokens`, `session_turns_p90:<kind>`, `tool_output_kchars:<kind>`, `compactions`, `usage_holds`), so `lessons`, `scorecard` and the retro digest see them; the scorecard's baseline for them starts at the next `agentflow scorecard --freeze`.
 - Run metrics split a run's cost by token class (`usd_split`, `tokens`) and by step kind (`by_step_kind`: sessions, cost, turns, prefix writes and tool-output size per kind such as `build.implement`), and `aggregate` adds `usd_split` and `step_kinds` with the median and p90 over every run's sessions. A run from before `usage` shows empty splits.
 - The run state keeps the latest `usage_window` per window (`usage_window`), and a run notes once per setting, in a `cli_setting_ignored` event and `cli_settings_ignored`, when the Claude CLI did not honour `cache_ttl` (the writes landed in the other lifetime) or `lean` (auto-memory was still on). The run goes on.
