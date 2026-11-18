@@ -758,6 +758,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             forbidden_paths=[*self.cfg.guardrails.forbidden_paths, *sr.step.forbid],
             idle_s=idle_s,
             tool_idle_s=tool_idle_s,
+            usage_windows=dict(self.run.state.get("usage_window") or {}),
         )
 
     def context_window_for(self, key: str, model: str) -> int | None:
