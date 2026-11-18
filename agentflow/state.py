@@ -296,6 +296,9 @@ def _on_agent_started(state: dict, ev: dict) -> None:
             row["session_id"] = session
         if not sizing:
             row["sized"] = True
+            # The session's pinned brief (`lanes.build_brief`), on every call: a shared session's later task carries it
+            # on. A call with none (a session from before the brief, Codex, `run_brief` off) leaves None.
+            row["brief"] = ev["brief"] if isinstance(ev.get("brief"), dict) else None
 
 
 def _on_run_held(state: dict, ev: dict) -> None:
@@ -880,6 +883,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "code_noted": ("text", "key"),
     "agent_started": (("session_id", "pid"),),
     "agent_session": ("session_id",),
+    "brief_replaced": ("key", "reason"),
     "context_window": ("model", "tokens"),
     "usage_window": ("window",),
     "cli_setting_ignored": ("setting",),

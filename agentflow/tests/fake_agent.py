@@ -4,7 +4,8 @@
 `AGENTFLOW_FAKE_SCRIPT` names a JSON file `{step_key: [act, ...]}`; each run consumes the next
 act for its `AGENTFLOW_STEP` (the cursor is kept in `<script>.cursor`). A step key with no acts
 left writes `{"status": "done", "summary": "ok"}`. Every run appends `{argv, env, stdin_devnull,
-step}` to the file named by `AGENTFLOW_FAKE_CALLS`.
+step, system_prompt}` to the file named by `AGENTFLOW_FAKE_CALLS`; `system_prompt` is the text of the file
+`--append-system-prompt-file` names (the run brief), or None when there is no such flag (or no such file).
 
 Act keys: write {relpath: text}, result {...}, result_raw str, usage_pct [..], tool_calls
 [{name, input}], subagents [{subagent_type, model}], compact bool, git_commit msg, sleep s,
@@ -46,6 +47,17 @@ def flag_value(argv: list[str], flag: str) -> str | None:
         if index + 1 < len(argv):
             return argv[index + 1]
     return None
+
+
+def system_prompt(argv: list[str]) -> str | None:
+    """The text of the file `--append-system-prompt-file` names, read as Claude would, or None."""
+    path = flag_value(argv, "--append-system-prompt-file")
+    if path is None:
+        return None
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
 
 
 def stdin_is_devnull() -> bool:
@@ -137,6 +149,7 @@ def main() -> int:
             },
             "stdin_devnull": stdin_is_devnull(),
             "step": step,
+            "system_prompt": system_prompt(argv),
         }
         with open(calls_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")

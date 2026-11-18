@@ -1141,7 +1141,8 @@ def test_a_continuation_in_a_fresh_session_still_gets_the_skill(flow_repo, monke
     assert run_step(flow_repo, step, extra={"task_title": "Task 2: B", "task_text": "do b"}) == "done"
     for call in flow_repo.calls():
         assert "--resume" not in call["argv"]
-        assert "Rules with {module}" in call["argv"][-1]  # no session holds the text yet, so it is sent
+        assert "Rules with {module}" in call["system_prompt"]  # no session holds the text yet, so it is sent (in its brief)
+        assert "its full text is in your system prompt" in call["argv"][-1]
 
 
 def test_task_briefs_do_not_suppress_the_skill_text(flow_repo, monkeypatch, tmp_path):
@@ -1675,13 +1676,15 @@ OLD_PREAMBLE_C2 = (ENGINE / "tests" / "fixtures" / "old_prompts" / "_preamble_c2
 def test_step_head_follows_the_preamble(flow_repo):
     run = flow_repo.new_run()
     assert run_step(flow_repo) == "done"
-    prompt = flow_repo.calls()[0]["argv"][-1]
+    call = flow_repo.calls()[0]
+    prompt, system = call["argv"][-1], call["system_prompt"]  # the preamble and the result contract are in the brief
     result = run.agent_result_path(KEY)
     template = "Goal: do the step `impl`"  # the first line of the default template
-    order = [prompt.index("Nobody can answer you"), prompt.index(f"## Step `{make_step().id}`"),
-             prompt.index(f"Your result file is `{result}`"), prompt.index(template), prompt.index("## When you finish")]
-    assert order == sorted(order) and len(set(order)) == 5
-    assert "{in_brief}" not in prompt and "the step's prompt names it" in prompt
+    assert system.index("Nobody can answer you") < system.index("## When you finish")
+    order = [prompt.index(f"## Step `{make_step().id}`"), prompt.index(f"Your result file is `{result}`"),
+             prompt.index(template)]
+    assert order == sorted(order) and len(set(order)) == 3 and prompt.startswith(f"## Step `{make_step().id}`")
+    assert "{in_brief}" not in prompt and "the step's prompt names it" in system
 
 
 SLOT_HEADINGS = ("## What this run already found", "## Code this run has mapped", lessons.LESSONS_HEADING)
@@ -1731,3 +1734,277 @@ def test_the_continue_prompt_names_the_result_file(flow_repo):
     assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
     prompt = flow_repo.calls()[0]["argv"][-1]
     assert f"`{run.agent_result_path(KEY)}`" in prompt and "write your result JSON to" in prompt
+
+
+# --------------------------------------------------------------------------- the run brief (C2)
+
+MDS = "CLAUDE_CODE_DISABLE_CLAUDE_MDS"
+FLAG = "--append-system-prompt-file"
+STUB_SKILL = "Stub: the test-driven-development skill."
+
+
+def brief_path(call: dict) -> str | None:
+    argv = call["argv"]
+    return argv[argv.index(FLAG) + 1] if FLAG in argv else None
+
+
+def pins(flow_repo, run) -> list:
+    return [e.get("brief") for e in flow_repo.events(run, "agent_started") if not e.get("sizer")]
+
+
+def test_brief_holds_the_stable_text_and_the_prompt_does_not(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", MDS)
+    run = flow_repo.new_run()
+    base = brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n"})
+    assert run_step(flow_repo) == "done"
+    (call,) = flow_repo.calls()
+    system, prompt = call["system_prompt"], call["argv"][-1]
+    for stable in ("RULE-MARKER", "Nobody can answer you", "## When you finish", STUB_SKILL):
+        assert stable in system and stable not in prompt, stable
+    assert f"`{base[:12]}`" in system  # the rules are the fork commit's
+    assert "## Step `impl`" in prompt and f"`{run.agent_result_path(KEY)}`" in prompt
+    assert "Use the `test-driven-development` skill: its full text is in your system prompt" in prompt
+    (pin,) = pins(flow_repo, run)
+    assert {k: pin[k] for k in ("rules", "skill", "files", "phase", "role")} == {
+        "rules": True, "skill": True, "files": False, "phase": "build", "role": "build"}
+    assert brief_path(call) == pin["path"] and os.path.dirname(pin["path"]) == str(run.dir / "brief")
+    assert os.path.basename(pin["path"]) == f"build-build-{pin['sha256'][:12]}.md"
+    assert call["env"][MDS] == "1"
+    assert run.state["steps"][KEY]["brief"] == pin
+
+
+def _gate_flips(flow_repo, executor, monkeypatch, run_brief: bool) -> None:
+    """After the first call, `context.run_brief` becomes `run_brief` in the live config, before the fix resumes."""
+    real = executor._failed_gates
+
+    def failed(sr):
+        flow_repo.cfg.context.run_brief = run_brief
+        return real(sr)
+
+    monkeypatch.setattr(executor, "_failed_gates", failed)
+
+
+def test_a_fix_keeps_the_pinned_brief_when_run_brief_turns_off(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    flow_repo.configure({"gates": {"flaky": {"run": "test -f fixed.txt"}}})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    flow_repo.script({KEY: [{"result": DONE}, {"write": {"fixed.txt": "ok\n"}, "result": DONE}]})
+    executor = flow_repo.executor(run)
+    _gate_flips(flow_repo, executor, monkeypatch, False)
+    assert run_step(flow_repo, make_step(gates=["flaky"], fix_loop=True), executor=executor) == "done"
+    first, fix = flow_repo.calls()
+    assert ("--resume", session_of(flow_repo, run)) in pairs(fix["argv"])
+    assert brief_path(fix) == brief_path(first) is not None and fix["system_prompt"] == first["system_prompt"]
+    assert pins(flow_repo, run)[0] == pins(flow_repo, run)[1] is not None
+
+
+def test_a_session_without_a_brief_never_gains_one(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    flow_repo.configure({"gates": {"flaky": {"run": "test -f fixed.txt"}}, "context": {"run_brief": False}})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    flow_repo.script({KEY: [{"result": DONE}, {"result": {"status": "blocked", "summary": "stuck"}},
+                            {"write": {"fixed.txt": "ok\n"}, "result": DONE}]})
+    executor = flow_repo.executor(run)
+    _gate_flips(flow_repo, executor, monkeypatch, True)
+    step = make_step(gates=["flaky"], fix_loop=True)
+    assert run_step(flow_repo, step, executor=executor) == "stopped"
+    from agentflow.hitl import approve
+
+    approve(run, KEY, by="me")
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"  # a restart, with the key on
+    calls = flow_repo.calls()
+    assert len(calls) == 3 and all("--resume" in c["argv"] for c in calls[1:])
+    assert [brief_path(c) for c in calls] == [None, None, None] and [c["system_prompt"] for c in calls] == [None] * 3
+    assert "Nobody can answer you" in calls[0]["argv"][-1]
+    assert pins(flow_repo, run) == [None, None, None]
+
+
+def test_every_direct_resume_passes_the_pinned_brief(flow_repo):
+    from conftest import brief_ready
+
+    flow_repo.configure({"gates": {"flaky": {"run": "test -f fixed.txt"}}})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    flow_repo.script({KEY: [{"result": {"status": "effort_change", "effort": "high", "reason": "big"}},  # effort change
+                            {},  # no result: a reminder follows
+                            {"result": DONE},  # the gate fails: a fix follows
+                            {"write": {"fixed.txt": "ok\n"}, "result": DONE}]})
+    assert run_step(flow_repo, make_step(gates=["flaky"], fix_loop=True)) == "done"
+    calls = flow_repo.calls()
+    assert len(calls) == 4 and all("--resume" in c["argv"] for c in calls[1:])
+    assert "was refused" in calls[1]["argv"][-1] and "no valid result.json" in calls[2]["argv"][-1]
+    assert "The gates failed" in calls[3]["argv"][-1]
+    assert len({brief_path(c) for c in calls}) == 1 and brief_path(calls[0]) is not None
+    assert len({c["system_prompt"] for c in calls}) == 1
+    assert len({json.dumps(p, sort_keys=True) for p in pins(flow_repo, run)}) == 1
+
+
+def _crash_after_first_call(flow_repo, run, step, monkeypatch) -> None:
+    """Run `step` until its first call has returned, then the runner dies (an exception before the result is read)."""
+    executor = flow_repo.executor(run)
+
+    def died(sr):
+        raise RuntimeError("the runner died")
+
+    monkeypatch.setattr(executor, "_read_result", died)
+    with pytest.raises(RuntimeError):
+        run_step(flow_repo, step, executor=executor)
+    assert run.refresh()["steps"][KEY]["status"] == "running"
+
+
+def test_a_restart_and_an_approval_resume_with_the_brief_pinned_in_state(flow_repo, monkeypatch):
+    from agentflow.hitl import approve
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n"})
+    flow_repo.script({KEY: [{"result": DONE}, {"result": {"status": "blocked", "summary": "stuck"}},
+                            {"result": DONE}]})
+    step = make_step()
+    _crash_after_first_call(flow_repo, run, step, monkeypatch)
+    pin = run.state["steps"][KEY]["brief"]
+    os.unlink(pin["path"])  # gone before the resume: rebuilt from the fork commit
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "stopped"  # restarted: it says blocked
+    approve(run, KEY, by="me")
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"
+    calls = flow_repo.calls()
+    assert len(calls) == 3 and all(("--resume", session_of(flow_repo, run)) in pairs(c["argv"]) for c in calls[1:])
+    assert {brief_path(c) for c in calls} == {pin["path"]}
+    assert len({c["system_prompt"] for c in calls}) == 1 and "RULE-MARKER" in calls[0]["system_prompt"]
+    assert pins(flow_repo, run) == [pin, pin, pin]
+    assert os.path.isfile(pin["path"]) and not flow_repo.events(run, "brief_replaced")
+
+
+def test_a_brief_that_cannot_be_rebuilt_to_its_pin_starts_a_fresh_session(flow_repo, monkeypatch):
+    from agentflow import brief
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    step = make_step()
+    _crash_after_first_call(flow_repo, run, step, monkeypatch)
+    old = run.state["steps"][KEY]["brief"]
+    real = lanes.build_brief
+
+    def changed(*args, **kwargs):
+        built = real(*args, **kwargs)
+        if isinstance(built, str):
+            return built
+        text, pin = built
+        text += "An engine upgrade changed this.\n"
+        name = brief.file_name(pin["phase"], pin["role"], text)
+        return text, {**pin, "sha256": brief.digest(text), "path": os.path.join(os.path.dirname(pin["path"]), name)}
+
+    monkeypatch.setattr(lanes, "build_brief", changed)
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"
+    first, resumed = flow_repo.calls()
+    assert "--resume" not in resumed["argv"]  # a fresh session, never a stop `retry` can't clear
+    assert "a fresh session" in resumed["argv"][-1]
+    (replaced,) = flow_repo.events(run, "brief_replaced")
+    assert replaced["key"] == KEY and replaced["reason"]
+    new = pins(flow_repo, run)[-1]
+    assert new["sha256"] != old["sha256"] and brief_path(resumed) == new["path"]
+    assert resumed["system_prompt"].endswith("An engine upgrade changed this.\n")
+    assert run.state["steps"][KEY]["brief"] == new
+
+
+def test_brief_never_holds_step_values(flow_repo, monkeypatch):
+    from agentflow import lessons as lessons_mod
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    mark = ["LESSON-ONE"]
+    monkeypatch.setattr(lanes, "_lessons", lambda *a: lessons_mod.Selection(mark[0], (), (), "d"))
+    executor = flow_repo.executor(run)
+    one, two = make_step(id="impl"), make_step(id="second")
+    assert executor.run_agent_step(make_phase(one), one, "build/impl") == "done"
+    mark[0] = "LESSON-TWO"
+    run.emit("run_fact", text="FACT-MARKER", key="build/impl")
+    run.emit("code_noted", text="src/a.py:1 `f`: MAP-MARKER", key="build/impl")
+    assert flow_repo.executor(run).run_agent_step(make_phase(two), two, "build/second") == "done"
+    first, second = flow_repo.calls()
+    assert first["system_prompt"] == second["system_prompt"] and brief_path(first) == brief_path(second)
+    assert "FACT-MARKER" in second["argv"][-1] and "LESSON-TWO" in second["argv"][-1]
+    for value in ("FACT-MARKER", "MAP-MARKER", "LESSON-ONE", "LESSON-TWO", "## Step", "`impl`", "`second`",
+                  str(run.agent_result_path("build/impl")), str(run.agent_result_path("build/second"))):
+        assert value not in first["system_prompt"], value
+
+
+@pytest.mark.parametrize("why", ["override", "oserror"])
+def test_brief_skipped_falls_back_to_the_full_prompt(flow_repo, monkeypatch, why):
+    from agentflow import safeio
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    if why == "override":
+        own = (ENGINE / "prompts" / "_result.md").read_text(encoding="utf-8") + "\nThe file is `{result_file}`.\n"
+        (flow_repo.cfg.path.parent / "prompts" / "_result.md").write_text(own, encoding="utf-8")
+        brief_ready(flow_repo, run, {".agentflow/prompts/_result.md": own})
+        reason = "prompt override holds {result_file}"
+    else:
+        brief_ready(flow_repo, run)
+        real = safeio.replace_file
+
+        def refuse(path, data):
+            if os.path.basename(os.path.dirname(path)) == "brief":
+                raise OSError("disk full")
+            return real(path, data)
+
+        monkeypatch.setattr(safeio, "replace_file", refuse)
+        reason = "disk full"
+    assert run_step(flow_repo) == "done"
+    (call,) = flow_repo.calls()
+    (started,) = flow_repo.events(run, "agent_started")
+    assert started["brief"] is None and reason in started["brief_skipped"]
+    assert "Nobody can answer you" in call["argv"][-1] and f"`{run.agent_result_path(KEY)}`" in call["argv"][-1]
+    assert "## When you finish" in call["argv"][-1]
+    assert FLAG not in call["argv"] and call["system_prompt"] is None
+    assert run.state["steps"][KEY]["brief"] is None
+
+
+def test_rules_fall_back_when_memory_blocks(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", MDS)
+    monkeypatch.setenv(MDS, "1")  # inherited: it must not reach the session, which then loads CLAUDE.md itself
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n\n@AGENTS.md\n", "AGENTS.md": "imported\n"})
+    assert run_step(flow_repo) == "done"
+    (call,) = flow_repo.calls()
+    assert call["system_prompt"] is not None and "Nobody can answer you" in call["system_prompt"]
+    assert "RULE-MARKER" not in call["system_prompt"] and "agent rules" not in call["system_prompt"]
+    (pin,) = pins(flow_repo, run)
+    assert pin["rules"] is False and pin["rules_fallback"]
+    assert MDS not in call["env"]
+
+
+def test_no_brief_for_codex_sizers_and_dry_run(flow_repo):
+    from conftest import brief_ready
+
+    flow_repo.configure({"effort": {"sizing": True}, "agents": {"codex": {"enabled": True}}})
+    flow_repo.script({f"{KEY}/size": [{"final_text": json.dumps({"answers": {}, "reason": "r"})}]})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    assert run_step(flow_repo) == "done"
+    sizer, work = flow_repo.calls()
+    assert sizer["step"] == f"{KEY}/size" and FLAG not in sizer["argv"] and sizer["system_prompt"] is None
+    assert FLAG in work["argv"]
+    step = make_step()
+    codex = flow_repo.executor(run).dry_agent_argv(make_phase(step, agent="codex"), step, KEY)
+    assert codex[0] == "codex" and FLAG not in codex
+
+    dry = flow_repo.new_run()
+    brief_ready(flow_repo, dry)
+    out = io.StringIO()
+    assert run_step(flow_repo, executor=flow_repo.executor(dry, dry_run=True, out=out)) == "skipped"
+    assert FLAG in out.getvalue() and str(dry.dir / "brief") in out.getvalue()
+    assert not (dry.dir / "brief").exists()
+    argv = flow_repo.executor(dry).dry_agent_argv(make_phase(step), step, KEY)
+    assert FLAG in argv and not (dry.dir / "brief").exists()

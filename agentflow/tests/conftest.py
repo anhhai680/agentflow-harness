@@ -386,6 +386,28 @@ def land_on_origin(flow_repo: FlowRepo, tmp_path: Path, files: dict[str, str], f
         run_git(flow_repo.root, "fetch", "-q", "origin")
 
 
+def brief_ready(flow_repo: FlowRepo, run, files: dict[str, str] | None = None) -> str:
+    """Make `run`'s brief readable at a commit, as a real run's fork commit is: replace the `.claude/skills` symlink
+    (to a folder outside the repository) with a real copy of its target, write `files` ({path: text}), commit all of it
+    (`.agentflow/` too) and record that commit as the run's `base_sha`. Returns the commit."""
+    skills = flow_repo.root / ".claude" / "skills"
+    if skills.is_symlink():
+        target = skills.resolve()
+        skills.unlink()
+        shutil.copytree(target, skills)
+    for rel, text in (files or {}).items():
+        path = flow_repo.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    run_git(flow_repo.root, "add", "-A")
+    for rel in files or {}:
+        run_git(flow_repo.root, "add", "-f", rel)
+    run_git(flow_repo.root, "commit", "-q", "--allow-empty", "-m", "brief sources")
+    sha = run_git(flow_repo.root, "rev-parse", "HEAD").strip()
+    run.emit("run_updated", base_sha=sha)
+    return sha
+
+
 @pytest.fixture
 def flow_repo(tmp_path: Path, fake: FakeAgent, tmp_cfg: Callable[..., Path], monkeypatch: pytest.MonkeyPatch) -> FlowRepo:
     origin = tmp_path / "origin.git"

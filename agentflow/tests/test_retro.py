@@ -578,6 +578,16 @@ def test_the_session_reads_the_digest_and_is_told_it_is_data(flow_repo, gh_log):
     assert "agentflow-retro" in prompt and "Change no file" in prompt
 
 
+def test_retro_session_has_no_brief(flow_repo, gh_log):
+    _two_runs_failing(flow_repo, "unit")
+    out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    (call,) = flow_repo.calls()
+    assert "--append-system-prompt-file" not in call["argv"] and call["system_prompt"] is None
+    run = _run(flow_repo, out)
+    assert [e.get("brief") for e in run.events.read() if e["type"] == "agent_started"] == [None]
+    assert not (run.dir / "brief").exists()
+
+
 def test_nothing_proposed_finishes_without_a_pr(flow_repo, gh_log):
     _two_runs_failing(flow_repo, "unit")
     flow_repo.fake.script({KEY: [_retro_result()]})

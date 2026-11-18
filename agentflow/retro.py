@@ -1061,7 +1061,7 @@ class _Retro:
         header, current, base_bytes = found
         shared, tree = git_state(worktree, branch), tree_state(worktree)
 
-        executor = Executor(cfg, run, make_agents(cfg), _ctx(cfg, run, worktree), {})
+        executor = Executor(cfg, run, make_agents(cfg), _ctx(cfg, run, worktree), {}, briefs=False)  # no run brief
         plain = Phase(name=RETRO_PIPELINE, agent=None, model=None, skip_if=None, steps=[])
         if executor.run_agent_step(plain, self.step, KEY, role=self.step.role,
                                    size=False) != "done":

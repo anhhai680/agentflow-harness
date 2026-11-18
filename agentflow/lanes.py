@@ -24,18 +24,19 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, TextIO
 
+from agentflow import brief as brief_mod
 from agentflow import lessons as lessons_mod
-from agentflow import doubt, overlays, pack, run_env, sizing, verification, workspace
+from agentflow import doubt, gitops, overlays, pack, run_env, safeio, sizing, verification, workspace
 from agentflow.agents import CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption, ignored_settings
 from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
 from agentflow.commit_checks import RUNNER_COMMITS, runner_head
 from agentflow.conditions import Ctx, fmt, skill_text
-from agentflow.config import Config, Phase, Step, resolve_model
+from agentflow.config import BRIEF_PLACEHOLDERS, Config, Phase, Step, resolve_model
 from agentflow.feature_lane import FeatureLane
 from agentflow.flow_control import (
     StepControl,
@@ -86,6 +87,15 @@ EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n
 SKILL_LINE = re.compile(r"\b([Uu])se the `([\w.:-]+)` skill")
 SKILL_HEADING = re.compile(r"#{1,6}[ \t]+.*`\{skill\}`")
 SKILL_BLOCK = ("## The `{skill}` skill\n\nIts full text follows, so you already have it: do not load it.\n\n{brief}")
+SKILL_POINTER_BLOCK = "## The `{skill}` skill\n\n{brief}"  # the skill is in the session's brief: `{brief}` points there
+PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+BRIEF_DIR = "brief"  # under the run's directory (the runs root, which no agent edits): `<phase>-<role>-<digest12>.md`
+BRIEF_FLAGS = ("rules", "skill", "files")
+BRIEF_REASON_MAX = 300
+BRIEF_LEAD = ("This is a fresh session: the runner could not give this step's earlier session its brief again. "
+              "Continue the step from `{progress}` and `{handoff}`: read them first, check the work tree, and do not "
+              "redo finished work.")
 RESUMABLE = ("running", "waiting_human")
 UNSTARTED_STEP = (None, "pending")
 FOOTER = re.compile(r"^\s*Next:\s*`?([\w.:/-]+)`?\s+(?:—|–|--?)\s", re.MULTILINE)
@@ -230,13 +240,43 @@ def _drop_skill_section(body: str, keep: bool = False) -> str:
     return "\n".join(kept).rstrip()
 
 
-def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode: Mode) -> str:
+def _inlined_skill(cfg: Config, step: Step, checkout: Path, body: str) -> str | None:
+    """The text of the step's skill when its prompt carries it, else None: a step with no configured `brief:` whose
+    skill resolves has the skill's text as its brief. Not when the template (`body`) names a skill of the repository
+    itself without a `{brief}` slot (a pack's own wording, which tells the agent to load it). A bundled skill is never
+    loadable by name, so it is always carried. Whether the step continues a session that has the text is the caller's
+    to check: a session's brief holds the skill whatever the task."""
+    if not step.skill or step.brief:
+        return None
+    found = pack.skill_file(checkout, cfg.project.skills_dir, step.skill)
+    owned = found is not None and not pack.is_bundled(found) and f"`{step.skill}` skill" in body
+    if "{brief}" in body or not owned:
+        return skill_text(cfg, checkout, step.skill)
+    return None
+
+
+def _brief_pointer(skill: str | None, files: bool) -> str:
+    """What stands at `{brief}` for the text a session's brief holds: the skill named, the `brief:` files, or both."""
+    if skill and files:
+        return (f"The `{skill}` skill's full text and the step's brief files are in your system prompt: follow them, "
+                "do not load them.")
+    if skill:
+        return f"The `{skill}` skill's full text is in your system prompt: follow it, do not load it."
+    return "The step's brief files are in your system prompt: follow them, do not load them."
+
+
+def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode: Mode,
+                 brief: dict | None = None) -> str:
     """`_preamble.md` + `_step_head.md` + the step's template (after the refine template in a refine round) +
     `_result.md`.
 
     The preamble's effort check is always stripped (a pack's own `_preamble.md` copy may still hold it): the
     runner sizes every step before it starts. Placeholders are filled in one pass over the joined text, so
     values that hold braces go in verbatim.
+
+    With `brief` (the session's pin, `build_brief`), the preamble and `_result.md` are in the session's system prompt
+    and are left out, and so are the skill and the `brief:` files when the pin says the brief holds them: `{brief}`
+    then points there. `step.task_brief` always stays in the prompt.
     """
     values = _values(cfg, step, ctx, {})
     preamble = EFFORT_BLOCK.sub("", _template(cfg, PREAMBLE))
@@ -251,35 +291,39 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     step_head = _template(cfg, STEP_HEAD)
     step_head = EMPTY_SLOT.sub(lambda m: "" if not values[m.group(1)] else m.group(0), step_head)
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
-    files = list(dict.fromkeys([*step.brief, *step.task_brief]))
-    # A step with no configured `brief:` whose skill resolves has the skill's text as its brief, and its first
-    # prompt carries it. Not a continuation (its session has the text) and not a template that names a skill of
-    # the repository itself without a `{brief}` slot (a pack's own wording, which tells the agent to load it).
-    # A bundled skill is never loadable by name, so it is always inlined.
-    skill_brief = None
-    if step.skill and not step.brief and not step.continuation:
-        found = pack.skill_file(ctx.repo, cfg.project.skills_dir, step.skill)
-        owned = found is not None and not pack.is_bundled(found) and f"`{step.skill}` skill" in body
-        if "{brief}" in body or not owned:
-            skill_brief = skill_text(cfg, ctx.repo, step.skill)
+    # The first prompt of a session carries the skill (`_inlined_skill`), a continuation not: its session has the text.
+    inlined = None if step.continuation else _inlined_skill(cfg, step, ctx.repo, body)
+    in_system = inlined is not None and bool(brief and brief.get("skill"))  # the session's brief holds the skill
+    files_in_system = bool(brief and brief.get("files") and step.brief)  # ... or its `brief:` files
+    skill_brief = None if in_system else inlined
+    files = list(dict.fromkeys([*([] if files_in_system else step.brief), *step.task_brief]))
     briefs = [skill_brief] if skill_brief is not None else []
     briefs.extend((ctx.repo / name).read_text(encoding="utf-8") for name in files)
-    if skill_brief is not None and "{brief}" not in body:
-        body = f"{body}\n\n{SKILL_BLOCK}"
+    pointer = (_brief_pointer(step.skill if in_system else None, files_in_system)
+               if in_system or files_in_system else "")
+    if "{brief}" not in body:
+        if skill_brief is not None:
+            body = f"{body}\n\n{SKILL_BLOCK}"
+        elif in_system:
+            body = f"{body}\n\n{SKILL_POINTER_BLOCK}"
     if not step.skill:  # no skill to name in a `## The `{skill}` skill` heading
-        body = _drop_skill_section(body, keep=bool(briefs))
-    elif step.continuation and not briefs:  # the session already holds the skill's text: no empty section for it
+        body = _drop_skill_section(body, keep=bool(briefs or pointer))
+    elif step.continuation and not briefs and not pointer:  # the session holds the skill's text: no empty section
         body = _drop_skill_section(body)
     if step.skill and f"`{step.skill}` skill" not in body:
-        line = (f"Use the `{step.skill}` skill: its full text is in this prompt, so do not load it."
-                if skill_brief is not None else f"Use the `{step.skill}` skill.")
+        if skill_brief is not None:
+            line = f"Use the `{step.skill}` skill: its full text is in this prompt, so do not load it."
+        elif in_system:
+            line = f"Use the `{step.skill}` skill: its full text is in your system prompt, so do not load it."
+        else:
+            line = f"Use the `{step.skill}` skill."
         body = f"{line}\n\n{body}"
     extra_skills = overlays.skill_lines(cfg, ctx, str(rec.get("role") or step.role or DEFAULT_ROLE), body)
     if extra_skills:
         body = f"{body}\n\n{extra_skills}"
     if extra.get("gate_evidence") and "{gate_evidence}" not in body:  # a `gates_first` template that has no slot
         body = f"{body}\n\n{{gate_evidence}}"
-    values["brief"] = "\n\n".join(briefs)
+    values["brief"] = "\n\n".join([pointer, *briefs] if pointer else briefs)
     values["skill"] = step.skill or ""
     values["base_ref"] = ctx.base_ref
     values["earlier_findings"] = ""
@@ -296,12 +340,130 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
         values.update(_refine_values(ctx, rec))
     values["in_brief"] = ""
     values.update({name: str(value) for name, value in extra.items()})
-    text = "\n\n".join(part.strip() for part in (preamble, step_head, body, _template(cfg, RESULT)))
+    parts = (step_head, body) if brief else (preamble, step_head, body, _template(cfg, RESULT))
+    text = "\n\n".join(part.strip() for part in parts)
     agent = cfg.agents.get(rec.get("agent") or cfg.defaults.agent)
     if agent is not None and agent.skill_loading == "read_file":
-        text = _read_file_skills(text, cfg.project.skills_dir,
-                                 frozenset({step.skill}) if skill_brief is not None and step.skill else frozenset())
+        carried = (skill_brief is not None or in_system) and step.skill
+        text = _read_file_skills(text, cfg.project.skills_dir, frozenset({step.skill}) if carried else frozenset())
     return fmt(text, values) + "\n"
+
+
+# --------------------------------------------------------------------------- the run brief
+
+
+def build_brief(cfg: Config, run: Run, phase_name: str, step: Step, role: str, body: str,
+                values: dict[str, str]) -> tuple[str, dict] | str:
+    """The run brief of a fresh session of `step` (`brief.py`): `(text, pin)`, or why it has none.
+
+    Everything taken from the repository is read in the main checkout at the run's fork commit (`state.base_sha`),
+    through `gitops.read_blob`, never from a working tree: the rules (`project.agent_rules`), a pack override of
+    `_preamble.md` or `_result.md` (`.agentflow/prompts/<name>`), the repository's skill and the step's `brief:` files.
+    The engine's prompts and bundled skills come from the engine's files. `body` (the step's template) decides only
+    whether the skill is carried (`_inlined_skill`), and `values` fill only `config.BRIEF_PLACEHOLDERS`, so two steps of
+    a phase and role get the same brief. The pin is `{path, sha256, rules, skill, files, phase, role}`, plus
+    `rules_fallback` (why) when the rules are not carried and Claude loads its own memory files."""
+    try:
+        return _assemble_brief(cfg, run, phase_name, step, role, body, values)
+    except (OSError, ValueError, UnicodeError) as exc:
+        return f"the brief could not be built: {exc}"[:BRIEF_REASON_MAX]
+
+
+def _assemble_brief(cfg: Config, run: Run, phase_name: str, step: Step, role: str, body: str,
+                 values: dict[str, str]) -> tuple[str, dict] | str:
+    checkout = pack.checkout_root(run.repo)
+    raw = run.state.get("base_sha")
+    base = raw if isinstance(raw, str) and FULL_SHA.fullmatch(raw) else None
+    listing: list[list[str] | None] = []
+
+    def tree() -> list[str] | None:  # the proven listing at `base`, read at most once
+        if not listing:
+            listing.append(gitops.verified_tree_paths(checkout, base) if base else None)
+        return listing[0]
+
+    partials: dict[str, str] = {}
+    for name in (PREAMBLE, RESULT):
+        text = _brief_partial(cfg, checkout, base, name)
+        if text is None:
+            return "prompt override not at base_sha"
+        partials[name] = text
+    preamble = PREAMBLE_SLOT.sub("", EFFORT_BLOCK.sub("", partials[PREAMBLE]))
+    result = partials[RESULT]
+    for text in (preamble, result):
+        outside = [name for name in PLACEHOLDER.findall(text) if name not in BRIEF_PLACEHOLDERS]
+        if outside:
+            return f"prompt override holds {{{outside[0]}}}"
+    fill = {name: str(values[name]) for name in BRIEF_PLACEHOLDERS if name in values}
+
+    rules, carries = brief_mod.read_rules(checkout, base, cfg.project.agent_rules)
+    docs: list[brief_mod.Doc] = []
+    skill_in = files_in = False
+    if step.skill and _inlined_skill(cfg, step, checkout, body) is not None:
+        owned = _repo_skill(cfg, checkout, base, step.skill, tree)
+        found = (brief_mod.read_skill(checkout, base, cfg.project.skills_dir, step.skill, owned)
+                 if owned is not None else None)
+        if found is not None:  # else the skill stays in the prompt, as without a brief
+            docs.append(found)
+            skill_in = True
+    if step.brief:
+        found_files = brief_mod.read_brief_files(checkout, base, step.brief)
+        if found_files is not None:  # else they stay in the prompt
+            docs.extend(found_files)
+            files_in = True
+    text = brief_mod.render(rules=rules, base_sha=base or "", preamble=fmt(preamble, fill), skill=docs,
+                            result=fmt(result, fill))
+    if len(text) > brief_mod.BRIEF_MAX_CHARS:
+        return f"brief over {brief_mod.BRIEF_MAX_CHARS} chars"
+    pin: dict = {"path": str(run.dir / BRIEF_DIR / brief_mod.file_name(phase_name, role, text)),
+                 "sha256": brief_mod.digest(text), "rules": carries, "skill": skill_in, "files": files_in,
+                 "phase": phase_name, "role": role}
+    if not carries:
+        pin["rules_fallback"] = _rules_fallback(cfg, base, tree)
+    return text, pin
+
+
+def _brief_partial(cfg: Config, checkout: Path, base: str | None, name: str) -> str | None:
+    """`_preamble.md` or `_result.md` for a brief: the pack's override as the fork commit holds it (None when it holds
+    none it can read), else the engine's own. A live pack prompt is never read."""
+    own = Path(cfg.path).parent / "prompts" / name
+    if pack.prompt_path(Path(cfg.path), name) == own:
+        data = gitops.read_blob(checkout, base, f".agentflow/prompts/{name}", brief_mod.BRIEF_FILE_MAX_BYTES) \
+            if base else None
+        return None if data is None else data.decode("utf-8").replace("\r\n", "\n")
+    return (pack.ENGINE_PROMPTS / name).read_text(encoding="utf-8")
+
+
+def _repo_skill(cfg: Config, checkout: Path, base: str | None, name: str, tree) -> bool | None:
+    """Whether skill `name` is the repository's own, from the fork commit's proven tree (None when that can't be
+    proven: the skill then stays in the prompt). With no fork commit the brief carries no repository skill, so a
+    skill the checkout has that the engine does not bundle reads as the repository's (and is left out)."""
+    if base is None:
+        found = pack.skill_file(checkout, cfg.project.skills_dir, name)
+        return found is not None and not pack.is_bundled(found)
+    listed = tree()
+    if listed is None:
+        return None
+    return "/".join((*PurePosixPath(cfg.project.skills_dir).parts, name, "SKILL.md")) in listed
+
+
+def _rules_fallback(cfg: Config, base: str | None, tree) -> str:
+    """Why `read_rules` did not carry the rules, as far as the runner can tell without reading them again."""
+    if base is None:
+        return "no base_sha"
+    if not cfg.project.agent_rules:
+        return "project.agent_rules is empty"
+    if tree() is None:
+        return "the tree at base_sha could not be proven"
+    return "a memory file the brief cannot carry, or a rules file that cannot be read at base_sha"
+
+
+def _pin(value: object) -> dict | None:
+    """A recorded pin, or None (no brief, or a session from before the brief)."""
+    return value if isinstance(value, dict) else None
+
+
+def _same_flags(a: dict, b: dict) -> bool:
+    return all(bool(a.get(flag)) == bool(b.get(flag)) for flag in BRIEF_FLAGS)
 
 
 # --------------------------------------------------------------------------- executor state
@@ -317,9 +479,10 @@ class _Turn:
 
 @dataclass
 class _Called:
-    outcome: AgentOutcome
+    outcome: AgentOutcome | None  # None only with `brief_error`: no agent was called
     after: str
     refused: list[Violation] = dataclasses.field(default_factory=list)  # found before the tree could be read safely
+    brief_error: str | None = None  # the session's pinned brief could not be given to the call (`_ensure_brief`)
 
 
 @dataclass
@@ -350,6 +513,11 @@ class _StepRun:
     agent_failures: int = 0
     down_since: float | None = None
     reconcile_base: dict | None = None  # a reconcile step's `gitops.reconcile_baseline`, the checks compare against it
+    brief: dict | None = None  # the session's pinned brief (`build_brief`); None: the session has none
+    brief_text: str | None = None  # its text, kept in memory; None after a restart until `_ensure_brief` rebuilds it
+    brief_skipped: str | None = None  # why the fresh session was refused one (`agent_started.brief_skipped`)
+    brief_refused: str | None = None  # a fresh session's brief failed at the call: the next fresh one goes without
+    dry: bool = False  # `dry_agent_argv`: the brief is built but never written
 
 
 def _mtime(path: Path) -> float | None:
@@ -420,6 +588,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         overrides: dict[str, str],
         dry_run: bool = False,
         out: TextIO = sys.stdout,
+        briefs: bool = True,
     ) -> None:
         self.cfg = cfg
         self.run = run
@@ -430,6 +599,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         self.overrides = overrides
         self.dry_run = dry_run
         self.out = out
+        self.briefs = briefs  # the retro's session gets none
+        self._brief_texts: dict[str, tuple[str, dict]] = {}  # by digest: what this executor wrote, for shared sessions
 
     @property
     def worktree(self) -> Path:
@@ -528,13 +699,17 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                                   and reopened.get("reason") == "review") or (mode == "refine" and session)):
             self.escalate_effort(sr, "review")  # a review sent the step back to its session
             sr.effort = sizing.floor(sr.effort, judgement, self.cfg.effort.allowed)
+        # A resumed session keeps the brief it started with (its pin in state), whatever the config says now.
         if resuming and session:
+            self._load_pin(sr, rec.get("brief"))
             turn = _Turn(self._continue_prompt(sr, _answers(since, key), _approved(since, key)), session)
         elif mode == "refine" and session:
+            self._load_pin(sr, rec.get("brief"))
             turn = _Turn(self._prompt(sr, resume=session), session)
         elif takes_shared:
             sr.session = shared["session_id"]
             sr.effort = sizing.floor(shared.get("effort") or sr.effort, judgement, self.cfg.effort.allowed)
+            self._load_pin(sr, shared.get("brief"))
             turn = _Turn(self._prompt(sr, resume=sr.session), sr.session)
         else:
             turn = _Turn(self._prompt(sr), None)
@@ -614,7 +789,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         sr = _StepRun(
             phase=phase, step=step, key=key, mode="first", role=role, agent_name=agent_name, agent=agent,
             model=model, effort=effort, extra=self._step_extra(key, extra), session=None,
-            agent_profile=overlays.agent_profile(self.cfg, step),
+            agent_profile=overlays.agent_profile(self.cfg, step), dry=True,
         )
         turn = _Turn(self._prompt(sr), None)
         return agent.argv(self._agent_call(sr, turn, attempt=1))
@@ -638,9 +813,12 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 return self._stop(sr, "budget_exceeded", f"The run has spent ${spend:.2f} of its ${budget:.2f} {which}.")
 
             called = self._call(sr, turn)
+            if called.brief_error is not None:  # no agent ran: the session can't have its brief, so a fresh one starts
+                turn = self._replace_brief(sr, turn, called.brief_error)
+                continue
             if self.run.refresh()["status"] in TERMINAL:
                 return "stopped"  # cancelled while the agent ran: nothing more is called or recorded
-            outcome = called.outcome
+            outcome = called.outcome  # set whenever `brief_error` is not
             if called.refused:  # the git state changed: nothing that reads the tree has run, and nothing may
                 return self._fail(sr, called.refused)
             violations = check_step(self.cfg, self.worktree, sr.start_head, sr.start_tree, called.after,
@@ -769,6 +947,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             idle_s=idle_s,
             tool_idle_s=tool_idle_s,
             usage_windows=dict(self.run.state.get("usage_window") or {}),
+            # Every call of a session with a brief passes it, the resumes too (fix, reminder, continue, effort change).
+            system_prompt_file=Path(str(sr.brief.get("path"))) if sr.brief is not None else None,
+            carries_rules=bool(sr.brief is not None and sr.brief.get("rules") is True),
         )
 
     def context_window_for(self, key: str, model: str) -> int | None:
@@ -782,6 +963,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         return None
 
     def _call(self, sr: _StepRun, turn: _Turn) -> _Called:
+        missing = self._ensure_brief(sr)  # right before the call: the file the CLI reads is the pinned text
+        if missing is not None:
+            return _Called(None, "", brief_error=missing)
         workspace.prepare(self.run)  # fresh copies of the inputs; whatever the agent left there is replaced
         workspace.clear_result(self.run, sr.key)  # a stale result must never count
         attempt = (self.run.state["steps"].get(sr.key) or {}).get("attempts", 0) + 1
@@ -793,6 +977,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if name == "agent_started":
                 seen["pid"] = data.get("pid")
                 data.update(sizing=False, phase=sr.phase.name, role=sr.role)  # a sizer's own call says True
+                data["brief"] = sr.brief  # on every call, so a shared session's later task carries the pin on
+                if turn.resume is None and sr.brief_skipped:
+                    data["brief_skipped"] = sr.brief_skipped
             elif name == "agent_session":
                 seen["model"] = data.get("model")
                 data.update(key=sr.key, pid=seen["pid"])
@@ -1139,8 +1326,101 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         A fresh session (the first turn, a rollover, a refine round whose session is gone)
         holds nothing yet, so it is never built as a continuation: the skill's text goes in again."""
         step = sr.step if resume else dataclasses.replace(sr.step, continuation=False)
-        prompt = build_prompt(self.cfg, step, self.ctx, self._rec(sr), sr.extra, sr.mode)
+        if resume is None:  # decided before the prompt is built: the prompt leaves out what the brief holds
+            self._decide_brief(sr)
+        prompt = build_prompt(self.cfg, step, self.ctx, self._rec(sr), sr.extra, sr.mode, brief=sr.brief)
         return f"{sr.lead}\n\n{prompt}" if sr.lead else prompt
+
+    # -- the run brief
+
+    def _decide_brief(self, sr: _StepRun) -> None:
+        """A fresh session's brief: built and written (`sr.brief`, `sr.brief_text`) when this executor gives briefs,
+        `context.run_brief` is on and the agent takes one; a brief that can't be built or written gives none, and
+        the reason goes on the call's `agent_started` (`sr.brief_skipped`). A dry run builds it and writes nothing."""
+        sr.brief = sr.brief_text = sr.brief_skipped = None
+        if not (self.briefs and self.cfg.context.run_brief and getattr(sr.agent, "takes_brief", False)):
+            return
+        if sr.brief_refused:
+            sr.brief_skipped = sr.brief_refused
+            return
+        built = self._build_brief(sr, sr.phase.name, sr.role)
+        if isinstance(built, str):
+            sr.brief_skipped = built
+            return
+        text, pin = built
+        if not (self.dry_run or sr.dry):
+            why = self._write_brief(pin, text)
+            if why:
+                sr.brief_skipped = why
+                return
+        sr.brief, sr.brief_text = pin, text
+        self._brief_texts[pin["sha256"]] = (text, pin)
+
+    def _build_brief(self, sr: _StepRun, phase_name: str, role: str) -> tuple[str, dict] | str:
+        try:
+            body = _template(self.cfg, sr.step.prompt or DEFAULT_TEMPLATE).strip()
+        except (OSError, UnicodeError) as exc:
+            return f"the step's template could not be read: {exc}"[:BRIEF_REASON_MAX]
+        return build_brief(self.cfg, self.run, phase_name, sr.step, role, body, self._values(sr))
+
+    def _write_brief(self, pin: dict, text: str) -> str | None:
+        """Write the brief file afresh (whatever is at its path is replaced, never followed); why it failed, or None."""
+        try:
+            safeio.ensure_dir(self.run.dir / BRIEF_DIR)
+            safeio.replace_file(Path(str(pin["path"])), text.encode("utf-8"))
+        except OSError as exc:
+            return f"the brief file could not be written: {exc}"[:BRIEF_REASON_MAX]
+        return None
+
+    def _load_pin(self, sr: _StepRun, value: object) -> None:
+        """A resumed session's pin, from state; its text when this executor wrote it, else rebuilt before the call."""
+        sr.brief = _pin(value)
+        cached = self._brief_texts.get(str(sr.brief.get("sha256"))) if sr.brief is not None else None
+        sr.brief_text = cached[0] if cached is not None and _same_flags(cached[1], sr.brief) else None
+
+    def _ensure_brief(self, sr: _StepRun) -> str | None:
+        """Before every call of a session with a pin: the pinned file holds exactly the pinned text. The text is the
+        one kept in memory, or after a restart `build_brief` run again for the pinned phase and role; it must have the
+        pinned digest and flags, and the pinned path must be this run's brief file named by that digest. Why the call
+        can't have it, or None."""
+        pin = sr.brief
+        if pin is None:
+            return None
+        try:
+            phase, role, sha = str(pin["phase"]), str(pin["role"]), str(pin["sha256"])
+            path = Path(str(pin["path"]))
+        except (KeyError, TypeError, ValueError):
+            return "the pinned brief is malformed"
+        text = sr.brief_text
+        if text is None:
+            built = self._build_brief(sr, phase, role)
+            if isinstance(built, str):
+                return f"the brief could not be rebuilt: {built}"[:BRIEF_REASON_MAX]
+            text, rebuilt = built
+            if not _same_flags(rebuilt, pin):
+                return "the rebuilt brief does not hold what its pin says"
+        if brief_mod.digest(text) != sha:
+            return "the brief does not match its pinned digest"
+        if path != self.run.dir / BRIEF_DIR / brief_mod.file_name(phase, role, text):
+            return "the pinned path is not this run's brief file"
+        why = self._write_brief(pin, text)
+        if why:
+            return why
+        sr.brief_text = text
+        self._brief_texts[sha] = (text, pin)
+        return None
+
+    def _replace_brief(self, sr: _StepRun, turn: _Turn, why: str) -> _Turn:
+        """The session's brief can't be given to its next call (a template changed between a shared session's tasks,
+        an engine upgrade, a tampered file): a fresh session, which records a new pin, as `_rollover` does. A fresh
+        session whose own brief failed this way goes on without one, so this never loops."""
+        self.run.emit("brief_replaced", key=sr.key, reason=why, session_id=turn.resume)
+        if turn.resume is None:
+            sr.brief_refused = why
+        sr.session = None
+        values = self._values(sr)
+        lead = BRIEF_LEAD.format(progress=values["progress"], handoff=values["handoff"])
+        return _Turn(f"{lead}\n\n{self._prompt(sr)}", None)
 
     def _result_partial(self, sr: _StepRun) -> str:
         """What a resume turn ends with: the reminder, which names the result file, then the result contract."""
