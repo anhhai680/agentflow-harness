@@ -49,6 +49,8 @@ def test_a_step_is_sized_before_its_work_session(flow_repo):
     assert ("--model", "haiku") in pairs(sizer["argv"]) and ("--effort", "low") in pairs(sizer["argv"])
     assert ("--max-turns", "8") in pairs(sizer["argv"]) and ("--tools", "Read,Grep,Glob") in pairs(sizer["argv"])
     assert ("--effort", "low") in pairs(work["argv"]) and "--tools" not in work["argv"]
+    # the sizer's brief is self-contained: no skills listing; the work session keeps it
+    assert "--disable-slash-commands" in sizer["argv"] and "--disable-slash-commands" not in work["argv"]
     decided = flow_repo.events(run, "effort_decided")[0]
     assert (decided["key"], decided["level"], decided["source"]) == (KEY, "low", "sizer")
     assert decided["answers"] == ANSWERS | {"mechanical": "yes"} and decided["reason"] == "r"

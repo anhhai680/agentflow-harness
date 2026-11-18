@@ -37,7 +37,7 @@ from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from agentflow import layers
 from agentflow.config import (
-    KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ROUTE_MODES, ConfigError, Issue, load_config, validate,
+    CACHE_TTLS, KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ROUTE_MODES, ConfigError, Issue, load_config, validate,
 )
 from agentflow.layers import PHASE_FREE_KEYS
 
@@ -45,7 +45,7 @@ __all__ = ["Conflict", "EditError", "Proposal", "Refused", "form_fields", "propo
 
 MAX_TEXT = 512 * 1024
 MERGE_TAG = "tag:yaml.org,2002:merge"
-AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices")  # what a page may change in an `agents.<name>` block
+AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices", "cache_ttl", "lean", "user_settings")  # what a page may change in an `agents.<name>` block
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
     "version", "engine", "gates", "gates_confirmed", "gate_sets", "guardrails", "conditions", "overlays", "project",
     "phase_approval", "record_step", "resolve_step", "retro_step", "paths", "defaults.env", "defaults.env_inherit", "context.autocompact_env", "context.progress_file",
@@ -54,7 +54,7 @@ _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and p
 )
 PROTECTED = (
     *_PROTECTED_KEYS,
-    "agents.<name> (all but enabled, models, max_turns, prices)",
+    "agents.<name> (all but enabled, models, max_turns, prices, cache_ttl, lean, user_settings)",
     "phases.<name> (all but needs_approval, resolve, model, agent)",
 )
 _LOCK = threading.Lock()
@@ -282,12 +282,20 @@ def _catalog(raw: dict) -> list[dict]:
     for name, spec in (raw.get("agents") or {}).items():
         if not isinstance(spec, dict):
             continue
-        sections.append({"title": f"Agent: {name}", "note": "Models by role and the turn limit for every session "
-                         "on this agent. Its command line is protected.", "fields": [
+        fields = [
             {"key": ["agents", name, "enabled"], "label": "Enabled", "kind": "bool"},
             {"key": ["agents", name, "models"], "label": "Model by role", "kind": "map", "value_kind": "text"},
             {"key": ["agents", name, "max_turns"], "label": "Max turns", "kind": "int", "min": 1},
-        ]})
+        ]
+        if name == "claude":  # the cache and session keys are read by the claude agent alone
+            fields += [
+                {"key": ["agents", name, "cache_ttl"], "label": "Prompt-cache lifetime", "kind": "enum",
+                 "options": list(CACHE_TTLS)},
+                {"key": ["agents", name, "lean"], "label": "Lean sessions (no project MCP servers)", "kind": "bool"},
+                {"key": ["agents", name, "user_settings"], "label": "Read my own settings and agents", "kind": "bool"},
+            ]
+        sections.append({"title": f"Agent: {name}", "note": "Models by role and the turn limit for every session "
+                         "on this agent. Its command line is protected.", "fields": fields})
     phase_fields = []
     for name, phase in (raw.get("phases") or {}).items():
         if not isinstance(phase, dict):

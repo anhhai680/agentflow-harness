@@ -71,7 +71,7 @@ def test_stops_and_plain_counters():
 
 def test_a_run_with_nothing_to_report_has_only_the_always_present_counts():
     assert run_signals([], EMPTY_METRICS) == {"ci_rounds": 0, "rollovers": 0, "progress_not_updated": 0, "rework_pct": 0,
-                                              "gate_reruns": 0}
+                                              "gate_reruns": 0, "compactions": 0, "usage_holds": 0}
 
 
 def test_a_run_with_a_gate_failure_but_no_ci_rounds_reports_zero_ci_rounds():
@@ -91,7 +91,7 @@ def test_open_parameter_counts_stay_absent_and_count_families_are_lower_is_bette
     out = run_signals([], EMPTY_METRICS)
     assert not [k for k in out if k.split(":")[0] in ("guard_trips", "permission_denied", "stop")]
     assert COUNT_FAMILIES <= set(FAMILIES) and all(FAMILIES[f][0] == "lower" for f in COUNT_FAMILIES)
-    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 17
+    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 19
 
 
 def test_cost_per_task_divides_by_the_steps_that_called_an_agent():
@@ -121,7 +121,8 @@ def test_signals_survive_events_without_the_new_fields():
     evs = [_ev("guard_tripped", key="build/x"), _ev("review_result", key="build/x"), _ev("hitl_raised", key="build/x"),
            _ev("phase_rejected", by="human")]
     assert run_signals(evs, EMPTY_METRICS) == {"ci_rounds": 0, "rollovers": 0, "progress_not_updated": 0, "rework_pct": 0,
-                                           "review_blocking:build": 0, "gate_reruns": 0}
+                                           "review_blocking:build": 0, "gate_reruns": 0, "compactions": 0,
+                                           "usage_holds": 0}
 
 
 def test_parse_target_accepts_only_the_vocabulary():
@@ -134,7 +135,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 33
+    assert len(FAMILIES) == 39
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -378,3 +379,77 @@ def test_route_upgrades_counts_upgrades():
     assert "route_upgrades" not in run_signals([], EMPTY_METRICS)
     assert FAMILIES["route_upgrades"] == ("lower", False) and "route_upgrades" in COUNT_FAMILIES
     assert parse_target("route_upgrades") == ("route_upgrades", None)
+
+
+COST_METRICS = {
+    **EMPTY_METRICS,
+    "usd_split": {"input": 0.05, "output": 0.15, "cache_read": 0.22, "cache_write": 0.58},
+    "by_step_kind": {
+        "build.implement": {"sessions": 2, "turns": [1] * 3 + [37] * 7, "prefix_writes": [25000, 20000, 30000],
+                            "tool_output_chars": 50000},
+        "build.review": {"sessions": 1, "turns": [], "prefix_writes": [], "tool_output_chars": 0},
+        "build.size": {"sessions": 0, "turns": [], "prefix_writes": [], "tool_output_chars": 0},
+    },
+}
+
+
+def test_cost_signals_read_the_metrics_splits():
+    s = run_signals([], COST_METRICS)
+    assert s["cache_write_share"] == 0.58 and s["prefix_write_tokens"] == 25000
+    assert s["session_turns_p90:build.implement"] == 37 and s["tool_output_kchars:build.implement"] == 5.0
+    assert "session_turns_p90:build.review" not in s and "session_turns_p90:build.size" not in s
+    assert "tool_output_kchars:build.review" not in s  # a session with no usage has no measured tool output
+    assert "tool_output_kchars:build.size" not in s
+
+
+def test_a_kind_with_turns_but_no_tool_output_reads_zero():
+    metrics = {**EMPTY_METRICS, "by_step_kind": {
+        "build.review": {"sessions": 2, "turns": [5, 9], "prefix_writes": [], "tool_output_chars": 0}}}
+    s = run_signals([], metrics)
+    assert s["tool_output_kchars:build.review"] == 0.0 and s["session_turns_p90:build.review"] == 9
+
+
+def test_tool_output_is_per_session_that_reached_the_model():
+    metrics = {**EMPTY_METRICS, "by_step_kind": {
+        "build.implement": {"sessions": 3, "turns": [4, 6], "prefix_writes": [], "tool_output_chars": 6000}}}
+    s = run_signals([], metrics)
+    assert s["tool_output_kchars:build.implement"] == 3.0  # the zero-turn session doesn't dilute it to 2.0
+
+
+def test_cache_write_share_is_rounded_to_four_places_and_tool_output_to_one():
+    metrics = {**EMPTY_METRICS, "usd_split": {"input": 1.0, "output": 0.0, "cache_read": 1.0, "cache_write": 1.0},
+               "by_step_kind": {"ship.fix": {"sessions": 3, "turns": [1, 1, 1], "prefix_writes": [], "tool_output_chars": 12345}}}
+    s = run_signals([], metrics)
+    assert s["cache_write_share"] == 0.3333 and s["tool_output_kchars:ship.fix"] == 4.1
+    assert "prefix_write_tokens" not in s
+
+
+def test_compactions_and_usage_holds_are_always_counted():
+    empty = run_signals([], {"phases": []})
+    assert (empty["compactions"], empty["usage_holds"]) == (0, 0)
+    evs = [_ev("compacted", key="build/x"), _ev("run_held", key="build/x", reason="usage limit"),
+           _ev("run_held", key="ship/ci", reason="ci_pending"), _ev("run_held", key="build/x", reason="outage")]
+    s = run_signals(evs, EMPTY_METRICS)
+    assert (s["compactions"], s["usage_holds"]) == (1, 1)
+
+
+def test_a_run_with_no_usage_has_no_cost_share():
+    metrics = {**EMPTY_METRICS, "usd_split": dict.fromkeys(("input", "output", "cache_read", "cache_write"), 0.0),
+               "by_step_kind": {"build.implement": {"sessions": 1, "turns": [], "prefix_writes": [], "tool_output_chars": 0}}}
+    for m in (metrics, EMPTY_METRICS):
+        s = run_signals([], m)
+        assert "cache_write_share" not in s and "prefix_write_tokens" not in s
+        assert not [k for k in s if k.startswith(("session_turns_p90", "tool_output_kchars"))]
+
+
+def test_the_new_families_are_targets_and_lower_is_better():
+    assert parse_target("session_turns_p90:build.review") == ("session_turns_p90", "build.review")
+    assert parse_target("tool_output_kchars:build.implement") == ("tool_output_kchars", "build.implement")
+    assert parse_target("session_turns_p90") is None and parse_target("compactions:x") is None
+    assert parse_target("cache_write_share") == ("cache_write_share", None)
+    assert parse_target("usage_holds") == ("usage_holds", None) and parse_target("prefix_write_tokens") is not None
+    for family in ("cache_write_share", "prefix_write_tokens", "compactions", "usage_holds"):
+        assert FAMILIES[family] == ("lower", False)
+    assert FAMILIES["session_turns_p90"] == ("lower", True) and FAMILIES["tool_output_kchars"] == ("lower", True)
+    assert {"compactions", "usage_holds"} <= COUNT_FAMILIES
+    assert not {"cache_write_share", "prefix_write_tokens", "session_turns_p90"} & COUNT_FAMILIES

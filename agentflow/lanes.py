@@ -29,7 +29,7 @@ from typing import Literal, TextIO
 
 from agentflow import lessons as lessons_mod
 from agentflow import doubt, overlays, pack, run_env, sizing, verification, workspace
-from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
+from agentflow.agents import CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption, ignored_settings
 from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
@@ -639,6 +639,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 violations = [*violations, *self._outside_output(sr)]
             if violations:
                 return self._fail(sr, violations)
+            if outcome.interruption is not None and outcome.interruption.kind == "cli_flags":
+                return self._stop(sr, "blocked", self._refused_flag_summary(sr, outcome.interruption.detail))
             if outcome.resume_failed:
                 if sr.mode == "refine" and turn.resume:
                     turn = self._fresh_refine(sr, turn.resume)
@@ -756,6 +758,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             forbidden_paths=[*self.cfg.guardrails.forbidden_paths, *sr.step.forbid],
             idle_s=idle_s,
             tool_idle_s=tool_idle_s,
+            usage_windows=dict(self.run.state.get("usage_window") or {}),
         )
 
     def context_window_for(self, key: str, model: str) -> int | None:
@@ -790,6 +793,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         if turn.resume is None:
             self._record_lessons(sr, turn)
         outcome = sr.agent.run(call, on_event)
+        self._note_ignored_settings(sr, outcome)
         sr.session = outcome.session_id or turn.resume or sr.session
         window = outcome.context_window
         if window:  # cached under the stream's model id and the alias, so the next call finds it either way
@@ -810,6 +814,16 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if planted:
                 return _Called(outcome, sr.start_tree, planted)
         return _Called(outcome, snapshot(self.worktree))
+
+    def _note_ignored_settings(self, sr: _StepRun, outcome: AgentOutcome) -> None:
+        """Say once per run (`cli_setting_ignored`) when the CLI did not honour `cache_ttl` or `lean`. Only a Claude
+        run call is checked; the run goes on."""
+        spec = self.cfg.agents.get(sr.agent_name)
+        if sr.agent_name != "claude" or spec is None:
+            return
+        for setting in ignored_settings(spec, outcome.usage):
+            if setting not in self.run.state["cli_settings_ignored"]:
+                self.run.emit("cli_setting_ignored", key=sr.key, setting=setting, agent=sr.agent_name)
 
     def _record_lessons(self, sr: _StepRun, turn: _Turn) -> None:
         """A fresh session's prompt carries the lessons: record which ones (and their digest), and which a size
@@ -1012,6 +1026,25 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         """The run already said it passed this soft budget: a soft limit notifies once per value, and plan sizing
         raising it is a new value."""
         return any(e["type"] == "budget_soft_reached" and e.get("soft_usd") == soft for e in self.run.events.read())
+
+    @staticmethod
+    def _refused_flag_summary(sr: _StepRun, flag: str | None) -> str:
+        """The CLI refused a flag before the session started: name it and the way out. No retry fixes it. A flag the
+        runner passes means a CLI too old for it, so the key that drops it comes first and the other key second (the
+        same CLI refuses that one next); any other flag came from the pack's own args."""
+        prefix = f"agents.{sr.agent_name}"
+        start = f"The `{sr.agent_name}` CLI refused the flag `{flag}` before the session started"
+        user_settings = f"`{prefix}.user_settings: true` (the pack or your user file) drops `{NO_USER_SETTINGS[0]}`"
+        lean = f"`{prefix}.lean: false` drops {' and '.join(f'`{arg}`' for arg in LEAN_ARGS)}"
+        if flag in LEAN_ARGS:
+            first, second = lean, user_settings
+        elif flag == NO_USER_SETTINGS[0]:
+            first, second = user_settings, lean
+        else:
+            return (f"{start}, and the runner doesn't pass it on its own: check `{prefix}.base_args` and "
+                    f"`{prefix}.effort_arg` for it, and whether this version of the CLI takes it.")
+        return (f"{start}: run sessions need Claude Code {CLAUDE_MIN_VERSION} or later. Update the CLI, or turn the "
+                f"flag off: {first}, and {second}.")
 
     def _stop(self, sr: _StepRun, kind: str, summary: str, extra: str = "") -> Outcome:
         raise_hitl(self.cfg, self.run, kind, sr.key, summary, extra=extra)

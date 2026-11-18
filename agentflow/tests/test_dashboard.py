@@ -457,6 +457,12 @@ def test_every_ui_file_is_listed():
     assert UI_SCRIPTS[0] == "core.js" and UI_SCRIPTS[-1] == "main.js"
 
 
+def test_tokens_loads_before_the_metrics_tab_and_reads_no_dom():
+    assert UI_SCRIPTS.index("tokens.js") + 1 == UI_SCRIPTS.index("metrics.js")
+    tokens = (UI_DIR / "tokens.js").read_text(encoding="utf-8")
+    assert "document" not in tokens and "innerHTML" not in tokens
+
+
 def test_markdown_loads_before_the_run_page():
     assert UI_SCRIPTS.index("markdown.js") < UI_SCRIPTS.index("run.js")
     assert UI_SCRIPTS.index("markdown.js") == UI_SCRIPTS.index("dialogs.js") + 1

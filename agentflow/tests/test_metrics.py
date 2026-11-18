@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from agentflow.metrics import aggregate, run_metrics
+from agentflow.metrics import aggregate, run_metrics, step_kind
 
 T0 = datetime(2026, 11, 3, 9, 0, tzinfo=UTC)
 
@@ -347,3 +347,131 @@ def test_metrics_table_totals_line_starts_with_blocked_when_no_run_reached_a_rea
     lines = metrics_table(_view(log)).splitlines()
     assert "Lead time:" not in "\n".join(lines)
     assert any(line.startswith("Blocked on a human 50.0% of wall time") for line in lines)
+
+
+def usage(turns: int, prefix: int | None, *, output: int = 100, estimated: bool = False) -> dict:
+    tokens = {"input": 10, "output": output, "cache_read": 1000, "cache_write_5m": prefix or 0, "cache_write_1h": 0}
+    usd = {"input": 0.01, "output": 0.02, "cache_read": 0.03, "cache_write": 0.04}
+    return {"tokens": tokens, "usd": usd, "turns": turns, "terminal_reason": "completed", "prefix_write": prefix,
+            "tool_output_chars": 500, "auto_memory": False, "estimated": estimated}
+
+
+def usage_call(log: Log, start: float, end: float, key: str, cost: float, *, session: str, use: dict | None,
+               resumed: bool = False, sizer: bool = False) -> Log:
+    extra = {"sizer": True} if sizer else {}
+    log.at(start).add("agent_started", agent="claude", pid=hash(session) % 10000, model="opus", effort="medium",
+                      step=key, session_id="prev" if resumed else None, role="build", phase=key.split("/")[0], **extra)
+    fields = {"usage": use} if use is not None else {}
+    log.at(end).add("agent_exited", session_id=session, exit_code=0, cost=cost, key=key, **fields, **extra)
+    return log
+
+
+def test_step_kind_is_the_phase_and_a_bounded_base():
+    keys = ("build/build/task-3/implement", "ship/ci/fix-1", "define/grill_open_questions/r2/apply",
+            "plan/plan/record-q3", "build/build/size-2")
+    assert [step_kind(k) for k in keys] == ["build.implement", "ship.fix", "define.apply", "plan.record", "build.size"]
+
+
+def usage_log() -> Log:
+    key = "build/build/task-1/implement"
+    log = Log().add("run_started", run_id="r", pipeline="feature", params={})
+    log.at(0).add("phase_started", phase="build")
+    usage_call(log, 1, 5, key, 1.0, session="a", use=usage(16, 25000))
+    usage_call(log, 6, 8, key, 0.4, session="b", use=usage(4, 3000), resumed=True)
+    usage_call(log, 9, 10, key, 0.1, session="c", use=usage(0, None))
+    usage_call(log, 11, 12, "build/build/size-1", 0.02, session="z", use=usage(2, 1500), sizer=True)
+    usage_call(log, 13, 14, "build/build/task-1/review", 0.3, session="d", use=usage(7, 9000))
+    log.at(15).add("run_finished")
+    return log
+
+
+def test_a_run_splits_its_cost_by_token_class_and_step_kind():
+    m = usage_log().metrics()
+    kinds = m["by_step_kind"]
+    impl = kinds["build.implement"]
+    assert impl["prefix_writes"] == [25000] and impl["turns"] == [16, 4]
+    assert impl["sessions"] == 3 and impl["cost_usd"] == pytest.approx(1.5)
+    assert impl["usd"] == {k: pytest.approx(v * 3) for k, v in {"input": 0.01, "output": 0.02, "cache_read": 0.03,
+                                                              "cache_write": 0.04}.items()}
+    assert impl["tool_output_chars"] == 1500
+    assert kinds["build.size"]["sessions"] == 1 and kinds["build.size"]["prefix_writes"] == []
+    assert kinds["build.size"]["turns"] == [2]
+    assert kinds["build.review"]["prefix_writes"] == [9000]
+    assert m["tokens"] == {"input": 50, "output": 500, "cache_read": 5000, "cache_write_5m": 38500, "cache_write_1h": 0}
+    assert m["usd_split"]["output"] == pytest.approx(0.10)
+
+
+def test_codex_style_all_zero_calls_contribute_no_turns():
+    key = "build/build/task-1/implement"
+    log = Log().add("run_started", run_id="r", pipeline="feature", params={})
+    log.at(0).add("phase_started", phase="build")
+    zero = usage(0, None, output=0, estimated=True)
+    zero["tokens"] = dict.fromkeys(zero["tokens"], 0)
+    zero["usd"] = dict.fromkeys(zero["usd"], 0.0)
+    usage_call(log, 1, 2, key, 0.0, session="x", use=zero)
+    kind = log.metrics()["by_step_kind"]["build.implement"]
+    assert kind["sessions"] == 1 and kind["turns"] == [] and kind["prefix_writes"] == []
+
+
+def test_runs_from_before_usage_have_empty_splits():
+    key = "build/build/task-1/implement"
+    log = Log().add("run_started", run_id="r", pipeline="feature", params={})
+    log.at(0).add("phase_started", phase="build")
+    usage_call(log, 1, 5, key, 1.0, session="a", use=None)
+    m = log.metrics()
+    assert set(m["usd_split"].values()) == {0.0} and set(m["tokens"].values()) == {0}
+    assert m["by_step_kind"]["build.implement"]["turns"] == []
+    assert m["by_step_kind"]["build.implement"]["sessions"] == 1
+    row = aggregate([{"metrics": m, "lane": "feature"}])["step_kinds"][0]
+    assert row["turns_p90"] == 0 and row["turns_p50"] == 0 and row["prefix_write_p50"] == 0
+
+
+def test_aggregate_takes_the_percentiles_over_every_runs_sessions():
+    key = "build/build/task-1/implement"
+
+    def one_run(turns: list[int]) -> dict:
+        log = Log().add("run_started", run_id="r", pipeline="feature", params={})
+        log.at(0).add("phase_started", phase="build")
+        for i, n in enumerate(turns):
+            usage_call(log, 1 + i, 1.5 + i, key, 1.0, session=f"s{i}", use=usage(n, 1000 * (i + 1)))
+        return {"metrics": log.metrics(), "lane": "feature"}
+
+    out = aggregate([one_run([4, 16]), one_run([5, 37, 8])])
+    row = next(r for r in out["step_kinds"] if r["kind"] == "build.implement")
+    assert row["sessions"] == 5 and row["cost_usd"] == pytest.approx(5.0)
+    assert (row["turns_p50"], row["turns_p90"]) == (8, 37)
+    assert row["prefix_write_p50"] == 2000 and row["tool_output_chars"] == 2500
+    assert row["usd"]["cache_read"] == pytest.approx(0.15)
+    assert out["usd_split"]["output"] == pytest.approx(0.10)
+
+
+def test_aggregate_sorts_step_kinds_by_cost_and_is_empty_with_no_runs():
+    out = aggregate([{"metrics": usage_log().metrics(), "lane": "feature"}])
+    assert [r["kind"] for r in out["step_kinds"]] == ["build.implement", "build.review", "build.size"]
+    empty = aggregate([])
+    assert empty["step_kinds"] == [] and set(empty["usd_split"].values()) == {0.0}
+
+
+def test_a_fake_agent_run_shows_its_exact_split_in_metrics_and_signals(flow_repo):
+    from agentflow.config import Phase, Step
+    from agentflow.signals import run_signals
+
+    run = flow_repo.new_run()
+    step = Step(id="impl", type="agent", skill="test-driven-development", role="build", prompt="step.md")
+    phase = Phase(name="build", agent=None, model="sonnet", skip_if=None, steps=[step])
+    act = {"result": {"status": "done", "summary": "did it"}, "model_id": "claude-sonnet-5-5",
+           "cache_write_1h": 1_000_000, "cache_read": 1_000_000, "output_tokens": 0}
+    flow_repo.script({"build/impl": [act]})
+    assert flow_repo.executor(run).run_agent_step(phase, step, "build/impl") == "done"
+    n_calls = len(flow_repo.events(run, "agent_exited"))
+    assert n_calls >= 1
+    events = run.events.read()
+    m = run_metrics(events, datetime.now(UTC))
+    assert m["usd_split"]["cache_write"] == pytest.approx(4.0 * n_calls)
+    assert m["usd_split"]["cache_read"] == pytest.approx(0.1 * n_calls)
+    s = run_signals(events, m)
+    assert s["cache_write_share"] == pytest.approx(round(4.0 / 4.1, 4), abs=1e-4)
+    kind = step_kind("build/impl")
+    assert m["by_step_kind"][kind]["sessions"] == n_calls
+    assert s[f"session_turns_p90:{kind}"] >= 1
+    assert s["compactions"] == 0 and s["usage_holds"] == 0

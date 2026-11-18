@@ -179,6 +179,7 @@ PROMPT_PLACEHOLDERS = frozenset(
 )
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
                     "--dangerously-skip-permissions", "--permission-mode")
+RUNNER_FLAGS = ("--setting-sources",)  # set by the runner from `agents.claude.user_settings`, never by base_args
 PERMISSION_MODES = ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions")
 EXPECT_VALUES = ("red", "green")
 ON_FAIL_VALUES = ("block",)
@@ -257,8 +258,12 @@ class AgentSpec:
     profile: str | None
     skill_loading: str
     prices: dict[str, dict[str, float]] = field(default_factory=dict)  # USD per 1M tokens, by model id
+    cache_ttl: str = "5m"  # the claude agent's prompt-cache lifetime: `5m`, `1h`, or `cli` (the CLI's own choice)
+    lean: bool = True  # the claude agent's run sessions skip the project's MCP servers and user-level state
+    user_settings: bool = False  # the claude agent's run sessions also read the user's own settings and agents
 
 
+CACHE_TTLS = ("5m", "1h", "cli")
 PRICE_KEYS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
 
 
@@ -817,6 +822,9 @@ def _build_agent(name: str, data: Any, path: str) -> AgentSpec:
         profile=_optional(data, "profile", path, str, None),
         skill_loading=_optional(data, "skill_loading", path, str, "native"),
         prices=_build_prices(data.get("prices"), _join(path, "prices")),
+        cache_ttl=str(_optional(data, "cache_ttl", path, str, "5m")),
+        lean=bool(_optional(data, "lean", path, bool, True)),
+        user_settings=bool(_optional(data, "user_settings", path, bool, False)),
     )
 
 
@@ -1792,9 +1800,36 @@ class _Validator:
             for arg in agent.base_args:
                 if arg.split("=", 1)[0] in PERMISSION_FLAGS:
                     self.error(_join(path, "base_args"), f"'{arg}' is not allowed: tool rules come from .claude/settings*.json")
+                elif arg.split("=", 1)[0] in RUNNER_FLAGS:
+                    self.error(_join(path, "base_args"), f"'{arg}' is not allowed: the runner sets it from "
+                               "`agents.claude.user_settings`")
             if agent.permission_mode is not None and agent.permission_mode not in PERMISSION_MODES:
                 self.error(_join(path, "permission_mode"),
                            f"unknown permission_mode '{agent.permission_mode}': use one of {', '.join(PERMISSION_MODES)}")
+        self.claude_session()
+
+    def claude_session(self) -> None:
+        """`cache_ttl`, `lean` and `user_settings` are read by the claude agent alone."""
+        claude = self.cfg.agents.get("claude")
+        if claude is not None and claude.cache_ttl not in CACHE_TTLS:
+            self.error("agents.claude.cache_ttl", f"cache_ttl must be one of {', '.join(CACHE_TTLS)}")
+        for name, block in (self.cfg.raw.get("agents") or {}).items():
+            if name == "claude" or not isinstance(block, dict):
+                continue
+            for key in ("cache_ttl", "lean", "user_settings"):
+                if key in block:
+                    self.add("warning", f"agents.{name}.{key}", f"only the claude agent reads `{key}`")
+        if claude is None:
+            return
+        if claude.lean and (self.repo / ".mcp.json").is_file():
+            self.add("warning", "agents.claude.lean", "lean runs don't load the project's `.mcp.json`: name its servers "
+                     "with `--mcp-config` in `agents.claude.base_args`, or set `lean: false`")
+        review = (self.cfg.overlays.get("security") or {}).get("review_agent")
+        if (not claude.user_settings and isinstance(review, str) and review
+                and not (self.repo / ".claude" / "agents" / f"{review}.md").is_file()):
+            self.add("warning", "overlays.security.review_agent", f"with `user_settings: false` a run loads only the "
+                     f"project's agents, and `.claude/agents/{review}.md` is not in the repository: add it, or set "
+                     "`agents.claude.user_settings: true`")
 
     def gate_definitions(self) -> None:
         confirmed = self.cfg.raw.get("gates_confirmed")

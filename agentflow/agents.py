@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import abc
 import json
+import math
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -34,6 +36,29 @@ SHELL_ENV_FILE_ENV = "CLAUDE_ENV_FILE"  # a script Claude Code sources in its Ba
 SYNTHETIC_MODEL = "<synthetic>"  # Claude Code's own error messages, shown as assistant turns: no model replied
 
 READ_ONLY_TOOLS = ("Read", "Grep", "Glob")  # the only Claude tools a read-only call gets
+
+# `agents.claude.cache_ttl`: the variable each lifetime sets. The inherited environment's other TTL variables are dropped
+# (`env_drop`), so it can't override the pack; `cli` sets and drops nothing, leaving the CLI's own choice.
+TTL_ENV: dict[str, dict[str, str]] = {"5m": {"FORCE_PROMPT_CACHING_5M": "1"}, "1h": {"ENABLE_PROMPT_CACHING_1H": "1"}, "cli": {}}
+TTL_VARS = ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H", "CLAUDE_CODE_PROMPT_CACHE_TTL")
+# `agents.claude.lean`: a system prefix that is the same in every worktree, only the MCP servers `base_args` names, and
+# no auto-memory (a run's memory is the lessons file).
+LEAN_ARGS = ("--exclude-dynamic-system-prompt-sections", "--strict-mcp-config")
+LEAN_ENV = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+NO_USER_SETTINGS = ("--setting-sources", "project,local")  # `agents.claude.user_settings: false`
+SELF_CONTAINED_ARGS = ("--disable-slash-commands",)  # a call whose brief is self-contained gets no skills listing
+UNKNOWN_OPTION = re.compile(r"unknown option '(--[\w-]+)'")  # how the claude CLI refuses a flag it does not know
+CLAUDE_MIN_VERSION = "2.1.327"  # the oldest Claude Code that takes every flag above
+STDERR_TAIL_BYTES = 4096  # how much of a failed call's own stderr is read for a refused flag
+
+# An invocation's usage (`StreamAccumulator.usage_payload`): the per-model fields of a result's
+# `model_usage_since_last_result`, the token classes they split into, and the classes their price splits into.
+USAGE_KEYS = ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens",
+              "cacheCreationEphemeral5mInputTokens", "cacheCreationEphemeral1hInputTokens")
+TOKEN_CLASSES = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
+USD_CLASSES = ("input", "output", "cache_read", "cache_write")
+USAGE_WINDOWS = ("five_hour", "seven_day")  # the `rate_limit_event` windows a `usage_window` event reports
+WINDOW_STEP = 0.05  # a window's utilization must move this much (or its status change) to be written again
 
 EventCallback = Callable[[str, dict], None]
 
@@ -61,11 +86,15 @@ class AgentCall:
     read_only: bool = False  # Claude gets only `READ_ONLY_TOOLS` and no MCP server; Codex a read-only sandbox (fresh session)
     idle_s: float | None = None  # end the session after this long with no stream line (`watchdog`); None: no watchdog
     tool_idle_s: float | None = None  # the same limit while a tool call is open, or for an agent that `tracks_tools` not
+    self_contained: bool = False  # the prompt is the whole brief (a sizer): Claude gets no skills listing
+    # The run's last recorded usage windows (`state.usage_window`): only a window that moved since is written again.
+    usage_windows: dict = field(default_factory=dict)
 
 
 @dataclass
 class Interruption:
     """Why a call ended without finishing. `usage_limit` carries the reset time (`until`, epoch seconds);
+    `cli_flags` is a CLI that refused a flag before it started (`detail` names the flag), which no retry fixes;
     `transient` is everything else, unknown failures included. `reached_model` tells an outage, where a
     retry is free, from a call that spent money and still died. `limit` is the stream's last limit info."""
 
@@ -73,6 +102,7 @@ class Interruption:
     reached_model: bool
     until: float | None = None
     limit: dict | None = None
+    detail: str | None = None
 
 
 @dataclass
@@ -93,6 +123,7 @@ class AgentOutcome:
     interruption: Interruption | None = None
     stalled: bool = False  # the watchdog ended the session: no stream line for `idle_limit_s` (never with `timed_out`)
     idle_limit_s: float | None = None  # the limit that was in force when the watchdog fired
+    usage: dict = field(default_factory=dict)  # this invocation's split (`StreamAccumulator.usage_payload`)
 
 
 class Agent(Protocol):
@@ -136,6 +167,18 @@ class StreamAccumulator:
     limit: dict | None = None  # the latest `rate_limit_event`'s `rate_limit_info`
     reached_model: bool = False
     result_error: bool = False
+    # This invocation's usage (`usage_payload`). A `result` event's `modelUsage` is the session's total over every
+    # `--resume`, so only its `model_usage_since_last_result` is summed, over every result the invocation sends.
+    result_usage: dict[str, dict] = field(default_factory=dict)  # per model, camel case as Claude writes it
+    results_seen: int = 0
+    result_turns: int = 0
+    main_calls: int = 0  # main-thread assistant messages with usage, once per message id
+    main_ids: set[str] = field(default_factory=set)
+    prefix_write: int | None = None  # the first main-thread message's `cache_creation_input_tokens`
+    tool_output_chars: int = 0  # the text of main-thread `tool_result`s
+    terminal_reason: str | None = None  # the first result's that has one: a trailing `api_error` hides nothing
+    auto_memory: bool | None = None  # the `init` event named memory paths; None: no `init` seen
+    windows: dict[str, tuple[float, str]] = field(default_factory=dict)  # the last emitted utilization and status
 
     @property
     def compactions_spent(self) -> bool:
@@ -158,6 +201,22 @@ class StreamAccumulator:
         if exit_code == 0 and not self.result_error:
             return None
         return Interruption("transient", self.reached_model, None, self.limit)
+
+    def usage_payload(self) -> dict:
+        """This invocation's tokens, their price, its turns and its prefix write. The results' own usage when they
+        reported any; else the messages' usage (a killed session, an old CLI, Codex), marked `estimated`."""
+        measured = any(usage_split(self.result_usage).values())
+        model_usage = self.result_usage if measured else _message_usage(self.usage_by_message)
+        return {
+            "tokens": usage_split(model_usage),
+            "usd": price_split(self.prices, model_usage),
+            "turns": self.result_turns if measured else self.main_calls,
+            "terminal_reason": self.terminal_reason,
+            "prefix_write": self.prefix_write,
+            "tool_output_chars": self.tool_output_chars,
+            "auto_memory": self.auto_memory,
+            "estimated": not measured,
+        }
 
     def to_outcome(
         self,
@@ -185,6 +244,7 @@ class StreamAccumulator:
             interruption=self.interruption(exit_code),
             stalled=stalled,
             idle_limit_s=idle_limit_s if stalled else None,
+            usage=self.usage_payload(),
         )
 
 
@@ -214,6 +274,93 @@ def _price_row(prices: dict[str, dict[str, float]], model: str | None) -> dict[s
     return next((row for name, row in prices.items() if model.startswith(name)), None)
 
 
+def _number(value: Any) -> float | None:
+    """A finite number from the stream (never a bool), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _count(value: Any) -> int:
+    """A token count from the stream: a non-negative whole number, else 0."""
+    number = _number(value)
+    return max(0, int(number)) if number is not None else 0
+
+
+def _camel(usage: Mapping[str, Any]) -> dict[str, int]:
+    """One message's snake-case `usage` in the camel-case shape of a result's per-model usage."""
+    created = usage.get("cache_creation") if isinstance(usage.get("cache_creation"), dict) else {}
+    return {
+        "inputTokens": _count(usage.get("input_tokens")),
+        "outputTokens": _count(usage.get("output_tokens")),
+        "cacheReadInputTokens": _count(usage.get("cache_read_input_tokens")),
+        "cacheCreationInputTokens": _count(usage.get("cache_creation_input_tokens")),
+        "cacheCreationEphemeral5mInputTokens": _count(created.get("ephemeral_5m_input_tokens")),
+        "cacheCreationEphemeral1hInputTokens": _count(created.get("ephemeral_1h_input_tokens")),
+    }
+
+
+def _add_usage(into: dict[str, dict], model: str, entry: Mapping[str, Any]) -> None:
+    row = into.setdefault(model, dict.fromkeys(USAGE_KEYS, 0))
+    for key in USAGE_KEYS:
+        row[key] += _count(entry.get(key))
+
+
+def _message_usage(usage_by_message: dict[str, tuple[str, dict]]) -> dict[str, dict]:
+    """The messages' usage summed per model, in the camel-case shape: the estimate when no result reported any."""
+    out: dict[str, dict] = {}
+    for model, usage in usage_by_message.values():
+        if isinstance(usage, dict):
+            _add_usage(out, model, _camel(usage))
+    return out
+
+
+def _entry_split(entry: Mapping[str, Any]) -> dict[str, int]:
+    """One model's tokens by class. Creation the two TTL fields don't cover is a 5-minute write."""
+    write_5m = _count(entry.get("cacheCreationEphemeral5mInputTokens"))
+    write_1h = _count(entry.get("cacheCreationEphemeral1hInputTokens"))
+    write_5m += max(0, _count(entry.get("cacheCreationInputTokens")) - write_5m - write_1h)
+    return {
+        "input": _count(entry.get("inputTokens")),
+        "output": _count(entry.get("outputTokens")),
+        "cache_read": _count(entry.get("cacheReadInputTokens")),
+        "cache_write_5m": write_5m,
+        "cache_write_1h": write_1h,
+    }
+
+
+def _usd(row: Mapping[str, float], split: Mapping[str, int]) -> dict[str, float]:
+    return {
+        "input": split["input"] * row.get("input", 0.0) / 1_000_000,
+        "output": split["output"] * row.get("output", 0.0) / 1_000_000,
+        "cache_read": split["cache_read"] * row.get("cache_read", 0.0) / 1_000_000,
+        "cache_write": (split["cache_write_5m"] * row.get("cache_write_5m", 0.0)
+                        + split["cache_write_1h"] * row.get("cache_write_1h", 0.0)) / 1_000_000,
+    }
+
+
+def usage_split(model_usage: Mapping[str, Any]) -> dict[str, int]:
+    """Tokens by class (`TOKEN_CLASSES`), summed over the models of a camel-case per-model usage dict."""
+    total = dict.fromkeys(TOKEN_CLASSES, 0)
+    for entry in model_usage.values():
+        if isinstance(entry, dict):
+            for key, tokens in _entry_split(entry).items():
+                total[key] += tokens
+    return total
+
+
+def price_split(prices: dict[str, dict[str, float]], model_usage: Mapping[str, Any]) -> dict[str, float]:
+    """USD by class (`USD_CLASSES`) for a camel-case per-model usage dict, rounded to 6 places. An unpriced model adds 0."""
+    total = dict.fromkeys(USD_CLASSES, 0.0)
+    for model, entry in model_usage.items():
+        row = _price_row(prices, str(model))
+        if row is None or not isinstance(entry, dict):
+            continue
+        for key, usd in _usd(row, _entry_split(entry)).items():
+            total[key] += usd
+    return {key: round(usd, 6) for key, usd in total.items()}
+
+
 def estimate_cost(prices: dict[str, dict[str, float]], usage_by_message: dict[str, tuple[str, dict]]) -> float:
     """USD for the messages seen so far, from each message's `usage` and the config's price table.
 
@@ -225,18 +372,64 @@ def estimate_cost(prices: dict[str, dict[str, float]], usage_by_message: dict[st
         row = _price_row(prices, model)
         if row is None or not isinstance(usage, dict):
             continue
-        created = usage.get("cache_creation") if isinstance(usage.get("cache_creation"), dict) else {}
-        write_5m = int(created.get("ephemeral_5m_input_tokens") or 0)
-        write_1h = int(created.get("ephemeral_1h_input_tokens") or 0)
-        write_5m += max(0, int(usage.get("cache_creation_input_tokens") or 0) - write_5m - write_1h)
-        total += (
-            int(usage.get("input_tokens") or 0) * row.get("input", 0.0)
-            + int(usage.get("output_tokens") or 0) * row.get("output", 0.0)
-            + int(usage.get("cache_read_input_tokens") or 0) * row.get("cache_read", 0.0)
-            + write_5m * row.get("cache_write_5m", 0.0)
-            + write_1h * row.get("cache_write_1h", 0.0)
-        ) / 1_000_000
+        total += sum(_usd(row, _entry_split(_camel(usage))).values())
     return total
+
+
+def ignored_settings(spec: AgentSpec, usage: dict) -> list[str]:
+    """The settings of `spec` an invocation's `usage` shows the CLI did not honour: `cache_ttl` when the writes landed
+    in the other lifetime, `auto_memory` when a lean session still loaded the user's memory. Reads `usage` only through
+    `.get`: an empty one (a Codex call, a dry run) gives `[]`."""
+    tokens = usage.get("tokens") or {}
+    write_5m, write_1h = tokens.get("cache_write_5m") or 0, tokens.get("cache_write_1h") or 0
+    out = []
+    if (spec.cache_ttl == "5m" and write_1h > 0) or (spec.cache_ttl == "1h" and write_5m > 0 and not write_1h):
+        out.append("cache_ttl")
+    if spec.lean and usage.get("auto_memory"):
+        out.append("auto_memory")
+    return out
+
+
+def _seed_windows(usage_windows: Any) -> dict[str, tuple[float, str]]:
+    """The run's recorded windows (`state.usage_window`: `{window: {"utilization", "status", ...}}`) as
+    `StreamAccumulator.windows`. An entry with no number is left out, so its next reading is news."""
+    out: dict[str, tuple[float, str]] = {}
+    if not isinstance(usage_windows, Mapping):
+        return out
+    for name, entry in usage_windows.items():
+        utilization = _number(entry.get("utilization")) if isinstance(entry, Mapping) else None
+        if utilization is not None:
+            out[str(name)] = (utilization, str(entry.get("status") or ""))
+    return out
+
+
+def _window_news(acc: StreamAccumulator, unified: Mapping[str, Any]) -> list[tuple[str, dict]]:
+    """A `usage_window` event for each window that is new to `acc.windows`, moved `WINDOW_STEP` or more since the
+    last one written, or changed status. Readings in between are not news, so the last emitted value stays."""
+    out: list[tuple[str, dict]] = []
+    for name in USAGE_WINDOWS:
+        entry = unified.get(name)
+        utilization = _number(entry.get("utilization")) if isinstance(entry, dict) else None
+        if utilization is None:
+            continue
+        status = str(entry.get("status") or "")
+        last = acc.windows.get(name)
+        if last is not None and round(abs(utilization - last[0]), 6) < WINDOW_STEP and status == last[1]:
+            continue
+        acc.windows[name] = (utilization, status)
+        resets_at = _number(entry.get("resetsAt"))
+        out.append(("usage_window", {"window": name, "utilization": utilization,
+                                     "resets_at": int(resets_at) if resets_at is not None else None, "status": status}))
+    return out
+
+
+def _text_length(content: Any) -> int:
+    """The text in a `tool_result`'s content: a string, or a list of blocks whose `text` counts."""
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        return sum(len(block["text"]) for block in content if isinstance(block, dict) and isinstance(block.get("text"), str))
+    return 0
 
 
 def _usage_tokens(usage: Any) -> int | None:
@@ -261,6 +454,7 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
         if subtype == "init":
             acc.session_id = event.get("session_id") or acc.session_id
             acc.model = event.get("model") or acc.model
+            acc.auto_memory = bool(event.get("memory_paths"))  # null when auto-memory is off
             out.append(("agent_session", {"session_id": acc.session_id, "model": acc.model}))
         elif subtype == "compact_boundary":
             acc.compactions += 1
@@ -276,6 +470,9 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
     if kind == "rate_limit_event":
         info = event.get("rate_limit_info")
         acc.limit = info if isinstance(info, dict) else acc.limit
+        unified = info.get("unifiedWindows") if isinstance(info, dict) else None
+        if isinstance(unified, dict):
+            out.extend(_window_news(acc, unified))
         return out
 
     if kind == "assistant":
@@ -307,10 +504,17 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
                     "model": sub["model"],
                     "tool_use_id": sub["tool_use_id"],
                 }))
-        if isinstance(message.get("usage"), dict) and not acc.cost_reported:
+        usage = message.get("usage")
+        if isinstance(usage, dict):
             key = str(message.get("id") or f"line-{len(acc.usage_by_message)}")  # one entry per API call
-            acc.usage_by_message[key] = (str(message.get("model") or acc.model or ""), message["usage"])
-            acc.cost_usd = estimate_cost(acc.prices, acc.usage_by_message)
+            acc.usage_by_message[key] = (str(message.get("model") or acc.model or ""), usage)
+            if not acc.cost_reported:  # a reported cost is never replaced by the estimate
+                acc.cost_usd = estimate_cost(acc.prices, acc.usage_by_message)
+            if main_thread and message.get("model") != SYNTHETIC_MODEL and key not in acc.main_ids:
+                acc.main_ids.add(key)
+                acc.main_calls += 1
+                if acc.prefix_write is None:
+                    acc.prefix_write = _count(usage.get("cache_creation_input_tokens"))
         tokens = _usage_tokens(message.get("usage"))
         if main_thread:
             acc.line_type = "assistant"
@@ -333,6 +537,7 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
         for block in _blocks(event.get("message")):
             if main_thread and block.get("type") == "tool_result":
                 acc.open_tools.discard(str(block.get("tool_use_id")))
+                acc.tool_output_chars += _text_length(block.get("content"))
             sub = acc.open_subagents.pop(str(block.get("tool_use_id")), None) if block.get("type") == "tool_result" else None
             if sub is not None:
                 out.append(("subagent_finished", {
@@ -354,6 +559,16 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
         acc.final_text = str(event.get("result") or "")
         denials = event.get("permission_denials")
         acc.permission_denials = [d for d in denials if isinstance(d, dict)] if isinstance(denials, list) else []
+        acc.results_seen += 1
+        acc.result_turns += _count(event.get("num_turns"))
+        since = event.get("model_usage_since_last_result")  # never `modelUsage`: that is the session's total
+        if isinstance(since, dict):
+            for name, entry in since.items():
+                if isinstance(entry, dict):
+                    _add_usage(acc.result_usage, str(name), entry)
+        reason = event.get("terminal_reason")
+        if acc.terminal_reason is None and isinstance(reason, str) and reason:
+            acc.terminal_reason = reason
         usage_by_model = event.get("modelUsage")
         if isinstance(usage_by_model, dict) and usage_by_model:
             entry = usage_by_model.get(acc.model) or next(iter(usage_by_model.values()))
@@ -415,6 +630,20 @@ def idle_limit(call: AgentCall, acc: StreamAccumulator, tracks_tools: bool) -> f
     return call.idle_s
 
 
+def _stderr_tail(handle: Any, start: int) -> str:
+    """What this call wrote to its stderr file: at most the last `STDERR_TAIL_BYTES` past `start`, read from the
+    runner's own open handle, so an earlier call's output in the same file is never this call's."""
+    end = handle.seek(0, os.SEEK_END)
+    handle.seek(max(start, end - STDERR_TAIL_BYTES))
+    return handle.read(STDERR_TAIL_BYTES).decode("utf-8", errors="replace")
+
+
+def refused_flag(stderr_tail: str) -> str | None:
+    """The flag the CLI refused as unknown, or None."""
+    found = UNKNOWN_OPTION.search(stderr_tail)
+    return found.group(1) if found else None
+
+
 def _signal_group(proc: subprocess.Popen, sig: int) -> None:
     try:
         os.killpg(proc.pid, sig)
@@ -464,6 +693,10 @@ class _CliAgent(abc.ABC):
             self.context.autocompact_env: str(self.context.autocompact_pct),
         }
 
+    def env_drop(self, call: AgentCall) -> tuple[str, ...]:
+        """Names `run` removes from the inherited environment before it adds `env(call)`."""
+        return ()
+
     def _effort_args(self, call: AgentCall) -> list[str]:
         return [part.replace("{effort}", call.effort) for part in self.spec.effort_arg]
 
@@ -481,6 +714,7 @@ class _CliAgent(abc.ABC):
             window_override=window if isinstance(window, int) and not isinstance(window, bool) else None,
             rollover_pct=self.context.rollover_pct if self.rollover_enabled else None,
             max_compactions=self.context.max_compactions if self.rollover_enabled else None,
+            windows=_seed_windows(call.usage_windows),
         )
 
     def run(self, call: AgentCall, on_event: EventCallback) -> AgentOutcome:
@@ -511,8 +745,13 @@ class _CliAgent(abc.ABC):
                 done.set()
 
         rolled_over = False
-        with open(call.transcript_path, "a", encoding="utf-8") as transcript, open(stderr_path, "a", encoding="utf-8") as stderr:
-            env = {**(os.environ if call.env_base is None else call.env_base), **self.env(call)}
+        # The stderr file appends across a step's calls: `stderr_start` is where this call's output begins.
+        with open(call.transcript_path, "a", encoding="utf-8") as transcript, open(stderr_path, "a+b") as stderr:
+            stderr_start = stderr.seek(0, os.SEEK_END)
+            inherited = dict(os.environ if call.env_base is None else call.env_base)
+            for name in self.env_drop(call):
+                inherited.pop(name, None)
+            env = {**inherited, **self.env(call)}
             env.update(self._shell_env(call, env))
             proc = subprocess.Popen(
                 argv,
@@ -586,16 +825,22 @@ class _CliAgent(abc.ABC):
                     _terminate(proc)
                     if proc.stdout is not None:
                         proc.stdout.close()
+            # A CLI that refuses a flag exits before its `init` line, with the reason on stderr.
+            tail = _stderr_tail(stderr, stderr_start) if exit_code != 0 and acc.session_id is None else ""
         # A timer callback that started but has not claimed yet may still claim after this read. That is harmless:
         # the process has exited by now, so its `_terminate` returns at once (`poll()` is set).
         with lock:
             timed_out, stalled, limit = state["timed_out"], state["stalled"], state["limit"]
+        refused = None if timed_out or stalled else refused_flag(tail)
         resume_failed = (bool(call.resume_session) and exit_code != 0 and acc.session_id is None
-                         and not timed_out and not stalled)
+                         and not timed_out and not stalled and refused is None)
         outcome = acc.to_outcome(exit_code, rolled_over=rolled_over, timed_out=timed_out, resume_failed=resume_failed,
                                  stalled=stalled, idle_limit_s=limit)
+        if refused is not None:  # no retry fixes it, and no session was there to resume
+            outcome.interruption = Interruption("cli_flags", reached_model=False, detail=refused)
         on_event("agent_exited", {"session_id": outcome.session_id, "exit_code": exit_code, "cost": outcome.cost_usd,
-                                  "cost_estimated": not acc.cost_reported and outcome.cost_usd > 0})
+                                  "cost_estimated": not acc.cost_reported and outcome.cost_usd > 0,
+                                  "usage": outcome.usage})
         return outcome
 
 
@@ -637,7 +882,16 @@ class ClaudeAgent(_CliAgent):
         if call.read_only:
             # `--tools` is an allowlist that holds in every permission mode, `bypassPermissions` included.
             # It is variadic like `--add-dir`, so it goes before the next option and never reaches the prompt.
-            argv += ["--tools", ",".join(READ_ONLY_TOOLS), "--strict-mcp-config"]
+            argv += ["--tools", ",".join(READ_ONLY_TOOLS)]
+        # `--strict-mcp-config` once: lean keeps only the servers `base_args` names, a read-only call none at all
+        if spec.lean:
+            argv += LEAN_ARGS
+        elif call.read_only:
+            argv.append("--strict-mcp-config")
+        if not spec.user_settings:
+            argv += NO_USER_SETTINGS
+        if call.self_contained:
+            argv += SELF_CONTAINED_ARGS
         argv += ["--model", call.model, *self._effort_args(call)]
         if spec.permission_mode:
             argv += ["--permission-mode", spec.permission_mode]
@@ -660,6 +914,20 @@ class ClaudeAgent(_CliAgent):
             argv += ["--resume", call.resume_session]
         argv.append(call.prompt)
         return argv
+
+    def env(self, call: AgentCall) -> dict[str, str]:
+        """`cache_ttl` other than `cli` owns the TTL variables: the pack's `defaults.env` can't set another one."""
+        spec = self.spec
+        env = super().env(call)
+        if spec.cache_ttl in TTL_ENV and spec.cache_ttl != "cli":
+            env = {name: value for name, value in env.items() if name not in TTL_VARS}
+        return {**env, **TTL_ENV.get(spec.cache_ttl, {}), **(LEAN_ENV if spec.lean else {})}
+
+    def env_drop(self, call: AgentCall) -> tuple[str, ...]:
+        """The TTL variables `cache_ttl` doesn't set, so the inherited environment can't override it (none for `cli`)."""
+        if self.spec.cache_ttl not in TTL_ENV or self.spec.cache_ttl == "cli":
+            return ()
+        return tuple(name for name in TTL_VARS if name not in TTL_ENV[self.spec.cache_ttl])
 
     def _shell_env(self, call: AgentCall, env: Mapping[str, str]) -> dict[str, str]:
         """Pin the Bash tool's PATH to the one the gates get. Claude Code's Bash tool runs a login shell, and on

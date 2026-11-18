@@ -15,11 +15,13 @@ import pytest
 from agentflow.agents import (
     AgentCall,
     RUNNER_ONLY_DENY,
+    TTL_VARS,
     ClaudeAgent,
     CodexAgent,
     WATCHDOG_THREAD,
     StreamAccumulator,
     idle_limit,
+    ignored_settings,
     make_agents,
     parse_claude_line,
     parse_codex_line,
@@ -83,6 +85,10 @@ def fake_claude(cfg, fake) -> ClaudeAgent:
     spec = dataclasses.replace(cfg.agents["claude"], command=fake.command)
     # the fake agent scripts `usage_pct` against a 200K window; the shipped default is checked on its own
     return ClaudeAgent(spec, dataclasses.replace(cfg.context, default_window_tokens=200000))
+
+
+def claude_with(cfg, **spec_changes) -> ClaudeAgent:
+    return ClaudeAgent(dataclasses.replace(cfg.agents["claude"], **spec_changes), cfg.context)
 
 
 def pairs(argv: list[str]) -> set[tuple[str, str]]:
@@ -201,13 +207,15 @@ def test_a_call_turn_cap_overrides_the_agents(claude, call):
     assert pairs(claude.argv(call)) == pairs(claude.argv(dataclasses.replace(call, max_turns=None)))
 
 
-def test_a_read_only_claude_call_allows_only_read_tools_and_no_mcp(claude, call):
+def test_a_read_only_claude_call_allows_only_read_tools_and_no_mcp(claude, cfg, call):
     argv = claude.argv(dataclasses.replace(call, read_only=True))
     at = argv.index("--tools")
     assert argv[at + 1] == "Read,Grep,Glob" and argv[at + 2].startswith("--")
     assert argv.index("--strict-mcp-config") < argv.index("--model")
     assert at < argv.index("--model") and argv[-1] == call.prompt
-    assert "--tools" not in claude.argv(call) and "--strict-mcp-config" not in claude.argv(call)
+    assert "--tools" not in claude.argv(call)
+    assert "--strict-mcp-config" not in claude_with(cfg, lean=False).argv(call)
+    assert claude_with(cfg, lean=False).argv(dataclasses.replace(call, read_only=True)).count("--strict-mcp-config") == 1
     resumed = claude.argv(dataclasses.replace(call, read_only=True, resume_session="abc"))
     assert resumed[-1] == call.prompt and "--tools" in resumed
 
@@ -269,7 +277,70 @@ def test_env(claude, codex, call):
     assert env["AGENTFLOW_RUN"] == call.run_id
     assert env["AGENTFLOW_RESULT"] == str(call.result_path)
     assert codex.env(call)["AGENTFLOW_RESULT"] == str(call.result_path)
-    assert codex.env(call) == env  # D8: both adapters get the run vars and the auto-compact override
+    # D8: both adapters get the run vars and the auto-compact override; Claude also gets its cache TTL and lean switches
+    run_vars = {"AGENTFLOW_RUN", "AGENTFLOW_STEP", "AGENTFLOW_RESULT", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"}
+    assert set(codex.env(call)) == run_vars
+    assert set(env) == run_vars | {"FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_DISABLE_AUTO_MEMORY"}
+    assert {k: v for k, v in env.items() if k in run_vars} == codex.env(call)
+    assert env["FORCE_PROMPT_CACHING_5M"] == "1" and env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+
+
+def test_a_lean_claude_call_has_a_stable_prefix_and_no_user_settings(claude, call):
+    a = claude.argv(call)
+    assert "--exclude-dynamic-system-prompt-sections" in a and a.count("--strict-mcp-config") == 1
+    assert ("--setting-sources", "project,local") in pairs(a) and a[-1] == call.prompt
+    assert "--disable-slash-commands" not in a
+    assert claude.argv(dataclasses.replace(call, read_only=True)).count("--strict-mcp-config") == 1
+    # placed after the variadic `--add-dir` / `--tools` values and before `--model`: no flag swallows the prompt
+    for flag in ("--exclude-dynamic-system-prompt-sections", "--strict-mcp-config", "--setting-sources"):
+        assert a.index("--add-dir") < a.index(flag) < a.index("--model")
+
+
+def test_lean_keeps_the_packs_own_mcp_servers(cfg, call):
+    spec = dataclasses.replace(cfg.agents["claude"],
+                               base_args=[*cfg.agents["claude"].base_args, "--mcp-config", "servers.json"])
+    a = ClaudeAgent(spec, cfg.context).argv(call)
+    assert ("--mcp-config", "servers.json") in pairs(a) and "--strict-mcp-config" in a
+
+
+def test_the_keys_switch_off(cfg, call):
+    agent = claude_with(cfg, lean=False, user_settings=True, cache_ttl="cli")
+    assert not {"--exclude-dynamic-system-prompt-sections", "--setting-sources", "--strict-mcp-config"} & set(agent.argv(call))
+    assert not set(TTL_VARS) & set(agent.env(call)) and "CLAUDE_CODE_DISABLE_AUTO_MEMORY" not in agent.env(call)
+    assert agent.env_drop(call) == ()  # `cli`: the inherited environment's own choice stands
+
+
+def test_a_one_hour_cache_ttl_sets_its_variable_and_drops_the_others(cfg, call):
+    agent = claude_with(cfg, cache_ttl="1h")
+    assert agent.env(call)["ENABLE_PROMPT_CACHING_1H"] == "1" and "FORCE_PROMPT_CACHING_5M" not in agent.env(call)
+    assert set(agent.env_drop(call)) == {"FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_PROMPT_CACHE_TTL"}
+
+
+def test_the_cache_ttl_wins_over_the_packs_env(cfg, call):
+    call = dataclasses.replace(call, env={"FORCE_PROMPT_CACHING_5M": "1", "KEEP": "x"})
+    env = claude_with(cfg, cache_ttl="1h").env(call)
+    assert {name for name in TTL_VARS if name in env} == {"ENABLE_PROMPT_CACHING_1H"} and env["KEEP"] == "x"
+    env = claude_with(cfg, cache_ttl="cli").env(call)  # `cli`: nothing dropped, nothing added
+    assert {name: env[name] for name in TTL_VARS if name in env} == {"FORCE_PROMPT_CACHING_5M": "1"}
+
+
+def test_a_codex_call_drops_nothing_from_the_environment(codex, call):
+    assert codex.env_drop(call) == ()
+
+
+def test_the_cache_ttl_wins_over_the_inherited_environment(fake, cfg, call, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", ",".join([*TTL_VARS, "CLAUDE_CODE_DISABLE_AUTO_MEMORY"]))
+    call = dataclasses.replace(call, env_base={**os.environ, "ENABLE_PROMPT_CACHING_1H": "1",
+                                               "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"})
+    claude_with(cfg, command=fake.command).run(call, collect()[1])
+    env = fake.calls()[0]["env"]
+    assert env["FORCE_PROMPT_CACHING_5M"] == "1" and env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert "ENABLE_PROMPT_CACHING_1H" not in env and "CLAUDE_CODE_PROMPT_CACHE_TTL" not in env
+
+
+def test_a_self_contained_call_drops_the_skills_listing(claude, call):
+    a = claude.argv(dataclasses.replace(call, self_contained=True))
+    assert "--disable-slash-commands" in a and a.index("--disable-slash-commands") < a.index("--model")
 
 
 def test_codex_env_includes_autocompact_override(codex, call):
@@ -475,7 +546,7 @@ def test_run_fresh_session_and_outcome(fake, fake_claude, call, wt):
     started = events[0][1]
     assert started["agent"] == "claude" and started["model"] == "sonnet" and started["effort"] == "medium"
     assert events[-1][1] == {"session_id": o.session_id, "exit_code": 0, "cost": pytest.approx(0.25),
-                             "cost_estimated": False}  # Claude reported it
+                             "cost_estimated": False, "usage": o.usage}  # Claude reported it
 
 
 def test_run_records_argv_and_env(fake, fake_claude, call):
@@ -569,6 +640,37 @@ def test_fresh_crash_is_not_resume_failed(fake, fake_claude, call):
     events, on_event = collect()
     o = fake_claude.run(call, on_event)
     assert o.exit_code == 1 and not o.resume_failed
+
+
+REFUSED = {"no_init": True, "exit": 1, "stderr": "error: unknown option '--setting-sources'\n"}
+
+
+@pytest.mark.parametrize("resume", [None, "sess-123"])
+def test_a_refused_flag_is_a_cli_flags_interruption_not_an_outage(fake, fake_claude, call, resume):
+    fake.script({STEP: [REFUSED]})
+    o = fake_claude.run(dataclasses.replace(call, resume_session=resume), collect()[1])
+    assert o.exit_code == 1 and o.session_id is None
+    assert o.interruption.kind == "cli_flags" and o.interruption.detail == "--setting-sources"
+    assert o.interruption.reached_model is False
+    assert o.resume_failed is False
+
+
+def test_only_this_calls_stderr_is_read_for_a_refused_flag(fake, fake_claude, call):
+    # the stderr file appends across a step's calls: an earlier call's refusal is not this call's
+    fake.script({STEP: [REFUSED, {"no_init": True, "exit": 1}]})
+    assert fake_claude.run(call, collect()[1]).interruption.kind == "cli_flags"
+    assert fake_claude.run(call, collect()[1]).interruption.kind == "transient"
+
+
+def test_only_the_last_4_kb_of_stderr_is_read(fake, fake_claude, call):
+    fake.script({STEP: [{**REFUSED, "stderr": REFUSED["stderr"] + "x" * 5000}]})
+    assert fake_claude.run(call, collect()[1]).interruption.kind == "transient"
+
+
+def test_a_crash_with_other_stderr_is_still_an_outage(fake, fake_claude, call):
+    fake.script({STEP: [{**REFUSED, "stderr": "Error: network unreachable\n"}]})
+    o = fake_claude.run(dataclasses.replace(call, resume_session="gone"), collect()[1])
+    assert o.interruption.kind == "transient" and o.resume_failed
 
 
 def test_a_quiet_session_is_ended_as_stalled(fake, fake_claude, call):
@@ -755,6 +857,183 @@ def test_unpriced_model_adds_nothing(cfg):
     assert acc.cost_usd == 0.0
 
 
+# ------------------------------------------------------------------ an invocation's usage and the usage window
+
+SONNET = "claude-sonnet-5-5"
+
+
+def _model_usage(model=SONNET, read=0, write_5m=0, write_1h=0, output=0, inp=0) -> dict:
+    """A `modelUsage` / `model_usage_since_last_result` dict as Claude Code writes it (camel case, per model)."""
+    return {model: {"inputTokens": inp, "outputTokens": output, "cacheReadInputTokens": read,
+                    "cacheCreationInputTokens": write_5m + write_1h, "cacheCreationEphemeral5mInputTokens": write_5m,
+                    "cacheCreationEphemeral1hInputTokens": write_1h, "contextWindow": 1000000, "costUSD": 0.01}}
+
+
+def _result(since=None, turns=1, reason="completed", cumulative=None, is_error=False):
+    return json.dumps({"type": "result", "subtype": "success", "is_error": is_error, "session_id": "s", "result": "",
+                       "total_cost_usd": 0.5, "num_turns": turns, "terminal_reason": reason,
+                       "modelUsage": cumulative if cumulative is not None else {},
+                       "model_usage_since_last_result": since if since is not None else {}})
+
+
+def _main_message(msg_id, parent=None, **usage):
+    return json.dumps({"type": "assistant", "parent_tool_use_id": parent,
+                       "message": {"id": msg_id, "model": SONNET, "content": [], "usage": usage}})
+
+
+def _tool_output(content, parent=None):
+    return json.dumps({"type": "user", "parent_tool_use_id": parent, "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_x", "content": content}]}})
+
+
+def _init(**extra):
+    return json.dumps({"type": "system", "subtype": "init", "session_id": "s", "model": SONNET, **extra})
+
+
+def usage_of(cfg, *lines, **acc_kwargs) -> dict:
+    acc = _acc(cfg, **acc_kwargs)
+    for line in lines:
+        parse_claude_line(line, acc)
+    return acc.to_outcome(0).usage
+
+
+def test_usage_sums_every_result_of_the_invocation(cfg):  # Review Focus 3
+    lines = [_result(_model_usage(write_1h=130480), turns=64)]
+    lines += [_result(_model_usage(write_5m=300), turns=1) for _ in range(8)]
+    lines += [_result({}, turns=0, reason="api_error", is_error=True) for _ in range(10)]
+    u = usage_of(cfg, *lines)
+    assert u["tokens"]["cache_write_5m"] + u["tokens"]["cache_write_1h"] == 130480 + 8 * 300
+    assert u["turns"] == 72 and u["terminal_reason"] == "completed" and u["estimated"] is False
+
+
+def test_a_resumed_invocation_never_takes_the_sessions_cumulative_usage(cfg):
+    u = usage_of(cfg, _result({}, turns=0, cumulative=_model_usage(read=900)),
+                 _result(_model_usage(read=100), turns=1, cumulative=_model_usage(read=1000)))
+    assert u["tokens"]["cache_read"] == 100 and u["turns"] == 1 and u["estimated"] is False
+
+
+def test_a_result_with_no_usage_keeps_the_per_message_estimate(cfg):  # a killed or interrupted session
+    lines = [_main_message(f"m{n}", cache_read_input_tokens=100) for n in (1, 2, 3)]
+    lines.insert(1, _main_message("m1", cache_read_input_tokens=100))  # one more line of the same message
+    u = usage_of(cfg, *lines, _result({}, turns=9, reason=None, cumulative=_model_usage(read=5000)))
+    assert u["estimated"] is True and u["tokens"]["cache_read"] == 300 and u["turns"] == 3
+    assert u["usd"]["cache_read"] == pytest.approx(round(300 * 0.10 / 1e6, 6))
+
+
+def test_a_session_with_no_result_is_estimated_from_its_messages(cfg):
+    u = usage_of(cfg, _main_message("m1", input_tokens=5, output_tokens=7, cache_creation_input_tokens=40,
+                                    cache_creation={"ephemeral_1h_input_tokens": 30, "ephemeral_5m_input_tokens": 0}))
+    assert u["tokens"] == {"input": 5, "output": 7, "cache_read": 0, "cache_write_5m": 10, "cache_write_1h": 30}
+    assert (u["estimated"], u["turns"], u["terminal_reason"]) == (True, 1, None)
+
+
+def test_usage_splits_writes_by_ttl_and_prices_them(cfg):
+    # claude-sonnet-5-5: 1h 1_000_000 -> 4.0; 5m 1_000_000 -> 2.5; read 1_000_000 -> 0.1
+    u = usage_of(cfg, _result(_model_usage(read=1_000_000, write_5m=1_000_000, write_1h=1_000_000)))
+    assert u["tokens"] == {"input": 0, "output": 0, "cache_read": 1_000_000, "cache_write_5m": 1_000_000,
+                           "cache_write_1h": 1_000_000}
+    assert u["usd"] == {"input": 0.0, "output": 0.0, "cache_read": 0.1, "cache_write": 6.5}
+
+
+def test_creation_the_ttl_fields_do_not_cover_is_a_five_minute_write_and_an_unpriced_model_adds_nothing(cfg):
+    from agentflow.agents import price_split, usage_split
+
+    usage = {SONNET: {"cacheCreationInputTokens": 1000, "cacheCreationEphemeral1hInputTokens": 400},
+             "claude-unknown-9": {"inputTokens": 1_000_000, "outputTokens": 3}, "junk": "not a dict"}
+    assert usage_split(usage) == {"input": 1_000_000, "output": 3, "cache_read": 0, "cache_write_5m": 600,
+                                  "cache_write_1h": 400}
+    assert price_split(cfg.agents["claude"].prices, usage) == {
+        "input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": round((600 * 2.5 + 400 * 4.0) / 1e6, 6)}
+    assert usage_split({}) == {"input": 0, "output": 0, "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0}
+
+
+def test_prefix_write_and_tool_output_count_the_main_thread_only(cfg):
+    u = usage_of(cfg,
+                 _main_message("sub1", parent="toolu_a", cache_creation_input_tokens=999),
+                 _main_message("m1", cache_creation_input_tokens=25404),
+                 _tool_output("0123456789"),
+                 _tool_output("y" * 500, parent="toolu_a"),
+                 _main_message("m2", cache_creation_input_tokens=3000),
+                 _tool_output([{"type": "text", "text": "x" * 20}, {"type": "image", "source": {}}]))
+    assert (u["prefix_write"], u["tool_output_chars"]) == (25404, 30)
+    assert u["turns"] == 2  # the subagent's message is not a main-thread call
+
+
+def test_auto_memory_reads_the_init_events_memory_paths(cfg):
+    assert usage_of(cfg, _init(memory_paths=None))["auto_memory"] is False
+    assert usage_of(cfg, _init(memory_paths={"auto": "/home/u/.claude/projects/x/memory/"}))["auto_memory"] is True
+    assert usage_of(cfg)["auto_memory"] is None  # no init: unknown
+
+
+def _windows(**windows):
+    """A `rate_limit_event` whose `unifiedWindows` carries `name=(utilization, status)`."""
+    unified = {name: {"utilization": u, "resetsAt": 1794910800, "status": status} for name, (u, status) in windows.items()}
+    return json.dumps({"type": "rate_limit_event", "session_id": "s", "rate_limit_info": {
+        "status": "allowed", "resetsAt": 1794910800, "rateLimitType": "five_hour", "unifiedWindows": unified}})
+
+
+def test_a_usage_window_event_only_on_news(cfg):
+    acc = _acc(cfg, windows={"five_hour": (0.40, "allowed")})
+    events = []
+    for line in (_windows(five_hour=(0.40, "allowed")), _windows(five_hour=(0.44, "allowed")),
+                 _windows(five_hour=(0.45, "allowed")),
+                 _windows(five_hour=(0.45, "allowed_warning"), seven_day=(0.41, "allowed"))):
+        events += parse_claude_line(line, acc)
+    assert [(e["window"], e["utilization"], e["status"]) for n, e in events if n == "usage_window"] == \
+        [("five_hour", 0.45, "allowed"), ("five_hour", 0.45, "allowed_warning"), ("seven_day", 0.41, "allowed")]
+    assert events[0][1] == {"window": "five_hour", "utilization": 0.45, "resets_at": 1794910800, "status": "allowed"}
+    assert acc.limit["unifiedWindows"]["seven_day"]["utilization"] == 0.41  # the limit info is still kept
+
+
+def test_a_window_with_no_utilization_is_not_news(cfg):
+    acc = _acc(cfg)
+    line = json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "unifiedWindows": {
+        "five_hour": {"status": "allowed"}, "seven_day": "junk", "other_window": {"utilization": 0.5}}}})
+    assert parse_claude_line(line, acc) == [] and acc.windows == {}
+
+
+def test_a_codex_payload_is_estimated_with_no_turns():
+    o, _ = parse_file(FIXTURES / "codex_stream.jsonl", parser=parse_codex_line)
+    assert o.usage["estimated"] is True and o.usage["turns"] == 0 and set(o.usage["tokens"].values()) == {0}
+
+
+def test_run_puts_usage_on_agent_exited(fake, fake_claude, call):
+    fake.script({STEP: [{"model_id": SONNET, "cache_write_1h": 1000, "cache_read": 2000, "output_tokens": 5,
+                         "results": [{"model_usage_since_last_result": _model_usage(read=100), "num_turns": 2}]}]})
+    events, on_event = collect()
+    o = fake_claude.run(call, on_event)
+    exited = events[-1][1]
+    assert set(exited["usage"]) >= {"tokens", "usd", "turns", "prefix_write", "estimated"}
+    assert exited["usage"] == o.usage
+    assert exited["usage"]["tokens"]["cache_read"] == 2100 and exited["usage"]["tokens"]["cache_write_1h"] == 1000
+    assert exited["usage"]["tokens"]["output"] == 5
+    assert exited["usage"]["turns"] == 3 and exited["usage"]["estimated"] is False
+
+
+def test_the_fakes_result_reports_the_sessions_total_and_this_invocations_share(fake, fake_claude, call):
+    fake.script({STEP: [{"cache_read": 700}, {"cache_read": 300}]})
+    fake_claude.run(call, collect()[1])
+    o = fake_claude.run(dataclasses.replace(call, resume_session=fake_claude_session(call)), collect()[1])
+    results = [json.loads(line) for line in call.transcript_path.read_text().splitlines()
+               if json.loads(line).get("type") == "result"]
+    assert [r["model_usage_since_last_result"]["fake-sonnet"]["cacheReadInputTokens"] for r in results] == [700, 300]
+    assert results[-1]["modelUsage"]["fake-sonnet"]["cacheReadInputTokens"] == 1000
+    assert o.usage["tokens"]["cache_read"] == 300  # this invocation's share, never the session's total
+
+
+def fake_claude_session(call) -> str:
+    lines = [json.loads(line) for line in call.transcript_path.read_text().splitlines()]
+    return next(line["session_id"] for line in lines if line.get("type") == "result")
+
+
+def test_a_run_emits_only_the_windows_that_moved_since_the_runs_last(fake, fake_claude, call):
+    fake.script({STEP: [{"windows": {"five_hour": 0.42, "seven_day": 0.41}}]})
+    events, on_event = collect()
+    seeded = {"five_hour": {"utilization": 0.40, "resets_at": 1794910800, "status": "allowed", "at": "t"}}
+    fake_claude.run(dataclasses.replace(call, usage_windows=seeded), on_event)
+    assert [(p["window"], p["utilization"]) for n, p in events if n == "usage_window"] == [("seven_day", 0.41)]
+
+
 # --------------------------------------------------------------------------- why a call ended
 
 
@@ -916,3 +1195,31 @@ def test_a_codex_session_gets_no_claude_env_file(fake, cfg, call, monkeypatch):
     codex = CodexAgent(dataclasses.replace(cfg.agents["codex"], command=fake.command), cfg.context)
     codex.run(dataclasses.replace(call, env_base={"PATH": os.environ["PATH"]}), collect()[1])
     assert "CLAUDE_ENV_FILE" not in seen[STEP]
+
+
+# ------------------------------------------------------------------ a setting the CLI did not honour
+
+
+def _spec(cfg, **changes):
+    return dataclasses.replace(cfg.agents["claude"], **changes)
+
+
+def test_ignored_settings_reads_the_usage_split(cfg):
+    assert ignored_settings(_spec(cfg, cache_ttl="5m"), {"tokens": {"cache_write_1h": 10}}) == ["cache_ttl"]
+    assert ignored_settings(_spec(cfg, cache_ttl="1h"), {"tokens": {"cache_write_5m": 10}}) == ["cache_ttl"]
+    assert ignored_settings(_spec(cfg, lean=True), {"auto_memory": True}) == ["auto_memory"]
+    assert ignored_settings(_spec(cfg), {}) == []
+
+
+def test_ignored_settings_is_quiet_when_the_cli_did_what_was_asked(cfg):
+    assert ignored_settings(_spec(cfg, cache_ttl="5m"), {"tokens": {"cache_write_5m": 10}}) == []
+    assert ignored_settings(_spec(cfg, cache_ttl="1h"), {"tokens": {"cache_write_5m": 10, "cache_write_1h": 4}}) == []
+    assert ignored_settings(_spec(cfg, cache_ttl="1h"), {"tokens": {"cache_write_1h": 4}}) == []
+    assert ignored_settings(_spec(cfg, cache_ttl="cli"), {"tokens": {"cache_write_1h": 4}}) == []
+    assert ignored_settings(_spec(cfg, lean=False), {"auto_memory": True}) == []
+    assert ignored_settings(_spec(cfg, lean=True), {"auto_memory": False}) == []
+
+
+def test_ignored_settings_gives_both_when_both_apply(cfg):
+    usage = {"tokens": {"cache_write_1h": 10}, "auto_memory": True}
+    assert ignored_settings(_spec(cfg, cache_ttl="5m", lean=True), usage) == ["cache_ttl", "auto_memory"]

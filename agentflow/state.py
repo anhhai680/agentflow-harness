@@ -72,6 +72,8 @@ def initial_state() -> dict:
         "budget_usd": None,  # the hard limit: the run stops when its spend crosses it
         "soft_budget_usd": None,  # the soft limit: crossing it only notifies; None for a run started before it
         "context_windows": {},
+        "usage_window": {},  # the latest `usage_window` per window (`five_hour`, `seven_day`): the plan's usage limits
+        "cli_settings_ignored": [],  # the settings a `cli_setting_ignored` event noted: each once per run
         "env_dropped": [],
         "facts": [],
         "code_map": [],
@@ -446,6 +448,19 @@ def _on_context_window(state: dict, ev: dict) -> None:
     state["context_windows"][ev["model"]] = int(ev["tokens"])
 
 
+def _on_usage_window(state: dict, ev: dict) -> None:
+    """A usage window as the CLI last reported it (`utilization` 0..1). Other keys of the event (`sizer`) are ignored."""
+    state["usage_window"][str(ev["window"])] = {
+        "utilization": ev.get("utilization"), "resets_at": ev.get("resets_at"), "status": ev.get("status"),
+        "at": ev.get("ts"),
+    }
+
+
+def _on_cli_setting_ignored(state: dict, ev: dict) -> None:
+    if ev["setting"] not in state["cli_settings_ignored"]:
+        state["cli_settings_ignored"].append(ev["setting"])
+
+
 def _on_env_dropped(state: dict, ev: dict) -> None:
     """The inherited variables the run does not pass on: names only, never a value."""
     state["env_dropped"] = sorted({str(name) for name in ev.get("names") or []})
@@ -797,6 +812,8 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "subagent_started": _on_subagent_started,
     "subagent_finished": _on_subagent_finished,
     "context_window": _on_context_window,
+    "usage_window": _on_usage_window,
+    "cli_setting_ignored": _on_cli_setting_ignored,
     "env_dropped": _on_env_dropped,
     "gate_result": _on_gate_result,
     "review_result": _on_review_result,
@@ -864,6 +881,8 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "agent_started": (("session_id", "pid"),),
     "agent_session": ("session_id",),
     "context_window": ("model", "tokens"),
+    "usage_window": ("window",),
+    "cli_setting_ignored": ("setting",),
     "runner_error": ("error",),
     "preflight_checked": ("ok",),
     "watchdog_fired": ("key",),

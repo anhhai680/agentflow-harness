@@ -364,3 +364,15 @@ def test_done_shows_the_newest_first_up_to_the_cap():
     assert js(["board.js"], "doneCards(args, 3, true).hidden", done) == 0
     tied = [{"run_id": "a", "ended_at": None}, {"run_id": "b", "ended_at": None}, {"run_id": "c", "ended_at": "2026-11-10T00:00:00+00:00"}]
     assert [c["run_id"] for c in js(["board.js"], "doneCards(args, 9, false).cards", tied)] == ["c", "b", "a"]
+
+
+def test_the_token_table_reads_one_row_per_step_kind():
+    rows = js(["tokens.js"], "tokenRows(args)", [{"kind": "build.implement", "sessions": 101, "cost_usd": 48.2,
+              "usd": {"cache_write": 23.73, "cache_read": 12.4, "output": 11.98, "input": 0},
+              "turns_p50": 16, "turns_p90": 37, "prefix_write_p50": 25404, "tool_output_chars": 5950000}])
+    assert rows == [["build.implement", "101", "$48.20", "$23.73", "$12.40", "$11.98", "16 · 37", "25.4K", "6.0M chars"]]
+
+
+def test_compact_and_an_empty_table():
+    assert js(["tokens.js"], "[compact(999), compact(1000), compact(2500000)]", None) == ["999", "1.0K", "2.5M"]
+    assert js(["tokens.js"], "tokenRows(args)", []) == []

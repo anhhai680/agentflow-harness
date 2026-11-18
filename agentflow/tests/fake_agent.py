@@ -13,7 +13,16 @@ the session's total, as Claude does), permission_denials [{tool_name, tool_input
 result event), rate_limit {...} (sent as a `rate_limit_event`'s `rate_limit_info`), result_error bool
 (the result event says `is_error`), delete [relpath, ...] (files removed after the writes), hold_tool s (one
 `Bash` tool call that stays open, with nothing on the stream, for s seconds before its result), linger s
-(after the last line, stdout is closed and the process stays alive s more seconds, as a CLI's shutdown does).
+(after the last line, stdout is closed and the process stays alive s more seconds, as a CLI's shutdown does),
+stderr str (written to stderr before anything else, as a CLI that refuses a flag does: pair it with `no_init` and
+`exit`), model_id str (the model the stream names, default `fake-<alias>`), windows {"five_hour": u, "seven_day": u}
+(a `rate_limit_event` whose `unifiedWindows` carries those utilizations, status `allowed`, sent before `rate_limit`).
+
+Every result event carries `model_usage_since_last_result`, this call's usage (`inputTokens` 10, and the act keys
+cache_read, cache_write_5m, cache_write_1h and output_tokens, default 0, 0, 0 and 20), and `modelUsage`, the
+session's total over every `--resume` (as Claude does). Act key results [{...}] sends one more result event per
+payload after the first, each with `num_turns` 0 and an empty `model_usage_since_last_result` unless the payload
+sets them (one invocation can send several results).
 """
 
 from __future__ import annotations
@@ -84,6 +93,34 @@ def session_total(session: str, cost: float) -> float:
     return totals[session]
 
 
+def call_usage(act: dict) -> dict:
+    """This call's tokens, per model field as `model_usage_since_last_result` carries them."""
+    write_5m, write_1h = int(act.get("cache_write_5m", 0)), int(act.get("cache_write_1h", 0))
+    return {
+        "inputTokens": 10,
+        "outputTokens": int(act.get("output_tokens", 20)),
+        "cacheReadInputTokens": int(act.get("cache_read", 0)),
+        "cacheCreationInputTokens": write_5m + write_1h,
+        "cacheCreationEphemeral5mInputTokens": write_5m,
+        "cacheCreationEphemeral1hInputTokens": write_1h,
+    }
+
+
+def session_usage(session: str, model: str, usage: dict) -> dict:
+    """`modelUsage` as Claude reports it: the session's tokens so far, over every `--resume`."""
+    calls_path = os.environ.get("AGENTFLOW_FAKE_CALLS")
+    if not calls_path:
+        return {model: dict(usage)}
+    totals_path = Path(calls_path + ".usage")
+    totals = json.loads(totals_path.read_text(encoding="utf-8")) if totals_path.exists() else {}
+    models = totals.setdefault(session, {})
+    row = models.setdefault(model, {})
+    for key, tokens in usage.items():
+        row[key] = row.get(key, 0) + tokens
+    totals_path.write_text(json.dumps(totals), encoding="utf-8")
+    return models
+
+
 def main() -> int:
     argv = sys.argv[1:]
     step = os.environ.get("AGENTFLOW_STEP", "")
@@ -106,13 +143,21 @@ def main() -> int:
 
     act = next_act(step)
     session = flag_value(argv, "--resume") or str(uuid.uuid4())
-    model = "fake-" + (flag_value(argv, "--model") or "model")
+    model = act.get("model_id") or "fake-" + (flag_value(argv, "--model") or "model")
     exit_code = int(act.get("exit", 0))
     base = {"session_id": session}
 
+    if act.get("stderr"):
+        sys.stderr.write(act["stderr"])
+        sys.stderr.flush()
     emit({"type": "system", "subtype": "hook_started", "hook_name": "SessionStart:startup", **base})
     if not act.get("no_init"):
         emit({"type": "system", "subtype": "init", "model": model, "per_turn_effort_active": True, **base})
+    if act.get("windows"):
+        unified = {name: {"utilization": u, "resetsAt": 1794910800, "status": "allowed"}
+                   for name, u in act["windows"].items()}
+        emit({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "allowed", "resetsAt": 1794910800, "rateLimitType": "five_hour", "unifiedWindows": unified}, **base})
     if act.get("rate_limit"):
         emit({"type": "rate_limit_event", "rate_limit_info": act["rate_limit"], **base})
 
@@ -174,9 +219,16 @@ def main() -> int:
         return exit_code
     cost = session_total(session, float(act.get("cost", 0.01)))
     final_text = act.get("final_text", "done")
-    emit({"type": "result", "subtype": "success", "is_error": bool(act.get("result_error")), "result": final_text,
-          "total_cost_usd": cost, "num_turns": 1, "permission_denials": act.get("permission_denials", []),
-          "modelUsage": {model: {"contextWindow": WINDOW, "costUSD": cost}}, **base})
+    this_call = call_usage(act)
+    cumulative = {name: {**tokens, "contextWindow": WINDOW, "costUSD": cost}
+                  for name, tokens in session_usage(session, model, this_call).items()}
+    result = {"type": "result", "subtype": "success", "is_error": bool(act.get("result_error")), "result": final_text,
+              "total_cost_usd": cost, "num_turns": 1, "terminal_reason": "completed",
+              "permission_denials": act.get("permission_denials", []), "modelUsage": cumulative,
+              "model_usage_since_last_result": {model: {**this_call, "contextWindow": WINDOW}}, **base}
+    emit(result)
+    for extra in act.get("results", []):
+        emit({**result, "num_turns": 0, "model_usage_since_last_result": {}, **extra, **base})
     if act.get("linger"):
         sys.stdout.flush()
         sys.stdout.close()  # a std stream does not own its fd: close the fd too, so the reader sees EOF

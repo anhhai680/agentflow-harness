@@ -36,6 +36,14 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   present only for a run with a `route_profile`.
   `gate_cache_hit_rate` is the gates named by `gates_reused` events over those plus the `gate_result`s that were not
   skipped (0..1); it is present only when that total is above 0, and a rate has no true 0 to read as when absent.
+  `cache_write_share` is the cache-write USD over all the USD of the run (0..1, 4 places; present only when the run
+  has USD split by class), `prefix_write_tokens` the median tokens a fresh session wrote for its prefix (present when
+  one did), `session_turns_p90:<kind>` the p90 of the turns of a step kind's sessions (present for a kind with turns)
+  and `tool_output_kchars:<kind>` its tool output per session that reached the model (one with turns) in thousands of
+  characters (present for the same kinds: those with turns). The kind is `metrics.step_kind`, such as
+  `build.implement`. `compactions` counts `compacted` events and `usage_holds` the `run_held` events whose reason is
+  `usage limit` (a CI or outage hold is not one); both are always present. A run from before usage was recorded has
+  none of the other four.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
 
@@ -45,11 +53,13 @@ Pure functions over data: nothing here reads a file or the clock. Fields added t
 
 from __future__ import annotations
 
+import statistics
 from collections import Counter
 from collections.abc import Collection
 from typing import Any
 
 from agentflow.events import parse_iso
+from agentflow.metrics import _p90
 
 # family -> (the direction that is better, whether the key takes a parameter after `:`)
 FAMILIES: dict[str, tuple[str, bool]] = {
@@ -86,6 +96,12 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "informed_approval": ("higher", True),    # a phase: share of a person's approvals that viewed what it produced
     "gate_cache_hit_rate": ("higher", False),  # gate results reused, over those reused plus those that ran
     "route_upgrades": ("lower", False),       # times the runner raised the run's route profile mid-flight
+    "cache_write_share": ("lower", False),    # share of the run's cost that was cache writes, 0..1
+    "prefix_write_tokens": ("lower", False),  # median tokens a fresh session wrote to the cache for its prefix
+    "session_turns_p90": ("lower", True),     # a step kind: the 90th percentile of its sessions' turns
+    "tool_output_kchars": ("lower", True),    # a step kind: thousands of characters of tool output per session
+    "compactions": ("lower", False),          # times a session's context was compacted
+    "usage_holds": ("lower", False),          # times the run waited out a usage limit
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
@@ -94,10 +110,11 @@ FAMILIES: dict[str, tuple[str, bool]] = {
 COUNT_FAMILIES = frozenset({"fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections",
                             "ci_rounds", "rollovers", "progress_not_updated", "conformance_missing", "conformance_waived",
                             "gate_reruns", "refine_rounds", "effort_escalations", "undersized",
-                            "sizer_fallbacks", "full_suite_runs", "route_upgrades"})
+                            "sizer_fallbacks", "full_suite_runs", "route_upgrades", "compactions", "usage_holds"})
 DOUBT_FIELDS = (("doubt_blocking", "first_blocking"), ("doubt_rounds", "rounds"), ("doubt_noise", "noise"),
                 ("doubt_misread", "misread"), ("doubt_open", "open"), ("doubt_actionable", "actionable"))
 RECONCILE = "reconcile"  # `phase_rejected.kind` of a round the runner opens on a doubt review's findings
+USAGE_HOLD = "usage limit"  # `run_held.reason` of a run waiting for its plan's usage limit to reset
 RUNNER = "runner"  # `phase_rejected.by` for what the runner settles itself; a person's name is never this
 
 
@@ -247,6 +264,27 @@ def _informed(ev: dict) -> bool:
     return bool(produced) and produced <= pairs(ev.get("viewed"))
 
 
+def _cost_signals(metrics: dict) -> dict[str, float]:
+    """The cache write share of the run's USD, the median prefix write, and per step kind the p90 of its sessions'
+    turns and its tool output per session that reached the model, all read from the metrics' splits. A key is absent
+    for a run (or a kind) with nothing to measure: a log from before usage was recorded, or a session that never reached a model."""
+    out: dict[str, float] = {}
+    split = metrics.get("usd_split") or {}
+    total = sum(float(v or 0.0) for v in split.values())
+    if total > 0:
+        out["cache_write_share"] = round(float(split.get("cache_write") or 0.0) / total, 4)
+    kinds = metrics.get("by_step_kind") or {}
+    prefixes = [p for row in kinds.values() for p in row.get("prefix_writes") or []]
+    if prefixes:
+        out["prefix_write_tokens"] = statistics.median(prefixes)
+    for kind, row in kinds.items():
+        if row.get("turns"):  # a kind with usage: a pre-usage row has sessions and no turns
+            out[f"session_turns_p90:{kind}"] = _p90(row["turns"])
+            # per session that reached the model (one `turns` entry each): a zero-turn session doesn't dilute it
+            out[f"tool_output_kchars:{kind}"] = round(float(row.get("tool_output_chars") or 0) / len(row["turns"]) / 1000, 1)
+    return out
+
+
 def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str] = ()) -> dict[str, float]:
     """The signals of one run, only for what the run did. `metrics` is `metrics.run_metrics` for the same run.
     `full_suite` names the gates of the verify set; with it, `full_suite_runs` is present."""
@@ -304,14 +342,17 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
         elif etype == "route_profile":
             routed = True
             plain["route_upgrades"] += int(ev.get("upgraded_from") is not None)
-        elif etype in ("ci_round", "rolled_over", "progress_not_updated"):
-            plain[{"ci_round": "ci_rounds", "rolled_over": "rollovers"}.get(etype, etype)] += 1
+        elif etype in ("ci_round", "rolled_over", "progress_not_updated", "compacted"):
+            plain[{"ci_round": "ci_rounds", "rolled_over": "rollovers", "compacted": "compactions"}.get(etype, etype)] += 1
+        elif etype == "run_held" and ev.get("reason") == USAGE_HOLD:
+            plain["usage_holds"] += 1
     for key, (_level, source) in decided.items():  # a step's last decision: a retried plan sizer counts once
         if source == "fallback" and (phase := _phase_of(key)):
             counts["sizer_fallbacks"][phase] += 1
     for family, found in counts.items():
         out.update({f"{family}:{param}": n for param, n in found.items()})
-    out.update({name: plain[name] for name in ("ci_rounds", "rollovers", "progress_not_updated")})
+    out.update({name: plain[name] for name in ("ci_rounds", "rollovers", "progress_not_updated", "compactions",
+                                               "usage_holds")})
     if routed:  # only a run that was triaged has a route to upgrade
         out["route_upgrades"] = plain["route_upgrades"]
     for phase in metrics.get("phases") or []:
@@ -341,6 +382,7 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
     if full_suite:
         out["full_suite_runs"] = _full_suite_runs(events, full_suite)
     out.update(_gate_cache_hit_rate(events))
+    out.update(_cost_signals(metrics))
     return out
 
 
