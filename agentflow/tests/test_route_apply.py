@@ -179,6 +179,17 @@ def test_a_task_with_no_sizer_answers_keeps_its_review(flow_repo):
     assert len(flow_repo.events(run, "task_committed")) == 2
 
 
+def test_a_hand_written_skip_of_the_build_step_is_not_applied(flow_repo):
+    """`validate` refuses a profile that skips a `foreach` step; a pack run without it still builds every task."""
+    flow_repo.configure({**BIG, "route": {"mode": "on", "lanes": [], "profiles": {"S": {"skip": ["build/build"]}}}})
+    run = begin_build(flow_repo, plan_text(count=2))
+    seed(run, "S")
+    assert build(flow_repo, run) == ("done", True)
+    assert route_skips(run) == []
+    steps = [c["step"] for c in flow_repo.calls()]
+    assert IMPL.format(n=1) in steps and IMPL.format(n=2) in steps
+
+
 # --------------------------------------------------------------------------- nothing applied
 
 

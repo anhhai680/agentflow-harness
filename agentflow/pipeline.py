@@ -324,7 +324,7 @@ class _Loop:
             return "waiting_human"
         # A triage in the log is checked whatever the pack says now; off with none builds nothing: today's run.
         history = route_lane.triage_history(run.events.read(), first)
-        if self.cfg.route.mode != "off" or history:
+        if self.cfg.route.mode in ("observe", "on") or history:
             executor = self.executor()
             if executor.route_due():
                 if executor.size_route(first) == "stopped":

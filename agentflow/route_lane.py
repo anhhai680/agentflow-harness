@@ -85,7 +85,7 @@ class RouteLane:
     def route_due(self) -> bool:
         """Whether the run is still to be triaged: never with `route.mode: off`, for a lane outside `route.lanes`, in a
         dry run, once a phase has started, or once a `route_profile` is recorded."""
-        if self.cfg.route.mode == "off" or self.dry_run:
+        if self.cfg.route.mode not in ("observe", "on") or self.dry_run:
             return False
         if self.run.state.get("pipeline") not in self.cfg.route.lanes:
             return False
@@ -173,7 +173,7 @@ class RouteLane:
     def route_record(self) -> dict | None:
         """The run's last `route_profile` when a mid-flight upgrade may follow it: never with `route.mode: off`, in a
         dry run, or for a run never triaged (or whose record names no profile the rule knows)."""
-        if self.cfg.route.mode == "off" or self.dry_run:
+        if self.cfg.route.mode not in ("observe", "on") or self.dry_run:
             return None
         record = self.run.state.get("route")
         if not isinstance(record, dict) or record.get("profile") not in ROUTE_PROFILES:

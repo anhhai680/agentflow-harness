@@ -1965,3 +1965,56 @@ def test_route_on_with_no_profiles_warns(tmp_cfg):
         "route.mode is on but route.profiles is empty: every profile runs the full route"]
     assert errors(found) == []
     assert not [i for i in route_issues(tmp_cfg, {"mode": "off"}) if i.path == "route.profiles"]
+
+
+def test_a_bare_yaml_off_keeps_the_route_off_and_still_fails_validate(tmp_cfg):
+    path = tmp_cfg(with_route({"mode": "MODE", "profiles": {"S": {}}}))
+    path.write_text(path.read_text(encoding="utf-8").replace("mode: MODE", "mode: off"), encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.raw["route"]["mode"] is False  # YAML 1.1 reads a bare `off` as false
+    assert cfg.route.mode == "off"
+    found = [i for i in validate(cfg, path.parent.parent) if i.path == "route.mode"]
+    assert [i.level for i in found] == ["error"]
+    assert "quote it" in found[0].message
+    assert not [i for i in validate(cfg, path.parent.parent) if i.path == "route.profiles"]
+
+
+@pytest.mark.parametrize("mode", ["sometimes", True, 1, None])
+def test_a_mode_outside_the_list_runs_as_off(tmp_cfg, mode):
+    cfg = load_config(tmp_cfg(with_route({"mode": mode})))
+    assert cfg.route.mode == "off"
+
+
+def test_a_profile_may_not_skip_a_group_that_holds_an_obligations_step(tmp_cfg):
+    def patch(data: dict) -> None:
+        with_route({"profiles": {"S": {"skip": ["define/grill_open_questions"]}}})(data)
+        data["policy"]["obligations"]["grilled"] = {"lanes": ["feature"], "require": ["step:apply"]}
+    found = issues_for(tmp_cfg, patch)
+    messages = [i.message for i in found if i.level == "error" and i.path == "route.profiles.S.skip"]
+    assert messages == ["skipping define/grill_open_questions drops the obligation grilled"], found
+
+
+def test_a_profile_may_not_skip_a_step_whose_review_is_an_obligations_step(tmp_cfg):
+    def patch(data: dict) -> None:
+        with_route({"profiles": {"S": {"skip": ["define/contracts"]}}})(data)
+        phase_step(data, "define", "contracts")["review"] = {"id": "contracts_check", "role": "review",
+                                                             "prompt": "task_review.md"}
+        data["policy"]["obligations"]["checked"] = {"lanes": ["feature"], "require": ["step:contracts_check"]}
+    found = issues_for(tmp_cfg, patch)
+    messages = [i.message for i in found if i.level == "error" and i.path == "route.profiles.S.skip"]
+    assert messages == ["skipping define/contracts drops the obligation checked"], found
+
+
+@pytest.mark.parametrize("held, text", [("finish", "it holds the `finish` step finish, which ends every run"),
+                                        ("ci", "it holds the `ci` step ci, which ends every run"),
+                                        ("build", "it holds the `foreach` step build, which is the build itself")])
+def test_a_profile_may_not_skip_a_group_that_holds_a_finish_ci_or_foreach_step(tmp_cfg, held, text):
+    def patch(data: dict) -> None:
+        with_route({"profiles": {"S": {"skip": ["ship/wrapped"]}}})(data)
+        source = "build" if held == "build" else "ship"
+        inner = phase_step(data, source, held)
+        data["phases"][source]["steps"].remove(inner)
+        data["phases"]["ship"]["steps"].append({"id": "wrapped", "type": "group", "steps": [inner]})
+    found = issues_for(tmp_cfg, patch)
+    messages = [i.message for i in found if i.level == "error" and i.path == "route.profiles.S.skip"]
+    assert any(m.startswith("skipping ship/wrapped is refused") and text in m for m in messages), found

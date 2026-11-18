@@ -713,6 +713,14 @@ def test_explain_with_a_profile_marks_its_skips(cfg, tmp_path):
         explain(cfg, "feature", ctx, profile="M")
 
 
+def test_explain_never_marks_a_finish_ci_or_foreach_step_as_a_profile_skip(cfg, tmp_path):
+    cfg = with_profiles(cfg, XS={"skip": ("build/build", "ship/finish", "ship/ci")})
+    ctx = make_ctx(cfg, fixture_repo(tmp_path, "SPEC-demo.md"), "feature", {"module": "demo"})
+    by_key = lines_by_key(explain(cfg, "feature", ctx, profile="XS"))
+    for key in ("build/build", "ship/finish", "ship/ci"):
+        assert by_key[key].reason != "route profile XS", key
+
+
 def test_explain_without_a_profile_is_unchanged(cfg, tmp_path):
     cfg = with_profiles(cfg, XS={"skip": ("define/grill_open_questions",)})
     ctx = make_ctx(cfg, fixture_repo(tmp_path, "SPEC-demo.md"), "feature", {"module": "demo"})

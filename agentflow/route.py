@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from agentflow import sizing
-from agentflow.config import ROUTE_PROFILES, Config, RouteProfile
+from agentflow.config import ROUTE_PROFILES, Config, RouteProfile, Step
 
 XS_MAX_FILES = 2
 S_MAX_TASKS = 3
@@ -118,12 +118,22 @@ def applied(cfg: Config, record: dict | None) -> RouteProfile | None:
     return cfg.route.profiles.get(name) if isinstance(name, str) else None
 
 
-def skips(cfg: Config, record: dict | None, key: str) -> str | None:
-    """The applied profile's name when its `skip` holds the step `key`."""
+def skips(cfg: Config, record: dict | None, key: str, step: Step | None = None) -> str | None:
+    """The applied profile's name when its `skip` holds the step `key`. Never for a `step` that is, or holds, a
+    `finish`, `ci` or `foreach` step: `validate` refuses such a profile, and a pack run without it still keeps them."""
     profile = applied(cfg, record)
     if profile is None or key not in profile.skip or not isinstance(record, dict):
         return None
+    if step is not None and not skippable(step):
+        return None
     return record["profile"]
+
+
+def skippable(step: Step) -> bool:
+    """Whether a profile may skip `step`: not when it, a step it holds or its `review` is a `finish`, `ci` or `foreach` step."""
+    if step.type in ("finish", "ci") or step.foreach:
+        return False
+    return all(skippable(inner) for inner in ([step.review] if step.review is not None else []) + list(step.steps))
 
 
 def round_cap(cfg: Config, record: dict | None, phase: str) -> int | None:

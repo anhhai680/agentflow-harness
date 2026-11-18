@@ -60,6 +60,26 @@ def test_off_runs_no_triage(flow_repo):
     assert run.state["route"] is None
 
 
+def test_a_bare_yaml_off_runs_no_triage(flow_repo):
+    configure(flow_repo, False)  # what YAML makes of a bare `mode: off`
+    assert flow_repo.cfg.raw["route"]["mode"] is False
+    run = begin(flow_repo)
+    assert go(flow_repo, run) == "awaiting_approval"
+    assert triage_calls(flow_repo) == [] and flow_repo.events(run, "route_profile") == []
+    assert run.state["route"] is None
+
+
+def test_the_runtime_gates_read_a_mode_outside_the_list_as_off(flow_repo):
+    """Defence in depth: a `Route` built by hand with a mode `_build_route` would never give still triages nothing."""
+    configure(flow_repo, "on")
+    run = begin(flow_repo)
+    executor = executor_for(flow_repo, run)
+    flow_repo.cfg.route.mode = "False"
+    assert executor.route_due() is False
+    seed(run, "S")
+    assert executor.route_record() is None
+
+
 def test_on_records_the_profile_before_define(flow_repo):
     configure(flow_repo, "on")
     flow_repo.script({TRIAGE: [answer(mechanical="yes", files=1, tasks=1)]})

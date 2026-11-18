@@ -1162,7 +1162,9 @@ def _build_route(raw: Any) -> Route:
             if isinstance(rounds, dict) else {},
             per_task_review=review if isinstance(review, bool) else True,
         )
-    return Route(mode=str(raw.get("mode", "off")),
+    # a mode outside the list runs as `off`, today's route: YAML reads a bare `off` as false, and `validate` names it
+    mode = raw.get("mode", "off")
+    return Route(mode=mode if mode in ("observe", "on") else "off",
                  lanes=_string_list(raw.get("lanes", ["feature"]), "route.lanes"),
                  profiles=profiles)
 
@@ -2196,7 +2198,7 @@ class _Validator:
             if lane not in cfg.lanes:
                 self.error("route.lanes", f"unknown lane '{lane}'; known: {', '.join(cfg.lanes)}")
         profiles = raw.get("profiles")
-        if mode != "off" and not profiles:
+        if mode in ("observe", "on") and not profiles:
             self.add("warning", "route.profiles",
                      "route.mode is on but route.profiles is empty: every profile runs the full route")
         if not isinstance(profiles, dict):
@@ -2240,8 +2242,9 @@ class _Validator:
 
     def _route_skip(self, where: str, skip: Any, route_lanes: list[str], needed_steps: dict[str, str],
                     needed_phases: dict[str, str]) -> None:
-        """One profile's `skip` list: each entry names a top-level step of a phase that no obligation, no `finish`
-        or `ci` step and no `foreach` step depends on, and no phase an approval is required for is left empty."""
+        """One profile's `skip` list: each entry names a top-level step of a phase that is not, and holds no (nested or
+        `review`) step that is, a `finish`, `ci` or `foreach` step or an obligation's `step:<id>` evidence, and no
+        phase an approval is required for is left empty."""
         cfg = self.cfg
         if not isinstance(skip, list):
             self.error(where, "skip is a list of `<phase>/<id>` entries")
@@ -2259,13 +2262,21 @@ class _Validator:
             step = next((s for s in phase.steps if s.id == step_id), None)
             if step is None:
                 self.error(where, f"'{entry}': no step '{step_id}' in {phase_name}; a profile skips a top-level step")
-            elif step.type in ("finish", "ci"):
-                self.error(where, f"skipping {entry} is refused: the `{step.type}` step ends every run")
-            elif step.foreach:
-                self.error(where, f"skipping {entry} is refused: a `foreach` step is the build itself, which a "
+                continue
+            # the step and all it holds (a group's or repeat's steps, a `review`): `step:<id>` evidence matches any
+            walked = list(_walk_steps([step]))
+            ends = next((s for s in walked if s.type in ("finish", "ci")), None)
+            build = next((s for s in walked if s.foreach), None)
+            needed = next((s for s in walked if s.id in needed_steps), None)
+            if ends is not None:
+                held = f"the `{ends.type}` step" if ends is step else f"it holds the `{ends.type}` step {ends.id}, which"
+                self.error(where, f"skipping {entry} is refused: {held} ends every run")
+            elif build is not None:
+                held = "a `foreach` step is" if build is step else f"it holds the `foreach` step {build.id}, which is"
+                self.error(where, f"skipping {entry} is refused: {held} the build itself, which a "
                            "profile trims by `per_task_review`")
-            elif step_id in needed_steps:
-                self.error(where, f"skipping {entry} drops the obligation {needed_steps[step_id]}")
+            elif needed is not None:
+                self.error(where, f"skipping {entry} drops the obligation {needed_steps[needed.id]}")
             else:
                 skipped.setdefault(phase_name, set()).add(step_id)
         for phase_name, ids in skipped.items():

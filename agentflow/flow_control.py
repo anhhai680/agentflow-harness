@@ -271,7 +271,7 @@ class StepControl:
         A top-level step (`<phase>/<id>`) the run's applied route profile skips is skipped before its `when` is decided."""
         if step.reconciles and not doubt.in_reconcile_round(self.run.state, phase.name):
             return False, None, doubt.RECONCILE_ONLY, None
-        profile = route.skips(self.cfg, self.run.state.get("route"), key) if key.count("/") == 1 else None
+        profile = route.skips(self.cfg, self.run.state.get("route"), key, step) if key.count("/") == 1 else None
         if profile is not None:
             return False, f"route:{profile}", f"route profile {profile} skips it", None
         if step.when is not None:

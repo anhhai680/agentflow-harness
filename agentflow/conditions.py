@@ -16,7 +16,7 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agentflow import finished, pack, sources, work_source
+from agentflow import finished, pack, route, sources, work_source
 from agentflow.config import ON_UNKNOWN_VALUES, Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.doubt import RECONCILE_ONLY
 from agentflow.gitops import GhError, changed_files, gh_json
@@ -519,7 +519,8 @@ def _explain_steps(
     skip = cfg.route.profiles[profile].skip if profile is not None else ()
     for step in for_lane(steps, ctx.values["lane"]):
         key = f"{prefix}/{step.id}"
-        if key in skip and not step.reconciles:  # a top-level step: a reconcile step keeps its own check first
+        # a top-level step: a reconcile step keeps its own check first, and no profile skips finish, ci or foreach
+        if key in skip and not step.reconciles and route.skippable(step):
             verdict, reason = "skip", f"route profile {profile}"
         else:
             verdict, reason = _step_verdict(cfg, step, ctx)

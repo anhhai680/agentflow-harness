@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agentflow import route
-from agentflow.config import ROUTE_PROFILES, Route, RouteProfile
+from agentflow.config import ROUTE_PROFILES, Route, RouteProfile, Step
 
 NO = {q: "no" for q in ("interface", "risk", "ambiguity", "breadth", "novelty", "mechanical")}
 
@@ -163,3 +163,19 @@ def test_reviews_task_keeps_risky_and_unknown_tasks():
     assert route.reviews_task(s, NO, False) is False
     assert route.reviews_task(None, NO, False) is True
     assert route.reviews_task(GRID["M"], NO, False) is True
+
+
+@pytest.mark.parametrize("step", [
+    Step(id="finish", type="finish"),
+    Step(id="ci", type="ci"),
+    Step(id="build", type="agent", foreach="plan_task"),
+    Step(id="wrapped", type="group", steps=[Step(id="finish", type="finish")]),
+    Step(id="wrapped", type="group", steps=[Step(id="build", type="agent", foreach="plan_task")]),
+])
+def test_a_hand_written_profile_never_skips_a_finish_ci_or_foreach_step(cfg, step):
+    """`validate` refuses such a profile; a pack nobody validated must still not skip the step at run time."""
+    key = f"ship/{step.id}"
+    cfg.route = Route(mode="on", lanes=["feature"], profiles={"XS": RouteProfile(skip=(key,))})
+    record = {"profile": "XS", "applied": True}
+    assert route.skips(cfg, record, key, step) is None
+    assert route.skips(cfg, record, key, Step(id=step.id, type="agent")) == "XS"
