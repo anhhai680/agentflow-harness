@@ -136,6 +136,53 @@ def test_agent_rows(run):
     assert run.state["spend_usd"] == 1.25
 
 
+def _pin(rules: bool, digest: str = "a") -> dict:
+    return {"path": f"/x/brief/build-build-{digest * 12}.md", "sha256": digest * 64, "rules": rules,
+            "skill": False, "files": False, "phase": "build", "role": "build"}
+
+
+def _started(seq: int, pid: int, session: str | None, brief: dict | None, key: str = "build.t1") -> dict:
+    return {"seq": seq, "type": "agent_started", "ts": "t", "key": key, "step": key, "pid": pid,
+            "session_id": session, "brief": brief, "phase": "build", "role": "build"}
+
+
+def _session(seq: int, pid: int, session: str, key: str = "build.t1") -> dict:
+    return {"seq": seq, "type": "agent_session", "ts": "t", "key": key, "pid": pid, "session_id": session}
+
+
+def test_a_fresh_call_that_dies_before_its_session_never_pins_the_old_session():
+    # A fresh call (a rollover, a replaced brief) records a new pin, then dies before its `agent_session`: the row
+    # must keep the session it had with that session's own pin, never the old session with the new pin.
+    new = _pin(True, "b")
+    row = replay([_started(1, 11, None, None), _session(2, 11, "SESSION-A"), _started(3, 12, None, new)])
+    row = row["steps"]["build.t1"]
+    assert row["session_id"] == "SESSION-A" and row["brief"] is None and row["brief_session"] == "SESSION-A"
+    # Once its session is known, the new pin is the row's, bound to that session.
+    row = replay([_started(1, 11, None, None), _session(2, 11, "SESSION-A"), _started(3, 12, None, new),
+                  _session(4, 12, "SESSION-B")])["steps"]["build.t1"]
+    assert row["session_id"] == "SESSION-B" and row["brief"] == new and row["brief_session"] == "SESSION-B"
+
+
+def test_a_resumed_call_binds_the_pin_it_passes_to_the_session_it_resumes():
+    old, new = _pin(True, "a"), _pin(False, "b")
+    events = [_started(1, 11, None, old), _session(2, 11, "SESSION-A"), _started(3, 12, None, new),
+              _started(4, 13, "SESSION-A", old)]  # the fresh call died; a restart resumed the old session
+    row = replay(events)["steps"]["build.t1"]
+    assert (row["session_id"], row["brief"], row["brief_session"]) == ("SESSION-A", old, "SESSION-A")
+    assert "brief_pending" not in row  # the dead fresh call's pin is gone: a later session event can't promote it
+    row = replay([*events, _session(5, 13, "SESSION-A")])["steps"]["build.t1"]
+    assert (row["session_id"], row["brief"], row["brief_session"]) == ("SESSION-A", old, "SESSION-A")
+
+
+def test_a_shared_session_carries_its_pin_to_the_next_task():
+    pin = _pin(True)
+    state = replay([_started(1, 11, None, pin, key="build.t1"), _session(2, 11, "S", key="build.t1"),
+                    _started(3, 12, "S", pin, key="build.t2"), _session(4, 12, "S", key="build.t2")])
+    for key in ("build.t1", "build.t2"):
+        row = state["steps"][key]
+        assert (row["session_id"], row["brief"], row["brief_session"]) == ("S", pin, "S"), key
+
+
 def test_effort_down_and_refused(run):
     run.emit("step_started", key="plan/x", phase="plan")
     run.emit("agent_started", agent="claude", pid=1, model="opus", effort="medium", step="plan/x", sizing=True)

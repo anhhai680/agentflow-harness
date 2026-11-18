@@ -54,8 +54,8 @@ def read_rules(checkout: Path, base_sha: str | None, files: Sequence[str]) -> tu
     proven (`gitops.verified_tree_paths`), a memory file the brief would not replace (`memory_blockers`), or a
     listed file in the tree that `read_blob` refuses (too big, not a regular file, a symlink out of the repository or
     under `.agentflow`, a tampered object). A listed file that is not in the tree is left out. `validate`'s
-    `project.agent_rules` warnings check the same things at `HEAD`, symlinks included, from `tree_paths` (a warning
-    is advice, so its listing need not be proven)."""
+    `project.agent_rules` warnings check the same things at `HEAD`, symlinks included, from the same bounded
+    `verified_tree_paths` listing."""
     if not _full(base_sha) or not files or any(rules_path_problem(entry) for entry in files):
         return [], False
     rules = list(dict.fromkeys(PurePosixPath(entry).as_posix() for entry in files))

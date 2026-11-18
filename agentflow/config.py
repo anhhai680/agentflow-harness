@@ -170,7 +170,7 @@ PROMPT_PLACEHOLDERS = frozenset(
         "base_ref",
         "self_checks",
         "reconcile_output",
-        "in_brief",
+        "in_brief",  # reserved: always "" (`lanes.build_prompt`), so a pack template may name it today
         # sizer prompts (`sizing_lane.py`)
         "task_card",
         "task_cards",
@@ -183,6 +183,10 @@ PROMPT_PLACEHOLDERS = frozenset(
 BRIEF_PLACEHOLDERS = frozenset({"run", "run_dir", "progress", "handoff", "questions", "module", "module_pkg", "lane",
                                 "slug"})
 BRIEF_FILES = ("_preamble.md", "_result.md")
+# A slot line in the preamble: only a pack's old copy of `_preamble.md` still has them (they moved to the step head),
+# so they are dropped whole, CRLF and end of file included, and the facts never show twice.
+PREAMBLE_SLOT = re.compile(r"^\{(run_facts|code_map|lessons)\}[ \t]*(?:\r?\n|\Z)", re.MULTILINE)
+EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n?", re.DOTALL)
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
                     "--dangerously-skip-permissions", "--permission-mode")
 RUNNER_FLAGS = ("--setting-sources",)  # set by the runner from `agents.claude.user_settings`, never by base_args
@@ -1110,23 +1114,35 @@ def _has_import(text: str) -> bool:
 
 def memory_blockers(paths: list[str], read: Callable[[str], str | None], rules: Sequence[str]) -> list[str]:
     """Why a run brief can't carry the repository's rules, given a tree's file list and a reader for a listed rules
-    file (None when it can't be read): Claude's own memory files the brief would not replace."""
-    listed = set(paths)
-    out: list[str] = []
-    if ".claude/CLAUDE.md" in listed:
-        out.append(".claude/CLAUDE.md")
-    if any(path.startswith(".claude/rules/") for path in paths):
+    file (None when it can't be read): Claude's own memory files the brief would not replace. Names are matched with
+    their case folded, since on a case-insensitive disk Claude opens `claude.md` as `CLAUDE.md`; a `CLAUDE.local.md`
+    anywhere is one too (Claude loads it beside `CLAUDE.md`)."""
+    listed = sorted(set(paths))
+    folded = {path: path.casefold() for path in listed}
+    out: list[str] = [path for path in listed if folded[path] == ".claude/claude.md"]
+    if any(name.startswith(".claude/rules/") for name in folded.values()):
         out.append(".claude/rules/")
-    for path in sorted(listed):
-        if path.endswith("/CLAUDE.md") and path != ".claude/CLAUDE.md":
+    for path in listed:
+        name = folded[path]
+        if (name.endswith("/claude.md") and name != ".claude/claude.md") or name.rsplit("/", 1)[-1] == "claude.local.md":
             out.append(path)
     for rule in rules:
         text = read(rule)
         if text is not None and _has_import(text):
             out.append(f"{rule}: @ import")
-    if "CLAUDE.md" in listed and "CLAUDE.md" not in {PurePosixPath(rule).as_posix() for rule in rules}:
-        out.append("CLAUDE.md is not in agent_rules")
+    named = {PurePosixPath(rule).as_posix() for rule in rules}
+    out.extend(f"{path} is not in agent_rules" for path in listed if folded[path] == "claude.md" and path not in named)
     return out
+
+
+def brief_partial(name: str, text: str) -> tuple[str, list[str]]:
+    """`_preamble.md` or `_result.md` (`name`) as a run's brief holds it, and the placeholders in it that the brief
+    can't fill (outside `BRIEF_PLACEHOLDERS`, in order): CRLF made LF, and in the preamble the effort-check block and an
+    old copy's slot lines dropped. The runner (`lanes.build_brief`) and `validate` both read it here."""
+    text = text.replace("\r\n", "\n")
+    if name == "_preamble.md":
+        text = PREAMBLE_SLOT.sub("", EFFORT_BLOCK.sub("", text))
+    return text, list(dict.fromkeys(found for found in _PLACEHOLDER.findall(text) if found not in BRIEF_PLACEHOLDERS))
 
 
 def _work_source(raw: dict) -> WorkSource | None:
@@ -1580,12 +1596,34 @@ class _Validator:
             for name in names:
                 if name not in PROMPT_PLACEHOLDERS:
                     self.error(label, f"unknown placeholder '{{{name}}}'")
-            outside = [name for name in names if name not in BRIEF_PLACEHOLDERS]
-            if outside and self.cfg.context.run_brief and label in {f"prompts/{name}" for name in BRIEF_FILES}:
+            brief_file = label in {f"prompts/{name}" for name in BRIEF_FILES}
+            outside = brief_partial(file.name, text)[1] if brief_file else []
+            if outside and self.cfg.context.run_brief:
                 shown = ", ".join(f"{{{name}}}" for name in outside)
                 self.add("warning", label, f"holds {shown}, which a run's brief cannot fill: sessions of this pack "
                                            "get no brief (the whole prompt is sent every time). Move step-specific "
                                            "lines into the step's own template, or set context.run_brief: false")
+
+    def brief_overrides(self) -> None:
+        """While `context.run_brief` is on, a pack override of `_preamble.md` or `_result.md` must be committed: a
+        run's brief reads it from the run's fork commit (`lanes.build_brief`), and gives no brief while that commit
+        has none it can read."""
+        if not self.cfg.context.run_brief:
+            return
+        own = [name for name in BRIEF_FILES
+               if pack.prompt_path(self.cfg.path, name) == self.cfg.path.parent / "prompts" / name]
+        if not own:
+            return
+        from agentflow import gitops
+
+        root = pack.checkout_root(self.repo)
+        head = gitops.commit_at(root, "HEAD")
+        if head is None:
+            return
+        for name in own:
+            if gitops.read_blob(root, head, f".agentflow/prompts/{name}", AGENT_RULE_MAX_BYTES) is None:
+                self.add("warning", f"prompts/{name}", "is not committed at HEAD (or can't be read there): run "
+                         "sessions get no brief until it is committed (the brief reads it from the run's fork commit)")
 
     def prompt_drift(self) -> None:
         """The pack's prompt overrides that hold text the engine retired, or copy an engine prompt unchanged."""
@@ -1807,14 +1845,19 @@ class _Validator:
 
         root = pack.checkout_root(self.repo)
         head = gitops.commit_at(root, "HEAD")
-        tree = gitops.tree_paths(root, head) if head is not None else None
-        if head is None or tree is None:
+        if head is None:
+            return
+        tail = "run sessions will let Claude load its own memory files instead"
+        # The bounded, proven listing the brief uses: a crafted tree can name billions of paths from a few KB.
+        tree = gitops.verified_tree_paths(root, head)
+        if tree is None:
+            self.add("warning", "project.agent_rules",
+                     f"could not list the tree at HEAD within limits (or verification failed): {tail}")
             return
         rules = [PurePosixPath(entry).as_posix() for entry in raw]
-        tail = "run sessions will let Claude load its own memory files instead"
         for rule in rules:
-            if rule != DEFAULT_AGENT_RULES[0] and rule not in tree:
-                self.add("warning", "project.agent_rules", f"{rule} is not committed at HEAD: {tail}")
+            if rule != DEFAULT_AGENT_RULES[0] and rule not in tree:  # left out; the brief carries the rest
+                self.add("warning", "project.agent_rules", f"{rule} is not committed at HEAD: the brief leaves it out")
         listed = set(tree)
         texts: dict[str, str | None] = {}
 
@@ -1830,9 +1873,9 @@ class _Validator:
 
         for rule in dict.fromkeys(rules):
             if rule in listed and read(rule) is None:
-                self.add("warning", "project.agent_rules", f"{rule} is no regular file of at most "
-                         f"{AGENT_RULE_MAX_BYTES} bytes, nor a symlink to one inside the repository and outside "
-                         f".agentflow, at HEAD: {tail}")
+                self.add("warning", "project.agent_rules", f"{rule} is not a regular file of at most "
+                         f"{AGENT_RULE_MAX_BYTES} bytes at HEAD (nor a symlink to one inside the repository and "
+                         f"outside .agentflow), or its object failed verification: {tail}")
         for reason in memory_blockers(tree, read, rules):
             self.add("warning", "project.agent_rules", f"{reason}: {tail}")
 
@@ -2780,5 +2823,6 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.overlays()
     v.dashboard()
     v.templates()
+    v.brief_overrides()
     v.prompt_drift()
     return v.issues

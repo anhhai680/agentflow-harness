@@ -925,14 +925,41 @@ def _cat_file_batch(repo: Path, shas: list[str], limit: int) -> dict[str, Blob] 
 
 def tree_paths(repo: Path, sha: str) -> list[str] | None:
     """Every file path in the tree of `sha`, from `git ls-tree -r`; a name that is not valid UTF-8 is left out.
-    `None` when git cannot read it (no such commit, not a repository, git failed or timed out)."""
+    `None` when git cannot read it (no such commit, not a repository, git failed or timed out), and when the listing
+    passes `verified_tree_paths`' bounds: more than `_LIST_MAX_PATHS` entries, more than `_LIST_MAX_PATH_BYTES` bytes
+    (each name with its NUL) or `_LIST_DEADLINE_S`. A few KB of shared subtrees can name billions of paths, so the
+    output is counted as it streams and git is killed past a bound: it is never held whole. Not proven: a caller that
+    relies on the listing uses `verified_tree_paths`."""
     try:
-        proc = subprocess.run(["git", *HARDENED, "ls-tree", "-r", "--name-only", "-z", sha], cwd=Path(repo),
-                              capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL)
-    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
+        proc = subprocess.Popen(["git", *HARDENED, "ls-tree", "-r", "--name-only", "-z", sha], cwd=Path(repo),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                env={**os.environ, "GIT_NO_LAZY_FETCH": "1"})
+    except (OSError, ValueError, TypeError):
         return None
+    timer = threading.Timer(_LIST_DEADLINE_S, proc.kill)  # a git that writes nothing never blocks the read for good
+    timer.daemon = True
+    timer.start()
+    chunks: list[bytes] = []
+    size = entries = 0
+    stream = proc.stdout
+    try:
+        while stream is not None and (chunk := stream.read1(65536)):
+            size += len(chunk)
+            entries += chunk.count(b"\0")
+            if size > _LIST_MAX_PATH_BYTES or entries > _LIST_MAX_PATHS:
+                return None
+            chunks.append(chunk)
+        if proc.wait() != 0:
+            return None
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+        if stream is not None:
+            stream.close()
+        proc.wait()
     out: list[str] = []
-    for raw in proc.stdout.split(b"\0"):
+    for raw in b"".join(chunks).split(b"\0"):
         try:
             name = raw.decode("utf-8")
         except UnicodeDecodeError:

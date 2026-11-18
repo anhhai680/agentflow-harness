@@ -297,8 +297,16 @@ def _on_agent_started(state: dict, ev: dict) -> None:
         if not sizing:
             row["sized"] = True
             # The session's pinned brief (`lanes.build_brief`), on every call: a shared session's later task carries it
-            # on. A call with none (a session from before the brief, Codex, `run_brief` off) leaves None.
-            row["brief"] = ev["brief"] if isinstance(ev.get("brief"), dict) else None
+            # on. A call with none (a session from before the brief, Codex, `run_brief` off) has None. The pin is bound
+            # to its session (`brief_session`), and the row's `brief` always belongs to its `session_id`: a resumed
+            # call's pin is the resumed session's, and a fresh call's waits (`brief_pending`) for that call's
+            # `agent_session`, so a fresh call that dies before it never pairs the old session with the new pin.
+            pin = ev["brief"] if isinstance(ev.get("brief"), dict) else None
+            if session:
+                row["brief"], row["brief_session"] = pin, session
+                row.pop("brief_pending", None)
+            else:
+                row["brief_pending"] = pin
 
 
 def _on_run_held(state: dict, ev: dict) -> None:
@@ -321,6 +329,10 @@ def _on_agent_session(state: dict, ev: dict) -> None:
         step = _step_row(state, key)
         step["session_id"] = session
         step["model"] = ev.get("model") or step["model"]
+        if "brief_pending" in step:  # the fresh call's session is known: its pin is the row's now
+            step["brief"] = step.pop("brief_pending")
+        if "brief" in step:  # the call in flight passed the row's pin (`_on_agent_started`): bound to its session
+            step["brief_session"] = session
 
 
 def _on_agent_turn(state: dict, ev: dict) -> None:

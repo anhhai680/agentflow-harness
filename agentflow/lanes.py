@@ -36,7 +36,7 @@ from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
 from agentflow.commit_checks import RUNNER_COMMITS, runner_head
 from agentflow.conditions import Ctx, fmt, skill_text
-from agentflow.config import BRIEF_PLACEHOLDERS, Config, Phase, Step, resolve_model
+from agentflow.config import BRIEF_PLACEHOLDERS, EFFORT_BLOCK, PREAMBLE_SLOT, Config, Phase, Step, brief_partial, resolve_model
 from agentflow.feature_lane import FeatureLane
 from agentflow.flow_control import (
     StepControl,
@@ -74,21 +74,16 @@ DEFAULT_TEMPLATE = "step.md"
 DEFAULT_REFINE = "refine.md"
 DEFAULT_ROLE = "build"
 EMPTY_SLOT = re.compile(r"^\{(run_facts|code_map|lessons)\}\n\n", re.MULTILINE)  # a step head slot, dropped whole when empty
-# A slot line in the preamble: only a pack's old copy of `_preamble.md` still has them (they moved to the step head),
-# so they are dropped whole, CRLF and end of file included, and the facts never show twice.
-PREAMBLE_SLOT = re.compile(r"^\{(run_facts|code_map|lessons)\}[ \t]*(?:\r?\n|\Z)", re.MULTILINE)
 RESULT_REMINDER = ("When you finish, write your result JSON to `{result_file}` again (the runner removed the last "
                    "one), as the \"When you finish\" section of your instructions says.")
 CODE_MAP_LEAD = ("Earlier sessions of this run found where this code lives. Open it at the line given instead of "
                  "searching for it, and check a signature before you rely on it.")
 RESOLVER_FINDINGS_SHOWN = 3
 RESOLVER_FINDING_MAX = 600
-EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n?", re.DOTALL)
 SKILL_LINE = re.compile(r"\b([Uu])se the `([\w.:-]+)` skill")
 SKILL_HEADING = re.compile(r"#{1,6}[ \t]+.*`\{skill\}`")
 SKILL_BLOCK = ("## The `{skill}` skill\n\nIts full text follows, so you already have it: do not load it.\n\n{brief}")
 SKILL_POINTER_BLOCK = "## The `{skill}` skill\n\n{brief}"  # the skill is in the session's brief: `{brief}` points there
-PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 BRIEF_DIR = "brief"  # under the run's directory (the runs root, which no agent edits): `<phase>-<role>-<digest12>.md`
 BRIEF_FLAGS = ("rules", "skill", "files")
@@ -340,7 +335,7 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
         body = f"{refine}\n\nThe step as it was first given:\n\n{body}"
     if mode == "refine" or (ctx.run is not None and ctx.run.state.get("refine")):  # a step can first run in a refine round
         values.update(_refine_values(ctx, rec))
-    values["in_brief"] = ""
+    values["in_brief"] = ""  # reserved (`config.PROMPT_PLACEHOLDERS`): always empty for now
     values.update({name: str(value) for name, value in extra.items()})
     parts = (step_head, body) if brief else (preamble, step_head, body, _template(cfg, RESULT))
     text = "\n\n".join(part.strip() for part in parts)
@@ -385,16 +380,13 @@ def _assemble_brief(cfg: Config, run: Run, phase_name: str, step: Step, role: st
 
     partials: dict[str, str] = {}
     for name in (PREAMBLE, RESULT):
-        text = _brief_partial(cfg, checkout, base, name)
-        if text is None:
+        raw_text = _brief_partial(cfg, checkout, base, name)
+        if raw_text is None:
             return "prompt override not at base_sha"
-        partials[name] = text
-    preamble = PREAMBLE_SLOT.sub("", EFFORT_BLOCK.sub("", partials[PREAMBLE]))
-    result = partials[RESULT]
-    for text in (preamble, result):
-        outside = [name for name in PLACEHOLDER.findall(text) if name not in BRIEF_PLACEHOLDERS]
+        partials[name], outside = brief_partial(name, raw_text)  # the same reading `validate` warns from
         if outside:
             return f"prompt override holds {{{outside[0]}}}"
+    preamble, result = partials[PREAMBLE], partials[RESULT]
     fill = {name: str(values[name]) for name in BRIEF_PLACEHOLDERS if name in values}
 
     rules, carries = brief_mod.read_rules(checkout, base, cfg.project.agent_rules)
@@ -464,8 +456,23 @@ def _pin(value: object) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+PIN_FIELDS: dict[str, type] = {"path": str, "sha256": str, "rules": bool, "skill": bool, "files": bool, "phase": str,
+                               "role": str}  # what `build_brief` pins, every one of them
+PIN_OPTIONAL: dict[str, type] = {"rules_fallback": str}
+PIN_SHA = re.compile(r"[0-9a-f]{64}")
+
+
+def _pin_ok(pin: dict) -> bool:
+    """`pin` has exactly the fields `build_brief` gives, of their types (a flag is a bool, never a truthy stand-in) and
+    a full SHA-256 digest. Anything else is malformed: the session's brief is replaced, never trusted."""
+    fields = {**PIN_FIELDS, **PIN_OPTIONAL}
+    if not set(PIN_FIELDS) <= set(pin) <= set(fields):
+        return False
+    return all(type(pin[key]) is fields[key] for key in pin) and bool(PIN_SHA.fullmatch(pin["sha256"]))
+
+
 def _same_flags(a: dict, b: dict) -> bool:
-    return all(bool(a.get(flag)) == bool(b.get(flag)) for flag in BRIEF_FLAGS)
+    return all(type(a.get(flag)) is bool and a.get(flag) is b.get(flag) for flag in BRIEF_FLAGS)
 
 
 # --------------------------------------------------------------------------- executor state
@@ -504,6 +511,7 @@ class _StepRun:
     session: str | None
     agent_profile: str | None = None
     lead: str = ""  # put before every fresh prompt until the gates run again (a gate step's first fix)
+    lead_fix: tuple[list[GateResult], str] | None = None  # what `lead` was built from: (failed gates, refine note)
     start_head: str = ""
     start_tree: str = ""
     resume_tree: str | None = None  # the tree when a human's approval resumed the session
@@ -519,6 +527,7 @@ class _StepRun:
     brief_text: str | None = None  # its text, kept in memory; None after a restart until `_ensure_brief` rebuilds it
     brief_skipped: str | None = None  # why the fresh session was refused one (`agent_started.brief_skipped`)
     brief_refused: str | None = None  # a fresh session's brief failed at the call: the next fresh one goes without
+    brief_invalid: str | None = None  # why a resumed session's recorded pin can't be trusted (`_load_pin`)
     dry: bool = False  # `dry_agent_argv`: the brief is built but never written
 
 
@@ -703,15 +712,15 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             sr.effort = sizing.floor(sr.effort, judgement, self.cfg.effort.allowed)
         # A resumed session keeps the brief it started with (its pin in state), whatever the config says now.
         if resuming and session:
-            self._load_pin(sr, rec.get("brief"))
+            self._load_pin(sr, rec, session)
             turn = _Turn(self._continue_prompt(sr, _answers(since, key), _approved(since, key)), session)
         elif mode == "refine" and session:
-            self._load_pin(sr, rec.get("brief"))
+            self._load_pin(sr, rec, session)
             turn = _Turn(self._refine_prompt(sr), session)
         elif takes_shared:
             sr.session = shared["session_id"]
             sr.effort = sizing.floor(shared.get("effort") or sr.effort, judgement, self.cfg.effort.allowed)
-            self._load_pin(sr, shared.get("brief"))
+            self._load_pin(sr, shared, sr.session)
             turn = _Turn(self._prompt(sr, resume=sr.session), sr.session)
         else:
             turn = _Turn(self._prompt(sr), None)
@@ -719,6 +728,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         if fixing:  # a gate step's session starts from the gate output (and a refine round's note)
             refine = current_refine(self.run, phase.name)
             note = f"\n\n{refine_note_block(refine)}" if refine is not None else ""
+            sr.lead_fix = (list(fix_first or []), note)
             sr.lead = f"{self._fix_lead(sr, fix_first or [], 1, excerpt=turn.resume is not None)}{note}"
             turn = dataclasses.replace(turn, prompt=f"{sr.lead}\n\n{turn.prompt}")
 
@@ -893,7 +903,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 return "done"
 
             failed = self._failed_gates(sr)
-            sr.lead = ""  # the gate output it carried is stale now; fix prompts carry the new output
+            sr.lead, sr.lead_fix = "", None  # the gate output it carried is stale now; fix prompts carry the new output
             expected = self.check_expect(sr, result, gates_failed=bool(failed))
             if expected == "stopped":
                 return "stopped"
@@ -1102,7 +1112,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             self._stop(sr, "max_rollovers",
                        f"The step ran out of context {sr.rollovers} times (limit {limit}); split it into smaller steps.")
             return None
-        sr.session = None
+        self._fresh_session(sr)
         values = self._values(sr)
         lead = (
             f"This is a fresh session: the previous one for this step ran out of context. "
@@ -1115,7 +1125,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         """A refine round could not resume the step's session (expired, rolled over): a fresh session gets
         the same prompt plus `progress.md` and `handoff.md`, at the same effort."""
         self.run.emit("resume_failed", key=sr.key, session_id=gone, effort=sr.effort)
-        sr.session = None
+        self._fresh_session(sr)
         values = self._values(sr)
         lead = (
             f"This is a fresh session: the runner could not resume this step's earlier session. "
@@ -1339,7 +1349,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         """A fresh session's brief: built and written (`sr.brief`, `sr.brief_text`) when this executor gives briefs,
         `context.run_brief` is on and the agent takes one; a brief that can't be built or written gives none, and
         the reason goes on the call's `agent_started` (`sr.brief_skipped`). A dry run builds it and writes nothing."""
-        sr.brief = sr.brief_text = sr.brief_skipped = None
+        sr.brief = sr.brief_text = sr.brief_skipped = sr.brief_invalid = None
         if not (self.briefs and self.cfg.context.run_brief and getattr(sr.agent, "takes_brief", False)):
             return
         if sr.brief_refused:
@@ -1374,9 +1384,16 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             return f"the brief file could not be written: {exc}"[:BRIEF_REASON_MAX]
         return None
 
-    def _load_pin(self, sr: _StepRun, value: object) -> None:
-        """A resumed session's pin, from state; its text when this executor wrote it, else rebuilt before the call."""
-        sr.brief = _pin(value)
+    def _load_pin(self, sr: _StepRun, row: dict, session: str) -> None:
+        """A resumed session's pin, from its step row in state; its text when this executor wrote it, else rebuilt
+        before the call. A pin that is malformed (`_pin_ok`) or bound to another session than `session` (the row's
+        `brief_session`) is refused at the call (`sr.brief_invalid`), which then starts a fresh session."""
+        sr.brief = _pin(row.get("brief"))
+        sr.brief_invalid = None
+        if sr.brief is not None and not _pin_ok(sr.brief):
+            sr.brief_invalid = "the pinned brief is malformed"
+        elif sr.brief is not None and row.get("brief_session") != session:
+            sr.brief_invalid = "the pinned brief belongs to another session"
         cached = self._brief_texts.get(str(sr.brief.get("sha256"))) if sr.brief is not None else None
         sr.brief_text = cached[0] if cached is not None and _same_flags(cached[1], sr.brief) else None
 
@@ -1388,6 +1405,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         pin = sr.brief
         if pin is None:
             return None
+        if sr.brief_invalid is not None:
+            return sr.brief_invalid
         try:
             phase, role, sha = str(pin["phase"]), str(pin["role"]), str(pin["sha256"])
             path = Path(str(pin["path"]))
@@ -1421,13 +1440,27 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         self.run.emit("brief_replaced", key=sr.key, reason=why, session_id=turn.resume)
         if turn.resume is None:
             sr.brief_refused = why
-        sr.session = None
+        old_lead = self._fresh_session(sr)
         values = self._values(sr)
         lead = BRIEF_LEAD.format(progress=values["progress"], handoff=values["handoff"])
         prompt = f"{lead}\n\n{self._prompt(sr)}"
         if turn.resume is not None:
-            prompt = f"{prompt.rstrip()}\n\n{BRIEF_CARRIED}\n\n{turn.prompt.strip()}\n"
+            carried = turn.prompt.strip()
+            if old_lead and carried.startswith(old_lead):  # the fresh prompt has the step's lead already, whole
+                carried = carried[len(old_lead):].strip()
+            prompt = f"{prompt.rstrip()}\n\n{BRIEF_CARRIED}\n\n{carried}\n"
         return _Turn(prompt, None)
+
+    def _fresh_session(self, sr: _StepRun) -> str:
+        """The step goes on in a fresh session (a rollover, a refine round whose session is gone, a replaced brief).
+        That session has seen nothing, so a lead built with the gate excerpt for a resumed session is built again with
+        the whole report. Returns the lead it had before."""
+        old = sr.lead
+        sr.session = None
+        if sr.lead_fix is not None:
+            failed, note = sr.lead_fix
+            sr.lead = f"{self._fix_lead(sr, failed, 1, excerpt=False)}{note}"
+        return old
 
     def _result_partial(self, sr: _StepRun) -> str:
         """What a resume turn ends with: the one-line reminder, which names the result file. A session with no brief

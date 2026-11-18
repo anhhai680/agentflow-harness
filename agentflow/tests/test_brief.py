@@ -106,6 +106,9 @@ def test_rules_read_every_listed_file_in_order(tmp_path):
     ({"CLAUDE.md": "x" * (brief.BRIEF_FILE_MAX_BYTES + 1)}, ["CLAUDE.md"]),
     ({"CLAUDE.md": "x\n"}, ["CLAUDE.md", "../outside.md"]),
     ({"CLAUDE.md": "x\n", ".agentflow/rules.md": "y\n"}, ["CLAUDE.md", ".agentflow/rules.md"]),
+    ({"CLAUDE.md": "x\n", "CLAUDE.local.md": "mine\n"}, ["CLAUDE.md"]),
+    ({"CLAUDE.md": "x\n", "pkg/Claude.md": "y\n"}, ["CLAUDE.md"]),
+    ({"claude.md": "x\n"}, ["CLAUDE.md"]),  # a case-insensitive disk loads it as CLAUDE.md
 ])
 def test_rules_do_not_carry_when_memory_blocks(tmp_path, files, rules):
     repo = _repo(tmp_path)

@@ -317,6 +317,40 @@ def test_a_refine_round_gets_the_excerpt_when_it_resumes_its_session(flow_repo):
     assert "row 300 end" in prompt and "row 150 end" not in prompt and "of 300 lines shown" in prompt
 
 
+@pytest.mark.parametrize("fresh", ["rollover", "replaced_brief"])
+def test_a_fresh_session_after_a_resumed_refine_gets_the_whole_report_once(flow_repo, monkeypatch, fresh):
+    # The refine round resumes its session with the excerpt; when a fresh session takes over (its context ran out, or
+    # its brief can't be given again), that session has seen nothing, so it gets the whole report, and only once.
+    from conftest import brief_ready
+
+    flow_repo.configure({"gates": {"loud": {"run": "if test -f bad.txt; then for i in $(seq 1 300); do echo \"row $i end\"; "
+                                            "done; exit 1; fi"}},
+                         "context": {"gate_output_lines": 300}})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    flow_repo.script({KEY: [{"result": DONE}, {"usage_pct": [81]} if fresh == "rollover" else {"result": DONE}]})
+    step = make_step(gates=["loud"], fix_loop=True, gates_first=True)
+    assert flow_repo.executor(run).run_steps(make_phase(step), [step], "build")[0] == "done"
+    sid = session_of(flow_repo, run)
+    (flow_repo.root / "bad.txt").write_text("", encoding="utf-8")
+    run.emit("phase_approval_raised", phase="build", summary="ok?")
+    run.emit("phase_rejected", by="human", phase="build", round=1, note="Rename the variable")
+    if fresh == "replaced_brief":
+        _brief_changes(monkeypatch)  # a restart on a newer engine: the resumed session's brief can't be rebuilt
+    flow_repo.executor(run).run_steps(make_phase(step), [step], "build")
+    calls = flow_repo.calls()
+    if fresh == "rollover":
+        assert ("--resume", sid) in pairs(calls[1]["argv"]) and "of 300 lines shown" in calls[1]["argv"][-1]
+        prompt = calls[2]["argv"][-1]
+        assert "--resume" not in calls[2]["argv"] and "ran out of context" in prompt
+    else:
+        prompt = calls[1]["argv"][-1]
+        assert "--resume" not in calls[1]["argv"] and flow_repo.events(run, "brief_replaced")
+        assert "Rename the variable" in prompt.split(lanes.BRIEF_CARRIED)[1]  # the round's note is carried
+    assert "row 1 end" in prompt and "row 150 end" in prompt and "lines shown" not in prompt
+    assert prompt.count("### loud (") == 1 and prompt.count("The gates failed") == 1  # the lead's report, once
+
+
 def test_a_step_that_changed_nothing_reuses_the_passes_another_step_had_on_the_same_tree(flow_repo):
     run = flow_repo.new_run()
     assert run_step(flow_repo, make_step(gates=["ok"])) == "done"
@@ -1989,6 +2023,87 @@ def test_a_brief_that_cannot_be_rebuilt_to_its_pin_starts_a_fresh_session(flow_r
     assert new["sha256"] != old["sha256"] and brief_path(resumed) == new["path"]
     assert resumed["system_prompt"].endswith("An engine upgrade changed this.\n")
     assert run.state["steps"][KEY]["brief"] == new
+
+
+def test_a_fresh_call_that_dies_before_its_session_never_lends_its_pin_to_the_old_session(flow_repo, monkeypatch):
+    # Session A starts with no brief. Its rollover's fresh call gets one that carries the rules (the key turned on),
+    # then the runner dies before that call names its session. The restart resumes A: it must go on with A's own
+    # (no) brief, never with the fresh call's flags (CLAUDE_CODE_DISABLE_CLAUDE_MDS on a session holding no rules).
+    from conftest import brief_ready
+
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", MDS)
+    flow_repo.configure({"context": {"run_brief": False}})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n"})
+    flow_repo.script({KEY: [{"usage_pct": [81]}, {"no_init": True}, {"result": DONE}]})
+    executor = flow_repo.executor(run)
+    real_rollover, real_read, reads = executor._rollover, executor._read_result, []
+
+    def rollover(sr, outcome):
+        flow_repo.cfg.context.run_brief = True
+        return real_rollover(sr, outcome)
+
+    def read(sr):
+        reads.append(sr.key)
+        if len(reads) == 2:
+            raise RuntimeError("the runner died")
+        return real_read(sr)
+
+    monkeypatch.setattr(executor, "_rollover", rollover)
+    monkeypatch.setattr(executor, "_read_result", read)
+    with pytest.raises(RuntimeError):
+        run_step(flow_repo, executor=executor)
+    first, fresh = flow_repo.calls()
+    assert brief_path(first) is None and brief_path(fresh) is not None and fresh["env"].get(MDS) == "1"
+    session = session_of(flow_repo, run)
+    row = run.refresh()["steps"][KEY]
+    assert row["session_id"] == session and row["brief"] is None  # the fresh call's pin is not session A's
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    resumed = flow_repo.calls()[2]
+    assert ("--resume", session) in pairs(resumed["argv"])
+    assert brief_path(resumed) is None and resumed["system_prompt"] is None and MDS not in resumed["env"]
+
+
+def test_a_pin_bound_to_another_session_is_replaced(flow_repo, monkeypatch):
+    # The reducer keeps a row's pin and session together; the loader checks it all the same before any resume.
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    step = make_step()
+    _crash_after_first_call(flow_repo, run, step, monkeypatch)
+    session = run.state["steps"][KEY]["session_id"]
+    assert run.state["steps"][KEY]["brief_session"] == session
+    run.state["steps"][KEY]["brief_session"] = "ANOTHER-SESSION"  # in memory only: no event can say this
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"
+    resumed = flow_repo.calls()[-1]
+    assert "--resume" not in resumed["argv"]
+    (replaced,) = flow_repo.events(run, "brief_replaced")
+    assert replaced["reason"] == "the pinned brief belongs to another session" and replaced["session_id"] == session
+
+
+@pytest.mark.parametrize("forged", [
+    {"rules": 1}, {"skill": "yes"}, {"files": None}, {"sha256": "a" * 63}, {"sha256": "G" * 64}, {"phase": 3},
+    {"role": None}, {"path": ["x"]}, {"extra": True}, {"rules_fallback": 7}])
+def test_a_malformed_pin_is_replaced_not_trusted(flow_repo, monkeypatch, forged):
+    from conftest import brief_ready
+
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", MDS)
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n"})
+    step = make_step()
+    _crash_after_first_call(flow_repo, run, step, monkeypatch)
+    row = run.state["steps"][KEY]
+    assert row["brief"]["rules"] is True
+    run.emit("agent_started", agent="claude", pid=1, step=KEY, session_id=row["session_id"],
+             brief={**row["brief"], **forged}, phase="build", role="build")  # a forged pin, bound to the session
+    run.emit("agent_exited", session_id=row["session_id"], exit_code=0, cost=0.0, key=KEY)
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"
+    resumed = flow_repo.calls()[-1]
+    assert "--resume" not in resumed["argv"]  # never the session, with flags the pin only seems to give
+    (replaced,) = flow_repo.events(run, "brief_replaced")
+    assert replaced["reason"] == "the pinned brief is malformed"
+    assert resumed["env"].get(MDS) == "1" and "RULE-MARKER" in resumed["system_prompt"]
 
 
 def test_brief_never_holds_step_values(flow_repo, monkeypatch):

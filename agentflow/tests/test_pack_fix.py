@@ -41,7 +41,10 @@ def found(repo: Path) -> pack_fix.Findings:
 
 
 def drift_issues(repo: Path) -> list:
-    return [i for i in validate(load_config(pack.pack_config(repo)), repo) if i.path.startswith("prompts/")]
+    """`validate`'s drift findings on the pack's prompts; the overrides these tests write are never committed, so the
+    run-brief warning about that (`brief_overrides`) is not one of them."""
+    return [i for i in validate(load_config(pack.pack_config(repo)), repo)
+            if i.path.startswith("prompts/") and "until it is committed" not in i.message]
 
 
 # ---- the register

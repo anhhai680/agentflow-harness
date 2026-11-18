@@ -1121,6 +1121,37 @@ def test_verified_tree_paths_refuses_a_fan_out_bomb_quickly_and_in_bounded_memor
     assert elapsed < 10 and peak < 64 * 1024 * 1024, (elapsed, peak)
 
 
+def test_tree_paths_refuses_a_fan_out_bomb_quickly_and_in_bounded_memory(tmp_path):
+    # `git ls-tree -r` on shared subtrees streams `width ** depth` paths from a few KB of objects: the listing is read
+    # as it streams and refused past its caps, never held whole.
+    import time
+    import tracemalloc
+
+    repo = _repo(tmp_path)
+    bomb = _fan_out(repo, 20, 4)  # 160_000 paths: past the 100_000 cap
+    tracemalloc.start()
+    started = time.monotonic()
+    try:
+        assert gitops.tree_paths(repo, bomb) is None
+        elapsed = time.monotonic() - started
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert elapsed < 10 and peak < 16 * 1024 * 1024, (elapsed, peak)
+
+
+def test_tree_paths_refuses_a_listing_past_its_byte_budget(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    small = _fan_out(repo, 4, 3)  # 64 paths of 8 bytes, each with its NUL
+    assert len(gitops.tree_paths(repo, small)) == 64
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATH_BYTES", 64 * 9 - 1)
+    assert gitops.tree_paths(repo, small) is None
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATH_BYTES", 64 * 9)
+    assert len(gitops.tree_paths(repo, small)) == 64
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATHS", 63)
+    assert gitops.tree_paths(repo, small) is None
+
+
 def test_verified_tree_paths_counts_queued_folders_against_the_cap(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
     bomb = _fan_out(repo, 10, 4)  # 1_000 folders queued at the third level before any file of the last is listed

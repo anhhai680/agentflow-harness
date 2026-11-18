@@ -545,6 +545,54 @@ def test_brief_placeholder_warning(tmp_cfg, name):
     assert "{result_file}" in found[0].message and "{run}" not in found[0].message
 
 
+def test_an_old_preamble_copy_with_only_slot_lines_still_gets_a_brief(tmp_cfg):
+    # The runner drops an old copy's slot lines and its effort-check block before it looks for placeholders: so must
+    # validate, or it warns of a brief the run does give.
+    path = tmp_cfg()
+    engine = (pack.ENGINE_PROMPTS / "_preamble.md").read_text(encoding="utf-8")
+    old = (engine + "\n{run_facts}\n{code_map}\n{lessons}\n\n<!-- effort-check -->\nYou run at `{effort}`.\n"
+           "<!-- /effort-check -->\n")
+    (path.parent / "prompts" / "_preamble.md").write_text(old.replace("\n", "\r\n"), encoding="utf-8")
+    assert _brief_placeholder_warnings(validate(load_config(path), path.parent.parent)) == []
+    (path.parent / "prompts" / "_preamble.md").write_text(old + "Step {step_id}.\n", encoding="utf-8")
+    (found,) = _brief_placeholder_warnings(validate(load_config(path), path.parent.parent))
+    assert "{step_id}" in found.message and "{run_facts}" not in found.message and "{effort}" not in found.message
+
+
+def test_the_shared_brief_partial_helper_matches_the_runner():
+    from agentflow.config import brief_partial
+
+    text, outside = brief_partial("_preamble.md", "A {run}.\r\n{lessons}\r\n<!-- effort-check -->\r\n{effort}\r\n"
+                                                  "<!-- /effort-check -->\r\nB {step_id}")
+    assert text == "A {run}.\nB {step_id}" and outside == ["step_id"]
+    assert brief_partial("_result.md", "{lessons} {result_file}\n") == ("{lessons} {result_file}\n",
+                                                                       ["lessons", "result_file"])
+
+
+def _override_warnings(issues: list[Issue]) -> list[Issue]:
+    return [i for i in issues if i.level == "warning" and "until it is committed" in i.message]
+
+
+def test_a_prompt_override_not_committed_at_head_warns(tmp_cfg, tmp_path):
+    path = tmp_cfg()
+    engine = (pack.ENGINE_PROMPTS / "_result.md").read_text(encoding="utf-8")
+    git_repo(tmp_path, {"CLAUDE.md": "x"})
+    (path.parent / "prompts" / "_result.md").write_text(engine + "\nOurs.\n", encoding="utf-8")
+    found = _override_warnings(validate(load_config(path), path.parent.parent))
+    assert [(i.path, i.message) for i in found] == [
+        ("prompts/_result.md", "is not committed at HEAD (or can't be read there): run sessions get no brief until "
+                               "it is committed (the brief reads it from the run's fork commit)")]
+    off = tmp_cfg({"context": {"run_brief": False}})
+    assert _override_warnings(validate(load_config(off), off.parent.parent)) == []
+    import subprocess
+
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "o"], cwd=tmp_path,
+                   check=True, capture_output=True)
+    path = tmp_cfg()
+    assert _override_warnings(validate(load_config(path), path.parent.parent)) == []
+
+
 def test_brief_placeholder_warning_off_with_run_brief_false(tmp_cfg):
     path = tmp_cfg({"context": {"run_brief": False}})
     (path.parent / "prompts" / "_result.md").write_text("Write to {result_file}.\n", encoding="utf-8")
@@ -2182,6 +2230,23 @@ def test_memory_blockers():
     assert blockers(None) == []  # an unreadable rules file has no import to find
 
 
+def test_memory_blockers_fold_case_and_see_local_memory():
+    from agentflow.config import memory_blockers
+
+    def blockers(paths, rules=("CLAUDE.md",)):
+        return memory_blockers(list(paths), lambda p: "x", rules)
+
+    assert blockers(("CLAUDE.md", "CLAUDE.local.md")) == ["CLAUDE.local.md"]
+    assert blockers(("CLAUDE.md", "docs/CLAUDE.local.md")) == ["docs/CLAUDE.local.md"]
+    assert blockers(("CLAUDE.md", "Claude.Local.MD")) == ["Claude.Local.MD"]
+    assert blockers(("CLAUDE.md", ".CLAUDE/claude.md")) == [".CLAUDE/claude.md"]
+    assert blockers(("CLAUDE.md", ".Claude/RULES/a.md")) == [".claude/rules/"]
+    assert blockers(("CLAUDE.md", "pkg/Claude.md")) == ["pkg/Claude.md"]
+    assert blockers(("claude.md",)) == ["claude.md is not in agent_rules"]  # a case-insensitive disk loads it
+    assert blockers(("claude.md",), rules=("claude.md",)) == []
+    assert blockers(("CLAUDE.md", "docs/claude.mdx", "CLAUDE.md.bak")) == []
+
+
 def git_repo(root: Path, files: dict[str, str | bytes]) -> None:
     import subprocess
 
@@ -2221,7 +2286,61 @@ def test_agent_rules_warnings(tmp_cfg, tmp_path, files, rules, run_brief, expect
     issues = issues_for(tmp_cfg, {"context": {"run_brief": run_brief}, "project": {"agent_rules": rules}})
     found = agent_rules_issues(issues, "warning")
     assert len(found) == expected, found
-    assert all("memory files" in i.message for i in found)
+    for issue in found:  # a listed file that is not committed is left out, and the brief still carries the rest
+        missing = "is not committed at HEAD" in issue.message
+        assert ("the brief leaves it out" in issue.message) is missing, issue.message
+        assert ("memory files" in issue.message) is not missing, issue.message
+
+
+def test_agent_rules_unreadable_file_warning_says_why(tmp_cfg, tmp_path):
+    git_repo(tmp_path, {"CLAUDE.md": "x" * 200_001})
+    (found,) = agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md"]}}), "warning")
+    assert found.message.startswith("CLAUDE.md is not a regular file of at most 200000 bytes at HEAD")
+    assert "failed verification" in found.message and "memory files" in found.message
+
+
+def _fan_out_head(root: Path, width: int, depth: int) -> None:
+    """Make HEAD a commit whose tree names `width ** depth` files through one shared subtree (a few KB of objects)."""
+    import subprocess
+
+    def git(*args, feed=None):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=root, input=feed,
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    blob = git("hash-object", "-w", "--stdin", feed="x\n")
+    tree = git("mktree", feed="".join(f"100644 blob {blob}\tf{i}\n" for i in range(width)))
+    for _ in range(depth - 1):
+        tree = git("mktree", feed="".join(f"040000 tree {tree}\td{i}\n" for i in range(width)))
+    git("update-ref", "HEAD", git("commit-tree", tree, "-p", "HEAD", "-m", "bomb"))
+
+
+def test_agent_rules_check_is_bounded_on_a_tree_bomb(tmp_cfg, tmp_path):
+    import time
+
+    git_repo(tmp_path, {"CLAUDE.md": "x"})
+    _fan_out_head(tmp_path, 20, 4)  # 160_000 paths: past the listing's bounds
+    started = time.monotonic()
+    found = agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md"]}}), "warning")
+    assert time.monotonic() - started < 20
+    assert [i.message for i in found] == [
+        "could not list the tree at HEAD within limits (or verification failed): run sessions will let Claude load "
+        "its own memory files instead"]
+    off = issues_for(tmp_cfg, {"context": {"run_brief": False}, "project": {"agent_rules": ["CLAUDE.md"]}})
+    assert agent_rules_issues(off, "warning") == []
+
+
+@pytest.mark.parametrize("files, blocker", [
+    ({"CLAUDE.md": "x", "CLAUDE.local.md": "mine"}, "CLAUDE.local.md"),
+    ({"CLAUDE.md": "x", "pkg/claude.local.md": "mine"}, "pkg/claude.local.md"),
+    ({"CLAUDE.md": "x", ".claude/claude.md": "y"}, ".claude/claude.md"),
+    ({"CLAUDE.md": "x", ".claude/Rules/a.md": "y"}, ".claude/rules/"),
+    ({"CLAUDE.md": "x", "pkg/claude.md": "y"}, "pkg/claude.md"),
+    ({"claude.md": "x"}, "claude.md is not in agent_rules"),
+])
+def test_agent_rules_warns_on_case_variants_and_local_memory(tmp_cfg, tmp_path, files, blocker):
+    git_repo(tmp_path, files)
+    found = agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md"]}}), "warning")
+    assert [i.message.split(": ")[0] for i in found] == [blocker], found
 
 
 def test_agent_rules_symlink_to_a_refused_target_warns(tmp_cfg, tmp_path):
