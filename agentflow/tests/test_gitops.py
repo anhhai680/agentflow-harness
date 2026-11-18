@@ -1039,3 +1039,37 @@ def test_read_blob_refuses_a_path_through_a_symlinked_directory(tmp_path):
     _commit(repo)
     assert gitops.read_blob(repo, _sha(repo), "real/a.md", 100) == b"a\n"
     assert gitops.read_blob(repo, _sha(repo), "alias/a.md", 100) is None
+
+
+def test_read_blob_refuses_an_unencodable_path(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "x", "x\n")
+    _commit(repo)
+    for path in ("a\ud800", "x/\udcff", "\udcffx"):
+        assert gitops.read_blob(repo, _sha(repo), path, 100) is None, path
+
+
+def test_verified_tree_paths_lists_every_file_and_refuses_a_rewritten_subtree(tmp_path):
+    import zlib
+
+    repo = _repo(tmp_path)
+    _write(repo, "CLAUDE.md", "x\n")
+    _write(repo, "pkg/CLAUDE.md", "y\n")
+    _write(repo, "pkg/deep/a.py", "z\n")
+    _write(repo, "same/deep/a.py", "z\n")  # an identical subtree at a second place
+    (repo / "link.md").symlink_to("CLAUDE.md")
+    _commit(repo)
+    sha = _sha(repo)
+    assert gitops.verified_tree_paths(repo, sha) == gitops.tree_paths(repo, sha) == [
+        "CLAUDE.md", "link.md", "pkg/CLAUDE.md", "pkg/deep/a.py", "same/deep/a.py"]
+    assert gitops.verified_tree_paths(repo, sha[:12]) is None  # full ids only: a prefix can be ground
+    assert gitops.verified_tree_paths(repo, "HEAD") is None
+    assert gitops.verified_tree_paths(repo, "0" * 40) is None
+    pkg = run_git(repo, "rev-parse", f"{sha}:pkg").strip()
+    deep = bytes.fromhex(run_git(repo, "rev-parse", f"{sha}:pkg/deep").strip())
+    body = b"40000 deep\0" + deep
+    loose = repo / ".git" / "objects" / pkg[:2] / pkg[2:]
+    os.chmod(loose, 0o644)
+    loose.write_bytes(zlib.compress(b"tree %d\0" % len(body) + body))
+    assert "pkg/CLAUDE.md" not in gitops.tree_paths(repo, sha)
+    assert gitops.verified_tree_paths(repo, sha) is None

@@ -179,3 +179,48 @@ def test_brief_files_are_read_at_base_sha(tmp_path):
     assert brief.read_brief_files(repo, sha, []) == []
     assert brief.read_brief_files(repo, sha, ["docs/a.md", "docs/missing.md"]) is None
     assert brief.read_brief_files(repo, None, ["docs/a.md"]) is None
+
+
+def _rewrite_loose_tree(repo: Path, sha: str, folder: str, keep: dict[str, str]) -> None:
+    """Rewrite the loose tree object of `folder` at `sha` so it holds only `keep` (name -> path of a blob at `sha`)."""
+    import os
+    import zlib
+
+    tree = run_git(repo, "rev-parse", f"{sha}:{folder}").strip()
+    body = b"".join(b"100644 %s\0" % name.encode() + bytes.fromhex(run_git(repo, "rev-parse", f"{sha}:{src}").strip())
+                    for name, src in sorted(keep.items()))
+    loose = repo / ".git" / "objects" / tree[:2] / tree[2:]
+    assert loose.is_file()
+    os.chmod(loose, 0o644)
+    loose.write_bytes(zlib.compress(b"tree %d\0" % len(body) + body))
+
+
+@pytest.mark.parametrize("folder, hidden", [("pkg", "pkg/CLAUDE.md"), (".claude", ".claude/rules/a.md"),
+                                            ("docs", "docs/rules.md")])
+def test_rules_do_not_carry_when_a_subtree_was_rewritten(tmp_path, folder, hidden):
+    repo = _repo(tmp_path)
+    sha = _commit(repo, {"CLAUDE.md": "x\n", hidden: "y\n", f"{folder}/a.py": "z\n"})
+    rules = ["CLAUDE.md", "docs/rules.md"] if folder == "docs" else ["CLAUDE.md"]
+    if folder != "docs":
+        assert brief.read_rules(repo, sha, rules) == ([], False)
+    _rewrite_loose_tree(repo, sha, folder, {"a.py": f"{folder}/a.py"})
+    assert hidden not in __import__("agentflow.gitops", fromlist=["x"]).tree_paths(repo, sha)  # git lists the forgery
+    assert brief.read_rules(repo, sha, rules) == ([], False)
+
+
+def test_brief_readers_take_only_a_full_commit_id(tmp_path):
+    repo = _repo(tmp_path)
+    sha = _commit(repo, {"CLAUDE.md": "x\n", "docs/a.md": "A\n", ".claude/skills/mine/SKILL.md": "Body\n"})
+    for short in (sha[:7], sha[:12], sha[:39]):
+        assert brief.read_rules(repo, short, ["CLAUDE.md"]) == ([], False)
+        assert brief.read_skill(repo, short, ".claude/skills", "mine", True) is None
+        assert brief.read_brief_files(repo, short, ["docs/a.md"]) is None
+    assert brief.read_skill(repo, sha, ".claude/skills", "mine", True) == Doc("## The `mine` skill", "Body\n")
+
+
+def test_brief_readers_never_raise_on_an_unencodable_path(tmp_path):
+    repo = _repo(tmp_path)
+    sha = _commit(repo, {"CLAUDE.md": "x\n"})
+    assert brief.read_rules(repo, sha, ["CLAUDE.md", "a\ud800"]) in (([], False), ([Doc("## CLAUDE.md", "x\n")], True))
+    assert brief.read_brief_files(repo, sha, ["a\ud800"]) is None
+    assert brief.read_skill(repo, sha, "skills\ud800", "mine", True) is None

@@ -959,12 +959,13 @@ _REGULAR = (b"100644", b"100755")
 _DIRECTORY = (b"40000", b"040000")
 
 
-def _read_git(repo: Path, *args: str) -> bytes | None:
-    """stdout of `git HARDENED <args>` in bytes; None on any failure. No object is ever fetched (a partial clone's
-    promisor remote is not asked), so a read never touches the network."""
+def _read_git(repo: Path, *args: str, feed: bytes | None = None) -> bytes | None:
+    """stdout of `git HARDENED <args>` in bytes, with `feed` on stdin; None on any failure. No object is ever fetched
+    (a partial clone's promisor remote is not asked), so a read never touches the network."""
+    stdin = {"input": feed} if feed is not None else {"stdin": subprocess.DEVNULL}
     try:
         proc = subprocess.run(["git", *HARDENED, *args], cwd=Path(repo), capture_output=True, timeout=30, check=True,
-                              stdin=subprocess.DEVNULL, env={**os.environ, "GIT_NO_LAZY_FETCH": "1"})
+                              env={**os.environ, "GIT_NO_LAZY_FETCH": "1"}, **stdin)
     except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired, ValueError):
         return None
     return proc.stdout
@@ -974,6 +975,10 @@ def _read_parts(path: object, *, target: bool = False) -> list[str] | None:
     """`path`'s segments when `read_blob` may read it: relative, no empty, `.` or `..` segment, no NUL, no leading
     `-`, not under `.git` (case-folded). A symlink's target (`target`) is not under `.agentflow` either."""
     if not isinstance(path, str) or not path or "\0" in path or path.startswith(("/", "-")):
+        return None
+    try:
+        path.encode("utf-8")  # a lone surrogate names no file git could hold
+    except UnicodeEncodeError:
         return None
     parts = path.split("/")
     if any(part in ("", ".", "..") for part in parts):
@@ -994,22 +999,32 @@ def _verified(repo: Path, kind: bytes, oid: str, limit: int, algo: Callable[[byt
     return data
 
 
-def _tree_entry(tree: bytes, name: bytes, raw: int) -> tuple[bytes, str] | None:
-    """`(mode, id)` of the one entry called `name` in a raw tree object; None when there is none, more than one, or
-    the tree is malformed."""
-    found: tuple[bytes, str] | None = None
+def _tree_entries(tree: bytes, raw: int) -> list[tuple[bytes, bytes, str]] | None:
+    """`(mode, name, id)` of every entry of a raw tree object; None when it is malformed or names an entry twice."""
+    out: list[tuple[bytes, bytes, str]] = []
+    names: set[bytes] = set()
     at = 0
     while at < len(tree):
         space = tree.find(b" ", at)
         nul = tree.find(b"\0", space + 1) if space >= 0 else -1
         if nul < 0 or nul + 1 + raw > len(tree):
             return None
-        if tree[space + 1:nul] == name:
-            if found is not None:
-                return None
-            found = tree[at:space], tree[nul + 1:nul + 1 + raw].hex()
+        name = tree[space + 1:nul]
+        if not name or name in names:
+            return None
+        names.add(name)
+        out.append((tree[at:space], name, tree[nul + 1:nul + 1 + raw].hex()))
         at = nul + 1 + raw
-    return found
+    return out
+
+
+def _tree_entry(tree: bytes, name: bytes, raw: int) -> tuple[bytes, str] | None:
+    """`(mode, id)` of the entry called `name` in a raw tree object; None when there is none or the tree is
+    malformed."""
+    for mode, entry, oid in _tree_entries(tree, raw) or ():
+        if entry == name:
+            return mode, oid
+    return None
 
 
 def _lookup(repo: Path, root: str, parts: list[str], algo: Callable[[bytes], Any], raw: int) -> tuple[bytes, str] | None:
@@ -1028,18 +1043,9 @@ def _lookup(repo: Path, root: str, parts: list[str], algo: Callable[[bytes], Any
     return mode, oid
 
 
-def read_blob(repo: Path, sha: str, path: str, limit: int) -> bytes | None:
-    """The bytes of the regular file at `path` in commit `sha`, at most `limit` of them, or None.
-
-    `repo` is untrusted: its objects and refs may have been written by an agent. So `sha` must be hex (never a ref
-    name, which a branch could shadow), and `path` relative, without `..`, a leading `-` or a `.git` segment. The
-    file is found by walking the commit's trees, each object hashed against the id that named it, so the bytes
-    returned are the ones that commit holds. A symlink is followed once: its target, joined to the link's folder and
-    normalised, must pass the same check, must not be under `.agentflow`, and must be a regular file. None for
-    anything missing, refused, over `limit`, or any git failure or timeout."""
-    parts = _read_parts(path)
-    if parts is None or not isinstance(sha, str) or _READ_SHA.fullmatch(sha) is None or limit < 0:
-        return None
+def _commit_tree(repo: Path, sha: str) -> tuple[str, Callable[[bytes], Any], int] | None:
+    """`(root tree id, hash, hex width)` of commit `sha` (hex, a prefix of one object or a full id), with the commit
+    object hashed against its id; None when it can't be proven."""
     out = _read_git(repo, "rev-parse", "--show-object-format")
     algo = _HASHES.get(out.decode("ascii", errors="replace").strip()) if out is not None else None
     if algo is None:
@@ -1059,6 +1065,97 @@ def read_blob(repo: Path, sha: str, path: str, limit: int) -> bytes | None:
     tree = first.removeprefix("tree ")
     if not first.startswith("tree ") or re.fullmatch(f"[0-9a-f]{{{width}}}", tree) is None:
         return None
+    return tree, algo, width
+
+
+def _verified_batch(repo: Path, oids: list[str], algo: Callable[[bytes], Any], budget: int) -> dict[str, bytes] | None:
+    """`{id: content}` of the tree objects `oids`, read with one `cat-file --batch-check` (all must be trees whose
+    sizes together fit `budget`, else nothing is read) and one `cat-file --batch`, each hashed against its id."""
+    feed = "".join(f"{oid}\n" for oid in oids).encode("ascii")
+    check = _read_git(repo, "cat-file", "--batch-check", feed=feed)
+    if check is None:
+        return None
+    wanted = set(oids)
+    sizes: dict[str, int] = {}
+    for line in check.decode("ascii", errors="replace").splitlines():
+        fields = line.split()
+        if len(fields) != 3 or fields[1] != "tree" or not fields[2].isdigit() or fields[0] not in wanted:
+            return None
+        sizes[fields[0]] = int(fields[2])
+    if len(sizes) != len(oids) or sum(sizes.values()) > budget:
+        return None
+    stream = _read_git(repo, "cat-file", "--batch", feed=feed)
+    if stream is None:
+        return None
+    out: dict[str, bytes] = {}
+    at = 0
+    for oid in oids:
+        end = stream.find(b"\n", at)
+        if stream[at:end] != f"{oid} tree {sizes[oid]}".encode("ascii"):
+            return None
+        data = stream[end + 1:end + 1 + sizes[oid]]
+        at = end + 1 + sizes[oid] + 1
+        if (len(data) != sizes[oid] or stream[at - 1:at] != b"\n"
+                or algo(b"tree %d\0" % len(data) + data).hexdigest() != oid):
+            return None
+        out[oid] = data
+    return out if at == len(stream) else None
+
+
+_LIST_MAX_BYTES = 64 * 1024 * 1024  # every tree of a listing together; a larger tree set is refused unread
+
+
+def verified_tree_paths(repo: Path, sha: str) -> list[str] | None:
+    """Every path in commit `sha`'s tree, sorted, like `tree_paths`, but proven: `sha` must be a full commit id (a
+    short one could be ground to a forged commit), and the commit and every tree are hashed against the id that
+    named them. A name that is not UTF-8 is kept (surrogate-escaped), so no entry is hidden by its spelling. None on
+    any failure, so a rewritten subtree can't hide a file from a caller that relies on the listing."""
+    if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) is None:
+        return None
+    root = _commit_tree(repo, sha)
+    if root is None or len(sha) != root[2]:
+        return None
+    tree, algo, width = root
+    paths: list[str] = []
+    pending = [("", tree)]
+    budget = _LIST_MAX_BYTES
+    while pending:
+        oids = list(dict.fromkeys(oid for _, oid in pending))
+        read = _verified_batch(repo, oids, algo, budget)
+        if read is None:
+            return None
+        budget -= sum(len(data) for data in read.values())
+        deeper: list[tuple[str, str]] = []
+        for prefix, oid in pending:
+            entries = _tree_entries(read[oid], width // 2)
+            if entries is None:
+                return None
+            for mode, name, child in entries:
+                path = prefix + name.decode("utf-8", errors="surrogateescape")
+                if mode in _DIRECTORY:
+                    deeper.append((path + "/", child))
+                else:
+                    paths.append(path)
+        pending = deeper
+    return sorted(paths)
+
+
+def read_blob(repo: Path, sha: str, path: str, limit: int) -> bytes | None:
+    """The bytes of the regular file at `path` in commit `sha`, at most `limit` of them, or None.
+
+    `repo` is untrusted: its objects and refs may have been written by an agent. So `sha` must be hex (never a ref
+    name, which a branch could shadow), and `path` relative, without `..`, a leading `-` or a `.git` segment. The
+    file is found by walking the commit's trees, each object hashed against the id that named it, so the bytes
+    returned are the ones that commit holds. A symlink is followed once: its target, joined to the link's folder and
+    normalised, must pass the same check, must not be under `.agentflow`, and must be a regular file. None for
+    anything missing, refused, over `limit`, or any git failure or timeout."""
+    parts = _read_parts(path)
+    if parts is None or not isinstance(sha, str) or _READ_SHA.fullmatch(sha) is None or limit < 0:
+        return None
+    root = _commit_tree(repo, sha)
+    if root is None:
+        return None
+    tree, algo, width = root
     entry = _lookup(repo, tree, parts, algo, width // 2)
     if entry is not None and entry[0] == b"120000":
         link = _verified(repo, b"blob", entry[1], _LINK_MAX_BYTES, algo)

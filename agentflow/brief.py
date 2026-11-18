@@ -29,13 +29,18 @@ RULES_LEAD = ("These are the repository's agent rules as of the commit this run 
 SKILL_LEAD = "The step's skill and brief files follow in full, so you already have them: do not load them."
 
 _NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
-_SHA = re.compile(r"[0-9a-f]{7,64}")  # as `gitops.read_blob` takes it
+_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")  # a full commit id: a short prefix could be ground to a forged commit
 
 
 @dataclass(frozen=True)
 class Doc:
     heading: str
     text: str
+
+
+def _full(base_sha: object) -> bool:
+    """Whether `base_sha` is a full commit id (never a ref name, never a prefix)."""
+    return isinstance(base_sha, str) and _SHA.fullmatch(base_sha) is not None
 
 
 def _text(data: bytes) -> str:
@@ -45,16 +50,17 @@ def _text(data: bytes) -> str:
 def read_rules(checkout: Path, base_sha: str | None, files: Sequence[str]) -> tuple[list[Doc], bool]:
     """`(docs, carries)`: the rules files at `base_sha`, in the order listed, and whether the brief carries the
     repository's rules faithfully. `([], False)` means it does not, and the session lets Claude load its own memory
-    files, as before: no `base_sha`, no files, a listed path `project.agent_rules` refuses, an unreadable tree, a
-    memory file the brief would not replace (`memory_blockers`), or a listed file in the tree that `read_blob`
-    refuses (too big, not a regular file, a symlink out of the repository or under `.agentflow`, a tampered object).
-    A listed file that is not in the tree is left out. `validate`'s `project.agent_rules` warnings check the same
-    things the same way (at `HEAD`), symlinks included."""
-    if (base_sha is None or _SHA.fullmatch(base_sha) is None or not files
-            or any(rules_path_problem(entry) for entry in files)):
-        return [], False  # a ref name is never a fork commit: the tree listing must not follow a branch
+    files, as before: no full `base_sha`, no files, a listed path `project.agent_rules` refuses, a tree that can't be
+    proven (`gitops.verified_tree_paths`), a memory file the brief would not replace (`memory_blockers`), or a
+    listed file in the tree that `read_blob` refuses (too big, not a regular file, a symlink out of the repository or
+    under `.agentflow`, a tampered object). A listed file that is not in the tree is left out. `validate`'s
+    `project.agent_rules` warnings check the same things at `HEAD`, symlinks included, from `tree_paths` (a warning
+    is advice, so its listing need not be proven)."""
+    if not _full(base_sha) or not files or any(rules_path_problem(entry) for entry in files):
+        return [], False
     rules = list(dict.fromkeys(PurePosixPath(entry).as_posix() for entry in files))
-    tree = gitops.tree_paths(checkout, base_sha)
+    # Proven, not `tree_paths`: a rewritten subtree could otherwise hide a memory file or a listed rules file.
+    tree = gitops.verified_tree_paths(checkout, base_sha)
     if tree is None:
         return [], False
     listed = set(tree)
@@ -100,7 +106,7 @@ def read_skill(checkout: Path, base_sha: str | None, skills_dir: str, name: str,
     if path is None:
         return None
     if repo_owned:
-        data = gitops.read_blob(checkout, base_sha, path, BRIEF_FILE_MAX_BYTES) if base_sha is not None else None
+        data = gitops.read_blob(checkout, base_sha, path, BRIEF_FILE_MAX_BYTES) if _full(base_sha) else None
         if data is None:
             return None
         try:
@@ -120,7 +126,7 @@ def read_brief_files(checkout: Path, base_sha: str | None, files: Sequence[str])
     user prompt."""
     docs: list[Doc] = []
     for name in files:
-        data = gitops.read_blob(checkout, base_sha, name, BRIEF_FILE_MAX_BYTES) if base_sha is not None else None
+        data = gitops.read_blob(checkout, base_sha, name, BRIEF_FILE_MAX_BYTES) if _full(base_sha) else None
         if data is None:
             return None
         docs.append(Doc(f"## {name}", _text(data)))
