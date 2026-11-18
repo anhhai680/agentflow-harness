@@ -69,6 +69,15 @@ def _config_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+@pytest.fixture(autouse=True)
+def _claude_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """No test reads the developer's own Claude settings (`doctor.claude_config_dir`): the dir is an empty tmp dir."""
+    home = tmp_path / "claude-config"
+    home.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+    return home
+
+
 @pytest.fixture
 def repo_root() -> Path:
     return REPO

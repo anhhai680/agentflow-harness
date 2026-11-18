@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -71,8 +72,8 @@ def test_doctor_is_all_ok_with_every_tool_present_and_logged_in(tmp_cfg, repo, m
     monkeypatch.setattr(keepawake, "describe", lambda platform=None: "caffeinate")
     checks = _checks(tmp_cfg, repo)
     assert {n: c.status for n, c in checks.items()} == {
-        "agent:claude": "ok", "gh": "ok", "remote": "ok", "state dir": "ok", "keep awake": "ok",
-        "inherited environment": "ok", "gate:build": "ok"}
+        "agent:claude": "ok", "gh": "ok", "claude user settings": "ok", "remote": "ok", "state dir": "ok",
+        "keep awake": "ok", "inherited environment": "ok", "gate:build": "ok"}
     assert "network" in checks["gh"].detail
 
 
@@ -312,3 +313,84 @@ def test_inherited_environment_lists_a_long_set_briefly(tmp_cfg, repo, monkeypat
 
     check = _checks(tmp_cfg, repo, both)["inherited environment"]
     assert check.status == "warn" and "more" in check.detail and len(check.detail) < 600
+
+
+def _user_settings(claude_config_dir: Path, content) -> None:
+    """Put `content` (a mapping, dumped as JSON, or raw text) in the Claude config dir's `settings.json`."""
+    text = content if isinstance(content, str) else json.dumps(content)
+    (claude_config_dir / "settings.json").write_text(text, encoding="utf-8")
+
+
+def test_doctor_names_the_user_plugins_and_hooks_a_run_skips(tmp_cfg, repo, _claude_config_dir):
+    _user_settings(_claude_config_dir, {"enabledPlugins": {"a@x": True, "b@x": True, "c@x": False},
+                                        "hooks": {"PreToolUse": [], "Stop": []}})
+    check = _checks(tmp_cfg, repo)["claude user settings"]
+    assert check.status == "ok" and "2 plugins, 2 hook events" in check.detail
+    assert "a@x" not in check.detail
+
+
+def test_doctor_names_no_plugins_or_hooks_when_there_are_none(tmp_cfg, repo, _claude_config_dir):
+    _user_settings(_claude_config_dir, {"theme": "dark", "enabledPlugins": {"c@x": False}})
+    check = _checks(tmp_cfg, repo)["claude user settings"]
+    assert check.status == "ok" and check.detail == "runs skip your user Claude settings"
+
+
+def test_doctor_warns_when_runs_would_drop_user_env_auth_or_deny_rules(tmp_cfg, repo, _claude_config_dir):
+    _user_settings(_claude_config_dir, {"env": {"ANTHROPIC_BASE_URL": "https://secret.invalid"},
+                                        "permissions": {"deny": ["Bash(rm *)"]}})
+    check = _checks(tmp_cfg, repo)["claude user settings"]
+    assert check.status == "warn" and "env" in check.detail and "permissions" in check.detail
+    assert "apiKeyHelper" not in check.detail
+    assert "secret.invalid" not in check.detail and "rm *" not in check.detail
+    assert "agents.claude.user_settings: true" in check.fix
+
+
+def test_doctor_warns_about_an_api_key_helper_without_echoing_it(tmp_cfg, repo, _claude_config_dir):
+    _user_settings(_claude_config_dir, {"apiKeyHelper": "/bin/print-my-secret"})
+    check = _checks(tmp_cfg, repo)["claude user settings"]
+    assert check.status == "warn" and "apiKeyHelper" in check.detail and "print-my-secret" not in check.detail
+
+
+@pytest.mark.parametrize("content", [None, "{not json", "[]", "SYMLINK", "x" * (300 * 1024), "null",
+                                     '{"enabledPlugins": [1, 2], "hooks": "nope"}',
+                                     '{"enabledPlugins": {"a@x": "yes"}, "hooks": 3}'])
+def test_an_absent_or_unreadable_user_settings_file_is_ok(tmp_cfg, repo, _claude_config_dir, tmp_path, content):
+    if content == "SYMLINK":
+        target = tmp_path / "elsewhere.json"
+        target.write_text('{"env": {"A": "b"}}', encoding="utf-8")
+        (_claude_config_dir / "settings.json").symlink_to(target)
+    elif content is not None:
+        _user_settings(_claude_config_dir, content)
+    check = _checks(tmp_cfg, repo)["claude user settings"]
+    assert check.status == "ok" and check.detail == "runs skip your user Claude settings"
+
+
+def test_a_directory_in_place_of_the_user_settings_file_is_ok(tmp_cfg, repo, _claude_config_dir):
+    (_claude_config_dir / "settings.json").mkdir()
+    assert _checks(tmp_cfg, repo)["claude user settings"].status == "ok"
+
+
+def test_no_check_when_runs_keep_the_user_settings(tmp_cfg, repo, _claude_config_dir):
+    _user_settings(_claude_config_dir, {"env": {"A": "b"}})
+
+    def patch(data):
+        _patch()(data)
+        data["agents"]["claude"]["user_settings"] = True
+
+    assert "claude user settings" not in _checks(tmp_cfg, repo, patch)
+
+
+def test_no_check_when_claude_is_disabled(tmp_cfg, repo):
+    def patch(data):
+        _patch()(data)
+        data["agents"]["claude"]["enabled"] = False
+        data["agents"]["codex"] = {**data["agents"]["claude"], "command": ["codex"], "enabled": True}
+
+    assert "claude user settings" not in _checks(tmp_cfg, repo, patch)
+
+
+def test_claude_config_dir_follows_the_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "c"))
+    assert doctor.claude_config_dir() == tmp_path / "c"
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert doctor.claude_config_dir() == Path.home() / ".claude"

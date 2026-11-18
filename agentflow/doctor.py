@@ -7,6 +7,7 @@ creating the state dir and a probe file there that it removes at once.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -17,10 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from agentflow import keepawake, layers, pack, run_env
+from agentflow import keepawake, layers, pack, run_env, safeio
 from agentflow.config import Config, ConfigError, load_config
 
 TIMEOUT_S = 20  # each external command
+MAX_USER_SETTINGS_BYTES = 256 * 1024  # the most of the user's Claude settings file that is read
+USER_SETTINGS_RISK_KEYS = ("env", "apiKeyHelper", "permissions")  # keys a run that skips the user settings loses
 
 LOGIN_CHECKS = {"claude": ("auth", "status", "run `claude auth login`"),
                 "codex": ("login", "status", "run `codex login`")}
@@ -131,6 +134,53 @@ def _agent_checks(cfg: Config, repo: Path) -> list[Check]:
         else:
             checks.append(_failed(label, code, output, login[2]))
     return checks
+
+
+def claude_config_dir() -> Path:
+    """Claude Code's config dir: `$CLAUDE_CONFIG_DIR`, else `~/.claude`."""
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(env) if env else Path.home() / ".claude"
+
+
+def _read_user_settings() -> dict:
+    """The user's Claude `settings.json` as a mapping. A missing, unreadable, oversize, symlinked, malformed or
+    non-mapping file is no settings (`{}`). This reads one file and runs no command."""
+    try:
+        raw = safeio.read_bytes(claude_config_dir() / "settings.json", MAX_USER_SETTINGS_BYTES)
+        data = json.loads(raw) if raw is not None else None
+    except (OSError, ValueError, RecursionError):  # SymlinkRefused is an OSError; JSON errors are ValueErrors
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _user_settings_check(cfg: Config) -> Check | None:
+    """What a Claude run session no longer loads from the user's own settings (`agents.claude.user_settings: false`).
+    Only key names and counts are reported, never a value of the user's file. None when the claude agent is off or
+    keeps the user settings."""
+    spec = cfg.agents.get("claude")
+    if spec is None or not spec.enabled or spec.user_settings:
+        return None
+    name = "claude user settings"
+    data = _read_user_settings()
+    risky = [key for key in USER_SETTINGS_RISK_KEYS if key in data]
+    if risky:
+        return Check(name, "warn",
+                     f"runs skip your user Claude settings, including {', '.join(f'`{key}`' for key in risky)}: an API key "
+                     "helper, provider or proxy env, or deny rules set there don't apply in runs (`doctor`'s login check "
+                     "still reads them)",
+                     "move them to the project's .claude/settings.json or the pack's defaults.env, or set "
+                     "`agents.claude.user_settings: true` in your user file")
+    plugins = data.get("enabledPlugins")
+    hooks = data.get("hooks")
+    plugin_count = sum(value is True for value in plugins.values()) if isinstance(plugins, dict) else 0
+    hook_count = len(hooks) if isinstance(hooks, dict) else 0
+    parts = []
+    if plugin_count:
+        parts.append(f"{plugin_count} plugin{'s' if plugin_count != 1 else ''}")
+    if hook_count:
+        parts.append(f"{hook_count} hook event{'s' if hook_count != 1 else ''}")
+    detail = "runs skip your user Claude settings" + (f": {', '.join(parts)}" if parts else "")
+    return Check(name, "ok", detail)
 
 
 def _gh_check(repo: Path) -> Check:
@@ -297,10 +347,13 @@ def _gate_checks(cfg: Config) -> tuple[list[Check], bool]:
 
 
 def run_checks(cfg: Config, repo: Path) -> list[Check]:
-    """Every check, in order: the agents, `gh`, its issue fields (with `issues.sync_label`), the remote, Docker (when a gate runs it), the state dir, keeping the
+    """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), the remote, Docker (when a gate runs it), the state dir, keeping the
     machine awake, the inherited environment, the gates."""
     gate_checks, uses_docker = _gate_checks(cfg)
-    checks = [*_agent_checks(cfg, repo), _gh_check(repo)]
+    checks = [*_agent_checks(cfg, repo)]
+    if (settings := _user_settings_check(cfg)) is not None:
+        checks.append(settings)
+    checks.append(_gh_check(repo))
     if cfg.issues.sync_label and shutil.which("gh"):
         checks.append(_gh_fields_check(repo))
     checks.append(_remote_check(repo))
