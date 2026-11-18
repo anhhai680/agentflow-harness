@@ -96,6 +96,8 @@ BRIEF_REASON_MAX = 300
 BRIEF_LEAD = ("This is a fresh session: the runner could not give this step's earlier session its brief again. "
               "Continue the step from `{progress}` and `{handoff}`: read them first, check the work tree, and do not "
               "redo finished work.")
+BRIEF_CARRIED = ("## The message the earlier session was about to get\n\nThe runner was about to send this to the earlier "
+                 "session. Whatever it holds (answers, a note, gate output) still applies to this step: act on it.")
 RESUMABLE = ("running", "waiting_human")
 UNSTARTED_STEP = (None, "pending")
 FOOTER = re.compile(r"^\s*Next:\s*`?([\w.:/-]+)`?\s+(?:—|–|--?)\s", re.MULTILINE)
@@ -1413,14 +1415,19 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
     def _replace_brief(self, sr: _StepRun, turn: _Turn, why: str) -> _Turn:
         """The session's brief can't be given to its next call (a template changed between a shared session's tasks,
         an engine upgrade, a tampered file): a fresh session, which records a new pin, as `_rollover` does. A fresh
-        session whose own brief failed this way goes on without one, so this never loops."""
+        session whose own brief failed this way goes on without one, so this never loops. A resumed turn's own message
+        (a human's or the runner's answers, an approval or reopen note, a fix turn's gate output) goes after the fresh
+        prompt, under `BRIEF_CARRIED`, so nothing it said is lost; a fresh turn's prompt is built again whole."""
         self.run.emit("brief_replaced", key=sr.key, reason=why, session_id=turn.resume)
         if turn.resume is None:
             sr.brief_refused = why
         sr.session = None
         values = self._values(sr)
         lead = BRIEF_LEAD.format(progress=values["progress"], handoff=values["handoff"])
-        return _Turn(f"{lead}\n\n{self._prompt(sr)}", None)
+        prompt = f"{lead}\n\n{self._prompt(sr)}"
+        if turn.resume is not None:
+            prompt = f"{prompt.rstrip()}\n\n{BRIEF_CARRIED}\n\n{turn.prompt.strip()}\n"
+        return _Turn(prompt, None)
 
     def _result_partial(self, sr: _StepRun) -> str:
         """What a resume turn ends with: the reminder, which names the result file, then the result contract."""

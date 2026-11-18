@@ -1881,15 +1881,10 @@ def test_a_restart_and_an_approval_resume_with_the_brief_pinned_in_state(flow_re
     assert os.path.isfile(pin["path"]) and not flow_repo.events(run, "brief_replaced")
 
 
-def test_a_brief_that_cannot_be_rebuilt_to_its_pin_starts_a_fresh_session(flow_repo, monkeypatch):
+def _brief_changes(monkeypatch) -> None:
+    """From now on `build_brief` gives a different text (an engine upgrade), with a pin that matches it."""
     from agentflow import brief
-    from conftest import brief_ready
 
-    run = flow_repo.new_run()
-    brief_ready(flow_repo, run)
-    step = make_step()
-    _crash_after_first_call(flow_repo, run, step, monkeypatch)
-    old = run.state["steps"][KEY]["brief"]
     real = lanes.build_brief
 
     def changed(*args, **kwargs):
@@ -1902,6 +1897,17 @@ def test_a_brief_that_cannot_be_rebuilt_to_its_pin_starts_a_fresh_session(flow_r
         return text, {**pin, "sha256": brief.digest(text), "path": os.path.join(os.path.dirname(pin["path"]), name)}
 
     monkeypatch.setattr(lanes, "build_brief", changed)
+
+
+def test_a_brief_that_cannot_be_rebuilt_to_its_pin_starts_a_fresh_session(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    step = make_step()
+    _crash_after_first_call(flow_repo, run, step, monkeypatch)
+    old = run.state["steps"][KEY]["brief"]
+    _brief_changes(monkeypatch)
     assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"
     first, resumed = flow_repo.calls()
     assert "--resume" not in resumed["argv"]  # a fresh session, never a stop `retry` can't clear
@@ -2008,3 +2014,82 @@ def test_no_brief_for_codex_sizers_and_dry_run(flow_repo):
     assert not (dry.dir / "brief").exists()
     argv = flow_repo.executor(dry).dry_agent_argv(make_phase(step), step, KEY)
     assert FLAG in argv and not (dry.dir / "brief").exists()
+
+
+def test_a_replaced_brief_keeps_the_answers_the_session_was_about_to_get(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    question = {"id": "q1", "question": "Cache the token?", "options": [{"key": "A", "label": "Per process"}]}
+    flow_repo.script({KEY: [{"result": {"status": "needs_human", "summary": "need a call", "questions": [question]}},
+                            {"result": DONE}]})
+    assert run_step(flow_repo) == "stopped"
+    assert answer(run, KEY, {"q1": "A"}, by="test") is True
+    _brief_changes(monkeypatch)  # the runner restarts on a newer engine: the pinned brief can't be rebuilt
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    first, fresh = flow_repo.calls()
+    assert "--resume" not in fresh["argv"] and len(flow_repo.events(run, "brief_replaced")) == 1
+    prompt = fresh["argv"][-1]
+    assert "a fresh session" in prompt and "## Step `impl`" in prompt  # the whole step, as a fresh session needs
+    assert "A human answered your questions" in prompt and "q1: A" in prompt  # and nothing the human said is lost
+    assert prompt.index(lanes.BRIEF_CARRIED) < prompt.index("q1: A")
+    assert pins(flow_repo, run)[-1] != pins(flow_repo, run)[0] and brief_path(fresh) == pins(flow_repo, run)[-1]["path"]
+
+
+def test_a_replaced_brief_keeps_the_gate_output_of_a_fix_turn(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    flow_repo.script({KEY: [{"result": DONE}, {"result": DONE}]})
+    executor = flow_repo.executor(run)
+    real, writes = executor._write_brief, []
+
+    def write(pin, text):  # 1 and 2: the first call's; 3: the fix turn's, which fails
+        writes.append(pin["path"])
+        return "the brief file could not be written: disk full" if len(writes) == 3 else real(pin, text)
+
+    monkeypatch.setattr(executor, "_write_brief", write)
+    assert run_step(flow_repo, make_step(gates=["fail"], fix_loop=True), executor=executor) == "stopped"
+    calls = flow_repo.calls()
+    fresh = calls[1]
+    assert "--resume" not in fresh["argv"] and "disk full" in flow_repo.events(run, "brief_replaced")[0]["reason"]
+    assert "The gates failed (fix attempt 1" in fresh["argv"][-1] and "boom {module} line" in fresh["argv"][-1]
+    assert all("--resume" in c["argv"] for c in calls[2:])  # the fresh session goes on as the step's session
+
+
+def test_a_prompt_override_not_at_base_sha_gives_no_brief(flow_repo):
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)  # the override below is in the pack's working tree only
+    own = (ENGINE / "prompts" / "_preamble.md").read_text(encoding="utf-8") + "\nLIVE-ONLY line.\n"
+    (flow_repo.cfg.path.parent / "prompts" / "_preamble.md").write_text(own, encoding="utf-8")
+    assert run_step(flow_repo) == "done"
+    (call,) = flow_repo.calls()
+    (started,) = flow_repo.events(run, "agent_started")
+    assert started["brief"] is None and started["brief_skipped"] == "prompt override not at base_sha"
+    assert FLAG not in call["argv"] and call["system_prompt"] is None
+    assert "Nobody can answer you" in call["argv"][-1] and "## When you finish" in call["argv"][-1]
+
+
+def test_a_prompt_override_committed_at_base_sha_is_the_one_in_the_brief(flow_repo):
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    engine = (ENGINE / "prompts" / "_result.md").read_text(encoding="utf-8")
+    committed = engine + "\nCOMMITTED-OVERRIDE line.\n"
+    live = flow_repo.cfg.path.parent / "prompts" / "_result.md"
+    live.write_text(committed, encoding="utf-8")
+    brief_ready(flow_repo, run, {".agentflow/prompts/_result.md": committed})
+    with live.open("a", encoding="utf-8") as handle:  # edited later and never committed
+        handle.write("LIVE-EDIT line.\n")
+    with (flow_repo.root / ".agentflow" / "prompts" / "_result.md").open("a", encoding="utf-8") as handle:
+        handle.write("CHECKOUT-EDIT line.\n")
+    assert run_step(flow_repo) == "done"
+    (call,) = flow_repo.calls()
+    system = call["system_prompt"]
+    assert "COMMITTED-OVERRIDE line." in system and "## When you finish" in system
+    assert "LIVE-EDIT" not in system and "CHECKOUT-EDIT" not in system
+    assert "COMMITTED-OVERRIDE" not in call["argv"][-1] and "LIVE-EDIT" not in call["argv"][-1]
