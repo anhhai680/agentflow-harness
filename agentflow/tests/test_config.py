@@ -697,6 +697,7 @@ FULL_PACKS = {"python": PYTHON_CONFIG, "node": PACKS / "node" / ".agentflow" / "
 # writes its whole workflow, so the engine's workflow never applies to it; only keys outside the workflow it left
 # unset can come from the engine defaults.
 _RETRO_STEP = "the engine's retro step: a retro is the engine's pipeline, so no pack needs to state it"
+_WATCHDOG = "the engine's watchdog default (15 minutes): a pack states it only to change it"
 _POLICY = "the engine's default obligations (verified, reviewed, ...) and the engine floor, which a pack states only to add to"
 INHERITED = {
     "python": {"retro_step": _RETRO_STEP, "policy": _POLICY},
@@ -705,8 +706,9 @@ INHERITED = {
         "agents.codex": "the engine's codex agent, disabled: it runs no step unless the pack enables it",
         "agents.claude.prices": "the engine's price table: it prices only a session Claude reported no cost for",
         "retro_step": _RETRO_STEP,
+        "watchdog.no_progress_min": _WATCHDOG,
     },
-    "this repo": {"retro_step": _RETRO_STEP, "policy": _POLICY},
+    "this repo": {"retro_step": _RETRO_STEP, "policy": _POLICY, "watchdog.no_progress_min": _WATCHDOG},
 }
 # The keys of `defaults`, `context`, `effort` and `recovery` that load_config requires (no code fallback). The engine
 # defaults hold the values the engine's minimum fixture pack (`node`) writes for them.
@@ -1614,7 +1616,7 @@ def test_watchdog_no_progress_min_must_be_zero_or_more(tmp_cfg):
     found = issues_for(tmp_cfg, {"watchdog": {"nope": 1}})
     assert [(i.path, i.message) for i in found if i.level == "error"] == [("watchdog.nope", "unknown watchdog key")]
     assert load_config(tmp_cfg({"watchdog": {"no_progress_min": 12.5}})).watchdog.no_progress_min == 12.5
-    assert load_config(tmp_cfg({"watchdog": None})).watchdog.no_progress_min == 0
+    assert load_config(tmp_cfg({"watchdog": None})).watchdog.no_progress_min == 15  # the engine default
 
 
 def test_ci_watch_max_h_defaults_off_and_may_be_left_out(sparse_repo, tmp_cfg):

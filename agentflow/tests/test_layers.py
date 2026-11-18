@@ -321,7 +321,7 @@ def test_rows_list_every_leaf_with_its_layer():
     assert ("defaults.run_budget_usd", 9, "user") in rows
     assert ("gates.unit", {"run": "true"}, "project") in rows                 # a whole entry is one row
     assert ("agents.claude.models.build", "opus", "project") in rows
-    assert ("agents.claude.models.plan", "opus", "engine") in rows
+    assert ("agents.claude.models.plan", "sonnet", "engine") in rows
     assert ("hitl.remind_after_h", 2, "project") in rows                      # below an engine `{}`
     assert ("record_step", merged["record_step"], "engine") in rows
     assert ("guardrails.forbidden_paths", [], "engine") in rows               # an empty list is a leaf

@@ -556,7 +556,7 @@ def test_form_shows_the_effective_value_its_layer_and_its_help(sparse_repo):
     assert (hard["value"], hard["source"], hard["present"]) == (65, "engine", False)
     assert hard["help"].startswith("hard: the run stops")
     models = fields[("agents", "claude", "models")]
-    assert models["source"] == "engine" and models["value"]["plan"] == "opus" and not models.get("readonly")
+    assert models["source"] == "engine" and models["value"]["plan"] == "sonnet" and not models.get("readonly")
     assert fields[("phases", "build", "resolve")]["value"] is True
     assert fields[("phases", "build", "resolve")]["source"] == "engine"
     assert ("hitl", "remind_after_h") in fields                          # a section the pack never wrote

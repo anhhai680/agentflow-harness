@@ -573,7 +573,7 @@ def test_config_show_effective_names_each_layer(sparse_repo, monkeypatch, capsys
     assert 'agents.claude.permission_mode: "bypassPermissions"  [project]' in lines
     assert "defaults.run_budget_usd: 9  [user]" in lines
     assert "defaults.run_budget_hard_usd: 65  [engine]" in lines
-    assert 'agents.claude.models.plan: "opus"  [engine]' in lines
+    assert 'agents.claude.models.plan: "sonnet"  [engine]' in lines
 
     assert main(["config", "show", "--effective", "defaults"]) == 0
     only = capsys.readouterr().out.splitlines()
