@@ -29,7 +29,7 @@ from typing import Literal, TextIO
 
 from agentflow import lessons as lessons_mod
 from agentflow import doubt, overlays, pack, run_env, sizing, verification, workspace
-from agentflow.agents import Agent, AgentCall, AgentOutcome, Interruption
+from agentflow.agents import CLAUDE_MIN_VERSION, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption
 from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
@@ -639,6 +639,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 violations = [*violations, *self._outside_output(sr)]
             if violations:
                 return self._fail(sr, violations)
+            if outcome.interruption is not None and outcome.interruption.kind == "cli_flags":
+                return self._stop(sr, "blocked", self._refused_flag_summary(sr, outcome.interruption.detail))
             if outcome.resume_failed:
                 if sr.mode == "refine" and turn.resume:
                     turn = self._fresh_refine(sr, turn.resume)
@@ -1012,6 +1014,15 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         """The run already said it passed this soft budget: a soft limit notifies once per value, and plan sizing
         raising it is a new value."""
         return any(e["type"] == "budget_soft_reached" and e.get("soft_usd") == soft for e in self.run.events.read())
+
+    @staticmethod
+    def _refused_flag_summary(sr: _StepRun, flag: str | None) -> str:
+        """A CLI too old for a flag the runner passes: name the flag and both ways out. No retry fixes it."""
+        prefix = f"agents.{sr.agent_name}"
+        return (f"The `{sr.agent_name}` CLI refused the flag `{flag}` before the session started: run sessions need "
+                f"Claude Code {CLAUDE_MIN_VERSION} or later. Update the CLI, or turn the flag off: "
+                f"`{prefix}.user_settings: true` (the pack or your user file) drops `{NO_USER_SETTINGS[0]}`, and "
+                f"`{prefix}.lean: false` drops `--exclude-dynamic-system-prompt-sections` and `--strict-mcp-config`.")
 
     def _stop(self, sr: _StepRun, kind: str, summary: str, extra: str = "") -> Outcome:
         raise_hitl(self.cfg, self.run, kind, sr.key, summary, extra=extra)

@@ -645,6 +645,29 @@ def test_calls_that_reach_the_model_and_die_stop_at_failed_attempts(flow_repo, q
     assert hitl_kinds(flow_repo, run) == ["agent_unavailable"]
 
 
+def test_a_refused_flag_stops_the_step_naming_the_flag_and_the_fix(flow_repo, quick_holds):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"no_init": True, "exit": 1, "stderr": "error: unknown option '--setting-sources'\n"}] * 3})
+    assert run_step(flow_repo) == "stopped"
+    assert len(flow_repo.calls()) == 1 and flow_repo.events(run, "run_held") == []
+    (raised,) = flow_repo.events(run, "hitl_raised")
+    assert raised["kind"] == "blocked" and raised["key"] == KEY
+    for part in ("--setting-sources", "2.1.327", "user_settings", "lean"):
+        assert part in raised["summary"]
+    assert run.state["steps"][KEY]["status"] == "waiting_human"
+
+
+def test_a_refused_flag_on_a_resumed_call_is_not_a_failed_resume(flow_repo, quick_holds):
+    run = flow_repo.new_run()
+    refused = {"no_init": True, "exit": 1, "stderr": "error: unknown option '--exclude-dynamic-system-prompt-sections'\n"}
+    flow_repo.script({KEY: [{}, refused]})  # no result: the reminder resumes the session, and the CLI refuses
+    assert run_step(flow_repo) == "stopped"
+    assert flow_repo.events(run, "resume_failed") == [] and flow_repo.events(run, "run_held") == []
+    (raised,) = flow_repo.events(run, "hitl_raised")
+    assert raised["kind"] == "blocked" and "--exclude-dynamic-system-prompt-sections" in raised["summary"]
+    assert "Could not resume" not in raised["summary"]
+
+
 def test_a_step_finished_before_the_agent_died_is_not_repeated(flow_repo, quick_holds):
     run = flow_repo.new_run()
     flow_repo.script({KEY: [{"result": DONE, "exit": 1}]})

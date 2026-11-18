@@ -15,6 +15,7 @@ import pytest
 from agentflow.agents import (
     AgentCall,
     RUNNER_ONLY_DENY,
+    TTL_VARS,
     ClaudeAgent,
     CodexAgent,
     WATCHDOG_THREAD,
@@ -83,6 +84,10 @@ def fake_claude(cfg, fake) -> ClaudeAgent:
     spec = dataclasses.replace(cfg.agents["claude"], command=fake.command)
     # the fake agent scripts `usage_pct` against a 200K window; the shipped default is checked on its own
     return ClaudeAgent(spec, dataclasses.replace(cfg.context, default_window_tokens=200000))
+
+
+def claude_with(cfg, **spec_changes) -> ClaudeAgent:
+    return ClaudeAgent(dataclasses.replace(cfg.agents["claude"], **spec_changes), cfg.context)
 
 
 def pairs(argv: list[str]) -> set[tuple[str, str]]:
@@ -201,13 +206,15 @@ def test_a_call_turn_cap_overrides_the_agents(claude, call):
     assert pairs(claude.argv(call)) == pairs(claude.argv(dataclasses.replace(call, max_turns=None)))
 
 
-def test_a_read_only_claude_call_allows_only_read_tools_and_no_mcp(claude, call):
+def test_a_read_only_claude_call_allows_only_read_tools_and_no_mcp(claude, cfg, call):
     argv = claude.argv(dataclasses.replace(call, read_only=True))
     at = argv.index("--tools")
     assert argv[at + 1] == "Read,Grep,Glob" and argv[at + 2].startswith("--")
     assert argv.index("--strict-mcp-config") < argv.index("--model")
     assert at < argv.index("--model") and argv[-1] == call.prompt
-    assert "--tools" not in claude.argv(call) and "--strict-mcp-config" not in claude.argv(call)
+    assert "--tools" not in claude.argv(call)
+    assert "--strict-mcp-config" not in claude_with(cfg, lean=False).argv(call)
+    assert claude_with(cfg, lean=False).argv(dataclasses.replace(call, read_only=True)).count("--strict-mcp-config") == 1
     resumed = claude.argv(dataclasses.replace(call, read_only=True, resume_session="abc"))
     assert resumed[-1] == call.prompt and "--tools" in resumed
 
@@ -269,7 +276,62 @@ def test_env(claude, codex, call):
     assert env["AGENTFLOW_RUN"] == call.run_id
     assert env["AGENTFLOW_RESULT"] == str(call.result_path)
     assert codex.env(call)["AGENTFLOW_RESULT"] == str(call.result_path)
-    assert codex.env(call) == env  # D8: both adapters get the run vars and the auto-compact override
+    # D8: both adapters get the run vars and the auto-compact override; Claude also gets its cache TTL and lean switches
+    run_vars = {"AGENTFLOW_RUN", "AGENTFLOW_STEP", "AGENTFLOW_RESULT", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"}
+    assert set(codex.env(call)) == run_vars
+    assert set(env) == run_vars | {"FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_DISABLE_AUTO_MEMORY"}
+    assert {k: v for k, v in env.items() if k in run_vars} == codex.env(call)
+    assert env["FORCE_PROMPT_CACHING_5M"] == "1" and env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+
+
+def test_a_lean_claude_call_has_a_stable_prefix_and_no_user_settings(claude, call):
+    a = claude.argv(call)
+    assert "--exclude-dynamic-system-prompt-sections" in a and a.count("--strict-mcp-config") == 1
+    assert ("--setting-sources", "project,local") in pairs(a) and a[-1] == call.prompt
+    assert "--disable-slash-commands" not in a
+    assert claude.argv(dataclasses.replace(call, read_only=True)).count("--strict-mcp-config") == 1
+    # placed after the variadic `--add-dir` / `--tools` values and before `--model`: no flag swallows the prompt
+    for flag in ("--exclude-dynamic-system-prompt-sections", "--strict-mcp-config", "--setting-sources"):
+        assert a.index("--add-dir") < a.index(flag) < a.index("--model")
+
+
+def test_lean_keeps_the_packs_own_mcp_servers(cfg, call):
+    spec = dataclasses.replace(cfg.agents["claude"],
+                               base_args=[*cfg.agents["claude"].base_args, "--mcp-config", "servers.json"])
+    a = ClaudeAgent(spec, cfg.context).argv(call)
+    assert ("--mcp-config", "servers.json") in pairs(a) and "--strict-mcp-config" in a
+
+
+def test_the_keys_switch_off(cfg, call):
+    agent = claude_with(cfg, lean=False, user_settings=True, cache_ttl="cli")
+    assert not {"--exclude-dynamic-system-prompt-sections", "--setting-sources", "--strict-mcp-config"} & set(agent.argv(call))
+    assert not set(TTL_VARS) & set(agent.env(call)) and "CLAUDE_CODE_DISABLE_AUTO_MEMORY" not in agent.env(call)
+    assert agent.env_drop(call) == ()  # `cli`: the inherited environment's own choice stands
+
+
+def test_a_one_hour_cache_ttl_sets_its_variable_and_drops_the_others(cfg, call):
+    agent = claude_with(cfg, cache_ttl="1h")
+    assert agent.env(call)["ENABLE_PROMPT_CACHING_1H"] == "1" and "FORCE_PROMPT_CACHING_5M" not in agent.env(call)
+    assert set(agent.env_drop(call)) == {"FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_PROMPT_CACHE_TTL"}
+
+
+def test_a_codex_call_drops_nothing_from_the_environment(codex, call):
+    assert codex.env_drop(call) == ()
+
+
+def test_the_cache_ttl_wins_over_the_inherited_environment(fake, cfg, call, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", ",".join([*TTL_VARS, "CLAUDE_CODE_DISABLE_AUTO_MEMORY"]))
+    call = dataclasses.replace(call, env_base={**os.environ, "ENABLE_PROMPT_CACHING_1H": "1",
+                                               "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"})
+    claude_with(cfg, command=fake.command).run(call, collect()[1])
+    env = fake.calls()[0]["env"]
+    assert env["FORCE_PROMPT_CACHING_5M"] == "1" and env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert "ENABLE_PROMPT_CACHING_1H" not in env and "CLAUDE_CODE_PROMPT_CACHE_TTL" not in env
+
+
+def test_a_self_contained_call_drops_the_skills_listing(claude, call):
+    a = claude.argv(dataclasses.replace(call, self_contained=True))
+    assert "--disable-slash-commands" in a and a.index("--disable-slash-commands") < a.index("--model")
 
 
 def test_codex_env_includes_autocompact_override(codex, call):
@@ -569,6 +631,37 @@ def test_fresh_crash_is_not_resume_failed(fake, fake_claude, call):
     events, on_event = collect()
     o = fake_claude.run(call, on_event)
     assert o.exit_code == 1 and not o.resume_failed
+
+
+REFUSED = {"no_init": True, "exit": 1, "stderr": "error: unknown option '--setting-sources'\n"}
+
+
+@pytest.mark.parametrize("resume", [None, "sess-123"])
+def test_a_refused_flag_is_a_cli_flags_interruption_not_an_outage(fake, fake_claude, call, resume):
+    fake.script({STEP: [REFUSED]})
+    o = fake_claude.run(dataclasses.replace(call, resume_session=resume), collect()[1])
+    assert o.exit_code == 1 and o.session_id is None
+    assert o.interruption.kind == "cli_flags" and o.interruption.detail == "--setting-sources"
+    assert o.interruption.reached_model is False
+    assert o.resume_failed is False
+
+
+def test_only_this_calls_stderr_is_read_for_a_refused_flag(fake, fake_claude, call):
+    # the stderr file appends across a step's calls: an earlier call's refusal is not this call's
+    fake.script({STEP: [REFUSED, {"no_init": True, "exit": 1}]})
+    assert fake_claude.run(call, collect()[1]).interruption.kind == "cli_flags"
+    assert fake_claude.run(call, collect()[1]).interruption.kind == "transient"
+
+
+def test_only_the_last_4_kb_of_stderr_is_read(fake, fake_claude, call):
+    fake.script({STEP: [{**REFUSED, "stderr": REFUSED["stderr"] + "x" * 5000}]})
+    assert fake_claude.run(call, collect()[1]).interruption.kind == "transient"
+
+
+def test_a_crash_with_other_stderr_is_still_an_outage(fake, fake_claude, call):
+    fake.script({STEP: [{**REFUSED, "stderr": "Error: network unreachable\n"}]})
+    o = fake_claude.run(dataclasses.replace(call, resume_session="gone"), collect()[1])
+    assert o.interruption.kind == "transient" and o.resume_failed
 
 
 def test_a_quiet_session_is_ended_as_stalled(fake, fake_claude, call):

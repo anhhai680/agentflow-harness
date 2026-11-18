@@ -11,6 +11,7 @@ from __future__ import annotations
 import abc
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -34,6 +35,20 @@ SHELL_ENV_FILE_ENV = "CLAUDE_ENV_FILE"  # a script Claude Code sources in its Ba
 SYNTHETIC_MODEL = "<synthetic>"  # Claude Code's own error messages, shown as assistant turns: no model replied
 
 READ_ONLY_TOOLS = ("Read", "Grep", "Glob")  # the only Claude tools a read-only call gets
+
+# `agents.claude.cache_ttl`: the variable each lifetime sets. The inherited environment's other TTL variables are dropped
+# (`env_drop`), so it can't override the pack; `cli` sets and drops nothing, leaving the CLI's own choice.
+TTL_ENV: dict[str, dict[str, str]] = {"5m": {"FORCE_PROMPT_CACHING_5M": "1"}, "1h": {"ENABLE_PROMPT_CACHING_1H": "1"}, "cli": {}}
+TTL_VARS = ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H", "CLAUDE_CODE_PROMPT_CACHE_TTL")
+# `agents.claude.lean`: a system prefix that is the same in every worktree, only the MCP servers `base_args` names, and
+# no auto-memory (a run's memory is the lessons file).
+LEAN_ARGS = ("--exclude-dynamic-system-prompt-sections", "--strict-mcp-config")
+LEAN_ENV = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+NO_USER_SETTINGS = ("--setting-sources", "project,local")  # `agents.claude.user_settings: false`
+SELF_CONTAINED_ARGS = ("--disable-slash-commands",)  # a call whose brief is self-contained gets no skills listing
+UNKNOWN_OPTION = re.compile(r"unknown option '(--[\w-]+)'")  # how the claude CLI refuses a flag it does not know
+CLAUDE_MIN_VERSION = "2.1.327"  # the oldest Claude Code that takes every flag above
+STDERR_TAIL_BYTES = 4096  # how much of a failed call's own stderr is read for a refused flag
 
 EventCallback = Callable[[str, dict], None]
 
@@ -61,11 +76,13 @@ class AgentCall:
     read_only: bool = False  # Claude gets only `READ_ONLY_TOOLS` and no MCP server; Codex a read-only sandbox (fresh session)
     idle_s: float | None = None  # end the session after this long with no stream line (`watchdog`); None: no watchdog
     tool_idle_s: float | None = None  # the same limit while a tool call is open, or for an agent that `tracks_tools` not
+    self_contained: bool = False  # the prompt is the whole brief (a sizer): Claude gets no skills listing
 
 
 @dataclass
 class Interruption:
     """Why a call ended without finishing. `usage_limit` carries the reset time (`until`, epoch seconds);
+    `cli_flags` is a CLI that refused a flag before it started (`detail` names the flag), which no retry fixes;
     `transient` is everything else, unknown failures included. `reached_model` tells an outage, where a
     retry is free, from a call that spent money and still died. `limit` is the stream's last limit info."""
 
@@ -73,6 +90,7 @@ class Interruption:
     reached_model: bool
     until: float | None = None
     limit: dict | None = None
+    detail: str | None = None
 
 
 @dataclass
@@ -415,6 +433,20 @@ def idle_limit(call: AgentCall, acc: StreamAccumulator, tracks_tools: bool) -> f
     return call.idle_s
 
 
+def _stderr_tail(handle: Any, start: int) -> str:
+    """What this call wrote to its stderr file: at most the last `STDERR_TAIL_BYTES` past `start`, read from the
+    runner's own open handle, so an earlier call's output in the same file is never this call's."""
+    end = handle.seek(0, os.SEEK_END)
+    handle.seek(max(start, end - STDERR_TAIL_BYTES))
+    return handle.read(STDERR_TAIL_BYTES).decode("utf-8", errors="replace")
+
+
+def refused_flag(stderr_tail: str) -> str | None:
+    """The flag the CLI refused as unknown, or None."""
+    found = UNKNOWN_OPTION.search(stderr_tail)
+    return found.group(1) if found else None
+
+
 def _signal_group(proc: subprocess.Popen, sig: int) -> None:
     try:
         os.killpg(proc.pid, sig)
@@ -464,6 +496,10 @@ class _CliAgent(abc.ABC):
             self.context.autocompact_env: str(self.context.autocompact_pct),
         }
 
+    def env_drop(self, call: AgentCall) -> tuple[str, ...]:
+        """Names `run` removes from the inherited environment before it adds `env(call)`."""
+        return ()
+
     def _effort_args(self, call: AgentCall) -> list[str]:
         return [part.replace("{effort}", call.effort) for part in self.spec.effort_arg]
 
@@ -511,8 +547,13 @@ class _CliAgent(abc.ABC):
                 done.set()
 
         rolled_over = False
-        with open(call.transcript_path, "a", encoding="utf-8") as transcript, open(stderr_path, "a", encoding="utf-8") as stderr:
-            env = {**(os.environ if call.env_base is None else call.env_base), **self.env(call)}
+        # The stderr file appends across a step's calls: `stderr_start` is where this call's output begins.
+        with open(call.transcript_path, "a", encoding="utf-8") as transcript, open(stderr_path, "a+b") as stderr:
+            stderr_start = stderr.seek(0, os.SEEK_END)
+            inherited = dict(os.environ if call.env_base is None else call.env_base)
+            for name in self.env_drop(call):
+                inherited.pop(name, None)
+            env = {**inherited, **self.env(call)}
             env.update(self._shell_env(call, env))
             proc = subprocess.Popen(
                 argv,
@@ -586,14 +627,19 @@ class _CliAgent(abc.ABC):
                     _terminate(proc)
                     if proc.stdout is not None:
                         proc.stdout.close()
+            # A CLI that refuses a flag exits before its `init` line, with the reason on stderr.
+            tail = _stderr_tail(stderr, stderr_start) if exit_code != 0 and acc.session_id is None else ""
         # A timer callback that started but has not claimed yet may still claim after this read. That is harmless:
         # the process has exited by now, so its `_terminate` returns at once (`poll()` is set).
         with lock:
             timed_out, stalled, limit = state["timed_out"], state["stalled"], state["limit"]
+        refused = None if timed_out or stalled else refused_flag(tail)
         resume_failed = (bool(call.resume_session) and exit_code != 0 and acc.session_id is None
-                         and not timed_out and not stalled)
+                         and not timed_out and not stalled and refused is None)
         outcome = acc.to_outcome(exit_code, rolled_over=rolled_over, timed_out=timed_out, resume_failed=resume_failed,
                                  stalled=stalled, idle_limit_s=limit)
+        if refused is not None:  # no retry fixes it, and no session was there to resume
+            outcome.interruption = Interruption("cli_flags", reached_model=False, detail=refused)
         on_event("agent_exited", {"session_id": outcome.session_id, "exit_code": exit_code, "cost": outcome.cost_usd,
                                   "cost_estimated": not acc.cost_reported and outcome.cost_usd > 0})
         return outcome
@@ -637,7 +683,16 @@ class ClaudeAgent(_CliAgent):
         if call.read_only:
             # `--tools` is an allowlist that holds in every permission mode, `bypassPermissions` included.
             # It is variadic like `--add-dir`, so it goes before the next option and never reaches the prompt.
-            argv += ["--tools", ",".join(READ_ONLY_TOOLS), "--strict-mcp-config"]
+            argv += ["--tools", ",".join(READ_ONLY_TOOLS)]
+        # `--strict-mcp-config` once: lean keeps only the servers `base_args` names, a read-only call none at all
+        if spec.lean:
+            argv += LEAN_ARGS
+        elif call.read_only:
+            argv.append("--strict-mcp-config")
+        if not spec.user_settings:
+            argv += NO_USER_SETTINGS
+        if call.self_contained:
+            argv += SELF_CONTAINED_ARGS
         argv += ["--model", call.model, *self._effort_args(call)]
         if spec.permission_mode:
             argv += ["--permission-mode", spec.permission_mode]
@@ -660,6 +715,16 @@ class ClaudeAgent(_CliAgent):
             argv += ["--resume", call.resume_session]
         argv.append(call.prompt)
         return argv
+
+    def env(self, call: AgentCall) -> dict[str, str]:
+        spec = self.spec
+        return {**super().env(call), **TTL_ENV.get(spec.cache_ttl, {}), **(LEAN_ENV if spec.lean else {})}
+
+    def env_drop(self, call: AgentCall) -> tuple[str, ...]:
+        """The TTL variables `cache_ttl` doesn't set, so the inherited environment can't override it (none for `cli`)."""
+        if self.spec.cache_ttl not in TTL_ENV or self.spec.cache_ttl == "cli":
+            return ()
+        return tuple(name for name in TTL_VARS if name not in TTL_ENV[self.spec.cache_ttl])
 
     def _shell_env(self, call: AgentCall, env: Mapping[str, str]) -> dict[str, str]:
         """Pin the Bash tool's PATH to the one the gates get. Claude Code's Bash tool runs a login shell, and on

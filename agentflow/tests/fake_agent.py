@@ -13,7 +13,9 @@ the session's total, as Claude does), permission_denials [{tool_name, tool_input
 result event), rate_limit {...} (sent as a `rate_limit_event`'s `rate_limit_info`), result_error bool
 (the result event says `is_error`), delete [relpath, ...] (files removed after the writes), hold_tool s (one
 `Bash` tool call that stays open, with nothing on the stream, for s seconds before its result), linger s
-(after the last line, stdout is closed and the process stays alive s more seconds, as a CLI's shutdown does).
+(after the last line, stdout is closed and the process stays alive s more seconds, as a CLI's shutdown does),
+stderr str (written to stderr before anything else, as a CLI that refuses a flag does: pair it with `no_init` and
+`exit`).
 """
 
 from __future__ import annotations
@@ -110,6 +112,9 @@ def main() -> int:
     exit_code = int(act.get("exit", 0))
     base = {"session_id": session}
 
+    if act.get("stderr"):
+        sys.stderr.write(act["stderr"])
+        sys.stderr.flush()
     emit({"type": "system", "subtype": "hook_started", "hook_name": "SessionStart:startup", **base})
     if not act.get("no_init"):
         emit({"type": "system", "subtype": "init", "model": model, "per_turn_effort_active": True, **base})
