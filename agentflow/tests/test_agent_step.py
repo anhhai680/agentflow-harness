@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from agentflow import gitops, lanes
+from agentflow import gitops, lanes, lessons
 from agentflow.config import PROMPT_PLACEHOLDERS, Phase, Step
 from agentflow.conditions import fmt, make_ctx
 from agentflow.events import parse_iso
@@ -1684,26 +1684,35 @@ def test_step_head_follows_the_preamble(flow_repo):
     assert "{in_brief}" not in prompt and "the step's prompt names it" in prompt
 
 
+SLOT_HEADINGS = ("## What this run already found", "## Code this run has mapped", lessons.LESSONS_HEADING)
+
+
+def _fill_every_slot(flow_repo) -> None:
+    """A run fact, a code-map note and a pack lesson, so each of the three slots has text to show."""
+    run = flow_repo.new_run()
+    run.emit("run_fact", text="a fact", key="build/x/resolve-1")
+    run.emit("code_noted", text="`a.py:1` `f()`", key="build/x")
+    _write_pack_lessons(flow_repo, LESSON_ONE)
+
+
 @pytest.mark.parametrize("crlf", [False, True])
-def test_old_preamble_override_does_not_double_the_slots(flow_repo, monkeypatch, crlf):
+def test_old_preamble_override_does_not_double_the_slots(flow_repo, monkeypatch, no_engine_lessons, crlf):
     old = OLD_PREAMBLE_C2.replace("\n", "\r\n") if crlf else OLD_PREAMBLE_C2
     real = lanes._template
     monkeypatch.setattr(lanes, "_template", lambda cfg, name: old if name == lanes.PREAMBLE else real(cfg, name))
-    run = flow_repo.new_run()
-    run.emit("run_fact", text="a fact", key="build/x/resolve-1")
+    _fill_every_slot(flow_repo)
     prompt = _prompt(flow_repo)
-    assert prompt.count("## What this run already found") == 1
+    assert [prompt.count(heading) for heading in SLOT_HEADINGS] == [1, 1, 1]
     assert "{run_facts}" not in prompt and "{code_map}" not in prompt and "{lessons}" not in prompt
 
 
-def test_a_preamble_slot_at_the_end_of_the_file_is_dropped(flow_repo, monkeypatch):
+def test_a_preamble_slot_at_the_end_of_the_file_is_dropped(flow_repo, monkeypatch, no_engine_lessons):
     real = lanes._template
     monkeypatch.setattr(lanes, "_template",
                         lambda cfg, name: real(cfg, name) + "\n{lessons}" if name == lanes.PREAMBLE else real(cfg, name))
-    run = flow_repo.new_run()
-    run.emit("run_fact", text="a fact", key="build/x/resolve-1")
+    _fill_every_slot(flow_repo)
     prompt = _prompt(flow_repo)
-    assert prompt.count("## What this run already found") == 1 and "{lessons}" not in prompt
+    assert [prompt.count(heading) for heading in SLOT_HEADINGS] == [1, 1, 1]  # a slot with no newline after it too
 
 
 def test_resume_turns_still_name_the_result_file(flow_repo):
