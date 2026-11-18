@@ -922,6 +922,50 @@ def _cat_file_batch(repo: Path, shas: list[str], limit: int) -> dict[str, Blob] 
         writer.join(timeout=1)
 
 
+def tree_paths(repo: Path, sha: str) -> list[str] | None:
+    """Every file path in the tree of `sha`, from `git ls-tree -r`; a name that is not valid UTF-8 is left out.
+    `None` when git cannot read it (no such commit, not a repository, git failed or timed out)."""
+    try:
+        proc = subprocess.run(["git", *HARDENED, "ls-tree", "-r", "--name-only", "-z", sha], cwd=Path(repo),
+                              capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
+        return None
+    out: list[str] = []
+    for raw in proc.stdout.split(b"\0"):
+        try:
+            name = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if name:
+            out.append(name)
+    return out
+
+
+def tree_entry(repo: Path, sha: str, path: str) -> tuple[str, int] | None:
+    """`(mode, size)` of the file at `path` in the tree of `sha`, such as `("100644", 1200)` or `("120000", 12)` for a
+    symlink; `None` when git cannot tell or the path is no file there."""
+    try:
+        proc = subprocess.run(["git", *HARDENED, "--literal-pathspecs", "ls-tree", "-l", "-z", sha, "--", path],
+                              cwd=Path(repo), capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
+        return None
+    meta, tab, _ = proc.stdout.decode("utf-8", errors="replace").partition("\t")
+    fields = meta.split()
+    if not tab or len(fields) != 4 or fields[1] != "blob" or not fields[3].isdigit():
+        return None
+    return fields[0], int(fields[3])
+
+
+def blob_text(repo: Path, sha: str, path: str) -> str | None:
+    """The text of the file at `path` in the tree of `sha` (undecodable bytes replaced); `None` when git cannot read it."""
+    try:
+        proc = subprocess.run(["git", *HARDENED, "cat-file", "blob", f"{sha}:{path}"], cwd=Path(repo),
+                              capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout.decode("utf-8", errors="replace")
+
+
 def changed_since(worktree: Path, sha: str) -> list[str]:
     """Files that differ from `sha`: committed since, staged, unstaged and untracked."""
     worktree = Path(worktree)

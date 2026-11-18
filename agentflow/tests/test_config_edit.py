@@ -1128,3 +1128,25 @@ def test_the_codex_section_has_no_claude_cache_fields(shipped):
     assert ("agents", "claude", "lean") in keys and ("agents", "codex", "lean") not in keys
     assert config_edit.AGENT_FREE_KEYS[-3:] == ("cache_ttl", "lean", "user_settings")
     assert "cache_ttl, lean, user_settings" in " ".join(config_edit.PROTECTED)
+
+
+def test_context_run_brief_and_gate_lines_editable(shipped):
+    fields = {tuple(f["key"]): f for s in config_edit.form_fields(shipped)["sections"] for f in s["fields"]}
+    assert fields[("context", "run_brief")]["kind"] == "bool"
+    assert fields[("context", "resume_gate_lines")]["min"] == 10 and fields[("context", "resume_gate_lines")]["max"] == 1000
+    text = shipped.read_text(encoding="utf-8")
+    config_edit.save(shipped, form(shipped, (["context", "run_brief"], False), (["context", "resume_gate_lines"], 120)))
+    cfg = load_config(shipped)
+    assert cfg.context.run_brief is False and cfg.context.resume_gate_lines == 120
+    after = shipped.read_text(encoding="utf-8")
+    assert sum(1 for line in after.splitlines() if "#" in line) >= sum(1 for line in text.splitlines() if "#" in line)
+    with pytest.raises(EditError):
+        form(shipped, (["context", "resume_gate_lines"], 5))
+
+
+def test_agent_rules_is_protected(shipped):
+    with pytest.raises(Refused):  # the form has no field for it
+        form(shipped, (["project", "agent_rules"], ["AGENTS.md"]))
+    _, sha = config_edit.read(shipped)
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=SHIPPED.replace("project:\n", "project:\n  agent_rules: [AGENTS.md]\n", 1), repo=REPO)

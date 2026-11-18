@@ -148,6 +148,8 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("context", "context_window_tokens"), "Context window (tokens)", {"kind": "int", "min": 100000}),
         (("context", "default_window_tokens"), "Default window (tokens)", _POS),
         (("context", "gate_output_lines"), "Gate output lines", _POS),
+        (("context", "run_brief"), "Stable text in a cached system prompt (run brief)", {"kind": "bool"}),
+        (("context", "resume_gate_lines"), "Gate lines in a fix prompt", {"kind": "int", "min": 10, "max": 1000}),
     ]),
     ("Memory", "What runs learn from earlier runs.", [
         (("memory", "lessons_max_tokens"), "Lessons per prompt (tokens, 0 = off)", {"kind": "int", "min": 0, "max": 4000}),

@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- `context.run_brief` (on), `context.resume_gate_lines` (80) and `project.agent_rules` (`[CLAUDE.md]`) are new keys, with `validate` checks (including a warning for each memory file a run brief could not replace) and Settings form fields for the two `context` keys; the brief itself and the short fix prompts follow in the same release.
 - `agentflow doctor` has a `claude user settings` check (when `agents.claude.user_settings` is off) that names what your own Claude settings hold that run sessions no longer load (enabled plugins and hook events), and warns about `env`, `apiKeyHelper` and `permissions` there; it reads one file and prints key names and counts only.
 - The Metrics tab shows what share of cost went on cache writes, and a "Where the tokens go" table by step kind (sessions, cost by token class, turns p50 and p90, prefix write, tool-output size).
 - Six cost signals join the vocabulary a lesson can target (`cache_write_share`, `prefix_write_tokens`, `session_turns_p90:<kind>`, `tool_output_kchars:<kind>`, `compactions`, `usage_holds`), so `lessons`, `scorecard` and the retro digest see them; the scorecard's baseline for them starts at the next `agentflow scorecard --freeze`.

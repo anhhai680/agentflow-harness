@@ -2083,3 +2083,128 @@ def test_a_review_agent_outside_the_project_is_a_warning_without_user_settings(t
     assert claude_issue(tmp_cfg, patch, "overlays.security.review_agent", add) is None
     both = {**patch, "agents": {"claude": {"user_settings": True}}}
     assert claude_issue(tmp_cfg, both, "overlays.security.review_agent") is None
+
+
+# --------------------------------------------------------------------------- cost C2: the run brief keys
+
+
+def test_cost_c2_keys_default(tmp_cfg):
+    cfg = load_config(tmp_cfg())
+    assert cfg.context.run_brief is True
+    assert cfg.context.resume_gate_lines == 80
+    assert cfg.project.agent_rules == ("CLAUDE.md",)
+    cfg = load_config(tmp_cfg({"context": {"run_brief": False, "resume_gate_lines": 30},
+                               "project": {"agent_rules": ["AGENTS.md", "docs/rules.md"]}}))
+    assert (cfg.context.run_brief, cfg.context.resume_gate_lines) == (False, 30)
+    assert cfg.project.agent_rules == ("AGENTS.md", "docs/rules.md")
+
+
+def gate_lines(issues, level):
+    return [i for i in issues if i.level == level and i.path == "context.resume_gate_lines"]
+
+
+def test_resume_gate_lines_range(tmp_cfg):
+    for bad in (9, 1001):
+        assert len(gate_lines(issues_for(tmp_cfg, {"context": {"resume_gate_lines": bad}}), "error")) == 1
+    for good in (10, 1000):
+        issues = issues_for(tmp_cfg, {"context": {"resume_gate_lines": good, "gate_output_lines": 1000}})
+        assert not gate_lines(issues, "error") and not gate_lines(issues, "warning")
+    warned = gate_lines(issues_for(tmp_cfg, {"context": {"resume_gate_lines": 300, "gate_output_lines": 200}}), "warning")
+    assert len(warned) == 1 and "tail" in warned[0].message
+
+
+def agent_rules_issues(issues, level="error"):
+    return [i for i in issues if i.level == level and i.path == "project.agent_rules"]
+
+
+@pytest.mark.parametrize("entry", ["/etc/x", "../x", "docs/../x", "./.agentflow/r.md", ".AGENTFLOW/r.md", ".git/config", "-x", ""])
+def test_agent_rules_entries_checked(tmp_cfg, entry):
+    assert len(agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md", entry]}}))) == 1
+
+
+def test_agent_rules_must_be_a_list(tmp_cfg):
+    assert len(agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": "CLAUDE.md"}}))) == 1
+    assert not agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md", "docs/rules.md"]}}))
+
+
+def test_rules_path_problem():
+    from agentflow.config import rules_path_problem
+
+    assert rules_path_problem("CLAUDE.md") is None and rules_path_problem("docs/a b.md") is None
+    for bad in ("", "  ", 3, None, "/x", "a/../b", "-x", ".agentflow/x", ".Git/x", "./.GIT"):
+        assert rules_path_problem(bad), bad
+
+
+def test_memory_blockers():
+    from agentflow.config import memory_blockers
+
+    def blockers(text, paths=("CLAUDE.md",), rules=("CLAUDE.md",)):
+        return memory_blockers(list(paths), lambda p: text if p in rules else None, rules)
+
+    assert blockers("@AGENTS.md\nrules") == ["CLAUDE.md: @ import"]
+    assert blockers("rules\nsee @docs/x.md here") == ["CLAUDE.md: @ import"]
+    assert blockers("read @README") == ["CLAUDE.md: @ import"]
+    assert blockers("```py\n@dataclass\nclass A: ...\n```\nplain") == []
+    assert blockers("~~~\n@x/y\n~~~\n") == []
+    assert blockers("use `@x/y` and mail me@example.com") == []
+    assert blockers("```\n@a\n```\n@b") == ["CLAUDE.md: @ import"]
+    assert blockers("plain", paths=("CLAUDE.md",), rules=("AGENTS.md",)) == ["CLAUDE.md is not in agent_rules"]
+    assert blockers("plain", paths=("AGENTS.md",), rules=("AGENTS.md",)) == []
+    assert blockers("x", paths=("CLAUDE.md", ".claude/CLAUDE.md")) == [".claude/CLAUDE.md"]
+    assert blockers("x", paths=("CLAUDE.md", ".claude/rules/a.md")) == [".claude/rules/"]
+    assert blockers("x", paths=("CLAUDE.md", "pkg/CLAUDE.md")) == ["pkg/CLAUDE.md"]
+    assert blockers(None) == []  # an unreadable rules file has no import to find
+
+
+def git_repo(root: Path, files: dict[str, str | bytes]) -> None:
+    import subprocess
+
+    def git(*args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=root, check=True, capture_output=True)
+
+    git("init", "-q")
+    for name, content in files.items():
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content if isinstance(content, bytes) else content.encode())
+    git("add", "-A")
+    git("commit", "-q", "-m", "c")
+
+
+def test_tree_paths(tmp_path):
+    from agentflow import gitops
+
+    git_repo(tmp_path, {"CLAUDE.md": "x", "a/b.md": "y"})
+    assert gitops.tree_paths(tmp_path, "HEAD") == ["CLAUDE.md", "a/b.md"]
+    assert gitops.tree_paths(tmp_path, "nosuchref") is None
+    assert gitops.tree_paths(tmp_path / "missing", "HEAD") is None
+
+
+@pytest.mark.parametrize("files, rules, run_brief, expected", [
+    ({"README.md": "x"}, ["AGENTS.md"], True, 1),
+    ({"README.md": "x"}, ["CLAUDE.md"], True, 0),
+    ({"CLAUDE.md": "x", "pkg/CLAUDE.md": "y"}, ["CLAUDE.md"], True, 1),
+    ({"CLAUDE.md": "x" * 200_001}, ["CLAUDE.md"], True, 1),
+    ({"CLAUDE.md": "x"}, ["CLAUDE.md"], True, 0),
+    ({"README.md": "x"}, ["AGENTS.md"], False, 0),
+    ({"CLAUDE.md": "x", "pkg/CLAUDE.md": "y"}, ["CLAUDE.md"], False, 0),
+    ({"CLAUDE.md": "x" * 200_001}, ["CLAUDE.md"], False, 0),
+])
+def test_agent_rules_warnings(tmp_cfg, tmp_path, files, rules, run_brief, expected):
+    git_repo(tmp_path, files)
+    issues = issues_for(tmp_cfg, {"context": {"run_brief": run_brief}, "project": {"agent_rules": rules}})
+    found = agent_rules_issues(issues, "warning")
+    assert len(found) == expected, found
+    assert all("memory files" in i.message for i in found)
+
+
+def test_agent_rules_symlink_to_a_refused_target_warns(tmp_cfg, tmp_path):
+    import subprocess
+
+    (tmp_path / "x").mkdir()
+    (tmp_path / "AGENTS.md").symlink_to("../outside/.git/config")
+    (tmp_path / "CLAUDE.md").write_text("x", encoding="utf-8")
+    for args in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"]):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    issues = issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md", "AGENTS.md"]}})
+    assert len(agent_rules_issues(issues, "warning")) == 1
