@@ -910,3 +910,132 @@ def test_a_replaced_head_is_seen_through(tmp_git, cfg, tmp_path):
         pytest.fail(f"the reconcile commit was made, and really holds {real}")
     assert _head(tmp_git) == parent  # nothing committed, and the index back at the real HEAD:
     assert run_git(tmp_git, "--no-replace-objects", "diff", "--cached", "--name-only") == ""
+
+
+# --------------------------------------------------------------------------- read_blob
+
+
+def _sha(repo: Path, ref: str = "HEAD") -> str:
+    return run_git(repo, "rev-parse", ref).strip()
+
+
+def test_read_blob_reads_a_regular_file_at_a_commit(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "CLAUDE.md", "first\n")
+    _write(repo, "docs/deep/rules.md", "deep\n")
+    _commit(repo)
+    sha = _sha(repo)
+    _write(repo, "CLAUDE.md", "second\n")
+    _commit(repo)
+    assert gitops.read_blob(repo, sha, "CLAUDE.md", 100) == b"first\n"
+    assert gitops.read_blob(repo, sha, "docs/deep/rules.md", 100) == b"deep\n"
+    assert gitops.read_blob(repo, sha[:12], "CLAUDE.md", 100) == b"first\n"
+    assert gitops.read_blob(repo, sha, "missing.md", 100) is None
+    assert gitops.read_blob(repo, "0" * 40, "CLAUDE.md", 100) is None
+    assert gitops.read_blob(tmp_path / "nowhere", sha, "CLAUDE.md", 100) is None
+
+
+def test_read_blob_ignores_replace_refs(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "CLAUDE.md", "original\n")
+    _commit(repo)
+    original = _sha(repo)
+    _write(repo, "CLAUDE.md", "forged\n")
+    _commit(repo, "forged")
+    forged = _sha(repo)
+    run_git(repo, "replace", original, forged)
+    assert run_git(repo, "show", f"{original}:CLAUDE.md") == "forged\n"  # git itself follows the replace ref
+    assert gitops.read_blob(repo, original, "CLAUDE.md", 100) == b"original\n"
+
+
+def test_read_blob_refuses_a_rewritten_loose_object(tmp_path):
+    import zlib
+
+    repo = _repo(tmp_path)
+    _write(repo, "CLAUDE.md", "honest\n")
+    _commit(repo)
+    sha = _sha(repo)
+    blob = run_git(repo, "rev-parse", f"{sha}:CLAUDE.md").strip()
+    loose = repo / ".git" / "objects" / blob[:2] / blob[2:]
+    assert loose.is_file()
+    os.chmod(loose, 0o644)
+    loose.write_bytes(zlib.compress(b"blob 7\0forged\n"))
+    assert gitops.read_blob(repo, sha, "CLAUDE.md", 100) is None
+
+
+def test_read_blob_refuses_a_rewritten_loose_tree(tmp_path):
+    import zlib
+
+    repo = _repo(tmp_path)
+    _write(repo, "docs/rules.md", "honest\n")
+    _write(repo, "evil.md", "forged\n")
+    _commit(repo)
+    sha = _sha(repo)
+    docs = run_git(repo, "rev-parse", f"{sha}:docs").strip()
+    evil = bytes.fromhex(run_git(repo, "rev-parse", f"{sha}:evil.md").strip())
+    body = b"100644 rules.md\0" + evil  # the tree now names the other blob, which is itself intact
+    loose = repo / ".git" / "objects" / docs[:2] / docs[2:]
+    os.chmod(loose, 0o644)
+    loose.write_bytes(zlib.compress(b"tree %d\0" % len(body) + body))
+    assert gitops.read_blob(repo, sha, "docs/rules.md", 100) is None
+
+
+def test_read_blob_reads_a_pack_prompt_override(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, ".agentflow/prompts/_preamble.md", "pack preamble\n")
+    _commit(repo)
+    assert gitops.read_blob(repo, _sha(repo), ".agentflow/prompts/_preamble.md", 1000) == b"pack preamble\n"
+
+
+def test_read_blob_refuses_bad_input_and_size(tmp_path, monkeypatch):
+    import subprocess
+
+    repo = _repo(tmp_path)
+    _write(repo, "x", "x\n")
+    _write(repo, "d/a.md", "a\n")
+    _write(repo, "big.md", "y" * 101)
+    _commit(repo)
+    sha = _sha(repo)
+    for path in ("../x", "-x", "/x", "", "d/../x", "./x", "d//a.md", ".git/config", ".GIT/config", "x\0y", "d"):
+        assert gitops.read_blob(repo, sha, path, 100) is None, path
+    for bad in ("HEAD", "main", sha[:6], sha.upper(), f"{sha}^", "-" + sha[:10], ""):
+        assert gitops.read_blob(repo, bad, "x", 100) is None, bad
+    assert gitops.read_blob(repo, sha, "big.md", 101) == b"y" * 101
+    calls: list[list[str]] = []
+    real = subprocess.run
+
+    def recorder(args, *rest, **kwargs):
+        calls.append(list(args))
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(gitops.subprocess, "run", recorder)
+    assert gitops.read_blob(repo, sha, "big.md", 100) is None
+    assert calls and all(call[0] == "git" and "--no-replace-objects" in call for call in calls)
+    assert not [call for call in calls if "cat-file" in call and "blob" in call]
+
+
+def test_read_blob_follows_an_inner_symlink_once(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "real.md", "real\n")
+    _write(repo, ".agentflow/prompts/x.md", "pack\n")
+    _write(repo, "sub/inner.md", "inner\n")
+    for link, target in (("link.md", "real.md"), ("sub/up.md", "../real.md"), ("sub/side.md", "inner.md"),
+                         ("out.md", "../outside"), ("abs.md", "/etc/hosts"), ("pack.md", ".agentflow/prompts/x.md"),
+                         ("chain.md", "link.md"), ("git.md", ".git/config"), ("dir.md", "sub")):
+        (repo / link).symlink_to(target)
+    _commit(repo)
+    sha = _sha(repo)
+    assert gitops.read_blob(repo, sha, "link.md", 100) == b"real\n"
+    assert gitops.read_blob(repo, sha, "sub/up.md", 100) == b"real\n"
+    assert gitops.read_blob(repo, sha, "sub/side.md", 100) == b"inner\n"
+    for link in ("out.md", "abs.md", "pack.md", "chain.md", "git.md", "dir.md"):
+        assert gitops.read_blob(repo, sha, link, 100) is None, link
+
+
+def test_read_blob_refuses_a_path_through_a_symlinked_directory(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "real/a.md", "a\n")
+    (repo / "alias").symlink_to("real")
+    _commit(repo)
+    assert gitops.read_blob(repo, _sha(repo), "real/a.md", 100) == b"a\n"
+    assert gitops.read_blob(repo, _sha(repo), "alias/a.md", 100) is None

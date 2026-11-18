@@ -100,15 +100,20 @@ def skill_text(cfg: Config, repo: Path, name: object) -> str | None:
     """The body of skill `name`'s `SKILL.md` (the repository's, else the engine's bundled one), or None.
 
     `repo` is the main checkout: a run's worktree holds what an agent wrote, so it is never a source of skill text.
-    A UTF-8 BOM and `\\r\\n` are normalised away; a frontmatter block (a first line `---` and a later line `---`)
-    is dropped, and a file whose frontmatter never closes is all body."""
+    The text goes through `normalise_skill`."""
     file = pack.skill_file(repo, cfg.project.skills_dir, name)
     if file is None:
         return None
     try:
-        text = file.read_text(encoding="utf-8").removeprefix("\ufeff").replace("\r\n", "\n")
+        return normalise_skill(file.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError):
         return None
+
+
+def normalise_skill(text: str) -> str:
+    """A `SKILL.md`'s body: a UTF-8 BOM and `\\r\\n` normalised away, and a frontmatter block (a first line `---` and a
+    later line `---`) dropped; a file whose frontmatter never closes is all body."""
+    text = text.removeprefix("\ufeff").replace("\r\n", "\n")
     lines = text.split("\n")
     if lines[0].rstrip() == "---":
         for number, line in enumerate(lines[1:], start=1):

@@ -2236,6 +2236,18 @@ def test_agent_rules_symlink_to_a_refused_target_warns(tmp_cfg, tmp_path):
     assert len(agent_rules_issues(issues, "warning")) == 1
 
 
+def test_agent_rules_symlink_target_is_read_like_the_brief_reads_it(tmp_cfg, tmp_path):
+    import subprocess
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "agents.md").write_text("see @README\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").symlink_to("docs/agents.md")
+    for args in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"]):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    found = agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md"]}}), "warning")
+    assert [i.message.split(":")[0] for i in found] == ["CLAUDE.md"] and "@ import" in found[0].message
+
+
 def test_memory_blockers_scan_is_linear_on_hostile_text():
     import time
 

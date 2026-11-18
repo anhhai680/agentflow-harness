@@ -1806,31 +1806,33 @@ class _Validator:
         from agentflow import gitops
 
         root = pack.checkout_root(self.repo)
-        tree = gitops.tree_paths(root, "HEAD")
-        if tree is None:
+        head = gitops.commit_at(root, "HEAD")
+        tree = gitops.tree_paths(root, head) if head is not None else None
+        if head is None or tree is None:
             return
         rules = [PurePosixPath(entry).as_posix() for entry in raw]
         tail = "run sessions will let Claude load its own memory files instead"
         for rule in rules:
             if rule != DEFAULT_AGENT_RULES[0] and rule not in tree:
                 self.add("warning", "project.agent_rules", f"{rule} is not committed at HEAD: {tail}")
+        listed = set(tree)
+        texts: dict[str, str | None] = {}
 
+        # The same reads as `brief.read_rules`, through the same hardened reader and cap: a symlink is followed once
+        # inside the repository, so its target's text is what the import check below sees.
         def read(rule: str) -> str | None:
-            entry = gitops.tree_entry(root, "HEAD", rule) if rule in tree else None
-            if entry is None or entry[0] not in ("100644", "100755") or entry[1] > AGENT_RULE_MAX_BYTES:
+            if rule not in listed:
                 return None
-            return gitops.blob_text(root, "HEAD", rule)
+            if rule not in texts:
+                data = gitops.read_blob(root, head, rule, AGENT_RULE_MAX_BYTES)
+                texts[rule] = None if data is None else data.decode("utf-8", errors="replace")
+            return texts[rule]
 
         for rule in dict.fromkeys(rules):
-            entry = gitops.tree_entry(root, "HEAD", rule) if rule in tree else None
-            if entry is None:
-                continue
-            if entry[0] == "120000":
-                target = gitops.blob_text(root, "HEAD", rule)
-                if target is None or rules_path_problem(target.strip()):
-                    self.add("warning", "project.agent_rules", f"{rule} is a symlink to a path the brief will not read: {tail}")
-            elif entry[1] > AGENT_RULE_MAX_BYTES:
-                self.add("warning", "project.agent_rules", f"{rule} is over {AGENT_RULE_MAX_BYTES} bytes: {tail}")
+            if rule in listed and read(rule) is None:
+                self.add("warning", "project.agent_rules", f"{rule} is no regular file of at most "
+                         f"{AGENT_RULE_MAX_BYTES} bytes, nor a symlink to one inside the repository and outside "
+                         f".agentflow, at HEAD: {tail}")
         for reason in memory_blockers(tree, read, rules):
             self.add("warning", "project.agent_rules", f"{reason}: {tail}")
 
