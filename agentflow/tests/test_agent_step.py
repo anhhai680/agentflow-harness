@@ -874,7 +874,7 @@ def test_build_prompt_parts(flow_repo):
     assert "stop and ask" in first
     assert "commit" in first and "push" in first
     assert "docs/specs/SPEC-crm.md" in first
-    assert first.index("spec-driven-development") < first.index("/workspace/out/step.json")
+    assert first.index("/workspace/out/step.json") < first.index("spec-driven-development") < first.index("## When you finish")
 
 
 def test_build_prompt_names_a_skill_the_template_leaves_out(flow_repo):
@@ -1361,9 +1361,10 @@ def test_without_facts_the_prompt_has_no_heading_and_no_stray_blank_lines(flow_r
     flow_repo.new_run()
     prompt = _prompt(flow_repo)
     assert "What this run already found" not in prompt and "{run_facts}" not in prompt
-    assert "\n\n\n" not in prompt.split("## The step")[0]  # (the skill's own text further down has some)
+    assert "\n\n\n" not in prompt.split("## Step `")[0]  # (the skill's own text further down has some)
     # the last bullet of the preamble's shell rules runs straight into the step's own text, one blank line between
-    assert re.search(r"stop as `blocked` and name the exact command\.\n\n## The step\n\n", prompt)
+    assert "stop as `blocked` and name the exact command.\n\n" in prompt  # the preamble's last line ends the preamble
+    assert re.search(r"\n\n## Step `[^`\n]+`\n\nYour result file is `[^`\n]+`\.\n\n", prompt)  # the step head follows it
 
 
 def test_a_run_with_no_facts_key_in_its_state_builds_the_same_prompt(flow_repo):
@@ -1380,9 +1381,9 @@ def test_facts_go_into_the_preamble_before_the_step(flow_repo):
     run.emit("run_fact", text="an environment cause", key="build/x/resolve-1")
     prompt = _prompt(flow_repo)
     block = ("## What this run already found\n\nEarlier sessions of this run established these. Check one before "
-             "relying on it; do not diagnose it again.\n\n- a tool quirk {step_id}\n- an environment cause\n\n## The step")
+             "relying on it; do not diagnose it again.\n\n- a tool quirk {step_id}\n- an environment cause\n\n## Step `")
     assert block in prompt  # braces in a fact go in verbatim
-    assert prompt.replace(block, "## The step") == plain
+    assert prompt.replace(block, "## Step `") == plain
 
 
 # --------------------------------------------------------------------------- the run's code map
@@ -1392,8 +1393,9 @@ def test_without_a_code_map_the_preamble_is_unchanged(flow_repo):
     flow_repo.new_run()
     prompt = _prompt(flow_repo)
     assert "Code this run has mapped" not in prompt and "{code_map}" not in prompt
-    assert "\n\n\n" not in prompt.split("## The step")[0]
-    assert re.search(r"stop as `blocked` and name the exact command\.\n\n## The step\n\n", prompt)
+    assert "\n\n\n" not in prompt.split("## Step `")[0]
+    assert "stop as `blocked` and name the exact command.\n\n" in prompt  # the preamble's last line ends the preamble
+    assert re.search(r"\n\n## Step `[^`\n]+`\n\nYour result file is `[^`\n]+`\.\n\n", prompt)  # the step head follows it
 
 
 def test_a_run_with_no_code_map_key_builds_the_same_prompt(flow_repo):
@@ -1410,11 +1412,11 @@ def test_the_code_map_follows_the_facts_before_the_step(flow_repo):
     run.emit("code_noted", text="`app/names.py:12` `f() {step_id}`", key="build/x")
     prompt = _prompt(flow_repo)
     block = ("- a cause\n\n## Code this run has mapped\n\n" + lanes.CODE_MAP_LEAD
-             + "\n\n- `app/names.py:12` `f() {step_id}`\n\n## The step")  # braces in an entry go in verbatim
+             + "\n\n- `app/names.py:12` `f() {step_id}`\n\n## Step `")  # braces in an entry go in verbatim
     assert block in prompt
     assert prompt.count("Code this run has mapped") == 1
     run.emit("code_noted", text="`app/other.py:3` `g()`", key="build/y")
-    assert "- `app/names.py:12` `f() {step_id}`\n- `app/other.py:3` `g()`\n\n## The step" in _prompt(flow_repo)
+    assert "- `app/names.py:12` `f() {step_id}`\n- `app/other.py:3` `g()`\n\n## Step `" in _prompt(flow_repo)
 
 
 def test_a_code_map_with_no_facts_drops_only_the_facts_slot(flow_repo):
@@ -1423,9 +1425,9 @@ def test_a_code_map_with_no_facts_drops_only_the_facts_slot(flow_repo):
     run.emit("code_noted", text="`a.py:1` `f()`", key="build/x")
     prompt = _prompt(flow_repo)
     assert "What this run already found" not in prompt and "{run_facts}" not in prompt
-    block = "## Code this run has mapped\n\n" + lanes.CODE_MAP_LEAD + "\n\n- `a.py:1` `f()`\n\n## The step"
+    block = "## Code this run has mapped\n\n" + lanes.CODE_MAP_LEAD + "\n\n- `a.py:1` `f()`\n\n## Step `"
     assert block in prompt
-    assert prompt.replace(block, "## The step") == plain
+    assert prompt.replace(block, "## Step `") == plain
 
 
 def test_task_prompts_point_at_interfaces_and_the_map_not_the_plan():
@@ -1569,8 +1571,9 @@ def test_no_lessons_no_heading_and_no_blank_lines(flow_repo, no_engine_lessons):
     flow_repo.new_run()
     prompt = _prompt(flow_repo)
     assert "Lessons from earlier runs" not in prompt and "{lessons}" not in prompt
-    assert "\n\n\n" not in prompt.split("## The step")[0]
-    assert re.search(r"stop as `blocked` and name the exact command\.\n\n## The step\n\n", prompt)
+    assert "\n\n\n" not in prompt.split("## Step `")[0]
+    assert "stop as `blocked` and name the exact command.\n\n" in prompt  # the preamble's last line ends the preamble
+    assert re.search(r"\n\n## Step `[^`\n]+`\n\nYour result file is `[^`\n]+`\.\n\n", prompt)  # the step head follows it
 
 
 def test_pack_lessons_go_into_the_preamble(flow_repo, no_engine_lessons):
@@ -1578,8 +1581,8 @@ def test_pack_lessons_go_into_the_preamble(flow_repo, no_engine_lessons):
     _write_pack_lessons(flow_repo, LESSON_ONE)
     prompt = _prompt(flow_repo)
     assert "- **L-0001** Lint first: Run `ruff`." in prompt
-    assert prompt.index("Lessons from earlier runs") < prompt.index("## The step")
-    assert "\n\n\n" not in prompt.split("## The step")[0]
+    assert prompt.index("Lessons from earlier runs") < prompt.index("## Step `")
+    assert "\n\n\n" not in prompt.split("## Step `")[0]
 
 
 def test_lessons_follow_the_code_map(flow_repo, no_engine_lessons):
@@ -1587,7 +1590,7 @@ def test_lessons_follow_the_code_map(flow_repo, no_engine_lessons):
     run.emit("code_noted", text="`a.py:1` `f()`", key="build/x")
     _write_pack_lessons(flow_repo, LESSON_ONE)
     prompt = _prompt(flow_repo)
-    assert prompt.index("Code this run has mapped") < prompt.index("Lessons from earlier runs") < prompt.index("## The step")
+    assert prompt.index("Code this run has mapped") < prompt.index("Lessons from earlier runs") < prompt.index("## Step `")
 
 
 def test_lesson_braces_go_in_verbatim(flow_repo, no_engine_lessons):
@@ -1662,3 +1665,60 @@ def test_lessons_that_do_not_fit_are_reported_as_truncated(flow_repo, no_engine_
     assert [(e["key"], e["tier"], e["dropped"]) for e in flow_repo.events(run, "memory_truncated")] == \
         [(KEY, "lessons", ["L-0001"])]
     assert flow_repo.events(run, "lessons_injected")[0]["ids"] == ["L-0002"]
+
+
+# --------------------------------------------------------------------------- the step head (cost C2)
+
+OLD_PREAMBLE_C2 = (ENGINE / "tests" / "fixtures" / "old_prompts" / "_preamble_c2.md").read_text(encoding="utf-8")
+
+
+def test_step_head_follows_the_preamble(flow_repo):
+    run = flow_repo.new_run()
+    assert run_step(flow_repo) == "done"
+    prompt = flow_repo.calls()[0]["argv"][-1]
+    result = run.agent_result_path(KEY)
+    template = "Goal: do the step `impl`"  # the first line of the default template
+    order = [prompt.index("Nobody can answer you"), prompt.index(f"## Step `{make_step().id}`"),
+             prompt.index(f"Your result file is `{result}`"), prompt.index(template), prompt.index("## When you finish")]
+    assert order == sorted(order) and len(set(order)) == 5
+    assert "{in_brief}" not in prompt and "the step's prompt names it" in prompt
+
+
+@pytest.mark.parametrize("crlf", [False, True])
+def test_old_preamble_override_does_not_double_the_slots(flow_repo, monkeypatch, crlf):
+    old = OLD_PREAMBLE_C2.replace("\n", "\r\n") if crlf else OLD_PREAMBLE_C2
+    real = lanes._template
+    monkeypatch.setattr(lanes, "_template", lambda cfg, name: old if name == lanes.PREAMBLE else real(cfg, name))
+    run = flow_repo.new_run()
+    run.emit("run_fact", text="a fact", key="build/x/resolve-1")
+    prompt = _prompt(flow_repo)
+    assert prompt.count("## What this run already found") == 1
+    assert "{run_facts}" not in prompt and "{code_map}" not in prompt and "{lessons}" not in prompt
+
+
+def test_a_preamble_slot_at_the_end_of_the_file_is_dropped(flow_repo, monkeypatch):
+    real = lanes._template
+    monkeypatch.setattr(lanes, "_template",
+                        lambda cfg, name: real(cfg, name) + "\n{lessons}" if name == lanes.PREAMBLE else real(cfg, name))
+    run = flow_repo.new_run()
+    run.emit("run_fact", text="a fact", key="build/x/resolve-1")
+    prompt = _prompt(flow_repo)
+    assert prompt.count("## What this run already found") == 1 and "{lessons}" not in prompt
+
+
+def test_resume_turns_still_name_the_result_file(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{}, {"result": DONE}]})  # no result the first time: a reminder turn follows
+    assert run_step(flow_repo) == "done"
+    named = f"`{run.agent_result_path(KEY)}`"
+    reminder = flow_repo.calls()[1]["argv"][-1]
+    assert named in reminder and "write your result JSON to" in reminder and "## When you finish" in reminder
+    assert "(the path after" in reminder  # the result contract's own, reworded line follows the reminder
+
+
+def test_the_continue_prompt_names_the_result_file(flow_repo):
+    run = flow_repo.new_run()
+    _interrupted(flow_repo, run)
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    prompt = flow_repo.calls()[0]["argv"][-1]
+    assert f"`{run.agent_result_path(KEY)}`" in prompt and "write your result JSON to" in prompt

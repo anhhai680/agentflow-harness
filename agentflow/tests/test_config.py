@@ -532,6 +532,32 @@ def test_unknown_placeholder_in_a_template(tmp_cfg):
     assert not any(i.path.startswith(("prompts/", "engine:prompts/")) and i.path != "prompts/bogus.md" for i in issues)
 
 
+def _brief_placeholder_warnings(issues: list[Issue]) -> list[Issue]:
+    return [i for i in issues if i.level == "warning" and i.path.startswith("prompts/") and "get no brief" in i.message]
+
+
+@pytest.mark.parametrize("name", ["_result.md", "_preamble.md"])
+def test_brief_placeholder_warning(tmp_cfg, name):
+    path = tmp_cfg()
+    (path.parent / "prompts" / name).write_text("Write to {result_file}. In run {run}.\n", encoding="utf-8")
+    found = _brief_placeholder_warnings(validate(load_config(path), path.parent.parent))
+    assert [(i.path, i.fixable) for i in found] == [(f"prompts/{name}", False)]
+    assert "{result_file}" in found[0].message and "{run}" not in found[0].message
+
+
+def test_brief_placeholder_warning_off_with_run_brief_false(tmp_cfg):
+    path = tmp_cfg({"context": {"run_brief": False}})
+    (path.parent / "prompts" / "_result.md").write_text("Write to {result_file}.\n", encoding="utf-8")
+    assert _brief_placeholder_warnings(validate(load_config(path), path.parent.parent)) == []
+
+
+def test_brief_placeholders_are_prompt_placeholders():
+    from agentflow import config
+
+    assert config.BRIEF_PLACEHOLDERS <= config.PROMPT_PLACEHOLDERS and "in_brief" in config.PROMPT_PLACEHOLDERS
+    assert "result_file" not in config.BRIEF_PLACEHOLDERS
+
+
 def test_a_brief_file_must_exist(tmp_cfg):
     path = tmp_cfg(lambda data: phase_step(data, "review", "branch_review").update(brief=".claude/skills/none.md"))
     assert ("error", "phases.review.steps[4].brief") in errors(validate(load_config(path), path.parent.parent))

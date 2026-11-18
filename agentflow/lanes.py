@@ -68,10 +68,16 @@ BACKOFF_MAX_S = 900.0
 
 PREAMBLE = "_preamble.md"
 RESULT = "_result.md"
+STEP_HEAD = "_step_head.md"
 DEFAULT_TEMPLATE = "step.md"
 DEFAULT_REFINE = "refine.md"
 DEFAULT_ROLE = "build"
-EMPTY_SLOT = re.compile(r"^\{(run_facts|code_map|lessons)\}\n\n", re.MULTILINE)  # a preamble slot, dropped whole when empty
+EMPTY_SLOT = re.compile(r"^\{(run_facts|code_map|lessons)\}\n\n", re.MULTILINE)  # a step head slot, dropped whole when empty
+# A slot line in the preamble: only a pack's old copy of `_preamble.md` still has them (they moved to the step head),
+# so they are dropped whole, CRLF and end of file included, and the facts never show twice.
+PREAMBLE_SLOT = re.compile(r"^\{(run_facts|code_map|lessons)\}[ \t]*(?:\r?\n|\Z)", re.MULTILINE)
+RESULT_REMINDER = ("When you finish, write your result JSON to `{result_file}` again (the runner removed the last "
+                   "one), as the \"When you finish\" section of your instructions says.")
 CODE_MAP_LEAD = ("Earlier sessions of this run found where this code lives. Open it at the line given instead of "
                  "searching for it, and check a signature before you rely on it.")
 RESOLVER_FINDINGS_SHOWN = 3
@@ -225,7 +231,8 @@ def _drop_skill_section(body: str, keep: bool = False) -> str:
 
 
 def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode: Mode) -> str:
-    """`_preamble.md` + the step's template (after the refine template in a refine round) + `_result.md`.
+    """`_preamble.md` + `_step_head.md` + the step's template (after the refine template in a refine round) +
+    `_result.md`.
 
     The preamble's effort check is always stripped (a pack's own `_preamble.md` copy may still hold it): the
     runner sizes every step before it starts. Placeholders are filled in one pass over the joined text, so
@@ -240,7 +247,9 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
                and doubt.is_doubt_reviewer(cfg, str(extra["phase"]), step, str(ctx.values.get("lane") or "")))
     if doubter:
         values["code_map"] = ""  # before the slot is dropped, so it goes whole
-    preamble = EMPTY_SLOT.sub(lambda m: "" if not values[m.group(1)] else m.group(0), preamble)
+    preamble = PREAMBLE_SLOT.sub("", preamble)
+    step_head = _template(cfg, STEP_HEAD)
+    step_head = EMPTY_SLOT.sub(lambda m: "" if not values[m.group(1)] else m.group(0), step_head)
     body = _template(cfg, step.prompt or DEFAULT_TEMPLATE).strip()
     files = list(dict.fromkeys([*step.brief, *step.task_brief]))
     # A step with no configured `brief:` whose skill resolves has the skill's text as its brief, and its first
@@ -285,8 +294,9 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
         body = f"{refine}\n\nThe step as it was first given:\n\n{body}"
     if mode == "refine" or (ctx.run is not None and ctx.run.state.get("refine")):  # a step can first run in a refine round
         values.update(_refine_values(ctx, rec))
+    values["in_brief"] = ""
     values.update({name: str(value) for name, value in extra.items()})
-    text = "\n\n".join(part.strip() for part in (preamble, body, _template(cfg, RESULT)))
+    text = "\n\n".join(part.strip() for part in (preamble, step_head, body, _template(cfg, RESULT)))
     agent = cfg.agents.get(rec.get("agent") or cfg.defaults.agent)
     if agent is not None and agent.skill_loading == "read_file":
         text = _read_file_skills(text, cfg.project.skills_dir,
@@ -1133,7 +1143,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         return f"{sr.lead}\n\n{prompt}" if sr.lead else prompt
 
     def _result_partial(self, sr: _StepRun) -> str:
-        return fmt(_template(self.cfg, RESULT), self._values(sr)).strip() + "\n"
+        """What a resume turn ends with: the reminder, which names the result file, then the result contract."""
+        return fmt(f"{RESULT_REMINDER}\n\n{_template(self.cfg, RESULT).strip()}", self._values(sr)).strip() + "\n"
 
     def _continue_prompt(self, sr: _StepRun, answers: dict[str, str], approved: dict | None = None) -> str:
         if answers:

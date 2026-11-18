@@ -97,7 +97,7 @@ Setting up a repository (these commands run with no pack, or before one exists):
 Safety and the UI:
 - `guards.py` refuses a step that touches `guardrails.forbidden_paths` or `.agentflow/**` (always refused), moves `HEAD`, or uses a user-only skill, and it rejects commit messages that carry a `guardrails.reject_trailers` trailer. Only the runner commits and pushes (`gitops.py`, `commit_checks.py`), and it never merges. `safeio.py` writes files without following symlinks.
 - `dashboard.py`, `dashboard.html` and `backlog.py` make up the local Kanban board: a stdlib HTTP server on 127.0.0.1 that needs a token and sends SSE updates. `config_edit.py` backs its Settings page, which edits `config.yaml` while keeping comments and anchors. Its `_PROTECTED_KEYS` lists the keys the page may not change.
-- `prompts/*.md` are the engine's default prompt templates. `_preamble.md` and `_result.md` are shared by all of them.
+- `prompts/*.md` are the engine's default prompt templates. `_preamble.md`, `_step_head.md` and `_result.md` are shared by all of them.
 
 Tests (`agentflow/tests/`):
 - `fake_agent.py` is a scripted stand-in for `claude -p` (`AGENTFLOW_FAKE_SCRIPT`), and `tests/bin/gh` is a fake `gh`. No test calls a real model or GitHub.

@@ -170,6 +170,7 @@ PROMPT_PLACEHOLDERS = frozenset(
         "base_ref",
         "self_checks",
         "reconcile_output",
+        "in_brief",
         # sizer prompts (`sizing_lane.py`)
         "task_card",
         "task_cards",
@@ -177,6 +178,11 @@ PROMPT_PLACEHOLDERS = frozenset(
         "route_card",
     }
 )
+# What a run's brief can fill in `_preamble.md` and `_result.md`: values that hold for a whole run. A pack copy of
+# either file with another placeholder (`{step_id}`, `{result_file}`) leaves its sessions with no brief.
+BRIEF_PLACEHOLDERS = frozenset({"run", "run_dir", "progress", "handoff", "questions", "module", "module_pkg", "lane",
+                                "slug"})
+BRIEF_FILES = ("_preamble.md", "_result.md")
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
                     "--dangerously-skip-permissions", "--permission-mode")
 RUNNER_FLAGS = ("--setting-sources",)  # set by the runner from `agents.claude.user_settings`, never by base_args
@@ -1569,9 +1575,17 @@ class _Validator:
             except UnicodeDecodeError:
                 self.error(pack.prompt_label(self.cfg.path, file), "is not UTF-8 text")
                 continue
-            for name in dict.fromkeys(_PLACEHOLDER.findall(text)):
+            label = pack.prompt_label(self.cfg.path, file)
+            names = list(dict.fromkeys(_PLACEHOLDER.findall(text)))
+            for name in names:
                 if name not in PROMPT_PLACEHOLDERS:
-                    self.error(pack.prompt_label(self.cfg.path, file), f"unknown placeholder '{{{name}}}'")
+                    self.error(label, f"unknown placeholder '{{{name}}}'")
+            outside = [name for name in names if name not in BRIEF_PLACEHOLDERS]
+            if outside and self.cfg.context.run_brief and label in {f"prompts/{name}" for name in BRIEF_FILES}:
+                shown = ", ".join(f"{{{name}}}" for name in outside)
+                self.add("warning", label, f"holds {shown}, which a run's brief cannot fill: sessions of this pack "
+                                           "get no brief (the whole prompt is sent every time). Move step-specific "
+                                           "lines into the step's own template, or set context.run_brief: false")
 
     def prompt_drift(self) -> None:
         """The pack's prompt overrides that hold text the engine retired, or copy an engine prompt unchanged."""

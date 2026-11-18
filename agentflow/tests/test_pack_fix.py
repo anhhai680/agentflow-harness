@@ -18,6 +18,8 @@ BLOCK = next(e for e in pack_fix.RETIRED if e.id == "effort-check-block")
 STATUS = next(e for e in pack_fix.RETIRED if e.id == "effort-change-status")
 OLD_PREAMBLE = engine("_preamble.md").replace("## Rules for this step", BLOCK.old + "## Rules for this step", 1)
 OLD_RESULT = engine("_result.md").replace(STATUS.new, STATUS.old)
+OLD_PREAMBLE_C2 = (Path(__file__).parent / "fixtures" / "old_prompts" / "_preamble_c2.md").read_text(encoding="utf-8")
+OLD_RESULT_C2 = (Path(__file__).parent / "fixtures" / "old_prompts" / "_result_c2.md").read_text(encoding="utf-8")
 EDITED_RESULT = engine("_result.md") + "\n- also `effort_change` when unsure\n"
 
 
@@ -159,6 +161,31 @@ def test_old_preamble_block_is_one_fixable_issue(pack_repo_python):
     assert [i.fixable for i in got.issues] == [True]
     assert b"effort" not in got.fixes[0].after
     assert got.fixes[0].after.decode("utf-8") == engine("_preamble.md") + "\nPack rule.\n"
+
+
+def test_preamble_and_result_c2_rewords_are_fixable(pack_repo_python):
+    put(pack_repo_python, "_preamble.md", OLD_PREAMBLE_C2)
+    got = found(pack_repo_python)
+    assert [(i.level, i.path, i.fixable) for i in got.issues] == [("warning", "prompts/_preamble.md", True)] * 2
+    assert all("2.10" in i.message for i in got.issues)
+    assert [f.after for f in got.fixes] == [None]  # the fixed text is the engine's file: the override goes
+    put(pack_repo_python, "_result.md", OLD_RESULT_C2)
+    got = found(pack_repo_python)
+    assert [i.path for i in got.issues].count("prompts/_result.md") == 1
+    assert [f.after for f in got.fixes if f.path.name == "_result.md"] == [None]
+    put(pack_repo_python, "_preamble.md", OLD_PREAMBLE_C2 + "\nPack rule.\n")
+    put(pack_repo_python, "_result.md", OLD_RESULT_C2 + "\nPack line.\n")
+    got = {f.path.name: f.after.decode("utf-8") for f in found(pack_repo_python).fixes}
+    assert got == {"_preamble.md": engine("_preamble.md") + "\nPack rule.\n",
+                   "_result.md": engine("_result.md") + "\nPack line.\n"}
+
+
+def test_the_c2_register_entries_are_exact_copies_of_the_old_prompts():
+    for entry_id, old_text in (("preamble-names-the-step", OLD_PREAMBLE_C2), ("preamble-step-slots", OLD_PREAMBLE_C2),
+                               ("result-names-the-file", OLD_RESULT_C2)):
+        entry = next(e for e in pack_fix.RETIRED if e.id == entry_id)
+        assert entry.retired_in == "2.10" and entry.old in old_text and entry.detect in old_text, entry_id
+        assert entry.new == "" or entry.new in engine(entry.file), entry_id
 
 
 def test_fix_that_lands_on_the_engine_text_deletes(pack_repo_python):

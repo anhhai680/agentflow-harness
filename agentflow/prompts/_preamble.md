@@ -1,4 +1,4 @@
-You are running headless as step `{step_id}` of the agentflow run `{run}`. Nobody can answer you during the step.
+You are running headless as one step of the agentflow run `{run}`; the step's prompt names it. Nobody can answer you during the step.
 
 ## Rules for this step
 
@@ -17,11 +17,3 @@ This session cannot ask for approval, so anything outside the allow rules is den
 - Read files with Read and search with Grep, using full paths. Do not `cat` them.
 - Run only the tests you wrote or changed, never the whole suite: the runner's gates run it.
 - A denied command stays denied in any other form. Do not rephrase it: stop as `blocked` and name the exact command.
-
-{run_facts}
-
-{code_map}
-
-{lessons}
-
-## The step
