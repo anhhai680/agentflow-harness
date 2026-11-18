@@ -1000,12 +1000,15 @@ def _verified(repo: Path, kind: bytes, oid: str, limit: int, algo: Callable[[byt
     return data
 
 
-def _tree_entries(tree: bytes, raw: int) -> list[tuple[bytes, bytes, str]] | None:
-    """`(mode, name, id)` of every entry of a raw tree object; None when it is malformed or names an entry twice."""
+def _tree_entries(tree: bytes, raw: int, most: int | None = None) -> list[tuple[bytes, bytes, str]] | None:
+    """`(mode, name, id)` of every entry of a raw tree object; None when it is malformed, names an entry twice, or
+    holds more than `most` entries (stopping at the first one past it)."""
     out: list[tuple[bytes, bytes, str]] = []
     names: set[bytes] = set()
     at = 0
     while at < len(tree):
+        if most is not None and len(out) >= most:
+            return None
         space = tree.find(b" ", at)
         nul = tree.find(b"\0", space + 1) if space >= 0 else -1
         if nul < 0 or nul + 1 + raw > len(tree):
@@ -1107,7 +1110,11 @@ def _verified_batch(repo: Path, oids: list[str], algo: Callable[[bytes], Any], b
 # The bounds of one listing; past any of them it is refused (None), never cut short. Distinct tree bytes alone don't
 # bound the work: one shared subtree named many times over fans out to `width ** depth` paths from a few KB.
 _LIST_MAX_BYTES = 64 * 1024 * 1024  # every distinct tree of a listing together; a larger tree set is refused unread
-_LIST_MAX_PATHS = 100_000  # files listed plus folders queued: about 10 MB of path strings at most
+_LIST_MAX_PATHS = 100_000  # entries: files listed plus folders queued
+_LIST_MAX_PATH_LEN = 4096  # bytes of one path (PATH_MAX); a longer path, or a folder whose prefix is longer, is refused
+# Bytes of every path and folder prefix the walk builds, all levels together, counted from the names before any
+# string is made; Python holds a str in at most 4 bytes a character, so the strings stay under 64 MiB.
+_LIST_MAX_PATH_BYTES = 16 * 1024 * 1024
 _LIST_MAX_DEPTH = 64  # folders below the root; each level costs two git processes
 _LIST_DEADLINE_S = 30.0  # the whole listing, as one `ls-tree -r` is given
 
@@ -1124,28 +1131,34 @@ def verified_tree_paths(repo: Path, sha: str) -> list[str] | None:
         return None
     tree, algo, width = root
     paths: list[str] = []
-    pending = [("", tree)]
+    pending: list[tuple[str, int, str]] = [("", 0, tree)]  # (prefix, its length in bytes, tree id)
     budget = _LIST_MAX_BYTES
     deadline = time.monotonic() + _LIST_DEADLINE_S
     depth = 0
+    built = 0  # bytes of every path and folder prefix built so far: an upper bound of what the walk holds
     while pending:
         left = deadline - time.monotonic()
         if left <= 0 or depth > _LIST_MAX_DEPTH:
             return None
-        oids = list(dict.fromkeys(oid for _, oid in pending))
+        oids = list(dict.fromkeys(oid for _, _, oid in pending))
         read = _verified_batch(repo, oids, algo, budget, left)
         if read is None:
             return None
         budget -= sum(len(data) for data in read.values())
-        deeper: list[tuple[str, str]] = []
-        for prefix, oid in pending:
-            entries = _tree_entries(read[oid], width // 2)
-            if entries is None or len(paths) + len(deeper) + len(entries) > _LIST_MAX_PATHS:
+        deeper: list[tuple[str, int, str]] = []
+        for prefix, size, oid in pending:
+            entries = _tree_entries(read[oid], width // 2, _LIST_MAX_PATHS - len(paths) - len(deeper))
+            if entries is None:
                 return None
-            for mode, name, child in entries:
+            # Every length is known before any string is built: refuse first, concatenate after.
+            lengths = [size + len(name) + (1 if mode in _DIRECTORY else 0) for mode, name, _ in entries]
+            if any(n > _LIST_MAX_PATH_LEN for n in lengths) or built + sum(lengths) > _LIST_MAX_PATH_BYTES:
+                return None
+            built += sum(lengths)
+            for (mode, name, child), length in zip(entries, lengths, strict=True):
                 path = prefix + name.decode("utf-8", errors="surrogateescape")
                 if mode in _DIRECTORY:
-                    deeper.append((path + "/", child))
+                    deeper.append((path + "/", length, child))
                 else:
                     paths.append(path)
         pending = deeper

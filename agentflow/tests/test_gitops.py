@@ -1153,3 +1153,71 @@ def test_verified_tree_paths_stops_at_its_deadline(tmp_path, monkeypatch):
     assert gitops.verified_tree_paths(repo, _sha(repo)) == ["a/b.md"]
     monkeypatch.setattr(gitops, "_LIST_DEADLINE_S", 0)
     assert gitops.verified_tree_paths(repo, _sha(repo)) is None
+
+
+def _blob_id(repo: Path) -> str:
+    import subprocess
+
+    return subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, input="x\n", capture_output=True,
+                          text=True, check=True).stdout.strip()
+
+
+def _long_name_fan_out(repo: Path, name_len: int, levels: int) -> str:
+    """A commit whose leaf holds one file with a `name_len` name, under `levels` levels of two folders with
+    `name_len` names each, all naming one shared subtree: `2 ** levels` paths of `(levels + 1) * name_len` bytes."""
+    tree = _mktree(repo, [("100644", _blob_id(repo), "f" * name_len)])
+    for _ in range(levels):
+        tree = _mktree(repo, [("040000", tree, "a" * name_len), ("040000", tree, "b" * name_len)])
+    return _commit_tree(repo, tree)
+
+
+@pytest.mark.parametrize("levels", [3, 11], ids=["levels3", "levels11"])
+def test_verified_tree_paths_refuses_long_names_quickly_and_in_bounded_memory(tmp_path, levels):
+    import time
+    import tracemalloc
+
+    repo = _repo(tmp_path)
+    bomb = _long_name_fan_out(repo, 100_000, levels)  # a few KB of objects naming paths of megabytes
+    tracemalloc.start()
+    started = time.monotonic()
+    try:
+        assert gitops.verified_tree_paths(repo, bomb) is None
+        elapsed = time.monotonic() - started
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert elapsed < 10 and peak < 64 * 1024 * 1024, (elapsed, peak)
+
+
+def test_verified_tree_paths_refuses_more_path_bytes_than_its_budget(tmp_path):
+    import tracemalloc
+
+    repo = _repo(tmp_path)
+    fits = _long_name_fan_out(repo, 300, 3)
+    assert len(gitops.verified_tree_paths(repo, fits)) == 8
+    bomb = _long_name_fan_out(repo, 300, 13)  # 8_192 paths of 4_200 bytes: over 16 MiB, each path under the cap
+    tracemalloc.start()
+    try:
+        assert gitops.verified_tree_paths(repo, bomb) is None
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 48 * 1024 * 1024, peak
+
+
+def test_verified_tree_paths_caps_each_path_length(tmp_path):
+    repo = _repo(tmp_path)
+    blob = _blob_id(repo)
+    cap = gitops._LIST_MAX_PATH_LEN
+
+    def listing(*names: str) -> list[str] | None:
+        tree = _mktree(repo, [("100644", blob, names[-1])])
+        for name in reversed(names[:-1]):
+            tree = _mktree(repo, [("040000", tree, name)])
+        return gitops.verified_tree_paths(repo, _commit_tree(repo, tree))
+
+    assert listing("f" * cap) == ["f" * cap]
+    assert listing("f" * (cap + 1)) is None
+    assert listing("d" * 2000, "f" * (cap - 2001)) == ["d" * 2000 + "/" + "f" * (cap - 2001)]
+    assert listing("d" * 2000, "f" * (cap - 2000)) is None
+    assert listing("d" * (cap + 1), "f") is None  # a folder whose own name is over the cap is refused before descending
