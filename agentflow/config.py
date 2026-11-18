@@ -1053,8 +1053,35 @@ def rules_path_problem(entry: object) -> str | None:
 
 
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_CODE_SPAN = re.compile(r"(`+).*?\1")
+_BACKTICKS = re.compile(r"`+")
 _IMPORT = re.compile(r"(?<![\w`])@[^\s`]+")
+
+
+def _outside_code_spans(line: str) -> str:
+    """`line` without its inline code spans: a run of backticks opens a span that the next run of the same length
+    closes, and an unmatched run is plain text. One pass over the runs, so the work is linear in the line."""
+    runs = [(m.start(), m.end()) for m in _BACKTICKS.finditer(line)]
+    if not runs:
+        return line
+    following = [-1] * len(runs)  # the next run of the same length, if any
+    last: dict[int, int] = {}
+    for k in range(len(runs) - 1, -1, -1):
+        length = runs[k][1] - runs[k][0]
+        following[k] = last.get(length, -1)
+        last[length] = k
+    kept: list[str] = []
+    at = 0
+    k = 0
+    while k < len(runs):
+        close = following[k]
+        if close < 0:
+            k += 1
+            continue
+        kept.append(line[at:runs[k][0]])
+        at = runs[close][1]
+        k = close + 1
+    kept.append(line[at:])
+    return " ".join(kept)
 
 
 def _has_import(text: str) -> bool:
@@ -1070,7 +1097,7 @@ def _has_import(text: str) -> bool:
         if marker:
             fence = marker.group(1)
             continue
-        if _IMPORT.search(_CODE_SPAN.sub(" ", line)):
+        if _IMPORT.search(_outside_code_spans(line)):
             return True
     return False
 

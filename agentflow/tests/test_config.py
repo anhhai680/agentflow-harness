@@ -2208,3 +2208,23 @@ def test_agent_rules_symlink_to_a_refused_target_warns(tmp_cfg, tmp_path):
         subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
     issues = issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md", "AGENTS.md"]}})
     assert len(agent_rules_issues(issues, "warning")) == 1
+
+
+def test_memory_blockers_scan_is_linear_on_hostile_text():
+    import time
+
+    from agentflow.config import memory_blockers
+
+    def blockers(text):
+        return memory_blockers(["CLAUDE.md"], lambda p: text, ["CLAUDE.md"])
+
+    for hostile in (" " * 4 + "`" * 20_000, "x " + "`" * 20_000 + " @x", "".join("`" * n + " " for n in range(1, 600)),
+                    "` " * 50_000):
+        started = time.monotonic()
+        blockers(hostile)
+        assert time.monotonic() - started < 1.0
+    assert blockers(" " * 4 + "`" * 20_000) == []
+    assert blockers("x " + "`" * 20_000 + " @x") == ["CLAUDE.md: @ import"]
+    assert blockers("```py\n@dataclass\n```\n`@x/y` and ``a ` @b`` text") == []
+    assert blockers("a `b` ` c @README") == ["CLAUDE.md: @ import"]
+    assert blockers("read @README") == ["CLAUDE.md: @ import"]
