@@ -397,9 +397,16 @@ def test_cost_signals_read_the_metrics_splits():
     s = run_signals([], COST_METRICS)
     assert s["cache_write_share"] == 0.58 and s["prefix_write_tokens"] == 25000
     assert s["session_turns_p90:build.implement"] == 37 and s["tool_output_kchars:build.implement"] == 25.0
-    assert s["tool_output_kchars:build.review"] == 0.0
     assert "session_turns_p90:build.review" not in s and "session_turns_p90:build.size" not in s
-    assert "tool_output_kchars:build.size" not in s  # no sessions, no ratio
+    assert "tool_output_kchars:build.review" not in s  # a session with no usage has no measured tool output
+    assert "tool_output_kchars:build.size" not in s
+
+
+def test_a_kind_with_turns_but_no_tool_output_reads_zero():
+    metrics = {**EMPTY_METRICS, "by_step_kind": {
+        "build.review": {"sessions": 2, "turns": [5, 9], "prefix_writes": [], "tool_output_chars": 0}}}
+    s = run_signals([], metrics)
+    assert s["tool_output_kchars:build.review"] == 0.0 and s["session_turns_p90:build.review"] == 9
 
 
 def test_cache_write_share_is_rounded_to_four_places_and_tool_output_to_one():
@@ -425,7 +432,7 @@ def test_a_run_with_no_usage_has_no_cost_share():
     for m in (metrics, EMPTY_METRICS):
         s = run_signals([], m)
         assert "cache_write_share" not in s and "prefix_write_tokens" not in s
-        assert not [k for k in s if k.startswith("session_turns_p90")]
+        assert not [k for k in s if k.startswith(("session_turns_p90", "tool_output_kchars"))]
 
 
 def test_the_new_families_are_targets_and_lower_is_better():
