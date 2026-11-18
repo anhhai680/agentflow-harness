@@ -23,6 +23,14 @@ retry, a fix attempt, a rejection or in a refine round counts as **rework**.
 A call whose events carry `sizer` sizes a step's effort: its cost lands in its phase's `cost_usd` and
 `sizing_cost_usd`, and it is never a step, an attempt or a `model · effort` row of a step.
 
+Each `agent_exited` may carry the invocation's `usage` (tokens and USD by class, turns, prefix write, tool-output
+size). `run_metrics` sums it into `tokens` and `usd_split`, and files each call under its **step kind**
+(`step_kind(key)`: the phase and the key's last segment cut at its first `-`, e.g. `build.implement`) in
+`by_step_kind`: sessions, cost, USD by class, the turns of each call that reached the model (`turns > 0`), the prefix
+write of each fresh, non-sizer call (a call that started with no `session_id`) and the tool-output size. A run
+from before `usage` has empty splits and empty lists. `aggregate` takes the median and p90 over every run's
+sessions per kind (`step_kinds`).
+
 The run ends at `run_finished`, `run_failed` or `run_cancelled`; nothing after that is charged but the cost
 of a call that exits after it. A run archived without one ends at its last event before `run_archived`: the
 idle gap up to the archive is not charged. `aggregate(rows)` sums several runs' metrics for the Metrics tab.
@@ -62,6 +70,13 @@ def _phase_of(key: object) -> str | None:
 
 def _buckets() -> dict[str, float]:
     return dict.fromkeys(BUCKETS, 0.0)
+
+
+def step_kind(key: str) -> str:
+    """`<phase>.<base>` of a step key: `base` is its last `/` segment cut at its first `-`, so the task and
+    round numbers drop out (`build/build/task-3/implement` is `build.implement`, `ship/ci/fix-1` is `ship.fix`)."""
+    base = str(key).rsplit("/", 1)[-1].split("-", 1)[0]
+    return f"{_phase_of(key) or '?'}.{base}"
 
 
 class _Fold:
@@ -213,6 +228,7 @@ class _Fold:
             "model": ev.get("model"), "model_alias": ev.get("model"), "model_source": None, "effort": ev.get("effort"),
             "role": ev.get("role"), "sizing": bool(ev.get("sizing")), "sizer": sizer, "mode": mode,
             "round": round_, "rework": bool(key and not sizer and key in self.rework_pending), "started_at": ev.get("ts"), "ended_at": None,
+            "fresh": not ev.get("session_id"), "usage": None,
             "agent_s": 0.0, "cost_usd": 0.0, "cost_estimated": False, "live": True, "exit_code": None,
         }
         self.open.append(call)
@@ -253,13 +269,14 @@ class _Fold:
             call = {"key": key, "session_id": ev.get("session_id"), "agent": None, "model": None, "effort": None,
                     "role": None, "rework": False, "started_at": ev.get("ts"), "agent_s": 0.0, "mode": None,
                     "round": None, "model_source": None, "sizing": False, "model_alias": None,
-                    "sizer": bool(ev.get("sizer"))}
+                    "sizer": bool(ev.get("sizer")), "fresh": False, "usage": None}
             self.calls.append(call)
         else:
             self.open.remove(call)
         start, end = parse_iso(call.get("started_at")), parse_iso(ev.get("ts"))
         call.update({"ended_at": ev.get("ts"), "cost_usd": added, "cost_estimated": bool(ev.get("cost_estimated")),
                      "live": False, "exit_code": ev.get("exit_code"),
+                     "usage": ev["usage"] if isinstance(ev.get("usage"), dict) else None,
                      "agent_s": max(0.0, (end - start).total_seconds()) if start and end else 0.0})
         self.estimated = self.estimated or bool(ev.get("cost_estimated"))
         self._spend(call)
@@ -329,6 +346,46 @@ def _models(calls: list[dict]) -> list[dict]:
         row["cost_usd"] += float(call.get("cost_usd") or 0.0)
     out = sorted(groups.values(), key=lambda r: -r["cost_usd"])
     return [{**r, "agent_s": round(r["agent_s"], 1), "cost_usd": round(r["cost_usd"], 6)} for r in out]
+
+
+USD_CLASSES = ("input", "output", "cache_read", "cache_write")
+TOKEN_CLASSES = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
+
+
+def _num(value: object) -> float:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
+def _split(usage: dict | None, field: str, classes: tuple[str, ...]) -> dict[str, float]:
+    part = usage.get(field) if usage else None
+    part = part if isinstance(part, dict) else {}
+    return {name: _num(part.get(name)) for name in classes}
+
+
+def _by_step_kind(calls: list[dict]) -> dict[str, dict]:
+    kinds: dict[str, dict] = {}
+    for call in calls:
+        if not call.get("key"):
+            continue
+        row = kinds.setdefault(step_kind(call["key"]), {
+            "sessions": 0, "cost_usd": 0.0, "usd": dict.fromkeys(USD_CLASSES, 0.0), "turns": [],
+            "prefix_writes": [], "tool_output_chars": 0})
+        usage = call.get("usage")
+        row["sessions"] += 1
+        row["cost_usd"] += float(call.get("cost_usd") or 0.0)
+        for name, value in _split(usage, "usd", USD_CLASSES).items():
+            row["usd"][name] += value
+        if not usage:
+            continue
+        turns = int(_num(usage.get("turns")))
+        if turns > 0:
+            row["turns"].append(turns)
+        prefix = int(_num(usage.get("prefix_write")))
+        if call.get("fresh") and not call.get("sizer") and prefix > 0:
+            row["prefix_writes"].append(prefix)
+        row["tool_output_chars"] += int(_num(usage.get("tool_output_chars")))
+    return {kind: {**row, "cost_usd": round(row["cost_usd"], 6), "usd": {n: round(v, 6) for n, v in row["usd"].items()}}
+            for kind, row in kinds.items()}
 
 
 def _call_view(call: dict) -> dict:
@@ -428,6 +485,13 @@ def _shape(fold: _Fold, now: datetime, stalled: bool, effort_changes: dict[str, 
         role["agent_s"] = round(role["agent_s"] + float(call.get("agent_s") or 0.0), 1)
         role["cost_usd"] = round(role["cost_usd"] + float(call.get("cost_usd") or 0.0), 6)
     cost = sum(row["cost_usd"] for row in fold.phases.values())
+    usd_split = dict.fromkeys(USD_CLASSES, 0.0)
+    tokens = dict.fromkeys(TOKEN_CLASSES, 0)
+    for call in fold.calls:
+        for name, value in _split(call.get("usage"), "usd", USD_CLASSES).items():
+            usd_split[name] += value
+        for name, value in _split(call.get("usage"), "tokens", TOKEN_CLASSES).items():
+            tokens[name] += int(value)
     return {
         "started_at": fold.started_at,
         "ended_at": fold.ended_at,
@@ -439,6 +503,9 @@ def _shape(fold: _Fold, now: datetime, stalled: bool, effort_changes: dict[str, 
         "rework_cost_usd": round(sum(row["rework_cost_usd"] for row in fold.phases.values()), 6),
         "cost_estimated": fold.estimated or any(c.get("live") for c in fold.calls),
         "approx": bool(fold.approx),
+        "usd_split": {name: round(value, 6) for name, value in usd_split.items()},
+        "tokens": tokens,
+        "by_step_kind": _by_step_kind(fold.calls),
         "phases": phases,
         "by_model": by_model,
         "by_role": by_role,
@@ -470,8 +537,23 @@ def aggregate(rows: list[dict]) -> dict:
     lanes: dict[str, dict] = {}
     model_cells: dict[tuple[str, str], dict] = {}
     steps: list[dict] = []
+    usd_split = dict.fromkeys(USD_CLASSES, 0.0)
+    kind_cells: dict[str, dict] = {}
     for row in rows:
         metrics = row["metrics"]
+        for name, value in (metrics.get("usd_split") or {}).items():
+            usd_split[name] = usd_split.get(name, 0.0) + value
+        for kind, k in (metrics.get("by_step_kind") or {}).items():
+            cell = kind_cells.setdefault(kind, {"kind": kind, "sessions": 0, "cost_usd": 0.0,
+                                                "usd": dict.fromkeys(USD_CLASSES, 0.0), "turns": [],
+                                                "prefix_writes": [], "tool_output_chars": 0})
+            cell["sessions"] += k["sessions"]
+            cell["cost_usd"] += k["cost_usd"]
+            for name, value in k["usd"].items():
+                cell["usd"][name] = cell["usd"].get(name, 0.0) + value
+            cell["turns"].extend(k["turns"])
+            cell["prefix_writes"].extend(k["prefix_writes"])
+            cell["tool_output_chars"] += k["tool_output_chars"]
         cost += metrics["cost_usd"]
         rework += metrics["rework_cost_usd"]
         for bucket, value in metrics["buckets"].items():
@@ -512,6 +594,13 @@ def aggregate(rows: list[dict]) -> dict:
                            "attempts": c["attempts"]}
                        for p, c in lane["phases"].items()},
         }
+    step_kinds = [
+        {"kind": c["kind"], "sessions": c["sessions"], "cost_usd": round(c["cost_usd"], 6),
+         "usd": {n: round(v, 6) for n, v in c["usd"].items()},
+         "turns_p50": statistics.median(c["turns"]) if c["turns"] else 0, "turns_p90": _p90(c["turns"]),
+         "prefix_write_p50": statistics.median(c["prefix_writes"]) if c["prefix_writes"] else 0,
+         "tool_output_chars": c["tool_output_chars"]}
+        for c in sorted(kind_cells.values(), key=lambda c: -c["cost_usd"])]
     return {
         "runs": len(rows),
         "cost_usd": round(cost, 6),
@@ -519,6 +608,8 @@ def aggregate(rows: list[dict]) -> dict:
         "rework_pct": round(rework / cost * 100, 1) if cost else 0.0,
         "wall_s": _spread([r["metrics"]["wall_s"] for r in rows]),
         "buckets": _round_buckets(buckets),
+        "usd_split": {name: round(value, 6) for name, value in usd_split.items()},
+        "step_kinds": step_kinds,
         "bucket_pct": {b: round(v / wall * 100, 1) if wall else 0.0 for b, v in buckets.items()},
         "lanes": lane_out,
         "models": sorted(model_cells.values(), key=lambda m: (m["phase"], -m["cost_usd"])),
@@ -527,4 +618,4 @@ def aggregate(rows: list[dict]) -> dict:
     }
 
 
-__all__ = ["BUCKETS", "DEFAULT_STALL_S", "aggregate", "run_metrics"]
+__all__ = ["BUCKETS", "DEFAULT_STALL_S", "aggregate", "run_metrics", "step_kind"]
