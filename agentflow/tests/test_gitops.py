@@ -1171,13 +1171,12 @@ def _long_name_fan_out(repo: Path, name_len: int, levels: int) -> str:
     return _commit_tree(repo, tree)
 
 
-@pytest.mark.parametrize("levels", [3, 11], ids=["levels3", "levels11"])
-def test_verified_tree_paths_refuses_long_names_quickly_and_in_bounded_memory(tmp_path, levels):
+def test_verified_tree_paths_refuses_long_names_quickly_and_in_bounded_memory(tmp_path):
     import time
     import tracemalloc
 
     repo = _repo(tmp_path)
-    bomb = _long_name_fan_out(repo, 100_000, levels)  # a few KB of objects naming paths of megabytes
+    bomb = _long_name_fan_out(repo, 100_000, 3)  # a few KB of objects naming 8 paths of 400 KB
     tracemalloc.start()
     started = time.monotonic()
     try:
@@ -1186,23 +1185,41 @@ def test_verified_tree_paths_refuses_long_names_quickly_and_in_bounded_memory(tm
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-    assert elapsed < 10 and peak < 64 * 1024 * 1024, (elapsed, peak)
+    assert elapsed < 10 and peak < 8 * 1024 * 1024, (elapsed, peak)
+
+
+def _built_bytes(name_len: int, levels: int) -> int:
+    """What `verified_tree_paths` counts for `_long_name_fan_out(name_len, levels)`: every folder prefix (with its
+    `/`) and every file path, in bytes."""
+    folders = sum(2 ** k * k * (name_len + 1) for k in range(1, levels + 1))
+    return folders + 2 ** levels * (levels * (name_len + 1) + name_len)
+
+
+def test_verified_tree_paths_refuses_one_byte_over_its_path_budget(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    commit = _long_name_fan_out(repo, 10, 3)
+    total = _built_bytes(10, 3)
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATH_BYTES", total)
+    assert len(gitops.verified_tree_paths(repo, commit)) == 8
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATH_BYTES", total - 1)
+    assert gitops.verified_tree_paths(repo, commit) is None
 
 
 def test_verified_tree_paths_refuses_more_path_bytes_than_its_budget(tmp_path):
     import tracemalloc
 
     repo = _repo(tmp_path)
-    fits = _long_name_fan_out(repo, 300, 3)
-    assert len(gitops.verified_tree_paths(repo, fits)) == 8
-    bomb = _long_name_fan_out(repo, 300, 13)  # 8_192 paths of 4_200 bytes: over 16 MiB, each path under the cap
+    # 16_384 paths of 2_264 bytes, every one under the length cap and 32_767 entries under the count cap, but
+    # about 100 MB of paths and prefixes: only the byte budget refuses it.
+    assert 14 * 151 + 150 < 4096 and _built_bytes(150, 14) > 6 * 16 * 1024 * 1024  # as shipped: 4 KB and 16 MiB
+    bomb = _long_name_fan_out(repo, 150, 14)
     tracemalloc.start()
     try:
         assert gitops.verified_tree_paths(repo, bomb) is None
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-    assert peak < 48 * 1024 * 1024, peak
+    assert peak < 32 * 1024 * 1024, peak
 
 
 def test_verified_tree_paths_caps_each_path_length(tmp_path):
