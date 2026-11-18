@@ -10,6 +10,7 @@ import re
 import stat
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -959,13 +960,13 @@ _REGULAR = (b"100644", b"100755")
 _DIRECTORY = (b"40000", b"040000")
 
 
-def _read_git(repo: Path, *args: str, feed: bytes | None = None) -> bytes | None:
+def _read_git(repo: Path, *args: str, feed: bytes | None = None, timeout: float = 30) -> bytes | None:
     """stdout of `git HARDENED <args>` in bytes, with `feed` on stdin; None on any failure. No object is ever fetched
     (a partial clone's promisor remote is not asked), so a read never touches the network."""
     stdin = {"input": feed} if feed is not None else {"stdin": subprocess.DEVNULL}
     try:
-        proc = subprocess.run(["git", *HARDENED, *args], cwd=Path(repo), capture_output=True, timeout=30, check=True,
-                              env={**os.environ, "GIT_NO_LAZY_FETCH": "1"}, **stdin)
+        proc = subprocess.run(["git", *HARDENED, *args], cwd=Path(repo), capture_output=True, timeout=timeout,
+                              check=True, env={**os.environ, "GIT_NO_LAZY_FETCH": "1"}, **stdin)
     except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired, ValueError):
         return None
     return proc.stdout
@@ -1068,11 +1069,12 @@ def _commit_tree(repo: Path, sha: str) -> tuple[str, Callable[[bytes], Any], int
     return tree, algo, width
 
 
-def _verified_batch(repo: Path, oids: list[str], algo: Callable[[bytes], Any], budget: int) -> dict[str, bytes] | None:
+def _verified_batch(repo: Path, oids: list[str], algo: Callable[[bytes], Any], budget: int,
+                    timeout: float) -> dict[str, bytes] | None:
     """`{id: content}` of the tree objects `oids`, read with one `cat-file --batch-check` (all must be trees whose
     sizes together fit `budget`, else nothing is read) and one `cat-file --batch`, each hashed against its id."""
     feed = "".join(f"{oid}\n" for oid in oids).encode("ascii")
-    check = _read_git(repo, "cat-file", "--batch-check", feed=feed)
+    check = _read_git(repo, "cat-file", "--batch-check", feed=feed, timeout=timeout)
     if check is None:
         return None
     wanted = set(oids)
@@ -1084,7 +1086,7 @@ def _verified_batch(repo: Path, oids: list[str], algo: Callable[[bytes], Any], b
         sizes[fields[0]] = int(fields[2])
     if len(sizes) != len(oids) or sum(sizes.values()) > budget:
         return None
-    stream = _read_git(repo, "cat-file", "--batch", feed=feed)
+    stream = _read_git(repo, "cat-file", "--batch", feed=feed, timeout=timeout)
     if stream is None:
         return None
     out: dict[str, bytes] = {}
@@ -1102,7 +1104,12 @@ def _verified_batch(repo: Path, oids: list[str], algo: Callable[[bytes], Any], b
     return out if at == len(stream) else None
 
 
-_LIST_MAX_BYTES = 64 * 1024 * 1024  # every tree of a listing together; a larger tree set is refused unread
+# The bounds of one listing; past any of them it is refused (None), never cut short. Distinct tree bytes alone don't
+# bound the work: one shared subtree named many times over fans out to `width ** depth` paths from a few KB.
+_LIST_MAX_BYTES = 64 * 1024 * 1024  # every distinct tree of a listing together; a larger tree set is refused unread
+_LIST_MAX_PATHS = 100_000  # files listed plus folders queued: about 10 MB of path strings at most
+_LIST_MAX_DEPTH = 64  # folders below the root; each level costs two git processes
+_LIST_DEADLINE_S = 30.0  # the whole listing, as one `ls-tree -r` is given
 
 
 def verified_tree_paths(repo: Path, sha: str) -> list[str] | None:
@@ -1119,16 +1126,21 @@ def verified_tree_paths(repo: Path, sha: str) -> list[str] | None:
     paths: list[str] = []
     pending = [("", tree)]
     budget = _LIST_MAX_BYTES
+    deadline = time.monotonic() + _LIST_DEADLINE_S
+    depth = 0
     while pending:
+        left = deadline - time.monotonic()
+        if left <= 0 or depth > _LIST_MAX_DEPTH:
+            return None
         oids = list(dict.fromkeys(oid for _, oid in pending))
-        read = _verified_batch(repo, oids, algo, budget)
+        read = _verified_batch(repo, oids, algo, budget, left)
         if read is None:
             return None
         budget -= sum(len(data) for data in read.values())
         deeper: list[tuple[str, str]] = []
         for prefix, oid in pending:
             entries = _tree_entries(read[oid], width // 2)
-            if entries is None:
+            if entries is None or len(paths) + len(deeper) + len(entries) > _LIST_MAX_PATHS:
                 return None
             for mode, name, child in entries:
                 path = prefix + name.decode("utf-8", errors="surrogateescape")
@@ -1137,6 +1149,7 @@ def verified_tree_paths(repo: Path, sha: str) -> list[str] | None:
                 else:
                     paths.append(path)
         pending = deeper
+        depth += 1
     return sorted(paths)
 
 

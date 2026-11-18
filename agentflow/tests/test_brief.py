@@ -221,6 +221,6 @@ def test_brief_readers_take_only_a_full_commit_id(tmp_path):
 def test_brief_readers_never_raise_on_an_unencodable_path(tmp_path):
     repo = _repo(tmp_path)
     sha = _commit(repo, {"CLAUDE.md": "x\n"})
-    assert brief.read_rules(repo, sha, ["CLAUDE.md", "a\ud800"]) in (([], False), ([Doc("## CLAUDE.md", "x\n")], True))
+    assert brief.read_rules(repo, sha, ["CLAUDE.md", "a\ud800"]) == ([Doc("## CLAUDE.md", "x\n")], True)  # absent: left out
     assert brief.read_brief_files(repo, sha, ["a\ud800"]) is None
     assert brief.read_skill(repo, sha, "skills\ud800", "mine", True) is None

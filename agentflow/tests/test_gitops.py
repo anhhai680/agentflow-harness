@@ -1073,3 +1073,83 @@ def test_verified_tree_paths_lists_every_file_and_refuses_a_rewritten_subtree(tm
     loose.write_bytes(zlib.compress(b"tree %d\0" % len(body) + body))
     assert "pkg/CLAUDE.md" not in gitops.tree_paths(repo, sha)
     assert gitops.verified_tree_paths(repo, sha) is None
+
+
+def _mktree(repo: Path, entries: list[tuple[str, str, str]]) -> str:
+    """A tree object from `(mode, id, name)` entries, written with `git mktree`."""
+    import subprocess
+
+    kinds = {"040000": "tree", "100644": "blob"}
+    feed = "".join(f"{mode} {kinds[mode]} {oid}\t{name}\n" for mode, oid, name in entries)
+    return subprocess.run(["git", "mktree"], cwd=repo, input=feed, capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def _commit_tree(repo: Path, tree: str) -> str:
+    return run_git(repo, "commit-tree", tree, "-m", "c").strip()
+
+
+def _fan_out(repo: Path, width: int, depth: int) -> str:
+    """A commit whose tree holds `width` names at each of `depth` levels, all pointing at one shared subtree:
+    a few kilobytes of objects that name `width ** depth` files."""
+    import subprocess
+
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, input="x\n", capture_output=True,
+                          text=True, check=True).stdout.strip()
+    tree = _mktree(repo, [("100644", blob, f"f{i}") for i in range(width)])
+    for _ in range(depth - 1):
+        tree = _mktree(repo, [("040000", tree, f"d{i}") for i in range(width)])
+    return _commit_tree(repo, tree)
+
+
+def test_verified_tree_paths_refuses_a_fan_out_bomb_quickly_and_in_bounded_memory(tmp_path):
+    import time
+    import tracemalloc
+
+    repo = _repo(tmp_path)
+    small = _fan_out(repo, 4, 3)
+    assert len(gitops.verified_tree_paths(repo, small)) == 64 == len(gitops.tree_paths(repo, small))
+    bomb = _fan_out(repo, 20, 4)  # 160_000 paths from 4 small trees: past the 100_000 cap
+    tracemalloc.start()
+    started = time.monotonic()
+    try:
+        assert gitops.verified_tree_paths(repo, bomb) is None
+        elapsed = time.monotonic() - started
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert elapsed < 10 and peak < 64 * 1024 * 1024, (elapsed, peak)
+
+
+def test_verified_tree_paths_counts_queued_folders_against_the_cap(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    bomb = _fan_out(repo, 10, 4)  # 1_000 folders queued at the third level before any file of the last is listed
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATHS", 999)
+    assert gitops.verified_tree_paths(repo, bomb) is None
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATHS", 10_000)
+    assert len(gitops.verified_tree_paths(repo, bomb)) == 10_000
+
+
+def test_verified_tree_paths_refuses_a_deep_chain(tmp_path):
+    import subprocess
+
+    repo = _repo(tmp_path)
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, input="x\n", capture_output=True,
+                          text=True, check=True).stdout.strip()
+    tree = _mktree(repo, [("100644", blob, "f")])
+    commits = {}
+    for depth in range(1, gitops._LIST_MAX_DEPTH + 2):
+        tree = _mktree(repo, [("040000", tree, "d")])
+        commits[depth] = _commit_tree(repo, tree)
+    deepest = gitops._LIST_MAX_DEPTH
+    assert gitops.verified_tree_paths(repo, commits[deepest]) == ["d/" * deepest + "f"]
+    assert gitops.verified_tree_paths(repo, commits[deepest + 1]) is None
+
+
+def test_verified_tree_paths_stops_at_its_deadline(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    _write(repo, "a/b.md", "x\n")
+    _commit(repo)
+    assert gitops.verified_tree_paths(repo, _sha(repo)) == ["a/b.md"]
+    monkeypatch.setattr(gitops, "_LIST_DEADLINE_S", 0)
+    assert gitops.verified_tree_paths(repo, _sha(repo)) is None
