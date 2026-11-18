@@ -209,7 +209,7 @@ def test_build_refines_every_task(flow_repo, git):
     for n in TITLES:
         call = calls_for(refined, impl.format(n=n))[0]
         assert ("--resume", sids[n]) in pairs(call["argv"])
-        assert NOTE in call["argv"][-1] and f"Task {n}: {TITLES[n]}" in call["argv"][-1]
+        assert NOTE in call["argv"][-1] and "The step as it was first given" not in call["argv"][-1]  # the note only
     assert len(flow_repo.events(run, "review_result")) == 4  # every reviewer ran again
     subjects = git_in(git, run, "log", "--format=%s").splitlines()
     assert subjects[:4] == ["Refine Task 2: Second thing", "Refine Task 1: First thing",
@@ -250,6 +250,81 @@ def test_refine_resume_failed_fresh_session(pipe):
     assert [e["key"] for e in pipe.events(run, "resume_failed")] == ["define/draft"]
     assert not [e for e in pipe.events(run, "hitl_raised") if e["key"] == "define/draft"]
     assert run.state["steps"]["define/draft"]["status"] == "done"
+
+
+def test_refine_resume_sends_only_the_note(pipe, monkeypatch):
+    from agentflow import overlays
+    from agentflow.lanes import RESULT_REMINDER
+    from conftest import brief_ready
+
+    overlay = {"on": False}
+
+    def security_path(cfg, ctx):
+        return overlay["on"]
+
+    monkeypatch.setattr(overlays, "security_path", security_path)
+    skill_line = "Also use the `security-and-hardening` skill."
+    pipe.script({
+        "define/draft": [{"write": {SPEC: SPEC_ROUTES}, **done("drafted")},
+                       {"write": {SPEC: SPEC_DELETE}, **done("added the delete route")}],
+        "define/contracts": [done("contracts for GET"), done("contracts for DELETE")],
+    })
+    run = begin(pipe)
+    brief_ready(pipe, run)
+    assert go(pipe, run) == "awaiting_approval"
+    first = calls_for(pipe.calls(), "define/draft")[0]["argv"][-1]
+    assert skill_line not in first and "The step as it was first given" not in first
+    assert pipe.events(run, "agent_started")[0]["brief"] is not None  # the session has its brief
+    sid = session_of(pipe, run, "define/draft")
+    before = len(pipe.calls())
+
+    overlay["on"] = True  # the overlay became active after the first round
+    reject(run, "define", "me", NOTE)
+    assert go(pipe, run) == "awaiting_approval"
+    refined = calls_for(pipe.calls()[before:], "define/draft")[0]
+    assert ("--resume", sid) in pairs(refined["argv"])
+    prompt = refined["argv"][-1]
+    assert NOTE in prompt and "refine round 1" in prompt and SPEC in prompt
+    assert skill_line in prompt
+    assert RESULT_REMINDER.split("`")[0] in prompt and str(run.agent_result_path("define/draft")) in prompt
+    assert "The step as it was first given" not in prompt
+    assert "## When you finish" not in prompt and "Nobody can answer you" not in prompt  # the brief has them
+    assert len(prompt) < len(first)
+
+
+def test_refine_resume_without_a_brief_keeps_the_result_contract(pipe):
+    pipe.configure({"context": {"run_brief": False}})
+    pipe.script({
+        "define/draft": [{"write": {SPEC: SPEC_ROUTES}, **done("drafted")},
+                       {"write": {SPEC: SPEC_DELETE}, **done("added the delete route")}],
+        "define/contracts": [done("contracts for GET"), done("contracts for DELETE")],
+    })
+    run = begin(pipe)
+    assert go(pipe, run) == "awaiting_approval"
+    before = len(pipe.calls())
+    reject(run, "define", "me", NOTE)
+    assert go(pipe, run) == "awaiting_approval"
+    prompt = calls_for(pipe.calls()[before:], "define/draft")[0]["argv"][-1]
+    assert NOTE in prompt and "The step as it was first given" not in prompt
+    assert "## When you finish" in prompt  # no brief: the contract follows the reminder
+
+
+def test_a_refine_whose_session_is_gone_gets_the_full_prompt(pipe):
+    pipe.script({
+        "define/draft": [{"write": {SPEC: SPEC_PLAIN}, **done("drafted")},
+                       {"no_init": True, "exit": 1},
+                       {"write": {SPEC: SPEC_PLAIN.replace("mẫu.", "mẫu, đã sửa.")}, **done("revised in a new session")}],
+    })
+    run = begin(pipe)
+    assert go(pipe, run) == "awaiting_approval"
+    before = len(pipe.calls())
+    reject(run, "define", "me", NOTE)
+    assert go(pipe, run) == "awaiting_approval"
+    resumed, fresh = calls_for(pipe.calls()[before:], "define/draft")
+    assert "The step as it was first given" not in resumed["argv"][-1]
+    assert "--resume" not in fresh["argv"]
+    prompt = fresh["argv"][-1]
+    assert NOTE in prompt and "The step as it was first given" in prompt and "## Step `draft`" in prompt
 
 
 def test_condition_flips_on_refine(pipe):

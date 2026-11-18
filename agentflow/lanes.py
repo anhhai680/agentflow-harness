@@ -46,7 +46,7 @@ from agentflow.flow_control import (
     refine_subject,
     writes_questions,
 )
-from agentflow.gates import (GateResult, agent_checks, failure_report, gates_ok, record_results, run_doc_checks,
+from agentflow.gates import (GateResult, agent_checks, failure_report, gates_ok, record_results, resume_report, run_doc_checks,
                              run_gates_reusing)
 from agentflow.gates import resolve as resolve_gates
 from agentflow.gitops import (CommitRejected, GitError, NothingToCommit, changed_since, commit, commit_artifact,
@@ -707,7 +707,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             turn = _Turn(self._continue_prompt(sr, _answers(since, key), _approved(since, key)), session)
         elif mode == "refine" and session:
             self._load_pin(sr, rec.get("brief"))
-            turn = _Turn(self._prompt(sr, resume=session), session)
+            turn = _Turn(self._refine_prompt(sr), session)
         elif takes_shared:
             sr.session = shared["session_id"]
             sr.effort = sizing.floor(shared.get("effort") or sr.effort, judgement, self.cfg.effort.allowed)
@@ -719,7 +719,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         if fixing:  # a gate step's session starts from the gate output (and a refine round's note)
             refine = current_refine(self.run, phase.name)
             note = f"\n\n{refine_note_block(refine)}" if refine is not None else ""
-            sr.lead = f"{self._fix_lead(sr, fix_first or [], 1)}{note}"
+            sr.lead = f"{self._fix_lead(sr, fix_first or [], 1, excerpt=turn.resume is not None)}{note}"
             turn = dataclasses.replace(turn, prompt=f"{sr.lead}\n\n{turn.prompt}")
 
         if self.dry_run:
@@ -1430,8 +1430,26 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         return _Turn(prompt, None)
 
     def _result_partial(self, sr: _StepRun) -> str:
-        """What a resume turn ends with: the reminder, which names the result file, then the result contract."""
-        return fmt(f"{RESULT_REMINDER}\n\n{_template(self.cfg, RESULT).strip()}", self._values(sr)).strip() + "\n"
+        """What a resume turn ends with: the one-line reminder, which names the result file. A session with no brief
+        has no `_result.md` in its system prompt, so the contract follows the reminder."""
+        text = RESULT_REMINDER if sr.brief is not None else f"{RESULT_REMINDER}\n\n{_template(self.cfg, RESULT).strip()}"
+        return fmt(text, self._values(sr)).strip() + "\n"
+
+    def _refine_prompt(self, sr: _StepRun) -> str:
+        """A refine round that resumes its session: the note and what it needs, no more. The session already holds the
+        step (its preamble, head and body, or its brief), so there is no preamble, no step head and no body again, only
+        the lead (gate output, when the round starts in a fix), the refine template filled in, the overlay's skill
+        lines (the overlay may have become active since the first round) and the result reminder."""
+        rec = self._rec(sr)
+        template = _template(self.cfg, self.cfg.phase_approval.get("refine_prompt") or DEFAULT_REFINE).strip()
+        values = {**self._values(sr), **_refine_values(self.ctx, rec)}
+        parts = [fmt(template, values)]
+        skills = overlays.skill_lines(self.cfg, self.ctx, sr.role, parts[0])
+        if skills:
+            parts.append(skills)
+        parts.append(self._result_partial(sr).strip())
+        text = "\n\n".join(parts) + "\n"
+        return f"{sr.lead}\n\n{text}" if sr.lead else text
 
     def _continue_prompt(self, sr: _StepRun, answers: dict[str, str], approved: dict | None = None) -> str:
         if answers:
@@ -1506,16 +1524,19 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
     def _gate_report(self, failed: list[GateResult]) -> str:
         return failure_report(failed)
 
-    def _fix_lead(self, sr: _StepRun, failed: list[GateResult], attempt: int) -> str:
+    def _fix_lead(self, sr: _StepRun, failed: list[GateResult], attempt: int, excerpt: bool) -> str:
+        """The fix turn's lead. A session that has seen this step gets `excerpt`: the gate output cut to
+        `context.resume_gate_lines`, each gate's log path kept. A step that starts fresh gets the whole report."""
         lead = (
             f"The gates failed (fix attempt {attempt} of {self.cfg.defaults.fix_attempts}). "
             "Fix the cause in this session: never weaken a check, skip a test or add a suppression. "
             "Run the failing gates yourself, then write the result file again."
         )
-        return f"{lead}\n\n{self._gate_report(failed)}"
+        report = resume_report(failed, self.cfg.context.resume_gate_lines) if excerpt else self._gate_report(failed)
+        return f"{lead}\n\n{report}"
 
     def _fix_prompt(self, sr: _StepRun, failed: list[GateResult]) -> str:
-        return f"{self._fix_lead(sr, failed, sr.fixes)}\n\n{self._result_partial(sr)}"
+        return f"{self._fix_lead(sr, failed, sr.fixes, excerpt=True)}\n\n{self._result_partial(sr)}"
 
     def _uncommitted_forbidden(self, tree: str) -> list[str]:
         """Forbidden paths that differ between `HEAD` and `tree` (changes nobody has committed)."""

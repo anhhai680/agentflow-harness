@@ -256,6 +256,67 @@ def test_a_failed_pre_run_starts_the_session_in_its_fix_loop(flow_repo):
     assert gate_runs(flow_repo, run) == [("flaky", False), ("flaky", True)]
 
 
+LOUD = {"gates": {"loud": {"run": "for i in $(seq 1 300); do echo \"row $i end\"; done; exit 1"}},
+        "context": {"gate_output_lines": 300}}
+
+
+def test_fix_prompt_is_short_with_a_brief(flow_repo):
+    from conftest import brief_ready
+
+    flow_repo.configure(LOUD)
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    assert run_step(flow_repo, make_step(gates=["loud"], fix_loop=True)) == "stopped"
+    first, fix = flow_repo.calls()[:2]
+    assert ("--resume", session_of(flow_repo, run)) in pairs(fix["argv"]) and brief_path(fix) is not None
+    prompt = fix["argv"][-1]
+    assert len(prompt) < 8000 and str(run.agent_result_path(KEY)) in prompt
+    assert "## When you finish" not in prompt and "write your result JSON to" in prompt
+    assert "row 300 end" in prompt and "row 150 end" not in prompt and "of 300 lines shown" in prompt
+    assert "Full log:" in prompt
+
+
+def test_fix_prompt_keeps_the_result_contract_without_a_brief(flow_repo):
+    flow_repo.configure({**LOUD, "context": {**LOUD["context"], "run_brief": False}})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, make_step(gates=["loud"], fix_loop=True)) == "stopped"
+    fix = flow_repo.calls()[1]["argv"][-1]
+    assert str(run.agent_result_path(KEY)) in fix and "## When you finish" in fix
+    assert "row 150 end" not in fix and "of 300 lines shown" in fix  # the excerpt is for every fix turn
+
+
+def test_fresh_gate_step_keeps_the_whole_report(flow_repo):
+    flow_repo.configure({"gates": {"loud": {"run": "if test -f bad.txt; then for i in $(seq 1 300); do echo \"row $i end\"; "
+                                            "done; exit 1; fi"}},
+                         "context": {"gate_output_lines": 300}})
+    run = flow_repo.new_run()
+    step = make_step(gates=["loud"], fix_loop=True, gates_first=True)
+    (flow_repo.root / "bad.txt").write_text("", encoding="utf-8")  # a fresh session: the gates fail before it starts
+    assert flow_repo.executor(run).run_steps(make_phase(step), [step], "build")[0] == "stopped"
+    fresh = flow_repo.calls()[0]["argv"][-1]
+    assert "row 1 end" in fresh and "row 150 end" in fresh and "row 300 end" in fresh
+    assert "lines shown" not in fresh
+
+
+def test_a_refine_round_gets_the_excerpt_when_it_resumes_its_session(flow_repo):
+    flow_repo.configure({"gates": {"loud": {"run": "if test -f bad.txt; then for i in $(seq 1 300); do echo \"row $i end\"; "
+                                            "done; exit 1; fi"}},
+                         "context": {"gate_output_lines": 300}})
+    run = flow_repo.new_run()
+    step = make_step(gates=["loud"], fix_loop=True, gates_first=True)
+    assert flow_repo.executor(run).run_steps(make_phase(step), [step], "build")[0] == "done"
+    sid = session_of(flow_repo, run)
+    (flow_repo.root / "bad.txt").write_text("", encoding="utf-8")
+    run.emit("phase_approval_raised", phase="build", summary="ok?")
+    run.emit("phase_rejected", by="human", phase="build", round=1, note="Rename the variable")
+    assert flow_repo.executor(run).run_steps(make_phase(step), [step], "build")[0] == "stopped"
+    refine = flow_repo.calls()[1]
+    assert ("--resume", sid) in pairs(refine["argv"])
+    prompt = refine["argv"][-1]
+    assert "Rename the variable" in prompt and "refine round 1" in prompt
+    assert "row 300 end" in prompt and "row 150 end" not in prompt and "of 300 lines shown" in prompt
+
+
 def test_a_step_that_changed_nothing_reuses_the_passes_another_step_had_on_the_same_tree(flow_repo):
     run = flow_repo.new_run()
     assert run_step(flow_repo, make_step(gates=["ok"])) == "done"
@@ -1724,8 +1785,18 @@ def test_resume_turns_still_name_the_result_file(flow_repo):
     assert run_step(flow_repo) == "done"
     named = f"`{run.agent_result_path(KEY)}`"
     reminder = flow_repo.calls()[1]["argv"][-1]
-    assert named in reminder and "write your result JSON to" in reminder and "## When you finish" in reminder
-    assert "(the path after" in reminder  # the result contract's own, reworded line follows the reminder
+    assert named in reminder and "write your result JSON to" in reminder
+    assert "## When you finish" not in reminder  # the session's brief holds the contract: the reminder is one line
+
+
+def test_a_resume_turn_without_a_brief_still_carries_the_result_contract(flow_repo):
+    flow_repo.configure({"context": {"run_brief": False}})
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{}, {"result": DONE}]})  # no result the first time: a reminder turn follows
+    assert run_step(flow_repo) == "done"
+    reminder = flow_repo.calls()[1]["argv"][-1]
+    assert f"`{run.agent_result_path(KEY)}`" in reminder and "write your result JSON to" in reminder
+    assert "## When you finish" in reminder and "(the path after" in reminder  # the contract follows the reminder
 
 
 def test_the_continue_prompt_names_the_result_file(flow_repo):
