@@ -214,6 +214,22 @@ Today `agent_exited` carries only `cost`, and `agent_turn` carries only total `t
 - **Order and identity matter:** tools come before the system prompt in the cache key. Sessions share the cached brief only when they share a role (same tool set) and a phase (same artifacts). That is why the brief is per `<phase>-<role>`.
 - **Trust:** the brief is built from the same sources the prompt reads today (`pack.py` resolution and the main checkout), so `config_trust` and the "never read from a run's worktree" rule apply unchanged.
 - **Safety net:** if `CLAUDE_CODE_DISABLE_CLAUDE_MDS` stops working, CLAUDE.md is simply present twice. That costs tokens but changes no behaviour, and the L1 `prefix_write_tokens` signal shows it.
+- *Amended for the C2 plan (doubt review, 2026-11-18):*
+  - **Item 4 (the approved spec and plan) and L6d are deferred to a later slice.**
+    - **Why:** they need their own design for what "approved" means. A runner auto-approval (`needs_approval: false`) emits the same `phase_approved` as a human one. `approval_sha` is taken when approval is *asked for*. The writer step's output and the plan's path have to be found, and a spec can be edited by `record_step` after approval.
+    - **Effect on §6:** C2's saving is the rules, preamble, skill and result prefix (L2c items 1–3), plus L3b. The re-reads of the spec and plan that §6 counts wait for that slice.
+  - **Trust, corrected.** Today Claude Code loads `CLAUDE.md` from the run's **worktree**, which agents can edit, and the executor's `ctx.repo` is that worktree too.
+    - The brief reads the rules, the repository's skill and `brief:` files, and any pack override of `_preamble.md` or `_result.md`, **at the run's fork commit** (`state.base_sha`), with hardened `git cat-file` (`--no-replace-objects`, each blob checked against its id) in the main checkout.
+    - That commit is outside anything an agent of the run can change, unlike the worktree or the main checkout's working tree.
+  - **Where the brief lives:** in the run's state dir, `<run dir>/brief/<phase>-<role>-<digest12>.md`, not the workspace.
+    - The name carries a digest of the content, because steps of one phase and role can name different skills. In `define`, `draft` uses the define skill and `spec_reconcile` the design-doc skill.
+    - Each session is **pinned** to the brief it started with, recorded on `agent_started`. Every resume passes the same file after a digest check, whatever the live config now says. A brief that can't be rebuilt to its digest starts a fresh session (`brief_replaced`). A session that started without a brief never gains one.
+  - **Rules the brief can't carry fall back to today.** These are `@` imports outside code, a committed `.claude/CLAUDE.md`, `.claude/rules/` or nested `CLAUDE.md`, and an unreadable or oversized file. For them, the rules stay out of the brief and `CLAUDE_CODE_DISABLE_CLAUDE_MDS` is neither set nor inherited, and `validate` warns. Whether the variable also drops organisation-managed memory is not known.
+  - **The skill brief** includes the step's configured `brief:` files. Per-task `task_briefs` stay in the prompt.
+  - **Size cap:** 150K chars per brief. A brief over the cap, or one that can't be built or written, gives no brief for that session, and the prompt is built in full.
+  - **Step-specific lines move to a new `_step_head.md`:** the step id, the result path, the run facts, the code map and the lessons. That leaves `_preamble.md` and `_result.md` run-stable, and they get `Retired` entries. A pack override that holds any placeholder outside the run-stable set turns the brief off for the call.
+  - **The brief is Claude only, and never for sizers or the retro.** A Codex step's prompt is built as with `run_brief: false`.
+  - **L3b:** a fresh session started from failed gates still gets the whole gate report. Only resume turns get the excerpt.
 
 **Expected (L2b + L2c):** the median fresh-session prefix write goes from ~25K to ≈ 6–10K tokens. That saves ~16K × 307 fresh sessions ≈ 4.9M of the 23.3M written tokens: **−8% to −12%**, before the saving on the reads it makes unnecessary.
 
