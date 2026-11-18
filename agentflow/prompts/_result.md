@@ -1,6 +1,6 @@
 ## When you finish
 
-Write your result as JSON to `{result_file}`, then stop. Use this exact path. The runner reads only that file, not your final message, and the step does not count as done without a valid one.
+Write your result as JSON to the step's result file (the path after "Your result file is" in the step's prompt), then stop. Use that exact path. The runner reads only that file, not your final message, and the step does not count as done without a valid one.
 
 ```json
 {"status": "done", "summary": "One to three lines on what you did."}

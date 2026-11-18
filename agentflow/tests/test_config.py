@@ -532,6 +532,80 @@ def test_unknown_placeholder_in_a_template(tmp_cfg):
     assert not any(i.path.startswith(("prompts/", "engine:prompts/")) and i.path != "prompts/bogus.md" for i in issues)
 
 
+def _brief_placeholder_warnings(issues: list[Issue]) -> list[Issue]:
+    return [i for i in issues if i.level == "warning" and i.path.startswith("prompts/") and "get no brief" in i.message]
+
+
+@pytest.mark.parametrize("name", ["_result.md", "_preamble.md"])
+def test_brief_placeholder_warning(tmp_cfg, name):
+    path = tmp_cfg()
+    (path.parent / "prompts" / name).write_text("Write to {result_file}. In run {run}.\n", encoding="utf-8")
+    found = _brief_placeholder_warnings(validate(load_config(path), path.parent.parent))
+    assert [(i.path, i.fixable) for i in found] == [(f"prompts/{name}", False)]
+    assert "{result_file}" in found[0].message and "{run}" not in found[0].message
+
+
+def test_an_old_preamble_copy_with_only_slot_lines_still_gets_a_brief(tmp_cfg):
+    # The runner drops an old copy's slot lines and its effort-check block before it looks for placeholders: so must
+    # validate, or it warns of a brief the run does give.
+    path = tmp_cfg()
+    engine = (pack.ENGINE_PROMPTS / "_preamble.md").read_text(encoding="utf-8")
+    old = (engine + "\n{run_facts}\n{code_map}\n{lessons}\n\n<!-- effort-check -->\nYou run at `{effort}`.\n"
+           "<!-- /effort-check -->\n")
+    (path.parent / "prompts" / "_preamble.md").write_text(old.replace("\n", "\r\n"), encoding="utf-8")
+    assert _brief_placeholder_warnings(validate(load_config(path), path.parent.parent)) == []
+    (path.parent / "prompts" / "_preamble.md").write_text(old + "Step {step_id}.\n", encoding="utf-8")
+    (found,) = _brief_placeholder_warnings(validate(load_config(path), path.parent.parent))
+    assert "{step_id}" in found.message and "{run_facts}" not in found.message and "{effort}" not in found.message
+
+
+def test_the_shared_brief_partial_helper_matches_the_runner():
+    from agentflow.config import brief_partial
+
+    text, outside = brief_partial("_preamble.md", "A {run}.\r\n{lessons}\r\n<!-- effort-check -->\r\n{effort}\r\n"
+                                                  "<!-- /effort-check -->\r\nB {step_id}")
+    assert text == "A {run}.\nB {step_id}" and outside == ["step_id"]
+    assert brief_partial("_result.md", "{lessons} {result_file}\n") == ("{lessons} {result_file}\n",
+                                                                       ["lessons", "result_file"])
+
+
+def _override_warnings(issues: list[Issue]) -> list[Issue]:
+    return [i for i in issues if i.level == "warning" and "until it is committed" in i.message]
+
+
+def test_a_prompt_override_not_committed_at_head_warns(tmp_cfg, tmp_path):
+    path = tmp_cfg()
+    engine = (pack.ENGINE_PROMPTS / "_result.md").read_text(encoding="utf-8")
+    git_repo(tmp_path, {"CLAUDE.md": "x"})
+    (path.parent / "prompts" / "_result.md").write_text(engine + "\nOurs.\n", encoding="utf-8")
+    found = _override_warnings(validate(load_config(path), path.parent.parent))
+    assert [(i.path, i.message) for i in found] == [
+        ("prompts/_result.md", "is not committed at HEAD (or can't be read there): run sessions get no brief until "
+                               "it is committed (the brief reads it from the run's fork commit)")]
+    off = tmp_cfg({"context": {"run_brief": False}})
+    assert _override_warnings(validate(load_config(off), off.parent.parent)) == []
+    import subprocess
+
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "o"], cwd=tmp_path,
+                   check=True, capture_output=True)
+    path = tmp_cfg()
+    assert _override_warnings(validate(load_config(path), path.parent.parent)) == []
+
+
+def test_brief_placeholder_warning_off_with_run_brief_false(tmp_cfg):
+    path = tmp_cfg({"context": {"run_brief": False}})
+    (path.parent / "prompts" / "_result.md").write_text("Write to {result_file}.\n", encoding="utf-8")
+    assert _brief_placeholder_warnings(validate(load_config(path), path.parent.parent)) == []
+
+
+def test_brief_placeholders_are_prompt_placeholders():
+    from agentflow import config
+
+    assert config.BRIEF_PLACEHOLDERS <= config.PROMPT_PLACEHOLDERS and "in_brief" in config.PROMPT_PLACEHOLDERS
+    assert "result_file" not in config.BRIEF_PLACEHOLDERS
+
+
 def test_a_brief_file_must_exist(tmp_cfg):
     path = tmp_cfg(lambda data: phase_step(data, "review", "branch_review").update(brief=".claude/skills/none.md"))
     assert ("error", "phases.review.steps[4].brief") in errors(validate(load_config(path), path.parent.parent))
@@ -2083,3 +2157,231 @@ def test_a_review_agent_outside_the_project_is_a_warning_without_user_settings(t
     assert claude_issue(tmp_cfg, patch, "overlays.security.review_agent", add) is None
     both = {**patch, "agents": {"claude": {"user_settings": True}}}
     assert claude_issue(tmp_cfg, both, "overlays.security.review_agent") is None
+
+
+# --------------------------------------------------------------------------- cost C2: the run brief keys
+
+
+def test_cost_c2_keys_default(tmp_cfg):
+    cfg = load_config(tmp_cfg())
+    assert cfg.context.run_brief is True
+    assert cfg.context.resume_gate_lines == 80
+    assert cfg.project.agent_rules == ("CLAUDE.md",)
+    cfg = load_config(tmp_cfg({"context": {"run_brief": False, "resume_gate_lines": 30},
+                               "project": {"agent_rules": ["AGENTS.md", "docs/rules.md"]}}))
+    assert (cfg.context.run_brief, cfg.context.resume_gate_lines) == (False, 30)
+    assert cfg.project.agent_rules == ("AGENTS.md", "docs/rules.md")
+
+
+def gate_lines(issues, level):
+    return [i for i in issues if i.level == level and i.path == "context.resume_gate_lines"]
+
+
+def test_resume_gate_lines_range(tmp_cfg):
+    for bad in (9, 1001):
+        assert len(gate_lines(issues_for(tmp_cfg, {"context": {"resume_gate_lines": bad}}), "error")) == 1
+    for good in (10, 1000):
+        issues = issues_for(tmp_cfg, {"context": {"resume_gate_lines": good, "gate_output_lines": 1000}})
+        assert not gate_lines(issues, "error") and not gate_lines(issues, "warning")
+    warned = gate_lines(issues_for(tmp_cfg, {"context": {"resume_gate_lines": 300, "gate_output_lines": 200}}), "warning")
+    assert len(warned) == 1 and "tail" in warned[0].message
+
+
+def agent_rules_issues(issues, level="error"):
+    return [i for i in issues if i.level == level and i.path == "project.agent_rules"]
+
+
+@pytest.mark.parametrize("entry", ["/etc/x", "../x", "docs/../x", "./.agentflow/r.md", ".AGENTFLOW/r.md", ".git/config", "-x", ""])
+def test_agent_rules_entries_checked(tmp_cfg, entry):
+    assert len(agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md", entry]}}))) == 1
+
+
+def test_agent_rules_must_be_a_list(tmp_cfg):
+    assert len(agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": "CLAUDE.md"}}))) == 1
+    assert not agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md", "docs/rules.md"]}}))
+
+
+def test_rules_path_problem():
+    from agentflow.config import rules_path_problem
+
+    assert rules_path_problem("CLAUDE.md") is None and rules_path_problem("docs/a b.md") is None
+    for bad in ("", "  ", 3, None, "/x", "a/../b", "-x", ".agentflow/x", ".Git/x", "./.GIT"):
+        assert rules_path_problem(bad), bad
+
+
+def test_memory_blockers():
+    from agentflow.config import memory_blockers
+
+    def blockers(text, paths=("CLAUDE.md",), rules=("CLAUDE.md",)):
+        return memory_blockers(list(paths), lambda p: text if p in rules else None, rules)
+
+    assert blockers("@AGENTS.md\nrules") == ["CLAUDE.md: @ import"]
+    assert blockers("rules\nsee @docs/x.md here") == ["CLAUDE.md: @ import"]
+    assert blockers("read @README") == ["CLAUDE.md: @ import"]
+    assert blockers("```py\n@dataclass\nclass A: ...\n```\nplain") == []
+    assert blockers("~~~\n@x/y\n~~~\n") == []
+    assert blockers("use `@x/y` and mail me@example.com") == []
+    assert blockers("```\n@a\n```\n@b") == ["CLAUDE.md: @ import"]
+    assert blockers("plain", paths=("CLAUDE.md",), rules=("AGENTS.md",)) == ["CLAUDE.md is not in agent_rules"]
+    assert blockers("plain", paths=("AGENTS.md",), rules=("AGENTS.md",)) == []
+    assert blockers("x", paths=("CLAUDE.md", ".claude/CLAUDE.md")) == [".claude/CLAUDE.md"]
+    assert blockers("x", paths=("CLAUDE.md", ".claude/rules/a.md")) == [".claude/rules/"]
+    assert blockers("x", paths=("CLAUDE.md", "pkg/CLAUDE.md")) == ["pkg/CLAUDE.md"]
+    assert blockers(None) == []  # an unreadable rules file has no import to find
+
+
+def test_memory_blockers_fold_case_and_see_local_memory():
+    from agentflow.config import memory_blockers
+
+    def blockers(paths, rules=("CLAUDE.md",)):
+        return memory_blockers(list(paths), lambda p: "x", rules)
+
+    assert blockers(("CLAUDE.md", "CLAUDE.local.md")) == ["CLAUDE.local.md"]
+    assert blockers(("CLAUDE.md", "docs/CLAUDE.local.md")) == ["docs/CLAUDE.local.md"]
+    assert blockers(("CLAUDE.md", "Claude.Local.MD")) == ["Claude.Local.MD"]
+    assert blockers(("CLAUDE.md", ".CLAUDE/claude.md")) == [".CLAUDE/claude.md"]
+    assert blockers(("CLAUDE.md", ".Claude/RULES/a.md")) == [".claude/rules/"]
+    assert blockers(("CLAUDE.md", "pkg/Claude.md")) == ["pkg/Claude.md"]
+    assert blockers(("claude.md",)) == ["claude.md is not in agent_rules"]  # a case-insensitive disk loads it
+    assert blockers(("claude.md",), rules=("claude.md",)) == []
+    assert blockers(("CLAUDE.md", "docs/claude.mdx", "CLAUDE.md.bak")) == []
+
+
+def git_repo(root: Path, files: dict[str, str | bytes]) -> None:
+    import subprocess
+
+    def git(*args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=root, check=True, capture_output=True)
+
+    git("init", "-q")
+    for name, content in files.items():
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content if isinstance(content, bytes) else content.encode())
+    git("add", "-A")
+    git("commit", "-q", "-m", "c")
+
+
+def test_tree_paths(tmp_path):
+    from agentflow import gitops
+
+    git_repo(tmp_path, {"CLAUDE.md": "x", "a/b.md": "y"})
+    assert gitops.tree_paths(tmp_path, "HEAD") == ["CLAUDE.md", "a/b.md"]
+    assert gitops.tree_paths(tmp_path, "nosuchref") is None
+    assert gitops.tree_paths(tmp_path / "missing", "HEAD") is None
+
+
+@pytest.mark.parametrize("files, rules, run_brief, expected", [
+    ({"README.md": "x"}, ["AGENTS.md"], True, 1),
+    ({"README.md": "x"}, ["CLAUDE.md"], True, 0),
+    ({"CLAUDE.md": "x", "pkg/CLAUDE.md": "y"}, ["CLAUDE.md"], True, 1),
+    ({"CLAUDE.md": "x" * 200_001}, ["CLAUDE.md"], True, 1),
+    ({"CLAUDE.md": "x"}, ["CLAUDE.md"], True, 0),
+    ({"README.md": "x"}, ["AGENTS.md"], False, 0),
+    ({"CLAUDE.md": "x", "pkg/CLAUDE.md": "y"}, ["CLAUDE.md"], False, 0),
+    ({"CLAUDE.md": "x" * 200_001}, ["CLAUDE.md"], False, 0),
+])
+def test_agent_rules_warnings(tmp_cfg, tmp_path, files, rules, run_brief, expected):
+    git_repo(tmp_path, files)
+    issues = issues_for(tmp_cfg, {"context": {"run_brief": run_brief}, "project": {"agent_rules": rules}})
+    found = agent_rules_issues(issues, "warning")
+    assert len(found) == expected, found
+    for issue in found:  # a listed file that is not committed is left out, and the brief still carries the rest
+        missing = "is not committed at HEAD" in issue.message
+        assert ("the brief leaves it out" in issue.message) is missing, issue.message
+        assert ("memory files" in issue.message) is not missing, issue.message
+
+
+def test_agent_rules_unreadable_file_warning_says_why(tmp_cfg, tmp_path):
+    git_repo(tmp_path, {"CLAUDE.md": "x" * 200_001})
+    (found,) = agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md"]}}), "warning")
+    assert found.message.startswith("CLAUDE.md is not a regular file of at most 200000 bytes at HEAD")
+    assert "failed verification" in found.message and "memory files" in found.message
+
+
+def _fan_out_head(root: Path, width: int, depth: int) -> None:
+    """Make HEAD a commit whose tree names `width ** depth` files through one shared subtree (a few KB of objects)."""
+    import subprocess
+
+    def git(*args, feed=None):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=root, input=feed,
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    blob = git("hash-object", "-w", "--stdin", feed="x\n")
+    tree = git("mktree", feed="".join(f"100644 blob {blob}\tf{i}\n" for i in range(width)))
+    for _ in range(depth - 1):
+        tree = git("mktree", feed="".join(f"040000 tree {tree}\td{i}\n" for i in range(width)))
+    git("update-ref", "HEAD", git("commit-tree", tree, "-p", "HEAD", "-m", "bomb"))
+
+
+def test_agent_rules_check_is_bounded_on_a_tree_bomb(tmp_cfg, tmp_path):
+    import time
+
+    git_repo(tmp_path, {"CLAUDE.md": "x"})
+    _fan_out_head(tmp_path, 20, 4)  # 160_000 paths: past the listing's bounds
+    started = time.monotonic()
+    found = agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md"]}}), "warning")
+    assert time.monotonic() - started < 20
+    assert [i.message for i in found] == [
+        "could not list the tree at HEAD within limits (or verification failed): run sessions will let Claude load "
+        "its own memory files instead"]
+    off = issues_for(tmp_cfg, {"context": {"run_brief": False}, "project": {"agent_rules": ["CLAUDE.md"]}})
+    assert agent_rules_issues(off, "warning") == []
+
+
+@pytest.mark.parametrize("files, blocker", [
+    ({"CLAUDE.md": "x", "CLAUDE.local.md": "mine"}, "CLAUDE.local.md"),
+    ({"CLAUDE.md": "x", "pkg/claude.local.md": "mine"}, "pkg/claude.local.md"),
+    ({"CLAUDE.md": "x", ".claude/claude.md": "y"}, ".claude/claude.md"),
+    ({"CLAUDE.md": "x", ".claude/Rules/a.md": "y"}, ".claude/rules/"),
+    ({"CLAUDE.md": "x", "pkg/claude.md": "y"}, "pkg/claude.md"),
+    ({"claude.md": "x"}, "claude.md is not in agent_rules"),
+])
+def test_agent_rules_warns_on_case_variants_and_local_memory(tmp_cfg, tmp_path, files, blocker):
+    git_repo(tmp_path, files)
+    found = agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md"]}}), "warning")
+    assert [i.message.split(": ")[0] for i in found] == [blocker], found
+
+
+def test_agent_rules_symlink_to_a_refused_target_warns(tmp_cfg, tmp_path):
+    import subprocess
+
+    (tmp_path / "x").mkdir()
+    (tmp_path / "AGENTS.md").symlink_to("../outside/.git/config")
+    (tmp_path / "CLAUDE.md").write_text("x", encoding="utf-8")
+    for args in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"]):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    issues = issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md", "AGENTS.md"]}})
+    assert len(agent_rules_issues(issues, "warning")) == 1
+
+
+def test_agent_rules_symlink_target_is_read_like_the_brief_reads_it(tmp_cfg, tmp_path):
+    import subprocess
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "agents.md").write_text("see @README\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").symlink_to("docs/agents.md")
+    for args in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"]):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    found = agent_rules_issues(issues_for(tmp_cfg, {"project": {"agent_rules": ["CLAUDE.md"]}}), "warning")
+    assert [i.message.split(":")[0] for i in found] == ["CLAUDE.md"] and "@ import" in found[0].message
+
+
+def test_memory_blockers_scan_is_linear_on_hostile_text():
+    import time
+
+    from agentflow.config import memory_blockers
+
+    def blockers(text):
+        return memory_blockers(["CLAUDE.md"], lambda p: text, ["CLAUDE.md"])
+
+    for hostile in (" " * 4 + "`" * 20_000, "x " + "`" * 20_000 + " @x", "".join("`" * n + " " for n in range(1, 600)),
+                    "` " * 50_000):
+        started = time.monotonic()
+        blockers(hostile)
+        assert time.monotonic() - started < 1.0
+    assert blockers(" " * 4 + "`" * 20_000) == []
+    assert blockers("x " + "`" * 20_000 + " @x") == ["CLAUDE.md: @ import"]
+    assert blockers("```py\n@dataclass\n```\n`@x/y` and ``a ` @b`` text") == []
+    assert blockers("a `b` ` c @README") == ["CLAUDE.md: @ import"]
+    assert blockers("read @README") == ["CLAUDE.md: @ import"]

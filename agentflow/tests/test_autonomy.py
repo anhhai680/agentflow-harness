@@ -330,7 +330,7 @@ def test_a_fact_a_resolver_finds_reaches_the_next_session(auto):
     assert [(e["text"], e["key"]) for e in auto.events(run, "run_fact")] == [(FACT, RESOLVE)]
     assert run.state["facts"] == [{"text": FACT, "key": RESOLVE}]
     prompt = next(c for c in auto.calls() if c["step"] == "build/fix")["argv"][-1]  # a step that starts after it
-    assert f"## What this run already found\n\nEarlier sessions of this run established these. Check one before relying on it; do not diagnose it again.\n\n- {FACT}\n\n## The step" in prompt
+    assert f"## What this run already found\n\nEarlier sessions of this run established these. Check one before relying on it; do not diagnose it again.\n\n- {FACT}\n\n## Step `" in prompt
 
 
 def test_the_same_fact_from_a_second_resolver_is_not_added_twice(auto):

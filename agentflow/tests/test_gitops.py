@@ -910,3 +910,362 @@ def test_a_replaced_head_is_seen_through(tmp_git, cfg, tmp_path):
         pytest.fail(f"the reconcile commit was made, and really holds {real}")
     assert _head(tmp_git) == parent  # nothing committed, and the index back at the real HEAD:
     assert run_git(tmp_git, "--no-replace-objects", "diff", "--cached", "--name-only") == ""
+
+
+# --------------------------------------------------------------------------- read_blob
+
+
+def _sha(repo: Path, ref: str = "HEAD") -> str:
+    return run_git(repo, "rev-parse", ref).strip()
+
+
+def test_read_blob_reads_a_regular_file_at_a_commit(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "CLAUDE.md", "first\n")
+    _write(repo, "docs/deep/rules.md", "deep\n")
+    _commit(repo)
+    sha = _sha(repo)
+    _write(repo, "CLAUDE.md", "second\n")
+    _commit(repo)
+    assert gitops.read_blob(repo, sha, "CLAUDE.md", 100) == b"first\n"
+    assert gitops.read_blob(repo, sha, "docs/deep/rules.md", 100) == b"deep\n"
+    assert gitops.read_blob(repo, sha[:12], "CLAUDE.md", 100) == b"first\n"
+    assert gitops.read_blob(repo, sha, "missing.md", 100) is None
+    assert gitops.read_blob(repo, "0" * 40, "CLAUDE.md", 100) is None
+    assert gitops.read_blob(tmp_path / "nowhere", sha, "CLAUDE.md", 100) is None
+
+
+def test_read_blob_ignores_replace_refs(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "CLAUDE.md", "original\n")
+    _commit(repo)
+    original = _sha(repo)
+    _write(repo, "CLAUDE.md", "forged\n")
+    _commit(repo, "forged")
+    forged = _sha(repo)
+    run_git(repo, "replace", original, forged)
+    assert run_git(repo, "show", f"{original}:CLAUDE.md") == "forged\n"  # git itself follows the replace ref
+    assert gitops.read_blob(repo, original, "CLAUDE.md", 100) == b"original\n"
+
+
+def test_read_blob_refuses_a_rewritten_loose_object(tmp_path):
+    import zlib
+
+    repo = _repo(tmp_path)
+    _write(repo, "CLAUDE.md", "honest\n")
+    _commit(repo)
+    sha = _sha(repo)
+    blob = run_git(repo, "rev-parse", f"{sha}:CLAUDE.md").strip()
+    loose = repo / ".git" / "objects" / blob[:2] / blob[2:]
+    assert loose.is_file()
+    os.chmod(loose, 0o644)
+    loose.write_bytes(zlib.compress(b"blob 7\0forged\n"))
+    assert gitops.read_blob(repo, sha, "CLAUDE.md", 100) is None
+
+
+def test_read_blob_refuses_a_rewritten_loose_tree(tmp_path):
+    import zlib
+
+    repo = _repo(tmp_path)
+    _write(repo, "docs/rules.md", "honest\n")
+    _write(repo, "evil.md", "forged\n")
+    _commit(repo)
+    sha = _sha(repo)
+    docs = run_git(repo, "rev-parse", f"{sha}:docs").strip()
+    evil = bytes.fromhex(run_git(repo, "rev-parse", f"{sha}:evil.md").strip())
+    body = b"100644 rules.md\0" + evil  # the tree now names the other blob, which is itself intact
+    loose = repo / ".git" / "objects" / docs[:2] / docs[2:]
+    os.chmod(loose, 0o644)
+    loose.write_bytes(zlib.compress(b"tree %d\0" % len(body) + body))
+    assert gitops.read_blob(repo, sha, "docs/rules.md", 100) is None
+
+
+def test_read_blob_reads_a_pack_prompt_override(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, ".agentflow/prompts/_preamble.md", "pack preamble\n")
+    _commit(repo)
+    assert gitops.read_blob(repo, _sha(repo), ".agentflow/prompts/_preamble.md", 1000) == b"pack preamble\n"
+
+
+def test_read_blob_refuses_bad_input_and_size(tmp_path, monkeypatch):
+    import subprocess
+
+    repo = _repo(tmp_path)
+    _write(repo, "x", "x\n")
+    _write(repo, "d/a.md", "a\n")
+    _write(repo, "big.md", "y" * 101)
+    _commit(repo)
+    sha = _sha(repo)
+    for path in ("../x", "-x", "/x", "", "d/../x", "./x", "d//a.md", ".git/config", ".GIT/config", "x\0y", "d"):
+        assert gitops.read_blob(repo, sha, path, 100) is None, path
+    for bad in ("HEAD", "main", sha[:6], sha.upper(), f"{sha}^", "-" + sha[:10], ""):
+        assert gitops.read_blob(repo, bad, "x", 100) is None, bad
+    assert gitops.read_blob(repo, sha, "big.md", 101) == b"y" * 101
+    calls: list[list[str]] = []
+    real = subprocess.run
+
+    def recorder(args, *rest, **kwargs):
+        calls.append(list(args))
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(gitops.subprocess, "run", recorder)
+    assert gitops.read_blob(repo, sha, "big.md", 100) is None
+    assert calls and all(call[0] == "git" and "--no-replace-objects" in call for call in calls)
+    assert not [call for call in calls if "cat-file" in call and "blob" in call]
+
+
+def test_read_blob_follows_an_inner_symlink_once(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "real.md", "real\n")
+    _write(repo, ".agentflow/prompts/x.md", "pack\n")
+    _write(repo, "sub/inner.md", "inner\n")
+    for link, target in (("link.md", "real.md"), ("sub/up.md", "../real.md"), ("sub/side.md", "inner.md"),
+                         ("out.md", "../outside"), ("abs.md", "/etc/hosts"), ("pack.md", ".agentflow/prompts/x.md"),
+                         ("chain.md", "link.md"), ("git.md", ".git/config"), ("dir.md", "sub")):
+        (repo / link).symlink_to(target)
+    _commit(repo)
+    sha = _sha(repo)
+    assert gitops.read_blob(repo, sha, "link.md", 100) == b"real\n"
+    assert gitops.read_blob(repo, sha, "sub/up.md", 100) == b"real\n"
+    assert gitops.read_blob(repo, sha, "sub/side.md", 100) == b"inner\n"
+    for link in ("out.md", "abs.md", "pack.md", "chain.md", "git.md", "dir.md"):
+        assert gitops.read_blob(repo, sha, link, 100) is None, link
+
+
+def test_read_blob_refuses_a_path_through_a_symlinked_directory(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "real/a.md", "a\n")
+    (repo / "alias").symlink_to("real")
+    _commit(repo)
+    assert gitops.read_blob(repo, _sha(repo), "real/a.md", 100) == b"a\n"
+    assert gitops.read_blob(repo, _sha(repo), "alias/a.md", 100) is None
+
+
+def test_read_blob_refuses_an_unencodable_path(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "x", "x\n")
+    _commit(repo)
+    for path in ("a\ud800", "x/\udcff", "\udcffx"):
+        assert gitops.read_blob(repo, _sha(repo), path, 100) is None, path
+
+
+def test_verified_tree_paths_lists_every_file_and_refuses_a_rewritten_subtree(tmp_path):
+    import zlib
+
+    repo = _repo(tmp_path)
+    _write(repo, "CLAUDE.md", "x\n")
+    _write(repo, "pkg/CLAUDE.md", "y\n")
+    _write(repo, "pkg/deep/a.py", "z\n")
+    _write(repo, "same/deep/a.py", "z\n")  # an identical subtree at a second place
+    (repo / "link.md").symlink_to("CLAUDE.md")
+    _commit(repo)
+    sha = _sha(repo)
+    assert gitops.verified_tree_paths(repo, sha) == gitops.tree_paths(repo, sha) == [
+        "CLAUDE.md", "link.md", "pkg/CLAUDE.md", "pkg/deep/a.py", "same/deep/a.py"]
+    assert gitops.verified_tree_paths(repo, sha[:12]) is None  # full ids only: a prefix can be ground
+    assert gitops.verified_tree_paths(repo, "HEAD") is None
+    assert gitops.verified_tree_paths(repo, "0" * 40) is None
+    pkg = run_git(repo, "rev-parse", f"{sha}:pkg").strip()
+    deep = bytes.fromhex(run_git(repo, "rev-parse", f"{sha}:pkg/deep").strip())
+    body = b"40000 deep\0" + deep
+    loose = repo / ".git" / "objects" / pkg[:2] / pkg[2:]
+    os.chmod(loose, 0o644)
+    loose.write_bytes(zlib.compress(b"tree %d\0" % len(body) + body))
+    assert "pkg/CLAUDE.md" not in gitops.tree_paths(repo, sha)
+    assert gitops.verified_tree_paths(repo, sha) is None
+
+
+def _mktree(repo: Path, entries: list[tuple[str, str, str]]) -> str:
+    """A tree object from `(mode, id, name)` entries, written with `git mktree`."""
+    import subprocess
+
+    kinds = {"040000": "tree", "100644": "blob"}
+    feed = "".join(f"{mode} {kinds[mode]} {oid}\t{name}\n" for mode, oid, name in entries)
+    return subprocess.run(["git", "mktree"], cwd=repo, input=feed, capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def _commit_tree(repo: Path, tree: str) -> str:
+    return run_git(repo, "commit-tree", tree, "-m", "c").strip()
+
+
+def _fan_out(repo: Path, width: int, depth: int) -> str:
+    """A commit whose tree holds `width` names at each of `depth` levels, all pointing at one shared subtree:
+    a few kilobytes of objects that name `width ** depth` files."""
+    import subprocess
+
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, input="x\n", capture_output=True,
+                          text=True, check=True).stdout.strip()
+    tree = _mktree(repo, [("100644", blob, f"f{i}") for i in range(width)])
+    for _ in range(depth - 1):
+        tree = _mktree(repo, [("040000", tree, f"d{i}") for i in range(width)])
+    return _commit_tree(repo, tree)
+
+
+def test_verified_tree_paths_refuses_a_fan_out_bomb_quickly_and_in_bounded_memory(tmp_path):
+    import time
+    import tracemalloc
+
+    repo = _repo(tmp_path)
+    small = _fan_out(repo, 4, 3)
+    assert len(gitops.verified_tree_paths(repo, small)) == 64 == len(gitops.tree_paths(repo, small))
+    bomb = _fan_out(repo, 20, 4)  # 160_000 paths from 4 small trees: past the 100_000 cap
+    tracemalloc.start()
+    started = time.monotonic()
+    try:
+        assert gitops.verified_tree_paths(repo, bomb) is None
+        elapsed = time.monotonic() - started
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert elapsed < 10 and peak < 64 * 1024 * 1024, (elapsed, peak)
+
+
+def test_tree_paths_refuses_a_fan_out_bomb_quickly_and_in_bounded_memory(tmp_path):
+    # `git ls-tree -r` on shared subtrees streams `width ** depth` paths from a few KB of objects: the listing is read
+    # as it streams and refused past its caps, never held whole.
+    import time
+    import tracemalloc
+
+    repo = _repo(tmp_path)
+    bomb = _fan_out(repo, 20, 4)  # 160_000 paths: past the 100_000 cap
+    tracemalloc.start()
+    started = time.monotonic()
+    try:
+        assert gitops.tree_paths(repo, bomb) is None
+        elapsed = time.monotonic() - started
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert elapsed < 10 and peak < 16 * 1024 * 1024, (elapsed, peak)
+
+
+def test_tree_paths_refuses_a_listing_past_its_byte_budget(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    small = _fan_out(repo, 4, 3)  # 64 paths of 8 bytes, each with its NUL
+    assert len(gitops.tree_paths(repo, small)) == 64
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATH_BYTES", 64 * 9 - 1)
+    assert gitops.tree_paths(repo, small) is None
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATH_BYTES", 64 * 9)
+    assert len(gitops.tree_paths(repo, small)) == 64
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATHS", 63)
+    assert gitops.tree_paths(repo, small) is None
+
+
+def test_verified_tree_paths_counts_queued_folders_against_the_cap(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    bomb = _fan_out(repo, 10, 4)  # 1_000 folders queued at the third level before any file of the last is listed
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATHS", 999)
+    assert gitops.verified_tree_paths(repo, bomb) is None
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATHS", 10_000)
+    assert len(gitops.verified_tree_paths(repo, bomb)) == 10_000
+
+
+def test_verified_tree_paths_refuses_a_deep_chain(tmp_path):
+    import subprocess
+
+    repo = _repo(tmp_path)
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, input="x\n", capture_output=True,
+                          text=True, check=True).stdout.strip()
+    tree = _mktree(repo, [("100644", blob, "f")])
+    commits = {}
+    for depth in range(1, gitops._LIST_MAX_DEPTH + 2):
+        tree = _mktree(repo, [("040000", tree, "d")])
+        commits[depth] = _commit_tree(repo, tree)
+    deepest = gitops._LIST_MAX_DEPTH
+    assert gitops.verified_tree_paths(repo, commits[deepest]) == ["d/" * deepest + "f"]
+    assert gitops.verified_tree_paths(repo, commits[deepest + 1]) is None
+
+
+def test_verified_tree_paths_stops_at_its_deadline(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    _write(repo, "a/b.md", "x\n")
+    _commit(repo)
+    assert gitops.verified_tree_paths(repo, _sha(repo)) == ["a/b.md"]
+    monkeypatch.setattr(gitops, "_LIST_DEADLINE_S", 0)
+    assert gitops.verified_tree_paths(repo, _sha(repo)) is None
+
+
+def _blob_id(repo: Path) -> str:
+    import subprocess
+
+    return subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, input="x\n", capture_output=True,
+                          text=True, check=True).stdout.strip()
+
+
+def _long_name_fan_out(repo: Path, name_len: int, levels: int) -> str:
+    """A commit whose leaf holds one file with a `name_len` name, under `levels` levels of two folders with
+    `name_len` names each, all naming one shared subtree: `2 ** levels` paths of `(levels + 1) * name_len` bytes."""
+    tree = _mktree(repo, [("100644", _blob_id(repo), "f" * name_len)])
+    for _ in range(levels):
+        tree = _mktree(repo, [("040000", tree, "a" * name_len), ("040000", tree, "b" * name_len)])
+    return _commit_tree(repo, tree)
+
+
+def test_verified_tree_paths_refuses_long_names_quickly_and_in_bounded_memory(tmp_path):
+    import time
+    import tracemalloc
+
+    repo = _repo(tmp_path)
+    bomb = _long_name_fan_out(repo, 100_000, 3)  # a few KB of objects naming 8 paths of 400 KB
+    tracemalloc.start()
+    started = time.monotonic()
+    try:
+        assert gitops.verified_tree_paths(repo, bomb) is None
+        elapsed = time.monotonic() - started
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert elapsed < 10 and peak < 8 * 1024 * 1024, (elapsed, peak)
+
+
+def _built_bytes(name_len: int, levels: int) -> int:
+    """What `verified_tree_paths` counts for `_long_name_fan_out(name_len, levels)`: every folder prefix (with its
+    `/`) and every file path, in bytes."""
+    folders = sum(2 ** k * k * (name_len + 1) for k in range(1, levels + 1))
+    return folders + 2 ** levels * (levels * (name_len + 1) + name_len)
+
+
+def test_verified_tree_paths_refuses_one_byte_over_its_path_budget(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    commit = _long_name_fan_out(repo, 10, 3)
+    total = _built_bytes(10, 3)
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATH_BYTES", total)
+    assert len(gitops.verified_tree_paths(repo, commit)) == 8
+    monkeypatch.setattr(gitops, "_LIST_MAX_PATH_BYTES", total - 1)
+    assert gitops.verified_tree_paths(repo, commit) is None
+
+
+def test_verified_tree_paths_refuses_more_path_bytes_than_its_budget(tmp_path):
+    import tracemalloc
+
+    repo = _repo(tmp_path)
+    # 16_384 paths of 2_264 bytes, every one under the length cap and 32_767 entries under the count cap, but
+    # about 100 MB of paths and prefixes: only the byte budget refuses it.
+    assert 14 * 151 + 150 < 4096 and _built_bytes(150, 14) > 6 * 16 * 1024 * 1024  # as shipped: 4 KB and 16 MiB
+    bomb = _long_name_fan_out(repo, 150, 14)
+    tracemalloc.start()
+    try:
+        assert gitops.verified_tree_paths(repo, bomb) is None
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 32 * 1024 * 1024, peak
+
+
+def test_verified_tree_paths_caps_each_path_length(tmp_path):
+    repo = _repo(tmp_path)
+    blob = _blob_id(repo)
+    cap = gitops._LIST_MAX_PATH_LEN
+
+    def listing(*names: str) -> list[str] | None:
+        tree = _mktree(repo, [("100644", blob, names[-1])])
+        for name in reversed(names[:-1]):
+            tree = _mktree(repo, [("040000", tree, name)])
+        return gitops.verified_tree_paths(repo, _commit_tree(repo, tree))
+
+    assert listing("f" * cap) == ["f" * cap]
+    assert listing("f" * (cap + 1)) is None
+    assert listing("d" * 2000, "f" * (cap - 2001)) == ["d" * 2000 + "/" + "f" * (cap - 2001)]
+    assert listing("d" * 2000, "f" * (cap - 2000)) is None
+    assert listing("d" * (cap + 1), "f") is None  # a folder whose own name is over the cap is refused before descending

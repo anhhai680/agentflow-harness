@@ -532,6 +532,58 @@ def failure_report(failed: list[GateResult]) -> str:
     return "\n\n".join(blocks)
 
 
+# A line that tells what failed, in the output of the usual test runners, linters and compilers.
+FAILURE_LINE = re.compile(
+    r"\b(?:FAILED|FAIL|ERROR|Error|error)\b|^E\s|AssertionError|Traceback|[\u2717\u2718]|^\s*-->\s|^[^\s:]+:\d+(?::\d+)?:\s")
+EXCERPT_LINE_MAX = 300  # a kept line is cut to this many characters, then `\u2026`
+EXCERPT_GATE_LINES = 10  # a gate that gets an excerpt gets at least this many lines, `max_lines` allowing
+
+
+def _excerpt(tail: str, budget: int) -> tuple[list[str], int, int]:
+    """`(lines, kept, total)`: at most `budget` lines of `tail` (`kept` of its `total`), plus the cut markers. A tail
+    that fits is kept whole. A longer one keeps up to half the budget from its first failure line (none when no line
+    matches), then its last lines for the rest, in the original order with no line twice, and `\u2026 <k> lines cut \u2026`
+    where lines are skipped. Every kept line is cut to `EXCERPT_LINE_MAX` characters."""
+    lines = tail.splitlines()
+    total = len(lines)
+    first = next((i for i, line in enumerate(lines) if FAILURE_LINE.search(line)), None)
+    if total <= budget:
+        keep = set(range(total))
+    else:
+        keep = set(range(first, min(total, first + budget // 2))) if first is not None else set()
+        keep.update(range(total - (budget - len(keep)), total))
+    shown: list[str] = []
+    expected = 0
+    for i in sorted(keep):
+        if i > expected:
+            shown.append(f"\u2026 {i - expected} lines cut \u2026")
+        line = lines[i]
+        shown.append(line[:EXCERPT_LINE_MAX] + "\u2026" if len(line) > EXCERPT_LINE_MAX else line)
+        expected = i + 1
+    return shown, len(keep), total
+
+
+def resume_report(failed: list[GateResult], max_lines: int) -> str:
+    """The gate output a fix turn carries: `failure_report` cut to `max_lines` kept lines in all.
+
+    The first `max(1, max_lines // 10)` failed gates each get an excerpt of their tail (`_excerpt`): the budget split
+    between them, at least `EXCERPT_GATE_LINES` each. Every other gate gets its header, its log path and a note to
+    read the log. A block is `### <gate> (<reason>)`, `Full log: <path>` (when there is one), the kept lines in a
+    fence and, when lines were cut, `(<k> of <m> lines shown; the full log has the rest)`."""
+    shown = max(1, max_lines // 10)
+    each = max(1, min(max_lines, max(EXCERPT_GATE_LINES, max_lines // min(len(failed) or 1, shown))))
+    blocks = []
+    for number, r in enumerate(failed):
+        head = f"### {r.name} ({r.reason})\n" + (f"Full log: {r.log_path}\n" if r.log_path else "")
+        if number >= shown:
+            blocks.append(f"{head}(output not shown: read the log)")
+            continue
+        lines, kept, total = _excerpt(r.tail, each)
+        note = f"\n({kept} of {total} lines shown; the full log has the rest)" if kept < total else ""
+        blocks.append(f"{head}```\n" + "\n".join(lines) + f"\n```{note}")
+    return "\n\n".join(blocks)
+
+
 def summarize(results: list[GateResult]) -> str:
     """One line per gate: `✓ floor`, `✗ py_lint`, `– web_types (skipped: <reason>)`."""
     lines = []

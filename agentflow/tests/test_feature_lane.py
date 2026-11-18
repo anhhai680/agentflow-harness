@@ -306,7 +306,7 @@ def _small_plan_without_brief(flow_repo, monkeypatch, shared: bool) -> list:
     seen = []
     real = lanes.build_prompt
     monkeypatch.setattr(lanes, "build_prompt",
-                        lambda cfg, s, *rest: seen.append((s.skill, s.continuation)) or real(cfg, s, *rest))
+                        lambda cfg, s, *rest, **kw: seen.append((s.skill, s.continuation)) or real(cfg, s, *rest, **kw))
     return seen
 
 
@@ -1116,7 +1116,7 @@ def test_only_a_batch_continuation_is_marked_as_one(batched, monkeypatch):
 
     seen = []
     real = lanes.build_prompt
-    monkeypatch.setattr(lanes, "build_prompt", lambda cfg, step, *rest: seen.append((step.id, step.continuation)) or real(cfg, step, *rest))
+    monkeypatch.setattr(lanes, "build_prompt", lambda cfg, step, *rest, **kw: seen.append((step.id, step.continuation)) or real(cfg, step, *rest, **kw))
     run = begin_build(batched, plan_text(count=3))
     assert build(batched, run) == ("done", True)
     flags = [continuation for step_id, continuation in seen if step_id == "build"]
@@ -1159,3 +1159,75 @@ def test_a_fix_step_runs_the_affected_tier(flow_repo):
     assert log.startswith("$ true src/x.py\n")
     verified = [e for e in flow_repo.events(run, "gate_result") if e["key"] == "verify/verify"]
     assert verified and all("tier" not in e for e in verified)  # the steps that do not fix things stay full
+
+
+# --------------------------------------------------------------------------- the run brief across a shared session (C2)
+
+FLAG = "--append-system-prompt-file"
+
+
+def brief_of(call: dict) -> str | None:
+    return call["argv"][call["argv"].index(FLAG) + 1] if FLAG in call["argv"] else None
+
+
+def test_batched_tasks_share_one_byte_identical_brief(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    monkeypatch.setitem(TITLES, 5, "Fifth thing")
+    flow_repo.configure(SMALL, batch=True)  # five tasks: above the pack's `plan_is_small` max of 3
+    run = begin_build(flow_repo, plan_text(count=5))
+    brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n"})
+    assert build(flow_repo, run) == ("done", True)
+    calls = {}
+    for call in flow_repo.calls():
+        calls.setdefault(call["step"], call)
+    members = [calls[IMPL.format(n=n)] for n in (1, 2, 3)]
+    first = session_of(flow_repo, run, IMPL.format(n=1))
+    assert "--resume" not in members[0]["argv"]
+    assert all(("--resume", first) in pairs(m["argv"]) for m in members[1:])  # task 3 resumes what task 2 continued
+    assert "Next task in this same session" in members[2]["argv"][-1]
+    assert brief_of(members[0]) is not None and len({brief_of(m) for m in members}) == 1
+    assert len({m["system_prompt"] for m in members}) == 1 and "RULE-MARKER" in members[0]["system_prompt"]
+    pinned = [run.state["steps"][IMPL.format(n=n)]["brief"] for n in (1, 2, 3)]
+    assert pinned[0] == pinned[1] == pinned[2] is not None
+
+
+def test_small_plan_shared_session_keeps_the_brief(flow_repo):
+    from conftest import brief_ready
+
+    flow_repo.configure(SMALL)
+    run = begin_build(flow_repo, plan_text())
+    brief_ready(flow_repo, run)
+    assert build(flow_repo, run) == ("done", True)
+    one, two = flow_repo.calls()
+    assert ("--resume", session_of(flow_repo, run, IMPL.format(n=1))) in pairs(two["argv"])
+    assert brief_of(one) is not None and brief_of(one) == brief_of(two)
+    assert one["system_prompt"] == two["system_prompt"] and "Nobody can answer you" in one["system_prompt"]
+    assert run.state["steps"][IMPL.format(n=2)]["brief"] == run.state["steps"][IMPL.format(n=1)]["brief"]
+
+
+def test_worktree_and_checkout_edits_never_reach_the_brief(flow_repo):
+    from conftest import brief_ready, run_git
+
+    flow_repo.configure(BIG)
+    engine_result = (AGENTFLOW / "prompts" / "_result.md").read_text(encoding="utf-8")
+    pack_prompts = Path(flow_repo.cfg.path).parent / "prompts"
+    (pack_prompts / "_result.md").write_text(engine_result, encoding="utf-8")  # the pack overrides `_result.md`
+    run = begin_build(flow_repo, plan_text())
+    brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n", ".agentflow/prompts/_result.md": engine_result})
+    worktree = flow_repo.root.parent / "wt-brief"
+    run_git(flow_repo.root, "worktree", "add", "-q", "-b", "flow/feature/demo", str(worktree))
+    run.emit("run_updated", branch="flow/feature/demo", worktree=str(worktree))
+    flow_repo.script({IMPL.format(n=1): [{"write": {"CLAUDE.md": "RULE-MARKER\nPLANTED by an agent\n"},
+                                          "result": DONE_RESULT}]})
+    for path in (flow_repo.root / "CLAUDE.md", flow_repo.root / ".agentflow" / "prompts" / "_result.md",
+                 pack_prompts / "_result.md"):
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write("PLANTED in the main checkout\n")
+    assert build(flow_repo, run) == ("done", True)
+    calls = flow_repo.calls()
+    assert [c["step"] for c in calls] == [IMPL.format(n=1), REVIEW.format(n=1), IMPL.format(n=2), REVIEW.format(n=2)]
+    assert "PLANTED" in (worktree / "CLAUDE.md").read_text(encoding="utf-8")  # the agent's edit is real
+    for call in calls:
+        assert call["system_prompt"] is not None and "RULE-MARKER" in call["system_prompt"], call["step"]
+        assert "PLANTED" not in call["system_prompt"], call["step"]

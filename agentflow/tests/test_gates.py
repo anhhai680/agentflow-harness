@@ -8,7 +8,8 @@ import pytest
 
 from agentflow.config import Affected, Gate, load_config
 from agentflow.gates import (GateResult, affected_gate, command_digest, deferred_full, gates_ok, hash_inputs,
-                             input_hashes, record_results, reusable_passes, run_gates, run_gates_reusing, summarize)
+                             input_hashes, record_results, resume_report, reusable_passes, run_gates, run_gates_reusing,
+                             summarize)
 from agentflow.guards import snapshot
 from conftest import PYTHON_CONFIG
 
@@ -674,3 +675,70 @@ def test_a_full_pass_is_reused_at_the_affected_tier(run, tmp_git, tmp_path):
     (again,) = run_gates_reusing(cfg, run, "review/fix_findings", ["t"], tmp_git, tmp_path / "logs", tree,
                                  tier="affected", changed=["a.py"])
     assert again.reused_from == "verify/verify" and again.tier == "full"
+
+
+# --------------------------------------------------------------------------- the excerpt a fix turn carries
+
+
+def failed_gate(name: str, tail: str, reason: str = "exit 1", log: bool = True) -> GateResult:
+    return GateResult(name, False, False, reason, Path(f"/logs/{name}.log") if log else None, tail)
+
+
+def fenced(report: str) -> list[str]:
+    """The lines inside the report's code fences, with the `… <k> lines cut …` markers counted out."""
+    lines, inside = [], False
+    for line in report.splitlines():
+        if line == "```":
+            inside = not inside
+        elif inside and not (line.startswith("… ") and line.endswith(" lines cut …")):
+            lines.append(line)
+    return lines
+
+
+def test_resume_report_keeps_short_output_whole():
+    tail = "\n".join(["E731 Do not assign a lambda expression", "  --> a.py:3:1", *[f"   | line {i}" for i in range(12)],
+                      "Found 1 error."])
+    assert len(tail.splitlines()) == 15
+    report = resume_report([failed_gate("py_lint", tail)], 80)
+    assert fenced(report) == tail.splitlines()
+    assert "lines shown" not in report and "### py_lint (exit 1)" in report and "Full log: /logs/py_lint.log" in report
+
+
+def test_resume_report_keeps_failures_within_budget():
+    tail = "\n".join(f"line {n}" + (" FAILED tests/test_x.py::test_y" if n == 120 else "") for n in range(1, 301))
+    report = resume_report([failed_gate("engine_tests", tail)], 80)
+    kept = fenced(report)
+    assert len(kept) <= 80
+    assert "line 120 FAILED tests/test_x.py::test_y" in kept and "line 300" in kept and "line 290" in kept
+    assert f"({len(kept)} of 300 lines shown; the full log has the rest)" in report
+    assert "Full log: /logs/engine_tests.log" in report and "lines cut" in report
+    assert [int(line.split()[1]) for line in kept] == sorted(int(line.split()[1]) for line in kept)  # original order
+
+
+def test_resume_report_without_failure_lines_keeps_the_tail():
+    tail = "\n".join(f"line {n}" for n in range(1, 201))
+    kept = fenced(resume_report([failed_gate("g", tail)], 80))
+    assert kept == [f"line {n}" for n in range(121, 201)]
+
+
+def test_resume_report_total_never_exceeds_the_budget():
+    tail = "\n".join(f"line {n} error" for n in range(300))
+    three = resume_report([failed_gate(f"g{i}", tail) for i in range(3)], 80)
+    blocks = three.split("### ")[1:]
+    assert len(blocks) == 3 and all(len(fenced(b)) <= 26 for b in blocks) and len(fenced(three)) <= 80
+    ten = resume_report([failed_gate(f"g{i}", tail) for i in range(10)], 80)
+    blocks = ten.split("### ")[1:]
+    shown = [b for b in blocks if "```" in b]
+    assert len(shown) == 8 and all(len(fenced(b)) == 10 for b in shown) and len(fenced(ten)) <= 80
+    hidden = [b for b in blocks if "```" not in b]
+    assert len(hidden) == 2 and all("(output not shown: read the log)" in b and "Full log:" in b for b in hidden)
+
+
+def test_resume_report_cuts_long_lines():
+    kept = fenced(resume_report([failed_gate("g", "x" * 5000 + "\nshort")], 80))
+    assert kept == ["x" * 300 + "\u2026", "short"]
+
+
+def test_resume_report_names_a_gate_without_a_log():
+    report = resume_report([failed_gate("doc", "bad", reason="doc check", log=False)], 80)
+    assert "### doc (doc check)\n```\nbad\n```" in report and "Full log" not in report

@@ -152,6 +152,33 @@ RETIRED: tuple[Retired, ...] = (
             "round, when the note needs no change; give the reason in `summary`)."
         ),
     ),
+    Retired(
+        id="preamble-names-the-step",
+        file="_preamble.md",
+        retired_in="2.10",
+        detect="You are running headless as step `{step_id}`",
+        old=("You are running headless as step `{step_id}` of the agentflow run `{run}`. Nobody can answer you during "
+             "the step."),
+        new=("You are running headless as one step of the agentflow run `{run}`; the step's prompt names it. Nobody "
+             "can answer you during the step."),
+    ),
+    Retired(
+        id="preamble-step-slots",
+        file="_preamble.md",
+        retired_in="2.10",
+        detect="{lessons}\n\n## The step",
+        old="\n\n{run_facts}\n\n{code_map}\n\n{lessons}\n\n## The step",
+        new="",
+    ),
+    Retired(
+        id="result-names-the-file",
+        file="_result.md",
+        retired_in="2.10",
+        detect="Write your result as JSON to `{result_file}`",
+        old="Write your result as JSON to `{result_file}`, then stop. Use this exact path.",
+        new=("Write your result as JSON to the step's result file (the path after \"Your result file is\" in the step's "
+             "prompt), then stop. Use that exact path."),
+    ),
 )
 
 

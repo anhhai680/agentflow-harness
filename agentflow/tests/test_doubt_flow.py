@@ -514,7 +514,7 @@ def test_the_doubt_reviewer_prompt_has_no_author_notes(flow, autopilot):
     [review] = prompts_of(flow, "plan/plan_review")
     assert "CODEMAP-X" not in review and "Code this run has mapped" not in review
     assert HANDOFF_LEAD not in review and "{code_map}" not in review
-    preamble, marker, _body = review.partition("## The step")
+    preamble, marker, _body = review.partition("## Step `")
     assert marker and "\n\n\n" not in preamble  # the empty code-map slot went whole
     assert "Do not open or append to" in review
     approve(run, "plan", by="me")

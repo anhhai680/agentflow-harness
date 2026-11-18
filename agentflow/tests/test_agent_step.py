@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from agentflow import gitops, lanes
+from agentflow import gitops, lanes, lessons
 from agentflow.config import PROMPT_PLACEHOLDERS, Phase, Step
 from agentflow.conditions import fmt, make_ctx
 from agentflow.events import parse_iso
@@ -254,6 +254,101 @@ def test_a_failed_pre_run_starts_the_session_in_its_fix_loop(flow_repo):
     assert "not fixed" in calls[0]["argv"][-1]
     assert [e["attempt"] for e in flow_repo.events(run, "fix_attempt")] == [1]
     assert gate_runs(flow_repo, run) == [("flaky", False), ("flaky", True)]
+
+
+LOUD = {"gates": {"loud": {"run": "for i in $(seq 1 300); do echo \"row $i end\"; done; exit 1"}},
+        "context": {"gate_output_lines": 300}}
+
+
+def test_fix_prompt_is_short_with_a_brief(flow_repo):
+    from conftest import brief_ready
+
+    flow_repo.configure(LOUD)
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    assert run_step(flow_repo, make_step(gates=["loud"], fix_loop=True)) == "stopped"
+    first, fix = flow_repo.calls()[:2]
+    assert ("--resume", session_of(flow_repo, run)) in pairs(fix["argv"]) and brief_path(fix) is not None
+    prompt = fix["argv"][-1]
+    assert len(prompt) < 8000 and str(run.agent_result_path(KEY)) in prompt
+    assert "## When you finish" not in prompt and "write your result JSON to" in prompt
+    assert "row 300 end" in prompt and "row 150 end" not in prompt and "of 300 lines shown" in prompt
+    assert "Full log:" in prompt
+
+
+def test_fix_prompt_keeps_the_result_contract_without_a_brief(flow_repo):
+    flow_repo.configure({**LOUD, "context": {**LOUD["context"], "run_brief": False}})
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, make_step(gates=["loud"], fix_loop=True)) == "stopped"
+    fix = flow_repo.calls()[1]["argv"][-1]
+    assert str(run.agent_result_path(KEY)) in fix and "## When you finish" in fix
+    assert "row 150 end" not in fix and "of 300 lines shown" in fix  # the excerpt is for every fix turn
+
+
+def test_fresh_gate_step_keeps_the_whole_report(flow_repo):
+    flow_repo.configure({"gates": {"loud": {"run": "if test -f bad.txt; then for i in $(seq 1 300); do echo \"row $i end\"; "
+                                            "done; exit 1; fi"}},
+                         "context": {"gate_output_lines": 300}})
+    run = flow_repo.new_run()
+    step = make_step(gates=["loud"], fix_loop=True, gates_first=True)
+    (flow_repo.root / "bad.txt").write_text("", encoding="utf-8")  # a fresh session: the gates fail before it starts
+    assert flow_repo.executor(run).run_steps(make_phase(step), [step], "build")[0] == "stopped"
+    fresh = flow_repo.calls()[0]["argv"][-1]
+    assert "row 1 end" in fresh and "row 150 end" in fresh and "row 300 end" in fresh
+    assert "lines shown" not in fresh
+
+
+def test_a_refine_round_gets_the_excerpt_when_it_resumes_its_session(flow_repo):
+    flow_repo.configure({"gates": {"loud": {"run": "if test -f bad.txt; then for i in $(seq 1 300); do echo \"row $i end\"; "
+                                            "done; exit 1; fi"}},
+                         "context": {"gate_output_lines": 300}})
+    run = flow_repo.new_run()
+    step = make_step(gates=["loud"], fix_loop=True, gates_first=True)
+    assert flow_repo.executor(run).run_steps(make_phase(step), [step], "build")[0] == "done"
+    sid = session_of(flow_repo, run)
+    (flow_repo.root / "bad.txt").write_text("", encoding="utf-8")
+    run.emit("phase_approval_raised", phase="build", summary="ok?")
+    run.emit("phase_rejected", by="human", phase="build", round=1, note="Rename the variable")
+    assert flow_repo.executor(run).run_steps(make_phase(step), [step], "build")[0] == "stopped"
+    refine = flow_repo.calls()[1]
+    assert ("--resume", sid) in pairs(refine["argv"])
+    prompt = refine["argv"][-1]
+    assert "Rename the variable" in prompt and "refine round 1" in prompt
+    assert "row 300 end" in prompt and "row 150 end" not in prompt and "of 300 lines shown" in prompt
+
+
+@pytest.mark.parametrize("fresh", ["rollover", "replaced_brief"])
+def test_a_fresh_session_after_a_resumed_refine_gets_the_whole_report_once(flow_repo, monkeypatch, fresh):
+    # The refine round resumes its session with the excerpt; when a fresh session takes over (its context ran out, or
+    # its brief can't be given again), that session has seen nothing, so it gets the whole report, and only once.
+    from conftest import brief_ready
+
+    flow_repo.configure({"gates": {"loud": {"run": "if test -f bad.txt; then for i in $(seq 1 300); do echo \"row $i end\"; "
+                                            "done; exit 1; fi"}},
+                         "context": {"gate_output_lines": 300}})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    flow_repo.script({KEY: [{"result": DONE}, {"usage_pct": [81]} if fresh == "rollover" else {"result": DONE}]})
+    step = make_step(gates=["loud"], fix_loop=True, gates_first=True)
+    assert flow_repo.executor(run).run_steps(make_phase(step), [step], "build")[0] == "done"
+    sid = session_of(flow_repo, run)
+    (flow_repo.root / "bad.txt").write_text("", encoding="utf-8")
+    run.emit("phase_approval_raised", phase="build", summary="ok?")
+    run.emit("phase_rejected", by="human", phase="build", round=1, note="Rename the variable")
+    if fresh == "replaced_brief":
+        _brief_changes(monkeypatch)  # a restart on a newer engine: the resumed session's brief can't be rebuilt
+    flow_repo.executor(run).run_steps(make_phase(step), [step], "build")
+    calls = flow_repo.calls()
+    if fresh == "rollover":
+        assert ("--resume", sid) in pairs(calls[1]["argv"]) and "of 300 lines shown" in calls[1]["argv"][-1]
+        prompt = calls[2]["argv"][-1]
+        assert "--resume" not in calls[2]["argv"] and "ran out of context" in prompt
+    else:
+        prompt = calls[1]["argv"][-1]
+        assert "--resume" not in calls[1]["argv"] and flow_repo.events(run, "brief_replaced")
+        assert "Rename the variable" in prompt.split(lanes.BRIEF_CARRIED)[1]  # the round's note is carried
+    assert "row 1 end" in prompt and "row 150 end" in prompt and "lines shown" not in prompt
+    assert prompt.count("### loud (") == 1 and prompt.count("The gates failed") == 1  # the lead's report, once
 
 
 def test_a_step_that_changed_nothing_reuses_the_passes_another_step_had_on_the_same_tree(flow_repo):
@@ -874,7 +969,7 @@ def test_build_prompt_parts(flow_repo):
     assert "stop and ask" in first
     assert "commit" in first and "push" in first
     assert "docs/specs/SPEC-crm.md" in first
-    assert first.index("spec-driven-development") < first.index("/workspace/out/step.json")
+    assert first.index("/workspace/out/step.json") < first.index("spec-driven-development") < first.index("## When you finish")
 
 
 def test_build_prompt_names_a_skill_the_template_leaves_out(flow_repo):
@@ -1141,7 +1236,8 @@ def test_a_continuation_in_a_fresh_session_still_gets_the_skill(flow_repo, monke
     assert run_step(flow_repo, step, extra={"task_title": "Task 2: B", "task_text": "do b"}) == "done"
     for call in flow_repo.calls():
         assert "--resume" not in call["argv"]
-        assert "Rules with {module}" in call["argv"][-1]  # no session holds the text yet, so it is sent
+        assert "Rules with {module}" in call["system_prompt"]  # no session holds the text yet, so it is sent (in its brief)
+        assert "its full text is in your system prompt" in call["argv"][-1]
 
 
 def test_task_briefs_do_not_suppress_the_skill_text(flow_repo, monkeypatch, tmp_path):
@@ -1361,9 +1457,10 @@ def test_without_facts_the_prompt_has_no_heading_and_no_stray_blank_lines(flow_r
     flow_repo.new_run()
     prompt = _prompt(flow_repo)
     assert "What this run already found" not in prompt and "{run_facts}" not in prompt
-    assert "\n\n\n" not in prompt.split("## The step")[0]  # (the skill's own text further down has some)
+    assert "\n\n\n" not in prompt.split("## Step `")[0]  # (the skill's own text further down has some)
     # the last bullet of the preamble's shell rules runs straight into the step's own text, one blank line between
-    assert re.search(r"stop as `blocked` and name the exact command\.\n\n## The step\n\n", prompt)
+    assert "stop as `blocked` and name the exact command.\n\n" in prompt  # the preamble's last line ends the preamble
+    assert re.search(r"\n\n## Step `[^`\n]+`\n\nYour result file is `[^`\n]+`\.\n\n", prompt)  # the step head follows it
 
 
 def test_a_run_with_no_facts_key_in_its_state_builds_the_same_prompt(flow_repo):
@@ -1380,9 +1477,9 @@ def test_facts_go_into_the_preamble_before_the_step(flow_repo):
     run.emit("run_fact", text="an environment cause", key="build/x/resolve-1")
     prompt = _prompt(flow_repo)
     block = ("## What this run already found\n\nEarlier sessions of this run established these. Check one before "
-             "relying on it; do not diagnose it again.\n\n- a tool quirk {step_id}\n- an environment cause\n\n## The step")
+             "relying on it; do not diagnose it again.\n\n- a tool quirk {step_id}\n- an environment cause\n\n## Step `")
     assert block in prompt  # braces in a fact go in verbatim
-    assert prompt.replace(block, "## The step") == plain
+    assert prompt.replace(block, "## Step `") == plain
 
 
 # --------------------------------------------------------------------------- the run's code map
@@ -1392,8 +1489,9 @@ def test_without_a_code_map_the_preamble_is_unchanged(flow_repo):
     flow_repo.new_run()
     prompt = _prompt(flow_repo)
     assert "Code this run has mapped" not in prompt and "{code_map}" not in prompt
-    assert "\n\n\n" not in prompt.split("## The step")[0]
-    assert re.search(r"stop as `blocked` and name the exact command\.\n\n## The step\n\n", prompt)
+    assert "\n\n\n" not in prompt.split("## Step `")[0]
+    assert "stop as `blocked` and name the exact command.\n\n" in prompt  # the preamble's last line ends the preamble
+    assert re.search(r"\n\n## Step `[^`\n]+`\n\nYour result file is `[^`\n]+`\.\n\n", prompt)  # the step head follows it
 
 
 def test_a_run_with_no_code_map_key_builds_the_same_prompt(flow_repo):
@@ -1410,11 +1508,11 @@ def test_the_code_map_follows_the_facts_before_the_step(flow_repo):
     run.emit("code_noted", text="`app/names.py:12` `f() {step_id}`", key="build/x")
     prompt = _prompt(flow_repo)
     block = ("- a cause\n\n## Code this run has mapped\n\n" + lanes.CODE_MAP_LEAD
-             + "\n\n- `app/names.py:12` `f() {step_id}`\n\n## The step")  # braces in an entry go in verbatim
+             + "\n\n- `app/names.py:12` `f() {step_id}`\n\n## Step `")  # braces in an entry go in verbatim
     assert block in prompt
     assert prompt.count("Code this run has mapped") == 1
     run.emit("code_noted", text="`app/other.py:3` `g()`", key="build/y")
-    assert "- `app/names.py:12` `f() {step_id}`\n- `app/other.py:3` `g()`\n\n## The step" in _prompt(flow_repo)
+    assert "- `app/names.py:12` `f() {step_id}`\n- `app/other.py:3` `g()`\n\n## Step `" in _prompt(flow_repo)
 
 
 def test_a_code_map_with_no_facts_drops_only_the_facts_slot(flow_repo):
@@ -1423,9 +1521,9 @@ def test_a_code_map_with_no_facts_drops_only_the_facts_slot(flow_repo):
     run.emit("code_noted", text="`a.py:1` `f()`", key="build/x")
     prompt = _prompt(flow_repo)
     assert "What this run already found" not in prompt and "{run_facts}" not in prompt
-    block = "## Code this run has mapped\n\n" + lanes.CODE_MAP_LEAD + "\n\n- `a.py:1` `f()`\n\n## The step"
+    block = "## Code this run has mapped\n\n" + lanes.CODE_MAP_LEAD + "\n\n- `a.py:1` `f()`\n\n## Step `"
     assert block in prompt
-    assert prompt.replace(block, "## The step") == plain
+    assert prompt.replace(block, "## Step `") == plain
 
 
 def test_task_prompts_point_at_interfaces_and_the_map_not_the_plan():
@@ -1569,8 +1667,9 @@ def test_no_lessons_no_heading_and_no_blank_lines(flow_repo, no_engine_lessons):
     flow_repo.new_run()
     prompt = _prompt(flow_repo)
     assert "Lessons from earlier runs" not in prompt and "{lessons}" not in prompt
-    assert "\n\n\n" not in prompt.split("## The step")[0]
-    assert re.search(r"stop as `blocked` and name the exact command\.\n\n## The step\n\n", prompt)
+    assert "\n\n\n" not in prompt.split("## Step `")[0]
+    assert "stop as `blocked` and name the exact command.\n\n" in prompt  # the preamble's last line ends the preamble
+    assert re.search(r"\n\n## Step `[^`\n]+`\n\nYour result file is `[^`\n]+`\.\n\n", prompt)  # the step head follows it
 
 
 def test_pack_lessons_go_into_the_preamble(flow_repo, no_engine_lessons):
@@ -1578,8 +1677,8 @@ def test_pack_lessons_go_into_the_preamble(flow_repo, no_engine_lessons):
     _write_pack_lessons(flow_repo, LESSON_ONE)
     prompt = _prompt(flow_repo)
     assert "- **L-0001** Lint first: Run `ruff`." in prompt
-    assert prompt.index("Lessons from earlier runs") < prompt.index("## The step")
-    assert "\n\n\n" not in prompt.split("## The step")[0]
+    assert prompt.index("Lessons from earlier runs") < prompt.index("## Step `")
+    assert "\n\n\n" not in prompt.split("## Step `")[0]
 
 
 def test_lessons_follow_the_code_map(flow_repo, no_engine_lessons):
@@ -1587,7 +1686,7 @@ def test_lessons_follow_the_code_map(flow_repo, no_engine_lessons):
     run.emit("code_noted", text="`a.py:1` `f()`", key="build/x")
     _write_pack_lessons(flow_repo, LESSON_ONE)
     prompt = _prompt(flow_repo)
-    assert prompt.index("Code this run has mapped") < prompt.index("Lessons from earlier runs") < prompt.index("## The step")
+    assert prompt.index("Code this run has mapped") < prompt.index("Lessons from earlier runs") < prompt.index("## Step `")
 
 
 def test_lesson_braces_go_in_verbatim(flow_repo, no_engine_lessons):
@@ -1662,3 +1761,521 @@ def test_lessons_that_do_not_fit_are_reported_as_truncated(flow_repo, no_engine_
     assert [(e["key"], e["tier"], e["dropped"]) for e in flow_repo.events(run, "memory_truncated")] == \
         [(KEY, "lessons", ["L-0001"])]
     assert flow_repo.events(run, "lessons_injected")[0]["ids"] == ["L-0002"]
+
+
+# --------------------------------------------------------------------------- the step head (cost C2)
+
+OLD_PREAMBLE_C2 = (ENGINE / "tests" / "fixtures" / "old_prompts" / "_preamble_c2.md").read_text(encoding="utf-8")
+
+
+def test_step_head_follows_the_preamble(flow_repo):
+    run = flow_repo.new_run()
+    assert run_step(flow_repo) == "done"
+    call = flow_repo.calls()[0]
+    prompt, system = call["argv"][-1], call["system_prompt"]  # the preamble and the result contract are in the brief
+    result = run.agent_result_path(KEY)
+    template = "Goal: do the step `impl`"  # the first line of the default template
+    assert system.index("Nobody can answer you") < system.index("## When you finish")
+    order = [prompt.index(f"## Step `{make_step().id}`"), prompt.index(f"Your result file is `{result}`"),
+             prompt.index(template)]
+    assert order == sorted(order) and len(set(order)) == 3 and prompt.startswith(f"## Step `{make_step().id}`")
+    assert "{in_brief}" not in prompt and "the step's prompt names it" in system
+
+
+SLOT_HEADINGS = ("## What this run already found", "## Code this run has mapped", lessons.LESSONS_HEADING)
+
+
+def _fill_every_slot(flow_repo) -> None:
+    """A run fact, a code-map note and a pack lesson, so each of the three slots has text to show."""
+    run = flow_repo.new_run()
+    run.emit("run_fact", text="a fact", key="build/x/resolve-1")
+    run.emit("code_noted", text="`a.py:1` `f()`", key="build/x")
+    _write_pack_lessons(flow_repo, LESSON_ONE)
+
+
+@pytest.mark.parametrize("crlf", [False, True])
+def test_old_preamble_override_does_not_double_the_slots(flow_repo, monkeypatch, no_engine_lessons, crlf):
+    old = OLD_PREAMBLE_C2.replace("\n", "\r\n") if crlf else OLD_PREAMBLE_C2
+    real = lanes._template
+    monkeypatch.setattr(lanes, "_template", lambda cfg, name: old if name == lanes.PREAMBLE else real(cfg, name))
+    _fill_every_slot(flow_repo)
+    prompt = _prompt(flow_repo)
+    assert [prompt.count(heading) for heading in SLOT_HEADINGS] == [1, 1, 1]
+    assert "{run_facts}" not in prompt and "{code_map}" not in prompt and "{lessons}" not in prompt
+
+
+def test_a_preamble_slot_at_the_end_of_the_file_is_dropped(flow_repo, monkeypatch, no_engine_lessons):
+    real = lanes._template
+    monkeypatch.setattr(lanes, "_template",
+                        lambda cfg, name: real(cfg, name) + "\n{lessons}" if name == lanes.PREAMBLE else real(cfg, name))
+    _fill_every_slot(flow_repo)
+    prompt = _prompt(flow_repo)
+    assert [prompt.count(heading) for heading in SLOT_HEADINGS] == [1, 1, 1]  # a slot with no newline after it too
+
+
+def test_resume_turns_still_name_the_result_file(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{}, {"result": DONE}]})  # no result the first time: a reminder turn follows
+    assert run_step(flow_repo) == "done"
+    named = f"`{run.agent_result_path(KEY)}`"
+    reminder = flow_repo.calls()[1]["argv"][-1]
+    assert named in reminder and "write your result JSON to" in reminder
+    assert "## When you finish" not in reminder  # the session's brief holds the contract: the reminder is one line
+
+
+def test_a_resume_turn_without_a_brief_still_carries_the_result_contract(flow_repo):
+    flow_repo.configure({"context": {"run_brief": False}})
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{}, {"result": DONE}]})  # no result the first time: a reminder turn follows
+    assert run_step(flow_repo) == "done"
+    reminder = flow_repo.calls()[1]["argv"][-1]
+    assert f"`{run.agent_result_path(KEY)}`" in reminder and "write your result JSON to" in reminder
+    assert "## When you finish" in reminder and "(the path after" in reminder  # the contract follows the reminder
+
+
+def test_the_continue_prompt_names_the_result_file(flow_repo):
+    run = flow_repo.new_run()
+    _interrupted(flow_repo, run)
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    prompt = flow_repo.calls()[0]["argv"][-1]
+    assert f"`{run.agent_result_path(KEY)}`" in prompt and "write your result JSON to" in prompt
+
+
+# --------------------------------------------------------------------------- the run brief (C2)
+
+MDS = "CLAUDE_CODE_DISABLE_CLAUDE_MDS"
+FLAG = "--append-system-prompt-file"
+STUB_SKILL = "Stub: the test-driven-development skill."
+
+
+def brief_path(call: dict) -> str | None:
+    argv = call["argv"]
+    return argv[argv.index(FLAG) + 1] if FLAG in argv else None
+
+
+def pins(flow_repo, run) -> list:
+    return [e.get("brief") for e in flow_repo.events(run, "agent_started") if not e.get("sizer")]
+
+
+def test_brief_holds_the_stable_text_and_the_prompt_does_not(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", MDS)
+    run = flow_repo.new_run()
+    base = brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n"})
+    assert run_step(flow_repo) == "done"
+    (call,) = flow_repo.calls()
+    system, prompt = call["system_prompt"], call["argv"][-1]
+    for stable in ("RULE-MARKER", "Nobody can answer you", "## When you finish", STUB_SKILL):
+        assert stable in system and stable not in prompt, stable
+    assert f"`{base[:12]}`" in system  # the rules are the fork commit's
+    assert "## Step `impl`" in prompt and f"`{run.agent_result_path(KEY)}`" in prompt
+    assert "Use the `test-driven-development` skill: its full text is in your system prompt" in prompt
+    (pin,) = pins(flow_repo, run)
+    assert {k: pin[k] for k in ("rules", "skill", "files", "phase", "role")} == {
+        "rules": True, "skill": True, "files": False, "phase": "build", "role": "build"}
+    assert brief_path(call) == pin["path"] and os.path.dirname(pin["path"]) == str(run.dir / "brief")
+    assert os.path.basename(pin["path"]) == f"build-build-{pin['sha256'][:12]}.md"
+    assert call["env"][MDS] == "1"
+    assert run.state["steps"][KEY]["brief"] == pin
+
+
+def _gate_flips(flow_repo, executor, monkeypatch, run_brief: bool) -> None:
+    """After the first call, `context.run_brief` becomes `run_brief` in the live config, before the fix resumes."""
+    real = executor._failed_gates
+
+    def failed(sr):
+        flow_repo.cfg.context.run_brief = run_brief
+        return real(sr)
+
+    monkeypatch.setattr(executor, "_failed_gates", failed)
+
+
+def test_a_fix_keeps_the_pinned_brief_when_run_brief_turns_off(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    flow_repo.configure({"gates": {"flaky": {"run": "test -f fixed.txt"}}})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    flow_repo.script({KEY: [{"result": DONE}, {"write": {"fixed.txt": "ok\n"}, "result": DONE}]})
+    executor = flow_repo.executor(run)
+    _gate_flips(flow_repo, executor, monkeypatch, False)
+    assert run_step(flow_repo, make_step(gates=["flaky"], fix_loop=True), executor=executor) == "done"
+    first, fix = flow_repo.calls()
+    assert ("--resume", session_of(flow_repo, run)) in pairs(fix["argv"])
+    assert brief_path(fix) == brief_path(first) is not None and fix["system_prompt"] == first["system_prompt"]
+    assert pins(flow_repo, run)[0] == pins(flow_repo, run)[1] is not None
+
+
+def test_a_session_without_a_brief_never_gains_one(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    flow_repo.configure({"gates": {"flaky": {"run": "test -f fixed.txt"}}, "context": {"run_brief": False}})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    flow_repo.script({KEY: [{"result": DONE}, {"result": {"status": "blocked", "summary": "stuck"}},
+                            {"write": {"fixed.txt": "ok\n"}, "result": DONE}]})
+    executor = flow_repo.executor(run)
+    _gate_flips(flow_repo, executor, monkeypatch, True)
+    step = make_step(gates=["flaky"], fix_loop=True)
+    assert run_step(flow_repo, step, executor=executor) == "stopped"
+    from agentflow.hitl import approve
+
+    approve(run, KEY, by="me")
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"  # a restart, with the key on
+    calls = flow_repo.calls()
+    assert len(calls) == 3 and all("--resume" in c["argv"] for c in calls[1:])
+    assert [brief_path(c) for c in calls] == [None, None, None] and [c["system_prompt"] for c in calls] == [None] * 3
+    assert "Nobody can answer you" in calls[0]["argv"][-1]
+    assert pins(flow_repo, run) == [None, None, None]
+
+
+def test_every_direct_resume_passes_the_pinned_brief(flow_repo):
+    from conftest import brief_ready
+
+    flow_repo.configure({"gates": {"flaky": {"run": "test -f fixed.txt"}}})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    flow_repo.script({KEY: [{"result": {"status": "effort_change", "effort": "high", "reason": "big"}},  # effort change
+                            {},  # no result: a reminder follows
+                            {"result": DONE},  # the gate fails: a fix follows
+                            {"write": {"fixed.txt": "ok\n"}, "result": DONE}]})
+    assert run_step(flow_repo, make_step(gates=["flaky"], fix_loop=True)) == "done"
+    calls = flow_repo.calls()
+    assert len(calls) == 4 and all("--resume" in c["argv"] for c in calls[1:])
+    assert "was refused" in calls[1]["argv"][-1] and "no valid result.json" in calls[2]["argv"][-1]
+    assert "The gates failed" in calls[3]["argv"][-1]
+    assert len({brief_path(c) for c in calls}) == 1 and brief_path(calls[0]) is not None
+    assert len({c["system_prompt"] for c in calls}) == 1
+    assert len({json.dumps(p, sort_keys=True) for p in pins(flow_repo, run)}) == 1
+
+
+def _crash_after_first_call(flow_repo, run, step, monkeypatch) -> None:
+    """Run `step` until its first call has returned, then the runner dies (an exception before the result is read)."""
+    executor = flow_repo.executor(run)
+
+    def died(sr):
+        raise RuntimeError("the runner died")
+
+    monkeypatch.setattr(executor, "_read_result", died)
+    with pytest.raises(RuntimeError):
+        run_step(flow_repo, step, executor=executor)
+    assert run.refresh()["steps"][KEY]["status"] == "running"
+
+
+def test_a_restart_and_an_approval_resume_with_the_brief_pinned_in_state(flow_repo, monkeypatch):
+    from agentflow.hitl import approve
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n"})
+    flow_repo.script({KEY: [{"result": DONE}, {"result": {"status": "blocked", "summary": "stuck"}},
+                            {"result": DONE}]})
+    step = make_step()
+    _crash_after_first_call(flow_repo, run, step, monkeypatch)
+    pin = run.state["steps"][KEY]["brief"]
+    os.unlink(pin["path"])  # gone before the resume: rebuilt from the fork commit
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "stopped"  # restarted: it says blocked
+    approve(run, KEY, by="me")
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"
+    calls = flow_repo.calls()
+    assert len(calls) == 3 and all(("--resume", session_of(flow_repo, run)) in pairs(c["argv"]) for c in calls[1:])
+    assert {brief_path(c) for c in calls} == {pin["path"]}
+    assert len({c["system_prompt"] for c in calls}) == 1 and "RULE-MARKER" in calls[0]["system_prompt"]
+    assert pins(flow_repo, run) == [pin, pin, pin]
+    assert os.path.isfile(pin["path"]) and not flow_repo.events(run, "brief_replaced")
+
+
+def _brief_changes(monkeypatch) -> None:
+    """From now on `build_brief` gives a different text (an engine upgrade), with a pin that matches it."""
+    from agentflow import brief
+
+    real = lanes.build_brief
+
+    def changed(*args, **kwargs):
+        built = real(*args, **kwargs)
+        if isinstance(built, str):
+            return built
+        text, pin = built
+        text += "An engine upgrade changed this.\n"
+        name = brief.file_name(pin["phase"], pin["role"], text)
+        return text, {**pin, "sha256": brief.digest(text), "path": os.path.join(os.path.dirname(pin["path"]), name)}
+
+    monkeypatch.setattr(lanes, "build_brief", changed)
+
+
+def test_a_brief_that_cannot_be_rebuilt_to_its_pin_starts_a_fresh_session(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    step = make_step()
+    _crash_after_first_call(flow_repo, run, step, monkeypatch)
+    old = run.state["steps"][KEY]["brief"]
+    _brief_changes(monkeypatch)
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"
+    first, resumed = flow_repo.calls()
+    assert "--resume" not in resumed["argv"]  # a fresh session, never a stop `retry` can't clear
+    assert "a fresh session" in resumed["argv"][-1]
+    (replaced,) = flow_repo.events(run, "brief_replaced")
+    assert replaced["key"] == KEY and replaced["reason"]
+    new = pins(flow_repo, run)[-1]
+    assert new["sha256"] != old["sha256"] and brief_path(resumed) == new["path"]
+    assert resumed["system_prompt"].endswith("An engine upgrade changed this.\n")
+    assert run.state["steps"][KEY]["brief"] == new
+
+
+def test_a_fresh_call_that_dies_before_its_session_never_lends_its_pin_to_the_old_session(flow_repo, monkeypatch):
+    # Session A starts with no brief. Its rollover's fresh call gets one that carries the rules (the key turned on),
+    # then the runner dies before that call names its session. The restart resumes A: it must go on with A's own
+    # (no) brief, never with the fresh call's flags (CLAUDE_CODE_DISABLE_CLAUDE_MDS on a session holding no rules).
+    from conftest import brief_ready
+
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", MDS)
+    flow_repo.configure({"context": {"run_brief": False}})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n"})
+    flow_repo.script({KEY: [{"usage_pct": [81]}, {"no_init": True}, {"result": DONE}]})
+    executor = flow_repo.executor(run)
+    real_rollover, real_read, reads = executor._rollover, executor._read_result, []
+
+    def rollover(sr, outcome):
+        flow_repo.cfg.context.run_brief = True
+        return real_rollover(sr, outcome)
+
+    def read(sr):
+        reads.append(sr.key)
+        if len(reads) == 2:
+            raise RuntimeError("the runner died")
+        return real_read(sr)
+
+    monkeypatch.setattr(executor, "_rollover", rollover)
+    monkeypatch.setattr(executor, "_read_result", read)
+    with pytest.raises(RuntimeError):
+        run_step(flow_repo, executor=executor)
+    first, fresh = flow_repo.calls()
+    assert brief_path(first) is None and brief_path(fresh) is not None and fresh["env"].get(MDS) == "1"
+    session = session_of(flow_repo, run)
+    row = run.refresh()["steps"][KEY]
+    assert row["session_id"] == session and row["brief"] is None  # the fresh call's pin is not session A's
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    resumed = flow_repo.calls()[2]
+    assert ("--resume", session) in pairs(resumed["argv"])
+    assert brief_path(resumed) is None and resumed["system_prompt"] is None and MDS not in resumed["env"]
+
+
+def test_a_pin_bound_to_another_session_is_replaced(flow_repo, monkeypatch):
+    # The reducer keeps a row's pin and session together; the loader checks it all the same before any resume.
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    step = make_step()
+    _crash_after_first_call(flow_repo, run, step, monkeypatch)
+    session = run.state["steps"][KEY]["session_id"]
+    assert run.state["steps"][KEY]["brief_session"] == session
+    run.state["steps"][KEY]["brief_session"] = "ANOTHER-SESSION"  # in memory only: no event can say this
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"
+    resumed = flow_repo.calls()[-1]
+    assert "--resume" not in resumed["argv"]
+    (replaced,) = flow_repo.events(run, "brief_replaced")
+    assert replaced["reason"] == "the pinned brief belongs to another session" and replaced["session_id"] == session
+
+
+@pytest.mark.parametrize("forged", [
+    {"rules": 1}, {"skill": "yes"}, {"files": None}, {"sha256": "a" * 63}, {"sha256": "G" * 64}, {"phase": 3},
+    {"role": None}, {"path": ["x"]}, {"extra": True}, {"rules_fallback": 7}])
+def test_a_malformed_pin_is_replaced_not_trusted(flow_repo, monkeypatch, forged):
+    from conftest import brief_ready
+
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", MDS)
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n"})
+    step = make_step()
+    _crash_after_first_call(flow_repo, run, step, monkeypatch)
+    row = run.state["steps"][KEY]
+    assert row["brief"]["rules"] is True
+    run.emit("agent_started", agent="claude", pid=1, step=KEY, session_id=row["session_id"],
+             brief={**row["brief"], **forged}, phase="build", role="build")  # a forged pin, bound to the session
+    run.emit("agent_exited", session_id=row["session_id"], exit_code=0, cost=0.0, key=KEY)
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"
+    resumed = flow_repo.calls()[-1]
+    assert "--resume" not in resumed["argv"]  # never the session, with flags the pin only seems to give
+    (replaced,) = flow_repo.events(run, "brief_replaced")
+    assert replaced["reason"] == "the pinned brief is malformed"
+    assert resumed["env"].get(MDS) == "1" and "RULE-MARKER" in resumed["system_prompt"]
+
+
+def test_brief_never_holds_step_values(flow_repo, monkeypatch):
+    from agentflow import lessons as lessons_mod
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    mark = ["LESSON-ONE"]
+    monkeypatch.setattr(lanes, "_lessons", lambda *a: lessons_mod.Selection(mark[0], (), (), "d"))
+    executor = flow_repo.executor(run)
+    one, two = make_step(id="impl"), make_step(id="second")
+    assert executor.run_agent_step(make_phase(one), one, "build/impl") == "done"
+    mark[0] = "LESSON-TWO"
+    run.emit("run_fact", text="FACT-MARKER", key="build/impl")
+    run.emit("code_noted", text="src/a.py:1 `f`: MAP-MARKER", key="build/impl")
+    assert flow_repo.executor(run).run_agent_step(make_phase(two), two, "build/second") == "done"
+    first, second = flow_repo.calls()
+    assert first["system_prompt"] == second["system_prompt"] and brief_path(first) == brief_path(second)
+    assert "FACT-MARKER" in second["argv"][-1] and "LESSON-TWO" in second["argv"][-1]
+    for value in ("FACT-MARKER", "MAP-MARKER", "LESSON-ONE", "LESSON-TWO", "## Step", "`impl`", "`second`",
+                  str(run.agent_result_path("build/impl")), str(run.agent_result_path("build/second"))):
+        assert value not in first["system_prompt"], value
+
+
+@pytest.mark.parametrize("why", ["override", "oserror"])
+def test_brief_skipped_falls_back_to_the_full_prompt(flow_repo, monkeypatch, why):
+    from agentflow import safeio
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    if why == "override":
+        own = (ENGINE / "prompts" / "_result.md").read_text(encoding="utf-8") + "\nThe file is `{result_file}`.\n"
+        (flow_repo.cfg.path.parent / "prompts" / "_result.md").write_text(own, encoding="utf-8")
+        brief_ready(flow_repo, run, {".agentflow/prompts/_result.md": own})
+        reason = "prompt override holds {result_file}"
+    else:
+        brief_ready(flow_repo, run)
+        real = safeio.replace_file
+
+        def refuse(path, data):
+            if os.path.basename(os.path.dirname(path)) == "brief":
+                raise OSError("disk full")
+            return real(path, data)
+
+        monkeypatch.setattr(safeio, "replace_file", refuse)
+        reason = "disk full"
+    assert run_step(flow_repo) == "done"
+    (call,) = flow_repo.calls()
+    (started,) = flow_repo.events(run, "agent_started")
+    assert started["brief"] is None and reason in started["brief_skipped"]
+    assert "Nobody can answer you" in call["argv"][-1] and f"`{run.agent_result_path(KEY)}`" in call["argv"][-1]
+    assert "## When you finish" in call["argv"][-1]
+    assert FLAG not in call["argv"] and call["system_prompt"] is None
+    assert run.state["steps"][KEY]["brief"] is None
+
+
+def test_rules_fall_back_when_memory_blocks(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", MDS)
+    monkeypatch.setenv(MDS, "1")  # inherited: it must not reach the session, which then loads CLAUDE.md itself
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run, {"CLAUDE.md": "RULE-MARKER\n\n@AGENTS.md\n", "AGENTS.md": "imported\n"})
+    assert run_step(flow_repo) == "done"
+    (call,) = flow_repo.calls()
+    assert call["system_prompt"] is not None and "Nobody can answer you" in call["system_prompt"]
+    assert "RULE-MARKER" not in call["system_prompt"] and "agent rules" not in call["system_prompt"]
+    (pin,) = pins(flow_repo, run)
+    assert pin["rules"] is False and pin["rules_fallback"]
+    assert MDS not in call["env"]
+
+
+def test_no_brief_for_codex_sizers_and_dry_run(flow_repo):
+    from conftest import brief_ready
+
+    flow_repo.configure({"effort": {"sizing": True}, "agents": {"codex": {"enabled": True}}})
+    flow_repo.script({f"{KEY}/size": [{"final_text": json.dumps({"answers": {}, "reason": "r"})}]})
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    assert run_step(flow_repo) == "done"
+    sizer, work = flow_repo.calls()
+    assert sizer["step"] == f"{KEY}/size" and FLAG not in sizer["argv"] and sizer["system_prompt"] is None
+    assert FLAG in work["argv"]
+    step = make_step()
+    codex = flow_repo.executor(run).dry_agent_argv(make_phase(step, agent="codex"), step, KEY)
+    assert codex[0] == "codex" and FLAG not in codex
+
+    dry = flow_repo.new_run()
+    brief_ready(flow_repo, dry)
+    out = io.StringIO()
+    assert run_step(flow_repo, executor=flow_repo.executor(dry, dry_run=True, out=out)) == "skipped"
+    assert FLAG in out.getvalue() and str(dry.dir / "brief") in out.getvalue()
+    assert not (dry.dir / "brief").exists()
+    argv = flow_repo.executor(dry).dry_agent_argv(make_phase(step), step, KEY)
+    assert FLAG in argv and not (dry.dir / "brief").exists()
+
+
+def test_a_replaced_brief_keeps_the_answers_the_session_was_about_to_get(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    question = {"id": "q1", "question": "Cache the token?", "options": [{"key": "A", "label": "Per process"}]}
+    flow_repo.script({KEY: [{"result": {"status": "needs_human", "summary": "need a call", "questions": [question]}},
+                            {"result": DONE}]})
+    assert run_step(flow_repo) == "stopped"
+    assert answer(run, KEY, {"q1": "A"}, by="test") is True
+    _brief_changes(monkeypatch)  # the runner restarts on a newer engine: the pinned brief can't be rebuilt
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    first, fresh = flow_repo.calls()
+    assert "--resume" not in fresh["argv"] and len(flow_repo.events(run, "brief_replaced")) == 1
+    prompt = fresh["argv"][-1]
+    assert "a fresh session" in prompt and "## Step `impl`" in prompt  # the whole step, as a fresh session needs
+    assert "A human answered your questions" in prompt and "q1: A" in prompt  # and nothing the human said is lost
+    assert prompt.index(lanes.BRIEF_CARRIED) < prompt.index("q1: A")
+    assert pins(flow_repo, run)[-1] != pins(flow_repo, run)[0] and brief_path(fresh) == pins(flow_repo, run)[-1]["path"]
+
+
+def test_a_replaced_brief_keeps_the_gate_output_of_a_fix_turn(flow_repo, monkeypatch):
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)
+    flow_repo.script({KEY: [{"result": DONE}, {"result": DONE}]})
+    executor = flow_repo.executor(run)
+    real, writes = executor._write_brief, []
+
+    def write(pin, text):  # 1 and 2: the first call's; 3: the fix turn's, which fails
+        writes.append(pin["path"])
+        return "the brief file could not be written: disk full" if len(writes) == 3 else real(pin, text)
+
+    monkeypatch.setattr(executor, "_write_brief", write)
+    assert run_step(flow_repo, make_step(gates=["fail"], fix_loop=True), executor=executor) == "stopped"
+    calls = flow_repo.calls()
+    fresh = calls[1]
+    assert "--resume" not in fresh["argv"] and "disk full" in flow_repo.events(run, "brief_replaced")[0]["reason"]
+    assert "The gates failed (fix attempt 1" in fresh["argv"][-1] and "boom {module} line" in fresh["argv"][-1]
+    assert all("--resume" in c["argv"] for c in calls[2:])  # the fresh session goes on as the step's session
+
+
+def test_a_prompt_override_not_at_base_sha_gives_no_brief(flow_repo):
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    brief_ready(flow_repo, run)  # the override below is in the pack's working tree only
+    own = (ENGINE / "prompts" / "_preamble.md").read_text(encoding="utf-8") + "\nLIVE-ONLY line.\n"
+    (flow_repo.cfg.path.parent / "prompts" / "_preamble.md").write_text(own, encoding="utf-8")
+    assert run_step(flow_repo) == "done"
+    (call,) = flow_repo.calls()
+    (started,) = flow_repo.events(run, "agent_started")
+    assert started["brief"] is None and started["brief_skipped"] == "prompt override not at base_sha"
+    assert FLAG not in call["argv"] and call["system_prompt"] is None
+    assert "Nobody can answer you" in call["argv"][-1] and "## When you finish" in call["argv"][-1]
+
+
+def test_a_prompt_override_committed_at_base_sha_is_the_one_in_the_brief(flow_repo):
+    from conftest import brief_ready
+
+    run = flow_repo.new_run()
+    engine = (ENGINE / "prompts" / "_result.md").read_text(encoding="utf-8")
+    committed = engine + "\nCOMMITTED-OVERRIDE line.\n"
+    live = flow_repo.cfg.path.parent / "prompts" / "_result.md"
+    live.write_text(committed, encoding="utf-8")
+    brief_ready(flow_repo, run, {".agentflow/prompts/_result.md": committed})
+    with live.open("a", encoding="utf-8") as handle:  # edited later and never committed
+        handle.write("LIVE-EDIT line.\n")
+    with (flow_repo.root / ".agentflow" / "prompts" / "_result.md").open("a", encoding="utf-8") as handle:
+        handle.write("CHECKOUT-EDIT line.\n")
+    assert run_step(flow_repo) == "done"
+    (call,) = flow_repo.calls()
+    system = call["system_prompt"]
+    assert "COMMITTED-OVERRIDE line." in system and "## When you finish" in system
+    assert "LIVE-EDIT" not in system and "CHECKOUT-EDIT" not in system
+    assert "COMMITTED-OVERRIDE" not in call["argv"][-1] and "LIVE-EDIT" not in call["argv"][-1]

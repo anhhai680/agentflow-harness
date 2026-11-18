@@ -307,13 +307,14 @@ def test_the_keys_switch_off(cfg, call):
     agent = claude_with(cfg, lean=False, user_settings=True, cache_ttl="cli")
     assert not {"--exclude-dynamic-system-prompt-sections", "--setting-sources", "--strict-mcp-config"} & set(agent.argv(call))
     assert not set(TTL_VARS) & set(agent.env(call)) and "CLAUDE_CODE_DISABLE_AUTO_MEMORY" not in agent.env(call)
-    assert agent.env_drop(call) == ()  # `cli`: the inherited environment's own choice stands
+    assert agent.env_drop(call) == ("CLAUDE_CODE_DISABLE_CLAUDE_MDS",)  # `cli`: the inherited TTL choice stands
 
 
 def test_a_one_hour_cache_ttl_sets_its_variable_and_drops_the_others(cfg, call):
     agent = claude_with(cfg, cache_ttl="1h")
     assert agent.env(call)["ENABLE_PROMPT_CACHING_1H"] == "1" and "FORCE_PROMPT_CACHING_5M" not in agent.env(call)
-    assert set(agent.env_drop(call)) == {"FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_PROMPT_CACHE_TTL"}
+    assert set(agent.env_drop(call)) == {"FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_PROMPT_CACHE_TTL",
+                                         "CLAUDE_CODE_DISABLE_CLAUDE_MDS"}  # no brief carries the rules here
 
 
 def test_the_cache_ttl_wins_over_the_packs_env(cfg, call):
@@ -336,6 +337,46 @@ def test_the_cache_ttl_wins_over_the_inherited_environment(fake, cfg, call, monk
     env = fake.calls()[0]["env"]
     assert env["FORCE_PROMPT_CACHING_5M"] == "1" and env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
     assert "ENABLE_PROMPT_CACHING_1H" not in env and "CLAUDE_CODE_PROMPT_CACHE_TTL" not in env
+
+
+MDS = "CLAUDE_CODE_DISABLE_CLAUDE_MDS"
+
+
+def test_claude_argv_and_env_with_a_brief(claude, codex, call, tmp_path):
+    brief = tmp_path / "brief" / "build-build-0123456789ab.md"
+    with_rules = dataclasses.replace(call, system_prompt_file=brief, carries_rules=True, env={MDS: "0", "KEEP": "x"})
+    argv = claude.argv(with_rules)
+    at = argv.index("--settings")
+    assert argv[at + 2:at + 4] == ["--append-system-prompt-file", str(brief)]  # right after the --settings value
+    env = claude.env(with_rules)
+    assert env[MDS] == "1" and env["KEEP"] == "x"  # the brief carries the rules: the pack can't turn this off
+    assert MDS not in claude.env_drop(with_rules)
+
+    without = dataclasses.replace(with_rules, carries_rules=False, env={MDS: "1"})
+    assert ("--append-system-prompt-file", str(brief)) in pairs(claude.argv(without))
+    assert MDS not in claude.env(without) and MDS in claude.env_drop(without)  # neither set nor inherited
+
+    none = dataclasses.replace(call, env={MDS: "1"})
+    assert "--append-system-prompt-file" not in claude.argv(none)
+    assert MDS not in claude.env(none) and MDS in claude.env_drop(none)
+    assert claude.takes_brief is True
+
+    assert codex.takes_brief is False
+    for c in (with_rules, without, call):
+        assert "--append-system-prompt-file" not in codex.argv(c) and str(brief) not in codex.argv(c)
+        assert MDS not in codex.env(dataclasses.replace(c, env={}))
+
+
+def test_a_brief_run_passes_the_file_and_the_variable(fake, cfg, call, monkeypatch, tmp_path):
+    brief = tmp_path / "brief.md"
+    brief.write_text("THE BRIEF\n", encoding="utf-8")
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", MDS)
+    agent = claude_with(cfg, command=fake.command)
+    agent.run(dataclasses.replace(call, system_prompt_file=brief, carries_rules=True), collect()[1])
+    agent.run(dataclasses.replace(call, env_base={**os.environ, MDS: "1"}), collect()[1])
+    first, second = fake.calls()
+    assert first["system_prompt"] == "THE BRIEF\n" and first["env"][MDS] == "1"
+    assert second["system_prompt"] is None and MDS not in second["env"]  # an inherited one is dropped
 
 
 def test_a_self_contained_call_drops_the_skills_listing(claude, call):

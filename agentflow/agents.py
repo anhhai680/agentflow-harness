@@ -47,6 +47,10 @@ LEAN_ARGS = ("--exclude-dynamic-system-prompt-sections", "--strict-mcp-config")
 LEAN_ENV = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
 NO_USER_SETTINGS = ("--setting-sources", "project,local")  # `agents.claude.user_settings: false`
 SELF_CONTAINED_ARGS = ("--disable-slash-commands",)  # a call whose brief is self-contained gets no skills listing
+BRIEF_ARG = "--append-system-prompt-file"  # a run session's brief (`lanes.build_brief`), its cached system prompt
+# Claude Code loads no `CLAUDE.md` with this set: only a call whose brief carries the repository's rules gets it, and every
+# other call has it dropped from the inherited environment and the pack's `defaults.env`, so its rules are never lost.
+NO_CLAUDE_MDS_ENV = "CLAUDE_CODE_DISABLE_CLAUDE_MDS"
 UNKNOWN_OPTION = re.compile(r"unknown option '(--[\w-]+)'")  # how the claude CLI refuses a flag it does not know
 CLAUDE_MIN_VERSION = "2.1.327"  # the oldest Claude Code that takes every flag above
 STDERR_TAIL_BYTES = 4096  # how much of a failed call's own stderr is read for a refused flag
@@ -87,6 +91,8 @@ class AgentCall:
     idle_s: float | None = None  # end the session after this long with no stream line (`watchdog`); None: no watchdog
     tool_idle_s: float | None = None  # the same limit while a tool call is open, or for an agent that `tracks_tools` not
     self_contained: bool = False  # the prompt is the whole brief (a sizer): Claude gets no skills listing
+    system_prompt_file: Path | None = None  # the session's pinned run brief, appended to Claude's system prompt
+    carries_rules: bool = False  # that brief holds the repository's rules: Claude loads no `CLAUDE.md` of its own
     # The run's last recorded usage windows (`state.usage_window`): only a window that moved since is written again.
     usage_windows: dict = field(default_factory=dict)
 
@@ -670,6 +676,7 @@ class _CliAgent(abc.ABC):
     parse_line: Callable[[str, StreamAccumulator], list[tuple[str, dict]]]
     rollover_enabled = False
     tracks_tools = False  # the stream shows open tool calls (`StreamAccumulator.open_tools`); else `idle_limit` is the long one
+    takes_brief = False  # passes `AgentCall.system_prompt_file` on (`lanes.build_brief`); else a call gets no brief
 
     def __init__(self, spec: AgentSpec, context: ContextPolicy) -> None:
         self.spec = spec
@@ -866,10 +873,16 @@ def _without_mcp_config(args: list[str]) -> list[str]:
     return out
 
 
+def _carries_rules(call: AgentCall) -> bool:
+    """The call passes a brief that holds the repository's rules."""
+    return call.carries_rules and call.system_prompt_file is not None
+
+
 class ClaudeAgent(_CliAgent):
     name = "claude"
     rollover_enabled = True
     tracks_tools = True
+    takes_brief = True
     parse_line = staticmethod(parse_claude_line)
 
     def argv(self, call: AgentCall) -> list[str]:
@@ -905,6 +918,8 @@ class ClaudeAgent(_CliAgent):
         except RuntimeError:  # `Path.home()` with no home directory: there is no user file to protect
             pass
         argv += ["--settings", json.dumps({"permissions": {"deny": deny}})]
+        if call.system_prompt_file is not None:
+            argv += [BRIEF_ARG, str(call.system_prompt_file)]
         max_turns = call.max_turns if call.max_turns is not None else spec.max_turns
         if max_turns is not None:
             argv += ["--max-turns", str(max_turns)]
@@ -916,18 +931,23 @@ class ClaudeAgent(_CliAgent):
         return argv
 
     def env(self, call: AgentCall) -> dict[str, str]:
-        """`cache_ttl` other than `cli` owns the TTL variables: the pack's `defaults.env` can't set another one."""
+        """`cache_ttl` other than `cli` owns the TTL variables: the pack's `defaults.env` can't set another one. The
+        runner owns `NO_CLAUDE_MDS_ENV`: `1` when the call's brief carries the rules, else never set."""
         spec = self.spec
         env = super().env(call)
         if spec.cache_ttl in TTL_ENV and spec.cache_ttl != "cli":
             env = {name: value for name, value in env.items() if name not in TTL_VARS}
-        return {**env, **TTL_ENV.get(spec.cache_ttl, {}), **(LEAN_ENV if spec.lean else {})}
+        env.pop(NO_CLAUDE_MDS_ENV, None)
+        rules = {NO_CLAUDE_MDS_ENV: "1"} if _carries_rules(call) else {}
+        return {**env, **TTL_ENV.get(spec.cache_ttl, {}), **(LEAN_ENV if spec.lean else {}), **rules}
 
     def env_drop(self, call: AgentCall) -> tuple[str, ...]:
-        """The TTL variables `cache_ttl` doesn't set, so the inherited environment can't override it (none for `cli`)."""
+        """The TTL variables `cache_ttl` doesn't set, so the inherited environment can't override it (none for `cli`),
+        and `NO_CLAUDE_MDS_ENV` unless the call's brief carries the rules (Claude then loads its own memory files)."""
+        rules = () if _carries_rules(call) else (NO_CLAUDE_MDS_ENV,)
         if self.spec.cache_ttl not in TTL_ENV or self.spec.cache_ttl == "cli":
-            return ()
-        return tuple(name for name in TTL_VARS if name not in TTL_ENV[self.spec.cache_ttl])
+            return rules
+        return (*(name for name in TTL_VARS if name not in TTL_ENV[self.spec.cache_ttl]), *rules)
 
     def _shell_env(self, call: AgentCall, env: Mapping[str, str]) -> dict[str, str]:
         """Pin the Bash tool's PATH to the one the gates get. Claude Code's Bash tool runs a login shell, and on

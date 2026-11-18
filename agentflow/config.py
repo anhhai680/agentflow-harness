@@ -15,9 +15,9 @@ import shlex
 import string
 import subprocess
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 import yaml
@@ -170,6 +170,7 @@ PROMPT_PLACEHOLDERS = frozenset(
         "base_ref",
         "self_checks",
         "reconcile_output",
+        "in_brief",  # reserved: always "" (`lanes.build_prompt`), so a pack template may name it today
         # sizer prompts (`sizing_lane.py`)
         "task_card",
         "task_cards",
@@ -177,6 +178,15 @@ PROMPT_PLACEHOLDERS = frozenset(
         "route_card",
     }
 )
+# What a run's brief can fill in `_preamble.md` and `_result.md`: values that hold for a whole run. A pack copy of
+# either file with another placeholder (`{step_id}`, `{result_file}`) leaves its sessions with no brief.
+BRIEF_PLACEHOLDERS = frozenset({"run", "run_dir", "progress", "handoff", "questions", "module", "module_pkg", "lane",
+                                "slug"})
+BRIEF_FILES = ("_preamble.md", "_result.md")
+# A slot line in the preamble: only a pack's old copy of `_preamble.md` still has them (they moved to the step head),
+# so they are dropped whole, CRLF and end of file included, and the facts never show twice.
+PREAMBLE_SLOT = re.compile(r"^\{(run_facts|code_map|lessons)\}[ \t]*(?:\r?\n|\Z)", re.MULTILINE)
+EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n?", re.DOTALL)
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
                     "--dangerously-skip-permissions", "--permission-mode")
 RUNNER_FLAGS = ("--setting-sources",)  # set by the runner from `agents.claude.user_settings`, never by base_args
@@ -212,6 +222,8 @@ class Issue:
 
 
 DEFAULT_SKILLS_DIR = ".claude/skills"
+DEFAULT_AGENT_RULES = ("CLAUDE.md",)  # `project.agent_rules`: what the run brief carries as the repository's rules
+AGENT_RULE_MAX_BYTES = 200_000  # a rules file larger than this is not carried (the brief's per-file cap)
 DEFAULT_SPEC_FILE = "{module}.md"  # a module's spec is `<docs.specs>/<spec_file>`
 # A spec header line that says the module is finished, matched per line with `re.IGNORECASE`: `Status: done`,
 # `**Status:** done`, `**Status: shipped** 2026-01-02`, `- **Status:** done`, `> Status: done`; never `done-ish`
@@ -235,6 +247,7 @@ class Project:
     skills_dir: str = DEFAULT_SKILLS_DIR
     spec_file: str = DEFAULT_SPEC_FILE
     done_status: str = DEFAULT_DONE_STATUS
+    agent_rules: tuple[str, ...] = DEFAULT_AGENT_RULES  # files, relative to the repository root, the run brief carries as the agent's rules
 
 
 @dataclass
@@ -322,6 +335,8 @@ class ContextPolicy:
     default_window_tokens: int
     progress_file: str
     gate_output_lines: int
+    run_brief: bool = True  # the stable text of a step in a cached system prompt (Claude only)
+    resume_gate_lines: int = 80  # gate lines a fix prompt of a resumed session carries, in total
 
 
 @dataclass
@@ -1022,6 +1037,114 @@ def _skills_dir(value: str) -> str:
     return posixpath.normpath(value) if value else ""
 
 
+def _agent_rules(value: Any) -> tuple[str, ...]:
+    """`project.agent_rules` as strings. A value that is not a list of them reads as the default here, and
+    `validate` reports it from the raw config, so nothing that is not a path reaches a reader."""
+    if not isinstance(value, list):
+        return DEFAULT_AGENT_RULES
+    return tuple(entry for entry in value if isinstance(entry, str))
+
+
+def rules_path_problem(entry: object) -> str | None:
+    """Why `entry` is no `project.agent_rules` path, or None: a non-empty relative path inside the repository, with
+    no `..`, no leading `-`, and not under `.agentflow` or `.git` (compared case-folded)."""
+    if not isinstance(entry, str) or not entry.strip():
+        return "must be a non-empty path"
+    if entry.startswith("-"):
+        return "must not start with '-'"
+    path = PurePosixPath(entry)
+    if path.is_absolute():
+        return "must be relative to the repository root"
+    if ".." in path.parts:
+        return "must not contain '..'"
+    if path.parts and path.parts[0].casefold() in (".agentflow", ".git"):
+        return f"must not be under {path.parts[0].casefold()}"
+    return None
+
+
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_BACKTICKS = re.compile(r"`+")
+_IMPORT = re.compile(r"(?<![\w`])@[^\s`]+")
+
+
+def _outside_code_spans(line: str) -> str:
+    """`line` without its inline code spans: a run of backticks opens a span that the next run of the same length
+    closes, and an unmatched run is plain text. One pass over the runs, so the work is linear in the line."""
+    runs = [(m.start(), m.end()) for m in _BACKTICKS.finditer(line)]
+    if not runs:
+        return line
+    following = [-1] * len(runs)  # the next run of the same length, if any
+    last: dict[int, int] = {}
+    for k in range(len(runs) - 1, -1, -1):
+        length = runs[k][1] - runs[k][0]
+        following[k] = last.get(length, -1)
+        last[length] = k
+    kept: list[str] = []
+    at = 0
+    k = 0
+    while k < len(runs):
+        close = following[k]
+        if close < 0:
+            k += 1
+            continue
+        kept.append(line[at:runs[k][0]])
+        at = runs[close][1]
+        k = close + 1
+    kept.append(line[at:])
+    return " ".join(kept)
+
+
+def _has_import(text: str) -> bool:
+    """True when `text` has an `@path` token outside fenced code blocks and inline code spans. A decorator in prose
+    counts too: that fails toward today's behaviour (Claude loads its own memory files)."""
+    fence = ""
+    for line in text.splitlines():
+        marker = _FENCE.match(line)
+        if fence:
+            if marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence):
+                fence = ""
+            continue
+        if marker:
+            fence = marker.group(1)
+            continue
+        if _IMPORT.search(_outside_code_spans(line)):
+            return True
+    return False
+
+
+def memory_blockers(paths: list[str], read: Callable[[str], str | None], rules: Sequence[str]) -> list[str]:
+    """Why a run brief can't carry the repository's rules, given a tree's file list and a reader for a listed rules
+    file (None when it can't be read): Claude's own memory files the brief would not replace. Names are matched with
+    their case folded, since on a case-insensitive disk Claude opens `claude.md` as `CLAUDE.md`; a `CLAUDE.local.md`
+    anywhere is one too (Claude loads it beside `CLAUDE.md`)."""
+    listed = sorted(set(paths))
+    folded = {path: path.casefold() for path in listed}
+    out: list[str] = [path for path in listed if folded[path] == ".claude/claude.md"]
+    if any(name.startswith(".claude/rules/") for name in folded.values()):
+        out.append(".claude/rules/")
+    for path in listed:
+        name = folded[path]
+        if (name.endswith("/claude.md") and name != ".claude/claude.md") or name.rsplit("/", 1)[-1] == "claude.local.md":
+            out.append(path)
+    for rule in rules:
+        text = read(rule)
+        if text is not None and _has_import(text):
+            out.append(f"{rule}: @ import")
+    named = {PurePosixPath(rule).as_posix() for rule in rules}
+    out.extend(f"{path} is not in agent_rules" for path in listed if folded[path] == "claude.md" and path not in named)
+    return out
+
+
+def brief_partial(name: str, text: str) -> tuple[str, list[str]]:
+    """`_preamble.md` or `_result.md` (`name`) as a run's brief holds it, and the placeholders in it that the brief
+    can't fill (outside `BRIEF_PLACEHOLDERS`, in order): CRLF made LF, and in the preamble the effort-check block and an
+    old copy's slot lines dropped. The runner (`lanes.build_brief`) and `validate` both read it here."""
+    text = text.replace("\r\n", "\n")
+    if name == "_preamble.md":
+        text = PREAMBLE_SLOT.sub("", EFFORT_BLOCK.sub("", text))
+    return text, list(dict.fromkeys(found for found in _PLACEHOLDER.findall(text) if found not in BRIEF_PLACEHOLDERS))
+
+
 def _work_source(raw: dict) -> WorkSource | None:
     block = _optional(raw, "work_source", "", dict, None)
     if block is None:
@@ -1234,6 +1357,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             skills_dir=_skills_dir(_optional(project, "skills_dir", "project", str, DEFAULT_SKILLS_DIR)),
             spec_file=_optional(docs, "spec_file", "project.docs", str, DEFAULT_SPEC_FILE),
             done_status=_optional(docs, "done_status", "project.docs", str, DEFAULT_DONE_STATUS),
+            agent_rules=_agent_rules(project.get("agent_rules")),
         ),
         agents={name: _build_agent(name, spec, f"agents.{name}") for name, spec in agents.items()},
         defaults=Defaults(
@@ -1262,6 +1386,8 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             default_window_tokens=_optional(context, "default_window_tokens", "context", int, 200000),
             progress_file=_require(context, "progress_file", "context", str),
             gate_output_lines=_require(context, "gate_output_lines", "context", int),
+            run_brief=_optional(context, "run_brief", "context", bool, True),
+            resume_gate_lines=_optional(context, "resume_gate_lines", "context", int, 80),
         ),
         memory=MemoryPolicy(
             lessons_max_tokens=_optional(memory, "lessons_max_tokens", "memory", int, 1500),
@@ -1465,9 +1591,39 @@ class _Validator:
             except UnicodeDecodeError:
                 self.error(pack.prompt_label(self.cfg.path, file), "is not UTF-8 text")
                 continue
-            for name in dict.fromkeys(_PLACEHOLDER.findall(text)):
+            label = pack.prompt_label(self.cfg.path, file)
+            names = list(dict.fromkeys(_PLACEHOLDER.findall(text)))
+            for name in names:
                 if name not in PROMPT_PLACEHOLDERS:
-                    self.error(pack.prompt_label(self.cfg.path, file), f"unknown placeholder '{{{name}}}'")
+                    self.error(label, f"unknown placeholder '{{{name}}}'")
+            brief_file = label in {f"prompts/{name}" for name in BRIEF_FILES}
+            outside = brief_partial(file.name, text)[1] if brief_file else []
+            if outside and self.cfg.context.run_brief:
+                shown = ", ".join(f"{{{name}}}" for name in outside)
+                self.add("warning", label, f"holds {shown}, which a run's brief cannot fill: sessions of this pack "
+                                           "get no brief (the whole prompt is sent every time). Move step-specific "
+                                           "lines into the step's own template, or set context.run_brief: false")
+
+    def brief_overrides(self) -> None:
+        """While `context.run_brief` is on, a pack override of `_preamble.md` or `_result.md` must be committed: a
+        run's brief reads it from the run's fork commit (`lanes.build_brief`), and gives no brief while that commit
+        has none it can read."""
+        if not self.cfg.context.run_brief:
+            return
+        own = [name for name in BRIEF_FILES
+               if pack.prompt_path(self.cfg.path, name) == self.cfg.path.parent / "prompts" / name]
+        if not own:
+            return
+        from agentflow import gitops
+
+        root = pack.checkout_root(self.repo)
+        head = gitops.commit_at(root, "HEAD")
+        if head is None:
+            return
+        for name in own:
+            if gitops.read_blob(root, head, f".agentflow/prompts/{name}", AGENT_RULE_MAX_BYTES) is None:
+                self.add("warning", f"prompts/{name}", "is not committed at HEAD (or can't be read there): run "
+                         "sessions get no brief until it is committed (the brief reads it from the run's fork commit)")
 
     def prompt_drift(self) -> None:
         """The pack's prompt overrides that hold text the engine retired, or copy an engine prompt unchanged."""
@@ -1665,6 +1821,63 @@ class _Validator:
         if skills_dir in ("", ".") or posixpath.isabs(skills_dir) or ".." in skills_dir.split("/"):
             self.error("project.skills_dir", "skills_dir is a directory inside the repository holding "
                        "<skill>/SKILL.md, relative to its root and without '..'")
+        self.agent_rules()
+
+    def agent_rules(self) -> None:
+        """`project.agent_rules`: a list of repository paths; while `context.run_brief` is on, a warning for each
+        reason the brief could not carry the rules at `HEAD` of the main checkout."""
+        raw = self.cfg.raw.get("project", {}).get("agent_rules")
+        if raw is None:
+            raw = list(DEFAULT_AGENT_RULES)
+        if not isinstance(raw, list):
+            self.error("project.agent_rules", "agent_rules is a list of file paths relative to the repository root")
+            return
+        refused = False
+        for i, entry in enumerate(raw):
+            problem = rules_path_problem(entry)
+            if problem:
+                refused = True
+                self.error("project.agent_rules", f"entry {i} {problem}: it is a path inside the repository, read "
+                           "from the run's fork commit")
+        if refused or not self.cfg.context.run_brief:
+            return
+        from agentflow import gitops
+
+        root = pack.checkout_root(self.repo)
+        head = gitops.commit_at(root, "HEAD")
+        if head is None:
+            return
+        tail = "run sessions will let Claude load its own memory files instead"
+        # The bounded, proven listing the brief uses: a crafted tree can name billions of paths from a few KB.
+        tree = gitops.verified_tree_paths(root, head)
+        if tree is None:
+            self.add("warning", "project.agent_rules",
+                     f"could not list the tree at HEAD within limits (or verification failed): {tail}")
+            return
+        rules = [PurePosixPath(entry).as_posix() for entry in raw]
+        for rule in rules:
+            if rule != DEFAULT_AGENT_RULES[0] and rule not in tree:  # left out; the brief carries the rest
+                self.add("warning", "project.agent_rules", f"{rule} is not committed at HEAD: the brief leaves it out")
+        listed = set(tree)
+        texts: dict[str, str | None] = {}
+
+        # The same reads as `brief.read_rules`, through the same hardened reader and cap: a symlink is followed once
+        # inside the repository, so its target's text is what the import check below sees.
+        def read(rule: str) -> str | None:
+            if rule not in listed:
+                return None
+            if rule not in texts:
+                data = gitops.read_blob(root, head, rule, AGENT_RULE_MAX_BYTES)
+                texts[rule] = None if data is None else data.decode("utf-8", errors="replace")
+            return texts[rule]
+
+        for rule in dict.fromkeys(rules):
+            if rule in listed and read(rule) is None:
+                self.add("warning", "project.agent_rules", f"{rule} is not a regular file of at most "
+                         f"{AGENT_RULE_MAX_BYTES} bytes at HEAD (nor a symlink to one inside the repository and "
+                         f"outside .agentflow), or its object failed verification: {tail}")
+        for reason in memory_blockers(tree, read, rules):
+            self.add("warning", "project.agent_rules", f"{reason}: {tail}")
 
     def paths(self) -> None:
         """`paths.state_dir`: a path; a state dir inside the checkout that git doesn't ignore is a warning, since
@@ -2079,6 +2292,12 @@ class _Validator:
             self.error("context.rollover_pct", "must be a percentage from 1 to 100")
         elif ctx.rollover_pct <= ctx.autocompact_pct:
             self.error("context.rollover_pct", f"must be above autocompact_pct ({ctx.autocompact_pct}): the rollover is the safety net behind the auto-compact")
+        lines = ctx.resume_gate_lines
+        if isinstance(lines, bool) or not 10 <= lines <= 1000:
+            self.error("context.resume_gate_lines", "must be a whole number of lines from 10 to 1000")
+        elif lines > ctx.gate_output_lines:
+            self.add("warning", "context.resume_gate_lines", f"is above context.gate_output_lines ({ctx.gate_output_lines}): "
+                     "only the gate's tail is kept, so a fix prompt never carries more than that")
 
     def memory(self) -> None:
         mem = self.cfg.memory
@@ -2604,5 +2823,6 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.overlays()
     v.dashboard()
     v.templates()
+    v.brief_overrides()
     v.prompt_drift()
     return v.issues

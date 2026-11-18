@@ -10,6 +10,7 @@ project:
   branch: "flow/{lane}/{slug}"
   skills_dir: .claude/skills   # a repository's own skills; the engine's bundled skills are the fallback
   commit_trailer: ""
+  agent_rules: [CLAUDE.md]     # files (relative to the repository root, read from the run's fork commit) a run brief carries as the agent's rules
   docs:
     specs: docs
     plans: docs/plans
@@ -78,6 +79,8 @@ context:
   default_window_tokens: 200000
   progress_file: "runs/{run}/progress.md"
   gate_output_lines: 200
+  run_brief: true                 # the stable text of a step (rules, skill, preamble, result contract) goes in a cached system prompt; Claude only
+  resume_gate_lines: 80           # gate lines a fix prompt of a resumed session carries, in total (a fresh session still gets the whole report)
 
 memory:
   lessons_max_tokens: 1500   # the most tokens of lessons a step's prompt carries (0 turns lessons off)
