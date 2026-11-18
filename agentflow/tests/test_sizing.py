@@ -92,3 +92,17 @@ def test_task_card_names_the_facts_and_caps_the_ask():
 def test_reason_text_is_bounded_and_strings_only():
     assert sizing.reason_text("y" * 1000) == "y" * sizing.REASON_MAX
     assert sizing.reason_text(None) == "" and sizing.reason_text(5) == ""
+
+
+def test_review_level_tiers_on_risk_only():
+    policy = EffortPolicy(default="medium", allowed=ALLOWED)
+    novelty = NO | {"novelty": "yes"}
+    assert sizing.decide(novelty, 1, False, True, policy)[0] == "high"
+    assert sizing.review_level(novelty, 1, False, policy) == "medium"
+    assert sizing.review_level(NO | {"risk": "yes"}, 1, False, policy) == "high"
+    assert sizing.review_level(NO | {"risk": "unsure"}, 1, False, policy) == "high"
+    assert sizing.review_level(NO, 1, True, policy) == "high"
+    assert sizing.review_level(None, 1, False, policy) == "high"
+    # clamped to what the pack allows, and floored as a judgement step: never below medium
+    assert sizing.review_level(NO, 1, False, EffortPolicy(default="low", allowed=["low", "medium"])) == "medium"
+    assert sizing.review_level(NO, 1, False, EffortPolicy(default="high", allowed=["high", "xhigh"])) == "high"

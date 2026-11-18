@@ -402,6 +402,8 @@ class _Loop:
                 if skip:
                     run.emit("phase_skipped", phase=name, reason=reason, via="skip_if", decided_by=executor.last_decided_by)
                     return None
+            if executor.route_record() is not None:  # a plan bigger than the triage said raises the route first
+                executor.reroute(tasks=executor.plan_open_tasks(), risk=False)
             run.emit("phase_started", phase=name, start_sha=head(self.worktree))
         outcome, ran = self.walk(phase, executor)
         if outcome == "stopped":

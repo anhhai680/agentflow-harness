@@ -1183,3 +1183,17 @@ def test_a_sizer_stop_with_no_recorded_state_says_to_cancel(flow_repo):
     detail = flow_repo.events(run, "guard_tripped")[0]["violations"][0]["detail"]
     assert "nothing to restore" in detail and "cancel the run and run it again" in detail
     assert run.refresh()["waiting"]["kind"] == "guard_violation"  # still a stop
+
+
+@pytest.mark.parametrize("mode, level", [("on", "medium"), ("off", "high")])
+def test_reviews_are_tiered_when_a_profile_applies(flow_repo, mode, level):
+    flow_repo.configure({**BIG, "effort": {"sizing": True},
+                         "route": {"mode": mode, "lanes": [], "profiles": {"M": {}}}})
+    run = begin_build(flow_repo, plan_doc(1))
+    run.emit("route_profile", profile="M", applied=mode == "on", proposed_by="rule", upgraded_from=None, facts={},
+             reason="")
+    flow_repo.script({PLAN_SIZE.format(i=1): [plan_answer({1: {"breadth": "yes"}})]})
+    assert size_directly(flow_repo, run) == "done"
+    levels = levels_of(flow_repo, run)
+    assert levels["build/build/task-1/review"] == level
+    assert levels["build/build/task-1/implement"] == "medium"  # the implement step is sized as it always is

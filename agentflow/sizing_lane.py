@@ -20,7 +20,9 @@ an `effort_decided` (`plan_sizer` or `fallback`) for each task's implement step 
 with the plan's digest when no task fell back, so ticking boxes sizes nothing again, an edit sizes only the tasks
 that have not started, and a fallback is tried again on the next entry. The sizer is asked only for the tasks with no
 plan-sizer answer for their current text (`task_digest`): one that fell back, a new one or an edited one. A plan
-sizer that changed the repository stops build on the plan's prefix, the same way as a step's sizer.
+sizer that changed the repository stops build on the plan's prefix, the same way as a step's sizer. Under an applied
+route profile (`route.applied`), a task's review is `sizing.review_level`: `high` only for `risk` or the security
+overlay, else `medium`.
 
 Agent text is untrusted: only the six normalized answers and a reason cut to `sizing.REASON_MAX` are kept, and
 neither reaches a commit message.
@@ -34,7 +36,7 @@ import os
 import stat
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import overlays, run_env, safeio, sizing, sources
+from agentflow import overlays, route, run_env, safeio, sizing, sources
 from agentflow.agents import Agent, AgentCall, AgentOutcome, EventCallback
 from agentflow.conditions import fmt
 from agentflow.config import Phase, Step, resolve_model
@@ -251,11 +253,13 @@ class SizingLane:
 
             implement: dict[int, str] = {}
             review: dict[int, str] = {}
+            tiered = route.applied(self.cfg, self.run.state.get("route")) is not None  # risk alone earns `high`
             for task in todo:
                 answers = answered[task.n][0]
                 files, security = facts[task.n]
                 implement[task.n] = sizing.decide(answers, files, security, judgement, policy)[0]
-                review[task.n] = sizing.decide(answers, files, security, True, policy)[0]
+                review[task.n] = (sizing.review_level(answers, files, security, policy) if tiered
+                                  else sizing.decide(answers, files, security, True, policy)[0])
             batch_of = self._batch_of or {}
             for n in implement:
                 members = [m for m in batch_of.get(n) or [] if m in implement]

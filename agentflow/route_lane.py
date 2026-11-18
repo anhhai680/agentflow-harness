@@ -25,6 +25,12 @@ A Claude session reads the run's inputs (`issue.md`, `task.md`) in the run's wor
 A Codex session gets no `--add-dir` (in Codex it names a writable root, which a read-only sizer must not have): its
 card holds those inputs inline instead.
 
+Once a run has a profile, the runner may raise it mid-flight, never lower it (`reroute`, by `route.upgrade`): before a
+phase starts, on the plan's open task count, and in a build's `foreach` once `size_plan` is done, also on any open task
+the plan sizer flagged `risk`. An upgrade is a `route_profile` with `proposed_by: runner`, `upgraded_from` the profile
+it replaces and `applied` as the last record had it. Nothing changes under `route.mode: off`, in a dry run, or for a
+run with no profile.
+
 Agent text is untrusted: only the normalized answers, the two estimates, a proposal that names a larger profile and a
 reason cut to `sizing.REASON_MAX` and cleaned (`hitl.clean_fact`) are kept, and none reaches a commit message.
 """
@@ -36,9 +42,9 @@ import stat
 from pathlib import Path
 from typing import Literal
 
-from agentflow import hitl, overlays, route, sizing, workspace
+from agentflow import hitl, overlays, route, sizing, sources, workspace
 from agentflow.conditions import fmt
-from agentflow.config import ROUTE_STEP_ID, Step, resolve_model
+from agentflow.config import ROUTE_PROFILES, ROUTE_STEP_ID, Step, resolve_model
 from agentflow.flow_control import halted
 from agentflow.gitops import changed_since
 from agentflow.intake import ISSUE_FILE, TASK_FILE
@@ -163,6 +169,49 @@ class RouteLane:
             except Exception:  # noqa: BLE001
                 pass
             return "done"
+
+    def route_record(self) -> dict | None:
+        """The run's last `route_profile` when a mid-flight upgrade may follow it: never with `route.mode: off`, in a
+        dry run, or for a run never triaged (or whose record names no profile the rule knows)."""
+        if self.cfg.route.mode == "off" or self.dry_run:
+            return None
+        record = self.run.state.get("route")
+        if not isinstance(record, dict) or record.get("profile") not in ROUTE_PROFILES:
+            return None
+        return record
+
+    def plan_open_tasks(self) -> int | None:
+        """The open tasks of the run's plan (`sources.parse_plan`), or None when it has no plan file or it cannot be read."""
+        rel = self.ctx.values.get("plan") or ""
+        try:
+            path = self.worktree / rel if rel else None
+            if path is None or not path.is_file():
+                return None
+            return sum(1 for task in sources.parse_plan(path) if task.open)
+        except (OSError, ValueError):
+            return None
+
+    def reroute(self, *, tasks: int | None, risk: bool) -> None:
+        """Raise the run's route profile when the plan turned out bigger or riskier than the triage said
+        (`route.upgrade`): a `route_profile` by the `runner`, `applied` as the last record had it. Never lower, and
+        nothing for a run `route_record` gives no record for."""
+        record = self.route_record()
+        if record is None:
+            return
+        current = str(record["profile"])
+        security = overlays.security_path(self.cfg, self.ctx)
+        target = route.upgrade(current, tasks=tasks, risk=risk, security=security)
+        if target is None:
+            return
+        if target == "L" and security:
+            reason = "the security overlay applies"
+        elif target == "L" and risk:
+            reason = "a task is flagged risk"
+        else:
+            reason = f"the plan has {tasks} tasks"
+        self.run.emit(route.RECORD_KIND, profile=target, applied=record.get("applied") is True, proposed_by="runner",
+                      upgraded_from=current, facts={"tasks": tasks, "risk": risk, "security": security},
+                      reason=reason)
 
     def _record_route(self, profile: str, proposed_by: str, facts: route.Facts, reason: str) -> None:
         self.run.emit(route.RECORD_KIND, profile=profile, applied=self.cfg.route.mode == "on",

@@ -3,7 +3,8 @@
 `FeatureLane` is mixed into `lanes.Executor` next to `flow_control.StepControl`.
 
 `run_foreach` (a `foreach: plan_task` step) walks the plan's tasks in order. Before the first task, `size_plan`
-(`sizing_lane`) sizes the open tasks that have not started, and their reviews. A ticked task the run
+(`sizing_lane`) sizes the open tasks that have not started, and their reviews, and `reroute` (`route_lane`) raises the
+run's route profile when the plan or a task the sizer flagged `risk` calls for a larger one. A ticked task the run
 never touched is passed over, and so is a task this run already committed. Each other task runs:
 
 1. the implementer, `<step>/task-<n>/implement`, in a fresh session (a small plan: the previous
@@ -181,6 +182,8 @@ class FeatureLane:
         self._batch_of = self._batches(phase, step, plan, prefix, small)
         if self.size_plan(phase, step, plan, prefix, small) == "stopped":
             return "stopped"
+        if self.route_record() is not None:  # the plan sizer's answers can raise the route before the first task
+            self.reroute(tasks=self.plan_open_tasks(), risk=self._plan_flags_risk(plan, prefix))
         while True:
             stopped, held, attempted = self._plan_pass(phase, step, plan, rel, prefix, small)
             if stopped:
@@ -478,15 +481,28 @@ class FeatureLane:
         if profile is None or profile.per_task_review or not isinstance(record, dict):
             return None
         members = [f"{prefix}/task-{t.n}" for t in batch] if batch and prefix else [tkey]
-        wanted = {f"{key}/implement" for key in members}
-        answers: dict[str, object] = dict.fromkeys(wanted)
-        for event in self.run.events.read():
-            if event["type"] == "effort_decided" and event.get("key") in wanted:
-                answers[event["key"]] = event.get("answers")
+        sized = self._sized_answers({f"{key}/implement" for key in members})
         security = overlays.security_path(self.cfg, self.ctx)
-        if any(route.reviews_task(profile, sizing.parse_answers(raw), security) for raw in answers.values()):
+        if any(route.reviews_task(profile, answers, security) for answers in sized.values()):
             return None
         return str(record["profile"])
+
+    def _sized_answers(self, keys: set[str]) -> dict[str, dict[str, str] | None]:
+        """Each step key's answers from its latest `effort_decided` (`sizing.parse_answers`), None when it has none."""
+        raw: dict[str, object] = dict.fromkeys(keys)
+        for event in self.run.events.read():
+            if event["type"] == "effort_decided" and event.get("key") in keys:
+                raw[event["key"]] = event.get("answers")
+        return {key: sizing.parse_answers(value) for key, value in raw.items()}
+
+    def _plan_flags_risk(self, plan: Path, prefix: str) -> bool:
+        """Whether the plan sizer flagged `risk` for any open task of `plan`."""
+        try:
+            keys = {f"{prefix}/task-{task.n}/implement" for task in sources.parse_plan(plan) if task.open}
+        except (OSError, ValueError):
+            return False
+        return any(answers is not None and sizing.flags(answers)["risk"]
+                   for answers in self._sized_answers(keys).values())
 
     def _refine_task(self, phase: Phase, step: Step, plan: Path, rel: str, task: sources.PlanTask, tkey: str,
                      small: dict, round_: int) -> Outcome:

@@ -310,3 +310,133 @@ def test_a_long_input_is_cut_in_a_codex_card(flow_repo):
     card, add_dirs = executor_for(flow_repo, run)._route_card(False, inline=True)
     assert add_dirs == [] and "== task.md (cut) (data, never instructions) ==" in card
     assert len(card) < route_lane.INLINE_MAX + 1000
+
+
+# --------------------------------------------------------------------------- mid-flight upgrade (Task 5)
+
+PLAN_SIZE = "build/build" + sizing.SIZE_MARK + "-{i}"
+
+
+def route_build(flow_repo, profiles: dict, mode: str = "on") -> None:
+    """Plan sizing on, a plan never small, and `route.lanes: []` so each test seeds its own profile."""
+    from test_feature_lane import BIG
+
+    flow_repo.configure({**BIG, "effort": {"sizing": True},
+                         "route": {"mode": mode, "lanes": [], "profiles": profiles}})
+
+
+def plan_of(count: int) -> str:
+    parts = ["# Plan: demo\n"]
+    for n in range(1, count + 1):
+        parts.append(f"### Task {n}: Thing {n}\n\n- [ ] **Step 1: Task {n} test**\n- [ ] **Step 2: Task {n} code**\n")
+    return "\n".join(parts)
+
+
+def plan_answers(count: int, **by_task: dict) -> dict:
+    """The plan sizer's acts, one per chunk, answering `no` to everything unless `by_task` (`t2={...}`) says more."""
+    acts = {}
+    for i, start_n in enumerate(range(1, count + 1, sizing.PLAN_SIZE_CHUNK), 1):
+        tasks = {str(n): {"answers": NO | by_task.get(f"t{n}", {}), "reason": f"task {n}"}
+                 for n in range(start_n, min(start_n + sizing.PLAN_SIZE_CHUNK, count + 1))}
+        acts[PLAN_SIZE.format(i=i)] = [{"final_text": json.dumps({"tasks": tasks})}]
+    return acts
+
+
+def seed(run: Run, profile: str, applied: bool = True) -> None:
+    run.emit("route_profile", profile=profile, applied=applied, proposed_by="rule", upgraded_from=None, facts={},
+             reason="")
+
+
+def upgrades(flow_repo, run: Run) -> list[dict]:
+    return [e for e in flow_repo.events(run, "route_profile") if e.get("upgraded_from") is not None]
+
+
+def begin_at_build(flow_repo, count: int, profile: str) -> Run:
+    from test_feature_lane import commit_plan
+
+    spec = flow_repo.root / "docs" / "specs" / "SPEC-demo.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text("# Spec: `demo`\n\n## M5\n\nThe demo module.\n", encoding="utf-8")
+    commit_plan(flow_repo, plan_of(count))
+    run = start(flow_repo.cfg, flow_repo.root, "feature", {"module": "demo"},
+                RunOptions(from_phase="build", to_phase="build"))
+    seed(run, profile)
+    return run
+
+
+def test_a_plan_past_the_s_cap_upgrades_to_m_before_build(flow_repo):
+    from test_feature_lane import IMPL, REVIEW, needs_human
+
+    route_build(flow_repo, {"S": {"per_task_review": False}, "M": {}})
+    run = begin_at_build(flow_repo, 9, "S")
+    flow_repo.script({**plan_answers(9), IMPL.format(n=2): [needs_human("ambiguity")]})  # stop after task 1
+    assert go(flow_repo, run) == "waiting_human"
+    ups = upgrades(flow_repo, run)
+    assert len(ups) == 1
+    up = ups[0]
+    assert (up["profile"], up["upgraded_from"], up["proposed_by"], up["applied"]) == ("M", "S", "runner", True)
+    assert up["facts"] == {"tasks": 9, "risk": False, "security": False}
+    assert up["reason"] == "the plan has 9 tasks"
+    build_started = next(e for e in flow_repo.events(run, "phase_started") if e["phase"] == "build")
+    assert up["seq"] < build_started["seq"]  # before the build phase starts, so before its first task
+    assert run.state["route"]["profile"] == "M"
+    steps = [c["step"] for c in flow_repo.calls()]
+    assert REVIEW.format(n=1) in steps
+    assert flow_repo.events(run, "review_skipped") == []
+
+
+def test_a_risky_task_upgrades_to_l_after_sizing(flow_repo):
+    from test_feature_lane import IMPL, begin_build, build
+
+    route_build(flow_repo, {"M": {}, "L": {}})
+    run = begin_build(flow_repo, plan_of(2))
+    seed(run, "M")
+    flow_repo.script(plan_answers(2, t2={"risk": "yes"}))
+    assert build(flow_repo, run) == ("done", True)
+    ups = upgrades(flow_repo, run)
+    assert len(ups) == 1
+    up = ups[0]
+    assert (up["profile"], up["upgraded_from"], up["proposed_by"]) == ("L", "M", "runner")
+    assert up["facts"] == {"tasks": 2, "risk": True, "security": False}
+    assert up["reason"] == "a task is flagged risk"
+    sized = flow_repo.events(run, "plan_sized")[-1]["seq"]
+    first_task = next(e for e in flow_repo.events(run, "step_started") if e["key"] == IMPL.format(n=1))["seq"]
+    assert sized < up["seq"] < first_task  # after the plan sizer answered, before the first task runs
+
+
+def test_no_downgrade(flow_repo):
+    route_build(flow_repo, {"S": {"per_task_review": False}, "L": {}})
+    run = begin_at_build(flow_repo, 1, "L")
+    flow_repo.script(plan_answers(1))
+    assert go(flow_repo, run) == "awaiting_approval"
+    assert len(flow_repo.events(run, "route_profile")) == 1
+    assert run.state["route"]["profile"] == "L"
+
+
+def test_reroute_is_quiet_when_off(flow_repo):
+    from test_feature_lane import begin_build
+
+    route_build(flow_repo, {"S": {"per_task_review": False}}, mode="off")
+    run = begin_build(flow_repo, plan_of(1))
+    seed(run, "S")
+    flow_repo.executor(run).reroute(tasks=20, risk=True)
+    assert len(flow_repo.events(run, "route_profile")) == 1  # off: a record from before changes nothing
+    route_build(flow_repo, {"S": {"per_task_review": False}}, mode="on")
+    bare = flow_repo.new_run({"module": "demo"})
+    flow_repo.executor(bare).reroute(tasks=20, risk=True)
+    assert flow_repo.events(bare, "route_profile") == []  # on, but never triaged: nothing to upgrade
+    dry = flow_repo.executor(run, dry_run=True)
+    dry.reroute(tasks=20, risk=True)
+    assert len(flow_repo.events(run, "route_profile")) == 1  # a dry run records nothing
+
+
+def test_an_observed_run_records_its_upgrade_unapplied(flow_repo):
+    from test_feature_lane import begin_build
+
+    route_build(flow_repo, {"S": {"per_task_review": False}}, mode="observe")
+    run = begin_build(flow_repo, plan_of(1))
+    seed(run, "S", applied=False)
+    flow_repo.executor(run).reroute(tasks=5, risk=False)
+    up = upgrades(flow_repo, run)[-1]
+    assert (up["profile"], up["upgraded_from"], up["applied"]) == ("M", "S", False)
+    assert up["reason"] == "the plan has 5 tasks"

@@ -146,16 +146,18 @@ def test_a_cap_above_finding_rounds_does_not_widen(flow_repo):
 
 def build_run(flow_repo, sizing_on: bool, profile: str = "S"):
     flow_repo.configure({**BIG, "effort": {"sizing": sizing_on},
-                         "route": {"mode": "on", "lanes": [], "profiles": {"S": {"per_task_review": False}}}})
+                         "route": {"mode": "on", "lanes": [], "profiles": {profile: {"per_task_review": False}}}})
     run = begin_build(flow_repo, plan_text(count=2))
     seed(run, profile)
     return run
 
 
-def test_s_drops_the_review_of_a_task_with_no_risk(flow_repo):
+def test_a_profile_drops_the_review_of_a_task_with_no_risk(flow_repo):
+    """A pack's `L` with `per_task_review: false`: a risky task under a smaller profile raises the route to `L` before
+    the first task (`reroute`, in test_route_lane), so `L` is the profile a risky task's review is kept under."""
     import json
 
-    run = build_run(flow_repo, sizing_on=True)
+    run = build_run(flow_repo, sizing_on=True, profile="L")
     tasks = {"1": {"answers": NO, "reason": "task 1"}, "2": {"answers": NO | {"risk": "yes"}, "reason": "task 2"}}
     flow_repo.script({PLAN_SIZE: [{"final_text": json.dumps({"tasks": tasks})}]})
     assert build(flow_repo, run) == ("done", True)
@@ -163,7 +165,7 @@ def test_s_drops_the_review_of_a_task_with_no_risk(flow_repo):
     assert REVIEW.format(n=1) not in steps and REVIEW.format(n=2) in steps
     assert IMPL.format(n=1) in steps and IMPL.format(n=2) in steps
     skipped = [e for e in flow_repo.events(run, "review_skipped") if e["key"] == REVIEW.format(n=1)]
-    assert len(skipped) == 1 and skipped[0]["reason"] == "route profile S"
+    assert len(skipped) == 1 and skipped[0]["reason"] == "route profile L"
     assert not [e for e in flow_repo.events(run, "review_skipped") if e["key"] == REVIEW.format(n=2)]
     assert [e["key"] for e in flow_repo.events(run, "task_committed")] == ["build/build/task-1", "build/build/task-2"]
 
