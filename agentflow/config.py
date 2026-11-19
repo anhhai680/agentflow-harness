@@ -861,7 +861,7 @@ def _build_agent(name: str, data: Any, path: str) -> AgentSpec:
         read_only_roles=tuple(_string_list(_optional(data, "read_only_roles", path, list, []), _join(path, "read_only_roles"))),
         max_turns_by_role=_role_numbers(data, "max_turns_by_role", path, False),
         session_budget_usd=_role_numbers(data, "session_budget_usd", path, True),
-        bash_output_chars=_optional(data, "bash_output_chars", path, int, 0),
+        bash_output_chars=_whole(data, "bash_output_chars", path, 0),
     )
 
 
@@ -873,10 +873,46 @@ def _role_numbers(data: dict, key: str, path: str, as_float: bool) -> dict:
     for role, value in raw.items():
         if value is None:
             continue
-        if not isinstance(value, (int, float)):
-            raise ConfigError(_join(_join(path, key), str(role)), "expected a number")
-        out[str(role)] = float(value) if as_float and not isinstance(value, bool) else value
+        here = _join(_join(path, key), str(role))
+        if isinstance(value, bool) or not isinstance(value, (int, float)):  # YAML's `true` is no number either
+            raise ConfigError(here, f"expected a number, got {type(value).__name__}")
+        if as_float:
+            try:
+                value = float(value)
+            except OverflowError:
+                raise ConfigError(here, "the number is too large") from None
+        out[str(role)] = value
     return out
+
+
+def _engine_cap_roles(agent_name: str, key: str) -> frozenset[str]:
+    """The roles the engine's own defaults name in `agents.<agent_name>.<key>`: a pack that drops one of those roles
+    from `models` must null its cap too, while any other role missing from `models` is a misspelt name."""
+    try:
+        data = yaml.safe_load(layers.ENGINE_DEFAULTS.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return frozenset()
+    agent = ((data or {}).get("agents") or {}).get(agent_name) if isinstance(data, dict) else None
+    roles = agent.get(key) if isinstance(agent, dict) else None
+    return frozenset(str(role) for role in roles) if isinstance(roles, dict) else frozenset()
+
+
+def _step_turns(value: Any, path: str) -> int | None:
+    """A step's `max_turns`, checked when the config loads (a run start never calls `validate`, and `0` there would
+    silently mean no cap): unset, or a whole number of turns, 1 or more."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ConfigError(path, "max_turns must be a whole number of turns, 1 or more")
+    return value
+
+
+def _whole(data: dict, key: str, path: str, default: int) -> int:
+    """An optional whole number; a bool, which YAML reads from `true`, is not one here."""
+    value = _optional(data, key, path, int, default)
+    if isinstance(value, bool):
+        raise ConfigError(_join(path, key), "expected int, got bool")
+    return value
 
 
 def resolve_turn_cap(cfg: Config, agent_name: str, step: Step, role: str) -> int | None:
@@ -995,7 +1031,7 @@ class _Builder:
             sync=sync,
             human_paths=_string_list(raw.get("human_paths", []), _join(path, "human_paths")),
             gate_tier=raw.get("gate_tier", "full"),  # kept as written: `validate` refuses anything but full or affected
-            max_turns=raw.get("max_turns"),  # kept as written: `validate` refuses anything but a whole number from 1
+            max_turns=_step_turns(raw.get("max_turns"), _join(path, "max_turns")),
             path=path,
         )
 
@@ -2106,8 +2142,10 @@ class _Validator:
                     if not ok(value):
                         self.error(_join(path, key), f"{key}.{role} must be {what}")
                     if role not in agent.models:
-                        self.error(_join(path, key), f"role '{role}' is not in `agents.{name}.models`: if you removed "
-                                   f"that model, also set `{key}.{role}: null` (the engine's defaults name the role)")
+                        hint = (f"if you removed that model, also set `{key}.{role}: null` (the engine's defaults name "
+                                f"the role)" if role in _engine_cap_roles(name, key)
+                                else "check the role's name (a role here must be one `models` names)")
+                        self.error(_join(path, key), f"role '{role}' is not in `agents.{name}.models`: {hint}")
             chars = agent.bash_output_chars
             if isinstance(chars, bool) or (chars != 0 and not 1000 <= chars <= 1_000_000):
                 self.error(_join(path, "bash_output_chars"),

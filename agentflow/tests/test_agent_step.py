@@ -2682,7 +2682,12 @@ def test_a_wrap_up_whose_brief_cannot_be_given_is_a_cap_stop(flow_repo, monkeypa
     monkeypatch.setattr(lanes.Executor, "_ensure_brief", ensure)
     assert run_step(flow_repo) == "stopped"
     assert len(flow_repo.calls()) == 1
-    assert hitl_kinds(flow_repo, run) == ["turn_cap"] and flow_repo.events(run, "brief_replaced") == []
+    assert hitl_kinds(flow_repo, run) == ["turn_cap"]
+    summary = run.state["waiting"]["summary"]
+    assert "the session's brief could not be given again: the pin changed" in summary and "no result" not in summary
+    (replaced,) = flow_repo.events(run, "brief_replaced")  # the audit trail: why, and that no fresh session started
+    assert replaced["reason"] == "the pin changed" and replaced["wrap_up"] is True
+    assert replaced["session_id"] == session_of(flow_repo, run)
 
 
 def test_a_restart_during_the_wrap_up_resumes_it(flow_repo):

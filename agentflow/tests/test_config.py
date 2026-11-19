@@ -2551,15 +2551,14 @@ def test_resolve_turn_cap_precedence(tmp_cfg):
 
 def test_cap_map_checks(tmp_cfg):
     for key, bad in (("max_turns_by_role", {"reviewer": 10}), ("max_turns_by_role", {"build": -1}),
-                     ("max_turns_by_role", {"build": True}), ("max_turns_by_role", {"build": 1.5}),
+                     ("max_turns_by_role", {"build": 1.5}),
                      ("session_budget_usd", {"build": float("inf")}), ("session_budget_usd", {"build": 0.001}),
-                     ("session_budget_usd", {"build": 5000}), ("session_budget_usd", {"build": True}),
-                     ("session_budget_usd", {"nobody": 1})):
+                     ("session_budget_usd", {"build": 5000}), ("session_budget_usd", {"nobody": 1})):
         found = [(i.level, i.path) for i in _c4_issues(tmp_cfg, {"agents": {"claude": {key: bad}}}) if i.level == "error"]
         assert found == [("error", f"agents.claude.{key}")], (key, bad)
-    for key in ("max_turns_by_role", "session_budget_usd"):  # the error says how to undo a role the engine's caps still name
+    for key in ("max_turns_by_role", "session_budget_usd"):  # a role the engine's caps don't name: a typo, most likely
         msg = next(i.message for i in _c4_issues(tmp_cfg, {"agents": {"claude": {key: {"nobody": 1}}}}) if i.level == "error")
-        assert f"`{key}.nobody: null`" in msg and "agents.claude.models" in msg
+        assert "agents.claude.models" in msg and "check the role's name" in msg and ": null" not in msg
     ok = {"agents": {"claude": {"max_turns_by_role": {"build": 0, "review": 7}, "session_budget_usd": {"build": 0, "plan": 0.01}}}}
     assert not [i for i in _c4_issues(tmp_cfg, ok) if i.level == "error"]
     for key in ("max_turns_by_role", "session_budget_usd"):
@@ -2567,6 +2566,10 @@ def test_cap_map_checks(tmp_cfg):
             load_config(tmp_cfg({"agents": {"claude": {key: {"build": "many"}}}}))
         with pytest.raises(ConfigError, match=key):
             load_config(tmp_cfg({"agents": {"claude": {key: ["build"]}}}))
+        with pytest.raises(ConfigError, match=f"{key}.build"):  # YAML's `true` is no number of turns or dollars
+            load_config(tmp_cfg({"agents": {"claude": {key: {"build": True}}}}))
+    with pytest.raises(ConfigError, match="session_budget_usd.build"):  # too large for a float: refused, not a crash
+        load_config(tmp_cfg({"agents": {"claude": {"session_budget_usd": {"build": 10 ** 400}}}}))
 
 
 def test_a_pack_that_drops_a_model_role_must_null_its_caps(tmp_cfg):
@@ -2590,8 +2593,9 @@ def test_bash_output_chars_checks(tmp_cfg):
         assert found == [("error", "agents.claude.bash_output_chars")], bad
     for good in (0, 15000, 1000, 1_000_000):
         assert not [i for i in _c4_issues(tmp_cfg, {"agents": {"claude": {"bash_output_chars": good}}}) if i.level == "error"], good
-    with pytest.raises(ConfigError, match="bash_output_chars"):
-        load_config(tmp_cfg({"agents": {"claude": {"bash_output_chars": "lots"}}}))
+    for bad in ("lots", True, 15000.5):  # never reaches `BASH_MAX_OUTPUT_LENGTH`: refused when the config loads
+        with pytest.raises(ConfigError, match="bash_output_chars"):
+            load_config(tmp_cfg({"agents": {"claude": {"bash_output_chars": bad}}}))
 
 
 def test_cap_keys_on_codex_warn(tmp_cfg):
@@ -2611,9 +2615,9 @@ def test_step_max_turns_checks(tmp_cfg):
 
         return patch
 
-    for bad in (0, "x", True, 1.5, -3):
-        found = [(i.level, i.path) for i in _c4_issues(tmp_cfg, on_step(bad), "phases.") if i.level == "error"]
-        assert found and all(p.endswith("max_turns") for _, p in found) and len(found) == 1, bad
+    for bad in (0, "x", True, 1.5, -3):  # refused when the config loads: a run start never calls `validate`
+        with pytest.raises(ConfigError, match=r"phases\.build.*max_turns"):
+            load_config(tmp_cfg(on_step(bad)))
     assert not [i for i in _c4_issues(tmp_cfg, on_step(20), "phases.") if i.level == "error"]
     assert phase_step_of(load_config(tmp_cfg(on_step(20))), "build", "build").max_turns == 20
 
@@ -2629,7 +2633,8 @@ def test_step_max_turns_checks(tmp_cfg):
         on_retro(data)
         data["retro_step"]["max_turns"] = 0
 
-    assert [i.path for i in _c4_issues(tmp_cfg, bad_retro, "retro_step") if i.level == "error"] == ["retro_step.max_turns"]
+    with pytest.raises(ConfigError, match=r"retro_step\.max_turns"):
+        load_config(tmp_cfg(bad_retro))
 
 
 @pytest.mark.parametrize("key,arg,owner", [("base_args", ["-p", "--max-budget-usd", "5"], "session_budget_usd"),

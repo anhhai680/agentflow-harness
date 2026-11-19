@@ -1175,6 +1175,14 @@ def test_cap_fields_are_editable(shipped):
         form(shipped, (["agents", "claude", "session_budget_usd"], {"build": -1}))
     with pytest.raises(EditError):
         form(shipped, (["agents", "claude", "bash_output_chars"], 2000001))
+    for key, value in ((["agents", "claude", "session_budget_usd"], {"build": 10 ** 400}),
+                       (["agents", "claude", "session_budget_usd"], {"build": True}),
+                       (["agents", "claude", "bash_output_chars"], True)):
+        try:  # refused, by the form's check or as a config that does not load: never a crash of the page's request
+            refused = bool(form(shipped, (key, value)).errors)
+        except EditError:
+            refused = True
+        assert refused, (key, value)
     with pytest.raises(Refused):  # a step's own turn cap is in the workflow, which the page does not edit
         form(shipped, (["phases", "build", "steps", "0", "max_turns"], 20))
 

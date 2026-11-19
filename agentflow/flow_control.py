@@ -139,7 +139,7 @@ def writes_questions(step: Step) -> bool:
 
 class StepControl:
     """`run_steps`/`run_step` for `lanes.Executor`; relies on its `cfg`, `run`, `ctx`, `dry_run`,
-    `out`, `worktree`, `run_agent_step`, `dry_agent_argv` and `_gate_report`, and on `run_foreach`,
+    `out`, `worktree`, `run_agent_step`, `dry_agent_argv`, `_since_step_started` and `_gate_report`, and on `run_foreach`,
     `run_finish`, `record_decisions` and `_earlier_step_review` from `feature_lane.FeatureLane`."""
 
     cfg: Config
@@ -326,6 +326,10 @@ class StepControl:
                                       size=False)
         if outcome != "done":
             return _STOPPED, ""
+        # A session that hit a cap answered from a truncated read (in its wrap-up turn, or before the cap ended it):
+        # never the agent's decision, so a human decides instead.
+        if any(e["type"] == "session_capped" and e.get("key") == cond_key for e in self._since_step_started(cond_key)):
+            return None, "the question's session reached its cap"
         try:
             result = read_result(self.run.result_path(cond_key))
         except ResultError as exc:

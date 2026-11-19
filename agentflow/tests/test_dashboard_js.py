@@ -381,9 +381,6 @@ def test_compact_and_an_empty_table():
 DOM_STUB = str(Path(__file__).parent / "fixtures" / "js" / "_dom_stub.js")
 
 
-DOM_STUB = str(Path(__file__).parent / "fixtures" / "js" / "_dom_stub.js")
-
-
 def test_a_number_map_sends_numbers_and_skips_an_empty_value():
     """`session_budget_usd` is a `number` map: the Settings page must send numbers, which the server's check requires."""
     values = js([DOM_STUB, "settings.js"], "args.map(v => mapValue({value: v}, 'number'))", ["7.5", "10", "0", "", "  ", "abc"])

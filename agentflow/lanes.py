@@ -1462,9 +1462,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         self._emit_capped(sr, cap, turn, wrap_up=True)
         return self._wrap_up_turn(sr, cap)
 
-    def _cap_stop(self, sr: _StepRun, cap: str, result: StepResult | None, wrapped: bool) -> None:
+    def _cap_stop(self, sr: _StepRun, cap: str, result: StepResult | None, wrapped: bool, how: str | None = None) -> None:
         """Stop as `turn_cap` or `budget_cap`. The agent's own text (the wrap-up's summary and `signals.todo`) goes
-        through `clean_fact`, one line each; the ways out are `hitl._how_to_go_on`'s, never the agent's."""
+        through `clean_fact`, one line each; the ways out are `hitl._how_to_go_on`'s, never the agent's. `how` says why
+        a wrap-up turn did not finish when no call answered (it is cleaned the same way)."""
         what = "turn cap" if cap == "turns" else "spend cap"
         value = self._cap_value(sr, cap, wrapped)
         if value is None:
@@ -1474,8 +1475,13 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         if sr.step.role == "review":
             summary = f"The review reached its {what} ({limit}), so the runner did not take it as complete."
         elif wrapped:
-            how = (clean_fact(result.summary).rstrip(".") or "no summary") if result is not None else "no result"
-            summary = f"The wrap-up turn reached its {what} ({limit}) or did not finish: {how}."
+            if how is not None:
+                why = clean_fact(how).rstrip(".") or "no result"
+            elif result is not None:
+                why = clean_fact(result.summary).rstrip(".") or "no summary"
+            else:
+                why = "no result"
+            summary = f"The wrap-up turn reached its {what} ({limit}) or did not finish: {why}."
         else:
             summary = f"The session reached its {what} ({limit}) after its wrap-up turn was used."
         extra = ""
@@ -1740,8 +1746,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         (a human's or the runner's answers, an approval or reopen note, a fix turn's gate output) goes after the fresh
         prompt, under `BRIEF_CARRIED`, so nothing it said is lost; a fresh turn's prompt is built again whole. During a
         wrap-up turn it stops as the cap's kind instead (None), as a wrap-up turn's rollover does (`_loop`)."""
-        if turn.wrap_up:
-            self._cap_stop(sr, turn.wrap_up, None, wrapped=True)
+        if turn.wrap_up:  # recorded, but nothing is replaced: no fresh session starts
+            self.run.emit("brief_replaced", key=sr.key, reason=why, session_id=turn.resume, wrap_up=True)
+            self._cap_stop(sr, turn.wrap_up, None, wrapped=True,
+                           how=f"the session's brief could not be given again: {why}")
             return None
         self.run.emit("brief_replaced", key=sr.key, reason=why, session_id=turn.resume)
         if turn.resume is None:
