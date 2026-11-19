@@ -190,6 +190,7 @@ EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
                     "--dangerously-skip-permissions", "--permission-mode")
 RUNNER_FLAGS = ("--setting-sources",)  # set by the runner from `agents.claude.user_settings`, never by base_args
+READ_ONLY_FLAGS = ("--tools", "--settings", "--agents", "--plugin-dir")  # the runner sets these for a read-only call (`read_only_roles`)
 PERMISSION_MODES = ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions")
 EXPECT_VALUES = ("red", "green")
 ON_FAIL_VALUES = ("block",)
@@ -198,7 +199,7 @@ RECONCILE_CHANGED = "reconcile_changed_conditions"  # a reconcile edit changed w
 NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable",
                   CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed", "environment")
 PREFLIGHT_KEYS = ("enabled",)
-WATCHDOG_KEYS = ("no_progress_min",)
+WATCHDOG_KEYS = ("no_progress_min", "read_only_idle_min")
 WATCHDOG_MAX_MIN = 1440  # `watchdog.no_progress_min` above a day is a typo, not a plan
 GATE_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # a gate's `group` or `resource`
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -274,6 +275,7 @@ class AgentSpec:
     cache_ttl: str = "5m"  # the claude agent's prompt-cache lifetime: `5m`, `1h`, or `cli` (the CLI's own choice)
     lean: bool = True  # the claude agent's run sessions skip the project's MCP servers and user-level state
     user_settings: bool = False  # the claude agent's run sessions also read the user's own settings and agents
+    read_only_roles: tuple[str, ...] = ()  # the claude agent's calls for these roles may read but not edit (`agents.claude.read_only_roles`)
 
 
 CACHE_TTLS = ("5m", "1h", "cli")
@@ -315,6 +317,7 @@ class Preflight:
 @dataclass
 class Watchdog:
     no_progress_min: float = 0  # end a session whose stream is quiet this long (`agents.idle_limit`); 0 = off
+    read_only_idle_min: float = 5  # a read-only session with no tool call open ends after this long quiet; 0 = no shorter limit
 
 
 @dataclass
@@ -840,6 +843,7 @@ def _build_agent(name: str, data: Any, path: str) -> AgentSpec:
         cache_ttl=str(_optional(data, "cache_ttl", path, str, "5m")),
         lean=bool(_optional(data, "lean", path, bool, True)),
         user_settings=bool(_optional(data, "user_settings", path, bool, False)),
+        read_only_roles=tuple(_string_list(_optional(data, "read_only_roles", path, list, []), _join(path, "read_only_roles"))),
     )
 
 
@@ -1428,7 +1432,8 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             failed_attempts=_optional(recovery, "failed_attempts", "recovery", int, 3),
         ),
         preflight=Preflight(enabled=_optional(preflight, "enabled", "preflight", bool, False)),
-        watchdog=Watchdog(no_progress_min=_float(watchdog, "no_progress_min", "watchdog", 0)),
+        watchdog=Watchdog(no_progress_min=_float(watchdog, "no_progress_min", "watchdog", 0),
+                          read_only_idle_min=_float(watchdog, "read_only_idle_min", "watchdog", 5)),
         autonomy=_optional(raw, "autonomy", "", dict, {}),
         resolve_step=builder.step(raw["resolve_step"], "resolve_step") if raw.get("resolve_step") else None,
         retro_step=builder.step(raw["retro_step"], "retro_step") if raw.get("retro_step") else None,
@@ -2016,10 +2021,50 @@ class _Validator:
                 elif arg.split("=", 1)[0] in RUNNER_FLAGS:
                     self.error(_join(path, "base_args"), f"'{arg}' is not allowed: the runner sets it from "
                                "`agents.claude.user_settings`")
+                elif agent.read_only_roles and arg.split("=", 1)[0] in READ_ONLY_FLAGS:
+                    self.error(_join(path, "base_args"), f"'{arg}' is not allowed while `read_only_roles` is not empty: "
+                               "the runner sets it for a read-only call, and a copy here could widen it")
             if agent.permission_mode is not None and agent.permission_mode not in PERMISSION_MODES:
                 self.error(_join(path, "permission_mode"),
                            f"unknown permission_mode '{agent.permission_mode}': use one of {', '.join(PERMISSION_MODES)}")
         self.claude_session()
+        self.read_only_roles()
+
+    def read_only_roles(self) -> None:
+        """`agents.<name>.read_only_roles`: roles the agent's `models` map has, that no editing step of the agent holds;
+        the runner enforces them only for the claude agent."""
+        cfg = self.cfg
+        for name, agent in cfg.agents.items():
+            path = _join(f"agents.{name}", "read_only_roles")
+            for role in agent.read_only_roles:
+                if role not in agent.models:
+                    self.error(path, f"role '{role}' is not in `agents.{name}.models`")
+            if agent.read_only_roles and name != "claude":
+                self.add("warning", path, "only the claude agent's calls are read-only: this has no effect on "
+                         f"`{name}`")
+
+        def edits(step: Step) -> str | None:
+            for key in ("commit", "reconciles", "fix_loop", "output", "expect", "gates"):
+                if getattr(step, key):
+                    return key
+            return None
+
+        def walk(step: Step, agent_name: str) -> None:
+            agent = cfg.agents.get(agent_name)
+            if agent is not None and step.role is not None and step.role in agent.read_only_roles:
+                key = edits(step)
+                if key is not None:
+                    self.error(step.path, f"role '{step.role}' is in `agents.{agent_name}.read_only_roles` but the step "
+                               f"edits the tree (`{key}`): give it another role, or drop the role from the list")
+            for inner in (*step.steps, *(s for s in (step.review, step.fix, step.sync) if s is not None)):
+                walk(inner, agent_name)
+
+        for phase in cfg.phases.values():
+            for step in phase.steps:
+                walk(step, phase.agent or cfg.defaults.agent)
+        for step in (cfg.record_step, cfg.resolve_step, cfg.retro_step):
+            if step is not None:
+                walk(step, cfg.defaults.agent)
 
     def claude_session(self) -> None:
         """`cache_ttl`, `lean` and `user_settings` are read by the claude agent alone."""
@@ -2331,11 +2376,19 @@ class _Validator:
 
     def watchdog(self) -> None:
         """`watchdog.no_progress_min`: 0 (off) or a finite number of minutes up to a day; a key that is not one of this
-        block's is a typo."""
+        block's is a typo. `read_only_idle_min` follows the same rule, and has no effect above a non-zero
+        `no_progress_min`."""
         minutes = self.cfg.watchdog.no_progress_min
         if not _finite(minutes) or not 0 <= minutes <= WATCHDOG_MAX_MIN:
             self.error("watchdog.no_progress_min", "no_progress_min must be 0 (off) or a finite number of minutes, "
                        f"at most {WATCHDOG_MAX_MIN} (a day)")
+        quiet = self.cfg.watchdog.read_only_idle_min
+        if not _finite(quiet) or not 0 <= quiet <= WATCHDOG_MAX_MIN:
+            self.error("watchdog.read_only_idle_min", "read_only_idle_min must be 0 (no shorter limit) or a finite "
+                       f"number of minutes, at most {WATCHDOG_MAX_MIN} (a day)")
+        elif _finite(minutes) and 0 < minutes < quiet:
+            self.add("warning", "watchdog.read_only_idle_min", f"read_only_idle_min ({quiet:g}) is above no_progress_min "
+                     f"({minutes:g}), so it has no effect: a read-only session already ends at no_progress_min")
         block = self.cfg.raw.get("watchdog")
         for key in block if isinstance(block, dict) else ():
             if key not in WATCHDOG_KEYS:

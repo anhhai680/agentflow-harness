@@ -45,7 +45,7 @@ __all__ = ["Conflict", "EditError", "Proposal", "Refused", "form_fields", "propo
 
 MAX_TEXT = 512 * 1024
 MERGE_TAG = "tag:yaml.org,2002:merge"
-AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices", "cache_ttl", "lean", "user_settings")  # what a page may change in an `agents.<name>` block
+AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices", "cache_ttl", "lean", "user_settings", "read_only_roles")  # what a page may change in an `agents.<name>` block
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
     "version", "engine", "gates", "gates_confirmed", "gate_sets", "guardrails", "conditions", "overlays", "project",
     "phase_approval", "record_step", "resolve_step", "retro_step", "paths", "defaults.env", "defaults.env_inherit", "context.autocompact_env", "context.progress_file",
@@ -54,7 +54,7 @@ _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and p
 )
 PROTECTED = (
     *_PROTECTED_KEYS,
-    "agents.<name> (all but enabled, models, max_turns, prices, cache_ttl, lean, user_settings)",
+    "agents.<name> (all but enabled, models, max_turns, prices, cache_ttl, lean, user_settings, read_only_roles)",
     "phases.<name> (all but needs_approval, resolve, model, agent)",
 )
 _LOCK = threading.Lock()
@@ -133,6 +133,9 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
     ("Environment", "Checks that keep a run from waiting on the machine.", [
         (("preflight", "enabled"), "Check the machine before a run starts", {"kind": "bool"}),
         (("watchdog", "no_progress_min"), "End a session with no progress after (min, 0 = off)",
+         {"kind": "number", "min": 0, "max": 1440}),
+        (("watchdog", "read_only_idle_min"),
+         "End a read-only session that is quiet with no tool running after (min, 0 = as above)",
          {"kind": "number", "min": 0, "max": 1440}),
     ]),
     ("Effort", "How the runner sizes each step's reasoning effort.", [
@@ -295,6 +298,7 @@ def _catalog(raw: dict) -> list[dict]:
                  "options": list(CACHE_TTLS)},
                 {"key": ["agents", name, "lean"], "label": "Lean sessions (no project MCP servers)", "kind": "bool"},
                 {"key": ["agents", name, "user_settings"], "label": "Read my own settings and agents", "kind": "bool"},
+                {"key": ["agents", name, "read_only_roles"], "label": "Read-only roles (no edits, no tests)", "kind": "list"},
             ]
         sections.append({"title": f"Agent: {name}", "note": "Models by role and the turn limit for every session "
                          "on this agent. Its command line is protected.", "fields": fields})

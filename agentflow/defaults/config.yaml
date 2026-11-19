@@ -33,6 +33,7 @@ agents:
     cache_ttl: 5m                # prompt-cache lifetime of a run's sessions: 5m, 1h or cli (the CLI's own choice)
     lean: true                   # a run's sessions skip the project's MCP servers and user-level state
     user_settings: false         # true: a run's sessions also read your own settings and agents (personal; the user file may set it)
+    read_only_roles: [review]    # roles whose sessions may read but not edit or run tests; a step that edits must not use one
     prices:                      # USD per 1M tokens; prices a session Claude never reported a cost for (rollover, timeout)
       claude-opus-5-5:   {input: 4.00, output: 20.00, cache_read: 0.20, cache_write_5m: 5.00,  cache_write_1h: 8.00}
       claude-sonnet-5-5: {input: 2.00, output: 10.00, cache_read: 0.10, cache_write_5m: 2.50,  cache_write_1h: 4.00}
@@ -63,6 +64,7 @@ preflight:
 
 watchdog:
   no_progress_min: 15   # end a session that writes nothing to its stream this many minutes (0 = off; 15 is a safe start)
+  read_only_idle_min: 5   # end a read-only session this quiet with no tool call open (0 = use no_progress_min)
 
 effort:
   sizing: true    # the runner sizes each step before it starts (false: every step runs at default)
