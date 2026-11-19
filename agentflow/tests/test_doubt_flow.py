@@ -96,6 +96,18 @@ def test_a_low_finding_goes_straight_to_approval(flow):
     assert events(run, "doubt_settled")[-1]["rounds"] == 0
 
 
+def test_spec_review_has_the_note_without_a_table(flow):
+    run = begin(flow, {REVIEW: [found(LOW)]})
+    assert go(flow, run) == "awaiting_approval"
+    prompts = {c["step"]: c["argv"][-1] for c in flow.calls()}
+    review, draft = prompts[REVIEW], prompts[DRAFT]
+    assert "## This session is read-only" in review
+    assert str(run.agent_dir / "progress.md") in review and "{progress}" not in review
+    assert "already ran these gates" not in review and "| Gate |" not in review  # no gate has run in `define`
+    assert "{read_only_note}" not in review
+    assert "## This session is read-only" not in draft
+
+
 def test_a_high_finding_gets_one_reconcile_round(flow):
     run = begin(flow, {REVIEW: [found(HIGH), done("sạch")], RECONCILE: [revised(1, disp("R1-F1", "actionable"))]})
     assert go(flow, run) == "awaiting_approval"

@@ -276,6 +276,21 @@ def test_task_review_runs_read_only(lane, git):
     commit_of(git, lane.root, "Task 1: First thing")  # the task is committed
 
 
+def test_task_review_prompt_carries_the_note_and_gate_table(lane, git):
+    run = begin_toy_build(lane)
+    assert build(lane, run) == ("done", True)
+    calls = {c["step"]: c["argv"][-1] for c in lane.calls()}
+    review_prompt, impl_prompt = calls[REVIEW.format(n=1)], calls[IMPL.format(n=1)]
+    progress = str(run.agent_dir / "progress.md")
+    assert "## This session is read-only" in review_prompt
+    assert f"Do not write `{progress}`" in review_prompt and "{progress}" not in review_prompt
+    assert "| Gate | Result | Time | Step | Log |" in review_prompt
+    assert "| ok | pass |" in review_prompt  # the task's gate, from the run's own results
+    assert "{read_only_note}" not in review_prompt
+    for text in ("## This session is read-only", "| Gate | Result |", "already ran these gates"):
+        assert text not in impl_prompt
+
+
 def test_a_forced_review_edit_fails_the_step(lane, git):
     from agentflow.run_control import retry
 

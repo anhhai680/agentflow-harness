@@ -154,6 +154,7 @@ PROMPT_PLACEHOLDERS = frozenset(
         "task_start_sha",
         "earlier_findings",
         "gate_evidence",
+        "read_only_note",  # a read-only session's note and gate table (`lanes.READ_ONLY_NOTE`); "" for any other
         "verification",
         "brief",
         "phase",

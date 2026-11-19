@@ -49,8 +49,8 @@ from agentflow.flow_control import (
     refine_subject,
     writes_questions,
 )
-from agentflow.gates import (GateResult, agent_checks, failure_report, gates_ok, record_results, resume_report, run_doc_checks,
-                             run_gates_reusing)
+from agentflow.gates import (GateResult, agent_checks, failure_report, gates_ok, record_results, results_table,
+                             resume_report, run_doc_checks, run_gates_reusing)
 from agentflow.gates import resolve as resolve_gates
 from agentflow.gitops import (CommitRejected, GitError, NothingToCommit, changed_since, commit, commit_artifact,
                               commits_between, git_state_changes, head, outside_only, reconcile_baseline)
@@ -108,6 +108,16 @@ SELF_CHECKS = ("Before you write the result, run each of these checks once, afte
                "or the whole suite: the runner runs every build gate right after you, and a failure comes back to this "
                "session with its output.")
 HANDOFF_LINE = "Read the handoff from the earlier phases first: `{handoff}`."
+# What a read-only session (`agents.claude.read_only_roles`) is told, `{read_only_note}` in a prompt: it ends the prompt
+# when the template has no slot. Only a session's first prompt carries it; a resumed turn's session already has it.
+READ_ONLY_NOTE = (
+    "## This session is read-only\n\n"
+    "You can read files, search, run `git diff`, `log`, `show`, `status` and `blame`, and write your result file. "
+    "Editing the code, running tests, linters or builds, and other commands are denied here by design. A denial is "
+    "expected: do not stop as `blocked` for it and do not rephrase the command; carry on with what you can read, and "
+    "write your result. Do not write `{progress}`: a read-only step leaves it to the steps that change the code. Judge "
+    "whether a test is real by reading it and the code it covers."
+)
 
 
 def footer_next(text: str) -> str | None:
@@ -342,11 +352,14 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
         body = f"{body}\n\n{extra_skills}"
     if extra.get("gate_evidence") and "{gate_evidence}" not in body:  # a `gates_first` template that has no slot
         body = f"{body}\n\n{{gate_evidence}}"
+    if extra.get("read_only_note") and "{read_only_note}" not in body:  # a template that has no slot for it
+        body = f"{body}\n\n{{read_only_note}}"
     values["brief"] = "\n\n".join([pointer, *briefs] if pointer else briefs)
     values["skill"] = step.skill or ""
     values["base_ref"] = ctx.base_ref
     values["earlier_findings"] = ""
     values["gate_evidence"] = ""
+    values["read_only_note"] = ""
     # The result file is read only when the template asks for it.
     values["verification"] = (verification.render_prompt(*verification.read_story(ctx.run))
                               if ctx.run is not None and "{verification}" in body else "")
@@ -1394,6 +1407,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         if resume is None:  # decided before the prompt is built: the prompt leaves out what the brief holds
             self._decide_read_only(sr)
             self._decide_brief(sr)
+            self._set_read_only_note(sr)
         prompt = build_prompt(self.cfg, step, self.ctx, self._rec(sr), sr.extra, sr.mode, brief=sr.brief,
                               self_contained=self._self_contained(sr))
         return f"{sr.lead}\n\n{prompt}" if sr.lead else prompt
@@ -1416,6 +1430,17 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 self.run.emit("read_only_skipped", key=sr.key, reason=str(exc))
             return
         sr.read_only = True
+
+    def _set_read_only_note(self, sr: _StepRun) -> None:
+        """A fresh read-only session's `{read_only_note}`: the note (its `{progress}` filled in here, because a value's
+        own placeholders are never filled) and the table of the run's gate results to date when it has any. Any other
+        fresh session, or a resumed turn, has none: a resumed session was told at its start."""
+        extra = {k: v for k, v in sr.extra.items() if k != "read_only_note"}
+        if sr.read_only:
+            note = fmt(READ_ONLY_NOTE, {"progress": self._values(sr)["progress"]})
+            table = results_table(self.run.events.read())
+            extra["read_only_note"] = f"{note}\n\n{table}" if table else note
+        sr.extra = extra
 
     def _load_read_only(self, sr: _StepRun, row: dict, session: str) -> None:
         """A resumed session's read-only setting, from its step row (`agent_started.read_only`), whatever the config
