@@ -2279,3 +2279,186 @@ def test_a_prompt_override_committed_at_base_sha_is_the_one_in_the_brief(flow_re
     assert "COMMITTED-OVERRIDE line." in system and "## When you finish" in system
     assert "LIVE-EDIT" not in system and "CHECKOUT-EDIT" not in system
     assert "COMMITTED-OVERRIDE" not in call["argv"][-1] and "LIVE-EDIT" not in call["argv"][-1]
+
+
+# --------------------------------------------------------------------------- read-only roles (`agents.claude.read_only_roles`)
+
+REVIEW_KEY = "review/rev"
+BY_DESIGN = "This step runs read-only (`agents.claude.read_only_roles`): these denials are by design."
+
+
+def review_step(**kw) -> Step:
+    return make_step(**({"id": "rev", "role": "review", "skill": "requesting-code-review", "prompt": "step.md"} | kw))
+
+
+def run_review(flow_repo, executor=None, key: str = REVIEW_KEY, step: Step | None = None) -> str:
+    step = step or review_step()
+    executor = executor or flow_repo.executor()
+    return executor.run_agent_step(make_phase(step, name="review"), step, key)
+
+
+def read_only_argv(argv: list[str], workspace) -> bool:
+    """The argv of a read-only role call: `dontAsk`, and an allow list whose only write rule is the workspace's."""
+    settings = json.loads(dict(pairs(argv))["--settings"])
+    allow = settings["permissions"].get("allow") or []
+    writes = [rule for rule in allow if rule.startswith("Edit(")]
+    return ("--permission-mode", "dontAsk") in pairs(argv) and writes == [f"Edit(/{workspace}/**)"]
+
+
+def needs_human_result() -> dict:
+    question = {"id": "q1", "question": "Which one?", "options": [{"key": "A", "label": "This one"}]}
+    return {"result": {"status": "needs_human", "summary": "need a call", "questions": [question]}}
+
+
+def test_a_resumed_review_keeps_read_only(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({REVIEW_KEY: [{}, needs_human_result(), {"result": DONE}]})
+    assert run_review(flow_repo) == "stopped"
+    first, reminder = flow_repo.calls()
+    assert read_only_argv(first["argv"], run.agent_dir) and "--disable-slash-commands" in first["argv"]
+    assert ("--resume", session_of(flow_repo, run)) in pairs(reminder["argv"])  # the result reminder
+    assert read_only_argv(reminder["argv"], run.agent_dir) and "--disable-slash-commands" in reminder["argv"]
+
+    flow_repo.configure({"agents": {"claude": {"read_only_roles": []}}})  # between the two calls of the session
+    assert answer(run, REVIEW_KEY, {"q1": "A"}, by="test") is True
+    assert run_review(flow_repo, executor=flow_repo.executor(run)) == "done"
+    resumed = flow_repo.calls()[-1]
+    assert ("--resume", session_of(flow_repo, run)) in pairs(resumed["argv"])
+    assert read_only_argv(resumed["argv"], run.agent_dir) and "--disable-slash-commands" in resumed["argv"]
+    assert [e["read_only"] for e in flow_repo.events(run, "agent_started")] == [True, True, True]
+
+    # A build session started before `read_only_roles` gained `build` keeps `bypassPermissions` (a config
+    # `validate` would refuse, loaded anyway).
+    flow_repo.configure()
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [needs_human_result(), {"result": DONE}]})
+    assert run_step(flow_repo) == "stopped"
+    flow_repo.configure({"agents": {"claude": {"read_only_roles": ["review", "build"]}}})
+    assert answer(run, KEY, {"q1": "A"}, by="test") is True
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    build_calls = [c for c in flow_repo.calls() if c["step"] == KEY]
+    assert len(build_calls) == 2 and ("--resume", session_of(flow_repo, run)) in pairs(build_calls[1]["argv"])
+    for call in build_calls:
+        assert ("--permission-mode", "bypassPermissions") in pairs(call["argv"])
+        assert "dontAsk" not in call["argv"] and "--disable-slash-commands" not in call["argv"]
+    assert run.state["steps"][KEY]["read_only"] is False
+
+
+def test_an_unsafe_workspace_path_runs_as_today(flow_repo, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "ws[1]" / "state"))
+    run = flow_repo.new_run()
+    assert "ws[1]" in str(run.agent_dir)
+    assert run_review(flow_repo) == "done"
+    assert run_review(flow_repo, key="review/rev2") == "done"
+    for call in flow_repo.calls():
+        argv = call["argv"]
+        assert ("--permission-mode", "bypassPermissions") in pairs(argv)
+        assert "dontAsk" not in argv and "--tools" not in argv and "--disable-slash-commands" not in argv
+        assert "allow" not in json.loads(dict(pairs(argv))["--settings"])["permissions"]
+    (skipped,) = flow_repo.events(run, "read_only_skipped")  # once per run
+    assert skipped["key"] == REVIEW_KEY and "ws[1]" in skipped["reason"]
+    assert [e["read_only"] for e in flow_repo.events(run, "agent_started")] == [False, False]
+
+
+def test_read_only_idle_limits(flow_repo, monkeypatch):
+    flow_repo.configure({"watchdog": {"no_progress_min": 15}})
+    tool_limit = max(900, flow_repo.cfg.defaults.gate_timeout_min * 60)
+    run = flow_repo.new_run()
+    executor = flow_repo.executor(run)
+    agent = executor.agents["claude"]
+    seen: list[tuple[str, float | None, float | None]] = []
+    real = agent.run
+
+    def spy(call, on_event):
+        seen.append((call.step_key, call.idle_s, call.tool_idle_s))
+        return real(call, on_event)
+
+    monkeypatch.setattr(agent, "run", spy)
+    assert run_review(flow_repo, executor=executor) == "done"
+    assert run_step(flow_repo, executor=executor) == "done"
+    assert seen == [(REVIEW_KEY, 300, tool_limit), (KEY, 900, tool_limit)]
+
+    flow_repo.configure({"watchdog": {"no_progress_min": 15, "read_only_idle_min": 0}})
+    executor = flow_repo.executor(run)
+    assert executor._idle_s(True) == executor._idle_s(False) == (900, tool_limit)
+    flow_repo.configure({"watchdog": {"no_progress_min": 0}})
+    executor = flow_repo.executor(run)
+    assert executor._idle_s(True) == executor._idle_s(False) == (None, None)
+
+
+def test_self_contained_prompts_point_at_skill_files(flow_repo, monkeypatch):
+    from agentflow import overlays, pack
+
+    monkeypatch.setattr(overlays, "security_path", lambda cfg, ctx: True)
+    run = flow_repo.new_run()
+    assert run_review(flow_repo) == "done"
+    (call,) = flow_repo.calls()
+    prompt = call["argv"][-1]
+    assert "Also read `.claude/skills/security-and-hardening/SKILL.md` and follow it" in prompt
+    assert "Also use the `security-and-hardening` skill" not in prompt
+    assert "Use the `requesting-code-review` skill" in prompt  # the step's own carried skill keeps its line
+    assert "--disable-slash-commands" in call["argv"]
+
+    # A bundled skill's line names the engine's file; an unknown name the repository's skills dir.
+    flow_repo.configure({"overlays": {"security": {"add_skills": {
+        "review": ["security-and-hardening", "agentflow-doubt", "no-such-skill"]}}}})
+    ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
+    text = build_prompt(flow_repo.cfg, review_step(), ctx, {"role": "review"}, {}, "first", self_contained=True)
+    bundled = pack.skill_file(flow_repo.root, flow_repo.cfg.project.skills_dir, "agentflow-doubt")
+    assert pack.is_bundled(bundled)
+    assert f"Also read `{bundled}` and follow it" in text
+    assert "Also read `.claude/skills/no-such-skill/SKILL.md` and follow it" in text
+    plain = build_prompt(flow_repo.cfg, review_step(), ctx, {"role": "review"}, {}, "first")
+    assert "Also use the `agentflow-doubt` skill." in plain  # not self-contained: as today
+
+    executor = flow_repo.executor(run)
+    plan = flow_repo.cfg.phases["plan"]
+    reconcile = make_step(id="plan_reconcile", role="plan", skill="writing-plans", prompt="reconcile.md",
+                          output="docs/plans/x.md", reconciles=True, commit=True, message="m")
+    argv = executor.dry_agent_argv(plan, reconcile, "plan/plan_reconcile")
+    assert "--disable-slash-commands" in argv and "dontAsk" not in argv
+    record = flow_repo.cfg.record_step
+    argv = executor.dry_agent_argv(plan, record, f"plan/{record.id}")
+    assert "--disable-slash-commands" in argv and "dontAsk" not in argv
+    plan_step = make_step(id="plan", role="plan", skill="writing-plans", prompt="step.md")
+    argv = executor.dry_agent_argv(plan, plan_step, "plan/plan")
+    assert "--disable-slash-commands" not in argv and "Also use the `security-and-hardening` skill." in argv[-1]
+    build = executor.dry_agent_argv(make_phase(make_step()), make_step(), KEY)
+    assert "--disable-slash-commands" not in build and "dontAsk" not in build and "--tools" not in build
+    assert ("--permission-mode", "bypassPermissions") in pairs(build) and "Also read `" not in build[-1]
+
+
+def test_a_blocked_read_only_step_reports_denials_as_by_design(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({REVIEW_KEY: [{"attempts": [{"tool_name": "Bash", "tool_input": {"command": "touch x"}}],
+                                    "result": {"status": "blocked", "summary": "a command was denied"}}]})
+    assert run_review(flow_repo) == "stopped"
+    assert not (flow_repo.root / "x").exists()
+    (denied,) = flow_repo.events(run, "permission_denied")
+    assert denied["read_only"] is True and denied["input"] == {"command": "touch x"}
+    page = run.inbox_path(REVIEW_KEY).read_text(encoding="utf-8")
+    assert "`Bash: touch x`" in page and BY_DESIGN in page
+    assert "settings.local.json" not in page and "add a narrow rule" not in page
+
+    # A step that is not read-only keeps today's advice.
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"permission_denials": [{"tool_name": "Bash", "tool_input": {"command": "make x"}}],
+                             "result": {"status": "blocked", "summary": "a command was denied"}}]})
+    assert run_step(flow_repo) == "stopped"
+    page = run.inbox_path(KEY).read_text(encoding="utf-8")
+    assert "settings.local.json" in page and BY_DESIGN not in page
+    assert "read_only" not in flow_repo.events(run, "permission_denied")[-1]
+
+
+def test_a_codex_review_gets_todays_argv(flow_repo):
+    """Codex takes no read-only role: its review argv and prompt are the same whatever `read_only_roles` says."""
+    step = review_step()
+    phase = make_phase(step, name="review", agent="codex")
+    seen = []
+    for roles in ([], ["review"]):
+        flow_repo.configure({"agents": {"codex": {"enabled": True, "read_only_roles": roles}}})
+        run = flow_repo.run or flow_repo.new_run()
+        seen.append(flow_repo.executor(run).dry_agent_argv(phase, step, REVIEW_KEY))
+    assert seen[0] == seen[1]
+    assert "-s" not in seen[1] and "dontAsk" not in seen[1]
+    assert flow_repo.events(flow_repo.run, "read_only_skipped") == []

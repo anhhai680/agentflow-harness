@@ -20,7 +20,8 @@ stderr str (written to stderr before anything else, as a CLI that refuses a flag
 (a `rate_limit_event` whose `unifiedWindows` carries those utilizations, status `allowed`, sent before `rate_limit`),
 attempts [{tool_name, tool_input}] (tool calls the model tries, decided by the permission model below; a permitted
 `Write` writes `tool_input.content` to `file_path`; a denied call is added to the result event's `permission_denials`, and
-a call to a tool `--tools` leaves out to its `unavailable` list as `{tool_name, tool_input, kind: "unknown_tool"}`).
+a call to a tool `--tools` leaves out to its `unavailable` list as `{tool_name, tool_input, kind: "unknown_tool"}`; a
+`file_path` of `$AGENTFLOW_RESULT` is the step's result file).
 `write` is not a tool call and bypasses the model: it is the fake's own hand on the tree.
 
 The permission model of `attempts` follows the real CLI. Each attempt is decided in this order:
@@ -152,6 +153,7 @@ def session_usage(session: str, model: str, usage: dict) -> dict:
 BASH_SEPARATORS = re.compile(r"&&|\|\||;|\|")
 REDIRECTION = re.compile(r"\d*>>?\s*(?P<target>[^\s;|&<>]+)")
 WRITE_TOOLS = ("Write", "Edit")
+RESULT_PLACEHOLDER = "$AGENTFLOW_RESULT"  # an attempt's `file_path` that stands for the step's result file
 
 
 def tool_rules(settings: dict, kind: str) -> list[str]:
@@ -305,7 +307,9 @@ def main() -> int:
     denials: list[dict] = list(act.get("permission_denials", []))
     unavailable: list[dict] = []
     for attempt in act.get("attempts", []):
-        tool, tool_input = attempt["tool_name"], attempt.get("tool_input", {})
+        tool, tool_input = attempt["tool_name"], dict(attempt.get("tool_input", {}))
+        if tool_input.get("file_path") == RESULT_PLACEHOLDER:  # the step's result file, which a script can't name
+            tool_input["file_path"] = os.environ.get("AGENTFLOW_RESULT", "")
         verdict = decide(argv, Path.cwd(), tool, tool_input)
         if verdict == "unknown_tool":  # the model can't call a tool it was not given: nothing reaches the stream
             unavailable.append({"tool_name": tool, "tool_input": tool_input, "kind": "unknown_tool"})

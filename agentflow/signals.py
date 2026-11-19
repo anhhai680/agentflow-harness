@@ -309,7 +309,8 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
                 if kind:
                     counts["guard_trips"][str(kind)] += 1
         elif etype == "permission_denied":
-            if ev.get("tool"):
+            # a denial in a read-only session (`read_only_roles`) is by design: no rule should be added for it
+            if ev.get("tool") and ev.get("read_only") is not True:
                 counts["permission_denied"][str(ev["tool"])] += 1
         elif etype == "hitl_raised":
             if ev.get("kind"):

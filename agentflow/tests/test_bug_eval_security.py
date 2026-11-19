@@ -20,6 +20,7 @@ RED = "build/regression_test"
 FIX = "build/fix"
 EVAL = "verify/eval_gate"
 SKILL_LINE = "Also use the `security-and-hardening` skill."
+READ_SKILL_LINE = "Also read `.claude/skills/security-and-hardening/SKILL.md` and follow it."  # a self-contained prompt's
 GREEN_GATES = {"gate_sets": {"build": ["ok"], "verify": ["ok"]}}
 REGRESSION = "eval: retrieval recall@5 0.71 below the baseline 0.80"
 EVAL_GATES = {"gates": {"floor": {"run": "true"}, "eval": {"run": f"echo '{REGRESSION}'; exit 1", "when_exists": None}}}
@@ -316,7 +317,8 @@ def test_security_overlay(flow_repo):
     security = calls_for(flow_repo, "review/security_review")[0]["argv"]
     assert ("--agent", "security-auditor") in pairs(security)
     assert "--agent" not in branch
-    assert SKILL_LINE in branch[-1]
+    # A review is read-only, with no skills listing: the overlay's line names the skill's file
+    assert READ_SKILL_LINE in branch[-1] and SKILL_LINE not in branch[-1]
     assert security[-1].count("`security-and-hardening` skill") == 1  # its own skill line is not repeated
 
 
@@ -333,7 +335,7 @@ def test_no_overlay_off_security_paths(flow_repo):
     assert run_phase(flow_repo, run, "review") == ("done", True)
     assert "review/security_review" in {e["key"] for e in flow_repo.events(run, "step_skipped")}
     branch = calls_for(flow_repo, "review/branch_review")[0]["argv"]
-    assert "--agent" not in branch and SKILL_LINE not in branch[-1]
+    assert "--agent" not in branch and SKILL_LINE not in branch[-1] and READ_SKILL_LINE not in branch[-1]
 
 
 # --------------------------------------------------------------------------- review fix round 1: the test command

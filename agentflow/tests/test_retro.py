@@ -588,6 +588,30 @@ def test_retro_session_has_no_brief(flow_repo, gh_log):
     assert not (run.dir / "brief").exists()
 
 
+def test_retro_session_is_read_only_and_writes_its_result(flow_repo, gh_log):
+    a, _b = _two_runs_failing(flow_repo, "unit")
+    result = _retro_result(add=[_add(sources=[f"{a}#{SEQ}"])])["result"]
+    flow_repo.fake.script({KEY: [{"attempts": [
+        {"tool_name": "Read", "tool_input": {"file_path": "README.md"}},
+        {"tool_name": "Bash", "tool_input": {"command": "touch notes.txt"}},
+        {"tool_name": "Write", "tool_input": {"file_path": "notes.txt", "content": "mine\n"}},
+        {"tool_name": "Write", "tool_input": {"file_path": "$AGENTFLOW_RESULT", "content": json.dumps(result)}}]}]})
+    out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    assert out.pr_url == PR_URL  # the result was written through the session's own Write, in the workspace
+    run = _run(flow_repo, out)
+    (call,) = flow_repo.calls()
+    argv = call["argv"]
+    pairs = set(zip(argv, argv[1:]))
+    assert ("--permission-mode", "dontAsk") in pairs and "--disable-slash-commands" in argv
+    assert ("--tools", "Read,Grep,Glob,Bash,Write") in pairs and ("--add-dir", str(run.agent_dir)) in pairs
+    allow = json.loads(dict(pairs)["--settings"])["permissions"]["allow"]
+    assert "Read" in allow and [r for r in allow if r.startswith("Edit(")] == [f"Edit(/{run.agent_dir}/**)"]
+    denied = [e for e in run.events.read() if e["type"] == "permission_denied"]
+    assert [(e["tool"], e.get("read_only")) for e in denied] == [("Bash", True), ("Write", True)]
+    assert not (Path(run.state["worktree"]) / "notes.txt").exists()
+    assert [e["read_only"] for e in run.events.read() if e["type"] == "agent_started"] == [True]
+
+
 def test_nothing_proposed_finishes_without_a_pr(flow_repo, gh_log):
     _two_runs_failing(flow_repo, "unit")
     flow_repo.fake.script({KEY: [_retro_result()]})
@@ -679,9 +703,8 @@ def test_a_session_that_edits_files_stops_blocked_without_a_pr(flow_repo, gh_log
     flow_repo.fake.script({KEY: [_retro_result(add=[_add(sources=[f"{a}#{SEQ}"])], write={"notes.txt": "mine\n"})]})
     out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
     assert out.pr_url is None and not _created(gh_log)
-    waiting = _waiting(flow_repo, out)
-    assert waiting["kind"] == "blocked" and "the retro session changed files" in waiting["summary"]
-    assert "notes.txt" in waiting["summary"]
+    waiting = _waiting(flow_repo, out)  # the read-only session's guard sees the edit first
+    assert waiting["kind"] == "guard_violation" and "read_only_edit: notes.txt" in waiting["summary"]
     assert _run(flow_repo, out).state["branch"] not in run_git(flow_repo.origin, "branch", "--list")
 
 

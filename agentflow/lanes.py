@@ -20,8 +20,10 @@ from __future__ import annotations
 import dataclasses
 import re
 import shlex
+import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path, PurePosixPath
@@ -30,7 +32,8 @@ from typing import Literal, TextIO
 from agentflow import brief as brief_mod
 from agentflow import lessons as lessons_mod
 from agentflow import doubt, gitops, overlays, pack, run_env, safeio, sizing, verification, workspace
-from agentflow.agents import CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption, ignored_settings
+from agentflow.agents import (CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption,
+                              ignored_settings, read_only_allow)
 from agentflow.autonomy import AUTO_BY, runner_settles
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
@@ -207,17 +210,32 @@ def _phase_artifacts(ctx: Ctx, phase: str | None) -> str:
     return "\n".join(f"- `{path}`" for path in paths) or "(none yet)"
 
 
-def _read_file_skills(text: str, skills_dir: str, inlined: frozenset[str] = frozenset()) -> str:
-    """For agents that cannot load skills by name: point them at the skill file in `skills_dir` instead.
-    A skill in `inlined` has its text in the prompt already, so its line stays as it is."""
+def _read_file_skills(text: str, skills_dir: str, inlined: frozenset[str] = frozenset(),
+                      resolve: Callable[[str], str] | None = None) -> str:
+    """For agents that cannot load skills by name: point them at the skill file in `skills_dir` instead, or at the
+    path `resolve` gives for the name. A skill in `inlined` has its text in the prompt already, so its line stays."""
 
     def replace(match: re.Match[str]) -> str:
         if match.group(2) in inlined:
             return match.group(0)
         read = "Read" if match.group(1) == "U" else "read"
-        return f"{read} `{skills_dir}/{match.group(2)}/SKILL.md` and follow it"
+        path = resolve(match.group(2)) if resolve is not None else f"{skills_dir}/{match.group(2)}/SKILL.md"
+        return f"{read} `{path}` and follow it"
 
     return SKILL_LINE.sub(replace, text)
+
+
+def _skill_path(repo: Path, skills_dir: str) -> Callable[[str], str]:
+    """The path a self-contained prompt's skill line names (`build_prompt`): a bundled skill's file in the engine, by
+    its absolute path; a repository skill, or a name that resolves to nothing, `<skills_dir>/<name>/SKILL.md`."""
+
+    def resolve(name: str) -> str:
+        found = pack.skill_file(repo, skills_dir, name)
+        if found is not None and pack.is_bundled(found):
+            return str(found)
+        return f"{skills_dir}/{name}/SKILL.md"
+
+    return resolve
 
 
 def _drop_skill_section(body: str, keep: bool = False) -> str:
@@ -263,7 +281,7 @@ def _brief_pointer(skill: str | None, files: bool) -> str:
 
 
 def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode: Mode,
-                 brief: dict | None = None) -> str:
+                 brief: dict | None = None, self_contained: bool = False) -> str:
     """`_preamble.md` + `_step_head.md` + the step's template (after the refine template in a refine round) +
     `_result.md`.
 
@@ -274,6 +292,10 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     With `brief` (the session's pin, `build_brief`), the preamble and `_result.md` are in the session's system prompt
     and are left out, and so are the skill and the `brief:` files when the pin says the brief holds them: `{brief}`
     then points there. `step.task_brief` always stays in the prompt.
+
+    With `self_contained` (a call with no skills listing: `Executor._self_contained`), a line that tells the agent to
+    use a skill by name points at its file instead, as `skill_loading: read_file` does: the step template's and the
+    overlay's lines, before placeholders are filled. The step's own carried skill keeps its line.
     """
     values = _values(cfg, step, ctx, {})
     preamble = EFFORT_BLOCK.sub("", _template(cfg, PREAMBLE))
@@ -340,9 +362,13 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     parts = (step_head, body) if brief else (preamble, step_head, body, _template(cfg, RESULT))
     text = "\n\n".join(part.strip() for part in parts)
     agent = cfg.agents.get(rec.get("agent") or cfg.defaults.agent)
-    if agent is not None and agent.skill_loading == "read_file":
+    if self_contained or (agent is not None and agent.skill_loading == "read_file"):
         carried = (skill_brief is not None or in_system) and step.skill
-        text = _read_file_skills(text, cfg.project.skills_dir, frozenset({step.skill}) if carried else frozenset())
+        if self_contained and step.skill and not carried:  # its `SKILL.md` as a `brief:` file carries it too
+            own = PurePosixPath(cfg.project.skills_dir, step.skill, "SKILL.md")
+            carried = any(PurePosixPath(name) == own for name in (*step.brief, *step.task_brief)) and step.skill
+        text = _read_file_skills(text, cfg.project.skills_dir, frozenset({step.skill}) if carried else frozenset(),
+                                 resolve=_skill_path(ctx.repo, cfg.project.skills_dir) if self_contained else None)
     return fmt(text, values) + "\n"
 
 
@@ -529,6 +555,9 @@ class _StepRun:
     brief_refused: str | None = None  # a fresh session's brief failed at the call: the next fresh one goes without
     brief_invalid: str | None = None  # why a resumed session's recorded pin can't be trusted (`_load_pin`)
     dry: bool = False  # `dry_agent_argv`: the brief is built but never written
+    # A `read_only_roles` session (`_decide_read_only`): no edits, no skills listing, a shorter idle limit. A resumed
+    # session keeps what it started with (`agent_started.read_only`, kept on the step row beside its session).
+    read_only: bool = False
 
 
 def _mtime(path: Path) -> float | None:
@@ -556,6 +585,8 @@ def _answers(events: list[dict], key: str) -> dict[str, str]:
 REOPENING = ("hitl_approved", "step_reopened")
 DENIED_SHOWN = 15  # commands listed in a blocked inbox
 DENIED_TEXT_MAX = 200
+READ_ONLY_DENIED = "This step runs read-only (`agents.claude.read_only_roles`): these denials are by design."
+READ_ONLY_REVERT = "Revert these before you approve or retry: a later step commits the whole work tree."
 
 
 def _approved(events: list[dict], key: str) -> dict | None:
@@ -711,16 +742,20 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             self.escalate_effort(sr, "review")  # a review sent the step back to its session
             sr.effort = sizing.floor(sr.effort, judgement, self.cfg.effort.allowed)
         # A resumed session keeps the brief it started with (its pin in state), whatever the config says now.
+        # ... and the read-only setting it started with, whatever `read_only_roles` says now.
         if resuming and session:
             self._load_pin(sr, rec, session)
+            self._load_read_only(sr, rec, session)
             turn = _Turn(self._continue_prompt(sr, _answers(since, key), _approved(since, key)), session)
         elif mode == "refine" and session:
             self._load_pin(sr, rec, session)
+            self._load_read_only(sr, rec, session)
             turn = _Turn(self._refine_prompt(sr), session)
         elif takes_shared:
             sr.session = shared["session_id"]
             sr.effort = sizing.floor(shared.get("effort") or sr.effort, judgement, self.cfg.effort.allowed)
             self._load_pin(sr, shared, sr.session)
+            self._load_read_only(sr, shared, sr.session)
             turn = _Turn(self._prompt(sr, resume=sr.session), sr.session)
         else:
             turn = _Turn(self._prompt(sr), None)
@@ -775,6 +810,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 dirty = self._uncommitted_forbidden(sr.start_tree)
                 if dirty:
                     return self._fail(sr, [Violation("forbidden_path", p) for p in dirty])
+                left = self._read_only_edits_left(since, sr.start_tree)
+                if left:  # a reviewer's edits still in the tree: a restart would adopt them, then a commit take them
+                    return self._fail(sr, [Violation("read_only_edit", p) for p in left])
             refine = state.get("refine") or {}
             round_ = refine.get("round") if mode == "refine" and refine.get("phase") == phase.name else None
             self.run.emit(
@@ -834,7 +872,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if called.refused:  # the git state changed: nothing that reads the tree has run, and nothing may
                 return self._fail(sr, called.refused)
             violations = check_step(self.cfg, self.worktree, sr.start_head, sr.start_tree, called.after,
-                                    outcome.tool_calls, sr.step.forbid)
+                                    outcome.tool_calls, sr.step.forbid, read_only=sr.read_only)
             if sr.step.reconciles:
                 violations = [*violations, *self._outside_output(sr)]
             if violations:
@@ -892,7 +930,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if result.status == "blocked":
                 kind = "blocked_repeat" if called.after == sr.resume_tree else "blocked"
                 return self._stop(sr, kind, result.summary or "The agent reported the step as blocked.",
-                                  extra=self._denied_report(sr.key))
+                                  extra=self._denied_report(sr.key, read_only=sr.read_only))
             if result.status == "unchanged":
                 edited = changed_paths(self.worktree, sr.start_tree, called.after)
                 if edited:  # never leave edits uncommitted and ungated under an `unchanged` label
@@ -927,17 +965,23 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
     def _timeout_s(self) -> int:
         return max(1, round(self.cfg.defaults.step_timeout_min * 60))
 
-    def _idle_s(self) -> tuple[float | None, float | None]:
+    def _idle_s(self, read_only: bool = False) -> tuple[float | None, float | None]:
         """The watchdog's two limits (`agents.idle_limit`): `watchdog.no_progress_min`, and while a tool call is open
-        at least `defaults.gate_timeout_min`, since a gate-length command writes nothing until it returns. 0: off."""
+        at least `defaults.gate_timeout_min`, since a gate-length command writes nothing until it returns. 0: off.
+        A `read_only` session with no tool call open ends sooner, after `watchdog.read_only_idle_min` (0: no sooner);
+        while one is open it keeps the same limit, since a reviewer may run a long command."""
         minutes = self.cfg.watchdog.no_progress_min
         if not minutes > 0:  # 0, and a value `validate` refuses, never arm a watchdog that fires at once
             return None, None
         idle = minutes * 60
-        return idle, max(idle, self.cfg.defaults.gate_timeout_min * 60)
+        tool = max(idle, self.cfg.defaults.gate_timeout_min * 60)
+        quiet = self.cfg.watchdog.read_only_idle_min
+        if read_only and quiet > 0:
+            return min(minutes, quiet) * 60, tool
+        return idle, tool
 
     def _agent_call(self, sr: _StepRun, turn: _Turn, attempt: int) -> AgentCall:
-        idle_s, tool_idle_s = self._idle_s()
+        idle_s, tool_idle_s = self._idle_s(sr.read_only)
         return AgentCall(
             prompt=turn.prompt,
             model=sr.model,
@@ -947,7 +991,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             step_key=sr.key,
             result_path=self.run.agent_result_path(sr.key),
             transcript_path=self.run.transcript_path(sr.key, attempt),
-            add_dirs=[self.run.agent_dir],  # the workspace only: never the runs root (events, state, inbox)
+            # The workspace only: never the runs root (events, state, inbox). A read-only call may write every add-dir
+            # (`agents.read_only_allow`), so nothing else may ever join this list.
+            add_dirs=[self.run.agent_dir],
             runs_root=self.run.dir.parent,  # denied to the agent's edits, wherever the pack puts the state dir
             timeout_s=self._timeout_s(),
             resume_session=turn.resume,
@@ -962,6 +1008,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             # Every call of a session with a brief passes it, the resumes too (fix, reminder, continue, effort change).
             system_prompt_file=Path(str(sr.brief.get("path"))) if sr.brief is not None else None,
             carries_rules=bool(sr.brief is not None and sr.brief.get("rules") is True),
+            # Every call of a session keeps the setting the session started with (`_decide_read_only`).
+            read_only_role=sr.read_only,
+            self_contained=self._self_contained(sr),
         )
 
     def context_window_for(self, key: str, model: str) -> int | None:
@@ -990,6 +1039,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 seen["pid"] = data.get("pid")
                 data.update(sizing=False, phase=sr.phase.name, role=sr.role)  # a sizer's own call says True
                 data["brief"] = sr.brief  # on every call, so a shared session's later task carries the pin on
+                data["read_only"] = sr.read_only  # likewise: a resume takes the session's own setting
                 if turn.resume is None and sr.brief_skipped:
                     data["brief_skipped"] = sr.brief_skipped
             elif name == "agent_session":
@@ -1013,10 +1063,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         if footer:
             self.run.emit("skill_footer", key=sr.key, phase=sr.phase.name, next=footer)
         for denial in outcome.permission_denials:
+            by_design = {"read_only": True} if sr.read_only else {}  # `signals` leaves these out: no rule to add
             self.run.emit(
                 "permission_denied", key=sr.key,
                 tool=denial.get("tool_name") or denial.get("tool"),
-                input=denial.get("tool_input", denial.get("input")),
+                input=denial.get("tool_input", denial.get("input")), **by_design,
             )
         if sr.step.reconciles and sr.reconcile_base is not None:  # before the snapshot: it runs `git add`
             planted = git_state_changes(self.worktree, sr.reconcile_base)
@@ -1315,6 +1366,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         if sr.step.reconciles and any(v.kind == "outside_output" for v in violations):
             summary += (". Remove or revert the file(s) named here before you approve or reject: a later step commits "
                         "the whole work tree.")
+        if any(v.kind == "read_only_edit" for v in violations):
+            summary += f". {READ_ONLY_REVERT}"
         self.run.emit("guard_tripped", key=sr.key, violations=[{"kind": v.kind, "detail": v.detail} for v in violations])
         raise_hitl(self.cfg, self.run, "guard_violation", sr.key, summary)
         self.run.emit("step_finished", key=sr.key, status="failed", summary=summary)
@@ -1339,9 +1392,60 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         holds nothing yet, so it is never built as a continuation: the skill's text goes in again."""
         step = sr.step if resume else dataclasses.replace(sr.step, continuation=False)
         if resume is None:  # decided before the prompt is built: the prompt leaves out what the brief holds
+            self._decide_read_only(sr)
             self._decide_brief(sr)
-        prompt = build_prompt(self.cfg, step, self.ctx, self._rec(sr), sr.extra, sr.mode, brief=sr.brief)
+        prompt = build_prompt(self.cfg, step, self.ctx, self._rec(sr), sr.extra, sr.mode, brief=sr.brief,
+                              self_contained=self._self_contained(sr))
         return f"{sr.lead}\n\n{prompt}" if sr.lead else prompt
+
+    # -- read-only roles (`agents.<name>.read_only_roles`)
+
+    def _decide_read_only(self, sr: _StepRun) -> None:
+        """A fresh session's read-only setting (`sr.read_only`): its role is one of the agent's `read_only_roles`, the
+        agent takes the setting, and the allow rule can name the workspace exactly. A workspace path it can't name runs
+        the step as before, never read-only, and says so once per run (`read_only_skipped`); a dry run says nothing."""
+        sr.read_only = False
+        spec = self.cfg.agents.get(sr.agent_name)
+        if spec is None or sr.role not in spec.read_only_roles or not getattr(sr.agent, "takes_read_only_role", False):
+            return
+        try:
+            read_only_allow([self.run.agent_dir])  # the rules `agents.argv` builds: it raises the same way
+        except ValueError as exc:
+            if not (self.dry_run or sr.dry) and not any(
+                    e["type"] == "read_only_skipped" for e in self.run.events.read()):
+                self.run.emit("read_only_skipped", key=sr.key, reason=str(exc))
+            return
+        sr.read_only = True
+
+    def _load_read_only(self, sr: _StepRun, row: dict, session: str) -> None:
+        """A resumed session's read-only setting, from its step row (`agent_started.read_only`), whatever the config
+        says now. A session from before the setting, or a row whose setting belongs to another session, is False."""
+        sr.read_only = row.get("read_only") is True and row.get("read_only_session") == session
+
+    def _self_contained(self, sr: _StepRun) -> bool:
+        """The call gets no skills listing (`--disable-slash-commands`), so its prompt names skill files, not skills: a
+        read-only session, a reconcile step and the record step."""
+        record = self.cfg.record_step
+        return sr.read_only or sr.step.reconciles or (record is not None and sr.step.id == record.id)
+
+    def _read_only_edits_left(self, since: list[dict], tree: str) -> list[str]:
+        """The paths the step's last `read_only_edit` violation named that `tree` still has changed against the start
+        of that failed session (its `step_started`, the first of `since`). A restart must not adopt them."""
+        if not since or not since[0].get("start_tree"):
+            return []
+        named: list[str] = []
+        for event in since:
+            if event["type"] == "guard_tripped":
+                found = [str(v.get("detail")) for v in event.get("violations") or []
+                         if isinstance(v, dict) and v.get("kind") == "read_only_edit"]
+                named = found or named
+        if not named:
+            return []
+        try:
+            still = set(changed_paths(self.worktree, str(since[0]["start_tree"]), tree))
+        except (subprocess.CalledProcessError, OSError):  # the start tree can't be read: every named path counts
+            return named
+        return [path for path in named if path in still]
 
     # -- the run brief
 
@@ -1478,6 +1582,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         values = {**self._values(sr), **_refine_values(self.ctx, rec)}
         parts = [fmt(template, values)]
         skills = overlays.skill_lines(self.cfg, self.ctx, sr.role, parts[0])
+        if skills and self._self_contained(sr):  # the call has no skills listing: the lines name the files
+            skills = _read_file_skills(skills, self.cfg.project.skills_dir,
+                                       resolve=_skill_path(self.ctx.repo, self.cfg.project.skills_dir))
         if skills:
             parts.append(skills)
         parts.append(self._result_partial(sr).strip())
@@ -1536,8 +1643,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         shown = [f"- `{k}`: {summary}" for k, summary in found if summary][-RESOLVER_FINDINGS_SHOWN:]
         return "### Earlier resolver findings in this run\n\n" + "\n".join(shown) if shown else ""
 
-    def _denied_report(self, key: str) -> str:
-        """The inbox section naming what was denied since the last approval, each once, so one fix covers it."""
+    def _denied_report(self, key: str, read_only: bool = False) -> str:
+        """The inbox section naming what was denied since the last approval, each once, so one fix covers it. A
+        `read_only` step's denials are by design, so no rule is suggested for them."""
         seen: dict[str, None] = {}
         for event in _after_approval(self.run.events.read(), key):
             if event["type"] == "permission_denied" and event.get("key") == key:
@@ -1549,6 +1657,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         shown = list(seen)[:DENIED_SHOWN]
         more = f"\n- and {len(seen) - len(shown)} more" if len(seen) > len(shown) else ""
         lines = "\n".join(f"- `{line}`" for line in shown)
+        if read_only:
+            return f"### Denied in this step\n\n{lines}{more}\n\n{READ_ONLY_DENIED}"
         rules = self.worktree / ".claude" / "settings.local.json"
         return (f"### Denied in this step\n\n{lines}{more}\n\nTo allow one in this run, add a narrow rule to `{rules}`. "
                 "The session reads the worktree's settings, and a change to `.claude/settings.json` there is a guard "

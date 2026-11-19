@@ -118,6 +118,40 @@ def test_allowed_edit_is_clean(cfg, tmp_git, git):
     assert v == []
 
 
+def test_snapshot_sees_a_same_size_edit_made_in_the_index_write_second(tmp_git, git):
+    """Git trusts an entry's stat data only when the entry is older than the index file (racy git): the snapshot's
+    copy of the index must keep the index's mtime, or a same-size edit in that second reads as unchanged."""
+    import os
+
+    target = tmp_git / "src" / "app.py"
+    index = tmp_git / ".git" / "index"
+    second = int(index.stat().st_mtime) - 5  # one past second for the file, its entry and the index file
+    os.utime(target, (second, second))
+    git(tmp_git, "update-index", "--refresh")  # the entry records that mtime
+    os.utime(index, (second, second))  # ... in the second the index was written: a racily clean entry
+    start = snapshot(tmp_git)
+    target.write_text("x = 2\n", encoding="utf-8")  # same size as "x = 1\n"
+    os.utime(target, (second, second))
+    assert changed_paths(tmp_git, start, snapshot(tmp_git)) == ["src/app.py"]
+
+
+def test_read_only_check_flags_any_tree_change(cfg, tmp_git, git):
+    start_head, start_tree = head(git, tmp_git), snapshot(tmp_git)
+    (tmp_git / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")  # an edited file
+    (tmp_git / "notes.txt").write_text("n\n", encoding="utf-8")  # a new one
+    (tmp_git / "CONSTRAINTS.md").write_text("weaker\n", encoding="utf-8")  # a forbidden path
+    end_tree = snapshot(tmp_git)
+    found = check_step(cfg, tmp_git, start_head, start_tree, end_tree, [], read_only=True)
+    assert sorted(found, key=lambda v: (v.kind, v.detail)) == [
+        Violation("forbidden_path", "CONSTRAINTS.md"),
+        Violation("read_only_edit", "notes.txt"),
+        Violation("read_only_edit", "src/app.py"),
+    ]  # a forbidden path gives only its `forbidden_path`
+    assert check_step(cfg, tmp_git, start_head, start_tree, end_tree, []) == [
+        Violation("forbidden_path", "CONSTRAINTS.md")]  # with `read_only=False`, as today
+    assert check_step(cfg, tmp_git, start_head, start_tree, start_tree, [], read_only=True) == []
+
+
 def test_agent_commit(cfg, tmp_git, git):
     def mutate():
         (tmp_git / "src" / "app.py").write_text("x = 3\n", encoding="utf-8")
