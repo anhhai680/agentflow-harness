@@ -24,7 +24,12 @@ a call to a tool `--tools` leaves out to its `unavailable` list as `{tool_name, 
 `file_path` of `$AGENTFLOW_RESULT` is the step's result file).
 `write` is not a tool call and bypasses the model: it is the fake's own hand on the tree.
 
-The permission model of `attempts` follows the real CLI. Each attempt is decided in this order:
+The permission model of `attempts` is a model of the real CLI's, close enough for the runner's tests, not a copy.
+It does NOT model: the CLI's built-in read-only command set (real `dontAsk` runs `grep`, `cat`, `ls` and the like with no
+allow rule; here every `Bash` part needs one); chaining by `&`, a newline, `$(...)` or backticks (only the separators in
+2. split a command); an environment-variable prefix (`FOO=1 git diff` is judged as the whole text); hooks, project or
+user settings files, `--agent` profiles and sandbox settings. A denied attempt's `tool_result` is an error, as the CLI's.
+Each attempt is decided in this order:
 1. A tool `--tools` doesn't list doesn't exist (a `--tools`-less argv lists every tool): `unavailable`, and nothing happens.
 2. A `Bash` command is split on `&&`, `||`, `;` and `|` into parts, and each `>` / `>>` redirection in a part is a write
    to its target path.
@@ -290,7 +295,7 @@ def main() -> int:
 
     serial = 0
 
-    def tool_turn(name: str, tool_input: dict, hold: float = 0) -> None:
+    def tool_turn(name: str, tool_input: dict, hold: float = 0, denied: bool = False) -> None:
         nonlocal serial
         serial += 1
         tool_id = f"toolu_fake_{serial}"
@@ -299,8 +304,11 @@ def main() -> int:
                                                "usage": usage(2000)}, "parent_tool_use_id": None, **base})
         if hold:
             time.sleep(hold)  # the tool runs: the stream says nothing until it returns
+        # a denied call never ran: the CLI answers it with an error result, as the real one does
+        answer = ({"content": f"Permission to use {name} has been denied.", "is_error": True} if denied
+                  else {"content": "ok"})
         emit({"type": "user", "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}]}, "parent_tool_use_id": None, **base})
+            {"type": "tool_result", "tool_use_id": tool_id, **answer}]}, "parent_tool_use_id": None, **base})
 
     for call in act.get("tool_calls", []):
         tool_turn(call["name"], call.get("input", {}))
@@ -314,7 +322,7 @@ def main() -> int:
         if verdict == "unknown_tool":  # the model can't call a tool it was not given: nothing reaches the stream
             unavailable.append({"tool_name": tool, "tool_input": tool_input, "kind": "unknown_tool"})
             continue
-        tool_turn(tool, tool_input)
+        tool_turn(tool, tool_input, denied=verdict == "denied")
         if verdict == "denied":
             denials.append({"tool_name": tool, "tool_input": tool_input})
         elif tool == "Write":

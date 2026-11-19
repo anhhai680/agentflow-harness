@@ -191,7 +191,10 @@ EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
                     "--dangerously-skip-permissions", "--permission-mode")
 RUNNER_FLAGS = ("--setting-sources",)  # set by the runner from `agents.claude.user_settings`, never by base_args
-READ_ONLY_FLAGS = ("--tools", "--settings", "--agents", "--plugin-dir")  # the runner sets these for a read-only call (`read_only_roles`)
+# The runner sets these for a read-only call (`read_only_roles`), and `--agent` only for the overlay's review step. A copy in
+# `command` or `base_args` would reach every read-only call, and an agent profile's own permission mode, tools or hooks
+# could widen it.
+READ_ONLY_FLAGS = ("--tools", "--settings", "--agents", "--agent", "--plugin-dir")
 PERMISSION_MODES = ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions")
 EXPECT_VALUES = ("red", "green")
 ON_FAIL_VALUES = ("block",)
@@ -2016,15 +2019,18 @@ class _Validator:
             path = f"agents.{name}"
             if agent.effort_arg and not any("{effort}" in arg for arg in agent.effort_arg):
                 self.error(_join(path, "effort_arg"), "effort_arg must contain {effort}: every call passes its level")
-            for arg in agent.base_args:
-                if arg.split("=", 1)[0] in PERMISSION_FLAGS:
-                    self.error(_join(path, "base_args"), f"'{arg}' is not allowed: tool rules come from .claude/settings*.json")
-                elif arg.split("=", 1)[0] in RUNNER_FLAGS:
-                    self.error(_join(path, "base_args"), f"'{arg}' is not allowed: the runner sets it from "
-                               "`agents.claude.user_settings`")
-                elif agent.read_only_roles and arg.split("=", 1)[0] in READ_ONLY_FLAGS:
-                    self.error(_join(path, "base_args"), f"'{arg}' is not allowed while `read_only_roles` is not empty: "
-                               "the runner sets it for a read-only call, and a copy here could widen it")
+            # `command` past the program goes on every argv as `base_args` does, so the same flags are refused there
+            for key, args in (("command", agent.command[1:]), ("base_args", agent.base_args)):
+                for arg in args:
+                    flag = str(arg).split("=", 1)[0]
+                    if flag in PERMISSION_FLAGS:
+                        self.error(_join(path, key), f"'{arg}' is not allowed: tool rules come from .claude/settings*.json")
+                    elif flag in RUNNER_FLAGS:
+                        self.error(_join(path, key), f"'{arg}' is not allowed: the runner sets it from "
+                                   "`agents.claude.user_settings`")
+                    elif agent.read_only_roles and flag in READ_ONLY_FLAGS:
+                        self.error(_join(path, key), f"'{arg}' is not allowed while `read_only_roles` is not empty: "
+                                   "the runner sets it for a read-only call, and a copy here could widen it")
             if agent.permission_mode is not None and agent.permission_mode not in PERMISSION_MODES:
                 self.error(_join(path, "permission_mode"),
                            f"unknown permission_mode '{agent.permission_mode}': use one of {', '.join(PERMISSION_MODES)}")

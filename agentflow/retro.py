@@ -54,14 +54,14 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from . import pack, safeio, views, workspace
-from .agents import make_agents
-from .conditions import make_ctx
+from .agents import ADAPTERS, make_agents
+from .conditions import fmt, make_ctx
 from .config import RETRO_PIPELINE, Config, Phase, Step, worktrees_root
 from .events import EventLog, nfc, parse_iso
 from .gitops import (CommitRejected, GhError, GitError, NothingToCommit, add_worktree, blob_at, branch_exists,
                      commit_lessons, create_draft_pr, git_state, head, push, tree_state)
 from .hitl import FACT_MAX, ResultError, clean_fact, raise_hitl
-from .lanes import Executor, build_prompt
+from .lanes import READ_ONLY_NOTE, Executor, build_prompt
 from .lessons import (_LEADING, BODY_MAX, CORRELATION_NOTE, ENGINE_PREFIX, FILE_MAX, RUN_ERRORS, SOURCE, Lesson, effects,
                       load, parse, read, render, run_logs, split_header)
 from .metrics import run_metrics
@@ -224,7 +224,9 @@ def _evidence(ev: dict) -> tuple[str, list[str]] | None:
         violations = [v for v in found if isinstance(v, dict)] if isinstance(found, list) else []
         return key, [_q(f"{_q(v.get('kind'))}: {_q(v.get('detail'))}") for v in violations[:DIGEST_TAIL_LINES]]
     if etype == "permission_denied":
-        return f"{key} tool {_q(ev.get('tool')) or '?'}", [q for q in (_q(ev.get("input")),) if q]
+        # a read-only session's denial (`read_only_roles`) is by design: marked, so no lesson re-allows the tool
+        by_design = " (read-only session: denied by design)" if ev.get("read_only") is True else ""
+        return f"{key} tool {_q(ev.get('tool')) or '?'}{by_design}", [q for q in (_q(ev.get("input")),) if q]
     if etype == "hitl_raised":
         return f"{_q(ev.get('kind')) or '?'} at {key}: {_q(ev.get('summary'))}", _lines(ev.get("extra"))
     if etype == "phase_rejected":
@@ -938,11 +940,21 @@ def due_or_none(repo: Path, cfg: Config, now: datetime) -> str | None:
 
 
 def _dry_prompt(cfg: Config, repo: Path, step: Step) -> str:
+    """The session's prompt as the run would build it, with placeholders for the run's paths: a read-only session
+    (`read_only_roles`, as `Executor._decide_read_only` decides it) is self-contained and carries the read-only note.
+    A workspace path no rule can name runs the session as before; a dry run can't know that path, so it is not
+    checked here."""
     ctx = make_ctx(cfg, repo, RETRO_PIPELINE, {})
     ctx.base_ref = f"origin/{cfg.project.base_branch}"
     extra = {"result_file": "(the run's result file)", "phase": RETRO_PIPELINE, "run_dir": "(the run's workspace)",
              "progress": "(the run's workspace)/progress.md"}
-    return build_prompt(cfg, step, ctx, {"role": step.role}, extra, "first")
+    name = cfg.defaults.agent
+    spec = cfg.agents.get(name)
+    read_only = bool(spec is not None and step.role in spec.read_only_roles
+                     and getattr(ADAPTERS.get(name), "takes_read_only_role", False))
+    if read_only:  # a retro run has no gate result, so the note comes with no table
+        extra["read_only_note"] = fmt(READ_ONLY_NOTE, {"progress": extra["progress"]})
+    return build_prompt(cfg, step, ctx, {"role": step.role, "agent": name}, extra, "first", self_contained=read_only)
 
 
 @contextmanager

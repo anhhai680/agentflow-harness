@@ -18,6 +18,7 @@ import signal
 import subprocess
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,14 +39,19 @@ SYNTHETIC_MODEL = "<synthetic>"  # Claude Code's own error messages, shown as as
 READ_ONLY_TOOLS = ("Read", "Grep", "Glob")  # the only Claude tools a read-only call gets
 # A `read_only_roles` session (`AgentCall.read_only_role`): these tools exist (`Edit` and the rest don't), and under
 # `dontAsk` only what `READ_ONLY_ALLOW` and the workspace rule allow runs. `Bash` is for read-only `git` and the shell's reads
-# the prompt asks for, `Write` for the result file in the workspace. A control on cost and independence, not a sandbox: the
+# the prompt asks for, `Write` for the result file in the workspace's `out/`. A control on cost and independence, not a sandbox: the
 # project's own settings and hooks still apply (plan C3, Decided 2).
 REVIEW_TOOLS = ("Read", "Grep", "Glob", "Bash", "Write")
 READ_ONLY_GIT = ("diff", "log", "show", "status", "blame")
 READ_ONLY_ALLOW = ("Read", "Grep", "Glob",
                    *(rule for sub in READ_ONLY_GIT for rule in (f"Bash(git {sub})", f"Bash(git {sub} *)")))
 READ_ONLY_DENY = ("Bash(git *--output*)",)  # `git diff --output=<file>` writes a file: no allow rule may reach it
-RULE_UNSAFE = frozenset("*?[]{}\\")  # in a path, these make a permission rule name more than that one directory
+# In a path, these could make a permission rule name more than that one directory, or end or split the rule; so could
+# any control or whitespace character other than a plain space (`_rule_unsafe`).
+RULE_UNSAFE = frozenset("*?[]{}\\()!#|@+,")
+# The one folder of each add-dir a read-only call may write: the workspace's `out/` (`workspace.OUT_DIR`), where its
+# result file goes. Never the workspace itself: `progress.md` there is read by the later steps that edit the code.
+READ_ONLY_WRITES = "out"
 
 # `agents.claude.cache_ttl`: the variable each lifetime sets. The inherited environment's other TTL variables are dropped
 # (`env_drop`), so it can't override the pack; `cli` sets and drops nothing, leaving the CLI's own choice.
@@ -885,14 +891,20 @@ def _without_mcp_config(args: list[str]) -> list[str]:
     return out
 
 
+def _rule_unsafe(path: str) -> bool:
+    """`path` holds a `RULE_UNSAFE` character, or a control, format or whitespace character other than a plain space."""
+    return bool(RULE_UNSAFE & set(path)) or any(
+        char != " " and (char.isspace() or unicodedata.category(char).startswith("C")) for char in path)
+
+
 def read_only_allow(add_dirs: list[Path]) -> list[str]:
-    """The allow rules of a `read_only_role` call: `READ_ONLY_ALLOW`, and writes in each of `add_dirs` (and nowhere else).
-    `//` + an absolute path is an absolute path in a permission rule. A path that holds a `RULE_UNSAFE` character can't be
-    named exactly by a rule, so it raises `ValueError`: the caller runs the step as it would otherwise."""
+    """The allow rules of a `read_only_role` call: `READ_ONLY_ALLOW`, and writes in the `READ_ONLY_WRITES` folder of each
+    of `add_dirs` (and nowhere else). `//` + an absolute path is an absolute path in a permission rule. A path a rule
+    can't name exactly (`_rule_unsafe`) raises `ValueError`: the caller runs the step as it would otherwise."""
     for directory in add_dirs:
-        if RULE_UNSAFE & set(str(directory)):
+        if _rule_unsafe(str(directory)):
             raise ValueError(f"a read-only role can't allow writes in {str(directory)!r}: the path holds a permission-rule character")
-    return [*READ_ONLY_ALLOW, *(f"Edit(/{directory}/**)" for directory in add_dirs)]
+    return [*READ_ONLY_ALLOW, *(f"Edit(/{directory}/{READ_ONLY_WRITES}/**)" for directory in add_dirs)]
 
 
 def _carries_rules(call: AgentCall) -> bool:

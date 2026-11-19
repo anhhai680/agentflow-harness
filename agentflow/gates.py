@@ -45,6 +45,7 @@ import contextlib
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
@@ -525,7 +526,8 @@ def results_table(events: list[dict]) -> str:
             if e.get("tier") == "affected":
                 result += " (affected files)"
         seconds = e.get("duration_s")
-        took = f"{round(seconds)}s" if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) else "—"
+        finite = isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds)
+        took = f"{round(seconds)}s" if finite else "—"  # `round` raises on an infinity and a NaN
         cells = (e["gate"], result, took, e.get("key") or "—", e.get("log") or "—")
         rows.append("| " + " | ".join(_cell(c) for c in cells) + " |")
     lines = ["The runner already ran these gates on this run's work; each row is a gate's newest result.", "",

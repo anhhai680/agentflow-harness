@@ -787,6 +787,14 @@ def test_results_table_marks_a_failure_and_flattens_newlines():
     assert rows == ["| lint | FAIL | 1s | build/a b | /logs/x.log |"]
 
 
+def test_results_table_shows_a_non_finite_duration_as_a_dash():
+    from agentflow.gates import results_table
+
+    for seconds in (float("inf"), float("-inf"), float("nan")):
+        rows = results_table([_result("lint", duration_s=seconds)]).splitlines()[4:]
+        assert rows == ["| lint | pass | — | build/implement | /logs/x.log |"], seconds
+
+
 def test_results_table_caps_its_rows():
     from agentflow.gates import GATE_TABLE_MAX_ROWS, results_table
 

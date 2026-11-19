@@ -53,6 +53,7 @@ These are choices the spec leaves open. Confirm them at review. Task 1 records e
    - **Example:** this repository's file allows its `pytest` command.
    - **What the runner adds:** its own allow list holds no test, build or write command. The prompt asks the reviewer not to run them. The guard catches tracked and untracked edits to the tree.
    - **The playbook line** names all of this.
+   - **Added in the fix wave:** the agent definition passed with `--agent` (the overlay's review agent, read from the work tree) and a project settings file's `sandbox.enabled` (`autoAllowBashIfSandboxed`) can widen a session too; a 2.1.328 probe saw neither do so (other versions unverified). The guard covers only the work tree: not writes or deletes outside it by a project-allowed command (`--basetemp`, `--junitxml` into the state dir), nor files hidden by an untracked `.gitignore` or `.git/info/exclude`. The write rule is the workspace's `out/` folder only, so a reviewer can't rewrite `progress.md`.
 3. **Codex is unchanged.**
    - A Codex review must write its result file, and `-s read-only` would refuse that.
    - `read_only_roles` on a non-Claude agent is a `validate` warning ("has no effect").

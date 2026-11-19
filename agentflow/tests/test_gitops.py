@@ -1269,3 +1269,56 @@ def test_verified_tree_paths_caps_each_path_length(tmp_path):
     assert listing("d" * 2000, "f" * (cap - 2001)) == ["d" * 2000 + "/" + "f" * (cap - 2001)]
     assert listing("d" * 2000, "f" * (cap - 2000)) is None
     assert listing("d" * (cap + 1), "f") is None  # a folder whose own name is over the cap is refused before descending
+
+
+# --------------------------------------------------------------------------- `artifact_diff`
+
+
+def _artifact_repo(tmp_path: Path, rel: str = "docs/a.md", data: str | bytes = "one\ntwo\n") -> tuple[Path, str]:
+    repo = _repo(tmp_path)
+    _write(repo, rel, data)
+    _commit(repo)
+    return repo, run_git(repo, "rev-parse", "HEAD^{tree}").strip()
+
+
+def test_artifact_diff_shows_a_text_hunk(tmp_path):
+    repo, base = _artifact_repo(tmp_path)
+    _write(repo, "docs/a.md", "one\nthree\n")
+    diff = gitops.artifact_diff(repo, base, "docs/a.md", 100)
+    assert diff is not None and "\n@@ " in diff and "\n+three\n" in diff
+
+
+def test_artifact_diff_is_none_for_a_binary_file(tmp_path):
+    repo, base = _artifact_repo(tmp_path, data=b"\x00\x01one\n")
+    _write(repo, "docs/a.md", b"\x00\x02two\n")
+    assert "Binary files" in run_git(repo, "diff", base, "--", "docs/a.md")  # the control: git says binary, no hunk
+    assert gitops.artifact_diff(repo, base, "docs/a.md", 100) is None
+
+
+def test_artifact_diff_is_none_for_a_file_no_longer_in_the_index(tmp_path):
+    repo, base = _artifact_repo(tmp_path)
+    run_git(repo, "rm", "-q", "--cached", "docs/a.md")  # still on disk: git diffs it as a deleted file
+    assert "deleted file mode" in run_git(repo, "diff", base, "--", "docs/a.md")
+    assert gitops.artifact_diff(repo, base, "docs/a.md", 100) is None
+
+
+def test_artifact_diff_is_none_for_an_oversize_file(tmp_path):
+    repo, base = _artifact_repo(tmp_path)
+    _write(repo, "docs/a.md", "x" * gitops.ARTIFACT_DIFF_MAX_BYTES + "\n")  # one line: only the size cap stops it
+    assert gitops.artifact_diff(repo, base, "docs/a.md", 100) is None
+    _write(repo, "docs/a.md", "x" * (gitops.ARTIFACT_DIFF_MAX_BYTES - 1) + "\n")
+    assert gitops.artifact_diff(repo, base, "docs/a.md", 100) is not None
+
+
+def test_artifact_diff_is_none_when_the_file_cannot_be_looked_at(tmp_path, monkeypatch):
+    repo, base = _artifact_repo(tmp_path)
+    _write(repo, "docs/a.md", "one\nthree\n")
+    real = os.lstat
+
+    def refuse(path, *args, **kwargs):
+        if str(path).endswith("a.md"):
+            raise PermissionError("no")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(gitops.os, "lstat", refuse)
+    assert gitops.artifact_diff(repo, base, "docs/a.md", 100) is None

@@ -18,6 +18,7 @@ runner commits only on top of the last `HEAD` it recorded (`commit_checks.runner
 from __future__ import annotations
 
 import dataclasses
+import json
 import re
 import shlex
 import subprocess
@@ -571,6 +572,9 @@ class _StepRun:
     # A `read_only_roles` session (`_decide_read_only`): no edits, no skills listing, a shorter idle limit. A resumed
     # session keeps what it started with (`agent_started.read_only`, kept on the step row beside its session).
     read_only: bool = False
+    # Any session of this step since its `step_started` was read-only (this process's, or a recorded `agent_started`):
+    # the tree guard stays on, though a fresh session (a rollover, a config edit) re-decides `read_only` (`_guard_read_only`).
+    read_only_seen: bool = False
     # This step's turn cap, over `agents.<name>.max_turns` on every call of it; None: the agent's own (a later doubt
     # round's review gets half, `doubt.delta_turn_cap`).
     max_turns: int | None = None
@@ -602,7 +606,8 @@ REOPENING = ("hitl_approved", "step_reopened")
 DENIED_SHOWN = 15  # commands listed in a blocked inbox
 DENIED_TEXT_MAX = 200
 READ_ONLY_DENIED = "This step runs read-only (`agents.claude.read_only_roles`): these denials are by design."
-READ_ONLY_REVERT = "Revert these before you approve or retry: a later step commits the whole work tree."
+READ_ONLY_REVERT = "Revert these before the run continues: a later step commits the whole work tree."
+READ_ONLY_EDITS_SHOWN = DENIED_SHOWN  # `read_only_edit` paths named in a stop; the event keeps them all
 
 
 def _approved(events: list[dict], key: str) -> dict | None:
@@ -626,7 +631,21 @@ def _after_approval(events: list[dict], key: str) -> list[dict]:
 
 
 def _violation_text(violations: list[Violation]) -> str:
-    return "; ".join(f"{v.kind}: {v.detail}" for v in violations)
+    """The violations for a stop's summary. The `read_only_edit` paths are listed once, where the first one is, each
+    quoted (`json.dumps`: a newline or a control character in a name stays on its line) and at most
+    `READ_ONLY_EDITS_SHOWN` of them, then `and <k> more`; the `guard_tripped` event keeps every path."""
+    edits = [v.detail for v in violations if v.kind == "read_only_edit"]
+    parts: list[str] = []
+    listed_edits = False
+    for v in violations:
+        if v.kind != "read_only_edit":
+            parts.append(f"{v.kind}: {v.detail}")
+        elif not listed_edits:
+            listed_edits = True
+            listed = ", ".join(json.dumps(path) for path in edits[:READ_ONLY_EDITS_SHOWN])
+            more = f" and {len(edits) - READ_ONLY_EDITS_SHOWN} more" if len(edits) > READ_ONLY_EDITS_SHOWN else ""
+            parts.append(f"read_only_edit: {listed}{more}")
+    return "; ".join(parts)
 
 
 # --------------------------------------------------------------------------- executor
@@ -812,6 +831,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if isinstance(baseline, list):
                 return self._fail(sr, baseline)
             sr.start_head, sr.start_tree = baseline
+            # a session of this step since that baseline ran read-only (one a dead runner left, too): the guard stays on
+            sr.read_only_seen = sr.read_only_seen or any(
+                e["type"] == "agent_started" and (e.get("step") or e.get("key")) == key and e.get("read_only") is True
+                for e in since)
             if (_approved(since, key) or {}).get("type") == "hitl_approved":
                 sr.resume_tree = snapshot(self.worktree)
             fresh = _after_approval(since, key)
@@ -890,7 +913,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if called.refused:  # the git state changed: nothing that reads the tree has run, and nothing may
                 return self._fail(sr, called.refused)
             violations = check_step(self.cfg, self.worktree, sr.start_head, sr.start_tree, called.after,
-                                    outcome.tool_calls, sr.step.forbid, read_only=sr.read_only)
+                                    outcome.tool_calls, sr.step.forbid, read_only=self._guard_read_only(sr))
             if sr.step.reconciles:
                 violations = [*violations, *self._outside_output(sr)]
             if violations:
@@ -1009,8 +1032,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             step_key=sr.key,
             result_path=self.run.agent_result_path(sr.key),
             transcript_path=self.run.transcript_path(sr.key, attempt),
-            # The workspace only: never the runs root (events, state, inbox). A read-only call may write every add-dir
-            # (`agents.read_only_allow`), so nothing else may ever join this list.
+            # The workspace only: never the runs root (events, state, inbox). A read-only call may write the `out/`
+            # folder of every add-dir (`agents.read_only_allow`), so nothing else may ever join this list.
             add_dirs=[self.run.agent_dir],
             runs_root=self.run.dir.parent,  # denied to the agent's edits, wherever the pack puts the state dir
             timeout_s=self._timeout_s(),
@@ -1435,7 +1458,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                     e["type"] == "read_only_skipped" for e in self.run.events.read()):
                 self.run.emit("read_only_skipped", key=sr.key, reason=str(exc))
             return
-        sr.read_only = True
+        sr.read_only = sr.read_only_seen = True
 
     def _set_read_only_note(self, sr: _StepRun) -> None:
         """A fresh read-only session's `{read_only_note}`: the note (its `{progress}` filled in here, because a value's
@@ -1452,6 +1475,13 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         """A resumed session's read-only setting, from its step row (`agent_started.read_only`), whatever the config
         says now. A session from before the setting, or a row whose setting belongs to another session, is False."""
         sr.read_only = row.get("read_only") is True and row.get("read_only_session") == session
+        sr.read_only_seen = sr.read_only_seen or sr.read_only
+
+    def _guard_read_only(self, sr: _StepRun) -> bool:
+        """The tree guard's `read_only` (`check_step`): this session is read-only, or an earlier session of the step
+        since its baseline was (`read_only_seen`), whatever a fresh session decided since. The argv and the prompt
+        follow `sr.read_only` alone."""
+        return sr.read_only or sr.read_only_seen
 
     def _self_contained(self, sr: _StepRun) -> bool:
         """The call gets no skills listing (`--disable-slash-commands`), so its prompt names skill files, not skills: a

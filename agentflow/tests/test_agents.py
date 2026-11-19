@@ -15,6 +15,7 @@ import pytest
 from agentflow.agents import (
     READ_ONLY_ALLOW,
     READ_ONLY_DENY,
+    READ_ONLY_WRITES,
     REVIEW_TOOLS,
     AgentCall,
     RUNNER_ONLY_DENY,
@@ -30,6 +31,7 @@ from agentflow.agents import (
     parse_codex_line,
     read_only_allow,
 )
+from agentflow import workspace
 from agentflow.config import load_config
 from agentflow.layers import user_config_path
 from agentflow.state import runs_root
@@ -261,22 +263,29 @@ def test_a_read_only_role_call_cannot_edit_or_test(cfg, call, tmp_path):
     assert ("--permission-mode", "dontAsk") in pairs(resumed) and ("--resume", "abc") in pairs(resumed)
 
 
-def test_the_read_only_allow_list_names_only_reads_and_the_workspace(tmp_path):
+def test_the_read_only_allow_list_names_only_reads_and_the_workspace_out_folder(tmp_path):
     ws, other = tmp_path / "ws", tmp_path / "other"
     allow = read_only_allow([ws, other])
     assert allow[:3] == ["Read", "Grep", "Glob"] and allow[:len(READ_ONLY_ALLOW)] == list(READ_ONLY_ALLOW)
-    assert allow[len(READ_ONLY_ALLOW):] == [f"Edit(/{ws}/**)", f"Edit(/{other}/**)"]
+    # only the result folder: `progress.md` in the workspace is read by the later steps that edit the code
+    assert allow[len(READ_ONLY_ALLOW):] == [f"Edit(/{ws}/out/**)", f"Edit(/{other}/out/**)"]
+    assert READ_ONLY_WRITES == workspace.OUT_DIR
     for sub in ("diff", "log", "show", "status", "blame"):
         assert {f"Bash(git {sub})", f"Bash(git {sub} *)"} <= set(allow)
     assert not [rule for rule in allow if rule.startswith("Bash(") and not rule.startswith("Bash(git ")]
     assert read_only_allow([]) == list(READ_ONLY_ALLOW)
 
 
-def test_read_only_allow_refuses_pattern_characters(tmp_path):
-    for bad in ("app[1]", "a*b", "a?b", "a{b}", "a\\b"):
-        with pytest.raises(ValueError):
-            read_only_allow([tmp_path / "ws" / bad])
-    assert read_only_allow([tmp_path / "ws" / "ok-name_1.2 x"])  # spaces and dots are not pattern characters
+@pytest.mark.parametrize("bad", ["app[1]", "a*b", "a?b", "a{b}", "a\\b", "a(b", "a)b", "a!b", "a#b", "a|b", "a@b",
+                                 "a+b", "a,b", "a\tb", "a\nb", "a\rb", "a\x00b", "a\x7fb", "a b", "a‮b",
+                                 "a​b"])
+def test_read_only_allow_refuses_pattern_and_control_characters(tmp_path, bad):
+    with pytest.raises(ValueError):
+        read_only_allow([tmp_path / "ws" / bad])
+
+
+def test_read_only_allow_takes_plain_names(tmp_path):
+    assert read_only_allow([tmp_path / "ws" / "ok-name_1.2 x~é"])  # a plain space, dots and letters name only themselves
 
 
 def test_other_calls_keep_their_argv(cfg, call, runs):

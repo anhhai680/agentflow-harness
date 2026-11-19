@@ -244,7 +244,7 @@ def test_review_clean_after_fix_commits(lane, git):
 
 
 TOY = "toy/x.py"
-REVERT = "Revert these before you approve or retry: a later step commits the whole work tree."
+REVERT = "Revert these before the run continues: a later step commits the whole work tree."
 
 
 def begin_toy_build(flow_repo):
@@ -301,7 +301,7 @@ def test_a_forced_review_edit_fails_the_step(lane, git):
     assert build(lane, run) == ("stopped", True)
     waiting = run.refresh()["waiting"]
     assert waiting["kind"] == "guard_violation" and waiting["key"] == review_key
-    assert f"read_only_edit: {TOY}" in waiting["summary"] and REVERT in waiting["summary"]
+    assert f'read_only_edit: "{TOY}"' in waiting["summary"] and REVERT in waiting["summary"]
     assert not lane.events(run, "step_committed") and not lane.events(run, "task_committed")
     assert "Task 1: First thing" not in subjects(git, lane.root)
     reviews = len([c for c in lane.calls() if c["step"] == review_key])
@@ -310,7 +310,7 @@ def test_a_forced_review_edit_fails_the_step(lane, git):
     assert build(lane, run) == ("stopped", True)
     assert len([c for c in lane.calls() if c["step"] == review_key]) == reviews
     waiting = run.refresh()["waiting"]
-    assert waiting["kind"] == "guard_violation" and f"read_only_edit: {TOY}" in waiting["summary"]
+    assert waiting["kind"] == "guard_violation" and f'read_only_edit: "{TOY}"' in waiting["summary"]
     assert REVERT in waiting["summary"]
 
     git(lane.root, "checkout", "--", TOY)

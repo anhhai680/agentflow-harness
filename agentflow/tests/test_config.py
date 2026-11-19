@@ -2438,6 +2438,19 @@ def test_read_only_flags_in_base_args_are_errors(sparse_repo):
         assert found == [("error", "agents.claude.base_args")], arg
     for arg in ("--tools", "--settings={}"):
         assert not errors(_sparse_issues(sparse_repo, claude={"read_only_roles": [], "base_args": ["-p", arg]})), arg
+    found = errors(_sparse_issues(sparse_repo, claude={"read_only_roles": ["review"], "base_args": ["-p", "--agent", "x"]}))
+    assert found == [("error", "agents.claude.base_args")]  # a profile's own mode, tools and hooks could widen it
+
+
+@pytest.mark.parametrize("arg,why", [("--tools", "read_only_roles"), ("--settings={}", "read_only_roles"),
+                                     ("--agent=x", "read_only_roles"), ("--permission-mode", "settings"),
+                                     ("--dangerously-skip-permissions", "settings"),
+                                     ("--allowedTools=Bash", "settings"), ("--setting-sources", "user_settings")])
+def test_runner_flags_in_the_command_are_errors(sparse_repo, arg, why):
+    """`command` past the program reaches every argv, as `base_args` does: the same flags are refused there."""
+    found = [i for i in _sparse_issues(sparse_repo, claude={"command": ["claude", arg]}) if i.level == "error"]
+    assert [i.path for i in found] == ["agents.claude.command"] and why in found[0].message
+    assert not errors(_sparse_issues(sparse_repo, claude={"command": ["claude", "--verbose"]}))
 
 
 def test_read_only_roles_on_codex_warns(sparse_repo):

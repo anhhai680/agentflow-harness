@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import os
@@ -2298,11 +2299,11 @@ def run_review(flow_repo, executor=None, key: str = REVIEW_KEY, step: Step | Non
 
 
 def read_only_argv(argv: list[str], workspace) -> bool:
-    """The argv of a read-only role call: `dontAsk`, and an allow list whose only write rule is the workspace's."""
+    """The argv of a read-only role call: `dontAsk`, and an allow list whose only write rule is the workspace's `out/`."""
     settings = json.loads(dict(pairs(argv))["--settings"])
     allow = settings["permissions"].get("allow") or []
     writes = [rule for rule in allow if rule.startswith("Edit(")]
-    return ("--permission-mode", "dontAsk") in pairs(argv) and writes == [f"Edit(/{workspace}/**)"]
+    return ("--permission-mode", "dontAsk") in pairs(argv) and writes == [f"Edit(/{workspace}/out/**)"]
 
 
 def needs_human_result() -> dict:
@@ -2342,6 +2343,80 @@ def test_a_resumed_review_keeps_read_only(flow_repo):
         assert ("--permission-mode", "bypassPermissions") in pairs(call["argv"])
         assert "dontAsk" not in call["argv"] and "--disable-slash-commands" not in call["argv"]
     assert run.state["steps"][KEY]["read_only"] is False
+
+
+def test_the_read_only_guard_stays_on_after_a_rollover_that_drops_the_role(flow_repo, monkeypatch):
+    """A rollover re-decides read-only from the config now: the guard still covers what the read-only session did."""
+    run = flow_repo.new_run()
+    executor = flow_repo.executor(run)
+    agent = executor.agents["claude"]
+    real = agent.run
+    seen: list[list[str]] = []
+
+    def spy(call, on_event):
+        seen.append(agent.argv(call))
+        if len(seen) == 2:  # what the read-only session left running (a background process) lands now
+            (executor.worktree / "notes.txt").write_text("mine\n", encoding="utf-8")
+        outcome = real(call, on_event)
+        if len(seen) == 1:  # `read_only_roles` loses `review` before the fresh session is decided
+            executor.cfg.agents["claude"] = dataclasses.replace(executor.cfg.agents["claude"], read_only_roles=())
+        return outcome
+
+    monkeypatch.setattr(agent, "run", spy)
+    flow_repo.script({REVIEW_KEY: [{"usage_pct": [81]}, {"result": DONE}]})
+    assert run_review(flow_repo, executor=executor) == "stopped"
+    assert read_only_argv(seen[0], run.agent_dir) and "dontAsk" not in seen[1]  # the fresh session is not read-only
+    assert [e["read_only"] for e in flow_repo.events(run, "agent_started")] == [True, False]
+    (tripped,) = flow_repo.events(run, "guard_tripped")
+    assert tripped["violations"] == [{"kind": "read_only_edit", "detail": "notes.txt"}]
+    assert hitl_kinds(flow_repo, run) == ["guard_violation"]
+
+
+def test_the_read_only_guard_stays_on_for_a_restarted_runner(flow_repo, monkeypatch):
+    """A runner that died during a read-only session with no session id yet: the restart starts a fresh session
+    under a config that dropped the role, and the guard still covers the dead session's edits."""
+    run = flow_repo.new_run()
+    executor = flow_repo.executor(run)
+    agent = executor.agents["claude"]
+    real = agent.run
+
+    def dies(call, on_event):
+        real(call, on_event)
+        raise RuntimeError("the runner died")
+
+    monkeypatch.setattr(agent, "run", dies)
+    flow_repo.script({REVIEW_KEY: [{"no_init": True, "write": {"notes.txt": "mine\n"}}, {"result": DONE}]})
+    with pytest.raises(RuntimeError):
+        run_review(flow_repo, executor=executor)
+    assert run.refresh()["steps"][REVIEW_KEY].get("session_id") is None
+    flow_repo.configure({"agents": {"claude": {"read_only_roles": []}}})
+    assert run_review(flow_repo, executor=flow_repo.executor(run)) == "stopped"
+    assert [e["read_only"] for e in flow_repo.events(run, "agent_started")] == [True, False]
+    (tripped,) = flow_repo.events(run, "guard_tripped")
+    assert tripped["violations"] == [{"kind": "read_only_edit", "detail": "notes.txt"}]
+
+
+def test_a_read_only_edit_stop_quotes_and_caps_its_paths(flow_repo):
+    from agentflow.run_control import retry
+
+    run = flow_repo.new_run()
+    names = ["a\nforged: line.txt", *(f"f{n:02}.txt" for n in range(20))]
+    flow_repo.script({REVIEW_KEY: [{"write": {name: "x\n" for name in names}, "result": DONE}]})
+    assert run_review(flow_repo) == "stopped"
+    summary = run.refresh()["waiting"]["summary"]
+    assert "\n" not in summary.split(". Revert", 1)[0]  # a name's newline can't start a line of its own
+    assert '"a\\nforged: line.txt"' in summary and f"and {len(names) - lanes.READ_ONLY_EDITS_SHOWN} more" in summary
+    assert '"f13.txt"' in summary and "f14.txt" not in summary  # sorted, cut after `READ_ONLY_EDITS_SHOWN`
+    (tripped,) = flow_repo.events(run, "guard_tripped")
+    assert sorted(v["detail"] for v in tripped["violations"]) == sorted(names)  # the event keeps every path
+
+    # The retry check reads the event's full list: a path past the cap still refuses the restart.
+    for name in names[:-1]:
+        (flow_repo.root / name).unlink()
+    retry(run, REVIEW_KEY, by="me")
+    assert run_review(flow_repo, executor=flow_repo.executor(run)) == "stopped"
+    assert run.refresh()["waiting"]["kind"] == "guard_violation"
+    assert '"f19.txt"' in run.state["waiting"]["summary"]
 
 
 def test_an_unsafe_workspace_path_runs_as_today(flow_repo, monkeypatch, tmp_path):

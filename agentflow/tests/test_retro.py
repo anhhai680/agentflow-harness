@@ -212,6 +212,19 @@ def test_each_signal_event_is_evidence_and_runner_settled_ones_are_not(tmp_git, 
     assert "runner note" not in evidence and "runner answer" not in evidence
 
 
+def test_a_read_only_denial_is_marked_by_design_in_the_evidence(tmp_git, cfg):
+    _finished(tmp_git, extra=[
+        {"type": "permission_denied", "key": "review/review", "tool": "Bash", "input": {"command": "pytest -q"},
+         "read_only": True},
+        {"type": "permission_denied", "key": "build/build", "tool": "Bash", "input": {"command": "make x"}},
+    ])
+    evidence = _section(build_digest(tmp_git, cfg, None, NOW).text, "## Evidence")
+    lines = [line for line in evidence.splitlines() if "permission_denied" in line]
+    assert len(lines) == 2  # marked, not skipped: a reviewer that keeps trying tests is still a lesson
+    assert lines[0].endswith("review/review tool Bash (read-only session: denied by design)")
+    assert lines[1].endswith("build/build tool Bash") and "pytest -q" in evidence
+
+
 def test_reconciled_noise_is_retro_evidence(tmp_git, cfg):
     reconciled = {"type": "findings_reconciled", "key": "plan/plan_reconcile", "phase": "plan", "round": 1,
                   "unresolved": [], "before": "a", "after": "b", "dispositions": [
@@ -605,7 +618,7 @@ def test_retro_session_is_read_only_and_writes_its_result(flow_repo, gh_log):
     assert ("--permission-mode", "dontAsk") in pairs and "--disable-slash-commands" in argv
     assert ("--tools", "Read,Grep,Glob,Bash,Write") in pairs and ("--add-dir", str(run.agent_dir)) in pairs
     allow = json.loads(dict(pairs)["--settings"])["permissions"]["allow"]
-    assert "Read" in allow and [r for r in allow if r.startswith("Edit(")] == [f"Edit(/{run.agent_dir}/**)"]
+    assert "Read" in allow and [r for r in allow if r.startswith("Edit(")] == [f"Edit(/{run.agent_dir}/out/**)"]
     denied = [e for e in run.events.read() if e["type"] == "permission_denied"]
     assert [(e["tool"], e.get("read_only")) for e in denied] == [("Bash", True), ("Write", True)]
     assert not (Path(run.state["worktree"]) / "notes.txt").exists()
@@ -698,13 +711,13 @@ def test_renew_beyond_180_days_is_dropped(flow_repo, gh_log):
         assert text in dropped, text
 
 
-def test_a_session_that_edits_files_stops_blocked_without_a_pr(flow_repo, gh_log):
+def test_a_session_that_edits_files_stops_on_the_guard_without_a_pr(flow_repo, gh_log):
     a, _b = _two_runs_failing(flow_repo, "unit")
     flow_repo.fake.script({KEY: [_retro_result(add=[_add(sources=[f"{a}#{SEQ}"])], write={"notes.txt": "mine\n"})]})
     out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
     assert out.pr_url is None and not _created(gh_log)
     waiting = _waiting(flow_repo, out)  # the read-only session's guard sees the edit first
-    assert waiting["kind"] == "guard_violation" and "read_only_edit: notes.txt" in waiting["summary"]
+    assert waiting["kind"] == "guard_violation" and 'read_only_edit: "notes.txt"' in waiting["summary"]
     assert _run(flow_repo, out).state["branch"] not in run_git(flow_repo.origin, "branch", "--list")
 
 
@@ -1562,6 +1575,29 @@ def test_cli_retro_dry_run_prints_the_digest_and_creates_nothing(flow_repo, caps
     assert "# Retro digest" in printed and f"{a}#{SEQ}" in printed and "dry run" in printed
     assert not _retro_runs(flow_repo) and "retro" not in run_git(flow_repo.root, "branch", "--list")
     assert not flow_repo.calls()
+    # the session's real prompt: a read-only session's note, its `{progress}` filled in
+    assert "## This session is read-only" in printed and "Do not write `(the run's workspace)/progress.md`" in printed
+    assert "{read_only_note}" not in printed and "{progress}" not in printed
+
+
+def test_retro_dry_run_prompt_matches_the_sessions_prompt(flow_repo, gh_log, capsys):
+    a, _b = _two_runs_failing(flow_repo, "unit")
+    assert run_retro(flow_repo.root, flow_repo.cfg, None, True, NOW, out=sys.stdout).run_id is None
+    dry = capsys.readouterr().out.split("\n", 1)[1]
+    flow_repo.fake.script({KEY: [_retro_result(add=[_add(sources=[f"{a}#{SEQ}"])])]})
+    out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    run = _run(flow_repo, out)
+    (call,) = flow_repo.calls()
+    real = call["argv"][-1]
+    for path, shown in ((run.agent_result_path(KEY), "(the run's result file)"),
+                        (run.progress_path(), "(the run's workspace)/progress.md"), (run.agent_dir, "(the run's workspace)")):
+        real = real.replace(str(path), shown)
+    real = real.replace(f"`{run.id}`", "``")  # a dry run has no run id yet
+    assert real.strip() in dry  # the dry run prints the digest, then this very prompt
+
+    flow_repo.configure({"agents": {"claude": {"read_only_roles": []}}})
+    assert run_retro(flow_repo.root, flow_repo.cfg, None, True, NOW, out=sys.stdout).run_id is None
+    assert "## This session is read-only" not in capsys.readouterr().out
 
 
 def test_cli_retro_prints_the_outcome_and_the_pr(flow_repo, gh_log, capsys):

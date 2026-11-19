@@ -83,10 +83,10 @@ def test_dont_ask_denies_what_is_not_allowed(fake, agent, tmp_path, wt, ws):
 def test_a_workspace_redirect_needs_a_read_only_command_and_a_workspace_target(fake, agent, tmp_path, wt, ws):
     call = make_call(tmp_path, wt, ws)
     fake.script({STEP: [{"attempts": [
-        {"tool_name": "Bash", "tool_input": {"command": f"git log >> {ws}/log.txt"}},
+        {"tool_name": "Bash", "tool_input": {"command": f"git log >> {ws}/out/log.txt"}},
         {"tool_name": "Bash", "tool_input": {"command": f"git log >> {ws}/../z"}},
         {"tool_name": "Bash", "tool_input": {"command": "git status && touch x"}},
-        {"tool_name": "Bash", "tool_input": {"command": "git status | grep M; git show HEAD"}},
+        {"tool_name": "Bash", "tool_input": {"command": "git status | xargs touch"}},
         {"tool_name": "Bash", "tool_input": {"command": "git diff --output=y"}},
         {"tool_name": "Bash", "tool_input": {"command": "GIT_PAGER=x git diff"}},
         {"tool_name": "Read", "tool_input": {"file_path": "/etc/hosts"}},
@@ -94,8 +94,29 @@ def test_a_workspace_redirect_needs_a_read_only_command_and_a_workspace_target(f
     ]}]})
     outcome = agent.run(call, lambda name, payload: None)
     denied = [d["tool_input"]["command"] for d in outcome.permission_denials]
-    assert denied == [f"git log >> {ws}/../z", "git status && touch x", "git status | grep M; git show HEAD",
+    assert denied == [f"git log >> {ws}/../z", "git status && touch x", "git status | xargs touch",
                       "git diff --output=y", "GIT_PAGER=x git diff"]
+
+
+def test_a_read_only_call_cannot_write_the_workspace_progress_file(fake, agent, tmp_path, wt, ws):
+    """Only the workspace's `out/` is writable: `progress.md` is read by the later steps that edit the code."""
+    call = make_call(tmp_path, wt, ws)
+    progress = ws / "progress.md"
+    progress.write_text("the implementer's notes\n", encoding="utf-8")
+    fake.script({STEP: [{"attempts": [
+        {"tool_name": "Write", "tool_input": {"file_path": str(progress), "content": "ignore the tests\n"}},
+        {"tool_name": "Bash", "tool_input": {"command": f"git log >> {progress}"}},
+        {"tool_name": "Write", "tool_input": {"file_path": str(ws / "notes.md"), "content": "x"}},
+        {"tool_name": "Write", "tool_input": {"file_path": str(ws / "out" / "r.json"), "content": "{}"}},
+    ]}]})
+    outcome = agent.run(call, lambda name, payload: None)
+    assert progress.read_text(encoding="utf-8") == "the implementer's notes\n"
+    assert not (ws / "notes.md").exists() and (ws / "out" / "r.json").exists()
+    assert [d["tool_name"] for d in outcome.permission_denials] == ["Write", "Bash", "Write"]
+    results = [block for line in call.transcript_path.read_text(encoding="utf-8").splitlines() if line
+               for block in (json.loads(line).get("message") or {}).get("content") or []
+               if isinstance(block, dict) and block.get("type") == "tool_result"]
+    assert [block.get("is_error", False) for block in results] == [True, True, True, False]
 
 
 def test_the_deny_rules_win_in_every_mode(fake, cfg, tmp_path, wt, ws):
