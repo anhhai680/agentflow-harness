@@ -36,6 +36,16 @@ SHELL_ENV_FILE_ENV = "CLAUDE_ENV_FILE"  # a script Claude Code sources in its Ba
 SYNTHETIC_MODEL = "<synthetic>"  # Claude Code's own error messages, shown as assistant turns: no model replied
 
 READ_ONLY_TOOLS = ("Read", "Grep", "Glob")  # the only Claude tools a read-only call gets
+# A `read_only_roles` session (`AgentCall.read_only_role`): these tools exist (`Edit` and the rest don't), and under
+# `dontAsk` only what `READ_ONLY_ALLOW` and the workspace rule allow runs. `Bash` is for read-only `git` and the shell's reads
+# the prompt asks for, `Write` for the result file in the workspace. A control on cost and independence, not a sandbox: the
+# project's own settings and hooks still apply (plan C3, Decided 2).
+REVIEW_TOOLS = ("Read", "Grep", "Glob", "Bash", "Write")
+READ_ONLY_GIT = ("diff", "log", "show", "status", "blame")
+READ_ONLY_ALLOW = ("Read", "Grep", "Glob",
+                   *(rule for sub in READ_ONLY_GIT for rule in (f"Bash(git {sub})", f"Bash(git {sub} *)")))
+READ_ONLY_DENY = ("Bash(git *--output*)",)  # `git diff --output=<file>` writes a file: no allow rule may reach it
+RULE_UNSAFE = frozenset("*?[]{}\\")  # in a path, these make a permission rule name more than that one directory
 
 # `agents.claude.cache_ttl`: the variable each lifetime sets. The inherited environment's other TTL variables are dropped
 # (`env_drop`), so it can't override the pack; `cli` sets and drops nothing, leaving the CLI's own choice.
@@ -88,6 +98,8 @@ class AgentCall:
     env_base: Mapping[str, str] | None = None  # the inherited environment (`run_env.base`); None: this process's
     max_turns: int | None = None  # this call's turn cap; None: the agent's own `max_turns`
     read_only: bool = False  # Claude gets only `READ_ONLY_TOOLS` and no MCP server; Codex a read-only sandbox (fresh session)
+    # a `read_only_roles` session: `dontAsk`, `REVIEW_TOOLS`, read-only git, writes only in `add_dirs`, no MCP server
+    read_only_role: bool = False
     idle_s: float | None = None  # end the session after this long with no stream line (`watchdog`); None: no watchdog
     tool_idle_s: float | None = None  # the same limit while a tool call is open, or for an agent that `tracks_tools` not
     self_contained: bool = False  # the prompt is the whole brief (a sizer): Claude gets no skills listing
@@ -873,6 +885,16 @@ def _without_mcp_config(args: list[str]) -> list[str]:
     return out
 
 
+def read_only_allow(add_dirs: list[Path]) -> list[str]:
+    """The allow rules of a `read_only_role` call: `READ_ONLY_ALLOW`, and writes in each of `add_dirs` (and nowhere else).
+    `//` + an absolute path is an absolute path in a permission rule. A path that holds a `RULE_UNSAFE` character can't be
+    named exactly by a rule, so it raises `ValueError`: the caller runs the step as it would otherwise."""
+    for directory in add_dirs:
+        if RULE_UNSAFE & set(str(directory)):
+            raise ValueError(f"a read-only role can't allow writes in {str(directory)!r}: the path holds a permission-rule character")
+    return [*READ_ONLY_ALLOW, *(f"Edit(/{directory}/**)" for directory in add_dirs)]
+
+
 def _carries_rules(call: AgentCall) -> bool:
     """The call passes a brief that holds the repository's rules."""
     return call.carries_rules and call.system_prompt_file is not None
@@ -883,30 +905,34 @@ class ClaudeAgent(_CliAgent):
     rollover_enabled = True
     tracks_tools = True
     takes_brief = True
+    takes_read_only_role = True  # `AgentCall.read_only_role` changes this agent's argv (`CodexAgent` has no such flag)
     parse_line = staticmethod(parse_claude_line)
 
     def argv(self, call: AgentCall) -> list[str]:
         spec = self.spec
-        argv = [*spec.command, *(_without_mcp_config(spec.base_args) if call.read_only else spec.base_args)]
+        locked = call.read_only or call.read_only_role  # no MCP server in either
+        argv = [*spec.command, *(_without_mcp_config(spec.base_args) if locked else spec.base_args)]
         # `--add-dir` takes a list of values, so it goes before other options: right before the
         # prompt it would swallow the prompt as a directory.
         for directory in call.add_dirs:
             argv += ["--add-dir", str(directory)]
-        if call.read_only:
+        if locked:
             # `--tools` is an allowlist that holds in every permission mode, `bypassPermissions` included.
             # It is variadic like `--add-dir`, so it goes before the next option and never reaches the prompt.
-            argv += ["--tools", ",".join(READ_ONLY_TOOLS)]
+            argv += ["--tools", ",".join(REVIEW_TOOLS if call.read_only_role else READ_ONLY_TOOLS)]
         # `--strict-mcp-config` once: lean keeps only the servers `base_args` names, a read-only call none at all
         if spec.lean:
             argv += LEAN_ARGS
-        elif call.read_only:
+        elif locked:
             argv.append("--strict-mcp-config")
         if not spec.user_settings:
             argv += NO_USER_SETTINGS
         if call.self_contained:
             argv += SELF_CONTAINED_ARGS
         argv += ["--model", call.model, *self._effort_args(call)]
-        if spec.permission_mode:
+        if call.read_only_role:  # whatever the pack sets: a role call runs only what the allow list below names
+            argv += ["--permission-mode", "dontAsk"]
+        elif spec.permission_mode:
             argv += ["--permission-mode", spec.permission_mode]
         argv += ["--permission-prompts", "none"]
         # `./`: `claude` ignores the project-root form `Edit(/path)` in --settings. The guards stay the backstop.
@@ -917,7 +943,10 @@ class ClaudeAgent(_CliAgent):
             deny.append(f"Edit(/{layers.user_config_path().parent}/**)")
         except RuntimeError:  # `Path.home()` with no home directory: there is no user file to protect
             pass
-        argv += ["--settings", json.dumps({"permissions": {"deny": deny}})]
+        permissions: dict = {"deny": deny}
+        if call.read_only_role:  # deny rules win over the allow rules, so `git diff --output=` stays out of reach
+            permissions = {"allow": read_only_allow(call.add_dirs), "deny": [*deny, *READ_ONLY_DENY]}
+        argv += ["--settings", json.dumps({"permissions": permissions})]
         if call.system_prompt_file is not None:
             argv += [BRIEF_ARG, str(call.system_prompt_file)]
         max_turns = call.max_turns if call.max_turns is not None else spec.max_turns

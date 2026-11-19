@@ -13,6 +13,9 @@ from pathlib import Path
 import pytest
 
 from agentflow.agents import (
+    READ_ONLY_ALLOW,
+    READ_ONLY_DENY,
+    REVIEW_TOOLS,
     AgentCall,
     RUNNER_ONLY_DENY,
     TTL_VARS,
@@ -25,6 +28,7 @@ from agentflow.agents import (
     make_agents,
     parse_claude_line,
     parse_codex_line,
+    read_only_allow,
 )
 from agentflow.config import load_config
 from agentflow.layers import user_config_path
@@ -230,6 +234,76 @@ def test_a_read_only_claude_call_drops_the_packs_mcp_config(cfg, call, mcp):
     assert not [a for a in argv if a.startswith("--mcp-config")] and not {"servers.json", "a.json", "b.json"} & set(argv)
     assert ("--output-format", "stream-json") in pairs(argv) and "--verbose" in argv
     assert [a for a in claude.argv(call) if a.startswith("--mcp-config")]  # a working call keeps the pack's servers
+
+
+def test_a_read_only_role_call_cannot_edit_or_test(cfg, call, tmp_path):
+    ws = tmp_path / "ws"
+    spec = dataclasses.replace(cfg.agents["claude"], permission_mode="bypassPermissions",
+                               base_args=["--verbose", "--mcp-config", "servers.json", "--output-format", "stream-json"])
+    claude = ClaudeAgent(spec, cfg.context)
+    for lean in (True, False):
+        agent = ClaudeAgent(dataclasses.replace(spec, lean=lean), cfg.context)
+        argv = agent.argv(dataclasses.replace(call, read_only_role=True, add_dirs=[ws], self_contained=True))
+        assert argv.count("--permission-mode") == 1 and ("--permission-mode", "dontAsk") in pairs(argv)
+        assert "bypassPermissions" not in argv
+        assert ("--tools", "Read,Grep,Glob,Bash,Write") in pairs(argv) and REVIEW_TOOLS == ("Read", "Grep", "Glob", "Bash", "Write")
+        assert argv.count("--strict-mcp-config") == 1
+        assert not [a for a in argv if a.startswith("--mcp-config")] and "servers.json" not in argv
+        assert "--disable-slash-commands" in argv  # through `self_contained`, which the executor sets
+        permissions = json.loads(argv[argv.index("--settings") + 1])["permissions"]
+        assert permissions["allow"] == read_only_allow([ws])
+        assert permissions["deny"][-1] == "Bash(git *--output*)" and tuple(permissions["deny"][-len(READ_ONLY_DENY):]) == READ_ONLY_DENY
+        assert set(RUNNER_ONLY_DENY) <= set(permissions["deny"])
+        assert argv.index("--tools") < argv.index("--model") and argv[-1] == call.prompt
+    # without `self_contained` the argv gets no skills flag of its own
+    assert "--disable-slash-commands" not in claude.argv(dataclasses.replace(call, read_only_role=True))
+    resumed = claude.argv(dataclasses.replace(call, read_only_role=True, resume_session="abc"))
+    assert ("--permission-mode", "dontAsk") in pairs(resumed) and ("--resume", "abc") in pairs(resumed)
+
+
+def test_the_read_only_allow_list_names_only_reads_and_the_workspace(tmp_path):
+    ws, other = tmp_path / "ws", tmp_path / "other"
+    allow = read_only_allow([ws, other])
+    assert allow[:3] == ["Read", "Grep", "Glob"] and allow[:len(READ_ONLY_ALLOW)] == list(READ_ONLY_ALLOW)
+    assert allow[len(READ_ONLY_ALLOW):] == [f"Edit(/{ws}/**)", f"Edit(/{other}/**)"]
+    for sub in ("diff", "log", "show", "status", "blame"):
+        assert {f"Bash(git {sub})", f"Bash(git {sub} *)"} <= set(allow)
+    assert not [rule for rule in allow if rule.startswith("Bash(") and not rule.startswith("Bash(git ")]
+    assert read_only_allow([]) == list(READ_ONLY_ALLOW)
+
+
+def test_read_only_allow_refuses_pattern_characters(tmp_path):
+    for bad in ("app[1]", "a*b", "a?b", "a{b}", "a\\b"):
+        with pytest.raises(ValueError):
+            read_only_allow([tmp_path / "ws" / bad])
+    assert read_only_allow([tmp_path / "ws" / "ok-name_1.2 x"])  # spaces and dots are not pattern characters
+
+
+def test_other_calls_keep_their_argv(cfg, call, runs):
+    # a literal copy of what a build call and a sizer call get today: the new flag changes neither
+    deny = json.dumps({"permissions": {"deny": [*RUNNER_ONLY_DENY, f"Edit(/{runs}/**)",
+                                                 f"Edit(/{user_config_path().parent}/**)"]}})
+    call = dataclasses.replace(call, runs_root=runs)
+    claude = ClaudeAgent(cfg.agents["claude"], cfg.context)
+    spec = cfg.agents["claude"]
+    expected = [*spec.command, *spec.base_args, "--add-dir", str(runs),
+                "--exclude-dynamic-system-prompt-sections", "--strict-mcp-config", "--setting-sources", "project,local",
+                "--model", "sonnet", "--effort", "medium", "--permission-mode", "bypassPermissions",
+                "--permission-prompts", "none", "--settings", deny, "--max-turns", "80", call.prompt]
+    assert claude.argv(call) == expected
+    sizer = dataclasses.replace(call, read_only=True)
+    assert claude.argv(sizer) == [
+        *spec.command, *spec.base_args, "--add-dir", str(runs), "--tools", "Read,Grep,Glob",
+        "--exclude-dynamic-system-prompt-sections", "--strict-mcp-config", "--setting-sources", "project,local",
+        "--model", "sonnet", "--effort", "medium", "--permission-mode", "bypassPermissions",
+        "--permission-prompts", "none", "--settings", deny, "--max-turns", "80", call.prompt]
+    assert claude.argv(dataclasses.replace(call, read_only_role=False)) == expected
+
+
+def test_codex_ignores_read_only_role(codex, call):
+    assert codex.argv(dataclasses.replace(call, read_only_role=True)) == codex.argv(call)
+    assert getattr(codex, "takes_read_only_role", False) is False
+    assert ClaudeAgent.takes_read_only_role is True
 
 
 def test_a_read_only_codex_call_uses_the_read_only_sandbox(codex, call):
