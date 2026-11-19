@@ -749,6 +749,7 @@ def test_a_nulled_inherited_map_entry_stays_deleted_after_a_form_save(sparse_rep
     path = _sparse(sparse_repo)
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     raw["agents"]["claude"]["models"] = {"mechanical": None}
+    raw["agents"]["claude"]["max_turns_by_role"] = {"mechanical": None}  # the engine's cap for a role the pack drops
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     models = _fields(path)[("agents", "claude", "models")]["value"]
     assert "mechanical" not in models
@@ -1144,8 +1145,36 @@ def test_the_codex_section_has_no_claude_cache_fields(shipped):
     keys = {tuple(f["key"]) for s in config_edit.form_fields(shipped)["sections"] for f in s["fields"]}
     assert ("agents", "claude", "lean") in keys and ("agents", "codex", "lean") not in keys
     assert ("agents", "claude", "read_only_roles") in keys and ("agents", "codex", "read_only_roles") not in keys
-    assert config_edit.AGENT_FREE_KEYS[-4:] == ("cache_ttl", "lean", "user_settings", "read_only_roles")
-    assert "cache_ttl, lean, user_settings, read_only_roles" in " ".join(config_edit.PROTECTED)
+    assert config_edit.AGENT_FREE_KEYS[-7:] == ("cache_ttl", "lean", "user_settings", "read_only_roles",
+                                                "max_turns_by_role", "session_budget_usd", "bash_output_chars")
+    assert "read_only_roles, max_turns_by_role, session_budget_usd, bash_output_chars" in " ".join(config_edit.PROTECTED)
+    for key in ("max_turns_by_role", "session_budget_usd", "bash_output_chars"):
+        assert ("agents", "claude", key) in keys and ("agents", "codex", key) not in keys
+
+
+def test_cap_fields_are_editable(shipped):
+    fields = {tuple(f["key"]): f for s in config_edit.form_fields(shipped)["sections"] for f in s["fields"]}
+    assert fields[("agents", "claude", "max_turns_by_role")]["value_kind"] == "int"
+    assert fields[("agents", "claude", "session_budget_usd")]["value_kind"] == "number"
+    assert fields[("agents", "claude", "bash_output_chars")]["max"] == 1000000
+    text = shipped.read_text(encoding="utf-8")
+    config_edit.save(shipped, form(shipped, (["agents", "claude", "max_turns_by_role"], {"review": 45, "plan": 60, "build": 70,
+                                                                                         "debug": 60, "mechanical": 0}),
+                                   (["agents", "claude", "session_budget_usd"], {"review": 4, "plan": 10, "build": 7.5, "debug": 10}),
+                                   (["agents", "claude", "bash_output_chars"], 20000)))
+    spec = load_config(shipped).agents["claude"]
+    assert spec.max_turns_by_role["build"] == 70 and spec.max_turns_by_role["mechanical"] == 0
+    assert spec.session_budget_usd["build"] == 7.5 and spec.bash_output_chars == 20000
+    after = shipped.read_text(encoding="utf-8")
+    assert sum(1 for line in after.splitlines() if "#" in line) >= sum(1 for line in text.splitlines() if "#" in line)
+    with pytest.raises(EditError):
+        form(shipped, (["agents", "claude", "max_turns_by_role"], {"build": -1}))
+    with pytest.raises(EditError):
+        form(shipped, (["agents", "claude", "session_budget_usd"], {"build": -1}))
+    with pytest.raises(EditError):
+        form(shipped, (["agents", "claude", "bash_output_chars"], 2000001))
+    with pytest.raises(Refused):  # a step's own turn cap is in the workflow, which the page does not edit
+        form(shipped, (["phases", "build", "steps", "0", "max_turns"], 20))
 
 
 def test_context_run_brief_and_gate_lines_editable(shipped):

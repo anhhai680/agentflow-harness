@@ -34,6 +34,9 @@ agents:
     lean: true                   # a run's sessions skip the project's MCP servers and user-level state
     user_settings: false         # true: a run's sessions also read your own settings and agents (personal; the user file may set it)
     read_only_roles: [review]    # roles whose sessions may read but not edit or run tests; a step that edits must not use one
+    max_turns_by_role: {review: 45, plan: 60, build: 60, debug: 60, mechanical: 15}  # --max-turns per call, by role, in the CLI's API-call unit (the CLI counts assistant API calls: one message with parallel tool calls is one turn); 0 = no cap; a role not named uses `max_turns`
+    session_budget_usd: {review: 4, plan: 10, build: 10, debug: 10}  # --max-budget-usd per call, by role, in list-price dollars (also on a subscription); 0 = no cap
+    bash_output_chars: 15000     # caps one shell command's output a session reads (BASH_MAX_OUTPUT_LENGTH); 0 leaves it to the environment
     prices:                      # USD per 1M tokens; prices a session Claude never reported a cost for (rollover, timeout)
       claude-opus-5-5:   {input: 4.00, output: 20.00, cache_read: 0.20, cache_write_5m: 5.00,  cache_write_1h: 8.00}
       claude-sonnet-5-5: {input: 2.00, output: 10.00, cache_read: 0.10, cache_write_5m: 2.50,  cache_write_1h: 4.00}
@@ -183,6 +186,8 @@ autonomy:
     fix_attempts_exhausted: 2
     red_test_passes: 2
     review_unresolved: 1
+    turn_cap: 1                 # a step that stopped at its turn cap
+    budget_cap: 1               # a step that stopped at its spend cap
 
 route:                         # size a run at its start; a profile drops ceremony, never an obligation
   mode: "off"                  # off | observe (decide and record a profile, run the full route) | on (apply it)

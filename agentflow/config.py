@@ -106,6 +106,7 @@ STEP_KEYS = (
     "sync",
     "human_paths",
     "gate_tier",
+    "max_turns",
 )
 
 
@@ -190,7 +191,13 @@ PREAMBLE_SLOT = re.compile(r"^\{(run_facts|code_map|lessons)\}[ \t]*(?:\r?\n|\Z)
 EFFORT_BLOCK = re.compile(r"<!-- effort-check -->\n(.*?)<!-- /effort-check -->\n?", re.DOTALL)
 PERMISSION_FLAGS = ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
                     "--dangerously-skip-permissions", "--permission-mode")
-RUNNER_FLAGS = ("--setting-sources",)  # set by the runner from `agents.claude.user_settings`, never by base_args
+# The flags the runner sets itself, each with the key it sets it from; a copy in `command`, `base_args` or `effort_arg`
+# would clash with the runner's (`--max-turns` and `--max-budget-usd` are now set on every Claude call).
+RUNNER_FLAGS = {
+    "--setting-sources": "agents.claude.user_settings",
+    "--max-turns": "agents.claude.max_turns_by_role",
+    "--max-budget-usd": "agents.claude.session_budget_usd",
+}
 # The runner sets these for a read-only call (`read_only_roles`), and `--agent` only for the overlay's review step. A copy in
 # `command` or `base_args` would reach every read-only call, and an agent profile's own permission mode, tools or hooks
 # could widen it.
@@ -280,6 +287,9 @@ class AgentSpec:
     lean: bool = True  # the claude agent's run sessions skip the project's MCP servers and user-level state
     user_settings: bool = False  # the claude agent's run sessions also read the user's own settings and agents
     read_only_roles: tuple[str, ...] = ()  # the claude agent's calls for these roles may read but not edit (`agents.claude.read_only_roles`)
+    max_turns_by_role: dict[str, int] = field(default_factory=dict)  # `--max-turns` of a call by role; 0 = no cap
+    session_budget_usd: dict[str, float] = field(default_factory=dict)  # `--max-budget-usd` of a call by role; 0 = no cap
+    bash_output_chars: int = 0  # `BASH_MAX_OUTPUT_LENGTH` of a call; 0 leaves it to the environment
 
 
 CACHE_TTLS = ("5m", "1h", "cli")
@@ -590,6 +600,7 @@ class Step:
     sync: Step | None = None  # a `finish` step: the session that resolves the target branch's conflicts
     human_paths: list[str] = field(default_factory=list)  # a `sync` step: conflicts in these paths are a human's
     gate_tier: str = "full"  # `affected`: its gates run their `affected` command on the files the step changed
+    max_turns: int | None = None  # this step's own turn cap, over its role's (`validate` checks it as written)
     path: str = ""
 
 
@@ -848,7 +859,41 @@ def _build_agent(name: str, data: Any, path: str) -> AgentSpec:
         lean=bool(_optional(data, "lean", path, bool, True)),
         user_settings=bool(_optional(data, "user_settings", path, bool, False)),
         read_only_roles=tuple(_string_list(_optional(data, "read_only_roles", path, list, []), _join(path, "read_only_roles"))),
+        max_turns_by_role=_role_numbers(data, "max_turns_by_role", path, False),
+        session_budget_usd=_role_numbers(data, "session_budget_usd", path, True),
+        bash_output_chars=_optional(data, "bash_output_chars", path, int, 0),
     )
+
+
+def _role_numbers(data: dict, key: str, path: str, as_float: bool) -> dict:
+    """A role -> number map (`max_turns_by_role`, `session_budget_usd`). A `null` entry is dropped. A value that is
+    not a number is a load error; one that is a number but out of range (negative, `inf`, a bool) is `validate`'s."""
+    raw = _optional(data, key, path, dict, {})
+    out: dict = {}
+    for role, value in raw.items():
+        if value is None:
+            continue
+        if not isinstance(value, (int, float)):
+            raise ConfigError(_join(_join(path, key), str(role)), "expected a number")
+        out[str(role)] = float(value) if as_float and not isinstance(value, bool) else value
+    return out
+
+
+def resolve_turn_cap(cfg: Config, agent_name: str, step: Step, role: str) -> int | None:
+    """The `--max-turns` of a call: the step's own `max_turns`, else the agent's cap for `role`, else its `max_turns`.
+    0 is "no cap" and never falls back to the next; None means no cap is configured at all."""
+    if step.max_turns is not None:
+        return step.max_turns
+    spec = cfg.agents[agent_name]
+    if role in spec.max_turns_by_role:
+        return spec.max_turns_by_role[role]
+    return spec.max_turns
+
+
+def session_budget(cfg: Config, agent_name: str, role: str) -> float | None:
+    """The `--max-budget-usd` of a call for `role`, or None for no cap (no entry, or 0)."""
+    value = cfg.agents[agent_name].session_budget_usd.get(role)
+    return float(value) if value else None
 
 
 def _build_prices(raw: Any, path: str) -> dict[str, dict[str, float]]:
@@ -950,6 +995,7 @@ class _Builder:
             sync=sync,
             human_paths=_string_list(raw.get("human_paths", []), _join(path, "human_paths")),
             gate_tier=raw.get("gate_tier", "full"),  # kept as written: `validate` refuses anything but full or affected
+            max_turns=raw.get("max_turns"),  # kept as written: `validate` refuses anything but a whole number from 1
             path=path,
         )
 
@@ -1705,6 +1751,9 @@ class _Validator:
             self.error(_join(p, "gate_tier"), f"gate_tier must be one of {', '.join(GATE_TIERS)}")
         elif step.gate_tier == "affected" and not step.gates:
             self.error(_join(p, "gate_tier"), "gate_tier: affected needs a step with `gates`")
+        if step.max_turns is not None and (not isinstance(step.max_turns, int) or isinstance(step.max_turns, bool)
+                                           or step.max_turns < 1):
+            self.error(_join(p, "max_turns"), "max_turns must be a whole number of turns, 1 or more")
         if step.commit not in (True, False, "per_task"):
             self.error(_join(p, "commit"), "commit must be true, false or per_task")
         for lane in step.lanes:
@@ -2020,15 +2069,15 @@ class _Validator:
             if agent.effort_arg and not any("{effort}" in arg for arg in agent.effort_arg):
                 self.error(_join(path, "effort_arg"), "effort_arg must contain {effort}: every call passes its level")
             # `command` past the program goes on every argv as `base_args` does, so the same flags are refused there
-            for key, args in (("command", agent.command[1:]), ("base_args", agent.base_args)):
+            for key, args in (("command", agent.command[1:]), ("base_args", agent.base_args), ("effort_arg", agent.effort_arg)):
                 for arg in args:
-                    flag = str(arg).split("=", 1)[0]
+                    flag = re.split(r"[=\s]", str(arg), maxsplit=1)[0]
                     if flag in PERMISSION_FLAGS:
                         self.error(_join(path, key), f"'{arg}' is not allowed: tool rules come from .claude/settings*.json")
                     elif flag in RUNNER_FLAGS:
                         self.error(_join(path, key), f"'{arg}' is not allowed: the runner sets it from "
-                                   "`agents.claude.user_settings`")
-                    elif agent.read_only_roles and flag in READ_ONLY_FLAGS:
+                                   f"`{RUNNER_FLAGS[flag]}`")
+                    elif key != "effort_arg" and agent.read_only_roles and flag in READ_ONLY_FLAGS:
                         self.error(_join(path, key), f"'{arg}' is not allowed while `read_only_roles` is not empty: "
                                    "the runner sets it for a read-only call, and a copy here could widen it")
             if agent.permission_mode is not None and agent.permission_mode not in PERMISSION_MODES:
@@ -2036,6 +2085,32 @@ class _Validator:
                            f"unknown permission_mode '{agent.permission_mode}': use one of {', '.join(PERMISSION_MODES)}")
         self.claude_session()
         self.read_only_roles()
+        self.caps()
+
+    def caps(self) -> None:
+        """`max_turns_by_role`, `session_budget_usd` and `bash_output_chars`: ranges, and roles the agent has."""
+        def turns_ok(v: Any) -> bool:
+            return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+        def usd_ok(v: Any) -> bool:
+            return (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                    and (v == 0 or 0.01 <= v <= 1000))
+
+        for name, agent in self.cfg.agents.items():
+            path = f"agents.{name}"
+            for key, values, ok, what in (
+                ("max_turns_by_role", agent.max_turns_by_role, turns_ok, "a whole number of turns, 0 or more (0 = no cap)"),
+                ("session_budget_usd", agent.session_budget_usd, usd_ok, "0 (no cap) or a number of USD from 0.01 to 1000"),
+            ):
+                for role, value in values.items():
+                    if not ok(value):
+                        self.error(_join(path, key), f"{key}.{role} must be {what}")
+                    if role not in agent.models:
+                        self.error(_join(path, key), f"role '{role}' is not in `agents.{name}.models`")
+            chars = agent.bash_output_chars
+            if isinstance(chars, bool) or (chars != 0 and not 1000 <= chars <= 1_000_000):
+                self.error(_join(path, "bash_output_chars"),
+                           "bash_output_chars must be 0 (the CLI's own cap) or a whole number from 1000 to 1000000")
 
     def read_only_roles(self) -> None:
         """`agents.<name>.read_only_roles`: roles the agent's `models` map has, that no editing step of the agent holds;
@@ -2084,6 +2159,10 @@ class _Validator:
             for key in ("cache_ttl", "lean", "user_settings"):
                 if key in block:
                     self.add("warning", f"agents.{name}.{key}", f"only the claude agent reads `{key}`")
+            for key in ("max_turns_by_role", "session_budget_usd", "bash_output_chars"):
+                if key in block:
+                    self.add("warning", f"agents.{name}.{key}", "only the claude agent's calls are capped: this has "
+                             f"no effect on `{name}`")
         if claude is None:
             return
         if claude.lean and (self.repo / ".mcp.json").is_file():

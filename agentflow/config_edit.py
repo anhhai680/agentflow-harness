@@ -45,7 +45,8 @@ __all__ = ["Conflict", "EditError", "Proposal", "Refused", "form_fields", "propo
 
 MAX_TEXT = 512 * 1024
 MERGE_TAG = "tag:yaml.org,2002:merge"
-AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices", "cache_ttl", "lean", "user_settings", "read_only_roles")  # what a page may change in an `agents.<name>` block
+AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices", "cache_ttl", "lean", "user_settings", "read_only_roles",
+                  "max_turns_by_role", "session_budget_usd", "bash_output_chars")  # what a page may change in an `agents.<name>` block
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
     "version", "engine", "gates", "gates_confirmed", "gate_sets", "guardrails", "conditions", "overlays", "project",
     "phase_approval", "record_step", "resolve_step", "retro_step", "paths", "defaults.env", "defaults.env_inherit", "context.autocompact_env", "context.progress_file",
@@ -54,7 +55,8 @@ _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and p
 )
 PROTECTED = (
     *_PROTECTED_KEYS,
-    "agents.<name> (all but enabled, models, max_turns, prices, cache_ttl, lean, user_settings, read_only_roles)",
+    "agents.<name> (all but enabled, models, max_turns, prices, cache_ttl, lean, user_settings, read_only_roles, "
+    "max_turns_by_role, session_budget_usd, bash_output_chars)",
     "phases.<name> (all but needs_approval, resolve, model, agent)",
 )
 _LOCK = threading.Lock()
@@ -299,9 +301,15 @@ def _catalog(raw: dict) -> list[dict]:
                 {"key": ["agents", name, "lean"], "label": "Lean sessions (no project MCP servers)", "kind": "bool"},
                 {"key": ["agents", name, "user_settings"], "label": "Read my own settings and agents", "kind": "bool"},
                 {"key": ["agents", name, "read_only_roles"], "label": "Read-only roles (no edits, no tests)", "kind": "list"},
+                {"key": ["agents", name, "max_turns_by_role"], "label": "Max turns by role (0 = no cap)", "kind": "map",
+                 "value_kind": "int", "min": 0},
+                {"key": ["agents", name, "session_budget_usd"], "label": "Spend cap per session by role (USD, 0 = no cap)",
+                 "kind": "map", "value_kind": "number", "min": 0},
+                {"key": ["agents", name, "bash_output_chars"], "label": "Shell output cap (chars, 0 = the CLI's own)",
+                 "kind": "int", "min": 0, "max": 1000000},
             ]
-        sections.append({"title": f"Agent: {name}", "note": "Models by role and the turn limit for every session "
-                         "on this agent. Its command line is protected.", "fields": fields})
+        sections.append({"title": f"Agent: {name}", "note": "Models by role, and the turn limit for the roles "
+                         "the turn map by role does not name. Its command line is protected.", "fields": fields})
     phase_fields = []
     for name, phase in (raw.get("phases") or {}).items():
         if not isinstance(phase, dict):
