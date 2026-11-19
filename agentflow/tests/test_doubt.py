@@ -557,3 +557,102 @@ def test_doubt_does_not_import_autonomy_at_module_level():
             imported |= {("." * node.level) + (node.module or "") + "." + alias.name for alias in node.names}
     assert not any("autonomy" in name for name in imported), imported
     assert not any(name.split(".")[-1] in ("pipeline", "flow_control", "lanes", "conditions") for name in imported), imported
+
+
+# --------------------------------------------------------------------------- the delta of a later round
+
+SPEC_FILE = "docs/specs/spec.md"
+SPEC_BODY = "".join(f"line {n}\n" for n in range(1, 41))
+
+
+def _delta_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A repo with `SPEC_FILE` committed; returns it and the first commit's tree id."""
+    repo = tmp_path / "repo"
+    (repo / "docs" / "specs").mkdir(parents=True)
+    for args in (("init", "-q", "-b", "main"), ("config", "user.email", "t@example.com"), ("config", "user.name", "T")):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / SPEC_FILE).write_text(SPEC_BODY, encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "spec"], cwd=repo, check=True, capture_output=True)
+    tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+    return repo, tree
+
+
+def _after_review(tree: str | None, head: str | None = None, restarted: bool = False) -> list[dict]:
+    """A review that started at `tree`, then a reconcile round; `restarted`: the round-2 review started again."""
+    start = {"type": "step_started", "key": SPEC_REVIEW, "phase": "define", "start_tree": tree, "start_head": head}
+    events = [started(), start, round_opened([HIGH], 1)]
+    return [*events, start] if restarted else events
+
+
+def _delta(repo: Path, events: list[dict], artifact: str = SPEC_FILE) -> str:
+    return doubt.delta_for_review(repo, log(*events), "define", SPEC_REVIEW, artifact)
+
+
+def test_delta_for_review_shows_the_artifact_diff(tmp_path):
+    repo, tree = _delta_repo(tmp_path)
+    (repo / SPEC_FILE).write_text(SPEC_BODY.replace("line 20\n", "line 20 changed\n"), encoding="utf-8")
+    delta = _delta(repo, _after_review(tree))
+    assert delta.startswith("This is a later round")
+    assert tree[:12] in delta and f"`{SPEC_FILE}`" in delta
+    assert "\n+line 20 changed\n" in delta and "\n-line 20\n" in delta
+    assert " line 17\n" in delta and " line 23\n" in delta
+    assert "\n line 16\n" not in delta and "\n line 24\n" not in delta  # no line more than 3 away from the change
+    assert delta.rstrip().endswith("```")
+    assert "\n\n```diff\n" in delta
+
+
+def test_delta_for_review_takes_the_base_head_when_there_is_no_tree(tmp_path):
+    repo, tree = _delta_repo(tmp_path)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+    (repo / SPEC_FILE).write_text(SPEC_BODY + "last\n", encoding="utf-8")
+    delta = _delta(repo, _after_review(None, head))
+    assert head[:12] in delta and "\n+last\n" in delta
+
+
+def test_delta_fence_outlasts_backticks_in_the_diff(tmp_path):
+    repo, tree = _delta_repo(tmp_path)
+    (repo / SPEC_FILE).write_text(SPEC_BODY.replace("line 20\n", "a `````x` run\n"), encoding="utf-8")
+    delta = _delta(repo, _after_review(tree))
+    assert "\n\n``````diff\n" in delta and delta.rstrip().endswith("\n``````")
+    quiet = tmp_path / "q"
+    quiet.mkdir()
+    repo2, tree2 = _delta_repo(quiet)
+    (repo2 / SPEC_FILE).write_text(SPEC_BODY + "more\n", encoding="utf-8")
+    assert "\n\n```diff\n" in _delta(repo2, _after_review(tree2))  # at least 3, and no longer than needed
+
+
+def test_delta_for_review_falls_back_to_the_full_review(tmp_path):
+    repo, tree = _delta_repo(tmp_path)
+    changed = SPEC_BODY.replace("line 20\n", "line 20 changed\n")
+    (repo / SPEC_FILE).write_text(changed, encoding="utf-8")
+    assert _delta(repo, _after_review(tree)) != ""  # the control: this setup does give a delta
+    assert _delta(repo, [started(), round_opened([HIGH], 1)]) == ""  # no review ran in this human round
+    assert _delta(repo, _after_review(tree, restarted=True)) != ""  # the first start still counts after a restart
+    only_new = [started(), round_opened([HIGH], 1),
+                {"type": "step_started", "key": SPEC_REVIEW, "phase": "define", "start_tree": tree}]
+    assert _delta(repo, only_new) == ""  # only this round's own start, after the latest reconcile
+    assert _delta(repo, _after_review("0" * 40)) == ""  # a base that is not readable
+    assert _delta(repo, _after_review(None, None)) == ""
+    for bad in ("/etc/passwd", "../x", "docs/../x", ":(glob)*", "-p", "", "docs/specs/missing.md"):
+        assert _delta(repo, _after_review(tree), bad) == "", bad
+    (repo / SPEC_FILE).write_text(SPEC_BODY, encoding="utf-8")
+    assert _delta(repo, _after_review(tree)) == ""  # no change
+    (repo / SPEC_FILE).write_text("".join(f"new {n}\n" for n in range(401)), encoding="utf-8")
+    assert _delta(repo, _after_review(tree)) == ""  # over the line cap
+    (repo / SPEC_FILE).unlink()
+    assert _delta(repo, _after_review(tree)) == ""  # deleted
+    (repo / "docs" / "specs" / "new.md").write_text("fresh\n", encoding="utf-8")
+    assert _delta(repo, _after_review(tree), "docs/specs/new.md") == ""  # new since the base
+
+
+def test_delta_for_review_ignores_a_review_of_an_earlier_human_round(tmp_path):
+    repo, tree = _delta_repo(tmp_path)
+    (repo / SPEC_FILE).write_text(SPEC_BODY + "more\n", encoding="utf-8")
+    events = [started(), *_after_review(tree)[1:], human_reject(), round_opened([HIGH], 1)]
+    assert _delta(repo, events) == ""  # the review before the human's rejection is not this round's base
+
+
+def test_delta_turn_cap():
+    assert doubt.delta_turn_cap(None) is None
+    assert [doubt.delta_turn_cap(n) for n in (1, 60, 61)] == [1, 30, 30]

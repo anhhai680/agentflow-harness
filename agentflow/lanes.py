@@ -571,6 +571,9 @@ class _StepRun:
     # A `read_only_roles` session (`_decide_read_only`): no edits, no skills listing, a shorter idle limit. A resumed
     # session keeps what it started with (`agent_started.read_only`, kept on the step row beside its session).
     read_only: bool = False
+    # This step's turn cap, over `agents.<name>.max_turns` on every call of it; None: the agent's own (a later doubt
+    # round's review gets half, `doubt.delta_turn_cap`).
+    max_turns: int | None = None
 
 
 def _mtime(path: Path) -> float | None:
@@ -674,6 +677,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         share_session_of: str | None = None,
         fix_first: list[GateResult] | None = None,
         size: bool = True,
+        turn_cap: int | None = None,
     ) -> Outcome:
         """Run `step` as `key` until it is done ("done"), or a human is needed ("stopped").
 
@@ -685,6 +689,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         tasks need not wait for returns "stopped" with its record `parked`.
         `fix_first` (gates that already failed, as for a gate step) starts a step that is not resuming
         in its fix loop: the first call is fix attempt 1, with the gate output.
+        `turn_cap` replaces the agent's `max_turns` for every call of the step (a later doubt round's review).
         With `size` and `effort.sizing`, a step that has not started is sized first (`SizingLane.size_step`), unless
         it continues a shared session, the run is over budget, or it is a dry run. Whether sized or not, a sizer of
         the step left open by a runner that died is checked first (`SizingLane.check_open_sizers`). A review that
@@ -725,7 +730,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         sr = _StepRun(
             phase=phase, step=step, key=key, mode=mode, role=role, agent_name=agent_name, agent=agent,
             model=model, effort=rec.get("effort") or self.cfg.effort.default, extra=extra, session=session,
-            agent_profile=overlays.agent_profile(self.cfg, step),
+            agent_profile=overlays.agent_profile(self.cfg, step), max_turns=turn_cap,
         )
         judgement = sizing.is_judgement(phase.name, role)
         sr.effort = sizing.floor(sr.effort, judgement, self.cfg.effort.allowed)
@@ -1024,6 +1029,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             # Every call of a session keeps the setting the session started with (`_decide_read_only`).
             read_only_role=sr.read_only,
             self_contained=self._self_contained(sr),
+            max_turns=sr.max_turns,
         )
 
     def context_window_for(self, key: str, model: str) -> int | None:

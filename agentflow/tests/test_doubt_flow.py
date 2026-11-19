@@ -714,3 +714,30 @@ def test_the_engine_defaults_run_the_doubt_review(sparse_repo):
     # the bug lane is as before
     bug = {line.key for line in explain(cfg, "bug", make_ctx(cfg, sparse_repo, "bug", {"slug": "x"}))}
     assert not {k for k in bug if "reconcile" in k or k.endswith(("spec_review", "plan_review"))}
+
+
+def test_round_two_review_gets_the_delta(flow):
+    run = begin(flow, {REVIEW: [found(HIGH), done("sạch")], RECONCILE: [revised(1, disp("R1-F1", "actionable"))]})
+    assert go(flow, run) == "awaiting_approval"
+    prompts = [c["argv"][-1] for c in flow.calls() if c["step"] == REVIEW]
+    assert len(prompts) == 2
+    first, second = prompts
+    lead = doubt.DELTA_LEAD.split(".")[0]
+    assert lead in second and "Rollback 1." in second and "```diff" in second
+    assert re.search(r"- R1-F1 .*actionable", second)
+    assert second.index(lead) < second.index("R1-F1")  # the delta comes before the earlier findings
+    assert lead not in first and "```diff" not in first and "R1-F1" not in first
+
+
+@pytest.mark.parametrize("cap", [40, None])
+def test_round_two_cap_is_half(flow, cap):
+    flow.configure({**PIPE, "agents": {"claude": {"max_turns": cap}}}, autopilot=True, edit=with_doubt)  # None: unset
+    run = begin(flow, {REVIEW: [found(HIGH), done("sạch")], RECONCILE: [revised(1, disp("R1-F1", "actionable"))]})
+    assert go(flow, run) == "awaiting_approval"
+
+    def turns(argv: list[str]) -> str | None:
+        return argv[argv.index("--max-turns") + 1] if "--max-turns" in argv else None
+
+    reviews = [c["argv"] for c in flow.calls() if c["step"] == REVIEW]
+    assert len(reviews) == 2
+    assert [turns(a) for a in reviews] == ([str(cap), str(cap // 2)] if cap else [None, None])

@@ -1429,6 +1429,30 @@ def blob_at(repo: Path, ref: str, path: str, limit: int) -> bytes | None:
                           check=True).stdout
 
 
+def artifact_diff(worktree: Path, base: str, path: str, max_lines: int) -> str | None:
+    """The diff of `path` in the work tree against `base` (a commit or tree id), three lines of context, or None.
+
+    None, so the caller shows the whole artifact as before, when: `path` is not a plain relative path (empty,
+    absolute, a `..` segment, or a leading `:` or `-`: a pathspec or an option), `base` is not hex or no longer holds
+    `path` (the artifact is new since then, or the base is gone), the artifact is missing, a symlink or not a regular
+    file in the tree, or the diff fails, is empty, or runs over `max_lines` lines. Read-only: `--literal-pathspecs`
+    keeps `path` a path, and no external diff driver or textconv filter runs."""
+    if _read_parts(path) is None or path.startswith(":") or not isinstance(base, str) or _READ_SHA.fullmatch(base) is None:
+        return None
+    worktree = Path(worktree)
+    target = worktree / path
+    if target.is_symlink() or not target.is_file():
+        return None
+    if _read_git(worktree, "cat-file", "-e", f"{base}:{path}") is None:
+        return None
+    out = _read_git(worktree, "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "-U3", base,
+                    "--", path)
+    text = out.decode("utf-8", errors="replace") if out else ""
+    if not text.strip() or len(text.splitlines()) > max_lines:
+        return None
+    return text
+
+
 def create_draft_pr(worktree: Path, base: str, branch: str, title: str, body_file: Path) -> str:
     """Open a draft pull request with `gh` and return its URL (the last line `gh` prints)."""
     args = ["pr", "create", "--draft", "--base", base, "--head", branch, "--title", title, "--body-file", str(body_file)]
