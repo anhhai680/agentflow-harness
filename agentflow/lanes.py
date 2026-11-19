@@ -40,7 +40,8 @@ from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
 from agentflow.commit_checks import RUNNER_COMMITS, runner_head
 from agentflow.conditions import Ctx, fmt, skill_text
-from agentflow.config import BRIEF_PLACEHOLDERS, EFFORT_BLOCK, PREAMBLE_SLOT, Config, Phase, Step, brief_partial, resolve_model
+from agentflow.config import (BRIEF_PLACEHOLDERS, EFFORT_BLOCK, PREAMBLE_SLOT, RUNNER_FLAGS, Config, Phase, Step, brief_partial,
+                              resolve_model, resolve_turn_cap, session_budget)
 from agentflow.feature_lane import FeatureLane
 from agentflow.flow_control import (
     StepControl,
@@ -56,7 +57,7 @@ from agentflow.gates import resolve as resolve_gates
 from agentflow.gitops import (CommitRejected, GitError, NothingToCommit, changed_since, commit, commit_artifact,
                               commits_between, git_state_changes, head, outside_only, reconcile_baseline)
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
-from agentflow.hitl import ResultError, StepResult, notify_run, park_hitl, raise_hitl, read_result
+from agentflow.hitl import ResultError, StepResult, clean_fact, notify_run, park_hitl, raise_hitl, read_result
 from agentflow.route_lane import RouteLane
 from agentflow.run_control import wait_for_agents
 from agentflow.sizing_lane import SizingLane
@@ -98,6 +99,17 @@ BRIEF_LEAD = ("This is a fresh session: the runner could not give this step's ea
 BRIEF_CARRIED = ("## The message the earlier session was about to get\n\nThe runner was about to send this to the earlier "
                  "session. Whatever it holds (answers, a note, gate output) still applies to this step: act on it.")
 RESUMABLE = ("running", "waiting_human")
+# A capped call (`AgentOutcome.capped`) of an editing step that wrote no valid result gets one wrap-up turn per step
+# since the last approval or reopen: the same session, resumed with these caps and `WRAP_UP_PROMPT`. A review step
+# (`role: review`) gets none: a capped review stops at once, so a truncated review is never taken as complete.
+WRAP_UP_TURNS = 3
+WRAP_UP_BUDGET_USD = 2.5  # never more than the role's own spend cap; none when the role has none
+WRAP_UP_PROMPT = ("You have used this session's {cap} budget, so the runner stopped it. Write your result now with what "
+                  "you have, and do not start new work: `done` if the step is finished, else `blocked`, with what is "
+                  "left in `signals.todo` as a list of one-line strings.")
+CAP_KINDS = {"turns": "turn_cap", "budget": "budget_cap"}  # a cap's name -> the stop kind it raises
+CAP_WORDS = {"turns": "turn", "budget": "spend"}  # `WRAP_UP_PROMPT`'s `{cap}`
+TODO_SHOWN = 20  # `signals.todo` items listed in a cap stop's report
 UNSTARTED_STEP = (None, "pending")
 FOOTER = re.compile(r"^\s*Next:\s*`?([\w.:/-]+)`?\s+(?:—|–|--?)\s", re.MULTILINE)
 SELF_CHECKS_NONE = ("Do not run the linters, type checkers or other quality gates yourself: the runner's build gates "
@@ -524,6 +536,7 @@ class _Turn:
 
     prompt: str
     resume: str | None
+    wrap_up: str | None = None  # the cap (`turns` | `budget`) this wrap-up turn follows; None: not a wrap-up turn
 
 
 @dataclass
@@ -575,9 +588,11 @@ class _StepRun:
     # Any session of this step since its `step_started` was read-only (this process's, or a recorded `agent_started`):
     # the tree guard stays on, though a fresh session (a rollover, a config edit) re-decides `read_only` (`_guard_read_only`).
     read_only_seen: bool = False
-    # This step's turn cap, over `agents.<name>.max_turns` on every call of it; None: the agent's own (a later doubt
-    # round's review gets half, `doubt.delta_turn_cap`).
+    # This step's turn cap on every call of it (`config.resolve_turn_cap`, or half of it for a later doubt round's
+    # review, `doubt.delta_turn_cap`): 0 passes no `--max-turns`; None: none configured at all.
     max_turns: int | None = None
+    budget_usd: float | None = None  # this step's spend cap on every call (`config.session_budget`); None: none
+    wrap_ups: int = 0  # wrap-up turns since the last approval or reopen (`session_capped` with `wrap_up: true`)
 
 
 def _mtime(path: Path) -> float | None:
@@ -749,8 +764,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         sr = _StepRun(
             phase=phase, step=step, key=key, mode=mode, role=role, agent_name=agent_name, agent=agent,
             model=model, effort=rec.get("effort") or self.cfg.effort.default, extra=extra, session=session,
-            agent_profile=overlays.agent_profile(self.cfg, step), max_turns=turn_cap,
+            agent_profile=overlays.agent_profile(self.cfg, step),
         )
+        self._set_caps(sr, turn_cap)
         judgement = sizing.is_judgement(phase.name, role)
         sr.effort = sizing.floor(sr.effort, judgement, self.cfg.effort.allowed)
         # A sizer of this step changed the repository: nothing runs until it is back as the sizer found it.
@@ -840,6 +856,14 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             fresh = _after_approval(since, key)
             sr.fixes = _count(fresh, "fix_attempt", key)
             sr.rollovers = _count(fresh, "rolled_over", key)
+            capped = [e for e in fresh if e["type"] == "session_capped" and e.get("key") == key]
+            sr.wrap_ups = sum(1 for e in capped if e.get("wrap_up") is True)
+            # A runner that died during the wrap-up turn: the resume is that turn again, with its caps and its prompt.
+            last = next((e for e in reversed(fresh) if e.get("key") == key
+                         and e["type"] in ("session_capped", "fix_attempt")), None)
+            if (last is not None and last["type"] == "session_capped" and last.get("wrap_up") is True
+                    and last.get("cap") in CAP_KINDS and sr.session and turn.resume == sr.session):
+                turn = self._wrap_up_turn(sr, str(last["cap"]))
         else:
             sr.start_head = head(self.worktree)
             sr.start_tree = snapshot(self.worktree)
@@ -882,8 +906,18 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             model=model, effort=effort, extra=self._step_extra(key, extra), session=None,
             agent_profile=overlays.agent_profile(self.cfg, step), dry=True,
         )
+        self._set_caps(sr, None)
         turn = _Turn(self._prompt(sr), None)
         return agent.argv(self._agent_call(sr, turn, attempt=1))
+
+    def _set_caps(self, sr: _StepRun, turn_cap: int | None) -> None:
+        """The step's per-call caps: `turn_cap` (a later doubt round's review) or the resolved turn cap, and the role's
+        spend cap. An agent the config doesn't name keeps none."""
+        if sr.agent_name not in self.cfg.agents:
+            sr.max_turns = turn_cap
+            return
+        sr.max_turns = turn_cap if turn_cap is not None else resolve_turn_cap(self.cfg, sr.agent_name, sr.step, sr.role)
+        sr.budget_usd = session_budget(self.cfg, sr.agent_name, sr.role)
 
     def _under_budget(self) -> bool:
         """The run's spend is under its hard budget (the check `_loop` stops on)."""
@@ -905,7 +939,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
 
             called = self._call(sr, turn)
             if called.brief_error is not None:  # no agent ran: the session can't have its brief, so a fresh one starts
-                turn = self._replace_brief(sr, turn, called.brief_error)
+                replaced = self._replace_brief(sr, turn, called.brief_error)
+                if replaced is None:
+                    return "stopped"
+                turn = replaced
                 continue
             if self.run.refresh()["status"] in TERMINAL:
                 return "stopped"  # cancelled while the agent ran: nothing more is called or recorded
@@ -933,13 +970,33 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 self.run.emit("watchdog_fired", key=sr.key, idle_min=quiet)
                 return self._stop(sr, "step_timeout",
                                   f"The agent made no progress for {quiet} min, so the runner ended the session.")
+            if outcome.capped and sr.step.role == "review":  # a truncated review is never a complete one
+                if outcome.interruption is not None:  # the usage window refused it: held, and its result never read
+                    next_turn = self._hold(sr, turn, outcome.interruption)
+                    if next_turn is None:
+                        return "stopped"
+                    turn = next_turn
+                    continue
+                self._emit_capped(sr, outcome.capped, turn, wrap_up=False)
+                self._cap_stop(sr, outcome.capped, None, wrapped=False)
+                return "stopped"
 
             result, error = self._read_result(sr)
+            if result is not None and outcome.capped:  # it wrote its result before the cap: a result as any other
+                self._emit_capped(sr, outcome.capped, turn, wrap_up=False)
             if result is None:
-                if outcome.rolled_over:
+                if outcome.rolled_over and turn.wrap_up:  # no fresh session: 3 turns can't do the step in one
+                    self._cap_stop(sr, turn.wrap_up, None, wrapped=True)
+                    next_turn = None
+                elif outcome.rolled_over:
                     next_turn = self._rollover(sr, outcome)
                 elif outcome.interruption is not None:
                     next_turn = self._hold(sr, turn, outcome.interruption)
+                elif outcome.capped:
+                    next_turn = self._capped(sr, outcome.capped, turn)
+                elif turn.wrap_up:
+                    self._cap_stop(sr, turn.wrap_up, None, wrapped=True)
+                    next_turn = None
                 elif not sr.reminded:
                     sr.reminded = True
                     self.run.emit("result_reminded", key=sr.key, error=error)
@@ -954,6 +1011,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             sr.reminded = False
             sr.holds, sr.agent_failures, sr.down_since = 0, 0, None
 
+            if turn.wrap_up and result.status != "done":  # the wrap-up did not finish the step
+                self._cap_stop(sr, turn.wrap_up, result, wrapped=True)
+                return "stopped"
             if result.status == "effort_change":
                 turn = self._effort_change(sr, called, result)
                 continue
@@ -1023,6 +1083,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
 
     def _agent_call(self, sr: _StepRun, turn: _Turn, attempt: int) -> AgentCall:
         idle_s, tool_idle_s = self._idle_s(sr.read_only)
+        max_turns, budget_usd = self._call_caps(sr, bool(turn.wrap_up))
         return AgentCall(
             prompt=turn.prompt,
             model=sr.model,
@@ -1052,8 +1113,17 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             # Every call of a session keeps the setting the session started with (`_decide_read_only`).
             read_only_role=sr.read_only,
             self_contained=self._self_contained(sr),
-            max_turns=sr.max_turns,
+            max_turns=max_turns,
+            budget_usd=budget_usd,
         )
+
+    @staticmethod
+    def _call_caps(sr: _StepRun, wrap_up: bool) -> tuple[int | None, float | None]:
+        """A call's turn and spend caps: the step's own, or a wrap-up turn's (`WRAP_UP_TURNS`, and
+        `WRAP_UP_BUDGET_USD` but never more than the step's spend cap, none when the step has none)."""
+        if not wrap_up:
+            return sr.max_turns, sr.budget_usd
+        return WRAP_UP_TURNS, (min(WRAP_UP_BUDGET_USD, sr.budget_usd) if sr.budget_usd else None)
 
     def context_window_for(self, key: str, model: str) -> int | None:
         """The window the run has seen for this step's model: by the stream's model id when the
@@ -1186,6 +1256,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         self.run.emit("run_hold_ended", key=sr.key)
         if not waited:
             return None
+        if turn.wrap_up:  # a wrap-up turn is sent again as it was, with its caps, whether or not it reached the model
+            return turn
         return _Turn(self._continue_prompt(sr, {}), sr.session) if why.reached_model else turn
 
     def _wait_until(self, until: float) -> bool:
@@ -1197,7 +1269,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         return not halted(self.run.refresh()["status"])
 
     def _rollover(self, sr: _StepRun, outcome: AgentOutcome) -> _Turn | None:
-        """The session crossed `rollover_pct`: continue in a fresh one, or stop past `max_rollovers`."""
+        """The session crossed `rollover_pct`: continue in a fresh one, or stop past `max_rollovers`. (`_loop` stops a
+        wrap-up turn's rollover as the cap's kind before this: 3 turns can't do the step in a fresh session.)"""
         self.run.emit("rolled_over", key=sr.key, session_id=outcome.session_id, context_pct=outcome.context_pct)
         sr.rollovers += 1
         limit = self.cfg.context.max_rollovers
@@ -1342,6 +1415,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             first, second = lean, user_settings
         elif flag == NO_USER_SETTINGS[0]:
             first, second = user_settings, lean
+        elif flag in ("--max-turns", "--max-budget-usd"):  # a cap: its own key turns it off, role by role
+            also = (f", and drop `{prefix}.max_turns` and any step's `max_turns`" if flag == "--max-turns" else "")
+            return (f"{start}: run sessions need Claude Code {CLAUDE_MIN_VERSION} or later. Update the CLI, or turn the "
+                    f"flag off: set each role's value in `{RUNNER_FLAGS[flag]}` to `0`{also}.")
         else:
             return (f"{start}, and the runner doesn't pass it on its own: check `{prefix}.base_args` and "
                     f"`{prefix}.effort_arg` for it, and whether this version of the CLI takes it.")
@@ -1351,6 +1428,66 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
     def _stop(self, sr: _StepRun, kind: str, summary: str, extra: str = "") -> Outcome:
         raise_hitl(self.cfg, self.run, kind, sr.key, summary, extra=extra)
         return "stopped"
+
+    # -- caps
+
+    def _wrap_up_turn(self, sr: _StepRun, cap: str) -> _Turn:
+        """The wrap-up turn after `cap`: the same session, told to write its result now."""
+        return _Turn(f"{WRAP_UP_PROMPT.format(cap=CAP_WORDS[cap])}\n\n{self._result_partial(sr)}", sr.session,
+                     wrap_up=cap)
+
+    def _cap_value(self, sr: _StepRun, cap: str, wrapped: bool) -> int | float | None:
+        """The cap in force on the call that hit `cap`: its turns or its USD (a wrap-up turn's own when `wrapped`)."""
+        turns, usd = self._call_caps(sr, wrapped)
+        if cap != "turns":
+            return usd
+        if turns is None and sr.agent_name in self.cfg.agents:  # what `argv` passes when the call names none
+            return self.cfg.agents[sr.agent_name].max_turns
+        return turns
+
+    def _emit_capped(self, sr: _StepRun, cap: str, turn: _Turn, wrap_up: bool) -> None:
+        """`session_capped`: the call hit `cap`; `wrap_up` says a wrap-up turn follows (the count `run_agent_step`
+        reads back after a restart)."""
+        self.run.emit("session_capped", key=sr.key, cap=cap, session_id=sr.session,
+                      limit=self._cap_value(sr, cap, bool(turn.wrap_up)), wrap_up=wrap_up)
+
+    def _capped(self, sr: _StepRun, cap: str, turn: _Turn) -> _Turn | None:
+        """An editing step's call hit `cap` with no valid result: its one wrap-up turn, or a stop as the cap's kind
+        when that turn is used (this is it, or one ran since the last approval or reopen)."""
+        if turn.wrap_up or sr.wrap_ups >= 1:
+            self._emit_capped(sr, cap, turn, wrap_up=False)
+            self._cap_stop(sr, cap, None, wrapped=bool(turn.wrap_up))
+            return None
+        sr.wrap_ups += 1
+        self._emit_capped(sr, cap, turn, wrap_up=True)
+        return self._wrap_up_turn(sr, cap)
+
+    def _cap_stop(self, sr: _StepRun, cap: str, result: StepResult | None, wrapped: bool) -> None:
+        """Stop as `turn_cap` or `budget_cap`. The agent's own text (the wrap-up's summary and `signals.todo`) goes
+        through `clean_fact`, one line each; the ways out are `hitl._how_to_go_on`'s, never the agent's."""
+        what = "turn cap" if cap == "turns" else "spend cap"
+        value = self._cap_value(sr, cap, wrapped)
+        if value is None:
+            limit = "a limit the runner did not set"
+        else:
+            limit = f"{value} turns" if cap == "turns" else f"${float(value):.2f}"
+        if sr.step.role == "review":
+            summary = f"The review reached its {what} ({limit}), so the runner did not take it as complete."
+        elif wrapped:
+            how = (clean_fact(result.summary).rstrip(".") or "no summary") if result is not None else "no result"
+            summary = f"The wrap-up turn reached its {what} ({limit}) or did not finish: {how}."
+        else:
+            summary = f"The session reached its {what} ({limit}) after its wrap-up turn was used."
+        extra = ""
+        todo = result.signals.get("todo") if result is not None else None
+        if isinstance(todo, list):
+            items = [line for line in (clean_fact(item) for item in todo if isinstance(item, str)) if line]
+            if items:
+                lines = [f"- {line}" for line in items[:TODO_SHOWN]]
+                if len(items) > TODO_SHOWN:
+                    lines.append(f"({len(items) - TODO_SHOWN} more)")
+                extra = "### Left to do\n\n" + "\n".join(lines)
+        self._stop(sr, CAP_KINDS[cap], summary, extra=extra)
 
     def _outside_output(self, sr: _StepRun) -> list[Violation]:
         """For a `reconciles` step: what in the tree is more than an edit of its `output`, against the step's baseline
@@ -1596,12 +1733,16 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         self._brief_texts[sha] = (text, pin)
         return None
 
-    def _replace_brief(self, sr: _StepRun, turn: _Turn, why: str) -> _Turn:
+    def _replace_brief(self, sr: _StepRun, turn: _Turn, why: str) -> _Turn | None:
         """The session's brief can't be given to its next call (a template changed between a shared session's tasks,
         an engine upgrade, a tampered file): a fresh session, which records a new pin, as `_rollover` does. A fresh
         session whose own brief failed this way goes on without one, so this never loops. A resumed turn's own message
         (a human's or the runner's answers, an approval or reopen note, a fix turn's gate output) goes after the fresh
-        prompt, under `BRIEF_CARRIED`, so nothing it said is lost; a fresh turn's prompt is built again whole."""
+        prompt, under `BRIEF_CARRIED`, so nothing it said is lost; a fresh turn's prompt is built again whole. During a
+        wrap-up turn it stops as the cap's kind instead (None), as a wrap-up turn's rollover does (`_loop`)."""
+        if turn.wrap_up:
+            self._cap_stop(sr, turn.wrap_up, None, wrapped=True)
+            return None
         self.run.emit("brief_replaced", key=sr.key, reason=why, session_id=turn.resume)
         if turn.resume is None:
             sr.brief_refused = why

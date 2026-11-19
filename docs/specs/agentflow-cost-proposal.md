@@ -275,6 +275,7 @@ Today a resume prompt is 10–20K chars (median: implement 10.5K, plan 20K). The
 - **Unchanged:** the doubt stop rules (`unchanged`, `disputed`, `theater` and `bounded`), the numbering, and the floor that at least one refine round runs.
 - **Expected:** together with L4 and L5, −6% to −10% of spend. Spec and plan reviews are 28% of spend, and later rounds are about half of them.
 - *Amended for the C3 plan:* the round 2+ turn cap is `max(1, base // 2)`, where `base` is the agent's `max_turns` (unset by default, which means no cap). C4 swaps the base for `max_turns_by_role`.
+- *Amended for the C4 plan:* `base` is the resolved turn cap: the step's own `max_turns`, else the role's `agents.<name>.max_turns_by_role` entry, else `agents.<name>.max_turns`. A role set to `0` stays `0` (no cap), and no base at all is no cap. With the shipped `review: 45`, a round 2+ review gets 22.
 
 ### 3.4 L4 — Read-only tools for review roles
 

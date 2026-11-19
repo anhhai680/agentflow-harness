@@ -729,15 +729,48 @@ def test_round_two_review_gets_the_delta(flow):
     assert lead not in first and "```diff" not in first and "R1-F1" not in first
 
 
-@pytest.mark.parametrize("cap", [40, None])
-def test_round_two_cap_is_half(flow, cap):
-    flow.configure({**PIPE, "agents": {"claude": {"max_turns": cap}}}, autopilot=True, edit=with_doubt)  # None: unset
+def _turns(argv: list[str]) -> str | None:
+    return argv[argv.index("--max-turns") + 1] if "--max-turns" in argv else None
+
+
+@pytest.mark.parametrize("patch, want", [
+    ({}, ["45", "22"]),  # the engine's `max_turns_by_role.review`, then half of it
+    ({"agents": {"claude": {"max_turns_by_role": {"review": 0}}}}, [None, None]),  # no cap, whatever `max_turns` says
+])
+def test_round_two_cap_is_half(flow, patch, want):
+    flow.configure({**PIPE, **patch}, autopilot=True, edit=with_doubt)
+    assert flow.cfg.agents["claude"].max_turns == 80  # the pack's own, which the role map supersedes
     run = begin(flow, {REVIEW: [found(HIGH), done("sạch")], RECONCILE: [revised(1, disp("R1-F1", "actionable"))]})
     assert go(flow, run) == "awaiting_approval"
-
-    def turns(argv: list[str]) -> str | None:
-        return argv[argv.index("--max-turns") + 1] if "--max-turns" in argv else None
-
     reviews = [c["argv"] for c in flow.calls() if c["step"] == REVIEW]
     assert len(reviews) == 2
-    assert [turns(a) for a in reviews] == ([str(cap), str(cap // 2)] if cap else [None, None])
+    assert [_turns(a) for a in reviews] == want
+
+
+def _review_turns(cap: int):
+    def edit(data: dict) -> None:
+        with_doubt(data)
+        step = next(s for s in data["phases"]["define"]["steps"] if s.get("id") == "spec_review")
+        step["max_turns"] = cap
+
+    return edit
+
+
+def test_round_two_cap_halves_a_step_override(flow):
+    flow.configure(PIPE, autopilot=True, edit=_review_turns(20))
+    run = begin(flow, {REVIEW: [found(HIGH), done("sạch")], RECONCILE: [revised(1, disp("R1-F1", "actionable"))]})
+    assert go(flow, run) == "awaiting_approval"
+    assert [_turns(c["argv"]) for c in flow.calls() if c["step"] == REVIEW] == ["20", "10"]
+
+
+def test_a_capped_doubt_review_stops_the_phase(flow):
+    capped = {**done("sạch", findings=[]), "capped": "turns"}
+    run = begin(flow, {REVIEW: [found(HIGH), capped], RECONCILE: [revised(1, disp("R1-F1", "actionable"))]})
+    assert go(flow, run) == "waiting_human"
+    assert called(flow) == [DRAFT, REVIEW, RECONCILE, REVIEW]
+    assert [_turns(c["argv"]) for c in flow.calls() if c["step"] == REVIEW] == ["45", "22"]
+    waiting = run.state["waiting"]
+    assert waiting["kind"] == "turn_cap" and waiting["key"] == REVIEW
+    assert "(22 turns)" in waiting["summary"]
+    assert not events(run, "doubt_settled") and not events(run, "phase_approval_raised")
+    assert [e["wrap_up"] for e in events(run, "session_capped")] == [False]

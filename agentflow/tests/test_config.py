@@ -898,7 +898,10 @@ def test_a_sparse_pack_dry_run_passes_the_effort(sparse_repo, monkeypatch, capsy
     monkeypatch.chdir(sparse_repo)
     assert main(["run", "feature", "--module", "greet", "--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "--effort medium" in out and "--permission-mode bypassPermissions" in out and "--max-turns" not in out
+    assert "--effort medium" in out and "--permission-mode bypassPermissions" in out
+    first = next(line for line in out.splitlines() if "--model" in line)  # the first step's command line
+    assert first.lstrip().startswith("define/draft:")  # `role: plan` in the engine defaults
+    assert "--max-turns 60" in first and "--max-budget-usd 10.00" in first
 
 
 def test_every_default_step_has_an_explicit_id_and_a_mapped_skill():

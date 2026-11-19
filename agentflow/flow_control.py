@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, Literal, TextIO
 from agentflow import doubt, route, sources
 from agentflow.conditions import Ctx, evaluate, fmt, paths_read
 from agentflow.commit_checks import runner_head
-from agentflow.config import RECONCILE_CHANGED, Config, Phase, Step, for_lane
+from agentflow.config import RECONCILE_CHANGED, Config, Phase, Step, for_lane, resolve_turn_cap
 from agentflow.gates import GateResult, gates_ok, record_results, resolve, run_gates_reusing, summarize
 from agentflow.guards import snapshot
 from agentflow.gitops import CommitRejected, NothingToCommit, commit
@@ -418,13 +418,14 @@ class StepControl:
         if review and rerun and reconciling and doubt.is_doubt_reviewer(self.cfg, phase.name, step, self.ctx.values["lane"]):
             log = self.run.events.read()
             # A later round's reviewer is shown what the artifact changed since the last review, then the dispositions,
-            # and gets half the turn cap. With no usable base (`delta_for_review`) it is the full prompt as before.
+            # and gets half the resolved turn cap. With no usable base (`delta_for_review`) it is the full prompt as before.
             artifact = fmt(str(doubt.reconcile_steps(phase, self.ctx.values["lane"])[0].output), self.ctx)
             delta = doubt.delta_for_review(self.worktree, log, phase.name, key, artifact)
             earlier = "\n\n".join(part for part in (delta, doubt.earlier_for_review(log, phase.name)) if part)
             extra = {**(extra or {}), "earlier_findings": earlier}
             if delta:
-                turn_cap = doubt.delta_turn_cap(self.cfg.agents[phase.agent or self.cfg.defaults.agent].max_turns)
+                agent_name = phase.agent or self.cfg.defaults.agent
+                turn_cap = doubt.delta_turn_cap(resolve_turn_cap(self.cfg, agent_name, step, step.role))
         elif review and rerun:
             extra = {**(extra or {}), "earlier_findings": self._earlier_step_review(key, refine.get("note"))}
         mode = "refine" if rerun and not review else "first"
