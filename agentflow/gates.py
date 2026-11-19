@@ -45,6 +45,7 @@ import contextlib
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
@@ -493,6 +494,47 @@ def run_gates_reusing(cfg: Config, run: Run, key: str, names: str | list[str], c
         run.emit("gates_reused", key=key, tree=tree, gates=sorted(reused),
                  **{"from": sorted({str(e.get("key")) for e in reused.values()})})
     return results
+
+
+GATE_TABLE_MAX_ROWS = 20  # rows of `results_table`; the older gates are counted in one line
+
+
+def _cell(text: object) -> str:
+    """One Markdown table cell: a newline becomes a space and `|` is escaped."""
+    return " ".join(str(text).split("\n")).replace("\r", " ").replace("|", "\\|")
+
+
+def results_table(events: list[dict]) -> str:
+    """The gates the runner already ran, as a Markdown table for a read-only session's prompt; `""` with no
+    `gate_result` event. Pure: one row per gate, its newest result (by event order), newest first, at most
+    `GATE_TABLE_MAX_ROWS` rows, then `(<k> older gates not shown)`. An `affected`-tier result is marked: it checked
+    only the files a step changed."""
+    newest: dict[str, dict] = {}
+    for e in events:
+        if e.get("type") == "gate_result" and e.get("gate") is not None:
+            newest.pop(str(e["gate"]), None)  # re-inserted last: the dict keeps event order of the newest results
+            newest[str(e["gate"])] = e
+    if not newest:
+        return ""
+    latest = list(reversed(newest.values()))
+    rows = []
+    for e in latest[:GATE_TABLE_MAX_ROWS]:
+        if e.get("skipped"):
+            result = f"skipped: {e.get('reason') or 'no reason given'}"
+        else:
+            result = "pass" if e.get("passed") else "FAIL"
+            if e.get("tier") == "affected":
+                result += " (affected files)"
+        seconds = e.get("duration_s")
+        finite = isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds)
+        took = f"{round(seconds)}s" if finite else "—"  # `round` raises on an infinity and a NaN
+        cells = (e["gate"], result, took, e.get("key") or "—", e.get("log") or "—")
+        rows.append("| " + " | ".join(_cell(c) for c in cells) + " |")
+    lines = ["The runner already ran these gates on this run's work; each row is a gate's newest result.", "",
+             "| Gate | Result | Time | Step | Log |", "|---|---|---|---|---|", *rows]
+    if len(latest) > GATE_TABLE_MAX_ROWS:
+        lines.append(f"({len(latest) - GATE_TABLE_MAX_ROWS} older gates not shown)")
+    return "\n".join(lines)
 
 
 def gates_ok(results: list[GateResult]) -> bool:

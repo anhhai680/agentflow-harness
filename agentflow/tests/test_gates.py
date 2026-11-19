@@ -742,3 +742,73 @@ def test_resume_report_cuts_long_lines():
 def test_resume_report_names_a_gate_without_a_log():
     report = resume_report([failed_gate("doc", "bad", reason="doc check", log=False)], 80)
     assert "### doc (doc check)\n```\nbad\n```" in report and "Full log" not in report
+
+
+# --------------------------------------------------------------------------- the results table a read-only review gets
+
+
+def _result(gate: str, *, passed: bool = True, skipped: bool = False, reason: str = "", tier: str | None = None,
+            key: str = "build/implement", log: str | None = "/logs/x.log", duration_s: float | None = 1.4) -> dict:
+    e = {"type": "gate_result", "key": key, "gate": gate, "passed": passed, "skipped": skipped, "reason": reason,
+         "log": log, "duration_s": duration_s}
+    if tier:
+        e["tier"] = tier
+    return e
+
+
+def test_results_table_keeps_the_newest_result_per_gate():
+    from agentflow.gates import results_table
+
+    events = [
+        _result("lint", passed=False, key="build/implement"),
+        {"type": "step_started", "key": "x"},
+        _result("lint", key="build/fix", log="/logs/lint2.log", duration_s=2.6),
+        _result("tests", passed=True, skipped=True, reason="no tests", log=None, duration_s=None),
+        _result("types", tier="affected", key="build/task-2"),
+        _result("a|b", log="/l/a|b.log"),
+    ]
+    lines = results_table(events).splitlines()
+    assert lines[0] == "The runner already ran these gates on this run's work; each row is a gate's newest result."
+    assert lines[1] == ""
+    assert lines[2:4] == ["| Gate | Result | Time | Step | Log |", "|---|---|---|---|---|"]
+    rows = lines[4:]
+    assert rows == [  # newest first, one row per gate
+        r"| a\|b | pass | 1s | build/implement | /l/a\|b.log |",
+        "| types | pass (affected files) | 1s | build/task-2 | /logs/x.log |",
+        "| tests | skipped: no tests | — | build/implement | — |",
+        "| lint | pass | 3s | build/fix | /logs/lint2.log |",
+    ]
+
+
+def test_results_table_marks_a_failure_and_flattens_newlines():
+    from agentflow.gates import results_table
+
+    rows = results_table([_result("lint", passed=False, key="build/a\nb")]).splitlines()[4:]
+    assert rows == ["| lint | FAIL | 1s | build/a b | /logs/x.log |"]
+
+
+def test_results_table_shows_a_non_finite_duration_as_a_dash():
+    from agentflow.gates import results_table
+
+    for seconds in (float("inf"), float("-inf"), float("nan")):
+        rows = results_table([_result("lint", duration_s=seconds)]).splitlines()[4:]
+        assert rows == ["| lint | pass | — | build/implement | /logs/x.log |"], seconds
+
+
+def test_results_table_caps_its_rows():
+    from agentflow.gates import GATE_TABLE_MAX_ROWS, results_table
+
+    assert GATE_TABLE_MAX_ROWS == 20
+    text = results_table([_result(f"g{i:02d}") for i in range(25)])
+    lines = text.splitlines()
+    rows = [line for line in lines if line.startswith("| g")]
+    assert len(rows) == 20
+    assert rows[0].startswith("| g24 ") and rows[-1].startswith("| g05 ")  # the newest 20
+    assert lines[-1] == "(5 older gates not shown)"
+
+
+def test_results_table_is_empty_without_results():
+    from agentflow.gates import results_table
+
+    assert results_table([]) == ""
+    assert results_table([{"type": "step_started", "key": "x"}]) == ""

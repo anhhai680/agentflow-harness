@@ -18,11 +18,12 @@ that need it. Model text shown to a human goes through `hitl.clean_fact`, one li
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentflow import route
+from agentflow import gitops, route
 from agentflow.config import Config, Phase, Step, for_lane
 from agentflow.hitl import clean_fact
 from agentflow.state import Run
@@ -33,6 +34,7 @@ RECONCILE_ONLY = "runs only in a reconcile round"
 STOP_REASONS = ("no_reconcile_step", "unchanged", "disputed", "theater", "bounded")  # check order
 NOTE_MAX = 300  # characters of a disposition's note
 ARTIFACT_MAX = 4_000_000  # bytes of an artifact `artifact_digest` reads
+DELTA_MAX_LINES = 400  # a later round's diff longer than this is not shown: that review reads the whole artifact
 
 DISPUTABLE = ("noise", "trade_off")  # a review may dispute these dispositions, and ending the rounds is its right
 NOT_FIXED = ("noise", "trade_off", "contract_misread")  # a round whose findings all got these fixed nothing
@@ -40,6 +42,10 @@ OPEN_STATUSES = ("still open", "unresolved", "disputed", "asked a human", "claim
 
 EARLIER_LEAD = ("Earlier reviews of this artifact found these, and the reconcile step answered as shown. "
                 "Check each against the artifact as it is now; dispute an answer you think wrong with `disputes`.")
+DELTA_LEAD = ("This is a later round of the review. Since the last review (at `{base}`), `{artifact}` changed only as the "
+              "diff below shows. Check that each disposition listed below holds in the artifact as it is now, and look for "
+              "new problems in the changed sections. Read the rest of the artifact only as far as you need to judge those "
+              "sections; do not review it again in full.")
 STOP_LINES = {
     "unchanged": "The reconcile step left the artifact as it was, so it was not reviewed again.",
     "disputed": "The reviewer disputes a disposition: you decide.",
@@ -267,6 +273,41 @@ def earlier_for_review(events: list[dict], phase: str) -> str:
     are none. It does not reuse the code reviewer's `earlier_review`, whose wording is about code."""
     lines = _earlier_lines(since_human_round(events, phase))
     return EARLIER_LEAD + "\n\n" + "\n".join(lines) if lines else ""
+
+
+def _delta_base(events: list[dict], phase: str, review_key: str) -> str | None:
+    """Where the last review of `review_key` started (its `start_tree`, else its `start_head`), among the phase's
+    events since its last human round and before the newest reconcile round opened. A review restarted in this round
+    has its own `step_started` after that, which is not what the artifact changed since."""
+    window = since_human_round(events, phase)
+    opened = max((i for i, e in enumerate(window) if e.get("type") == "phase_rejected" and e.get("kind") == RECONCILE),
+                 default=-1)
+    starts = [e for e in window[:opened] if e.get("type") == "step_started" and e.get("key") == review_key]
+    if not starts:
+        return None
+    base = starts[-1].get("start_tree") or starts[-1].get("start_head")
+    return base if isinstance(base, str) and base else None
+
+
+def delta_for_review(worktree: Path, events: list[dict], phase: str, review_key: str, artifact: str) -> str:
+    """What a later round's reviewer is shown before the earlier findings: how `artifact` changed since the last
+    review started, as a diff in a fence. `""` whenever there is nothing usable (no earlier review in this human round,
+    a restarted review, an unreadable base, a missing, new, unchanged or too long diff, an unsafe path): the review then
+    gets the full round-1 prompt and the earlier findings, as before, and nothing errors or stops."""
+    base = _delta_base(events, phase, review_key)
+    if base is None:
+        return ""
+    diff = gitops.artifact_diff(worktree, base, artifact, DELTA_MAX_LINES)
+    if diff is None:
+        return ""
+    ticks = max((len(run) for run in re.findall(r"`+", diff)), default=0)
+    fence = "`" * max(3, ticks + 1)
+    return f"{DELTA_LEAD.format(base=base[:12], artifact=artifact)}\n\n{fence}diff\n{diff.rstrip(chr(10))}\n{fence}"
+
+
+def delta_turn_cap(base: int | None) -> int | None:
+    """The turn cap of a later round's review: half the agent's `max_turns`, at least 1; None (no cap) when it has none."""
+    return None if base is None else max(1, base // 2)
 
 
 # --------------------------------------------------------------------------- dispositions

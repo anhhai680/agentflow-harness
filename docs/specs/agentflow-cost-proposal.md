@@ -274,6 +274,7 @@ Today a resume prompt is 10–20K chars (median: implement 10.5K, plan 20K). The
   - If C0's signals show doubt round 2+ is still a top cost after L3c, forking comes back as a measured experiment.
 - **Unchanged:** the doubt stop rules (`unchanged`, `disputed`, `theater` and `bounded`), the numbering, and the floor that at least one refine round runs.
 - **Expected:** together with L4 and L5, −6% to −10% of spend. Spec and plan reviews are 28% of spend, and later rounds are about half of them.
+- *Amended for the C3 plan:* the round 2+ turn cap is `max(1, base // 2)`, where `base` is the agent's `max_turns` (unset by default, which means no cap). C4 swaps the base for `max_turns_by_role`.
 
 ### 3.4 L4 — Read-only tools for review roles
 
@@ -297,6 +298,16 @@ A `role: review` session doesn't need to edit the tree, run the test suite or ca
 
 **Codex:** a `role: review` call uses the existing read-only sandbox, as a fresh sizer does.
 
+*Amended for the C3 plan:*
+- **Allow list (Decided 1):** it goes in the `--settings` JSON the runner already passes with its deny rules, not in `--allowedTools`, which avoids a comma-splitting hazard. If the probe shows `--settings` allow rules aren't honoured under `dontAsk`, one comma-joined `--allowedTools` argument right after `--tools` is the fallback, and a workspace path with `,`, `(` or `)` then joins the refused characters of item 6.
+- **Not a sandbox (Decided 2):** L4 is a cost and independence control. Under `--setting-sources project,local`, the project's `.claude/settings.json` and `settings.local.json` (a worktree copy an earlier step of the run wrote included), their hooks (a `PreToolUse` hook can allow a call) and, with `user_settings: true`, the user's own rules still apply to a read-only session, and this repository's file allows its `pytest` command. So can the agent definition passed with `--agent` (the security overlay's review agent, read from the work tree's `.claude/agents/`), and `sandbox.enabled` in a project settings file, whose `autoAllowBashIfSandboxed` may auto-allow Bash. A probe with Claude Code 2.1.328 on macOS saw neither widen a call (the profile's `permissionMode`, `tools` and hooks did not apply, and a sandboxed `touch` was still denied); other versions are unverified. The runner's own allow list holds no test, build or write command, the prompt asks the reviewer not to run them, and the guard catches tracked and untracked edits to the tree. Real `dontAsk` also runs the CLI's built-in read-only commands (`ls`, `cat`, `grep` …) with no allow rule, so the commands it denies are tests, builds, writes and commands that are neither built-in reads nor listed.
+- **Write rule (fix wave):** the allow rule is `Edit(//<workspace>/out/**)`, the workspace's `out/` folder where the result file goes, not the whole workspace: `progress.md` there is read by the later steps that edit the code, which run with `bypassPermissions`.
+- **Codex (Decided 3):** unchanged. A Codex review must write its result file, and `-s read-only` would refuse that. `read_only_roles` on a non-Claude agent is a `validate` warning ("has no effect"). The Codex line above moves to a later slice, which needs a result taken from the final message.
+- **Idle limit (Decided 5):** this replaces "no reason to wait 15–30 minutes". A read-only session's limit with no tool call open is `min(no_progress_min, read_only_idle_min)` minutes. While a tool call is open it keeps today's `max(idle, gate_timeout_min)`, because item 2 lets a reviewer run a long command. `watchdog.no_progress_min: 0` switches every watchdog off, and `read_only_idle_min: 0` gives read-only sessions today's limits.
+- **Workspace paths (Decided 6):** a workspace path the allow rule can't name exactly (it holds one of `*?[]{}\()!#|@+,`, or a control or whitespace character other than a plain space) makes the step run as today, not read-only, with a `read_only_skipped` note recorded once per run. It is a fallback toward today's behaviour, never a failed review.
+- **Guard (Decided 7):** the `read_only_edit` guard compares the tree snapshot (tracked and untracked, not ignored files), as `forbidden_path` does. Ignored paths, `.git/config` and hooks aren't covered, which is the coverage every build step has today. The sizer's strict `git_state` + `tree_state` check would fail every test run item 2 allows (`__pycache__`, `.pytest_cache`). The guard covers only the work tree: it does not see writes or deletes outside it by a command a project rule allows (a test command whose options name an output path, such as `--basetemp` or `--junitxml` pointing at the run's state dir), nor new files an agent hides with an untracked `.gitignore` or an edit to `.git/info/exclude`. It stays on for the whole step once any session of it ran read-only, whatever a later fresh session decides. Its retry refusal covers only the same step key: a `reject`, a `skip` or a reconcile round reopens another step, whose start adopts the reviewer's edits as its baseline, so the paths the stop names are reverted first.
+- **Denials (Decided 8):** a denial in a read-only session is recorded as `permission_denied` with `read_only: true`; `signals.py` leaves it out of `permission_denied:<tool>`, and a `blocked` stop's report says the denial is by design.
+
 ### 3.5 L5 — Turn caps, spend caps and the idle limit
 
 **L5a. A turn cap per role, with one wrap-up turn.**
@@ -317,6 +328,7 @@ A `role: review` session doesn't need to edit the tree, run the test suite or ca
 - **No per-step cap** (decided, Q6). One step can spend up to about (1 + `fix_attempts` + wrap-up) × the cap. That range is already bounded by `fix_attempts`, the turn caps and `run_budget_hard_usd`. L1's per-step cost signal shows whether a step-level cap is ever needed.
 
 **L5c. The idle limit** stays as T3 shipped it (15 minutes), plus `read_only_idle_min` (L4). The data shows no case for changing the default: 18 gaps over 15 minutes in 5,547 calls.
+- *Amended for the C3 plan:* `read_only_idle_min` applies only while no tool call is open (L4, Decided 5), and `0` gives read-only sessions today's limits.
 
 **L5d. Compaction.** 102 auto-compactions at ~110K tokens is a symptom of context growth, not a policy to tune first. L2c, L3 and L6 shrink the context. L1's `compactions` signal shows whether `context.autocompact_pct` needs to change afterwards. No default changes in this proposal.
 

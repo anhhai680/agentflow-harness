@@ -414,8 +414,17 @@ class StepControl:
         # A review never resumes: it is told the last one's findings and the note. Nor does a step whose findings
         # hold the phase back, because `unchanged` would clear them with no check having run.
         review = step.role == "review" or step.blocks_on_findings
+        turn_cap: int | None = None
         if review and rerun and reconciling and doubt.is_doubt_reviewer(self.cfg, phase.name, step, self.ctx.values["lane"]):
-            extra = {**(extra or {}), "earlier_findings": doubt.earlier_for_review(self.run.events.read(), phase.name)}
+            log = self.run.events.read()
+            # A later round's reviewer is shown what the artifact changed since the last review, then the dispositions,
+            # and gets half the turn cap. With no usable base (`delta_for_review`) it is the full prompt as before.
+            artifact = fmt(str(doubt.reconcile_steps(phase, self.ctx.values["lane"])[0].output), self.ctx)
+            delta = doubt.delta_for_review(self.worktree, log, phase.name, key, artifact)
+            earlier = "\n\n".join(part for part in (delta, doubt.earlier_for_review(log, phase.name)) if part)
+            extra = {**(extra or {}), "earlier_findings": earlier}
+            if delta:
+                turn_cap = doubt.delta_turn_cap(self.cfg.agents[phase.agent or self.cfg.defaults.agent].max_turns)
         elif review and rerun:
             extra = {**(extra or {}), "earlier_findings": self._earlier_step_review(key, refine.get("note"))}
         mode = "refine" if rerun and not review else "first"
@@ -425,7 +434,7 @@ class StepControl:
                 return "stopped"
             evidence, fix_first = self._prerun_gates(step, key)
             extra = {**(extra or {}), "gate_evidence": evidence}
-        outcome = self.run_agent_step(phase, step, key, extra=extra, mode=mode, fix_first=fix_first)
+        outcome = self.run_agent_step(phase, step, key, extra=extra, mode=mode, fix_first=fix_first, turn_cap=turn_cap)
         if outcome == "done" and rec.get("status") not in DONE_STATUSES and writes_questions(step):
             self._render_questions(key, mode == "refine")
         return outcome

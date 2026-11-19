@@ -23,8 +23,10 @@ from agentflow.config import Config, Issue
 # `sizer_edit`: a read-only sizer session changed the work tree, `HEAD` or the git state (`sizing_lane.py`)
 # `outside_output`: a reconcile step changed a path other than its `output`, or left that output deleted, empty or
 # not a regular file (`gitops.outside_only`). Never reverted by the runner: a human looks at the tree.
+# `read_only_edit`: a session of a `read_only_roles` role changed the tree anyway (a hook, a project allow rule, a shell
+# built-in); the tree snapshot is compared, as for `forbidden_path`. Never reverted by the runner either.
 ViolationKind = Literal["forbidden_path", "agent_commit", "rejected_trailer", "user_only_skill", "sizer_edit",
-                        "outside_output"]
+                        "outside_output", "read_only_edit"]
 
 # Run first on every git call the runner makes after an agent may have touched the repository's shared git state:
 # no hook and no fsmonitor command runs (the agent could have planted either), nothing is hidden from status, and no
@@ -57,7 +59,10 @@ def snapshot(worktree: Path) -> str:
     with tempfile.TemporaryDirectory(prefix="agentflow-index-") as tmp:
         index = Path(tmp) / "index"
         if real_index.exists():
-            shutil.copyfile(real_index, index)  # seeds the stat cache so the add below is fast
+            # Seeds the stat cache so the add below is fast. `copy2` keeps the index's mtime: git trusts an entry's stat
+            # data only when it is older than the index file, so a fresh mtime would hide a same-size edit made in the
+            # second the index was written (racy git).
+            shutil.copy2(real_index, index)
         env = {**os.environ, "GIT_INDEX_FILE": str(index)}
         _git(worktree, *HARDENED, "add", "-A", env=env)  # an agent's planted fsmonitor never runs here
         return _git(worktree, *HARDENED, "write-tree", env=env).strip()
@@ -144,14 +149,19 @@ def check_step(
     end_tree: str,
     tool_calls: list[dict],
     forbid: list[str] | tuple[str, ...] = (),
+    read_only: bool = False,
 ) -> list[Violation]:
-    """Everything a finished agent step did that the guardrails, or the step's own `forbid`, forbid."""
+    """Everything a finished agent step did that the guardrails, or the step's own `forbid`, forbid. With `read_only`
+    (a `read_only_roles` session), every other changed path is a `read_only_edit` too: tracked and untracked files, not
+    ignored ones (the snapshot's coverage)."""
     worktree = Path(worktree)
     violations: list[Violation] = []
     patterns = [*cfg.guardrails.forbidden_paths, *forbid]
     for path in changed_paths(worktree, start_tree, end_tree):
         if any(path_matches(path, pattern) for pattern in patterns):
             violations.append(Violation("forbidden_path", path))
+        elif read_only:
+            violations.append(Violation("read_only_edit", path))
     head = _git(worktree, *HARDENED, "rev-parse", "HEAD").strip()
     if head != start_head:
         violations.append(Violation("agent_commit", f"HEAD moved from {start_head[:12]} to {head[:12]}"))

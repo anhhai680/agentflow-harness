@@ -243,6 +243,84 @@ def test_review_clean_after_fix_commits(lane, git):
     assert run.state["waiting"] is None
 
 
+TOY = "toy/x.py"
+REVERT = "Revert these before the run continues: a later step commits the whole work tree."
+
+
+def begin_toy_build(flow_repo):
+    """`begin_build` with a tracked `toy/x.py` on the base, for a reviewer to try to change."""
+    (flow_repo.root / "toy").mkdir(exist_ok=True)
+    (flow_repo.root / TOY).write_text("x = 1\n", encoding="utf-8")
+    return begin_build(flow_repo, plan_text(count=1))
+
+
+def test_task_review_runs_read_only(lane, git):
+    run = begin_toy_build(lane)
+    review_key = REVIEW.format(n=1)
+    lane.script({review_key: [{**review(), "attempts": [
+        {"tool_name": "Edit", "tool_input": {"file_path": TOY, "old_string": "x = 1", "new_string": "x = 2"}},
+        {"tool_name": "Bash", "tool_input": {"command": "pytest -q"}}]}]})
+    assert build(lane, run) == ("done", True)
+    denied = lane.events(run, "permission_denied")
+    assert [(e["key"], e["tool"], e["input"], e.get("read_only")) for e in denied] == [
+        (review_key, "Bash", {"command": "pytest -q"}, True)]  # `Edit` doesn't exist in the session: no denial
+    assert (lane.root / TOY).read_text(encoding="utf-8") == "x = 1\n"
+    calls = lane.calls()
+    (impl,) = [c["argv"] for c in calls if c["step"] == IMPL.format(n=1)]
+    (rev,) = [c["argv"] for c in calls if c["step"] == review_key]
+    assert ("--permission-mode", "dontAsk") in pairs(rev) and "--disable-slash-commands" in rev
+    assert ("--permission-mode", "dontAsk") not in pairs(impl) and "--disable-slash-commands" not in impl
+    assert ("--permission-mode", "bypassPermissions") in pairs(impl)
+    assert [e["read_only"] for e in lane.events(run, "agent_started")] == [False, True]
+    assert run.state["steps"][review_key]["read_only"] is True
+    commit_of(git, lane.root, "Task 1: First thing")  # the task is committed
+
+
+def test_task_review_prompt_carries_the_note_and_gate_table(lane, git):
+    run = begin_toy_build(lane)
+    assert build(lane, run) == ("done", True)
+    calls = {c["step"]: c["argv"][-1] for c in lane.calls()}
+    review_prompt, impl_prompt = calls[REVIEW.format(n=1)], calls[IMPL.format(n=1)]
+    progress = str(run.agent_dir / "progress.md")
+    assert "## This session is read-only" in review_prompt
+    assert f"Do not write `{progress}`" in review_prompt and "{progress}" not in review_prompt
+    assert "| Gate | Result | Time | Step | Log |" in review_prompt
+    assert "| ok | pass |" in review_prompt  # the task's gate, from the run's own results
+    assert "{read_only_note}" not in review_prompt
+    for text in ("## This session is read-only", "| Gate | Result |", "already ran these gates"):
+        assert text not in impl_prompt
+
+
+def test_a_forced_review_edit_fails_the_step(lane, git):
+    from agentflow.run_control import retry
+
+    run = begin_toy_build(lane)
+    review_key = REVIEW.format(n=1)
+    # `write` is the fake's own hand on the tree, past its permissions: a hook, a project allow rule, a shell built-in
+    lane.script({review_key: [{**review(), "write": {TOY: "x = 2\n"}}, review()]})
+    assert build(lane, run) == ("stopped", True)
+    waiting = run.refresh()["waiting"]
+    assert waiting["kind"] == "guard_violation" and waiting["key"] == review_key
+    assert f'read_only_edit: "{TOY}"' in waiting["summary"] and REVERT in waiting["summary"]
+    assert not lane.events(run, "step_committed") and not lane.events(run, "task_committed")
+    assert "Task 1: First thing" not in subjects(git, lane.root)
+    reviews = len([c for c in lane.calls() if c["step"] == review_key])
+
+    retry(run, review_key, by="me")  # refused while `toy/x.py` still differs from the failed session's start
+    assert build(lane, run) == ("stopped", True)
+    assert len([c for c in lane.calls() if c["step"] == review_key]) == reviews
+    waiting = run.refresh()["waiting"]
+    assert waiting["kind"] == "guard_violation" and f'read_only_edit: "{TOY}"' in waiting["summary"]
+    assert REVERT in waiting["summary"]
+
+    git(lane.root, "checkout", "--", TOY)
+    retry(run, review_key, by="me")
+    assert build(lane, run) == ("done", True)
+    assert len([c for c in lane.calls() if c["step"] == review_key]) == reviews + 1  # the review runs again
+    commit_of(git, lane.root, "Task 1: First thing")
+    assert (lane.root / TOY).read_text(encoding="utf-8") == "x = 1\n"
+
+
 def test_review_stays_off_the_shared_progress_notes(lane, git):
     run = begin_build(lane, plan_text(count=1))
     assert build(lane, run) == ("done", True)

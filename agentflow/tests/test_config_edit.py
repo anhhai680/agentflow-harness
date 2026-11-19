@@ -1123,11 +1123,29 @@ def test_the_form_sets_the_claude_cache_keys(shipped):
         form(shipped, (["agents", "claude", "cache_ttl"], "10m"))
 
 
+def test_read_only_roles_and_idle_are_editable(shipped):
+    fields = {tuple(f["key"]): f for s in config_edit.form_fields(shipped)["sections"] for f in s["fields"]}
+    assert fields[("agents", "claude", "read_only_roles")]["kind"] == "list"
+    idle = fields[("watchdog", "read_only_idle_min")]
+    assert idle["kind"] == "number" and idle["min"] == 0 and idle["max"] == 1440
+    text = shipped.read_text(encoding="utf-8")
+    config_edit.save(shipped, form(shipped, (["agents", "claude", "read_only_roles"], ["review", "debug"]),
+                                   (["watchdog", "read_only_idle_min"], 3)))
+    cfg = load_config(shipped)
+    assert cfg.agents["claude"].read_only_roles == ("review", "debug") and cfg.watchdog.read_only_idle_min == 3
+    after = shipped.read_text(encoding="utf-8")
+    assert sum(1 for line in after.splitlines() if "#" in line) >= sum(1 for line in text.splitlines() if "#" in line)
+    for bad in (-1, 1441):
+        with pytest.raises(EditError):
+            form(shipped, (["watchdog", "read_only_idle_min"], bad))
+
+
 def test_the_codex_section_has_no_claude_cache_fields(shipped):
     keys = {tuple(f["key"]) for s in config_edit.form_fields(shipped)["sections"] for f in s["fields"]}
     assert ("agents", "claude", "lean") in keys and ("agents", "codex", "lean") not in keys
-    assert config_edit.AGENT_FREE_KEYS[-3:] == ("cache_ttl", "lean", "user_settings")
-    assert "cache_ttl, lean, user_settings" in " ".join(config_edit.PROTECTED)
+    assert ("agents", "claude", "read_only_roles") in keys and ("agents", "codex", "read_only_roles") not in keys
+    assert config_edit.AGENT_FREE_KEYS[-4:] == ("cache_ttl", "lean", "user_settings", "read_only_roles")
+    assert "cache_ttl, lean, user_settings, read_only_roles" in " ".join(config_edit.PROTECTED)
 
 
 def test_context_run_brief_and_gate_lines_editable(shipped):

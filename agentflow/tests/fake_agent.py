@@ -17,7 +17,27 @@ result event), rate_limit {...} (sent as a `rate_limit_event`'s `rate_limit_info
 (after the last line, stdout is closed and the process stays alive s more seconds, as a CLI's shutdown does),
 stderr str (written to stderr before anything else, as a CLI that refuses a flag does: pair it with `no_init` and
 `exit`), model_id str (the model the stream names, default `fake-<alias>`), windows {"five_hour": u, "seven_day": u}
-(a `rate_limit_event` whose `unifiedWindows` carries those utilizations, status `allowed`, sent before `rate_limit`).
+(a `rate_limit_event` whose `unifiedWindows` carries those utilizations, status `allowed`, sent before `rate_limit`),
+attempts [{tool_name, tool_input}] (tool calls the model tries, decided by the permission model below; a permitted
+`Write` writes `tool_input.content` to `file_path`; a denied call is added to the result event's `permission_denials`, and
+a call to a tool `--tools` leaves out to its `unavailable` list as `{tool_name, tool_input, kind: "unknown_tool"}`; a
+`file_path` of `$AGENTFLOW_RESULT` is the step's result file).
+`write` is not a tool call and bypasses the model: it is the fake's own hand on the tree.
+
+The permission model of `attempts` is a model of the real CLI's, close enough for the runner's tests, not a copy.
+It does NOT model: the CLI's built-in read-only command set (real `dontAsk` runs `grep`, `cat`, `ls` and the like with no
+allow rule; here every `Bash` part needs one); chaining by `&`, a newline, `$(...)` or backticks (only the separators in
+2. split a command); an environment-variable prefix (`FOO=1 git diff` is judged as the whole text); hooks, project or
+user settings files, `--agent` profiles and sandbox settings. A denied attempt's `tool_result` is an error, as the CLI's.
+Each attempt is decided in this order:
+1. A tool `--tools` doesn't list doesn't exist (a `--tools`-less argv lists every tool): `unavailable`, and nothing happens.
+2. A `Bash` command is split on `&&`, `||`, `;` and `|` into parts, and each `>` / `>>` redirection in a part is a write
+   to its target path.
+3. The deny rules of `--settings` win for any part: `Bash(<pattern>)` matches the part by `fnmatch`, and `Edit(./<rel>)` or
+   `Edit(/<abs>/**)` matches a `Write` / `Edit` `file_path` or a redirection target.
+4. Under `--permission-mode dontAsk` every part needs an allow rule: the bare tool name, a `Bash(<pattern>)` that matches the
+   part, and for a write (a `Write` / `Edit` `file_path`, a redirection target) an `Edit(/<abs>/**)` that covers the path.
+5. In any other mode the call is allowed.
 
 Every result event carries `model_usage_since_last_result`, this call's usage (`inputTokens` 10, and the act keys
 cache_read, cache_write_5m, cache_write_1h and output_tokens, default 0, 0, 0 and 20), and `modelUsage`, the
@@ -28,8 +48,10 @@ sets them (one invocation can send several results).
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -133,6 +155,93 @@ def session_usage(session: str, model: str, usage: dict) -> dict:
     return models
 
 
+BASH_SEPARATORS = re.compile(r"&&|\|\||;|\|")
+REDIRECTION = re.compile(r"\d*>>?\s*(?P<target>[^\s;|&<>]+)")
+WRITE_TOOLS = ("Write", "Edit")
+RESULT_PLACEHOLDER = "$AGENTFLOW_RESULT"  # an attempt's `file_path` that stands for the step's result file
+
+
+def tool_rules(settings: dict, kind: str) -> list[str]:
+    return [rule for rule in settings.get("permissions", {}).get(kind, []) if isinstance(rule, str)]
+
+
+def rule_arg(rule: str, tool: str) -> str | None:
+    """`pattern` of a `Tool(pattern)` rule, or None for another tool's rule and for the bare name."""
+    prefix = tool + "("
+    return rule[len(prefix):-1] if rule.startswith(prefix) and rule.endswith(")") else None
+
+
+def under_edit_rule(rule: str, path: Path, cwd: Path) -> bool:
+    """`rule` is an `Edit(...)` rule that covers `path`: `./<rel>` is relative to the cwd, `/<abs>/**` is absolute."""
+    pattern = rule_arg(rule, "Edit")
+    if pattern is None:
+        return False
+    if pattern.startswith("./"):
+        pattern = str(cwd / pattern[2:])
+    elif pattern.startswith("/"):
+        pattern = pattern[1:]  # `Edit(//abs/**)` is the absolute `/abs/**`
+    else:
+        pattern = str(cwd / pattern)
+    return fnmatch.fnmatchcase(str(path), pattern)
+
+
+def bash_parts(command: str) -> list[tuple[str, list[str]]]:
+    """`[(command text, [redirection targets])]`: the command split on `&&`, `||`, `;`, `|`, redirections taken out."""
+    parts = []
+    for segment in BASH_SEPARATORS.split(command):
+        targets = [match.group("target") for match in REDIRECTION.finditer(segment)]
+        text = " ".join(REDIRECTION.sub(" ", segment).split())
+        if text or targets:
+            parts.append((text, targets))
+    return parts
+
+
+def decide(argv: list[str], cwd: Path, tool: str, tool_input: dict) -> str:
+    """`unknown_tool`, `denied` or `allowed`, as the permission model in the module docstring decides."""
+    tools = flag_value(argv, "--tools")
+    if tools is not None and tool not in tools.split(","):
+        return "unknown_tool"
+    settings = json.loads(flag_value(argv, "--settings") or "{}")
+    deny, allow = tool_rules(settings, "deny"), tool_rules(settings, "allow")
+    commands: list[str] = []  # Bash parts, each needs its own allow
+    writes: list[Path] = []  # every path the call writes
+    if tool == "Bash":
+        for text, targets in bash_parts(str(tool_input.get("command", ""))):
+            if text:
+                commands.append(text)
+            writes += [Path(os.path.normpath(cwd / target)) for target in targets]
+    elif tool in WRITE_TOOLS and tool_input.get("file_path"):
+        writes.append(Path(os.path.normpath(cwd / str(tool_input["file_path"]))))
+    if any(fnmatch.fnmatchcase(text, pattern) for text in commands for rule in deny
+           if (pattern := rule_arg(rule, "Bash")) is not None):
+        return "denied"
+    if any(under_edit_rule(rule, path, cwd) for path in writes for rule in deny):
+        return "denied"
+    if tool in deny:  # a bare tool name in the deny list
+        return "denied"
+    if flag_value(argv, "--permission-mode") != "dontAsk":
+        return "allowed"
+    if any(not under_allow(allow, tool, path, cwd) for path in writes):
+        return "denied"
+    if tool == "Bash":
+        if "Bash" not in allow and not all(
+                any(fnmatch.fnmatchcase(text, pattern) for rule in allow if (pattern := rule_arg(rule, "Bash")) is not None)
+                for text in commands):
+            return "denied"
+    elif tool in WRITE_TOOLS:
+        if tool not in allow and not writes:
+            return "denied"
+    elif tool not in allow:
+        return "denied"
+    return "allowed"
+
+
+def under_allow(allow: list[str], tool: str, path: Path, cwd: Path) -> bool:
+    """An allow rule covers `tool`'s write to `path`: an `Edit(...)` rule, the bare `Edit`, or the bare name of a
+    write tool itself."""
+    return "Edit" in allow or (tool in WRITE_TOOLS and tool in allow) or any(under_edit_rule(rule, path, cwd) for rule in allow)
+
+
 def main() -> int:
     argv = sys.argv[1:]
     step = os.environ.get("AGENTFLOW_STEP", "")
@@ -186,7 +295,7 @@ def main() -> int:
 
     serial = 0
 
-    def tool_turn(name: str, tool_input: dict, hold: float = 0) -> None:
+    def tool_turn(name: str, tool_input: dict, hold: float = 0, denied: bool = False) -> None:
         nonlocal serial
         serial += 1
         tool_id = f"toolu_fake_{serial}"
@@ -195,11 +304,31 @@ def main() -> int:
                                                "usage": usage(2000)}, "parent_tool_use_id": None, **base})
         if hold:
             time.sleep(hold)  # the tool runs: the stream says nothing until it returns
+        # a denied call never ran: the CLI answers it with an error result, as the real one does
+        answer = ({"content": f"Permission to use {name} has been denied.", "is_error": True} if denied
+                  else {"content": "ok"})
         emit({"type": "user", "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}]}, "parent_tool_use_id": None, **base})
+            {"type": "tool_result", "tool_use_id": tool_id, **answer}]}, "parent_tool_use_id": None, **base})
 
     for call in act.get("tool_calls", []):
         tool_turn(call["name"], call.get("input", {}))
+    denials: list[dict] = list(act.get("permission_denials", []))
+    unavailable: list[dict] = []
+    for attempt in act.get("attempts", []):
+        tool, tool_input = attempt["tool_name"], dict(attempt.get("tool_input", {}))
+        if tool_input.get("file_path") == RESULT_PLACEHOLDER:  # the step's result file, which a script can't name
+            tool_input["file_path"] = os.environ.get("AGENTFLOW_RESULT", "")
+        verdict = decide(argv, Path.cwd(), tool, tool_input)
+        if verdict == "unknown_tool":  # the model can't call a tool it was not given: nothing reaches the stream
+            unavailable.append({"tool_name": tool, "tool_input": tool_input, "kind": "unknown_tool"})
+            continue
+        tool_turn(tool, tool_input, denied=verdict == "denied")
+        if verdict == "denied":
+            denials.append({"tool_name": tool, "tool_input": tool_input})
+        elif tool == "Write":
+            target = Path(tool_input["file_path"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(tool_input.get("content", "")), encoding="utf-8")
     if act.get("hold_tool"):
         tool_turn("Bash", {"command": "make test"}, hold=float(act["hold_tool"]))
     for sub in act.get("subagents", []):
@@ -237,8 +366,10 @@ def main() -> int:
                   for name, tokens in session_usage(session, model, this_call).items()}
     result = {"type": "result", "subtype": "success", "is_error": bool(act.get("result_error")), "result": final_text,
               "total_cost_usd": cost, "num_turns": 1, "terminal_reason": "completed",
-              "permission_denials": act.get("permission_denials", []), "modelUsage": cumulative,
+              "permission_denials": denials, "modelUsage": cumulative,
               "model_usage_since_last_result": {model: {**this_call, "contextWindow": WINDOW}}, **base}
+    if unavailable:
+        result["unavailable"] = unavailable
     emit(result)
     for extra in act.get("results", []):
         emit({**result, "num_turns": 0, "model_usage_since_last_result": {}, **extra, **base})

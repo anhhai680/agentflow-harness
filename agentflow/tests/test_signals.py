@@ -59,6 +59,16 @@ def test_guard_trips_count_each_violation_by_kind_and_denials_by_tool():
     assert out["permission_denied:Bash"] == 2 and not [k for k in out if k.startswith("permission_denied:None")]
 
 
+def test_read_only_denials_are_not_counted():
+    evs = [_ev("permission_denied", key="build/t/review", tool="Bash", read_only=True),
+           _ev("permission_denied", key="build/t/review", tool="Write", read_only=True),
+           _ev("permission_denied", key="build/t/implement", tool="Bash"),
+           _ev("permission_denied", key="build/t/implement", tool="Bash", read_only=False)]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert out["permission_denied:Bash"] == 2  # by design in a read-only session: no rule to add for those
+    assert "permission_denied:Write" not in out
+
+
 def test_stops_and_plain_counters():
     evs = [_ev("hitl_raised", kind="blocked", key="build/x"), _ev("hitl_raised", kind="blocked", key="build/y"),
            _ev("hitl_raised", kind="boundary", key="plan/plan"),

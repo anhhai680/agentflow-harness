@@ -302,11 +302,17 @@ def _on_agent_started(state: dict, ev: dict) -> None:
             # call's pin is the resumed session's, and a fresh call's waits (`brief_pending`) for that call's
             # `agent_session`, so a fresh call that dies before it never pairs the old session with the new pin.
             pin = ev["brief"] if isinstance(ev.get("brief"), dict) else None
+            # The session's read-only setting (`read_only_roles`), kept beside it the same way: a resume takes it,
+            # whatever the config says now. A call from before the setting has none, which reads as False.
+            read_only = ev.get("read_only") is True
             if session:
                 row["brief"], row["brief_session"] = pin, session
+                row["read_only"], row["read_only_session"] = read_only, session
                 row.pop("brief_pending", None)
+                row.pop("read_only_pending", None)
             else:
                 row["brief_pending"] = pin
+                row["read_only_pending"] = read_only
 
 
 def _on_run_held(state: dict, ev: dict) -> None:
@@ -333,6 +339,10 @@ def _on_agent_session(state: dict, ev: dict) -> None:
             step["brief"] = step.pop("brief_pending")
         if "brief" in step:  # the call in flight passed the row's pin (`_on_agent_started`): bound to its session
             step["brief_session"] = session
+        if "read_only_pending" in step:
+            step["read_only"] = step.pop("read_only_pending")
+        if "read_only" in step:
+            step["read_only_session"] = session
 
 
 def _on_agent_turn(state: dict, ev: dict) -> None:
@@ -896,6 +906,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "agent_started": (("session_id", "pid"),),
     "agent_session": ("session_id",),
     "brief_replaced": ("key", "reason"),
+    "read_only_skipped": ("key", "reason"),
     "context_window": ("model", "tokens"),
     "usage_window": ("window",),
     "cli_setting_ignored": ("setting",),

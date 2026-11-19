@@ -772,17 +772,20 @@ FULL_PACKS = {"python": PYTHON_CONFIG, "node": PACKS / "node" / ".agentflow" / "
 # unset can come from the engine defaults.
 _RETRO_STEP = "the engine's retro step: a retro is the engine's pipeline, so no pack needs to state it"
 _WATCHDOG = "the engine's watchdog default (15 minutes): a pack states it only to change it"
+_READ_ONLY = "the engine's read-only roles (review): a pack states them only to change them"
 _POLICY = "the engine's default obligations (verified, reviewed, ...) and the engine floor, which a pack states only to add to"
 INHERITED = {
-    "python": {"retro_step": _RETRO_STEP, "policy": _POLICY},
+    "python": {"retro_step": _RETRO_STEP, "policy": _POLICY, "agents.claude.read_only_roles": _READ_ONLY},
     "node": {
         "policy": _POLICY,
         "agents.codex": "the engine's codex agent, disabled: it runs no step unless the pack enables it",
         "agents.claude.prices": "the engine's price table: it prices only a session Claude reported no cost for",
         "retro_step": _RETRO_STEP,
         "watchdog.no_progress_min": _WATCHDOG,
+        "agents.claude.read_only_roles": _READ_ONLY,
     },
-    "this repo": {"retro_step": _RETRO_STEP, "policy": _POLICY, "watchdog.no_progress_min": _WATCHDOG},
+    "this repo": {"retro_step": _RETRO_STEP, "policy": _POLICY, "watchdog.no_progress_min": _WATCHDOG,
+                  "agents.claude.read_only_roles": _READ_ONLY},
 }
 # The keys of `defaults`, `context`, `effort` and `recovery` that load_config requires (no code fallback). The engine
 # defaults hold the values the engine's minimum fixture pack (`node`) writes for them.
@@ -2385,3 +2388,89 @@ def test_memory_blockers_scan_is_linear_on_hostile_text():
     assert blockers("```py\n@dataclass\n```\n`@x/y` and ``a ` @b`` text") == []
     assert blockers("a `b` ` c @README") == ["CLAUDE.md: @ import"]
     assert blockers("read @README") == ["CLAUDE.md: @ import"]
+
+
+# --------------------------------------------------------------------------- C3: read-only roles and their idle limit
+
+
+def _sparse_issues(sparse_repo, **agents_claude_and_more):
+    """Validate the sparse pack (the engine's default phases) with `agents.claude` and top-level keys patched."""
+    target = pack.pack_config(sparse_repo)
+    data = yaml.safe_load(target.read_text(encoding="utf-8"))
+    data["agents"]["claude"].update(agents_claude_and_more.pop("claude", {}))
+    data.update(agents_claude_and_more)
+    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return validate(load_config(target), sparse_repo)
+
+
+def test_cost_c3_keys_default(sparse_repo):
+    cfg = load_config(pack.pack_config(sparse_repo))
+    assert cfg.agents["claude"].read_only_roles == ("review",)
+    assert cfg.agents["codex"].read_only_roles == ()
+    assert cfg.watchdog.read_only_idle_min == 5.0
+
+
+def test_read_only_roles_must_be_known_roles(sparse_repo):
+    found = _sparse_issues(sparse_repo, claude={"read_only_roles": ["reviewer"]})
+    assert [(i.path) for i in found if i.level == "error"] == ["agents.claude.read_only_roles"]
+    assert not errors(_sparse_issues(sparse_repo, claude={"read_only_roles": ["review"]}))
+    target = pack.pack_config(sparse_repo)
+    target.write_text(yaml.safe_dump({**SPARSE_PACK, "agents": {"claude": {"read_only_roles": "review"}}}), encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"read_only_roles"):
+        load_config(target)
+
+
+def test_a_read_only_role_on_a_step_that_edits_is_an_error(sparse_repo):
+    cfg = load_config(pack.pack_config(sparse_repo))
+    build = {s.id: s for s in cfg.phases["build"].steps}["build"]
+    found = errors(_sparse_issues(sparse_repo, claude={"read_only_roles": ["review", "build"]}))
+    assert ("error", build.path) in found
+    assert ("error", build.review.path) not in found  # a review step only reads
+    assert not [p for _, p in found if p.startswith("phases.define.steps") and p.endswith("spec_review")]
+    found = errors(_sparse_issues(sparse_repo, claude={"read_only_roles": ["plan"]}))
+    steps = {s.id: s.path for s in cfg.phases["plan"].steps}
+    assert ("error", steps["plan_reconcile"]) in found and ("error", steps["plan"]) in found
+
+
+def test_read_only_flags_in_base_args_are_errors(sparse_repo):
+    for arg in ("--tools", "--settings={}"):
+        found = errors(_sparse_issues(sparse_repo, claude={"base_args": ["-p", arg, *(["Edit"] if arg == "--tools" else [])]}))
+        assert found == [("error", "agents.claude.base_args")], arg
+    for arg in ("--tools", "--settings={}"):
+        assert not errors(_sparse_issues(sparse_repo, claude={"read_only_roles": [], "base_args": ["-p", arg]})), arg
+    found = errors(_sparse_issues(sparse_repo, claude={"read_only_roles": ["review"], "base_args": ["-p", "--agent", "x"]}))
+    assert found == [("error", "agents.claude.base_args")]  # a profile's own mode, tools and hooks could widen it
+
+
+@pytest.mark.parametrize("arg,why", [("--tools", "read_only_roles"), ("--settings={}", "read_only_roles"),
+                                     ("--agent=x", "read_only_roles"), ("--permission-mode", "settings"),
+                                     ("--dangerously-skip-permissions", "settings"),
+                                     ("--allowedTools=Bash", "settings"), ("--setting-sources", "user_settings")])
+def test_runner_flags_in_the_command_are_errors(sparse_repo, arg, why):
+    """`command` past the program reaches every argv, as `base_args` does: the same flags are refused there."""
+    found = [i for i in _sparse_issues(sparse_repo, claude={"command": ["claude", arg]}) if i.level == "error"]
+    assert [i.path for i in found] == ["agents.claude.command"] and why in found[0].message
+    assert not errors(_sparse_issues(sparse_repo, claude={"command": ["claude", "--verbose"]}))
+
+
+def test_read_only_roles_on_codex_warns(sparse_repo):
+    target = pack.pack_config(sparse_repo)
+    data = yaml.safe_load(target.read_text(encoding="utf-8"))
+    data["agents"]["codex"] = {"read_only_roles": ["review"]}
+    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    found = validate(load_config(target), sparse_repo)
+    assert [(i.level, i.path) for i in found if i.path == "agents.codex.read_only_roles"] == [
+        ("warning", "agents.codex.read_only_roles")]
+    assert not [i for i in found if i.level == "error"]
+
+
+def test_read_only_idle_min_checks(sparse_repo):
+    for bad in (-1, float("inf")):
+        found = _sparse_issues(sparse_repo, watchdog={"read_only_idle_min": bad})
+        assert [i.path for i in found if i.level == "error"] == ["watchdog.read_only_idle_min"], bad
+    found = _sparse_issues(sparse_repo, watchdog={"no_progress_min": 15, "read_only_idle_min": 20})
+    assert [(i.level, i.path) for i in found if i.path == "watchdog.read_only_idle_min"] == [
+        ("warning", "watchdog.read_only_idle_min")]
+    for fine in ({"no_progress_min": 15, "read_only_idle_min": 0}, {"no_progress_min": 0, "read_only_idle_min": 20}):
+        found = _sparse_issues(sparse_repo, watchdog=fine)
+        assert not [i for i in found if i.path == "watchdog.read_only_idle_min"], fine
