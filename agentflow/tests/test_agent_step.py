@@ -281,6 +281,7 @@ def test_fix_lead_reruns_only_what_failed(flow_repo):
     flow_repo.configure(LOUD)
     flow_repo.new_run()
     assert run_step(flow_repo, make_step(gates=["loud"], fix_loop=True)) == "stopped"
+    assert flow_repo.calls()[1:]  # a fix call exists, so the loop below checks something
     for call in flow_repo.calls()[1:]:
         prompt = call["argv"][-1]
         assert "Re-run only what failed" in prompt and "Run the failing gates yourself" not in prompt
