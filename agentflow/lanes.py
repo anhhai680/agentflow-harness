@@ -1875,7 +1875,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         lead = (
             f"The gates failed (fix attempt {attempt} of {self.cfg.defaults.fix_attempts}). "
             "Fix the cause in this session: never weaken a check, skip a test or add a suppression. "
-            "Run the failing gates yourself, then write the result file again."
+            "Re-run only what failed (the failing tests, or the one lint or type check), with quiet flags, not the "
+            "whole gate, then write the result file again: the runner runs every gate after you."
         )
         report = resume_report(failed, self.cfg.context.resume_gate_lines) if excerpt else self._gate_report(failed)
         return f"{lead}\n\n{report}"

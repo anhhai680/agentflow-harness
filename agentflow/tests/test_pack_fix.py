@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -169,7 +170,7 @@ def test_old_preamble_block_is_one_fixable_issue(pack_repo_python):
 def test_preamble_and_result_c2_rewords_are_fixable(pack_repo_python):
     put(pack_repo_python, "_preamble.md", OLD_PREAMBLE_C2)
     got = found(pack_repo_python)
-    assert [(i.level, i.path, i.fixable) for i in got.issues] == [("warning", "prompts/_preamble.md", True)] * 2
+    assert [(i.level, i.path, i.fixable) for i in got.issues] == [("warning", "prompts/_preamble.md", True)] * 3
     assert all("2.10" in i.message for i in got.issues)
     assert [f.after for f in got.fixes] == [None]  # the fixed text is the engine's file: the override goes
     put(pack_repo_python, "_result.md", OLD_RESULT_C2)
@@ -189,6 +190,78 @@ def test_the_c2_register_entries_are_exact_copies_of_the_old_prompts():
         entry = next(e for e in pack_fix.RETIRED if e.id == entry_id)
         assert entry.retired_in == "2.10" and entry.old in old_text and entry.detect in old_text, entry_id
         assert entry.new == "" or entry.new in engine(entry.file), entry_id
+
+
+# the C4 rewords: each engine prompt's old sentence and the sentence that replaced it
+C4_REWORDS = (
+    ("preamble-quiet-search-read-once", "_preamble.md",
+     "the runner's gates run it.\n- A denied command stays denied",
+     "the runner's gates run it.\n"
+     "- Use quiet flags for the tests you run (such as `-q`, no coverage report), and show only the failures.\n"
+     "- Find files with Glob and search with Grep, with a result limit, not `grep -r`, `find` or `ls -R` through "
+     "Bash.\n"
+     "- Read a file once, and read it again only after it changed.\n"
+     "- A denied command stays denied"),
+    ("task_inline-runner-runs-gates", "task_inline.md", "Run the build gates before you finish.",
+     "Run only the tests you wrote or changed: the runner runs the build gates after you."),
+    ("fix-runner-runs-gates", "fix.md", "Run the test and see it go from red to green, then run the build gates.",
+     "Run the test and see it go from red to green: the runner runs the gates after you."),
+    ("ci_fix-runner-runs-gates", "ci_fix.md",
+     "Run the verify gates before you finish. Do not commit: the runner commits and pushes.",
+     "Run only the tests that cover your fix: the runner runs the verify gates after you. Do not commit: the "
+     "runner commits and pushes."),
+    ("fix_findings-runner-runs-gates", "fix_findings.md",
+     "so do not review your own work. Run the verify gates before you finish.",
+     "so do not review your own work. Run only the tests that cover your fixes: the runner runs the verify gates "
+     "after you."),
+    ("sync_conflicts-runner-runs-gates", "sync_conflicts.md",
+     "\nRun the verify gates before you finish.\n",
+     "\nRun only the tests that cover the files you merged: the runner runs the verify gates after you.\n"),
+)
+
+
+def old_c4(name: str) -> str:
+    """The engine's file as it was before C4: the new sentence put back as the old one."""
+    _, _, old, new = next(r for r in C4_REWORDS if r[1] == name)
+    assert new in engine(name), name
+    return engine(name).replace(new, old)
+
+
+def test_c4_retired_entries_fix_old_overrides(pack_repo_python):
+    for entry_id, name, old, new in C4_REWORDS:
+        entry = next(e for e in pack_fix.RETIRED if e.id == entry_id)
+        assert (entry.file, entry.retired_in, entry.old, entry.new) == (name, "2.10", old, new), entry_id
+        put(pack_repo_python, name, old_c4(name))
+        got = found(pack_repo_python)
+        assert [(i.path, i.fixable, entry_id in i.message) for i in got.issues] == \
+            [(f"prompts/{name}", True, True)], entry_id
+        assert [f.after for f in got.fixes] == [None], entry_id  # fixed, it equals the engine's file: the override goes
+        put(pack_repo_python, name, old_c4(name) + "\nPack rule.\n")
+        assert [f.after.decode("utf-8") for f in found(pack_repo_python).fixes] == [engine(name) + "\nPack rule.\n"]
+        (prompts(pack_repo_python) / name).unlink()
+
+
+def test_shared_sentence_gets_each_files_own_fix(pack_repo_python):
+    names = ("ci_fix.md", "fix_findings.md", "sync_conflicts.md")
+    for name in names:
+        put(pack_repo_python, name, old_c4(name))
+    got = found(pack_repo_python)
+    by_file = {Path(i.path).name: i for i in got.issues}
+    assert sorted(by_file) == sorted(names) and len(got.issues) == 3
+    for entry_id, name, _, _ in C4_REWORDS:
+        if name in names:
+            assert entry_id in by_file[name].message, name
+    for name in names:
+        put(pack_repo_python, name, old_c4(name) + "\nPack rule.\n")
+    fixed = {f.path.name: f.after.decode("utf-8") for f in found(pack_repo_python).fixes}
+    assert fixed == {name: engine(name) + "\nPack rule.\n" for name in names}
+
+
+def test_no_engine_prompt_tells_a_session_to_run_its_gates():
+    pattern = re.compile(r"Run the (build|verify) gates before you finish|then run the build gates")
+    for file in pack.ENGINE_PROMPTS.glob("*.md"):
+        if file.name != "gate_fix.md":
+            assert not pattern.search(file.read_text(encoding="utf-8")), file.name
 
 
 def test_fix_that_lands_on_the_engine_text_deletes(pack_repo_python):

@@ -277,6 +277,15 @@ def test_fix_prompt_is_short_with_a_brief(flow_repo):
     assert "Full log:" in prompt
 
 
+def test_fix_lead_reruns_only_what_failed(flow_repo):
+    flow_repo.configure(LOUD)
+    flow_repo.new_run()
+    assert run_step(flow_repo, make_step(gates=["loud"], fix_loop=True)) == "stopped"
+    for call in flow_repo.calls()[1:]:
+        prompt = call["argv"][-1]
+        assert "Re-run only what failed" in prompt and "Run the failing gates yourself" not in prompt
+
+
 def test_fix_prompt_keeps_the_result_contract_without_a_brief(flow_repo):
     flow_repo.configure({**LOUD, "context": {**LOUD["context"], "run_brief": False}})
     run = flow_repo.new_run()

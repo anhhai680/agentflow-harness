@@ -16,4 +16,7 @@ This session cannot ask for approval, so anything outside the allow rules is den
 - One command per Bash call. No `;`, `&&`, `$VAR`, `$(...)`, heredocs or `NAME=value` prefixes.
 - Read files with Read and search with Grep, using full paths. Do not `cat` them.
 - Run only the tests you wrote or changed, never the whole suite: the runner's gates run it.
+- Use quiet flags for the tests you run (such as `-q`, no coverage report), and show only the failures.
+- Find files with Glob and search with Grep, with a result limit, not `grep -r`, `find` or `ls -R` through Bash.
+- Read a file once, and read it again only after it changed.
 - A denied command stays denied in any other form. Do not rephrase it: stop as `blocked` and name the exact command.
