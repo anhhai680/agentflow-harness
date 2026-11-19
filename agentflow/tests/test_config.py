@@ -2554,6 +2554,9 @@ def test_cap_map_checks(tmp_cfg):
                      ("session_budget_usd", {"nobody": 1})):
         found = [(i.level, i.path) for i in _c4_issues(tmp_cfg, {"agents": {"claude": {key: bad}}}) if i.level == "error"]
         assert found == [("error", f"agents.claude.{key}")], (key, bad)
+    for key in ("max_turns_by_role", "session_budget_usd"):  # the error says how to undo a role the engine's caps still name
+        msg = next(i.message for i in _c4_issues(tmp_cfg, {"agents": {"claude": {key: {"nobody": 1}}}}) if i.level == "error")
+        assert f"`{key}.nobody: null`" in msg and "agents.claude.models" in msg
     ok = {"agents": {"claude": {"max_turns_by_role": {"build": 0, "review": 7}, "session_budget_usd": {"build": 0, "plan": 0.01}}}}
     assert not [i for i in _c4_issues(tmp_cfg, ok) if i.level == "error"]
     for key in ("max_turns_by_role", "session_budget_usd"):
@@ -2561,6 +2564,20 @@ def test_cap_map_checks(tmp_cfg):
             load_config(tmp_cfg({"agents": {"claude": {key: {"build": "many"}}}}))
         with pytest.raises(ConfigError, match=key):
             load_config(tmp_cfg({"agents": {"claude": {key: ["build"]}}}))
+
+
+def test_a_pack_that_drops_a_model_role_must_null_its_caps(tmp_cfg):
+    def dropping(caps):
+        def patch(data):
+            data["agents"]["claude"]["models"] = {"mechanical": None}
+            data["agents"]["claude"].update(caps)
+
+        return patch
+
+    bare = [i for i in _c4_issues(tmp_cfg, dropping({})) if i.level == "error"]
+    assert [i.path for i in bare] == ["agents.claude.max_turns_by_role"] and "max_turns_by_role.mechanical: null" in bare[0].message
+    both = {"max_turns_by_role": {"mechanical": None}, "session_budget_usd": {"mechanical": None}}
+    assert not [i for i in _c4_issues(tmp_cfg, dropping(both)) if i.level == "error"]
 
 
 def test_bash_output_chars_checks(tmp_cfg):

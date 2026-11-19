@@ -1167,6 +1167,8 @@ def test_cap_fields_are_editable(shipped):
     assert spec.session_budget_usd["build"] == 7.5 and spec.bash_output_chars == 20000
     after = shipped.read_text(encoding="utf-8")
     assert sum(1 for line in after.splitlines() if "#" in line) >= sum(1 for line in text.splitlines() if "#" in line)
+    with pytest.raises(EditError):  # what the page sent before it learned `number` maps: text, which the server refuses
+        form(shipped, (["agents", "claude", "session_budget_usd"], {"build": "7.5"}))
     with pytest.raises(EditError):
         form(shipped, (["agents", "claude", "max_turns_by_role"], {"build": -1}))
     with pytest.raises(EditError):

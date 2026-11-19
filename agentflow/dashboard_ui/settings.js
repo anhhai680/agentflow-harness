@@ -35,26 +35,39 @@ function setEdit(field, value) {
 function numberOf(input, kind) {
   if (input.value.trim() === "") return null;
   const value = Number(input.value);
+  if (kind === "number") return Number.isFinite(value) ? value : input.value;  // a non-number stays text: the server refuses it
   return kind === "int" && Number.isInteger(value) ? value : (kind === "int" ? input.value : value);
+}
+
+// One map value as the server wants it: a number for an `int` or `number` map, text otherwise. `undefined` for an
+// empty `number` value: its entry is left out, so the layers below decide it.
+function mapValue(input, kind) {
+  if (kind === "number") {
+    const value = numberOf(input, "number");
+    return value === null ? undefined : value;
+  }
+  return kind === "int" ? numberOf(input, "int") : input.value;
 }
 
 function mapInput(field, id) {
   const rows = el("div", { class: "map-rows" });
   const pairs = Object.entries(field.value || {});
   const isInt = field.value_kind === "int";
+  const isNumeric = isInt || field.value_kind === "number";
   const collect = () => {
     const out = {};
     for (const row of rows.children) {
       const [k, v] = row.querySelectorAll("input");
       if (!k.value.trim()) continue;
-      out[k.value.trim()] = isInt ? numberOf(v, "int") : v.value;
+      const value = mapValue(v, field.value_kind);
+      if (value !== undefined) out[k.value.trim()] = value;
     }
     setEdit(field, out);
   };
   const addRow = (key, value) => {
     const k = el("input", { type: "text", value: key, "aria-label": field.label + ": name", placeholder: "name", disabled: !!field.readonly });
-    const v = el("input", { type: isInt ? "number" : "text", value: value === null || value === undefined ? "" : value,
-      "aria-label": field.label + ": value", placeholder: "value", step: isInt ? "1" : null, min: field.min, disabled: !!field.readonly });
+    const v = el("input", { type: isNumeric ? "number" : "text", value: value === null || value === undefined ? "" : value,
+      "aria-label": field.label + ": value", placeholder: "value", step: isInt ? "1" : (isNumeric ? "any" : null), min: field.min, disabled: !!field.readonly });
     const remove = el("button", { type: "button", text: "×", title: "Remove", "aria-label": "Remove " + (key || "row"), disabled: !!field.readonly,
       onclick: () => { row.remove(); collect(); } });
     const row = el("div", { class: "map-row" }, k, v, remove);

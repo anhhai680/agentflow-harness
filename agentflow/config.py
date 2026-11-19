@@ -2106,7 +2106,8 @@ class _Validator:
                     if not ok(value):
                         self.error(_join(path, key), f"{key}.{role} must be {what}")
                     if role not in agent.models:
-                        self.error(_join(path, key), f"role '{role}' is not in `agents.{name}.models`")
+                        self.error(_join(path, key), f"role '{role}' is not in `agents.{name}.models`: if you removed "
+                                   f"that model, also set `{key}.{role}: null` (the engine's defaults name the role)")
             chars = agent.bash_output_chars
             if isinstance(chars, bool) or (chars != 0 and not 1000 <= chars <= 1_000_000):
                 self.error(_join(path, "bash_output_chars"),
