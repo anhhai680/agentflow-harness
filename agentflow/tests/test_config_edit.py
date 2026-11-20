@@ -1265,3 +1265,14 @@ def test_the_settings_form_has_the_park_keys(shipped):
     assert again[("hitl", "park_kinds")]["value"] == ["blocked", "gate_failed"]
     assert again[("hitl", "park_independent")]["value"] is False
     assert set(hitl.PARKABLE) >= {"blocked", "gate_failed"}
+
+
+def test_the_settings_form_has_the_digest_key(shipped):
+    field = _fields(shipped)[("hitl", "digest")]
+    assert (field["label"], field["kind"]) == ("One digest line instead of a notification per stop", "bool")
+    assert field["value"] is False
+    proposal = form(shipped, (["hitl", "digest"], True))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).hitl["digest"] is True
+    assert _fields(shipped)[("hitl", "digest")]["value"] is True

@@ -208,6 +208,7 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("hitl", "remind_after_h"), "Remind after (h)", _NUM),
         (("hitl", "park_independent"), "Park a stopped task and go on", {"kind": "bool"}),
         (("hitl", "park_kinds"), "Stops that park a task", {"kind": "list"}),
+        (("hitl", "digest"), "One digest line instead of a notification per stop", {"kind": "bool"}),
     ]),
     ("Dashboard", "The page reads these at once; a new port needs a dashboard restart.", [
         (("dashboard", "port"), "Port (restart)", {"kind": "int", "min": 0, "max": 65535}),

@@ -775,11 +775,12 @@ _WATCHDOG = "the engine's watchdog default (15 minutes): a pack states it only t
 _READ_ONLY = "the engine's read-only roles (review): a pack states them only to change them"
 _CAPS = "the engine's per-role caps: a pack states them only to change them"
 _PARK = "the engine's parkable stops (hitl.PARKABLE): a pack states them only to park fewer"
+_DIGEST = "the engine's notification default (one line per stop): a pack states it only to send a digest"
 _POLICY = "the engine's default obligations (verified, reviewed, ...) and the engine floor, which a pack states only to add to"
 INHERITED = {
     "python": {"retro_step": _RETRO_STEP, "policy": _POLICY, "agents.claude.read_only_roles": _READ_ONLY,
                "agents.claude.max_turns_by_role": _CAPS, "agents.claude.session_budget_usd": _CAPS,
-               "agents.claude.bash_output_chars": _CAPS, "hitl.park_kinds": _PARK},
+               "agents.claude.bash_output_chars": _CAPS, "hitl.park_kinds": _PARK, "hitl.digest": _DIGEST},
     "node": {
         "policy": _POLICY,
         "hitl": "the engine's park settings (parking on, every parkable stop): a pack states them only to change them",
@@ -795,7 +796,7 @@ INHERITED = {
     "this repo": {"retro_step": _RETRO_STEP, "policy": _POLICY, "watchdog.no_progress_min": _WATCHDOG,
                   "agents.claude.read_only_roles": _READ_ONLY, "agents.claude.max_turns_by_role": _CAPS,
                   "agents.claude.session_budget_usd": _CAPS, "agents.claude.bash_output_chars": _CAPS,
-                  "hitl.park_kinds": _PARK},
+                  "hitl.park_kinds": _PARK, "hitl.digest": _DIGEST},
 }
 # The keys of `defaults`, `context`, `effort` and `recovery` that load_config requires (no code fallback). The engine
 # defaults hold the values the engine's minimum fixture pack (`node`) writes for them.
@@ -2796,3 +2797,13 @@ def test_constraint_override_is_unset_by_default(tmp_cfg):
 def test_a_malformed_constraint_override_does_not_load(tmp_cfg, override):
     with pytest.raises(ConfigError, match="constraint_override"):
         load_config(tmp_cfg({"guardrails": {"constraint_override": override}}))
+
+
+@pytest.mark.parametrize("value", ["yes", 1, ["true"]])
+def test_digest_must_be_a_bool(tmp_cfg, value):
+    assert ("error", "hitl.digest") in errors(issues_for(tmp_cfg, {"hitl": {"digest": value}}))
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_digest_may_be_on_or_off(tmp_cfg, value):
+    assert not [path for _, path in errors(issues_for(tmp_cfg, {"hitl": {"digest": value}})) if path.startswith("hitl")]

@@ -119,6 +119,7 @@ hitl:
   park_independent: true       # park a stopped plan task and go on with the tasks that don't depend on it
   park_kinds: [needs_human, blocked, blocked_repeat, gate_failed, fix_attempts_exhausted, review_unresolved,
                guard_violation, step_timeout, turn_cap, budget_cap]   # the stops that park; [] parks nothing
+  digest: false                # true: each notification is one machine-wide line ("2 items need you; 3 runs progressing"), sent when it changes
 
 dashboard:
   host: 127.0.0.1

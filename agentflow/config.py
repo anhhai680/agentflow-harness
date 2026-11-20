@@ -2922,12 +2922,15 @@ class _Validator:
         self.early_pr_after()
 
     def hitl(self) -> None:
-        """`hitl.park_independent` (a bool) and `hitl.park_kinds` (stops a plan task may park, none of them a run's)."""
+        """`hitl.park_independent` and `hitl.digest` (bools) and `hitl.park_kinds` (stops a plan task may park, none of
+        them a run's)."""
         from agentflow.hitl import PARKABLE  # hitl imports config: imported here, not at the top
 
         hitl = self.cfg.hitl
         if not isinstance(hitl.get("park_independent", False), bool):
             self.error("hitl.park_independent", "park_independent must be true or false")
+        if not isinstance(hitl.get("digest", False), bool):
+            self.error("hitl.digest", "digest must be true or false")
         kinds = hitl.get("park_kinds", [])
         if not isinstance(kinds, list) or any(not isinstance(kind, str) for kind in kinds):
             self.error("hitl.park_kinds", f"park_kinds must be a list of stop kinds: {', '.join(PARKABLE)}")

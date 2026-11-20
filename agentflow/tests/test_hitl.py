@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agentflow import hitl
+from agentflow import hitl, pack
 from agentflow.autonomy import AUTO_BY
 from agentflow.flow import main
 from agentflow.hitl import (
@@ -988,3 +988,71 @@ def test_the_engine_default_parks_a_task_stop():
     raw = yaml.safe_load((Path(hitl.__file__).parent / "defaults" / "config.yaml").read_text(encoding="utf-8"))
     assert raw["hitl"]["park_independent"] is True
     assert tuple(raw["hitl"]["park_kinds"]) == hitl.PARKABLE
+
+
+# ------------------------------------------------------------------ the notification digest (T4)
+
+
+def _digest_cfg(cfg):
+    return _park_cfg(cfg, digest=True)
+
+
+def test_the_digest_counts_items_and_runs(repo, run, cfg, macos_calls):
+    from agentflow.state import Run
+
+    assert hitl.digest_text(repo) == "Nothing needs you; 1 run progressing"
+    park(cfg, run, PA)  # a parked item needs a person, though its run is still progressing
+    assert hitl.digest_text(repo) == "1 item needs you; 1 run progressing"
+    other = Run.create(cfg, repo, "feature", {"module": "billing"})
+    third = Run.create(cfg, repo, "feature", {"module": "search"})
+    asked = dataclasses.replace(one_question(), kind="boundary")
+    raise_hitl(cfg, other, "needs_human", "plan/plan", "needs a TTL", [asked])  # a run's wait: it holds the run
+    assert hitl.digest_text(repo) == "2 items need you (1 holds a run); 2 runs progressing"
+    assert third.state["status"] == "running"
+
+
+def test_an_unchanged_digest_is_not_sent_again(repo, run, cfg, macos_calls):
+    on = _digest_cfg(cfg)
+    hitl.notify_run(on, run, "blocked: something specific")
+    assert len(macos_calls) == 1
+    assert "Nothing needs you; 1 run progressing" in macos_calls[0][2]
+    assert "blocked: something specific" not in macos_calls[0][2] and 'with title "agentflow"' in macos_calls[0][2]
+    hitl.notify_run(on, run, "blocked: something else")
+    assert len(macos_calls) == 1  # nothing changed
+    park(on, run, PA)  # a stop that parks is raised quietly, so only the digest can tell of it
+    hitl.notify_run(on, run, "parked")
+    assert len(macos_calls) == 2 and "1 item needs you; 1 run progressing" in macos_calls[1][2]
+    assert (pack.state_dir(repo) / "notify_digest.txt").read_text(encoding="utf-8") == (
+        "1 item needs you; 1 run progressing")
+
+
+def test_a_runner_note_never_reaches_the_digest(repo, run, cfg, macos_calls):
+    on = _digest_cfg(cfg)
+    hitl.notify_run(on, run, "needs you")
+    macos_calls.clear()
+    hitl.notify_run(on, run, "took the recommended answer(s) q1=A in plan/grill; the decision is recorded")
+    assert macos_calls == []
+
+
+def test_an_unreadable_last_digest_is_sent_again(repo, run, cfg, macos_calls):
+    on = _digest_cfg(cfg)
+    hitl.notify_run(on, run, "x")
+    last = pack.state_dir(repo) / "notify_digest.txt"
+    last.unlink()
+    last.mkdir()  # not a regular file: it can't be read
+    hitl.notify_run(on, run, "x")
+    assert len(macos_calls) == 2
+
+
+def test_with_the_digest_off_every_notification_is_sent(repo, run, cfg, macos_calls):
+    hitl.notify_run(cfg, run, "one")
+    hitl.notify_run(cfg, run, "one")
+    assert len(macos_calls) == 2 and "one" in macos_calls[0][2]
+    assert not (pack.state_dir(repo) / "notify_digest.txt").exists()
+
+
+def test_the_engine_default_has_the_digest_off():
+    import yaml
+
+    raw = yaml.safe_load((Path(hitl.__file__).parent / "defaults" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["hitl"]["digest"] is False

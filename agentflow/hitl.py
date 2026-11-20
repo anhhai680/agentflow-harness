@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from . import pack, safeio
 from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RECONCILE_CHANGED, RETRO_PIPELINE, Config
 from .events import nfc, parse_iso
 from .park import radius_line
@@ -377,9 +378,50 @@ def notify(cfg: Config, title: str, message: str, run: Run | None = None) -> Non
             _log_failure(run, str(entry.get("type")), str(exc) or type(exc).__name__)
 
 
+DIGEST_TITLE = "agentflow"
+DIGEST_FILE = "notify_digest.txt"  # in the state dir: the digest line last sent
+DIGEST_MAX_BYTES = 1024
+PROGRESSING = ("running", "refining")  # a run no one waits on and that is neither done, paused nor ready
+
+
+def digest_text(repo: Path) -> str:
+    """The one machine-wide line of `hitl.digest`: the items that need a person, and the runs going on.
+    An item "holds a run" when it is a run's wait; a parked item needs a person but holds nothing, and its run still
+    counts as progressing."""
+    runs = list_runs(repo)
+    items = inbox_items(repo, runs)
+    holding = sum(1 for item in items if item["kind"] != "parked")
+    going = sum(1 for run in runs if run.state["status"] in PROGRESSING)
+    count = len(items)
+    need = "Nothing needs you" if not count else f"{count} item{'s' if count != 1 else ''} need{'' if count != 1 else 's'} you"
+    held = f" ({holding} hold{'s' if holding == 1 else ''} a run)" if holding else ""
+    return f"{need}{held}; {going} run{'' if going == 1 else 's'} progressing"
+
+
+def _digest_unchanged(path: Path, text: str) -> bool:
+    try:
+        last = safeio.read_bytes(path, DIGEST_MAX_BYTES)
+    except (OSError, ValueError):
+        return False  # it can't be read: send the digest
+    return last is not None and last.decode("utf-8", "replace") == text
+
+
 def notify_run(cfg: Config, run: Run, message: str) -> None:
-    """`notify` with the run's configured title."""
-    notify(cfg, _title_for(cfg, run), message, run=run)
+    """`notify` with the run's configured title. With `hitl.digest` on it sends `digest_text` instead of `message`,
+    and only when that differs from the line last sent (kept in the state dir): a note that changes no count is
+    never sent."""
+    if cfg.hitl.get("digest") is not True:
+        notify(cfg, _title_for(cfg, run), message, run=run)
+        return
+    text = digest_text(run.repo)
+    path = pack.state_dir(run.repo) / DIGEST_FILE
+    if _digest_unchanged(path, text):
+        return
+    notify(cfg, DIGEST_TITLE, text, run=run)
+    try:
+        safeio.write_text(path, text)
+    except (OSError, ValueError) as exc:
+        _log_failure(run, "digest", f"could not keep the digest sent: {exc}")
 
 
 def _title_for(cfg: Config, run: Run) -> str:
