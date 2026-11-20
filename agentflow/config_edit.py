@@ -140,6 +140,17 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
          "End a read-only session that is quiet with no tool running after (min, 0 = as above)",
          {"kind": "number", "min": 0, "max": 1440}),
     ]),
+    ("Usage window", "When runs stop starting new work because the plan's usage window is nearly spent; the soft mark "
+                     "is your headroom.", [
+        (("usage", "governor"), "Governor", {"kind": "enum", "options": ["on", "observe", "off"]}),
+        (("usage", "five_hour_soft"), "5-hour soft mark: no new run or phase above it",
+         {"kind": "number", "min": 0, "max": 1, "exclusive_min": True}),
+        (("usage", "five_hour_hard"), "5-hour hard mark: no new session above it",
+         {"kind": "number", "min": 0, "max": 1, "exclusive_min": True}),
+        (("usage", "seven_day_soft"), "7-day soft mark: no new run or phase above it",
+         {"kind": "number", "min": 0, "max": 1, "exclusive_min": True}),
+        (("usage", "finish_first"), "Held runs go again closest to finish first", {"kind": "bool"}),
+    ]),
     ("Effort", "How the runner sizes each step's reasoning effort.", [
         (("effort", "sizing"), "Size each step before it starts", {"kind": "bool"}),
         (("effort", "default"), "Level when sizing is off or fails", {"kind": "enum", "options": list(KNOWN_EFFORT_LEVELS)}),

@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from agentflow import pack
-from agentflow.config import CACHE_TTLS, ConfigError, Evidence, Issue, load_config, parse_evidence, validate
+from agentflow.config import CACHE_TTLS, ConfigError, Evidence, Issue, Usage, load_config, parse_evidence, validate
 from agentflow.flow import main, repo_root
 from conftest import PYTHON_CONFIG, with_doubt
 
@@ -1693,6 +1693,52 @@ def test_preflight_enabled_must_be_a_bool(tmp_cfg):
     assert [(i.path, i.message) for i in found if i.level == "error"] == [("preflight.nope", "unknown preflight key")]
     assert load_config(tmp_cfg({"preflight": {"enabled": True}})).preflight.enabled is True
     assert load_config(tmp_cfg({"preflight": None})).preflight.enabled is False
+
+
+def test_usage_defaults_load(tmp_cfg):
+    assert load_config(tmp_cfg()).usage == Usage("on", 0.75, 0.92, 0.85, True)
+
+
+def test_a_bare_off_loads_as_off_and_is_a_warning(tmp_cfg):
+    assert load_config(tmp_cfg({"usage": {"governor": False}})).usage.governor == "off"
+    issues = issues_for(tmp_cfg, {"usage": {"governor": False}})
+    assert [(i.level, i.path) for i in issues if "governor" in i.path] == [("warning", "usage.governor")]
+    assert load_config(tmp_cfg({"usage": {"governor": True}})).usage.governor == "on"
+
+
+def test_governor_is_a_reserved_step_id(tmp_cfg):
+    def patch(data):
+        phase_step(data, "build", "build")["id"] = "governor"
+    found = issues_for(tmp_cfg, patch)
+    assert any(i.level == "error" and "step id 'governor' is reserved" in i.message for i in found)
+
+
+@pytest.mark.parametrize("block, path, message", [
+    ({"governor": "sometimes"}, "usage.governor", 'governor must be "on", "observe" or "off"'),
+    ({"five_hour_soft": 0.95}, "usage.five_hour_soft", "five_hour_soft must be above 0 and below five_hour_hard"),
+    ({"five_hour_soft": 0}, "usage.five_hour_soft", "five_hour_soft must be above 0 and below five_hour_hard"),
+    ({"five_hour_soft": float("nan")}, "usage.five_hour_soft", "five_hour_soft must be above 0 and below five_hour_hard"),
+    ({"five_hour_hard": 1.2}, "usage.five_hour_hard", "five_hour_hard must be at most 1"),
+    ({"five_hour_hard": float("inf")}, "usage.five_hour_hard", "five_hour_hard must be at most 1"),
+    ({"seven_day_soft": 0}, "usage.seven_day_soft", "seven_day_soft must be above 0 and at most 1"),
+    ({"soft": 0.7}, "usage.soft", "unknown usage key"),
+])
+def test_validate_refuses_bad_usage(tmp_cfg, block, path, message):
+    found = issues_for(tmp_cfg, {"usage": block})
+    assert any(i.level == "error" and i.path == path and message in i.message for i in found), found
+
+
+@pytest.mark.parametrize("block", [{"five_hour_soft": True}, {"finish_first": "yes"}])
+def test_a_wrongly_typed_usage_value_is_a_load_error(tmp_cfg, block):
+    (key,) = block
+    with pytest.raises(ConfigError, match=rf"usage\.{key}"):
+        load_config(tmp_cfg({"usage": block}))
+
+
+def test_validate_takes_the_shipped_usage_block():
+    issues = validate(load_config(ROOT / ".agentflow" / "config.yaml"), ROOT)
+    assert [(i.level, i.path) for i in issues if i.level in ("error", "warning")] == []
+    assert yaml.safe_load(layers.ENGINE_DEFAULTS.read_text(encoding="utf-8"))["usage"]["governor"] == "on"
 
 
 def test_watchdog_no_progress_min_must_be_zero_or_more(tmp_cfg):

@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 from agentflow import config_edit, pack, pipeline
-from agentflow.config import ConfigError, load_config
+from agentflow.config import ConfigError, Usage, load_config
 from agentflow.config_edit import Conflict, EditError, Refused
 from agentflow.pipeline import RunOptions
 
@@ -113,6 +113,28 @@ def test_the_form_sets_the_watchdog(shipped):
     assert len(changed_lines(proposal.diff)) == 2  # one line out, one in
     config_edit.save(shipped, proposal)
     assert load_config(shipped).watchdog.no_progress_min == 15
+
+
+def test_the_form_sets_the_usage_window(shipped):
+    proposal = form(shipped, (["usage", "governor"], "observe"), (["usage", "five_hour_soft"], 0.6),
+                    (["usage", "five_hour_hard"], 0.9), (["usage", "seven_day_soft"], 0.8),
+                    (["usage", "finish_first"], False))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).usage == Usage("observe", 0.6, 0.9, 0.8, False)
+
+
+def test_the_form_reports_a_soft_mark_above_the_hard_one(shipped):
+    proposal = form(shipped, (["usage", "five_hour_soft"], 0.95))  # in range for the field, wrong across fields
+    assert any(i.path == "usage.five_hour_soft" and i.level == "error" for i in proposal.issues)
+
+
+def test_the_form_refuses_a_mark_out_of_its_range(shipped):
+    for key, bad in (("five_hour_hard", 1.5), ("five_hour_soft", 0), ("seven_day_soft", -0.1)):
+        with pytest.raises(EditError):
+            form(shipped, (["usage", key], bad))
+    with pytest.raises(EditError):
+        form(shipped, (["usage", "governor"], "sometimes"))
 
 
 def test_the_form_sets_the_ci_watch(shipped):
