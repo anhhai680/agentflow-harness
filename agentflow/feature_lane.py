@@ -54,7 +54,13 @@ answerable (`state["parked"]`): one settled while the run goes on lets its task 
 another walk of the plan, once its shelf is applied back (`_unshelve`; a shelf that no longer applies is a `blocked`
 stop on `<task>/unshelve`, and approving it takes the tree as the person left it). A wait the walk handled is never
 taken over again by `pipeline.walk` (`handled`). Each state change is an event, so a resumed run picks every task up
-where it stopped, and first finishes a park a dead runner left half done (`_finish_shelving`).
+where it stopped, and first finishes a park a dead runner left half done (`_finish_shelving`). The events are
+`step_parked` (with `stop_class`, `blast_radius`, `shelf`, `shelved` and `demoted`), `unit_unparked` (the shelf applied
+back, with `conflict` when it did not apply), `hitl_notified` (a person was told of the stop: folded into
+`waiting.notified`, so a walk again, a resume or a restarted runner never sends the same stop's notice twice, with
+parking on or off), `forbidden_reverted` (a guard park's forbidden edit set aside) and `plan_batched` with `split`.
+A person's `approve --constraint` is `constraint_approved` (`constraint.py`) and the `constraint` field of
+`hitl_approved`.
 
 `record_decisions` runs before an answered step resumes: an answer to a `spec_gap` question (or one
 given with `--record`) runs `record_step` and commits its `message` (default `Decide <question> in the
@@ -574,8 +580,9 @@ class FeatureLane:
         batch's last, whose review is the only one of the members committed before it: that one stops.
 
         A guard stop's forbidden paths stay in the shelf commit, recoverable from its ref, but are not `shelved`: they
-        go back to the runner's `HEAD` before `step_parked`, recorded as `forbidden_reverted` (as `Resolver._revert`
-        does), so the task never gets them back and its restart is not refused for them again."""
+        go back to the runner's `HEAD` after `step_parked` (once `park_wait` has recorded it), recorded as
+        `forbidden_reverted` (as `Resolver._revert` does), so the task never gets them back and its restart is not
+        refused for them again. A runner killed in between has `_finish_shelving` do it on resume."""
         kind, key = str(wait.get("kind")), str(wait.get("key"))
         match = TASK_N.search(key)
         if match is None or not parks_first(self.cfg, kind, key):
