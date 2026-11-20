@@ -24,6 +24,7 @@ from typing import Any
 
 from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RECONCILE_CHANGED, RETRO_PIPELINE, Config
 from .events import nfc, parse_iso
+from .park import radius_line
 from .state import TERMINAL, Run, list_runs
 
 RESULT_STATUSES = ("done", "blocked", "needs_human", "effort_change", "unchanged")
@@ -382,12 +383,13 @@ def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questio
            _how_to_go_on(run, kind, key, bool(questions), cfg, **counted)]
     path = run.inbox_path(key)
     render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
-    run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
-             questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:], **counted)
     if notify is None:
         from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
 
         notify = not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions])
+    run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
+             questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:],
+             notified=bool(notify), **counted)
     if notify:
         notify_run(cfg, run, notice_text({"key": key, "summary": summary, **counted}) or f"{key} needs a decision")
     return path
@@ -439,6 +441,38 @@ def park_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, question
              questions=[asdict(q) for q in questions], inbox=str(path), paths=list(paths))
     notify(cfg, _title_for(cfg, run), f"parked: {summary or key}", run=run)
     return path
+
+
+def park_wait(cfg: Config, run: Run, wait: dict, *, blast_radius: dict, shelf: str | None, shelved: list[str],
+              stop_class: str | None, extra: str = "") -> Path:
+    """Park a task stop's wait away so the run goes on with the tasks that do not wait on it: rewrite its inbox file
+    with the ways out and the blast radius, record `step_parked` (which clears the wait on the same key), and tell a
+    person `parked <key>: <blast radius>`. `shelf` and `shelved` are the ref and the paths the task's unfinished
+    work was put aside in; `extra` is the stop's report. Returns the inbox path."""
+    key, kind = str(wait["key"]), str(wait["kind"])
+    questions = _questions_from_state(wait.get("questions") or [])
+    radius = {"blocks": list(blast_radius.get("blocks") or []), "continue": list(blast_radius.get("continue") or [])}
+    line = radius_line(radius)
+    how = [f"Run `{run.id}` parked `{key}` ({kind}) and goes on with the tasks that do not wait on it.",
+           _parked_ways_out(run, kind, key, bool(questions)),
+           f"Blast radius: {line}"]
+    path = run.inbox_path(key)
+    summary = str(wait.get("summary") or "")
+    render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
+    run.emit("step_parked", kind=kind, key=key, phase=wait.get("phase") or key.split("/")[0], summary=summary,
+             questions=[asdict(q) for q in questions], inbox=str(path), paths=[], stop_class=stop_class,
+             blast_radius=radius, shelf=shelf, shelved=list(shelved))
+    notify_run(cfg, run, f"parked {key}: {line}")
+    return path
+
+
+def _parked_ways_out(run: Run, kind: str, key: str, has_questions: bool) -> str:
+    """The inbox line for a parked stop: answer it by its key, or approve it, or retry it once no runner is live."""
+    if has_questions:
+        return f"Fill in the `Answer:` lines below, or run `agentflow answer {run.id} --key {key}`."
+    note = ' --note "..."' if kind == "blocked_repeat" else ' [--note "..."]'
+    return (f"`agentflow approve {run.id} {key}{note}` settles it, and the run takes the task up again; or "
+            f"`agentflow pause {run.id}`, then `agentflow retry {run.id} {key}` starts the step in a fresh session.")
 
 
 def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config, times: int = 1) -> str:
@@ -549,9 +583,12 @@ def refuse_retro(run: Run) -> None:
 
 
 def _resolve(run: Run, target: str) -> tuple[str, str]:
-    """`("phase", name)` or `("checkpoint", key)` for what the run is waiting on, else `NotWaiting`."""
+    """`("phase", name)` or `("checkpoint", key)` for what the run is waiting on, `("parked", key)` for a parked
+    stop that is not the run's wait, else `NotWaiting`."""
     _refuse_ended(run)
     waiting = run.state["waiting"]
+    if target in (run.state.get("parked") or {}) and (waiting is None or waiting.get("key") != target):
+        return "parked", target
     if waiting is None:
         raise _not_waiting(run, target)
     if waiting["kind"] == "phase_approval":
@@ -602,6 +639,7 @@ def answer(run: Run, key: str, answers: dict[str, str], by: str, record: bool = 
             return False
         extra = {"record": True} if record else {}
         run.emit("hitl_answered", by=by, key=key, answers=final, **extra)
+        demote_promoted(run, key)
         return True
 
 
@@ -624,6 +662,9 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
     `note` goes to the agent that the approval resumes. A `blocked_repeat` stop needs one: the session already
     blocked again with nothing changed, so a plain approval would only repeat that.
 
+    A parked stop (`state["parked"]`) is approved by its key the same way, by the rules of its own kind; a promoted
+    wait is then parked again (`demote_promoted`), so the run goes on with the approved stop's task.
+
     `viewed` (`[{path, sha}]`, the artifact revisions the dashboard page showed) is informational: a phase approval
     records it on `phase_approved` when it is not empty, and any other approval ignores it.
     `produced` (`[{path, sha}]`, the newest revision of each artifact the phase produced) is recorded the same way
@@ -634,7 +675,8 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
         raise ValueError(f"a budget must be a finite number of USD, not {budget!r}")
     with run.locked():
         kind, name = _resolve(run, target)
-        waiting_kind = (run.state["waiting"] or {}).get("kind")
+        item = run.state["parked"][name] if kind == "parked" else run.state["waiting"]  # every rule reads its kind
+        waiting_kind = (item or {}).get("kind")
         if note and (kind == "phase" or waiting_kind in CLEARED_BY_APPROVE):
             raise ValueError(f"no agent resumes from {name!r}, so nothing would read the note; use `agentflow reject`")
         if note and waiting_kind == "preflight_failed":
@@ -656,9 +698,10 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
             if hold:
                 run.emit("phase_ready", by=by, phase=name)
             return run.state["status"] == "ready"
-        waiting = run.state["waiting"]
+        waiting = item
         if waiting["questions"]:
-            raise NotWaiting(f"{name!r} is waiting for answers, not an approval; use `agentflow answer {run.id}`")
+            how = f"agentflow answer {run.id}" + (f" --key {name}" if kind == "parked" else "")
+            raise NotWaiting(f"{name!r} is waiting for answers, not an approval; use `{how}`")
         if waiting["kind"] == "budget_exceeded" and budget is None:
             spend = float(run.state["spend_usd"] or 0.0)
             soft = run.state.get("soft_budget_usd")
@@ -670,12 +713,28 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
                 budget = spend + float(step)
         if budget is not None:
             run.emit("run_updated", by=by, budget_usd=budget)
-        if waiting["kind"] in CLEARED_BY_APPROVE:
+        if waiting["kind"] in CLEARED_BY_APPROVE and kind != "parked":
             run.emit("checkpoint_cleared", by=by, key=name)
         else:
             extra = {"note": note} if note else {}
             run.emit("hitl_approved", by=by, key=name, kind=waiting["kind"], summary=waiting["summary"], **extra)
+        demote_promoted(run, name)
         return False
+
+
+def demote_promoted(run: Run, settled: str) -> None:
+    """Put the run's promoted wait back among the parked stops once a person settled another one (`settled`), so the
+    run goes on with that one's task: the last `step_parked` of the wait's key is recorded again with `demoted`.
+    Nothing happens when the wait is not promoted or is `settled` itself."""
+    with run.locked():
+        waiting = run.state["waiting"]
+        if waiting is None or not waiting.get("promoted") or waiting.get("key") == settled:
+            return
+        parks = [e for e in run.events.read() if e["type"] == "step_parked" and e.get("key") == waiting["key"]]
+        if not parks:
+            return
+        again = {k: v for k, v in parks[-1].items() if k not in ("seq", "ts", "type", "by", "demoted")}
+        run.emit("step_parked", **again, demoted=True)
 
 
 def task_scope(phase: str, key: str) -> tuple[str, int] | None:
@@ -707,6 +766,8 @@ def reject(run: Run, target: str, by: str, note: str) -> None:
         raise ValueError("a rejection needs a note")
     with run.locked():
         kind, name = _resolve(run, target)
+        if kind == "parked":
+            raise NotWaiting(f"{name} is parked: approve, answer or retry it; reject it once it is the run's wait")
         if (run.state["waiting"] or {}).get("kind") == "preflight_failed":
             raise NotWaiting("preflight has nothing to refine: approve it once the machine is fixed, or cancel the run")
         if (run.state["waiting"] or {}).get("kind") == ENVIRONMENT:
@@ -774,7 +835,8 @@ def remind_due(cfg: Config, repo: Path, now: datetime | None = None) -> list[str
 
 
 def inbox_items(repo: Path, runs: list[Run] | None = None) -> list[dict]:
-    """One dict per thing a human can act on: each run's wait, then its parked questions (kind `parked`).
+    """One dict per thing a human can act on: each run's wait, then its parked stops (kind `parked`, with the park's
+    own kind as `stop_kind` and its `blast_radius`).
     `runs` are the runs to read when the caller has loaded them already; else every run of `repo`."""
     items = []
     for run in list_runs(repo) if runs is None else runs:
@@ -802,5 +864,6 @@ def inbox_items(repo: Path, runs: list[Run] | None = None) -> list[dict]:
                 "key": item["key"], "phase": item["phase"], "summary": item["summary"],
                 "questions": item["questions"], "since": item["since"],
                 "inbox_path": str(path) if path.exists() else None,
+                "stop_kind": item["kind"], "blast_radius": item.get("blast_radius"),
             })
     return items

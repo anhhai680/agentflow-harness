@@ -17,6 +17,8 @@ Each action records one event with who took it, through `Run.emit`, and the runn
   the runner raised on it; a retried failed step still gets the failed step's check for forbidden paths. A step
   of an approved phase runs again, and the phase settles again (`pipeline.retried`). On a `conformance_failed`
   stop, retrying the step that would bring the missing evidence clears that stop too, so `finish` audits again.
+  A parked stop retried by its key leaves the parked list, and a wait promoted from the parked list is parked again
+  (`hitl.demote_promoted`), so the run goes on with the retried task.
 - `attach` opens the waiting step's Claude Code session interactively in the run's worktree.
 
 `spawn_resume` starts `flow.py resume <run>` in the background (new session, stdin closed, output in the
@@ -341,10 +343,14 @@ def retry(run: Run, key: str | None, by: str, reason: str | None = None) -> str:
             if waiting.get("kind") == "phase_approval" or waiting.get("questions"):
                 raise ControlError(f"{key!r} waits for an answer or an approval, not a retry")
             run.emit("hitl_approved", by=by, key=key, kind=waiting["kind"], summary=waiting.get("summary", ""))
+        elif (run.state.get("parked") or {}).get(key, {}).get("questions"):
+            raise ControlError(f"{key!r} is parked waiting for answers, not a retry: "
+                               f"`agentflow answer {run.id} --key {key}`")
         elif waiting is not None and waiting.get("kind") == CONFORMANCE_FAILED:
             # retrying a step that would bring missing evidence is the way on this stop names: `finish` audits again
             run.emit("hitl_approved", by=by, key=waiting["key"], kind=waiting["kind"], summary=waiting.get("summary", ""))
-        run.emit("step_retry", by=by, key=key, reason=reason)
+        run.emit("step_retry", by=by, key=key, reason=reason)  # it drops a parked stop of `key`
+        hitl.demote_promoted(run, key)
     return key
 
 

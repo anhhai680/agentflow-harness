@@ -258,6 +258,7 @@ def _on_step_retry(state: dict, ev: dict) -> None:
     failed = "failed" in (row["status"], row.get("retry_of"))  # sticky: a second retry keeps the tree check
     row["retry_of"] = "failed" if failed else row["status"]
     row["status"] = "pending"
+    state.setdefault("parked", {}).pop(ev["key"], None)  # a retried parked stop starts afresh
 
 
 def _on_agent_started(state: dict, ev: dict) -> None:
@@ -528,21 +529,29 @@ def _on_hitl_raised(state: dict, ev: dict) -> None:
     }
     if "times" in ev:  # a `blocked_repeat` stop that came back after a human's approval
         wait["times"] = ev["times"]
+    for mark in ("promoted", "notified"):  # a parked item made the wait once no task could run; a person was told
+        if mark in ev:
+            wait[mark] = ev[mark]
     if state["status"] in TERMINAL:  # a stop raised after a cancel is logged, never a wait to act on
         return
-    state.setdefault("parked", {}).pop(key, None)  # a parked question that stops the run is now the wait
+    state.setdefault("parked", {}).pop(key, None)  # a parked stop that stops the run is now the wait
     if _approval_pending(state):
         state["waiting_queue"].append(wait)  # the approval stays; this one is shown once it ends
     else:
         state["waiting"] = wait
         state["status"] = "waiting_human"
-    _step_row(state, key, ev.get("phase"))["status"] = "waiting_human"
+    row = _step_row(state, key, ev.get("phase"))
+    if row["status"] != "failed":  # a failed step (a guard violation) stays failed, so its restart checks the tree
+        row["status"] = "waiting_human"
 
 
 def _on_step_parked(state: dict, ev: dict) -> None:
-    """A question that later tasks need not wait for: kept answerable in `parked`, the run goes on."""
+    """A stop that later tasks need not wait for: kept in `parked` to approve, answer or retry, and the run goes on.
+
+    The wait on the same key, which the stop raised first (or a promoted wait put back, `demoted`), is cleared. A
+    failed step (a guard violation) stays failed, so its restart checks the tree."""
     key = ev["key"]
-    state.setdefault("parked", {})[key] = {
+    item = {
         "kind": ev.get("kind") or "needs_human",
         "key": key,
         "phase": ev.get("phase") or _phase_of(key),
@@ -550,7 +559,16 @@ def _on_step_parked(state: dict, ev: dict) -> None:
         "questions": copy.deepcopy(ev.get("questions") or []),
         "since": ev.get("ts"),
     }
-    _step_row(state, key, ev.get("phase"))["status"] = "parked"
+    for field in ("stop_class", "blast_radius", "shelf", "shelved"):
+        if field in ev:
+            item[field] = copy.deepcopy(ev[field])
+    state.setdefault("parked", {})[key] = item
+    waiting = state["waiting"]
+    if waiting is not None and not _approval_pending(state) and waiting.get("key") == key:
+        _clear_wait(state)
+    row = _step_row(state, key, ev.get("phase"))
+    if row["status"] != "failed":
+        row["status"] = "parked"
 
 
 def _on_step_reopened(state: dict, ev: dict) -> None:
@@ -621,9 +639,17 @@ def _on_checkpoint_cleared(state: dict, ev: dict) -> None:
 def _on_hitl_approved(state: dict, ev: dict) -> None:
     """A human approved a stop the runner raised: the step goes back to resumable, never to done.
 
-    A failed step (a guard violation) stays failed, so its restart checks the tree again.
+    A parked stop approved by its key leaves the parked list, and the run's own wait stays. A failed step (a guard
+    violation) stays failed, so its restart checks the tree again.
     """
     waiting = state["waiting"]
+    parked = state.setdefault("parked", {})
+    if ev["key"] in parked and (waiting is None or waiting.get("key") != ev["key"]):
+        parked.pop(ev["key"])  # a parked stop settled by its key: the run's own wait, if any, stays
+        row = state["steps"].get(ev["key"])
+        if row is not None and row["status"] in ("parked", "waiting_human"):
+            row["status"] = "running"
+        return
     if waiting is None or _approval_pending(state) or waiting.get("key") != ev["key"]:
         return
     _clear_wait(state)
@@ -905,6 +931,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "run_hold_ended": ("key",),
     "usage_governed": ("key", "level"),
     "step_parked": ("key",),
+    "unit_unparked": ("key",),
     "step_reopened": ("key",),
     "resolve_started": ("key",),
     "resolve_finished": ("key",),

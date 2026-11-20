@@ -340,6 +340,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_inbox(args: argparse.Namespace) -> int:
     from agentflow.config import RETRO_PIPELINE
     from agentflow.hitl import inbox_items
+    from agentflow.park import radius_line
 
     try:
         items = inbox_items(_find_repo())
@@ -350,7 +351,8 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         print("Nothing is waiting on you.")
         return 0
     for item in items:
-        print(f"{item['run_id']}  {item['kind']}  {item['key']}  since {item['since']}")
+        kind = f"parked ({item['stop_kind']})" if item["kind"] == "parked" and item.get("stop_kind") else item["kind"]
+        print(f"{item['run_id']}  {kind}  {item['key']}  since {item['since']}")
         if item["summary"]:
             print(f"  {item['summary']}")
         for q in item["questions"]:
@@ -362,7 +364,13 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         elif item["kind"] == "phase_approval":
             print(f"  agentflow approve {item['run_id']} {item['phase']}    |    agentflow reject {item['run_id']} {item['phase']} --note \"...\"")
         elif item["kind"] == "parked":
-            print(f"  agentflow answer {item['run_id']} --key {item['key']}")
+            if item.get("blast_radius"):
+                print(f"  Blast radius: {radius_line(item['blast_radius'])}")
+            if item["questions"]:
+                print(f"  agentflow answer {item['run_id']} --key {item['key']}")
+            else:
+                print(f"  agentflow approve {item['run_id']} {item['key']}    |    agentflow pause {item['run_id']}, "
+                      f"then agentflow retry {item['run_id']} {item['key']}")
         elif item["questions"]:
             print(f"  agentflow answer {item['run_id']}")
         else:
@@ -576,10 +584,16 @@ def _survive_hangup(run) -> None:
     signal.signal(signal.SIGHUP, hangup)
 
 
-def _continue(run, args: argparse.Namespace, cfg=None) -> int:
-    """D13: after a human action, run on in the foreground (`--detach`: background; `--no-continue`: stop)."""
+def _continue(run, args: argparse.Namespace, cfg=None, recorded: bool = True) -> int:
+    """D13: after a human action, run on in the foreground (`--detach`: background; `--no-continue`: stop). A runner
+    already working on the run takes what was `recorded` up itself (a parked stop settled while it builds); a plain
+    resume records nothing, so it goes on to `advance`, which refuses a live runner."""
+    from agentflow.events import lock_state
     from agentflow.pipeline import RunOptions, advance
 
+    if recorded and lock_state(run.dir) == "live":
+        print(f"recorded; the runner working on {run.id} picks it up")
+        return 0
     if getattr(args, "no_continue", False):
         print(f"Continue the run with `agentflow resume {run.id}`.")
         if run.state["status"] == "ready":
@@ -680,7 +694,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         refuse_retro(run)
         if args.mark_done:
             mark_done(run, _by(args))
-        return _continue(run, args)
+        return _continue(run, args, recorded=False)
     except _human_errors() as exc:
         print(f"error: {exc}")
         return 1

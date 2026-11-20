@@ -641,6 +641,176 @@ def test_raise_hitl_notify_overrides_who_is_told(run, cfg, macos_calls):
     assert len(macos_calls) == 1
 
 
+def test_raise_hitl_records_whether_a_person_was_told(run, cfg, macos_calls):
+    raise_hitl(cfg, run, "blocked", "build/a", "quiet", notify=False)
+    assert run.events.read()[-1]["notified"] is False and run.state["waiting"]["notified"] is False
+    raise_hitl(cfg, run, "blocked", "build/b", "told", notify=True)
+    assert run.events.read()[-1]["notified"] is True and run.state["waiting"]["notified"] is True
+
+
+# ------------------------------------------------------------------ parked stops (T4)
+
+PA = "build/build/task-1/implement"
+PB = "build/build/task-2/implement"
+RADIUS = {"blocks": [2], "continue": [3]}
+
+
+def park(cfg, run, key, kind="blocked", questions=(), radius=None, extra=""):
+    """What the plan walk does with a task stop it parks: raise the wait, then park it away."""
+    raise_hitl(cfg, run, kind, key, f"{key} is stuck", questions, notify=False)
+    return hitl.park_wait(cfg, run, dict(run.state["waiting"]), blast_radius=radius or RADIUS, shelf=None,
+                          shelved=[], stop_class=None, extra=extra)
+
+
+def promote(run, key):
+    """What the walk does once no runnable task is left: the parked item becomes the run's wait."""
+    item = run.state["parked"][key]
+    run.emit("hitl_raised", kind=item["kind"], key=key, phase="build", summary=item["summary"],
+             questions=item["questions"], promoted=True, notified=True)
+
+
+def test_park_wait_records_the_park_and_clears_the_wait(run, cfg, macos_calls):
+    path = park(cfg, run, PA, extra="the gate log")
+    assert path == run.inbox_path(PA)
+    ev = run.events.read()[-1]
+    assert ev["type"] == "step_parked" and ev["kind"] == "blocked" and ev["paths"] == []
+    assert ev["blast_radius"] == RADIUS and ev["shelf"] is None and ev["shelved"] == [] and ev["stop_class"] is None
+    assert "demoted" not in ev
+    assert run.state["waiting"] is None and run.state["status"] == "running" and list(run.state["parked"]) == [PA]
+    assert run.state["steps"][PA]["status"] == "parked"
+
+
+def test_the_parked_inbox_file_names_the_blast_radius(run, cfg, macos_calls):
+    text = park(cfg, run, PA, extra="the gate log").read_text(encoding="utf-8")
+    assert "Blast radius: blocks task 2; task 3 continues" in text and "the gate log" in text
+    assert f"agentflow approve {run.id} {PA}" in text and f"agentflow retry {run.id} {PA}" in text
+    assert f"agentflow pause {run.id}" in text and "agentflow answer" not in text
+    assert [c for c in macos_calls if f"parked {PA}: blocks task 2; task 3 continues" in c[-1]]
+    asked = park(cfg, run, PB, kind="needs_human", questions=[one_question()]).read_text(encoding="utf-8")
+    assert f"agentflow answer {run.id} --key {PB}" in asked and QUESTION in asked
+
+
+def test_a_parked_stop_is_approved_by_its_key(run, cfg, macos_calls):
+    park(cfg, run, PA)
+    assert approve(run, PA, "me") is False
+    ev = run.events.read()[-1]
+    assert ev["type"] == "hitl_approved" and ev["key"] == PA and ev["kind"] == "blocked" and ev["by"] == "me"
+    assert run.state["waiting"] is None and run.state["parked"] == {}
+    assert run.state["steps"][PA]["status"] == "running"
+
+
+def test_a_parked_blocked_repeat_needs_a_note(run, cfg, macos_calls):
+    park(cfg, run, PA, kind="blocked_repeat")
+    with pytest.raises(NotWaiting, match="blocked again with nothing changed"):
+        approve(run, PA, "me")
+    assert list(run.state["parked"]) == [PA]
+    approve(run, PA, "me", note="the import is fixed")
+    assert run.events.read()[-1]["note"] == "the import is fixed" and run.state["parked"] == {}
+
+
+def test_a_parked_question_is_answered_not_approved(run, cfg, macos_calls):
+    park(cfg, run, PA, kind="needs_human", questions=[one_question()])
+    with pytest.raises(NotWaiting, match="waiting for answers"):
+        approve(run, PA, "me")
+    assert answer(run, PA, {"q1": ANSWER}, "me") is True
+    assert run.state["parked"] == {} and run.state["waiting"] is None
+
+
+def test_a_parked_item_cannot_be_rejected(run, cfg, macos_calls):
+    park(cfg, run, PA)
+    with pytest.raises(NotWaiting) as caught:
+        reject(run, PA, "me", "redo it")
+    assert str(caught.value) == f"{PA} is parked: approve, answer or retry it; reject it once it is the run's wait"
+    assert list(run.state["parked"]) == [PA] and not run.state.get("refine")
+
+
+def test_settling_a_parked_item_demotes_the_promoted_wait(run, cfg, macos_calls):  # Review Focus 2
+    park(cfg, run, PA)
+    park(cfg, run, PB)
+    promote(run, PA)
+    assert run.state["waiting"]["key"] == PA and run.state["waiting"]["promoted"] is True
+    approve(run, PB, "me")
+    assert run.state["waiting"] is None and set(run.state["parked"]) == {PA}
+    assert run.state["status"] == "running"
+    last = run.events.read()[-1]
+    assert last["type"] == "step_parked" and last["demoted"] is True and last["key"] == PA
+    assert last["blast_radius"] == RADIUS
+    promote(run, PA)
+    approve(run, PA, "me")  # settling the promoted wait itself demotes nothing
+    assert run.state["waiting"] is None and run.state["parked"] == {}
+    assert run.events.read()[-1]["type"] == "hitl_approved"
+
+
+def test_answering_a_parked_item_demotes_the_promoted_wait(run, cfg, macos_calls):
+    park(cfg, run, PA)
+    park(cfg, run, PB, kind="needs_human", questions=[one_question()])
+    promote(run, PA)
+    assert answer(run, PB, {"q1": ANSWER}, "me") is True
+    assert run.state["waiting"] is None and set(run.state["parked"]) == {PA}
+    assert run.events.read()[-1]["demoted"] is True
+
+
+def test_a_parked_stop_is_retried_by_its_key(run, cfg, macos_calls):
+    from agentflow.run_control import ControlError, retry
+
+    park(cfg, run, PA)
+    park(cfg, run, PB)
+    park(cfg, run, "build/build/task-3/implement", kind="needs_human", questions=[one_question()])
+    with pytest.raises(ControlError, match="parked waiting for answers"):
+        retry(run, "build/build/task-3/implement", "me")
+    promote(run, PA)
+    assert retry(run, PB, "me") == PB
+    assert run.state["steps"][PB]["status"] == "pending" and PB not in run.state["parked"]
+    assert run.state["waiting"] is None and PA in run.state["parked"]
+    assert run.events.read()[-1]["demoted"] is True
+
+
+def test_inbox_items_carry_the_stop_kind_of_a_parked_item(repo, run, cfg, macos_calls):
+    park(cfg, run, PA, kind="guard_violation")
+    (item,) = inbox_items(repo)
+    assert item["kind"] == "parked" and item["stop_kind"] == "guard_violation" and item["key"] == PA
+    assert item["blast_radius"] == RADIUS and item["inbox_path"] == str(run.inbox_path(PA))
+
+
+def test_inbox_cli_names_a_parked_stops_way_out(repo, run, cfg, macos_calls, capsys):
+    park(cfg, run, PA)
+    capsys.readouterr()
+    assert main(["inbox"]) == 0
+    out = capsys.readouterr().out
+    assert "parked (blocked)" in out and "Blast radius: blocks task 2; task 3 continues" in out
+    assert f"agentflow approve {run.id} {PA}" in out and f"agentflow retry {run.id} {PA}" in out
+
+
+def test_approving_while_a_runner_is_live_only_records(repo, run, cfg, macos_calls, capsys):
+    from agentflow.events import RunLock
+
+    park(cfg, run, PA)
+    lock = RunLock(run.dir)
+    assert lock.acquire()
+    try:
+        assert main(["approve", run.id, PA]) == 0
+    finally:
+        lock.release()
+    assert f"recorded; the runner working on {run.id} picks it up" in capsys.readouterr().out
+    ev = Run.load(repo, run.id).events.read()[-1]
+    assert ev["type"] == "hitl_approved" and ev["key"] == PA
+
+
+def test_resuming_while_a_runner_is_live_records_nothing_and_is_refused(repo, run, cfg, capsys, monkeypatch):
+    from agentflow import flow
+    from agentflow.events import RunLock
+
+    monkeypatch.setattr(flow, "_preflight", lambda cfg: None)  # no agent CLI is needed to be refused
+    lock = RunLock(run.dir)
+    assert lock.acquire()
+    try:
+        assert main(["resume", run.id, "--config", str(cfg.path)]) == 1
+    finally:
+        lock.release()
+    out = capsys.readouterr().out
+    assert "recorded" not in out and f"another runner is working on {run.id}" in out
+
+
 # ------------------------------------------------------------------ inbox listing and CLI
 
 

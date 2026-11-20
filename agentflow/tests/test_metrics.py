@@ -207,6 +207,15 @@ def test_a_waiting_run_keeps_counting_human_time_until_now():
     assert m["stalled"] is False and minutes(step(m, "plan/plan")["buckets"]) == {"human": 298}
 
 
+def test_a_park_ends_the_human_wait():
+    key = "build/build/task-2/implement"
+    log = Log().add("phase_started", phase="build")
+    log.at(2).add("hitl_raised", kind="blocked", key=key, phase="build")
+    log.at(3).add("step_parked", kind="blocked", key=key, phase="build")
+    m = log.metrics(now_minute=300)
+    assert minutes(step(m, key)["buckets"]).get("human") == 1  # 60 s: the run went on with the other tasks
+
+
 def test_an_old_run_without_gate_durations_files_the_gap_as_gates_and_says_so():
     key = "verify/verify"
     log = Log().add("phase_started", phase="verify")

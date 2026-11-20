@@ -754,6 +754,51 @@ def test_parked_questions_never_take_the_wait_and_stay_answerable(run):
     assert state_json(run) == replay(run.events.read())
 
 
+PARKED = "build/build/task-1/implement"
+
+
+def test_parking_a_stop_clears_its_wait_and_keeps_a_failed_row(run):
+    K = PARKED
+    run.emit("hitl_raised", kind="guard_violation", key=K, phase="build", summary="x", questions=[])
+    run.emit("step_finished", key=K, status="failed", summary="x")
+    run.emit("step_parked", kind="guard_violation", key=K, summary="x", questions=[], paths=[], shelf="abc",
+             blast_radius={"blocks": [2], "continue": [3]})
+    assert run.state["waiting"] is None and run.state["status"] == "running"
+    assert run.state["steps"][K]["status"] == "failed" and run.state["parked"][K]["blast_radius"]["blocks"] == [2]
+    run.emit("hitl_approved", key=K, kind="guard_violation", by="me", summary="x")
+    assert run.state["parked"] == {} and run.state["steps"][K]["status"] == "failed"   # its restart checks the tree
+    assert state_json(run) == replay(run.events.read())
+
+
+def test_a_parked_stop_approved_by_its_key_is_resumable_and_keeps_another_wait(run):
+    other = "build/build/task-2/implement"
+    run.emit("hitl_raised", kind="blocked", key=PARKED, phase="build", summary="x", questions=[])
+    run.emit("step_parked", kind="blocked", key=PARKED, summary="x", questions=[], paths=[])
+    assert run.state["steps"][PARKED]["status"] == "parked"
+    run.emit("hitl_raised", kind="blocked", key=other, phase="build", summary="y", questions=[])
+    run.emit("hitl_approved", key=PARKED, kind="blocked", by="me", summary="x")
+    assert run.state["parked"] == {} and run.state["steps"][PARKED]["status"] == "running"
+    assert run.state["waiting"]["key"] == other and run.state["status"] == "waiting_human"
+
+
+def test_a_promoted_wait_keeps_its_mark_and_a_failed_row_stays_failed(run):
+    run.emit("step_finished", key=PARKED, status="failed", summary="x")
+    run.emit("step_parked", kind="guard_violation", key=PARKED, summary="x", questions=[], paths=[])
+    run.emit("hitl_raised", kind="guard_violation", key=PARKED, phase="build", summary="x", questions=[],
+             promoted=True, notified=True)
+    assert run.state["waiting"]["promoted"] is True and run.state["waiting"]["notified"] is True
+    assert run.state["steps"][PARKED]["status"] == "failed" and run.state["parked"] == {}
+
+
+def test_a_retry_drops_the_parked_entry(run):
+    run.emit("hitl_raised", kind="blocked", key=PARKED, phase="build", summary="x", questions=[])
+    run.emit("step_parked", kind="blocked", key=PARKED, summary="x", questions=[], paths=[])
+    run.emit("step_retry", key=PARKED, by="me")
+    assert run.state["parked"] == {} and run.state["waiting"] is None
+    assert run.state["steps"][PARKED]["status"] == "pending"
+    assert state_json(run) == replay(run.events.read())
+
+
 def test_reopened_step_is_resumable_and_rejection_drops_parked(run):
     run.emit("step_finished", key="build/b/task-1/review", status="done", summary="ok")
     run.emit("step_reopened", key="build/b/task-1/review", note="re-review")
