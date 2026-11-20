@@ -1413,3 +1413,54 @@ def test_a_shelf_ref_names_the_task():
 def test_a_shelf_ref_git_refuses_is_a_value_error():
     with pytest.raises(ValueError):
         gitops.shelf_ref("r1", "build/a..b")
+
+
+# The constraint override: the one runner commit that carries the pack's human-only trailer.
+
+OVERRIDE_MESSAGE = "Approve the guard constraint for build/build/task-2/commit\n\nme approved it.\n\nConstraints-Approved-By: Hải"
+
+
+def test_commit_constraint_writes_heads_tree_and_touches_no_file(tmp_path):
+    from agentflow.guards import snapshot
+    repo = _shelf_repo(tmp_path)  # uncommitted work in the tree, as a waiting task leaves it
+    run_git(repo, "add", "b.py")  # and something staged
+    before = run_git(repo, "rev-parse", "HEAD").strip()
+    status, tree = run_git(repo, "status", "--porcelain"), snapshot(repo)
+    sha = gitops.commit_constraint(repo, OVERRIDE_MESSAGE, before)
+    assert run_git(repo, "rev-parse", "HEAD").strip() == sha
+    assert run_git(repo, "rev-parse", "main").strip() == sha  # the branch moved, not a detached HEAD
+    assert run_git(repo, "rev-list", "--parents", "-n", "1", sha).split()[1:] == [before]
+    assert run_git(repo, "rev-parse", f"{sha}^{{tree}}") == run_git(repo, "rev-parse", f"{before}^{{tree}}")
+    assert run_git(repo, "log", "-1", "--format=%B", sha).rstrip().endswith("Constraints-Approved-By: Hải")
+    assert run_git(repo, "status", "--porcelain") == status and snapshot(repo) == tree
+
+
+def test_commit_constraint_refuses_a_head_that_is_not_the_runners(tmp_path):
+    repo = _shelf_repo(tmp_path)
+    expected = run_git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "someone else's")
+    moved = run_git(repo, "rev-parse", "HEAD").strip()
+    with pytest.raises(gitops.GitError, match="last recorded"):
+        gitops.commit_constraint(repo, OVERRIDE_MESSAGE, expected)
+    with pytest.raises(gitops.GitError):
+        gitops.commit_constraint(repo, OVERRIDE_MESSAGE, "")
+    assert run_git(repo, "rev-parse", "HEAD").strip() == moved
+
+
+def test_commit_constraint_runs_no_hook(tmp_path):
+    repo = _shelf_repo(tmp_path)
+    hooks = repo / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    marker = tmp_path / "ran"
+    for name in ("commit-msg", "post-commit", "reference-transaction"):
+        hook = hooks / name
+        hook.write_text(f'#!/bin/sh\necho {name} >> "{marker}"\n', encoding="utf-8")
+        hook.chmod(0o755)
+    gitops.commit_constraint(repo, OVERRIDE_MESSAGE, run_git(repo, "rev-parse", "HEAD").strip())
+    assert not marker.exists()
+
+
+def test_commit_still_refuses_the_human_only_trailer(tmp_git, cfg):
+    (tmp_git / "README.md").write_text("changed\n", encoding="utf-8")
+    with pytest.raises(CommitRejected, match="Constraints-Approved-By"):
+        gitops.commit(tmp_git, OVERRIDE_MESSAGE, cfg)

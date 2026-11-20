@@ -82,7 +82,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import carry, overlays, park, route, sizing, sources, verification
+from agentflow import carry, constraint, overlays, park, route, sizing, sources, verification
 from agentflow.autonomy import AUTO_BY, FORBIDDEN, GUARD_KIND, Resolver, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
@@ -307,7 +307,13 @@ class FeatureLane:
 
     def _plan_pass(self, phase: Phase, step: Step, plan: Path, rel: str, prefix: str,
                    small: dict) -> tuple[bool, set[int], bool]:
-        """One walk over the plan: `(stopped, held task numbers, whether any task was attempted)`."""
+        """One walk over the plan: `(stopped, held task numbers, whether any task was attempted)`. It first writes the
+        override commits a person approved (`constraint.write`), while a parked task's work is still on its shelf."""
+        if not constraint.write(self.cfg, self.run, self.worktree):
+            self.run.refresh()
+            if self.run.state["waiting"] is not None:  # the person's: neither the resolver nor a park takes it
+                self.handled_waits.add(wait_id(self.run.state["waiting"]))
+            return True, set(), False
         held: set[int] = set()
         previous: str | None = None
         previous_n: int | None = None

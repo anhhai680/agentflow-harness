@@ -7,6 +7,9 @@ it as `expected_head`, so code a gate or a test command ran cannot slip a commit
 carries a rejected trailer; `finish` pushes only when there are none. The target branch brought in by
 `finish` (a `base_synced` event: the merge commit is the runner's, `target` is the tip it brought in) is not
 the runner's to vouch for: commits already on it are left out.
+A person's constraint override (`constraint_approved`, written by `constraint.write`) is a runner commit too, and the
+one commit whose message may carry `guardrails.constraint_override.trailer`: that trailer's rejection is dropped for its
+sha alone, and every other rejected trailer, on it or on any other commit, still counts.
 """
 
 from __future__ import annotations
@@ -18,7 +21,8 @@ from agentflow.gitops import GitError, _git_or_raise, commits_between
 from agentflow.guards import check_message
 from agentflow.state import Run
 
-RUNNER_COMMITS = ("step_committed", "task_committed", "decision_recorded", "module_added", "base_synced")
+RUNNER_COMMITS = ("step_committed", "task_committed", "decision_recorded", "module_added", "base_synced",
+                  "constraint_approved")
 HEAD_FIELDS = {"run_updated": "base_sha", "step_started": "start_head", "step_rebased": "start_head",
                **{etype: "sha" for etype in RUNNER_COMMITS}}
 
@@ -41,9 +45,12 @@ def runner_commits(run: Run) -> set[str]:
 
 def foreign_commits(run: Run, cfg: Config, worktree: Path, base: str) -> list[str]:
     """One line per commit in `base..HEAD` the runner did not record, or whose message carries a rejected
-    trailer. Raises `GitError` when git cannot list them."""
+    trailer; the constraint trailer is not one on a commit a `constraint_approved` recorded. Raises `GitError` when
+    git cannot list them."""
     events = run.events.read()
     ours = {str(e["sha"]) for e in events if e["type"] in RUNNER_COMMITS and e.get("sha")}
+    overrides = {str(e["sha"]) for e in events if e["type"] == "constraint_approved" and e.get("sha")}
+    trailer = cfg.guardrails.constraint_trailer
     targets = [str(e["target"]) for e in events if e["type"] == "base_synced" and e.get("target")]
     lines = []
     for sha in commits_between(Path(worktree), base, exclude=targets):
@@ -55,7 +62,8 @@ def foreign_commits(run: Run, cfg: Config, worktree: Path, base: str) -> list[st
         except GitError as exc:
             why.append(f"its message cannot be read: {exc}")
             message = ""
-        rejected = check_message(cfg, message)
+        rejected = [v for v in check_message(cfg, message)
+                    if not (trailer and sha in overrides and v.detail == trailer)]
         if rejected:
             why.append("rejected trailer " + ", ".join(v.detail for v in rejected))
         if why:

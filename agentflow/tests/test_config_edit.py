@@ -284,6 +284,21 @@ def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
 
 
+def test_the_settings_page_refuses_constraint_override(shipped):
+    """Who may lift a constraint gate is a guardrail: neither the YAML tab nor the form may add, change or drop it."""
+    _, sha = config_edit.read(shipped)
+    line = '  reject_trailers: ["Constraints-Approved-By"]\n'
+    assert line in SHIPPED
+    added = SHIPPED.replace(line, line + '  constraint_override: {trailer: Constraints-Approved-By, gates: [floor]}\n')
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=added, repo=REPO)
+    with pytest.raises(EditError):
+        form(shipped, (["guardrails", "constraint_override"], {"trailer": "Constraints-Approved-By", "gates": ["floor"]}))
+    with pytest.raises(EditError):
+        form(shipped, (["guardrails", "constraint_override", "gates"], ["floor"]))
+    assert config_edit.read(shipped)[1] == sha
+
+
 def test_the_form_refuses_switching_refinement_off(shipped):
     with pytest.raises(EditError):
         form(shipped, (["autonomy", "finding_rounds"], 0))

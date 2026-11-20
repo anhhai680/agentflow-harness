@@ -1906,8 +1906,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         make the step fail before any call.
 
         The recorded start, unless the runner committed other work since (another task while this one
-        was parked, a recorded decision): then `HEAD` and the tree as they are now (`step_rebased`), so
-        the runner's own commits never count as the agent moving `HEAD`. A rebase is refused when a
+        was parked, a recorded decision, a person's constraint override): then `HEAD` and the tree as they are now
+        (`step_rebased`), so the runner's own commits never count as the agent moving `HEAD`. A rebase is refused when a
         commit since the start is not one the runner recorded (an agent committed), or when the tree
         holds an uncommitted change to a forbidden path: adopting either would hide it from the guards.
         """
@@ -1917,8 +1917,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         for event in since:
             if event["type"] == "step_rebased" and event.get("key") == key:
                 head_sha, tree, rebased = event["start_head"], event["start_tree"], event["seq"]
-        others = [e for e in since if e["type"] == "step_committed" and e.get("key") != key and e.get("sha")
-                  and e["seq"] > rebased]
+        others = [e for e in since if e.get("sha") and e["seq"] > rebased
+                  and ((e["type"] == "step_committed" and e.get("key") != key) or e["type"] == "constraint_approved")]
         if not others:
             return head_sha, tree
         ours = {e["sha"] for e in self.run.events.read()

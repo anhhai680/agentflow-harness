@@ -942,6 +942,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "step_parked": ("key",),
     "unit_unparked": ("key",),
     "hitl_notified": ("key",),
+    "constraint_approved": ("key", "sha"),
     "step_reopened": ("key",),
     "resolve_started": ("key",),
     "resolve_finished": ("key",),

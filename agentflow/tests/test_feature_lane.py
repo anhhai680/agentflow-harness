@@ -1962,3 +1962,133 @@ def test_a_capped_review_in_a_refused_window_is_held(lane, git, monkeypatch):
     assert held["reason"] == "usage limit" and held["key"] == review_key
     assert lane.events(run, "session_capped") == []
     assert subjects(git, lane.root)[0] == "Task 1: First thing"
+
+
+# --------------------------------------------------------------------------- a person lifts a constraint gate (T4 Task 7)
+
+CONSTRAINT = "Constraints-Approved-By"
+COMMIT2 = "build/build/task-2/commit"
+
+
+def guarded(lane, count: int = 2):
+    """A pack whose build gate is a constraint gate: it fails while `guarded.txt` exists, until a commit carries the
+    human-only trailer. A run on a plan of `count` independent tasks, its base recorded as the runner does."""
+    from conftest import TEST_GATES
+
+    lane.configure({**BIG, "gates": {**TEST_GATES, "guard": {
+        "run": f"test ! -f guarded.txt || git log --format=%B | grep -q '^{CONSTRAINT}:'"}},
+        "gate_sets": {"build": ["guard"], "verify": ["ok"]},
+        "guardrails": {"constraint_override": {"trailer": CONSTRAINT, "gates": ["guard"]}}})
+    names = {1: "one", 2: "two", 3: "three"}
+    run = begin_build(lane, plan_text({n: "none" for n in range(1, count + 1)}, count=count,
+                                      files={n: [f"src/{names[n]}.py"] for n in range(1, count + 1)}))
+    run.emit("run_updated", base_sha=lane.head())
+    return run
+
+
+def touch_guarded_before(lane, review_key: str):
+    """A person's edit the constraint gate refuses, made after task 2's implementer passed its gates."""
+    def human(key):
+        if key == review_key and not (lane.root / "guarded.txt").exists():
+            (lane.root / "guarded.txt").write_text("needs a person\n", encoding="utf-8")
+    return human
+
+
+@pytest.fixture
+def persons_terminal(monkeypatch):
+    """The approvals below are a person's, even when an agent session runs the suite."""
+    monkeypatch.delenv("AGENTFLOW_STEP", raising=False)
+    monkeypatch.delenv("AGENTFLOW_RUN", raising=False)
+
+
+def lifted(lane, git, persons_terminal):
+    """A run whose constraint gate stopped task 2's commit (the run's wait), lifted by a person; built to the end."""
+    run = guarded(lane)
+    lane.script({IMPL.format(n=2): [TWO]})
+    assert build_with(wrap_agent(lane, run, touch_guarded_before(lane, REVIEW.format(n=2))), lane) == ("stopped", True)
+    return run
+
+
+def test_the_override_commits_once_with_no_agent_commit_trip(lane, git, persons_terminal):  # spec "T4" verification
+    from agentflow.commit_checks import foreign_commits
+
+    run = lifted(lane, git, persons_terminal)
+    waiting = run.state["waiting"]
+    assert waiting["key"] == COMMIT2 and waiting["kind"] == "gate_failed" and not waiting.get("promoted")
+    assert lane.events(run, "step_parked") == []  # nothing else can run: it is the run's wait
+    inbox = run.inbox_path(COMMIT2).read_text(encoding="utf-8")
+    assert f"Only a person can lift this constraint: `agentflow approve {run.id} {COMMIT2} --constraint`." in inbox
+
+    approve(run, COMMIT2, by="Hải", constraint=True, cfg=lane.cfg)
+    calls = len(lane.calls())
+    assert build(lane, run) == ("done", True)
+    assert len(lane.calls()) == calls  # no session ran again: the gates, then the commit
+    (ok,) = lane.events(run, "constraint_approved")
+    assert ok["key"] == COMMIT2 and ok["by"] == "Hải" and ok["gates"] == ["guard"]
+    assert git(lane.root, "log", "-1", "--format=%B", ok["sha"]).rstrip().endswith(f"{CONSTRAINT}: Hải")
+    assert subjects(git, lane.root)[:3] == ["Task 2: Second thing", f"Approve the guard constraint for {COMMIT2}",
+                                            "Task 1: First thing"]
+    assert git(lane.root, "rev-parse", "HEAD^").strip() == ok["sha"]
+    assert files_of(git, lane.root, "Task 2: Second thing") == [PLAN_PATH, "guarded.txt", "src/two.py"]
+    assert [e for e in lane.events(run, "guard_tripped")] == []
+    assert foreign_commits(run, lane.cfg, lane.root, run.state["base_sha"]) == []
+    assert lane.executor(run).runner_commits_only("ship/finish")
+    assert build(lane, run) == ("done", True) and len(lane.events(run, "constraint_approved")) == 1  # once
+
+
+def test_a_rejected_trailer_on_any_other_commit_still_fails_finish(lane, git, persons_terminal):
+    from agentflow.commit_checks import foreign_commits
+
+    run = lifted(lane, git, persons_terminal)
+    approve(run, COMMIT2, by="Hải", constraint=True, cfg=lane.cfg)
+    assert build(lane, run) == ("done", True)
+    git(lane.root, "commit", "-q", "--allow-empty", "-m", f"Another\n\n{CONSTRAINT}: Hải")
+    sneak = lane.head()
+    run.emit("step_committed", key="build/build/task-3", sha=sneak, summary="Another")  # even one the runner made
+    (line,) = foreign_commits(run, lane.cfg, lane.root, run.state["base_sha"])
+    assert line.startswith(sneak[:12]) and f"rejected trailer {CONSTRAINT}" in line
+    assert not lane.executor(run).runner_commits_only("ship/finish")
+    assert run.state["waiting"]["kind"] == "guard_violation"
+    assert sneak[:12] in lane.events(run, "hitl_raised")[-1]["extra"]
+
+
+def test_a_parked_constraint_stop_is_lifted_while_the_run_goes_on(lane, git, persons_terminal):
+    run = guarded(lane, count=3)
+    lane.script({IMPL.format(n=2): [TWO], IMPL.format(n=3): [{"write": {"src/three.py": "three\n"},
+                                                              "result": DONE_RESULT}]})
+    touch = touch_guarded_before(lane, REVIEW.format(n=2))
+
+    def human(key):
+        touch(key)
+        run.refresh()
+        if key == IMPL.format(n=3) and COMMIT2 in (run.state.get("parked") or {}):
+            approve(run, COMMIT2, by="Hải", constraint=True, cfg=lane.cfg)  # while task 3 runs
+
+    assert build_with(wrap_agent(lane, run, human), lane) == ("done", True)
+    (parked,) = lane.events(run, "step_parked")
+    assert parked["key"] == COMMIT2 and "guarded.txt" in parked["shelved"]
+    (ok,) = lane.events(run, "constraint_approved")
+    assert subjects(git, lane.root)[:4] == ["Task 2: Second thing", f"Approve the guard constraint for {COMMIT2}",
+                                            "Task 3: Third thing", "Task 1: First thing"]
+    assert git(lane.root, "show", "--name-only", "--format=", ok["sha"]).strip() == ""  # it changes no file
+    (unparked,) = lane.events(run, "unit_unparked")
+    assert unparked["conflict"] is False and shelves(git, lane.root) == []
+    assert files_of(git, lane.root, "Task 2: Second thing") == [PLAN_PATH, "guarded.txt", "src/two.py"]
+    assert lane.events(run, "guard_tripped") == [] and git(lane.root, "status", "--porcelain") == ""
+    assert f"`agentflow approve {run.id} {COMMIT2} --constraint`" in run.inbox_path(COMMIT2).read_text(encoding="utf-8")
+
+
+def test_a_step_resumed_after_an_override_rebases_instead_of_tripping(lane, git, persons_terminal):
+    run = guarded(lane, count=1)
+    impl1 = IMPL.format(n=1)
+    lane.script({impl1: [{"write": {"src/one.py": "one\n", "guarded.txt": "x\n"}, "result": DONE_RESULT}]})
+    assert build(lane, run) == ("stopped", True)
+    waiting = run.state["waiting"]
+    assert waiting["key"] == impl1 and waiting["kind"] in ("gate_failed", "fix_attempts_exhausted")
+    approve(run, impl1, by="Hải", constraint=True, cfg=lane.cfg)
+    assert build(lane, run) == ("done", True)
+    (ok,) = lane.events(run, "constraint_approved")
+    rebased = [e for e in lane.events(run, "step_rebased") if e["key"] == impl1]
+    assert rebased and rebased[-1]["start_head"] == ok["sha"]
+    assert lane.events(run, "guard_tripped") == []
+    assert subjects(git, lane.root)[:2] == ["Task 1: First thing", f"Approve the guard constraint for {impl1}"]

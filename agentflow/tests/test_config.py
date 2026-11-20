@@ -2777,3 +2777,22 @@ def test_park_independent_must_be_a_bool(tmp_cfg, value):
 @pytest.mark.parametrize("value", [True, False])
 def test_park_independent_takes_a_bool(tmp_cfg, value):
     assert not [path for _, path in errors(issues_for(tmp_cfg, {"hitl": {"park_independent": value}})) if path.startswith("hitl")]
+
+
+def test_constraint_override_loads_into_the_guardrails(tmp_cfg):
+    cfg = load_config(tmp_cfg({"guardrails": {"constraint_override": {"trailer": "Constraints-Approved-By",
+                                                                      "gates": ["floor"]}}}))
+    assert cfg.guardrails.constraint_trailer == "Constraints-Approved-By"
+    assert cfg.guardrails.constraint_gates == ["floor"]
+
+
+def test_constraint_override_is_unset_by_default(tmp_cfg):
+    cfg = load_config(tmp_cfg())
+    assert cfg.guardrails.constraint_trailer == "" and cfg.guardrails.constraint_gates == []
+
+
+@pytest.mark.parametrize("override", ["Constraints-Approved-By", {"trailer": 3, "gates": ["floor"]},
+                                      {"trailer": "Constraints-Approved-By", "gates": "floor"}])
+def test_a_malformed_constraint_override_does_not_load(tmp_cfg, override):
+    with pytest.raises(ConfigError, match="constraint_override"):
+        load_config(tmp_cfg({"guardrails": {"constraint_override": override}}))

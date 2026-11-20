@@ -655,3 +655,30 @@ def test_defaults_env_reaches_the_agent_session_even_when_its_name_is_dropped(pi
     assert pipe.calls()
     assert {call["env"]["LEAKED_URL"] for call in pipe.calls()} == {"from-pack"}
     assert "leak-sentinel-7f3a" not in (run.dir / "events.jsonl").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- a person's constraint override (T4 Task 7)
+
+
+def test_walk_writes_a_persons_constraint_override_before_the_steps(flow_repo, git, monkeypatch):
+    from conftest import TEST_GATES
+
+    monkeypatch.delenv("AGENTFLOW_STEP", raising=False)  # a person's terminal, even when an agent runs the suite
+    monkeypatch.delenv("AGENTFLOW_RUN", raising=False)
+    trailer = "Constraints-Approved-By"
+    flow_repo.configure({"gates": {**TEST_GATES, "guard": {
+        "run": f"test ! -f guarded.txt || git log --format=%B | grep -q '^{trailer}:'"}},
+        "gate_sets": {"verify": ["guard"]},
+        "guardrails": {"constraint_override": {"trailer": trailer, "gates": ["guard"]}}})
+    commit_files(flow_repo, {"guarded.txt": "a change only a person may let through\n"})
+    run = begin(flow_repo, from_phase="verify", to_phase="verify")
+    assert go(flow_repo, run) == "waiting_human"
+    key = run.state["waiting"]["key"]
+    assert key.startswith("verify/")
+    approve(run, key, by="Hải", constraint=True, cfg=flow_repo.cfg)
+    assert go(flow_repo, run) == "awaiting_approval"  # the phase's steps passed: its approval is next
+    assert run.state["waiting"]["key"] == "verify_approved"
+    (ok,) = flow_repo.events(run, "constraint_approved")
+    worktree = Path(run.state["worktree"])
+    assert git(worktree, "log", "-1", "--format=%B", ok["sha"]).rstrip().endswith(f"{trailer}: Hải")
+    assert flow_repo.events(run, "guard_tripped") == []

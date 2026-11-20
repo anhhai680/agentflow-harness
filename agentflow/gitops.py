@@ -249,6 +249,31 @@ def commit(worktree: Path, message: str, cfg: Config, paths: list[str] | None = 
     return sha
 
 
+def commit_constraint(worktree: Path, message: str, expected_head: str) -> str:
+    """Write a person's constraint override as a commit on `HEAD` holding `HEAD`'s own tree, move `HEAD` to it, and
+    return its sha. It is the one runner commit whose message carries the pack's human-only trailer: `constraint.write`
+    builds `message` from a recorded `hitl_approved{constraint: True}`, and nothing else calls it (`commit`,
+    `check_message` and `reject_trailers` still refuse the trailer everywhere else).
+
+    It never touches the index or the working tree: `commit-tree <HEAD^{tree}> -p <HEAD>` (the message on stdin), then
+    `update-ref HEAD <new> <expected_head>`, so a `HEAD` that is not `expected_head`, before or during, raises
+    `GitError` and stays where it is. No hook runs (`HARDENED`); the commit is signed as the user's git config says,
+    like every runner commit."""
+    root = Path(worktree)
+    before = _git_or_raise(root, *HARDENED, "rev-parse", "--verify", "HEAD^{commit}").strip()
+    if not expected_head or before != expected_head:
+        raise GitError(f"HEAD is {before[:12]}, not the {expected_head[:12] or 'none'} the runner last recorded; the "
+                       "runner writes a constraint override only on top of its own commits")
+    tree = _git_or_raise(root, *HARDENED, "rev-parse", "--verify", f"{before}^{{tree}}").strip()
+    proc = subprocess.run(["git", *HARDENED, "commit-tree", tree, "-p", before, "-F", "-"], cwd=root,
+                          input=message.strip() + "\n", capture_output=True, text=True, encoding="utf-8", check=False)
+    if proc.returncode != 0:
+        raise GitError(f"git commit-tree failed: {proc.stderr.strip() or f'exit {proc.returncode}'}")
+    sha = proc.stdout.strip()
+    _git_or_raise(root, *HARDENED, "update-ref", "-m", "agentflow: constraint override", "HEAD", sha, before)
+    return sha
+
+
 def _status_entries(worktree: Path) -> list[tuple[str, str]]:
     """`(XY, path)` for every changed, staged or untracked path, read from `git status --porcelain -z`.
 

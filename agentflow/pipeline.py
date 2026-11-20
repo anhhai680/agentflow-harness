@@ -50,7 +50,7 @@ from agentflow.autonomy import (
     phase_findings,
     round_limit,
 )
-from agentflow import doubt, governor, pack, preflight, route_lane, run_env, work_source
+from agentflow import constraint, doubt, governor, pack, preflight, route_lane, run_env, work_source
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
@@ -430,11 +430,15 @@ class _Loop:
 
     def walk(self, phase: Phase, executor: Executor) -> tuple[Outcome, bool]:
         """Run the phase's steps, letting the resolver settle what it can; `(outcome, any step ran)`. A wait the plan
-        walk already handled (it ran the resolver on it, and parked it or told a person) is never taken over again."""
+        walk already handled (it ran the resolver on it, and parked it or told a person) is never taken over again.
+        Before each pass, the override commits a person approved are written (`constraint.write`); one that cannot be
+        is a stop the resolver never takes."""
         resolver = Resolver(self.cfg, self.run, executor)
         ran = False
         while True:
             if not resolver.finish_open():
+                return "stopped", ran
+            if not constraint.write(self.cfg, self.run, self.worktree):  # a person's override, before any step runs
                 return "stopped", ran
             outcome, stepped = executor.run_steps(phase, phase.steps, phase.name)
             ran = ran or stepped

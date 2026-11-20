@@ -462,6 +462,7 @@ def park_wait(cfg: Config, run: Run, wait: dict, *, blast_radius: dict, shelf: s
     line = radius_line(radius)
     how = [f"Run `{run.id}` parked `{key}` ({kind}) and goes on with the tasks that do not wait on it.",
            _parked_ways_out(run, kind, key, bool(questions)),
+           *filter(None, [constraint_line(cfg, run, key, bool(questions))]),
            f"Blast radius: {line}"]
     path = run.inbox_path(key)
     summary = str(wait.get("summary") or "")
@@ -483,8 +484,38 @@ def _parked_ways_out(run: Run, kind: str, key: str, has_questions: bool) -> str:
 
 
 def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config, times: int = 1) -> str:
-    """The inbox line that says what each way out of this stop does. `times` above 1 is a `blocked_repeat` stop that
-    came back after a human's approval."""
+    """The inbox line that says what each way out of this stop does, and the constraint line (`constraint_line`) when
+    a constraint gate failed on `key`. `times` above 1 is a `blocked_repeat` stop that came back after a human's
+    approval."""
+    way = _way_on(run, kind, key, has_questions, cfg, times)
+    lifted = constraint_line(cfg, run, key, has_questions)
+    return f"{way}\n\n{lifted}" if lifted else way
+
+
+def constraint_line(cfg: Config, run: Run, key: str, has_questions: bool = False) -> str:
+    """The inbox line for a stop a constraint gate failed on (`constraint_gates_failed`), else "": only a person lifts
+    it, with one approval."""
+    if has_questions or run.state.get("pipeline") == RETRO_PIPELINE or not constraint_gates_failed(cfg, run, key):
+        return ""
+    return f"Only a person can lift this constraint: `agentflow approve {run.id} {key} --constraint`."
+
+
+def constraint_gates_failed(cfg: Config, run: Run, key: str) -> list[str]:
+    """The gates of `guardrails.constraint_override.gates` whose last `gate_result` at `key`, or under `key/`, did not
+    pass (a skipped result is no failure), in the config's order."""
+    gates = cfg.guardrails.constraint_gates
+    if not gates or not cfg.guardrails.constraint_trailer:
+        return []
+    last: dict[str, dict] = {}
+    for event in run.events.read():
+        where = str(event.get("key") or "")
+        if event["type"] == "gate_result" and event.get("gate") in gates and (where == key or where.startswith(key + "/")):
+            last[str(event["gate"])] = event
+    return [g for g in gates if g in last and last[g].get("passed") is False and not last[g].get("skipped")]
+
+
+def _way_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config, times: int = 1) -> str:
+    """What each way out of a stop of this `kind` does (`_how_to_go_on`)."""
     if run.state.get("pipeline") == RETRO_PIPELINE:
         return (f"A retro run cannot be resumed, approved or answered: `agentflow cancel {run.id}`, then run "
                 "`agentflow retro` again (it reads the same runs, since this retro did not finish).")
@@ -652,7 +683,8 @@ def answer(run: Run, key: str, answers: dict[str, str], by: str, record: bool = 
 
 def approve(run: Run, target: str, by: str, budget: float | None = None, hold: bool = False,
             note: str | None = None, budget_step: float | None = None,
-            viewed: list[dict] | None = None, produced: list[dict] | None = None) -> bool:
+            viewed: list[dict] | None = None, produced: list[dict] | None = None,
+            constraint: bool = False, cfg: Config | None = None) -> bool:
     """Approve a phase (`plan` or `plan_approved`), clear an inner checkpoint, or resume a runner stop.
 
     `hold` rests an approved phase as ready (`phase_ready`) instead of leaving the run to go on, and True is
@@ -676,7 +708,16 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
     records it on `phase_approved` when it is not empty, and any other approval ignores it.
     `produced` (`[{path, sha}]`, the newest revision of each artifact the phase produced) is recorded the same way
     when it is not None, an empty list included: that says the phase produced nothing. `signals` reads both back.
+
+    `constraint` lifts a constraint gate (`guardrails.constraint_override`) as a person: `hitl_approved` carries
+    `constraint: True`, and the runner then writes the override commit with the person's name in the pack's human-only
+    trailer (`constraint.write`). Only a person does this, so it is refused, before any event is written, for the
+    runner's own `by` (`AUTO_BY`), inside an agent session (`AGENTFLOW_STEP` or `AGENTFLOW_RUN` set), for a name that
+    cleans to nothing, for a phase or a checkpoint, for an item with questions, and when no constraint gate failed on
+    the key (`constraint_gates_failed`, read with `cfg`, else the config the run continues with).
     """
+    if constraint:
+        _refuse_constraint_by(by)
     note = nfc(note).strip() if note else None
     if budget is not None and not math.isfinite(budget):
         raise ValueError(f"a budget must be a finite number of USD, not {budget!r}")
@@ -697,6 +738,8 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
             spend = float(run.state["spend_usd"] or 0.0)
             if budget <= spend:
                 raise ValueError(f"a budget of ${budget:.2f} is not above the ${spend:.2f} {run.id} has spent")
+        if constraint:
+            _refuse_constraint_item(run, kind, name, item, cfg)
         if kind == "phase":
             if budget is not None:
                 run.emit("run_updated", by=by, budget_usd=budget)
@@ -724,9 +767,45 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
             run.emit("checkpoint_cleared", by=by, key=name)
         else:
             extra = {"note": note} if note else {}
+            if constraint:
+                extra["constraint"] = True
             run.emit("hitl_approved", by=by, key=name, kind=waiting["kind"], summary=waiting["summary"], **extra)
         demote_promoted(run, name)
         return False
+
+
+def _refuse_constraint_by(by: str) -> None:
+    """`NotWaiting` unless a person, outside any agent session, approves a constraint: the name the trailer would carry
+    (`clean_fact(by)[:100]`) is not empty and not the runner's, and no agent session's variables are set."""
+    from agentflow.autonomy import AUTO_BY  # autonomy imports this module
+
+    name = clean_fact(str(by or ""))[:100]
+    if name.casefold() == AUTO_BY:
+        raise NotWaiting("the runner cannot approve a constraint: only a person lifts it")
+    if "AGENTFLOW_STEP" in os.environ or "AGENTFLOW_RUN" in os.environ:  # set for every agent session, even empty
+        raise NotWaiting("a constraint cannot be approved from inside an agent session: only a person lifts it, "
+                         "from their own terminal or the dashboard")
+    if not name:
+        raise NotWaiting("a constraint approval needs the name of the person who gives it (--by)")
+
+
+def _refuse_constraint_item(run: Run, kind: str, name: str, item: dict | None, cfg: Config | None) -> None:
+    """`NotWaiting` unless `name` is a stop with no questions that a constraint gate failed on."""
+    if kind == "phase" or item is None:
+        raise NotWaiting(f"{name!r} is a phase approval; a constraint is lifted on the stop its gate failed on")
+    if item.get("questions"):
+        raise NotWaiting(f"{name!r} is waiting for answers, not a constraint approval")
+    if item.get("kind") in CLEARED_BY_APPROVE and kind != "parked":
+        raise NotWaiting(f"{name!r} is a checkpoint, which no constraint gate stops")
+    if cfg is None:
+        from agentflow.config import load_config  # only a constraint approval made with no config loads one
+        from agentflow.config_trust import run_config_path
+
+        cfg = load_config(run_config_path(run))
+    if not constraint_gates_failed(cfg, run, name):
+        gates = ", ".join(cfg.guardrails.constraint_gates) or "none: the pack sets no guardrails.constraint_override"
+        raise NotWaiting(f"no constraint gate failed on {name!r} (the constraint gates are {gates}); approve it "
+                         "without --constraint")
 
 
 def demote_promoted(run: Run, settled: str) -> None:

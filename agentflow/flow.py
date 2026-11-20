@@ -497,8 +497,11 @@ def cmd_approve(args: argparse.Namespace) -> int:
                 cfg = _run_cfg(run, args)
             except (ConfigError, PackError):
                 cfg = None  # the run's own soft budget instead; continuing reports the config error
+        if args.constraint:  # its refusals read the pack's constraint gates; a config error is reported, not skipped
+            cfg = _run_cfg(run, args)
         approve(run, args.target, _by(args), budget=args.budget, hold=args.no_continue, note=args.note,
-                budget_step=cfg.defaults.run_budget_usd if cfg is not None else None)
+                budget_step=cfg.defaults.run_budget_usd if cfg is not None else None,
+                constraint=args.constraint, cfg=cfg)
         print(f"approved {args.target} for {run.id}.")
         return _continue(run, args, cfg)
     except _human_errors() as exc:
@@ -1147,6 +1150,9 @@ def build_parser() -> argparse.ArgumentParser:
     app.add_argument("--note", help="what to tell the agent an approved stop resumes (what changed, what to do)")
     app.add_argument("--budget", type=float, help="set the run's hard budget (USD); without it, approving a hard-budget "
                                                   "stop allows the spend so far plus one soft budget (run_budget_usd)")
+    app.add_argument("--constraint", action="store_true",
+                     help="lift a constraint gate (guardrails.constraint_override) as a person: the runner writes the "
+                          "override commit with your name in the pack's human-only trailer")
     _continue_flags(app)
     app.set_defaults(func=cmd_approve)
 
