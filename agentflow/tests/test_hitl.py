@@ -935,3 +935,49 @@ def test_read_result_takes_dispositions(tmp_path):
 def test_read_result_refuses_dispositions_that_are_not_a_list(tmp_path, bad):
     with pytest.raises(ResultError, match="dispositions must be a list"):
         read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x", "dispositions": bad}))
+
+
+# ------------------------------------------------------------------ which stops park a task (T4)
+
+TASK_IMPLEMENT = "build/build/task-2/implement"
+
+
+def _park_cfg(cfg, **hitl_keys):
+    return dataclasses.replace(cfg, hitl={**cfg.hitl, **hitl_keys})
+
+
+def test_parks_first_only_for_a_task_steps_parkable_stop(cfg):
+    assert hitl.parks_first(cfg, "blocked", TASK_IMPLEMENT)
+    assert hitl.parks_first(cfg, "gate_failed", "build/build/task-2/commit")
+    assert hitl.parks_first(cfg, "needs_human", "build/build/task-2/review")
+    assert not hitl.parks_first(cfg, "blocked", TASK_IMPLEMENT + "/resolve-1")  # a resolver's own stop
+    assert not hitl.parks_first(cfg, "blocked", "build/build/task-2/gate")
+    assert not hitl.parks_first(cfg, "blocked", "build/build/implement")  # not a task's step
+    assert not hitl.parks_first(cfg, "budget_exceeded", TASK_IMPLEMENT)
+    assert not hitl.parks_first(cfg, "environment", TASK_IMPLEMENT)
+    assert not hitl.parks_first(_park_cfg(cfg, park_independent=False), "blocked", TASK_IMPLEMENT)
+
+
+def test_park_kinds_default_to_every_parkable_stop_and_never_name_a_run_wide_one(cfg):
+    engine = _park_cfg(cfg)
+    assert hitl.park_kinds(dataclasses.replace(cfg, hitl={})) == hitl.PARKABLE
+    assert hitl.park_kinds(engine) == tuple(engine.hitl.get("park_kinds", hitl.PARKABLE))
+    assert "budget_exceeded" not in hitl.PARKABLE and "environment" not in hitl.PARKABLE
+    assert hitl.park_kinds(_park_cfg(cfg, park_kinds=["blocked"])) == ("blocked",)
+    assert hitl.park_kinds(_park_cfg(cfg, park_kinds=[])) == ()
+
+
+def test_parks_first_follows_park_kinds(cfg):
+    only_blocked = _park_cfg(cfg, park_independent=True, park_kinds=["blocked"])
+    assert hitl.parks_first(only_blocked, "blocked", TASK_IMPLEMENT)
+    assert not hitl.parks_first(only_blocked, "gate_failed", TASK_IMPLEMENT)
+    assert not hitl.parks_first(_park_cfg(cfg, park_independent=True, park_kinds=[]), "blocked", TASK_IMPLEMENT)
+    assert not hitl.parks_first(_park_cfg(cfg, park_independent="yes"), "blocked", TASK_IMPLEMENT)  # only `true` parks
+
+
+def test_the_engine_default_parks_a_task_stop():
+    import yaml
+
+    raw = yaml.safe_load((Path(hitl.__file__).parent / "defaults" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["hitl"]["park_independent"] is True
+    assert tuple(raw["hitl"]["park_kinds"]) == hitl.PARKABLE

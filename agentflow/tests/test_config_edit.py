@@ -1231,3 +1231,22 @@ def test_agent_rules_is_protected(shipped):
     _, sha = config_edit.read(shipped)
     with pytest.raises(Refused, match="protected"):
         config_edit.propose(shipped, sha, text=SHIPPED.replace("project:\n", "project:\n  agent_rules: [AGENTS.md]\n", 1), repo=REPO)
+
+
+def test_the_settings_form_has_the_park_keys(shipped):
+    from agentflow import hitl
+
+    fields = _fields(shipped)
+    park = fields[("hitl", "park_independent")]
+    assert (park["label"], park["kind"]) == ("Park a stopped task and go on", "bool")
+    kinds = fields[("hitl", "park_kinds")]
+    assert (kinds["label"], kinds["kind"]) == ("Stops that park a task", "list")
+    proposal = form(shipped, (["hitl", "park_kinds"], ["blocked", "gate_failed"]), (["hitl", "park_independent"], False))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    saved = load_config(shipped).hitl
+    assert saved["park_kinds"] == ["blocked", "gate_failed"] and saved["park_independent"] is False
+    again = _fields(shipped)
+    assert again[("hitl", "park_kinds")]["value"] == ["blocked", "gate_failed"]
+    assert again[("hitl", "park_independent")]["value"] is False
+    assert set(hitl.PARKABLE) >= {"blocked", "gate_failed"}

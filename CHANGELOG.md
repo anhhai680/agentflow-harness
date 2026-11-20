@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- `hitl.park_kinds` names the stops a plan task may park on (`needs_human`, `blocked`, `gate_failed` and the other task stops; `[]` parks nothing, and a run-wide `budget_exceeded` or `environment` stop never parks), and `hitl.park_independent` now defaults to `true`; both have `validate` checks and Settings form fields.
 - A parked task stop can be approved, answered or retried by its key (`agentflow approve <run> <key>`, `answer --key`, `retry <run> <key>`); settling one while the run waits on a promoted parked stop parks that one again, so the run goes on. `agentflow inbox` shows a parked stop's kind, its blast radius ("blocks task 2; task 3 continues") and its ways out, and `reject` refuses a parked key until it is the run's wait. An `approve` or `answer` while a runner is live only records, and that runner picks it up.
 
 ## [3.0] - 2026-11-20

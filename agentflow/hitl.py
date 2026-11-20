@@ -54,6 +54,30 @@ CLEARED_BY_APPROVE = ("checkpoint", "max_rounds", RECONCILE_CHANGED)
 # A retro run walks no phase and is never resumed (`pipeline.advance` refuses it), so a stop of one has one way out.
 RETRO_WAY_OUT = "cancel it and run `agentflow retro` again"
 CAP_STOPS = ("turn_cap", "budget_cap")  # a session that hit its turn or spend cap (`lanes.CAP_KINDS`)
+# The stops a plan task may park (`hitl.park_kinds`). `budget_exceeded` and `environment` are the run's own, not a
+# task's, so they are never parked: they end or pause the whole run.
+PARKABLE = ("needs_human", "blocked", "blocked_repeat", "gate_failed", "fix_attempts_exhausted", "review_unresolved",
+            "guard_violation", "step_timeout", "turn_cap", "budget_cap")
+# A stop on one of a plan task's own steps. A resolver's stop (`.../implement/resolve-1`) has a longer key.
+TASK_STOP = re.compile(r"/task-\d+/(implement|review|commit)$")
+
+
+def park_kinds(cfg: Config) -> tuple[str, ...]:
+    """The stop kinds a task may park: `hitl.park_kinds`, or every `PARKABLE` one when unset. Only `PARKABLE` kinds
+    count, and a value that is not a list (which `validate` refuses) parks nothing."""
+    kinds = cfg.hitl.get("park_kinds")
+    if kinds is None:
+        return PARKABLE
+    if not isinstance(kinds, (list, tuple)):
+        return ()
+    return tuple(kind for kind in kinds if kind in PARKABLE)
+
+
+def parks_first(cfg: Config, kind: str, key: str) -> bool:
+    """Whether a stop is parked as it is raised: the setting is on (a bare `true`), the kind is one a task may
+    park, and the key is a plan task's own step."""
+    return (cfg.hitl.get("park_independent") is True and kind in park_kinds(cfg)
+            and TASK_STOP.search(key) is not None)
 
 
 class ResultError(Exception):

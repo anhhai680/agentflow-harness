@@ -2886,6 +2886,21 @@ class _Validator:
                 self.error(f"ci.{key}", "unknown ci key")
         self.early_pr_after()
 
+    def hitl(self) -> None:
+        """`hitl.park_independent` (a bool) and `hitl.park_kinds` (stops a plan task may park, none of them a run's)."""
+        from agentflow.hitl import PARKABLE  # hitl imports config: imported here, not at the top
+
+        hitl = self.cfg.hitl
+        if not isinstance(hitl.get("park_independent", False), bool):
+            self.error("hitl.park_independent", "park_independent must be true or false")
+        kinds = hitl.get("park_kinds", [])
+        if not isinstance(kinds, list) or any(not isinstance(kind, str) for kind in kinds):
+            self.error("hitl.park_kinds", f"park_kinds must be a list of stop kinds: {', '.join(PARKABLE)}")
+            return
+        for kind in kinds:
+            if kind not in PARKABLE:
+                self.error("hitl.park_kinds", f"{kind}: not a stop a task can park (one of {', '.join(PARKABLE)})")
+
     def early_pr_after(self) -> None:
         """`ci.early_pr_after`: empty, or a phase that comes before the phase holding the `finish` step, since the
         draft pull request it opens early is the one `finish` audits and updates."""
@@ -3097,6 +3112,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.policy()
     v.approval()
     v.autonomy()
+    v.hitl()
     v.route()
     v.overlays()
     v.dashboard()

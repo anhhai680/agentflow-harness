@@ -774,13 +774,15 @@ _RETRO_STEP = "the engine's retro step: a retro is the engine's pipeline, so no 
 _WATCHDOG = "the engine's watchdog default (15 minutes): a pack states it only to change it"
 _READ_ONLY = "the engine's read-only roles (review): a pack states them only to change them"
 _CAPS = "the engine's per-role caps: a pack states them only to change them"
+_PARK = "the engine's parkable stops (hitl.PARKABLE): a pack states them only to park fewer"
 _POLICY = "the engine's default obligations (verified, reviewed, ...) and the engine floor, which a pack states only to add to"
 INHERITED = {
     "python": {"retro_step": _RETRO_STEP, "policy": _POLICY, "agents.claude.read_only_roles": _READ_ONLY,
                "agents.claude.max_turns_by_role": _CAPS, "agents.claude.session_budget_usd": _CAPS,
-               "agents.claude.bash_output_chars": _CAPS},
+               "agents.claude.bash_output_chars": _CAPS, "hitl.park_kinds": _PARK},
     "node": {
         "policy": _POLICY,
+        "hitl": "the engine's park settings (parking on, every parkable stop): a pack states them only to change them",
         "agents.codex": "the engine's codex agent, disabled: it runs no step unless the pack enables it",
         "agents.claude.prices": "the engine's price table: it prices only a session Claude reported no cost for",
         "retro_step": _RETRO_STEP,
@@ -792,7 +794,8 @@ INHERITED = {
     },
     "this repo": {"retro_step": _RETRO_STEP, "policy": _POLICY, "watchdog.no_progress_min": _WATCHDOG,
                   "agents.claude.read_only_roles": _READ_ONLY, "agents.claude.max_turns_by_role": _CAPS,
-                  "agents.claude.session_budget_usd": _CAPS, "agents.claude.bash_output_chars": _CAPS},
+                  "agents.claude.session_budget_usd": _CAPS, "agents.claude.bash_output_chars": _CAPS,
+                  "hitl.park_kinds": _PARK},
 }
 # The keys of `defaults`, `context`, `effort` and `recovery` that load_config requires (no code fallback). The engine
 # defaults hold the values the engine's minimum fixture pack (`node`) writes for them.
@@ -2746,3 +2749,31 @@ def test_runner_flags_name_their_key(tmp_cfg, key, arg, owner):
     found = [i for i in _c4_issues(tmp_cfg, {"agents": {"claude": {key: arg}}}) if i.level == "error"]
     assert [i.path for i in found] == [f"agents.claude.{key}"]
     assert f"agents.claude.{owner}" in found[0].message and "is not allowed" in found[0].message
+
+
+def test_park_kinds_may_not_name_a_stop_a_task_cannot_park(tmp_cfg):
+    issues = issues_for(tmp_cfg, {"hitl": {"park_kinds": ["blocked", "budget_exceeded"]}})
+    bad = [i for i in issues if i.level == "error" and i.path == "hitl.park_kinds"]
+    assert bad and "not a stop a task can park" in bad[0].message
+    for kind in ("environment", "phase_approval", "taste"):
+        assert ("error", "hitl.park_kinds") in errors(issues_for(tmp_cfg, {"hitl": {"park_kinds": [kind]}}))
+
+
+@pytest.mark.parametrize("value", ["blocked", {"blocked": True}, [1], [["blocked"]]])
+def test_park_kinds_must_be_a_list_of_stop_kinds(tmp_cfg, value):
+    assert ("error", "hitl.park_kinds") in errors(issues_for(tmp_cfg, {"hitl": {"park_kinds": value}}))
+
+
+@pytest.mark.parametrize("value", [[], ["blocked", "gate_failed"]])
+def test_park_kinds_may_be_empty_or_name_parkable_stops(tmp_cfg, value):
+    assert not [path for _, path in errors(issues_for(tmp_cfg, {"hitl": {"park_kinds": value}})) if path.startswith("hitl")]
+
+
+@pytest.mark.parametrize("value", ["yes", 1, ["true"]])
+def test_park_independent_must_be_a_bool(tmp_cfg, value):
+    assert ("error", "hitl.park_independent") in errors(issues_for(tmp_cfg, {"hitl": {"park_independent": value}}))
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_park_independent_takes_a_bool(tmp_cfg, value):
+    assert not [path for _, path in errors(issues_for(tmp_cfg, {"hitl": {"park_independent": value}})) if path.startswith("hitl")]
