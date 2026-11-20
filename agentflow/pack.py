@@ -125,9 +125,16 @@ def state_dir(repo: Path) -> Path:
     value = _raw_state_dir(root / PACK_DIR / "config.yaml")
     if isinstance(value, str) and value.strip():
         return resolve_state_dir(value, root)
+    return (user_state_root() / repo_id(root)).resolve()
+
+
+def user_state_root() -> Path:
+    """`${XDG_STATE_HOME:-~/.local/state}/agentflow`, where `XDG_STATE_HOME` counts only when it is absolute: the
+    folder holding every repository's default state dir and the machine-wide files (`governor.window_path`). It is
+    left unresolved, so `safeio.ensure_dir` still sees, and refuses, a symlink at it."""
     home = os.environ.get("XDG_STATE_HOME", "")
     base = Path(home) if home and Path(home).is_absolute() else Path(STATE_HOME).expanduser()
-    return (base / "agentflow" / repo_id(root)).resolve()
+    return base / "agentflow"
 
 
 def _version(text: str) -> tuple[int, ...]:
