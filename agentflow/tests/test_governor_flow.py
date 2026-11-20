@@ -55,6 +55,29 @@ def held_events(flow_repo) -> list[dict]:
     return flow_repo.events(flow_repo.run, "run_held")
 
 
+def after_hold(flow_repo, action, run=None) -> tuple[threading.Thread, dict]:
+    """Run `action` once a new `run_held` event exists, never before: a fixed delay races the code reaching its hold.
+    When none appears within SOON, `action` is not run (`box["fired"]` stays False) and `held_then` fails the test."""
+    run = run or flow_repo.run
+    seen = len(flow_repo.events(run, "run_held"))
+    box: dict = {"fired": False}
+
+    def target() -> None:
+        if wait_for(lambda: len(flow_repo.events(run, "run_held")) > seen):
+            action()
+            box["fired"] = True
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread, box
+
+
+def held_then(waiter: tuple[threading.Thread, dict]) -> None:
+    thread, box = waiter
+    thread.join(SOON)
+    assert box["fired"], "no run_held event appeared, so the action that ends the hold never ran"
+
+
 def write_file(text: str) -> None:
     path = governor.window_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -76,8 +99,9 @@ def test_a_reading_at_095_holds_the_next_fresh_session_until_the_window_clears(f
     flow_repo.script({KEY: [{"windows": {"five_hour": 0.95}, "resets_at": int(time.time()) + 3600, "result": DONE}],
                       KEY2: [{"result": DONE}]})
     assert run_step(flow_repo) == "done"  # the session already running is never cut
-    threading.Timer(0.3, release).start()
+    waiter = after_hold(flow_repo, release)
     assert second_step(flow_repo) == "done"
+    held_then(waiter)
     (held,) = held_events(flow_repo)
     assert held["reason"] == "usage window" and held["level"] == "hard" and held["key"] == KEY2
     assert held["utilization"] == 0.95 and held["window"] == "five_hour" and flow_repo.run.state["hold"] is None
@@ -102,8 +126,9 @@ def test_a_reading_at_08_holds_a_new_phase_but_not_a_step(flow_repo, quick):
                       KEY2: [{"result": DONE}]})
     assert run_step(flow_repo) == "done" and second_step(flow_repo) == "done"  # steps in a started phase go on
     assert held_events(flow_repo) == []
-    threading.Timer(0.3, release).start()
+    waiter = after_hold(flow_repo, release)
     assert flow_repo.executor().govern("plan/governor", "soft", "plan") is True
+    held_then(waiter)
     (held,) = held_events(flow_repo)
     assert held["key"] == "plan/governor" and held["level"] == "soft" and held["utilization"] == 0.8
     assert flow_repo.run.refresh()["hold"] is None
@@ -113,8 +138,9 @@ def test_a_new_run_waits_before_its_first_phase(flow_repo, quick, monkeypatch):
     prime(0.8)
     monkeypatch.setattr(pipeline._Loop, "walk", lambda self, phase, executor: ("stopped", False))
     run = begin(flow_repo)
-    threading.Timer(0.3, release).start()
+    waiter = after_hold(flow_repo, release, run)
     go(flow_repo, run)
+    held_then(waiter)
     log = run.events.read()
     seq = {e["type"]: e["seq"] for e in log if e["type"] in ("run_held", "run_hold_ended", "phase_started")}
     (held,) = [e for e in log if e["type"] == "run_held"]
@@ -131,12 +157,9 @@ def test_a_new_run_s_triage_waits_on_the_soft_mark(flow_repo, quick, monkeypatch
                         lambda self, first: triaged.append(len(self.run.events.read())) or "stopped")
     run = begin(flow_repo)
 
-    def release_once_held() -> None:
-        wait_for(lambda: flow_repo.events(run, "run_held"))
-        release()
-
-    threading.Thread(target=release_once_held, daemon=True).start()
+    waiter = after_hold(flow_repo, release, run)
     go(flow_repo, run)
+    held_then(waiter)
     log = run.events.read()
     (held,) = [e for e in log if e["type"] == "run_held"]
     (ended,) = [e for e in log if e["type"] == "run_hold_ended"]
@@ -237,9 +260,10 @@ def test_a_pause_during_a_hold_stops_without_a_call(flow_repo, quick):
     prime(0.95)
     run = flow_repo.new_run()
     flow_repo.script({KEY: [{"result": DONE}]})
-    threading.Timer(0.05, lambda: Run.load(flow_repo.root, run.id).emit("run_paused", by="me")).start()
+    waiter = after_hold(flow_repo, lambda: Run.load(flow_repo.root, run.id).emit("run_paused", by="me"), run)
     started = time.monotonic()
     assert run_step(flow_repo) == "stopped"
+    held_then(waiter)
     assert time.monotonic() - started < SOON
     assert flow_repo.calls() == []
     assert [e["key"] for e in flow_repo.events(run, "run_hold_ended")] == [KEY]
@@ -252,9 +276,10 @@ def test_a_cancel_during_a_sizer_hold_returns_no_answer(flow_repo, quick, monkey
     executor = flow_repo.executor()
     reached = []
     monkeypatch.setattr(SizingLane, "_run_sizer", lambda self, agent, call, on_event: reached.append(call.step_key))
-    threading.Timer(0.05, lambda: Run.load(flow_repo.root, run.id).emit("run_cancelled", by="me")).start()
+    waiter = after_hold(flow_repo, lambda: Run.load(flow_repo.root, run.id).emit("run_cancelled", by="me"), run)
     assert executor._sizer_call(f"{KEY}/size", "p", executor.agents["claude"], "sonnet", "low", "build", "build",
                                 3, 30) == (None, [])
+    held_then(waiter)
     assert reached == [] and flow_repo.events(run, "sizer_started") == []
     assert [e["key"] for e in flow_repo.events(run, "run_hold_ended")] == [f"{KEY}/size"]
 
@@ -280,8 +305,9 @@ def test_finish_first_waits_only_for_a_ready_run_closer_to_finish(flow_repo, qui
 
     plant(True)
     executor = flow_repo.executor()
-    threading.Timer(0.3, lambda: governor.WindowFile().unwait("x")).start()
+    waiter = after_hold(flow_repo, lambda: governor.WindowFile().unwait("x"))
     assert executor.govern("build/governor", "soft", "build") is True
+    held_then(waiter)
     (held,) = held_events(flow_repo)
     assert held["key"] == "build/governor" and held["level"] == "clear"
     assert governor.WindowFile().read()["waiting"] == {}
@@ -354,7 +380,8 @@ def test_a_codex_step_and_a_codex_sizer_are_not_held(flow_repo, quick, monkeypat
                                 3, 30) == (None, [])
     assert reached == [KEY, size] and flow_repo.events(run, "run_held") == []
 
-    threading.Timer(0.3, release).start()  # a Claude sizer is held
+    waiter = after_hold(flow_repo, release, run)  # a Claude sizer is held
     executor._sizer_call(size, "p", executor.agents["claude"], "sonnet", "low", "build", "build", 3, 30)
+    held_then(waiter)
     assert reached == [KEY, size, size]
     assert [e["key"] for e in flow_repo.events(run, "run_held")] == [size]
