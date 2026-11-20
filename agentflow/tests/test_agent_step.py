@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import fcntl
 import io
@@ -2926,18 +2927,14 @@ def test_a_broken_or_locked_window_file_never_touches_a_running_session(flow_rep
     reset = int(time.time()) + 3600
     run = flow_repo.new_run()
     flow_repo.script({KEY: [{"windows": {"five_hour": 0.42}, "resets_at": reset, "result": DONE}]})
-    held = None
-    try:
+    with contextlib.ExitStack() as stack:  # the lock file stays open (and locked) for the whole call
         if breakage == "garbage":
             path.write_text('{"version": 1, "waiting": {"x": {"pid": "1", "rank": "a"}}, '
                             '"windows": {"five_hour": {"utilization": NaN}}}', encoding="utf-8")
         else:
-            held = open(path.with_name("usage_window.lock"), "a")  # noqa: SIM115 - held for the whole call
+            held = stack.enter_context(open(path.with_name("usage_window.lock"), "a"))
             fcntl.flock(held.fileno(), fcntl.LOCK_EX)
         assert run_step(flow_repo) == "done"
-    finally:
-        if held is not None:
-            held.close()
     assert flow_repo.events(run, "watchdog_fired") == [] and flow_repo.events(run, "runner_error") == []
     assert [e["type"] for e in run.events.read() if e["type"] in ("agent_exited", "step_finished")] == \
         ["agent_exited", "step_finished"]
