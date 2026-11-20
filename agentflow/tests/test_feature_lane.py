@@ -708,6 +708,49 @@ def test_a_forbidden_path_stop_parks(lane, git):
     assert shelves(git, lane.root) == [ref]  # kept: it holds the edit that was set aside
 
 
+def test_a_shelf_ref_git_refuses_never_parks_and_tells_a_person(lane, git, monkeypatch, notified):
+    run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
+    impl1 = IMPL.format(n=1)
+    lane.script({impl1: [{"write": {"src/one.py": "half\n"}, **BLOCKED}]})
+
+    def refused(run_id, tkey):
+        raise ValueError(f"not a valid shelf ref: {tkey!r}")
+
+    monkeypatch.setattr("agentflow.feature_lane.shelf_ref", refused)
+    assert build(lane, run) == ("stopped", True)  # no crash: no shelf, no park
+    assert lane.events(run, "step_parked") == [] and steps(lane.calls()) == [impl1]
+    assert run.state["waiting"]["key"] == impl1 and run.state["waiting"]["kind"] == "blocked"
+    assert (lane.root / "src/one.py").read_text(encoding="utf-8") == "half\n"  # the work stays in the tree
+    assert notified == ["stuck"]
+
+
+def test_a_runner_killed_mid_guard_park_sets_the_forbidden_edit_aside_on_resume(lane, git, monkeypatch):
+    run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
+    lane.script({IMPL.format(n=1): [FORBIDDEN_ACT], IMPL.format(n=2): [TWO]})
+    from agentflow import feature_lane
+
+    real = feature_lane.restore_paths
+    kills: list[list[str]] = []
+
+    def killed(worktree, paths, sha):  # dies after `step_parked`, before any path is reset
+        if not kills:
+            kills.append(list(paths))
+            raise KeyboardInterrupt
+        real(worktree, paths, sha)
+
+    monkeypatch.setattr(feature_lane, "restore_paths", killed)
+    with pytest.raises(KeyboardInterrupt):
+        build(lane, run)
+    assert len(lane.events(run, "step_parked")) == 1 and lane.events(run, "forbidden_reverted") == []
+    assert "weakened" in (lane.root / "CONSTRAINTS.md").read_text(encoding="utf-8")
+
+    assert build(lane, run) == ("stopped", True)
+    assert [e["paths"] for e in lane.events(run, "forbidden_reverted")] == [["CONSTRAINTS.md"]]
+    assert "weakened" not in (lane.root / "CONSTRAINTS.md").read_text(encoding="utf-8")
+    assert files_of(git, lane.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
+    assert git(lane.root, "status", "--porcelain") == ""
+
+
 def test_an_unshelve_conflict_stops_and_overwrites_nothing(lane, git):
     run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
     impl1, unshelve = IMPL.format(n=1), "build/build/task-1/unshelve"

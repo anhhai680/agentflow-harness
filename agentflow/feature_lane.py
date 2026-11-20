@@ -566,17 +566,15 @@ class FeatureLane:
         forbidden = self._forbidden_tripped(events, key) if kind == GUARD_KIND else []
         paths = [p for p in changed if p not in forbidden]
         aside = [p for p in changed if p in forbidden]
-        shelf = None
-        ref = shelf_ref(self.run.id, tkey) if changed else ""
+        shelf, ref = None, ""
         if changed:
-            try:
+            try:  # a ref name git refuses is no shelf either
+                ref = shelf_ref(self.run.id, tkey)
                 shelf = shelve(self.worktree, tree, ref, f"Shelve {tkey}")
             except (GitError, ValueError, subprocess.CalledProcessError):
                 return False  # no shelf, no park: the work stays in the tree and the stop stays the run's wait
         note = ""
         if aside and shelf:
-            restore_paths(self.worktree, aside, str(runner_head(self.run)))
-            self.run.emit("forbidden_reverted", key=key, paths=aside)
             shown = ", ".join(f"`{p}`" for p in aside)
             note = (f"The edit to {shown}, which no agent may touch in a run, was set aside: the runner put "
                     f"{'it' if len(aside) == 1 else 'them'} back as at `HEAD`, and the task will not get the edit back. "
@@ -588,7 +586,14 @@ class FeatureLane:
                   shelved=paths, stop_class=classes[-1].get("stop_class") if classes else None,
                   extra="\n\n".join(part for part in (note, extra) if part))
         restore_paths(self.worktree, paths, "HEAD")
+        if aside and shelf:
+            self._set_forbidden_aside(key, aside)
         return True
+
+    def _set_forbidden_aside(self, key: str, paths: list[str]) -> None:
+        """Put a guard park's forbidden paths back as at the runner's `HEAD`, recorded as `Resolver._revert` does."""
+        restore_paths(self.worktree, paths, str(runner_head(self.run) or "HEAD"))
+        self.run.emit("forbidden_reverted", key=key, paths=paths)
 
     @staticmethod
     def _forbidden_tripped(events: list[dict], key: str) -> list[str]:
@@ -704,8 +709,9 @@ class FeatureLane:
 
     def _finish_shelving(self, prefix: str) -> None:
         """End a park a runner died in after `step_parked`: every shelved path of a still parked task that still holds
-        the shelved work goes back to `HEAD`, before any task runs, so no other task's commit takes it. A path that
-        changed since (a later task's edit) is left alone, and so is a shelf git can no longer read."""
+        the shelved work goes back to `HEAD`, before any task runs, so no other task's commit takes it, and so does a
+        guard park's forbidden edit it had not yet set aside (`forbidden_reverted`). A path that changed since (a
+        later task's edit) is left alone, and so is a shelf git can no longer read."""
         tkeys = {key[: m.end() - 1] for key in self.run.state.get("parked") or {}
                  if key.startswith(prefix + "/") and (m := TASK_N.search(key)) is not None}
         for tkey in sorted(tkeys):
@@ -721,6 +727,12 @@ class FeatureLane:
             stale = [str(p) for p in item.get("shelved") or [] if p in differs and p not in moved]
             if stale:
                 restore_paths(self.worktree, stale, "HEAD")
+            if item.get("kind") == GUARD_KIND:
+                key = str(item["key"])
+                aside = [p for p in self._forbidden_tripped(self.run.events.read(), key)
+                         if p in differs and p not in moved]
+                if aside:
+                    self._set_forbidden_aside(key, aside)
 
     def _task_extra(self, task: sources.PlanTask, rel: str) -> dict[str, str]:
         return {"task_n": str(task.n), "task_title": f"Task {task.n}: {task.title}", "task_text": task.text,
