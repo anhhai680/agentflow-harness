@@ -342,7 +342,7 @@ class FeatureLane:
                 carry_prev = None
                 continue
             batch = (self._batch_of or {}).get(task.n) if not refine else None
-            in_batch = bool(batch) and previous_n is not None and previous_n in (batch or [])
+            in_batch = self._continues_batch(batch, task.n, previous_n, tasks)
             share = previous if small.get("shared_session") or in_batch else None
             carried = False
             if share is None and not batch and not small.get("active") and not refine:
@@ -364,9 +364,21 @@ class FeatureLane:
             carry_prev = None if batch or small.get("active") or refine else tkey
         return False, held, attempted
 
+    @staticmethod
+    def _continues_batch(batch: list[int] | None, n: int, previous_n: int | None,
+                         tasks: list[sources.PlanTask]) -> bool:
+        """Whether task `n` continues the session of `previous_n`: the member before it in its batch, and the plan's
+        task right before it. A member split out between them ran in that session, and its work is shelved."""
+        if not batch or previous_n is None or n not in batch or batch.index(n) == 0:
+            return False
+        order = [t.n for t in tasks]
+        before = order[order.index(n) - 1] if order.index(n) > 0 else None
+        return previous_n == batch[batch.index(n) - 1] == before
+
     def _batches(self, phase: Phase, step: Step, plan: Path, prefix: str, small: dict) -> dict[int, list[int]]:
         """Task number -> its batch (`step.batch`), decided once per run and kept in a `plan_batched` event, so a
-        resume sees the same batches after their tasks were ticked. None in a small plan or a refine round."""
+        resume sees the same batches after their tasks were ticked. None in a small plan or a refine round. The last
+        `plan_batched` counts, so a member split out of its batch (`_split_out`) stays out; a batch of one is none."""
         if not step.batch or small.get("active") or self._refine_round(phase):
             return {}
         recorded = [e for e in self.run.events.read() if e["type"] == "plan_batched" and e.get("key") == prefix]
@@ -376,7 +388,19 @@ class FeatureLane:
             batches = sources.plan_batches(sources.parse_plan(plan), int(step.batch.get("max_tasks", 3)),
                                            int(step.batch.get("max_files", 3)))
             self.run.emit("plan_batched", key=prefix, batches=batches)
-        return {n: batch for batch in batches for n in batch}
+        return {n: batch for batch in batches if len(batch) > 1 for n in batch}
+
+    def _split_out(self, prefix: str, n: int) -> None:
+        """Take task `n` out of its batch, so it parks and later runs alone with a review of its own: every batch
+        is kept, and `n`'s becomes the batch without `n`, then `[n]`, recorded as the last `plan_batched` so a
+        resume, `hitl.rejected_scope` and the review all see the split."""
+        recorded = [e for e in self.run.events.read() if e["type"] == "plan_batched" and e.get("key") == prefix]
+        batches: list[list[int]] = []
+        for batch in (recorded[-1].get("batches") or []) if recorded else []:
+            members = [int(m) for m in batch]
+            batches.extend([[m for m in members if m != n], [n]] if n in members else [members])
+        self.run.emit("plan_batched", key=prefix, batches=batches, split=n)
+        self._batch_of = {m: batch for batch in batches if len(batch) > 1 for m in batch}
 
     def _carry(self, step: Step, tkey: str, carry_prev: str | None) -> str | None:
         """The implement key whose session task `tkey`'s implementer resumes under the step's `carry`, or None for a
@@ -535,6 +559,9 @@ class FeatureLane:
         the shelf is written before `step_parked`, and the paths go back to `HEAD` only after it (`_finish_shelving`
         ends that on resume).
 
+        A member of a batch of several is split out of it first (`_split_out`) and parks alone, unless it is the
+        batch's last, whose review is the only one of the members committed before it: that one stops.
+
         A guard stop's forbidden paths stay in the shelf commit, recoverable from its ref, but are not `shelved`: they
         go back to the runner's `HEAD` before `step_parked`, recorded as `forbidden_reverted` (as `Resolver._revert`
         does), so the task never gets them back and its restart is not refused for them again."""
@@ -546,7 +573,8 @@ class FeatureLane:
         if kind == GUARD_KIND and not self._guard_parks(events, key):
             return False
         n = int(match[1])
-        if len((self._batch_of or {}).get(n) or []) > 1:  # its batch's one review would miss it, or take its work
+        batch = (self._batch_of or {}).get(n) or []
+        if len(batch) > 1 and n == batch[-1]:  # its review is the only one of the members committed before it
             return False
         rel = self.ctx.values.get("plan") or ""
         plan = self.worktree / rel if rel else None
@@ -573,6 +601,8 @@ class FeatureLane:
                 shelf = shelve(self.worktree, tree, ref, f"Shelve {tkey}")
             except (GitError, ValueError, subprocess.CalledProcessError):
                 return False  # no shelf, no park: the work stays in the tree and the stop stays the run's wait
+        if len(batch) > 1:  # before `step_parked`: a runner killed between never leaves a parked task in a batch
+            self._split_out(prefix, n)
         note = ""
         if aside and shelf:
             shown = ", ".join(f"`{p}`" for p in aside)
@@ -799,8 +829,10 @@ class FeatureLane:
             rextra = extra
             if batch and len(batch) > 1:
                 start = self._task_start(phase, f"{prefix}/task-{batch[0].n}/implement")
-                rextra = {**extra, "task_title": f"Tasks {batch[0].n}-{task.n} ("
-                          + "; ".join(t.title for t in batch) + ")",
+                numbers = [t.n for t in batch]  # a batch a member was split out of is no range
+                shown = (f"{batch[0].n}-{task.n}" if numbers == list(range(batch[0].n, task.n + 1))
+                         else ", ".join(str(m) for m in numbers))
+                rextra = {**extra, "task_title": f"Tasks {shown} (" + "; ".join(t.title for t in batch) + ")",
                           "task_text": "\n\n".join(t.text for t in batch)}
             outcome, open_findings = self._review_task(phase, impl_step, review, tkey, extra, rextra, start)
             if outcome != "done":

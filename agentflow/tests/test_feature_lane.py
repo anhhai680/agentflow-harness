@@ -1491,13 +1491,68 @@ def test_a_batch_review_fix_lands_in_the_last_members_commit(batched, git):
     assert subjects(git, batched.root)[0] == "Task 2: Second thing"
 
 
-def test_a_batch_member_stops_instead_of_parking(batched):
-    run = begin_build(batched, plan_text({1: "none", 2: "none"}, count=2))
-    batched.script({IMPL.format(n=1): [needs_human("ambiguity", can_continue=True)]})
+def test_a_batch_member_parks_alone(batched, git):
+    run = begin_build(batched, plan_text({1: "none", 2: "none", 3: "none"}, count=3))
+    start = batched.head()
+    batched.script({IMPL.format(n=2): [{"write": {"src/two.py": "half\n"},
+                                        "result": {"status": "blocked", "summary": "stuck"}}]})
     assert build(batched, run) == ("stopped", True)
-    assert batched.events(run, "step_parked") == []
-    assert steps(batched.calls()) == [IMPL.format(n=1)]  # task 2 waits: the batch stays whole
-    assert run.state["waiting"]["key"] == IMPL.format(n=1)
+    split = batched.events(run, "plan_batched")[-1]
+    assert split["split"] == 2 and split["batches"] == [[1, 3], [2]]
+    (parked,) = batched.events(run, "step_parked")
+    assert parked["key"] == IMPL.format(n=2) and parked["shelved"] == ["src/two.py"]
+    assert subjects(git, batched.root)[:2] == ["Task 3: Third thing", "Task 1: First thing"]
+    calls = batched.calls()
+    assert steps(calls) == [IMPL.format(n=1), IMPL.format(n=2), IMPL.format(n=3), REVIEW.format(n=3)]
+    assert steps(calls).count(REVIEW.format(n=3)) == 1  # the batch's one review, without 2
+    first = session_of(batched, run, IMPL.format(n=1))
+    assert not any(arg == first for arg in calls[2]["argv"])  # 3 does not continue the session 2 ran in
+    assert "Next task in this same session" not in calls[2]["argv"][-1]
+    review_prompt = calls[3]["argv"][-1]
+    assert f"`{start}..worktree`" in review_prompt  # from where task 1 started
+    assert "Tasks 1, 3 (First thing; Third thing)" in review_prompt
+    assert "src/two.py" not in git(batched.root, "show", "HEAD", "--name-only", "--format=").split()
+    assert not (batched.root / "src" / "two.py").exists()  # shelved: task 3's commit and review never see it
+    assert run.state["waiting"]["key"] == IMPL.format(n=2)
+
+    task3 = batched.head()
+    approve(run, IMPL.format(n=2), by="me")
+    assert build(batched, run) == ("done", True)
+    after = batched.calls()[4:]
+    assert steps(after) == [IMPL.format(n=2), REVIEW.format(n=2)]  # 2 alone gets its own review
+    assert f"`{task3}..worktree`" in after[1]["argv"][-1]  # from task 3's commit: 2's work only
+    assert subjects(git, batched.root)[0] == "Task 2: Second thing"
+    assert "src/two.py" in git(batched.root, "show", "HEAD", "--name-only", "--format=").split()
+
+
+def test_a_split_batch_survives_a_resume(batched):
+    run = begin_build(batched, plan_text({1: "none", 2: "none", 3: "none"}, count=3))
+    batched.script({IMPL.format(n=2): [{"result": {"status": "blocked", "summary": "stuck"}}]})
+    assert build(batched, run) == ("stopped", True)
+    executor = batched.executor(run)  # a restarted runner reads the split back
+    step = next(s for s in batched.cfg.phases["build"].steps if s.id == "build")
+    assert executor._batches(batched.cfg.phases["build"], step, batched.root / PLAN_PATH, "build/build", {}) == {
+        1: [1, 3], 3: [1, 3]}  # 2 is no batch of its own: it runs alone
+
+
+def test_a_first_batch_member_parks_and_the_rest_start_a_fresh_session(batched):
+    run = begin_build(batched, plan_text({1: "none", 2: "none", 3: "none"}, count=3))
+    batched.script({IMPL.format(n=1): [{"result": {"status": "blocked", "summary": "stuck"}}]})
+    assert build(batched, run) == ("stopped", True)
+    assert batched.events(run, "plan_batched")[-1]["batches"] == [[2, 3], [1]]
+    calls = batched.calls()
+    assert steps(calls) == [IMPL.format(n=1), IMPL.format(n=2), IMPL.format(n=3), REVIEW.format(n=3)]
+    one, two = session_of(batched, run, IMPL.format(n=1)), session_of(batched, run, IMPL.format(n=2))
+    assert two != one and ("--resume", two) in pairs(calls[2]["argv"])  # 3 continues 2, never 1
+    assert "Tasks 2-3 (Second thing; Third thing)" in calls[3]["argv"][-1]
+
+
+def test_a_batchs_last_member_stops(batched):
+    run = begin_build(batched, plan_text({1: "none", 2: "none", 3: "none"}, count=3))
+    batched.script({IMPL.format(n=3): [{"result": {"status": "blocked", "summary": "stuck"}}]})
+    assert build(batched, run) == ("stopped", True)
+    assert batched.events(run, "step_parked") == [] and run.state["waiting"]["key"] == IMPL.format(n=3)
+    assert [e["batches"] for e in batched.events(run, "plan_batched")] == [[[1, 2, 3]]]  # never split
 
 
 def test_batches_are_decided_once_and_survive_ticked_tasks(batched):
