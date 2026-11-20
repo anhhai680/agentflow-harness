@@ -430,16 +430,16 @@ Fewer review rounds, reviews at medium effort and fewer full-suite fix sessions 
 
 Slices are ordered by **hours saved per unit of risk**. Each slice is one PR on the feature lane of agentflow itself, with a plan in `docs/plans/`.
 
-| Slice | Content | Risk | Expected saving |
-|---|---|---|---|
-| **T0 Measure** | Wall-time breakdown in `metrics`; `lead_time_h`, `human_blocked_share` and `full_suite_runs` in signals and the scorecard; freeze the baseline | none | makes the rest measurable |
-| **T1 Never block on the environment** | Preflight (A.3); `stop_class` from the resolver plus routing (A.2) for `environment` and `flaky`; dedupe of `blocked_repeat`; watchdog (B); CI watcher (A.4, E.5) | low | ~20 % of human-wait hours |
-| **T2 Gate economics** | `group`, `resource`, `inputs` and `affected` for gates; tiers; one full suite on the final tree, enforced by the conformance audit (E.1–E.3); early draft PR (E.4) | medium (the conformance audit gets new evidence kinds) | −50–60 % gate wall time |
-| **T3 Route profiles** | Profiles + rule + mid-flight upgrade (C.1); review tiering (C.2); capped doubt rounds | medium (quality); guarded by the floor and `observe` first | −30–60 % define/plan; small features ≤ 45 min |
-| **T4 Park and continue** | `park_independent` on by default and widened to every task stop, with the runner deciding independence; batch members park alone; a blast radius on each item (A.1); the human override for guards (A.6); batched approvals and a digest (A.5, A.7) | medium | most of the remaining human-wait hours |
-| **T5 Parallel build** | Human pre-flight with a real `claude -p` (decision 1); `**Parallel group:**` in the plan; the runner's check of the mark; wave sessions that fan out sub-agents; attribution, build gates once per wave, a review wave, commits per task (D) | high (concurrency); `max_subagents: 1` until the scorecard is green on 5 runs | build 2–2.5× faster |
-| **T6 Slots and multi-run** | `slots` and `{slot}`; the human slot; resource locks across runs (F) | medium | 3 features in flight |
-| **T7 Speculative planning and the approval ramp** | Plan while the spec awaits approval; `observe → auto` per approval kind, from the scorecard (A.5) | medium | overlaps the last human wait |
+| Slice | Content | Risk | Expected saving | Status |
+|---|---|---|---|---|
+| **T0 Measure** | Wall-time breakdown in `metrics`; `lead_time_h`, `human_blocked_share` and `full_suite_runs` in signals and the scorecard; freeze the baseline | none | makes the rest measurable | shipped 2026-11-15 (PR #29) |
+| **T1 Never block on the environment** | Preflight (A.3); `stop_class` from the resolver plus routing (A.2) for `environment` and `flaky`; dedupe of `blocked_repeat`; watchdog (B); CI watcher (A.4, E.5) | low | ~20 % of human-wait hours | shipped 2026-11-15 (PR #30) |
+| **T2 Gate economics** | `group`, `resource`, `inputs` and `affected` for gates; tiers; one full suite on the final tree, enforced by the conformance audit (E.1–E.3); early draft PR (E.4) | medium (the conformance audit gets new evidence kinds) | −50–60 % gate wall time | shipped 2026-11-16 (PR #32) |
+| **T3 Route profiles** | Profiles + rule + mid-flight upgrade (C.1); review tiering (C.2); capped doubt rounds | medium (quality); guarded by the floor and `observe` first | −30–60 % define/plan; small features ≤ 45 min | shipped 2026-11-18 (PR #39); `route.mode` defaults to `off`. Deferred: M's wave review (needs T5), XS without a spec draft, the profile on the dashboard |
+| **T4 Park and continue** | `park_independent` on by default and widened to every task stop, with the runner deciding independence; batch members park alone; a blast radius on each item (A.1); the human override for guards (A.6); batched approvals and a digest (A.5, A.7) | medium | most of the remaining human-wait hours | not started |
+| **T5 Parallel build** | Human pre-flight with a real `claude -p` (decision 1); `**Parallel group:**` in the plan; the runner's check of the mark; wave sessions that fan out sub-agents; attribution, build gates once per wave, a review wave, commits per task (D) | high (concurrency); `max_subagents: 1` until the scorecard is green on 5 runs | build 2–2.5× faster | not started |
+| **T6 Slots and multi-run** | `slots` and `{slot}`; the human slot; resource locks across runs (F) | medium | 3 features in flight | not started |
+| **T7 Speculative planning and the approval ramp** | Plan while the spec awaits approval; `observe → auto` per approval kind, from the scorecard (A.5) | medium | overlaps the last human wait | not started |
 
 T1 and T2 change nothing about how agents work, and they recover the most hours for the least risk. They go first. T5 depends on T4, because parking is how a failed member gets out of a wave. It doesn't need T6: sub-agents don't run integration tests or Docker, and the runner's gates still run one at a time per run.
 
