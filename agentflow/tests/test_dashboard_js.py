@@ -389,3 +389,27 @@ def test_a_number_map_sends_numbers_and_skips_an_empty_value():
     assert js([DOM_STUB, "settings.js"], "mapValue({value: ''}, 'int')", None) is None  # an `int` map still sends null for an empty value
     assert js([DOM_STUB, "settings.js"], "mapValue({value: '7'}, 'text')", None) == "7"
     assert js([DOM_STUB, "settings.js"], "args.map(v => mapValue({value: v}, 'number') === undefined)", ["", "5"]) == [True, False]
+
+
+def test_the_usage_pill_reads_short():
+    usage = {"mode": "on", "level": "soft", "waiting": 2, "note": None, "error": None,
+             "windows": {"five_hour": {"utilization": 0.82, "resets_at": 1800000000, "stale": False},
+                         "seven_day": {"utilization": 0.41, "resets_at": 1800300000, "stale": False}}}
+    label = js(["board.js"], "usageLabel(args)", usage)
+    assert label["text"] == "5h 82% · 7d 41%" and label["level"] == "soft" and label["title"].endswith(" · 2 runs wait")
+    assert label["title"].startswith("resets ") and label["note"] == ""
+    assert js(["board.js"], "usageLabel(args).text", {**usage, "windows": {}}) == ""
+    assert js(["board.js"], "usageLabel(args).note", {**usage, "error": "bad json"}) == \
+        "usage window file unreadable: bad json"
+    assert js(["board.js"], "usageLabel(args).note", {**usage, "note": "rose", "error": "x"}) == "rose"
+
+
+def test_the_usage_pill_leaves_out_stale_windows_and_names_the_mode():
+    stale = {"utilization": 0.9, "resets_at": 1800000000, "stale": True}
+    fresh = {"utilization": 0.3, "resets_at": 1800000000, "stale": False}
+    usage = {"mode": "observe", "level": "clear", "waiting": 1, "note": None, "error": None,
+             "windows": {"five_hour": stale, "seven_day": fresh}}
+    label = js(["board.js"], "usageLabel(args)", usage)
+    assert label["text"] == "7d 30% (observe)" and label["title"].endswith(" · 1 run waits")
+    assert js(["board.js"], "usageLabel(args).text", {**usage, "mode": "off"}) == "7d 30% (off)"
+    assert js(["board.js"], "usageLabel(args).title", {**usage, "waiting": 0}).count("·") == 0

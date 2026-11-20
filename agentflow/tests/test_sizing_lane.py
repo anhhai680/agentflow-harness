@@ -7,10 +7,11 @@ import io
 import json
 import re
 import threading
+import time
 
 import pytest
 
-from agentflow import sizing, sizing_lane
+from agentflow import governor, sizing, sizing_lane
 from agentflow.gitops import GitError
 from agentflow.hitl import answer as answer_questions
 from agentflow.hitl import approve
@@ -1199,3 +1200,12 @@ def test_reviews_are_tiered_when_a_profile_applies(flow_repo, mode, level):
     levels = levels_of(flow_repo, run)
     assert levels["build/build/task-1/review"] == level
     assert levels["build/build/task-1/implement"] == "medium"  # the implement step is sized as it always is
+
+
+def test_a_sizer_writes_its_readings_to_the_shared_file_too(flow_repo):
+    reset = int(time.time()) + 3600
+    flow_repo.script({SIZE_KEY: [answer(mechanical="yes") | {"windows": {"five_hour": 0.61}, "resets_at": reset}]})
+    flow_repo.new_run()
+    assert run_step(flow_repo) == "done"
+    mine = governor.WindowFile().read()["windows"][governor.account_of(flow_repo.cfg)]
+    assert mine["five_hour"]["utilization"] == 0.61 and mine["five_hour"]["resets_at"] == reset

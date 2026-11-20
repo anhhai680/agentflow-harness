@@ -1414,6 +1414,31 @@ def test_batched_tasks_share_one_byte_identical_brief(flow_repo, monkeypatch):
     assert pinned[0] == pinned[1] == pinned[2] is not None
 
 
+def test_a_shared_session_s_next_task_is_held(lane, quick):
+    """Decided 2 (C6): a task that continues a shared session is new work, so the hard mark holds its first call."""
+    import threading
+    import time
+
+    from conftest import release
+
+    lane.configure(SMALL)
+    run = begin_build(lane, plan_text())
+    lane.script({IMPL.format(n=1): [{"windows": {"five_hour": 0.95}, "resets_at": int(time.time()) + 3600,
+                                     "result": DONE_RESULT}]})
+    def release_once_held() -> None:  # task 1 takes longer than any fixed delay: release only once task 2 is held
+        deadline = time.monotonic() + 30
+        while not lane.events(run, "run_held") and time.monotonic() < deadline:
+            time.sleep(0.01)
+        release()
+
+    threading.Thread(target=release_once_held, daemon=True).start()
+    assert build(lane, run) == ("done", True)
+    (held,) = lane.events(run, "run_held")
+    assert held["key"] == IMPL.format(n=2) and held["level"] == "hard" and held["reason"] == "usage window"
+    one, two = lane.calls()
+    assert ("--resume", session_of(lane, run, IMPL.format(n=1))) in pairs(two["argv"])
+
+
 def test_small_plan_shared_session_keeps_the_brief(flow_repo):
     from conftest import brief_ready
 

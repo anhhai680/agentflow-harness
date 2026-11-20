@@ -108,8 +108,8 @@ def test_version_1_pack_is_refused(tmp_cfg):
 
 
 def test_engine_range_that_excludes_this_engine_is_refused(tmp_cfg):
-    with pytest.raises(ConfigError, match=rf"engine: '>=3' .* this engine is {re.escape(pack.ENGINE_VERSION)}"):
-        load_config(tmp_cfg({"engine": ">=3"}))
+    with pytest.raises(ConfigError, match=rf"engine: '>=4' .* this engine is {re.escape(pack.ENGINE_VERSION)}"):
+        load_config(tmp_cfg({"engine": ">=4"}))
 
 
 def test_engine_range_that_does_not_parse_is_refused(tmp_cfg):

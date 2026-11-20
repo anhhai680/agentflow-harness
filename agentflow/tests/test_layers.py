@@ -196,6 +196,22 @@ def test_the_user_layer_overrides_the_pack_for_personal_keys():
     check_user({}, lower, USER_FILE)  # an empty file is fine
 
 
+def test_the_usage_window_keys_are_personal_settings():
+    assert "usage.*" in layers.USER_KEYS
+    engine = yaml.safe_load(layers.ENGINE_DEFAULTS.read_text(encoding="utf-8"))
+    pack = {"usage": {"five_hour_hard": 0.9}}
+    user = {"usage": {"five_hour_soft": 0.6, "governor": "observe"}}
+    lower, _ = merge([L("engine", {"usage": engine["usage"]}), L("project", pack)])
+    check_user(user, lower, USER_FILE)
+    with pytest.raises(LayerError):
+        check_user({"usage": {"soft": 0.6}}, lower, USER_FILE)  # a typo is refused, not carried
+    merged, origins = merge([L("engine", {"usage": engine["usage"]}), L("project", pack), L("user", user)])
+    assert merged["usage"] == {"governor": "observe", "five_hour_soft": 0.6, "five_hour_hard": 0.9,
+                               "seven_day_soft": 0.85, "finish_first": True}
+    assert origins[("usage", "five_hour_soft")] == "user" and origins[("usage", "governor")] == "user"
+    assert origins[("usage", "five_hour_hard")] == "project" and origins[("usage", "finish_first")] == "engine"
+
+
 def test_the_hard_budget_is_a_personal_setting():
     assert "defaults.run_budget_hard_usd" in layers.USER_KEYS
     user = {"defaults": {"run_budget_hard_usd": 40}}

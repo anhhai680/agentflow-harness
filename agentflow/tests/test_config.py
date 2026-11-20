@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from agentflow import pack
-from agentflow.config import CACHE_TTLS, ConfigError, Evidence, Issue, load_config, parse_evidence, validate
+from agentflow.config import CACHE_TTLS, ConfigError, Evidence, Issue, Usage, load_config, parse_evidence, validate, validate_usage
 from agentflow.flow import main, repo_root
 from conftest import PYTHON_CONFIG, with_doubt
 
@@ -954,7 +954,7 @@ def test_every_skills_map_reference_in_the_defaults_resolves(tmp_path):
 
 def test_engine_defaults_match_the_code_fallbacks(tmp_path):
     node = yaml.safe_load(FULL_PACKS["node"].read_text(encoding="utf-8"))
-    minimal = {"version": 2, "engine": ">=2,<3",
+    minimal = {"version": 2, "engine": ">=3,<4",
                "project": {"base_branch": "main", "fork_from": "main", "branch": "b", "commit_trailer": ""},
                "agents": {"claude": {"command": ["claude"]}}, "guardrails": {}, "gates": {}, "gate_sets": {},
                "lanes": [], "phases": {}}
@@ -1067,7 +1067,7 @@ def test_a_user_file_cannot_revive_an_agent_the_pack_deleted(tmp_cfg):
 
 def test_a_recursive_anchor_in_the_pack_is_a_config_error_naming_it(tmp_path):
     target = tmp_path / "config.yaml"
-    target.write_text('version: 2\nengine: ">=2,<3"\nloop: &a {x: *a}\n', encoding="utf-8")
+    target.write_text('version: 2\nengine: ">=3,<4"\nloop: &a {x: *a}\n', encoding="utf-8")
     with pytest.raises(ConfigError) as err:
         load_config(target)
     assert str(target) in str(err.value)
@@ -1141,7 +1141,7 @@ def test_an_unreadable_user_file_location_is_a_config_error_naming_it(monkeypatc
 
 def _starter_pack(sparse_repo: Path, **extra) -> Path:
     path = pack.pack_config(sparse_repo)
-    data = {"version": 2, "engine": ">=2,<3", "agents": {"claude": {"permission_mode": "bypassPermissions"}}, **extra}
+    data = {"version": 2, "engine": ">=3,<4", "agents": {"claude": {"permission_mode": "bypassPermissions"}}, **extra}
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return path
 
@@ -1693,6 +1693,59 @@ def test_preflight_enabled_must_be_a_bool(tmp_cfg):
     assert [(i.path, i.message) for i in found if i.level == "error"] == [("preflight.nope", "unknown preflight key")]
     assert load_config(tmp_cfg({"preflight": {"enabled": True}})).preflight.enabled is True
     assert load_config(tmp_cfg({"preflight": None})).preflight.enabled is False
+
+
+def test_usage_defaults_load(tmp_cfg):
+    assert load_config(tmp_cfg()).usage == Usage("on", 0.75, 0.92, 0.85, True)
+
+
+def test_a_bare_off_loads_as_off_and_is_a_warning(tmp_cfg):
+    assert load_config(tmp_cfg({"usage": {"governor": False}})).usage.governor == "off"
+    issues = issues_for(tmp_cfg, {"usage": {"governor": False}})
+    assert [(i.level, i.path) for i in issues if "governor" in i.path] == [("warning", "usage.governor")]
+    assert load_config(tmp_cfg({"usage": {"governor": True}})).usage.governor == "on"
+
+
+def test_governor_is_a_reserved_step_id(tmp_cfg):
+    def patch(data):
+        phase_step(data, "build", "build")["id"] = "governor"
+    found = issues_for(tmp_cfg, patch)
+    assert any(i.level == "error" and "step id 'governor' is reserved" in i.message for i in found)
+
+
+@pytest.mark.parametrize("block, path, message", [
+    ({"governor": "sometimes"}, "usage.governor", 'governor must be "on", "observe" or "off"'),
+    ({"five_hour_soft": 0.95}, "usage.five_hour_soft", "five_hour_soft must be above 0 and below five_hour_hard"),
+    ({"five_hour_soft": 0}, "usage.five_hour_soft", "five_hour_soft must be above 0 and below five_hour_hard"),
+    ({"five_hour_soft": float("nan")}, "usage.five_hour_soft", "five_hour_soft must be above 0 and below five_hour_hard"),
+    ({"five_hour_hard": 1.2}, "usage.five_hour_hard", "five_hour_hard must be at most 1"),
+    ({"five_hour_hard": float("inf")}, "usage.five_hour_hard", "five_hour_hard must be at most 1"),
+    ({"seven_day_soft": 0}, "usage.seven_day_soft", "seven_day_soft must be above 0 and at most 1"),
+    ({"soft": 0.7}, "usage.soft", "unknown usage key"),
+])
+def test_validate_refuses_bad_usage(tmp_cfg, block, path, message):
+    found = issues_for(tmp_cfg, {"usage": block})
+    assert any(i.level == "error" and i.path == path and message in i.message for i in found), found
+
+
+def test_validate_usage_is_the_usage_part_of_validate(tmp_cfg):
+    path = tmp_cfg({"usage": {"five_hour_soft": 0.95, "soft": 0.7}})
+    cfg = load_config(path)
+    mine = [i for i in validate(cfg, path.parent.parent) if i.path == "usage" or i.path.startswith("usage.")]
+    assert mine and validate_usage(cfg) == mine
+
+
+@pytest.mark.parametrize("block", [{"five_hour_soft": True}, {"finish_first": "yes"}])
+def test_a_wrongly_typed_usage_value_is_a_load_error(tmp_cfg, block):
+    (key,) = block
+    with pytest.raises(ConfigError, match=rf"usage\.{key}"):
+        load_config(tmp_cfg({"usage": block}))
+
+
+def test_validate_takes_the_shipped_usage_block():
+    issues = validate(load_config(ROOT / ".agentflow" / "config.yaml"), ROOT)
+    assert [(i.level, i.path) for i in issues if i.level in ("error", "warning")] == []
+    assert yaml.safe_load(layers.ENGINE_DEFAULTS.read_text(encoding="utf-8"))["usage"]["governor"] == "on"
 
 
 def test_watchdog_no_progress_min_must_be_zero_or_more(tmp_cfg):

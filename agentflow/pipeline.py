@@ -50,7 +50,7 @@ from agentflow.autonomy import (
     phase_findings,
     round_limit,
 )
-from agentflow import doubt, pack, preflight, route_lane, run_env, work_source
+from agentflow import doubt, governor, pack, preflight, route_lane, run_env, work_source
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
@@ -96,6 +96,16 @@ class RunOptions:
     dry_run: bool = False
     detach: bool = False
     new_module: dict | None = None  # {module, responsibility, deps}: a module not in the map yet; the run adds its row
+
+
+def _holds_ship(steps: list[Step]) -> bool:
+    """Whether a `finish` or `ci` step is among `steps` or inside one of their groups: a phase the usage window's soft
+    mark never holds, so a run that is done with review still opens its pull request."""
+    return any(step.type in ("finish", "ci") or _holds_ship(step.steps) for step in steps)
+
+
+def _governor_key(phase: str) -> str:
+    return f"{phase}/{governor.GOVERNOR_STEP}"
 
 
 def needs_approval(phase: Phase) -> bool:
@@ -327,6 +337,8 @@ class _Loop:
         if self.cfg.route.mode in ("observe", "on") or history:
             executor = self.executor()
             if executor.route_due():
+                if not executor.govern(_governor_key(first), "soft", first):  # the soft mark holds a new run's triage
+                    return self.status()
                 if executor.size_route(first) == "stopped":
                     return self.status()
             elif history and executor.route_backstop(first) == "stopped":
@@ -402,6 +414,9 @@ class _Loop:
                 if skip:
                     run.emit("phase_skipped", phase=name, reason=reason, via="skip_if", decided_by=executor.last_decided_by)
                     return None
+            # The soft mark holds a phase about to start, never the phase that ships the run.
+            if not _holds_ship(phase.steps) and not executor.govern(_governor_key(name), "soft", name):
+                return self.status()
             if executor.route_record() is not None:  # a plan bigger than the triage said raises the route first
                 executor.reroute(tasks=executor.plan_open_tasks(), risk=False)
             run.emit("phase_started", phase=name, start_sha=head(self.worktree))

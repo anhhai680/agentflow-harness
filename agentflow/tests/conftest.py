@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -76,6 +78,34 @@ def _claude_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
     return home
+
+
+def prime(u: float, resets_in: int = 3600, refused: bool = False) -> None:
+    """Record a `five_hour` reading of `u` in the usage window file, for the account of this test's
+    `CLAUDE_CONFIG_DIR`, resetting `resets_in` seconds from now."""
+    from agentflow import governor
+
+    reading = {"utilization": u, "resets_at": int(time.time()) + resets_in, "refused": refused}
+    governor.WindowFile().record(governor.account_key(os.environ.get("CLAUDE_CONFIG_DIR")), {"five_hour": reading},
+                                 time.time())
+
+
+def release() -> None:
+    """Record a `five_hour` reading of 0 for a period 5 h ahead: later than any `prime` that resets sooner, so it
+    replaces that reading and clears the window at once."""
+    from agentflow import governor
+
+    reading = {"utilization": 0.0, "resets_at": int(time.time()) + 5 * 3600, "refused": False}
+    governor.WindowFile().record(governor.account_key(os.environ.get("CLAUDE_CONFIG_DIR")), {"five_hour": reading},
+                                 time.time())
+
+
+@pytest.fixture
+def quick(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The governor polls every 0.01 s; `FRESH_S` and `READY_MAX_S` keep their values."""
+    from agentflow import governor
+
+    monkeypatch.setattr(governor, "POLL_S", 0.01)
 
 
 @pytest.fixture
@@ -195,7 +225,7 @@ def pack_repo_python(tmp_path: Path) -> Path:
 
 SPARSE_PACK = {  # a pack that states only what the engine defaults can't know: its gates and its permission line
     "version": 2,
-    "engine": ">=2,<3",
+    "engine": ">=3,<4",
     "gates": {"unit": {"run": "true"}},
     "gate_sets": {"setup": [], "build": ["unit"], "verify": ["unit"]},
     "agents": {"claude": {"permission_mode": "bypassPermissions"}},

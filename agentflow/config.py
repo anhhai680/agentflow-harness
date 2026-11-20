@@ -213,6 +213,9 @@ NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition"
 PREFLIGHT_KEYS = ("enabled",)
 WATCHDOG_KEYS = ("no_progress_min", "read_only_idle_min")
 WATCHDOG_MAX_MIN = 1440  # `watchdog.no_progress_min` above a day is a typo, not a plan
+USAGE_KEYS = ("governor", "five_hour_soft", "five_hour_hard", "seven_day_soft", "finish_first")
+USAGE_GOVERNORS = ("on", "observe", "off")
+GOVERNOR_STEP_ID = "governor"  # the usage governor's owner is `<phase>/governor`: no step's id
 GATE_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # a gate's `group` or `resource`
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -333,6 +336,15 @@ class Preflight:
 class Watchdog:
     no_progress_min: float = 0  # end a session whose stream is quiet this long (`agents.idle_limit`); 0 = off
     read_only_idle_min: float = 5  # a read-only session with no tool call open ends after this long quiet; 0 = no shorter limit
+
+
+@dataclass
+class Usage:
+    governor: str = "on"  # `on` holds new work above the marks, `observe` only records, `off` is silent
+    five_hour_soft: float = 0.75  # of the 5-hour window: above it no new run or phase starts
+    five_hour_hard: float = 0.92  # of the 5-hour window: above it no new session starts
+    seven_day_soft: float = 0.85  # of the 7-day window: above it no new run or phase starts
+    finish_first: bool = True  # held runs go again closest to `finish` first
 
 
 @dataclass
@@ -644,6 +656,7 @@ class Config:
     recovery: Recovery = field(default_factory=Recovery)
     preflight: Preflight = field(default_factory=Preflight)
     watchdog: Watchdog = field(default_factory=Watchdog)
+    usage: Usage = field(default_factory=Usage)
     autonomy: dict = field(default_factory=dict)
     resolve_step: Step | None = None
     retro_step: Step | None = None  # the one session of a retro run (`retro.run_retro`); not part of any lane
@@ -779,6 +792,16 @@ def _float(data: dict, key: str, path: str, default: float) -> float:
         return float(value)
     except OverflowError:
         return math.inf
+
+
+def _governor(value: Any) -> str:
+    """`usage.governor`: a bare YAML `off` or `on` (a bool) is the word; anything else loads as given and `validate`
+    refuses what is not a mode (the governor then runs as `on`)."""
+    if value is None:
+        return "on"
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    return value if isinstance(value, str) else str(value)
 
 
 def _finite(value: object) -> bool:
@@ -1467,6 +1490,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
     recovery = _optional(raw, "recovery", "", dict, {})
     preflight = _optional(raw, "preflight", "", dict, {})
     watchdog = _optional(raw, "watchdog", "", dict, {})
+    usage = _optional(raw, "usage", "", dict, {})
     agents = _require(raw, "agents", "", dict)
     gate_sets = _require(raw, "gate_sets", "", dict)
     docs = dict(_optional(project, "docs", "project", dict, {}))
@@ -1557,6 +1581,11 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
         preflight=Preflight(enabled=_optional(preflight, "enabled", "preflight", bool, False)),
         watchdog=Watchdog(no_progress_min=_float(watchdog, "no_progress_min", "watchdog", 0),
                           read_only_idle_min=_float(watchdog, "read_only_idle_min", "watchdog", 5)),
+        usage=Usage(governor=_governor(usage.get("governor")),
+                    five_hour_soft=_float(usage, "five_hour_soft", "usage", 0.75),
+                    five_hour_hard=_float(usage, "five_hour_hard", "usage", 0.92),
+                    seven_day_soft=_float(usage, "seven_day_soft", "usage", 0.85),
+                    finish_first=_optional(usage, "finish_first", "usage", bool, True)),
         autonomy=_optional(raw, "autonomy", "", dict, {}),
         resolve_step=builder.step(raw["resolve_step"], "resolve_step") if raw.get("resolve_step") else None,
         retro_step=builder.step(raw["retro_step"], "retro_step") if raw.get("retro_step") else None,
@@ -1702,6 +1731,9 @@ class _Validator:
             elif step.id == ROUTE_STEP_ID:
                 self.error(_join(step.path, "id"), f"step id '{step.id}' is reserved: the runner's triage of a run "
                                                    f"uses `<phase>/{ROUTE_STEP_ID}`")
+            elif step.id == GOVERNOR_STEP_ID:
+                self.error(_join(step.path, "id"), f"step id '{step.id}' is reserved: the runner's usage governor "
+                                                   f"uses `<phase>/{GOVERNOR_STEP_ID}`")
             seen.add(step.id)
             if step.review is not None:
                 self.unique_ids([step.review], seen)
@@ -2556,6 +2588,29 @@ class _Validator:
             if key not in WATCHDOG_KEYS:
                 self.error(f"watchdog.{key}", "unknown watchdog key")
 
+    def usage(self) -> None:
+        """`usage.governor`: `on`, `observe` or `off` (a bare `off` loads as `off` and warns, since YAML turns it into
+        a bool); the marks are fractions of a window, finite, and the soft mark of the 5-hour window sits below its
+        hard one; a key that is not one of this block's is a typo."""
+        raw = self.cfg.raw.get("usage")
+        block = raw if isinstance(raw, dict) else {}
+        mode = block.get("governor")
+        if isinstance(mode, bool):
+            self.add("warning", "usage.governor", f'governor is a bare {"on" if mode else "off"}, which YAML reads as a '
+                     f'boolean: quote it ("{"on" if mode else "off"}") so it reads as the mode')
+        elif mode is not None and mode not in USAGE_GOVERNORS:
+            self.error("usage.governor", 'governor must be "on", "observe" or "off"')
+        use = self.cfg.usage
+        if not _finite(use.five_hour_hard) or not 0 < use.five_hour_hard <= 1:
+            self.error("usage.five_hour_hard", "five_hour_hard must be at most 1, and above 0")
+        if not _finite(use.five_hour_soft) or not 0 < use.five_hour_soft < use.five_hour_hard:
+            self.error("usage.five_hour_soft", "five_hour_soft must be above 0 and below five_hour_hard")
+        if not _finite(use.seven_day_soft) or not 0 < use.seven_day_soft <= 1:
+            self.error("usage.seven_day_soft", "seven_day_soft must be above 0 and at most 1")
+        for key in block:
+            if key not in USAGE_KEYS:
+                self.error(f"usage.{key}", "unknown usage key")
+
     def issue_sync(self, pol: IssuePolicy) -> None:
         """`issues.sync_label`, `sync_lane`, `lane_labels`: which open issues the Backlog shows and their lanes."""
         if _label_problem(pol.sync_label):
@@ -3011,6 +3066,13 @@ def _find_keys(node: Any, key: str, path: str = "") -> list[str]:
     return found
 
 
+def validate_usage(cfg: Config) -> list[Issue]:
+    """Only the problems under `usage`: it needs no repository, so the governor can re-check a reloaded config cheaply."""
+    v = _Validator(cfg, Path("."))
+    v.usage()
+    return v.issues
+
+
 def validate(cfg: Config, repo: Path) -> list[Issue]:
     """Return every problem found in `cfg`, checked against the checkout at `repo`."""
     v = _Validator(cfg, Path(repo))
@@ -3031,6 +3093,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.issue_policy()
     v.preflight()
     v.watchdog()
+    v.usage()
     v.policy()
     v.approval()
     v.autonomy()

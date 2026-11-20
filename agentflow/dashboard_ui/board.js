@@ -393,12 +393,36 @@ function doneNode(done) {
     done.map((item) => el("div", { class: "muted", text: item.id + " · " + item.reason })));
 }
 
+// The usage window as the header shows it. A pure function of `board().usage`: the pill (`text` empty hides it), its
+// hover (`title`) and the note under it (the interactive-use warning, else a broken window file, else nothing).
+const two = (n) => ("0" + n).slice(-2);
+const clockText = (epoch) => { const d = new Date(epoch * 1000); return two(d.getHours()) + ":" + two(d.getMinutes()); };
+
+function usageLabel(usage) {
+  const names = { five_hour: "5h", seven_day: "7d" };
+  const shown = Object.entries(names).filter(([key]) => usage.windows && usage.windows[key] && !usage.windows[key].stale);
+  const mode = usage.mode === "observe" || usage.mode === "off" ? " (" + usage.mode + ")" : "";
+  const text = shown.length ? shown.map(([key, name]) => name + " " + Math.round(usage.windows[key].utilization * 100) + "%").join(" · ") + mode : "";
+  let title = shown.length ? "resets " + clockText(usage.windows[shown[0][0]].resets_at) : "";
+  if (usage.waiting) title += " · " + usage.waiting + (usage.waiting === 1 ? " run waits" : " runs wait");
+  const note = usage.note || (usage.error ? "usage window file unreadable: " + usage.error : "");
+  return { text, level: usage.level, title, note };
+}
+
 function renderBoard(data) {
   ui.board = data;
   const counts = Object.entries(data.counts).map(([k, v]) => k.replace("_", " ") + " " + v).join(" · ") || "no runs";
   const byModel = Object.entries(data.agents_running.by_model).map(([k, v]) => k + " " + v).join(" · ");
   $("summary").textContent = counts + " | agents running " + data.agents_running.total + (byModel ? " (" + byModel + ")" : "") +
     " | today " + money(data.spend_today) + " (budget per run: soft " + money(data.run_budget_usd) + " · hard " + money(data.run_budget_hard_usd) + ")";
+  const label = usageLabel(data.usage || { windows: {} });
+  $("usage").hidden = !label.text;
+  $("usage").textContent = label.text;
+  $("usage").title = label.title;
+  $("usage").className = "pill" + (label.level === "soft" || label.level === "hard" ? " " + label.level : "");
+  $("usage-note").hidden = !label.note;
+  $("usage-note").textContent = label.note;
+  $("usage-note").title = label.note;
   syncBoardFilters(data);
   const shown = filterCards(data.cards, ui.boardQuery, boardLanes(data), boardStatuses(data));
   const noMatch = data.cards.length > 0 && shown.length === 0;

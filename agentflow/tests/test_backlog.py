@@ -12,7 +12,7 @@ from agentflow.flow import main
 from agentflow.backlog import Invalid, Refused
 from agentflow.state import Run, runs_root
 
-from conftest import ENGINE, run_git
+from conftest import ENGINE, prime, release, run_git
 
 GH_BIN = ENGINE / "tests" / "bin"
 # A is merged, B and C depend on A, D depends on B (the plan's example).
@@ -1578,3 +1578,25 @@ def test_an_issue_in_the_module_lane_waits_for_its_blocker(ibk, monkeypatch):
     call = ibk.spawn.calls[-1]
     assert call["lane"] == "feature" and call["params"] == {"issue": "2", "module": "issue-2"}
     assert call["new_module"] == {"module": "issue-2", "responsibility": "GitHub issue #2", "deps": []}
+
+
+def test_the_backlog_refuses_a_start_above_the_soft_mark(bk):
+    bk.refresh()
+    prime(0.8)
+    with pytest.raises(Refused, match=r"the usage window holds new runs: the 5h usage window is at 80%"):
+        bk.start("module:b")
+    assert not [e for e in backlog._log(bk.root).read() if e.get("type") == "item_starting"]
+    assert bk.spawn.calls == []
+    release()
+    assert bk.start("module:b")  # the window cleared: the same card starts
+
+
+def test_the_backlog_starts_in_observe_and_when_the_governor_fails(bk, monkeypatch):
+    from agentflow import governor
+
+    bk.refresh()
+    bk.fr.configure({"usage": {"governor": "observe"}})
+    prime(0.95)
+    assert bk.start("module:b")
+    monkeypatch.setattr(governor, "account_of", lambda cfg: 1 / 0)
+    assert bk.start("module:c")

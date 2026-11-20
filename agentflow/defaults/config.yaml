@@ -69,6 +69,13 @@ watchdog:
   no_progress_min: 15   # end a session that writes nothing to its stream this many minutes (0 = off; 15 is a safe start)
   read_only_idle_min: 5   # end a read-only session this quiet with no tool call open (0 = use no_progress_min)
 
+usage:
+  governor: "on"   # "on": hold new work near the plan's usage window; "observe": record only; "off": nothing (quote it)
+  five_hour_soft: 0.75   # of the 5-hour window (above 0, below five_hour_hard): above it no new run or phase starts
+  five_hour_hard: 0.92   # of the 5-hour window (above 0, at most 1): above it no new session starts
+  seven_day_soft: 0.85   # of the 7-day window (above 0, at most 1): above it no new run or phase starts
+  finish_first: true   # held runs go again closest to `finish` first (false: oldest first)
+
 effort:
   sizing: true    # the runner sizes each step before it starts (false: every step runs at default)
   default: medium

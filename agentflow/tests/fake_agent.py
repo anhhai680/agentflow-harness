@@ -17,7 +17,8 @@ result event), rate_limit {...} (sent as a `rate_limit_event`'s `rate_limit_info
 (after the last line, stdout is closed and the process stays alive s more seconds, as a CLI's shutdown does),
 stderr str (written to stderr before anything else, as a CLI that refuses a flag does: pair it with `no_init` and
 `exit`), model_id str (the model the stream names, default `fake-<alias>`), windows {"five_hour": u, "seven_day": u}
-(a `rate_limit_event` whose `unifiedWindows` carries those utilizations, status `allowed`, sent before `rate_limit`),
+(a `rate_limit_event` whose `unifiedWindows` carries those utilizations, status `allowed`, sent before `rate_limit`;
+`resets_at` n is the `resetsAt` it sends, default 1794910800, and `refused` true makes its top-level status `rejected`),
 attempts [{tool_name, tool_input}] (tool calls the model tries, decided by the permission model below; a permitted
 `Write` writes `tool_input.content` to `file_path`; a denied call is added to the result event's `permission_denials`, and
 a call to a tool `--tools` leaves out to its `unavailable` list as `{tool_name, tool_input, kind: "unknown_tool"}`; a
@@ -282,10 +283,12 @@ def main() -> int:
     if not act.get("no_init"):
         emit({"type": "system", "subtype": "init", "model": model, "per_turn_effort_active": True, **base})
     if act.get("windows"):
-        unified = {name: {"utilization": u, "resetsAt": 1794910800, "status": "allowed"}
+        resets = act.get("resets_at", 1794910800)
+        unified = {name: {"utilization": u, "resetsAt": resets, "status": "allowed"}
                    for name, u in act["windows"].items()}
         emit({"type": "rate_limit_event", "rate_limit_info": {
-            "status": "allowed", "resetsAt": 1794910800, "rateLimitType": "five_hour", "unifiedWindows": unified}, **base})
+            "status": "rejected" if act.get("refused") else "allowed", "resetsAt": resets,
+            "rateLimitType": "five_hour", "unifiedWindows": unified}, **base})
     if act.get("rate_limit"):
         emit({"type": "rate_limit_event", "rate_limit_info": act["rate_limit"], **base})
 

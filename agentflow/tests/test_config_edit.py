@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 from agentflow import config_edit, pack, pipeline
-from agentflow.config import ConfigError, load_config
+from agentflow.config import ConfigError, Usage, load_config
 from agentflow.config_edit import Conflict, EditError, Refused
 from agentflow.pipeline import RunOptions
 
@@ -113,6 +113,28 @@ def test_the_form_sets_the_watchdog(shipped):
     assert len(changed_lines(proposal.diff)) == 2  # one line out, one in
     config_edit.save(shipped, proposal)
     assert load_config(shipped).watchdog.no_progress_min == 15
+
+
+def test_the_form_sets_the_usage_window(shipped):
+    proposal = form(shipped, (["usage", "governor"], "observe"), (["usage", "five_hour_soft"], 0.6),
+                    (["usage", "five_hour_hard"], 0.9), (["usage", "seven_day_soft"], 0.8),
+                    (["usage", "finish_first"], False))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).usage == Usage("observe", 0.6, 0.9, 0.8, False)
+
+
+def test_the_form_reports_a_soft_mark_above_the_hard_one(shipped):
+    proposal = form(shipped, (["usage", "five_hour_soft"], 0.95))  # in range for the field, wrong across fields
+    assert any(i.path == "usage.five_hour_soft" and i.level == "error" for i in proposal.issues)
+
+
+def test_the_form_refuses_a_mark_out_of_its_range(shipped):
+    for key, bad in (("five_hour_hard", 1.5), ("five_hour_soft", 0), ("seven_day_soft", -0.1)):
+        with pytest.raises(EditError):
+            form(shipped, (["usage", key], bad))
+    with pytest.raises(EditError):
+        form(shipped, (["usage", "governor"], "sometimes"))
 
 
 def test_the_form_sets_the_ci_watch(shipped):
@@ -239,7 +261,7 @@ def test_yaml_text_may_change_anything_but_the_protected_settings(shipped):
         ("  fork_from: main", "  fork_from: --upload-pack=x"),                          # reaches git
         ('  progress_file: "runs/{run}/progress.md"', '  progress_file: "../../x.md"'),  # a path the runner writes
         ("version: 2\n", "version: 3\n"),                                          # the pack's format
-        ('engine: ">=2,<3"', 'engine: ">=2"'),                                      # the engines it runs on
+        ('engine: ">=3,<4"', 'engine: ">=3"'),                                      # the engines it runs on
     ]:
         assert old in SHIPPED, old
         with pytest.raises(Refused, match="protected"):
@@ -936,7 +958,7 @@ def test_an_on_disk_pack_that_loads_neither_way_still_holds_the_protected_settin
     _refused_and_unchanged(path, sparse_repo, raw)
     raw["engine"] = ">=99"  # a new text that does not load either: still held
     _refused_and_unchanged(path, sparse_repo, raw, match="engine|gates")
-    raw["gates"]["unit"]["run"], raw["engine"] = "true", ">=2,<3"  # the repair alone saves
+    raw["gates"]["unit"]["run"], raw["engine"] = "true", ">=3,<4"  # the repair alone saves
     _, sha = config_edit.read(path)
     proposal = config_edit.propose(path, sha, text=yaml.safe_dump(raw, sort_keys=False), repo=sparse_repo)
     assert not proposal.errors, proposal.errors

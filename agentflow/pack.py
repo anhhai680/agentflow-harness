@@ -22,7 +22,7 @@ ENGINE_SKILLS: Path = Path(__file__).resolve().parent / "skills"  # the generic 
 SKILL_NAME = re.compile(r"(?!-)[\w.:-]+")  # a skill's directory name: the character set of `lanes.SKILL_LINE`, no leading `-`
 PACK_DIR = ".agentflow"
 PACK_VERSION = 2  # the pack format this engine reads (`version:`)
-ENGINE_VERSION = "2.9"  # what a pack's `engine:` range is checked against
+ENGINE_VERSION = "3.0"  # what a pack's `engine:` range is checked against
 ENGINE_FORBIDDEN = (".agentflow/**",)  # forbidden paths every pack gets, whatever it lists itself
 STATE_HOME = "~/.local/state"  # where the default state dir goes when `XDG_STATE_HOME` is unset
 ENGINE_LESSONS: Path = Path(__file__).resolve().parent / "lessons.md"  # the engine's own lessons, for any project
@@ -125,9 +125,16 @@ def state_dir(repo: Path) -> Path:
     value = _raw_state_dir(root / PACK_DIR / "config.yaml")
     if isinstance(value, str) and value.strip():
         return resolve_state_dir(value, root)
+    return (user_state_root() / repo_id(root)).resolve()
+
+
+def user_state_root() -> Path:
+    """`${XDG_STATE_HOME:-~/.local/state}/agentflow`, where `XDG_STATE_HOME` counts only when it is absolute: the
+    folder holding every repository's default state dir and the machine-wide files (`governor.window_path`). It is
+    left unresolved, so `safeio.ensure_dir` still sees, and refuses, a symlink at it."""
     home = os.environ.get("XDG_STATE_HOME", "")
     base = Path(home) if home and Path(home).is_absolute() else Path(STATE_HOME).expanduser()
-    return (base / "agentflow" / repo_id(root)).resolve()
+    return base / "agentflow"
 
 
 def _version(text: str) -> tuple[int, ...]:
@@ -138,7 +145,7 @@ def engine_satisfies(spec: str, version: str = ENGINE_VERSION) -> bool:
     """Whether `version` is in `spec`: comma-separated clauses of `>=`, `>`, `<=`, `<`, `==` on dotted integers,
     all of which must hold. Raises `PackError` on a clause it can't parse."""
     if not isinstance(spec, str) or not spec.strip():
-        raise PackError(f"engine range {spec!r} is empty: write clauses such as '>=2,<3'")
+        raise PackError(f"engine range {spec!r} is empty: write clauses such as '>=3,<4'")
     have = _version(version)
     ok = True
     for clause in spec.split(","):

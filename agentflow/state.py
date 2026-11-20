@@ -73,6 +73,7 @@ def initial_state() -> dict:
         "soft_budget_usd": None,  # the soft limit: crossing it only notifies; None for a run started before it
         "context_windows": {},
         "usage_window": {},  # the latest `usage_window` per window (`five_hour`, `seven_day`): the plan's usage limits
+        "usage_governed": None,  # the last `usage_governed`: what `usage.governor: observe` would have held
         "cli_settings_ignored": [],  # the settings a `cli_setting_ignored` event noted: each once per run
         "env_dropped": [],
         "facts": [],
@@ -321,6 +322,10 @@ def _on_run_held(state: dict, ev: dict) -> None:
 
 def _on_run_hold_ended(state: dict, ev: dict) -> None:
     state["hold"] = None
+
+
+def _on_usage_governed(state: dict, ev: dict) -> None:
+    state["usage_governed"] = {name: ev.get(name) for name in ("key", "level", "window", "utilization", "until")}
 
 
 def _on_agent_session(state: dict, ev: dict) -> None:
@@ -846,6 +851,7 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "hitl_raised": _on_hitl_raised,
     "run_held": _on_run_held,
     "run_hold_ended": _on_run_hold_ended,
+    "usage_governed": _on_usage_governed,
     "step_parked": _on_step_parked,
     "step_reopened": _on_step_reopened,
     "resolve_started": _on_resolve_started,
@@ -897,6 +903,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "module_added": ("module", "sha"),
     "run_held": ("key", "reason", "until"),
     "run_hold_ended": ("key",),
+    "usage_governed": ("key", "level"),
     "step_parked": ("key",),
     "step_reopened": ("key",),
     "resolve_started": ("key",),

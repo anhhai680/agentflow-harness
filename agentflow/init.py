@@ -39,7 +39,7 @@ from agentflow.gates import GateResult, resolve, run_gates
 
 _show = doctor.printable
 
-ENGINE_RANGE = ">=2,<3"
+ENGINE_RANGE = ">=3,<4"
 GIT_TIMEOUT_S = 120
 DROPPED_ENV = ("VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONPATH")  # the caller's Python environment, not the project's
 GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")  # they would point git at the caller's repository, not the worktree

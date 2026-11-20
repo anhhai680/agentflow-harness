@@ -36,6 +36,7 @@ from agentflow.activity import activity_page
 from agentflow.artifacts import artifact_tabs
 from agentflow.config import RETRO_PIPELINE, Config, Phase, Step, check_lane, for_lane, resolve_model
 from agentflow.events import parse_iso
+from agentflow import governor
 from agentflow import lessons as lessons_mod
 from agentflow.hitl import inbox_items
 from agentflow.metrics import BUCKETS, aggregate, run_metrics
@@ -417,6 +418,10 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
         counts[status] += 1
         cards.append(_card(run, status, cfg, now, digest, metrics))
     needs = [{**item, "age_s": _age(now, item.get("since"))} for item in inbox_items(repo)]
+    try:
+        account = governor.account_of(cfg)
+    except Exception:  # noqa: BLE001 - the header must not break the board
+        account = governor.account_key(None)
     return {
         "lane": lane,
         "lanes": list(cfg.lanes),
@@ -441,6 +446,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
         "spend_today": round(spend_today, 2),
         "run_budget_usd": cfg.defaults.run_budget_usd,
         "run_budget_hard_usd": cfg.defaults.run_budget_hard_usd,
+        "usage": governor.header(governor.current_usage(cfg), account, now.timestamp()),
         "generated_at": now.isoformat(timespec="seconds"),
     }
 

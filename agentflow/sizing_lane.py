@@ -84,7 +84,8 @@ def _is_sizer_edit(event: dict) -> bool:
 
 class SizingLane:
     """Sizes agent steps and plans; a mixin of `Executor` (uses `cfg`, `run`, `agents`, `ctx`, `worktree`, `overrides`,
-    `dry_run`, `_under_budget`, `_waiting_on`, and `FeatureLane`'s `_refine_round` and `_batch_of`)."""
+    `dry_run`, `_under_budget`, `_waiting_on`, `FeatureLane`'s `_refine_round` and `_batch_of`, and `GovernorLane`'s
+    `govern` and `_metered`)."""
 
     # -- one step
 
@@ -458,9 +459,13 @@ class SizingLane:
 
     def _sizer_call(self, key: str, prompt: str, agent: Agent, model: str, effort: str, phase: str, role: str,
                     turns: int, timeout_s: int, add_dirs: list[Path] | None = None) -> tuple[dict | None, list[str]]:
-        """One fresh read-only session: its parsed answer (None when it gave none) and what it changed. Never holds,
-        reminds or stops: an interruption, a timeout or an exception gives no answer. `add_dirs` are the directories
-        outside the worktree it may read (the run's workspace, for a triage that names the run's inputs)."""
+        """One fresh read-only session: its parsed answer (None when it gave none) and what it changed. Never waits
+        on a usage limit, reminds or stops: an interruption, a timeout or an exception gives no answer. `add_dirs` are the directories
+        outside the worktree it may read (the run's workspace, for a triage that names the run's inputs). A Claude
+        sizer waits first while the usage window is above its hard mark; paused or cancelled there, it gives no answer
+        and changed nothing."""
+        if agent.name == "claude" and not self.govern(key, "hard", phase):
+            return None, []
         before = self._repo_state()
         self.run.emit("sizer_started", key=key, **before)
         call = AgentCall(
@@ -471,7 +476,7 @@ class SizingLane:
             agent_profile=None, context_window=self.context_window_for(key, model), env=self.cfg.defaults.env,
             env_base=run_env.base(self.cfg), forbidden_paths=list(self.cfg.guardrails.forbidden_paths),
             max_turns=turns, read_only=True, self_contained=True,
-            usage_windows=dict(self.run.state.get("usage_window") or {}),
+            usage_windows=dict(self.run.state.get("usage_window") or {}), on_reading=self._on_reading,
         )
         seen: dict[str, object] = {"pid": None}
 
@@ -489,7 +494,7 @@ class SizingLane:
         outcome: AgentOutcome | None = None
         changed = ["unknown"]
         try:
-            outcome = self._run_sizer(agent, call, on_event)
+            outcome = self._metered(lambda: self._run_sizer(agent, call, on_event))
         except Exception:  # noqa: BLE001 - no answer; what it changed is still checked below
             outcome = None
         finally:

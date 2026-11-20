@@ -2,7 +2,7 @@
 # Edit behaviour here, not in code. `agentflow validate` checks it.
 # A string value that starts with "@" is a reference to another key ("@overlays.eval.when_paths").
 version: 2
-engine: ">=2,<3"               # the engine versions that may run this pack
+engine: ">=3,<4"               # the engine versions that may run this pack
 
 project:
   base_branch: main            # the base the changed-path conditions compare against (`origin/<base_branch>`)
