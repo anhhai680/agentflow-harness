@@ -42,7 +42,10 @@ the plan sizer did not flag `risk`, outside the security overlay, gets none eith
 Parking. A stop on a task's own step (`<task>/implement`, `/review` or `/commit`) is settled inside the walk
 (`_settle_task_stop`): the resolver tries it first (`Resolver.take_over`), and one it cannot clear parks
 (`_park`) when `hitl.parks_first` holds and some other task can still run. A guard stop parks only when it names
-forbidden paths alone and `HEAD` is still the runner's; a member of a batch of several does not park. The park
+forbidden paths alone and `HEAD` is still the runner's. A member of a batch of several is split out of it
+(`_split_out`, a `plan_batched` with `split`) and parks alone, unless it is the batch's last, whose review is the only
+one of the members committed before it: that one stops. A member held behind a parked task is split out too, so it
+later runs alone with a review of its own, and the batch's review covers only the members that ran. The park
 shelves the task's uncommitted work in a ref (`gitops.shelve`), records `step_parked` with the stop's blast radius
 (`park.blast_radius`), then puts the shelved paths back to `HEAD`. A task waits on a held one when it depends on it
 or names one of its files (`park.waits_on`); the rest are built. The run stops for the first parked stop, promoted
@@ -337,11 +340,13 @@ class FeatureLane:
                 previous, previous_n = impl_key, task.n
                 carry_prev = None  # committed by an earlier walk: never a carry source
                 continue
+            batch = (self._batch_of or {}).get(task.n) if not refine else None
             if self._parked(tkey) or park.waits_on(task, held, texts):
                 held.add(task.n)
                 carry_prev = None
+                if batch and task.n != batch[-1]:  # the batch's one review would cover a member that never ran
+                    self._split_out(prefix, task.n)
                 continue
-            batch = (self._batch_of or {}).get(task.n) if not refine else None
             in_batch = self._continues_batch(batch, task.n, previous_n, tasks)
             share = previous if small.get("shared_session") or in_batch else None
             carried = False

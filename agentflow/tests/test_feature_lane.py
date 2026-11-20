@@ -1548,11 +1548,50 @@ def test_a_first_batch_member_parks_and_the_rest_start_a_fresh_session(batched):
 
 
 def test_a_batchs_last_member_stops(batched):
-    run = begin_build(batched, plan_text({1: "none", 2: "none", 3: "none"}, count=3))
+    run = begin_build(batched, plan_text({1: "none", 2: "none", 3: "none", 4: "none"}, count=4))
     batched.script({IMPL.format(n=3): [{"result": {"status": "blocked", "summary": "stuck"}}]})
     assert build(batched, run) == ("stopped", True)
+    assert [e["batches"] for e in batched.events(run, "plan_batched")] == [[[1, 2, 3]]]  # 4 is past `max_tasks`
     assert batched.events(run, "step_parked") == [] and run.state["waiting"]["key"] == IMPL.format(n=3)
-    assert [e["batches"] for e in batched.events(run, "plan_batched")] == [[[1, 2, 3]]]  # never split
+    assert IMPL.format(n=4) not in steps(batched.calls())  # task 4 could run, but the batch's last never parks
+
+
+def reviewed_commits(run) -> dict[int, list[int]]:
+    """Each committed task -> the tasks the review before its commit covered (its batch's members, or itself)."""
+    covered: dict[int, list[int]] = {}
+    batches: dict[int, list[int]] = {}
+    for event in run.events.read():
+        if event["type"] == "plan_batched":
+            batches = {n: b for b in event["batches"] if len(b) > 1 for n in b}
+        elif event["type"] == "review_result":
+            n = int(event["key"].split("task-")[1].split("/")[0])
+            covered[n] = batches.get(n, [n])
+    return covered
+
+
+@pytest.mark.parametrize("plan", [
+    plan_text({1: "none", 2: "Task 1", 3: "none"}, count=3),
+    plan_text({1: "none", 2: "none", 3: "none"}, count=3, files={1: ["src/a.py"], 2: ["src/a.py"]}),
+], ids=["depends", "shared-file"])
+def test_a_batch_member_held_behind_a_split_member_runs_alone(batched, git, plan):
+    run = begin_build(batched, plan)
+    batched.script({IMPL.format(n=1): [{"result": {"status": "blocked", "summary": "stuck"}}]})
+    assert build(batched, run) == ("stopped", True)
+    assert batched.events(run, "plan_batched")[-1]["batches"] == [[3], [2], [1]]  # 2 held behind 1: split out too
+    calls = batched.calls()
+    assert steps(calls) == [IMPL.format(n=1), IMPL.format(n=3), REVIEW.format(n=3)]
+    assert "Task 3: Third thing" in calls[-1]["argv"][-1]
+    assert "Second thing" not in calls[-1]["argv"][-1]  # the review names no member that did not run
+    assert reviewed_commits(run) == {3: [3]}
+
+    approve(run, IMPL.format(n=1), by="me")
+    assert build(batched, run) == ("done", True)
+    assert steps(batched.calls()[3:]) == [IMPL.format(n=1), REVIEW.format(n=1), IMPL.format(n=2), REVIEW.format(n=2)]
+    assert subjects(git, batched.root)[:3] == ["Task 2: Second thing", "Task 1: First thing", "Task 3: Third thing"]
+    covered = reviewed_commits(run)
+    committed = [e["n"] for e in batched.events(run, "task_committed")]
+    assert all(any(n in members for members in covered.values()) for n in committed)  # no commit goes unreviewed
+    assert covered == {1: [1], 2: [2], 3: [3]}
 
 
 def test_batches_are_decided_once_and_survive_ticked_tasks(batched):
