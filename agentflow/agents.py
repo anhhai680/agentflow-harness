@@ -326,9 +326,13 @@ def _price_row(prices: dict[str, dict[str, float]], model: str | None) -> dict[s
 
 def _number(value: Any) -> float | None:
     """A finite number from the stream (never a bool), else None."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)  # an int past the float range raises OverflowError
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _count(value: Any) -> int:

@@ -1249,6 +1249,16 @@ def test_the_readings_ignore_what_is_not_a_number(cfg):
     assert acc.last_readings == {} and acc.first_readings == {}
 
 
+def test_a_number_too_large_for_a_float_is_no_reading(cfg):
+    acc = _acc(cfg)
+    huge = 10**400
+    line = json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "resetsAt": huge,
+                                                                       "unifiedWindows": {
+        "five_hour": {"utilization": 0.5, "resetsAt": huge}, "seven_day": {"utilization": huge, "resetsAt": 1794910800}}}})
+    parse_claude_line(line, acc)  # an OverflowError here would end the session
+    assert acc.last_readings == {} and acc.first_readings == {}
+
+
 def test_only_the_top_level_status_marks_a_reading_refused(cfg):
     acc = _acc(cfg)
     parse_claude_line(_limit("allowed", window="rejected"), acc)
