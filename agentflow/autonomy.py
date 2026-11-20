@@ -309,8 +309,10 @@ class Resolver:
         settled = self._revert(key) if kind == GUARD_KIND else self._resolve(wait)
         if notify and not settled and not self._handed_over:  # a hand-over told the human already
             self.run.refresh()
-            if self.run.state["waiting"] is not None and self.run.state["waiting"]["key"] == key:
+            now = self.run.state["waiting"]
+            if now is not None and now["key"] == key and not now.get("notified"):  # told once, whoever looks again
                 notify_run(self.cfg, self.run, notice_text(wait) or f"{key} needs a decision")
+                self.run.emit("hitl_notified", key=key)
         return settled
 
     def _attempts(self, key: str) -> int:

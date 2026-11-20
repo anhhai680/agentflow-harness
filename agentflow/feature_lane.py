@@ -517,14 +517,27 @@ class FeatureLane:
             self.handled_waits.add(wait_id(wait))
             if self._park(tkey, wait):
                 return "parked"
-            if not wait.get("notified") and not wait.get("promoted"):
-                notify_run(self.cfg, self.run, notice_text(wait) or f"{wait['key']} needs a decision")
+            self._tell_once(wait)
             return "stopped"
+
+    def _tell_once(self, wait: dict) -> None:
+        """Tell a person of a wait raised quietly, once: `hitl_notified` keeps that on the wait, so no later walk (a
+        fresh executor) or restarted runner tells them again. A promoted wait was told as it was promoted."""
+        if wait.get("notified") or wait.get("promoted"):
+            return
+        notify_run(self.cfg, self.run, notice_text(wait) or f"{wait['key']} needs a decision")
+        self.run.emit("hitl_notified", key=wait["key"])
 
     def _park(self, tkey: str, wait: dict) -> bool:
         """Park the stop `wait` of task `tkey` and shelve the task's work, when the task may park and some other task
-        can still run. False changes nothing. The order matters to a runner killed half way: the shelf is written
-        before `step_parked`, and the paths go back to `HEAD` only after it (`_finish_shelving` ends that on resume)."""
+        can still run, or another task is already parked (the walk then promotes the first parked stop, which a person
+        settling any other one demotes again). False changes nothing. The order matters to a runner killed half way:
+        the shelf is written before `step_parked`, and the paths go back to `HEAD` only after it (`_finish_shelving`
+        ends that on resume).
+
+        A guard stop's forbidden paths stay in the shelf commit, recoverable from its ref, but are not `shelved`: they
+        go back to the runner's `HEAD` before `step_parked`, recorded as `forbidden_reverted` (as `Resolver._revert`
+        does), so the task never gets them back and its restart is not refused for them again."""
         kind, key = str(wait.get("kind")), str(wait.get("key"))
         match = TASK_N.search(key)
         if match is None or not parks_first(self.cfg, kind, key):
@@ -545,24 +558,44 @@ class FeatureLane:
         view = [dataclasses.replace(t, checked=t.n in done, deferred=False) for t in tasks]  # open = not done
         parked = self._parked_numbers(prefix) | {n}
         held = park.held_tasks(view, parked, done)
-        if not any(t.n not in done and t.n not in held for t in view):
-            return False  # nothing else can run: parking would only promote it back at once
+        if not any(t.n not in done and t.n not in held for t in view) and parked == {n}:
+            return False  # nothing else can run and nothing else is parked: it would only be promoted back at once
         tree = snapshot(self.worktree)
         theirs = self._held_paths(tkey)  # files an older engine's park left in the tree: not this task's
-        paths = [p for p in changed_paths(self.worktree, "HEAD^{tree}", tree) if p not in theirs]
+        changed = [p for p in changed_paths(self.worktree, "HEAD^{tree}", tree) if p not in theirs]
+        forbidden = self._forbidden_tripped(events, key) if kind == GUARD_KIND else []
+        paths = [p for p in changed if p not in forbidden]
+        aside = [p for p in changed if p in forbidden]
         shelf = None
-        if paths:
+        ref = shelf_ref(self.run.id, tkey) if changed else ""
+        if changed:
             try:
-                shelf = shelve(self.worktree, tree, shelf_ref(self.run.id, tkey), f"Shelve {tkey}")
+                shelf = shelve(self.worktree, tree, ref, f"Shelve {tkey}")
             except (GitError, ValueError, subprocess.CalledProcessError):
                 return False  # no shelf, no park: the work stays in the tree and the stop stays the run's wait
+        note = ""
+        if aside and shelf:
+            restore_paths(self.worktree, aside, str(runner_head(self.run)))
+            self.run.emit("forbidden_reverted", key=key, paths=aside)
+            shown = ", ".join(f"`{p}`" for p in aside)
+            note = (f"The edit to {shown}, which no agent may touch in a run, was set aside: the runner put "
+                    f"{'it' if len(aside) == 1 else 'them'} back as at `HEAD`, and the task will not get the edit back. "
+                    f"It is kept in `{ref}` (commit {shelf[:12]}) if you want it.")
         classes = [e for e in events if e["type"] == "stop_classified" and e.get("key") == key]
         raised = [e for e in events if e["type"] == "hitl_raised" and e.get("key") == key]
+        extra = str(raised[-1].get("extra") or "") if raised else ""
         park_wait(self.cfg, self.run, wait, blast_radius=park.blast_radius(view, parked, n, done), shelf=shelf,
                   shelved=paths, stop_class=classes[-1].get("stop_class") if classes else None,
-                  extra=str(raised[-1].get("extra") or "") if raised else "")
+                  extra="\n\n".join(part for part in (note, extra) if part))
         restore_paths(self.worktree, paths, "HEAD")
         return True
+
+    @staticmethod
+    def _forbidden_tripped(events: list[dict], key: str) -> list[str]:
+        """The forbidden paths the last guard trip on `key` named."""
+        tripped = [e for e in events if e["type"] == "guard_tripped" and e.get("key") == key]
+        violations = (tripped[-1].get("violations") or []) if tripped else []
+        return [str(v.get("detail")) for v in violations if isinstance(v, dict) and v.get("kind") == FORBIDDEN]
 
     def _guard_parks(self, events: list[dict], key: str) -> bool:
         """A guard stop parks only when its last trip names forbidden paths alone and `HEAD` is still the one the
@@ -655,10 +688,19 @@ class FeatureLane:
                           by=str(approvals[-1].get("by") or ""))
         else:
             self.run.emit("unit_unparked", key=item["key"], shelf=shelf, paths=paths, conflict=False)
-            drop_shelf(self.worktree, ref)
+            if not self._set_aside(shelf, paths):  # a shelf holding an edit set aside stays, so it can be recovered
+                drop_shelf(self.worktree, ref)
         if ukey in self.run.state["steps"]:
             self.run.emit("step_finished", key=ukey, status="done", summary="the shelved work was settled")
         return True
+
+    def _set_aside(self, shelf: str, paths: list[str]) -> bool:
+        """Whether the shelf commit holds changes beyond `paths` (a guard park's forbidden edit); True when git
+        cannot tell, so the ref is kept."""
+        try:
+            return bool(set(changed_paths(self.worktree, f"{shelf}^", shelf)) - set(paths))
+        except (GitError, subprocess.CalledProcessError):
+            return True
 
     def _finish_shelving(self, prefix: str) -> None:
         """End a park a runner died in after `step_parked`: every shelved path of a still parked task that still holds

@@ -770,6 +770,15 @@ def test_parking_a_stop_clears_its_wait_and_keeps_a_failed_row(run):
     assert state_json(run) == replay(run.events.read())
 
 
+def test_a_notified_wait_stays_notified_and_another_keys_notice_changes_nothing(run):
+    run.emit("hitl_raised", kind="blocked", key=PARKED, phase="build", summary="x", questions=[], notified=False)
+    run.emit("hitl_notified", key="build/build/task-2/implement")
+    assert run.state["waiting"]["notified"] is False
+    run.emit("hitl_notified", key=PARKED)
+    assert run.state["waiting"]["notified"] is True
+    assert state_json(run) == replay(run.events.read())
+
+
 def test_a_parked_stop_approved_by_its_key_is_resumable_and_keeps_another_wait(run):
     other = "build/build/task-2/implement"
     run.emit("hitl_raised", kind="blocked", key=PARKED, phase="build", summary="x", questions=[])

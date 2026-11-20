@@ -669,6 +669,14 @@ def _on_hitl_reminded(state: dict, ev: dict) -> None:
         waiting["reminded_at"] = ev.get("at") or ev.get("ts")
 
 
+def _on_hitl_notified(state: dict, ev: dict) -> None:
+    """A person was told of the run's wait after it was raised quietly (a task stop that could not park): kept on the
+    wait, so no later walk or runner tells them again."""
+    waiting = state["waiting"]
+    if waiting is not None and waiting.get("key") == ev["key"]:
+        waiting["notified"] = True
+
+
 def _on_phase_approval_raised(state: dict, ev: dict) -> None:
     if state["status"] in TERMINAL:  # an ended run raises nothing a human could approve
         return
@@ -888,6 +896,7 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "pr_marked_ready": _on_pr_marked_ready,
     "hitl_answered": _on_hitl_answered,
     "hitl_reminded": _on_hitl_reminded,
+    "hitl_notified": _on_hitl_notified,
     "checkpoint_cleared": _on_checkpoint_cleared,
     "hitl_approved": _on_hitl_approved,
     "handoff_written": _on_handoff_written,
@@ -932,6 +941,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "usage_governed": ("key", "level"),
     "step_parked": ("key",),
     "unit_unparked": ("key",),
+    "hitl_notified": ("key",),
     "step_reopened": ("key",),
     "resolve_started": ("key",),
     "resolve_finished": ("key",),

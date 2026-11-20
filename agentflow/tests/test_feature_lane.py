@@ -633,10 +633,37 @@ def test_no_park_when_every_other_task_waits_on_it(lane, git, notified):
     assert (lane.root / "src/one.py").read_text(encoding="utf-8") == "half\n"  # a stop leaves the tree as it is
     waiting = run.state["waiting"]
     assert waiting["key"] == IMPL.format(n=1) and waiting["kind"] == "blocked" and not waiting.get("promoted")
+    assert waiting["notified"] is True and [e["key"] for e in lane.events(run, "hitl_notified")] == [IMPL.format(n=1)]
+    assert build(lane, run) == ("stopped", True)  # each walk is a fresh executor: the person was told already
+    assert build(lane, run) == ("stopped", True)
     assert notified == ["stuck"]  # one stop, one notification
+    assert len(lane.calls()) == 1
 
 
-def test_a_guard_stop_with_a_foreign_head_never_parks(lane, git, monkeypatch):
+def test_settling_a_parked_stop_while_a_later_task_stops_runs_its_task(lane, git, notified):
+    run = begin_build(lane, plan_text({1: "none", 2: "none", 3: "none"}, count=3,
+                                      files={1: ["src/one.py"], 2: ["src/two.py"], 3: ["src/three.py"]}))
+    impl1, impl3 = IMPL.format(n=1), IMPL.format(n=3)
+    lane.script({impl1: [{"write": {"src/one.py": "one\n"}, **BLOCKED}], IMPL.format(n=2): [TWO],
+                 impl3: [{"write": {"src/three.py": "three\n"}, "result": {"status": "blocked", "summary": "stuck 3"}}]})
+    assert build(lane, run) == ("stopped", True)
+    # task 3 parks too, though nothing else can run, because task 1 is parked: the first parked stop is promoted
+    assert [e["key"] for e in lane.events(run, "step_parked")] == [impl1, impl3]
+    assert run.state["waiting"]["key"] == impl1 and run.state["waiting"]["promoted"] is True
+    assert list(run.state["parked"]) == [impl3]
+    assert len(notified) == 3  # two parks and the promotion
+    notified.clear()
+
+    approve(run, impl1, by="me")
+    calls = len(lane.calls())
+    assert build(lane, run) == ("stopped", True)
+    assert steps(lane.calls()[calls:]) == [impl1, REVIEW.format(n=1)]  # the run goes on with task 1
+    assert subjects(git, lane.root)[0] == "Task 1: First thing"
+    assert run.state["waiting"]["key"] == impl3 and run.state["waiting"]["promoted"] is True
+    assert notified == ["No runnable task remains: 1 parked stop(s) wait."]  # one notification for that walk
+
+
+def test_a_guard_stop_with_a_foreign_head_never_parks(lane, git):
     run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
     impl1 = IMPL.format(n=1)
     lane.script({impl1: [{"write": {"src/one.py": "x\n"}, "git_commit": "sneaky", **DONE_RESULT}]})
@@ -660,11 +687,25 @@ def test_a_forbidden_path_stop_with_head_not_the_runners_never_parks(lane, git, 
 
 def test_a_forbidden_path_stop_parks(lane, git):
     run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
-    lane.script({IMPL.format(n=1): [FORBIDDEN_ACT], IMPL.format(n=2): [TWO]})
+    impl1 = IMPL.format(n=1)
+    lane.script({impl1: [FORBIDDEN_ACT], IMPL.format(n=2): [TWO]})
     assert build(lane, run) == ("stopped", True)
     (parked,) = lane.events(run, "step_parked")
-    assert parked["kind"] == "guard_violation" and parked["shelved"] == ["CONSTRAINTS.md", "src/one.py"]
+    assert parked["kind"] == "guard_violation" and parked["shelved"] == ["src/one.py"]  # the forbidden edit is set aside
+    assert [e["paths"] for e in lane.events(run, "forbidden_reverted")] == [["CONSTRAINTS.md"]]
+    ref = f"{SHELVES}/{run.id}/build.build.task-1"
+    assert git(lane.root, "show", f"{ref}:CONSTRAINTS.md") == "weakened\n"  # recoverable from the shelf
+    inbox = run.inbox_path(impl1).read_text(encoding="utf-8")
+    assert "was set aside" in inbox and ref in inbox
     assert files_of(git, lane.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
+    assert git(lane.root, "status", "--porcelain") == ""
+
+    approve(run, impl1, by="me")
+    assert build(lane, run) == ("done", True)  # the task restarts cleanly: the guard does not trip again
+    assert len(lane.events(run, "guard_tripped")) == 1
+    assert files_of(git, lane.root, "Task 1: First thing") == [PLAN_PATH, "src/one.py"]
+    assert "weakened" not in (lane.root / "CONSTRAINTS.md").read_text(encoding="utf-8")
+    assert shelves(git, lane.root) == [ref]  # kept: it holds the edit that was set aside
 
 
 def test_an_unshelve_conflict_stops_and_overwrites_nothing(lane, git):

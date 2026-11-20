@@ -730,10 +730,10 @@ def test_crossing_the_soft_budget_is_never_a_stop(flow_repo, notified):
 # --------------------------------------------------------------------------- questions
 
 
-def begin_feature(flow) -> Run:
-    """A feature run past `plan`, with the spec and the one-task plan written."""
+def begin_feature(flow, plan: str = PLAN_TEXT) -> Run:
+    """A feature run past `plan`, with the spec and the plan (one task by default) written."""
     flow.script({"define/draft": [{"write": {SPEC: SPEC_TEXT}, **done("drafted")}],
-                 "plan/plan": [{"write": {PLAN: PLAN_TEXT}, **done("planned")}]})
+                 "plan/plan": [{"write": {PLAN: plan}, **done("planned")}]})
     run = start(flow.cfg, flow.root, "feature", {"module": "demo"}, RunOptions(to_phase="build"))
     for phase in ("define", "plan"):
         assert go(flow, run) == "awaiting_approval"
@@ -824,14 +824,18 @@ def test_a_boundary_question_in_a_resolve_phase_stops_for_a_human(auto, notified
     assert any("cần quyết định" in text for text in notified)
 
 
+TWO_TASKS = PLAN_TEXT + "\n### Task 2: Second thing\n\n**Depends on:** none\n\n- [ ] **Step 1: Do it too**\n"
+
+
 def test_a_parked_boundary_question_still_waits_for_a_human(auto, notified):
-    run = begin_feature(auto)
+    run = begin_feature(auto, TWO_TASKS)
     script_more(auto, {IMPL: [asks(question("boundary"), park=True)]})
     assert go(auto, run) == "waiting_human"
-    assert auto.events(run, "step_parked") == []  # the plan's one task: nothing else could run, so it is a stop
-    assert run.state["waiting"]["key"] == IMPL and run.state["waiting"]["questions"][0]["kind"] == "boundary"
-    assert not auto.events(run, "hitl_answered")
-    assert [text for text in notified if "cần quyết định" in text] == ["cần quyết định"]  # told once
+    assert [e["key"] for e in auto.events(run, "step_parked")] == [IMPL]  # task 2 was built meanwhile
+    assert run.state["waiting"]["key"] == IMPL and run.state["waiting"]["promoted"] is True
+    assert run.state["waiting"]["questions"][0]["kind"] == "boundary"
+    assert not auto.events(run, "hitl_answered")  # never the runner's, parked or promoted
+    assert any(text.startswith(f"parked {IMPL}: blocks task 1") for text in notified)
 
 
 def test_no_human_question_kinds_lets_the_runner_answer_a_boundary(flow_repo, notified):
