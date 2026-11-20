@@ -46,7 +46,8 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   none of the other four.
   `parked_units` counts the `step_parked` events of the run that are not a re-emitted park (`demoted`), and
   `park_resume_rework` the tasks that were parked and afterwards had a `unit_unparked` with `conflict` or a
-  `step_retry` on one of their keys, once per task (a retry before the task's first park is no rework). Both are
+  `step_retry` a person or a command asked for (its `by` is not the runner's) on one of their keys, once per task
+  (a retry before the task's first park is no rework, and neither is the runner's own `re-review`). Both are
   always present (0 when nothing parked), and both are lower-is-better.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
@@ -148,7 +149,8 @@ def _phase_of(key: object) -> str | None:
 def _park_signals(events: list[dict]) -> dict[str, int]:
     """`parked_units`: the `step_parked` events that are a new park (a re-emitted one carries `demoted`).
     `park_resume_rework`: the parked units (a plan task, else the parked key itself) that, after their first park, had
-    a `unit_unparked` that was a conflict or a `step_retry` on a key at or under theirs, once each."""
+    a `unit_unparked` that was a conflict or a `step_retry` on a key at or under theirs, once each. Only a retry
+    someone asked for counts: the runner emits `step_retry` itself for a re-review round, with `by` the runner's."""
     parked = 0
     units: set[str] = set()
     redone: set[str] = set()
@@ -166,7 +168,7 @@ def _park_signals(events: list[dict]) -> dict[str, int]:
         elif etype == "unit_unparked" and ev.get("conflict") is True:
             if (unit := unit_of(key)) in units:
                 redone.add(unit)
-        elif etype == "step_retry":
+        elif etype == "step_retry" and ev.get("by") and ev["by"] != RUNNER:
             redone.update(unit for unit in units if key == unit or key.startswith(f"{unit}/"))
     return {"parked_units": parked, "park_resume_rework": len(redone)}
 

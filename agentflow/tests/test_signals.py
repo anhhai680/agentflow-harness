@@ -481,26 +481,47 @@ def test_parked_units_skip_demoted_parks():
 def test_rework_counts_a_conflict_and_a_retry_once_per_task():
     evs = [_park(f"{T2}/implement"), _park("build/build/task-3/review"),
            _ev("unit_unparked", key=f"{T2}/implement", shelf="r", paths=[], conflict=True, by="human"),
-           _ev("step_retry", key=f"{T2}/review", reason="re-review"),
-           _ev("step_retry", key=f"{T2}/commit"),
+           _ev("step_retry", by="human", key=f"{T2}/review"),
+           _ev("step_retry", by="human", key=f"{T2}/commit"),
            _ev("unit_unparked", key="build/build/task-3/review", shelf="r", paths=[], conflict=False)]
     out = run_signals(evs, EMPTY_METRICS)
     assert (out["parked_units"], out["park_resume_rework"]) == (2, 1)
-    evs.append(_ev("step_retry", key="build/build/task-3/implement"))
+    evs.append(_ev("step_retry", by="human", key="build/build/task-3/implement"))
     assert run_signals(evs, EMPTY_METRICS)["park_resume_rework"] == 2
 
 
 def test_rework_ignores_a_retry_before_the_park_and_one_on_another_task():
-    evs = [_ev("step_retry", key=f"{T2}/review"), _ev("unit_unparked", key=f"{T2}/implement", conflict=True),
-           _park(f"{T2}/implement"), _ev("step_retry", key="build/build/task-3/review"),
-           _ev("step_retry", key="build/build/task-22/review")]
+    evs = [_ev("step_retry", by="human", key=f"{T2}/review"), _ev("unit_unparked", key=f"{T2}/implement", conflict=True),
+           _park(f"{T2}/implement"), _ev("step_retry", by="human", key="build/build/task-3/review"),
+           _ev("step_retry", by="human", key="build/build/task-22/review")]
     out = run_signals(evs, EMPTY_METRICS)
     assert (out["parked_units"], out["park_resume_rework"]) == (1, 0)
 
 
 def test_a_run_with_no_park_has_zero_of_both():
-    out = run_signals([_ev("step_retry", key=f"{T2}/review")], EMPTY_METRICS)
+    out = run_signals([_ev("step_retry", by="human", key=f"{T2}/review")], EMPTY_METRICS)
     assert (out["parked_units"], out["park_resume_rework"]) == (0, 0)
     assert FAMILIES["parked_units"] == FAMILIES["park_resume_rework"] == ("lower", False)
     assert {"parked_units", "park_resume_rework"} <= COUNT_FAMILIES
     assert parse_target("park_resume_rework") == ("park_resume_rework", None)
+
+
+def test_rework_ignores_the_runners_own_review_round_retries():
+    runner_retry = {"seq": 1, "ts": "2026-11-03T09:00:00.000+00:00", "type": "step_retry", "by": "runner",
+                    "key": f"{T2}/review", "reason": "re-review", "round": 1}
+    evs = [_park(f"{T2}/implement"), runner_retry, {k: v for k, v in runner_retry.items() if k != "by"}]
+    assert run_signals(evs, EMPTY_METRICS)["park_resume_rework"] == 0
+    assert run_signals([*evs, _ev("step_retry", by="alice", key=f"{T2}/review")], EMPTY_METRICS)["park_resume_rework"] == 1
+
+
+def test_a_park_on_a_non_task_key_is_its_own_unit():
+    evs = [_park("build/verify-fix"), _ev("step_retry", by="human", key="build/verify-fix/gate"),
+           _ev("step_retry", by="human", key="build/verify-fix-2")]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert (out["parked_units"], out["park_resume_rework"]) == (1, 1)
+
+
+def test_the_same_task_parked_twice_counts_two_parks_and_one_task_of_rework():
+    evs = [_park(f"{T2}/implement"), _park(f"{T2}/review"), _ev("step_retry", by="human", key=f"{T2}/review")]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert (out["parked_units"], out["park_resume_rework"]) == (2, 1)
