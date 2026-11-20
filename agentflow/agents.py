@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import layers, safeio
+from . import layers, pack, safeio
 from .config import AgentSpec, Config, ContextPolicy
 
 KILL_GRACE_S = 10
@@ -123,6 +123,9 @@ class AgentCall:
     carries_rules: bool = False  # that brief holds the repository's rules: Claude loads no `CLAUDE.md` of its own
     # The run's last recorded usage windows (`state.usage_window`): only a window that moved since is written again.
     usage_windows: dict = field(default_factory=dict)
+    # Called with a copy of the stream's last window readings (`StreamAccumulator.last_readings`) whenever a
+    # `rate_limit_event` changed them. A failure in it never reaches the call (the stream loop catches it).
+    on_reading: Callable[[dict], None] | None = None
 
 
 @dataclass
@@ -159,6 +162,9 @@ class AgentOutcome:
     idle_limit_s: float | None = None  # the limit that was in force when the watchdog fired
     usage: dict = field(default_factory=dict)  # this invocation's split (`StreamAccumulator.usage_payload`)
     capped: str | None = None  # `turns` or `budget`: the CLI stopped itself at that cap (`CAP_SUBTYPES`); None: it didn't
+    # This invocation's first and last window reading, `{window: {utilization, resets_at, refused}}` (`window_readings`)
+    first_readings: dict = field(default_factory=dict)
+    last_readings: dict = field(default_factory=dict)
 
 
 class Agent(Protocol):
@@ -215,6 +221,9 @@ class StreamAccumulator:
     terminal_reason: str | None = None  # the first result's that has one: a trailing `api_error` hides nothing
     auto_memory: bool | None = None  # the `init` event named memory paths; None: no `init` seen
     windows: dict[str, tuple[float, str]] = field(default_factory=dict)  # the last emitted utilization and status
+    # Every window reading the stream carried (`window_readings`), apart from `windows`: that one only dedupes events
+    first_readings: dict[str, dict] = field(default_factory=dict)
+    last_readings: dict[str, dict] = field(default_factory=dict)
 
     @property
     def compactions_spent(self) -> bool:
@@ -284,6 +293,8 @@ class StreamAccumulator:
             idle_limit_s=idle_limit_s if stalled else None,
             usage=self.usage_payload(),
             capped=self.capped,
+            first_readings={name: dict(reading) for name, reading in self.first_readings.items()},
+            last_readings={name: dict(reading) for name, reading in self.last_readings.items()},
         )
 
 
@@ -462,6 +473,30 @@ def _window_news(acc: StreamAccumulator, unified: Mapping[str, Any]) -> list[tup
     return out
 
 
+def window_readings(info: Mapping[str, Any]) -> dict[str, dict]:
+    """The readings a `rate_limit_event`'s `rate_limit_info` carries, `{window: {utilization, resets_at, refused}}`.
+    A window counts only with a number and a `resetsAt`. `refused` is True when the top-level `status` is `rejected`
+    and `rateLimitType` names the window: a window's own `status` says nothing, because extra usage can still cover
+    a call. A top-level rejection of a window that has no usable entry is read from the top-level fields (utilization
+    1.0, its `resetsAt`): no real rejection has been seen yet, so this shape is a guess. A `rateLimitType` outside
+    `USAGE_WINDOWS` is not a reading."""
+    out: dict[str, dict] = {}
+    unified = info.get("unifiedWindows")
+    rejected = info.get("status") == "rejected"
+    for name in USAGE_WINDOWS:
+        entry = unified.get(name) if isinstance(unified, dict) else None
+        utilization = _number(entry.get("utilization")) if isinstance(entry, dict) else None
+        resets_at = _number(entry.get("resetsAt")) if isinstance(entry, dict) else None
+        refused = rejected and info.get("rateLimitType") == name
+        if utilization is None or resets_at is None:
+            top = _number(info.get("resetsAt"))
+            if not (refused and top is not None and not isinstance(entry, dict)):
+                continue
+            utilization, resets_at = 1.0, top
+        out[name] = {"utilization": utilization, "resets_at": int(resets_at), "refused": refused}
+    return out
+
+
 def _text_length(content: Any) -> int:
     """The text in a `tool_result`'s content: a string, or a list of blocks whose `text` counts."""
     if isinstance(content, str):
@@ -512,6 +547,10 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
         unified = info.get("unifiedWindows") if isinstance(info, dict) else None
         if isinstance(unified, dict):
             out.extend(_window_news(acc, unified))
+        if isinstance(info, dict):
+            for name, reading in window_readings(info).items():
+                acc.first_readings.setdefault(name, reading)
+                acc.last_readings[name] = reading
         return out
 
     if kind == "assistant":
@@ -844,12 +883,19 @@ class _CliAgent(abc.ABC):
                     thread.start()
                     watcher = thread  # only a started thread is joined
                 assert proc.stdout is not None
+                reported: dict[str, dict] = {}  # the readings `call.on_reading` has been given
                 for line in proc.stdout:
                     state["last_line"] = time.monotonic()
                     transcript.write(line if line.endswith("\n") else line + "\n")
                     transcript.flush()
                     for name, payload in self.parse_line(line, acc):
                         on_event(name, payload)
+                    if call.on_reading is not None and acc.last_readings != reported:
+                        reported = {window: dict(reading) for window, reading in acc.last_readings.items()}
+                        try:  # a failure here never reaches the session: the readings are a scheduling aid
+                            call.on_reading({window: dict(reading) for window, reading in reported.items()})
+                        except Exception:  # noqa: BLE001
+                            pass
                     if acc.line_type == "result":
                         end_stream()
                     if acc.over_threshold and acc.line_type in ("user", "result"):
@@ -972,6 +1018,8 @@ class ClaudeAgent(_CliAgent):
             deny.append(f"Edit(/{call.runs_root}/**)")
         try:  # the user's own config file: a live run reloads it (`config.layer_files`), so no agent edits it
             deny.append(f"Edit(/{layers.user_config_path().parent}/**)")
+            # the machine-wide usage window file, its lock and its temp files: a scheduling aid no agent writes
+            deny.append(f"Edit(/{pack.user_state_root()}/usage_window.*)")
         except RuntimeError:  # `Path.home()` with no home directory: there is no user file to protect
             pass
         permissions: dict = {"deny": deny}

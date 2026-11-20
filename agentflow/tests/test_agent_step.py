@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import io
 import json
 import os
@@ -14,7 +15,7 @@ import time
 
 import pytest
 
-from agentflow import gitops, hitl, lanes, lessons, sizing
+from agentflow import gitops, governor, hitl, lanes, lessons, sizing
 from agentflow.config import PROMPT_PLACEHOLDERS, Phase, Step
 from agentflow.conditions import fmt, make_ctx
 from agentflow.events import parse_iso
@@ -2850,3 +2851,96 @@ def test_a_refused_cap_flag_names_its_key(flow_repo, quick_holds, flag_name, key
     summary = raised["summary"]
     assert raised["kind"] == "blocked" and flag_name in summary and f"`{key}`" in summary and "`0`" in summary
     assert "2.1.327" in summary and "base_args" not in summary
+
+
+# --------------------------------------------------------------------------- the usage window file (slice C6)
+
+
+def _file() -> governor.WindowFile:
+    return governor.WindowFile()
+
+
+def test_a_session_writes_its_readings_to_the_shared_file(flow_repo):
+    reset = int(time.time()) + 3600
+    flow_repo.new_run()
+    flow_repo.script({KEY: [{"windows": {"five_hour": 0.42, "seven_day": 0.30}, "resets_at": reset, "result": DONE}]})
+    assert run_step(flow_repo) == "done"
+    data = _file().read()
+    mine = data["windows"][governor.account_of(flow_repo.cfg)]
+    assert mine["five_hour"]["utilization"] == 0.42 and mine["five_hour"]["resets_at"] == reset
+    assert mine["seven_day"]["utilization"] == 0.30
+    assert data["sessions"] == {}  # the session left the file when it ended
+
+
+def test_a_refused_session_records_the_refusal(flow_repo):
+    reset = int(time.time()) + 3600
+    flow_repo.new_run()
+    flow_repo.script({KEY: [{"windows": {"five_hour": 0.50}, "resets_at": reset, "refused": True, "result": DONE}]})
+    run_step(flow_repo)
+    assert _file().read()["windows"][governor.account_of(flow_repo.cfg)]["five_hour"]["refused"] is True
+
+
+def test_off_still_records_and_never_holds(flow_repo):
+    flow_repo.configure({"usage": {"governor": "off"}})
+    reset = int(time.time()) + 3600
+    flow_repo.new_run()
+    flow_repo.script({KEY: [{"windows": {"five_hour": 0.97}, "resets_at": reset, "result": DONE}]})
+    assert run_step(flow_repo) == "done"
+    assert _file().read()["windows"][governor.account_of(flow_repo.cfg)]["five_hour"]["utilization"] == 0.97
+
+
+def test_readings_are_kept_per_account(flow_repo):
+    plain = flow_repo.cfg
+    flow_repo.configure({"defaults": {"env": {"CLAUDE_CONFIG_DIR": "/x"}}})
+    other = governor.account_of(flow_repo.cfg)
+    assert other != governor.account_of(plain) and other == governor.account_key("/x")
+    flow_repo.new_run()
+    flow_repo.script({KEY: [{"windows": {"five_hour": 0.42}, "resets_at": int(time.time()) + 3600, "result": DONE}]})
+    assert run_step(flow_repo) == "done"
+    windows = _file().read()["windows"]
+    assert windows[other]["five_hour"]["utilization"] == 0.42 and governor.account_of(plain) not in windows
+
+
+def test_a_raw_reading_mid_session_reaches_the_file(flow_repo, monkeypatch):
+    # 0.88 then 0.92 in one call: a 0.04 move is no `usage_window` event, so only `on_reading` can put 0.92 there
+    # before the call ends. The call's own closing write is switched off to prove it.
+    monkeypatch.setattr(governor.WindowFile, "exit_session", lambda *a, **k: None)
+    reset = int(time.time()) + 3600
+    flow_repo.new_run()
+    later = {"status": "allowed", "resetsAt": reset, "rateLimitType": "five_hour", "unifiedWindows": {
+        "five_hour": {"utilization": 0.92, "resetsAt": reset, "status": "allowed"}}}
+    flow_repo.script({KEY: [{"windows": {"five_hour": 0.88}, "resets_at": reset, "rate_limit": later, "result": DONE}]})
+    assert run_step(flow_repo) == "done"
+    assert _file().read()["windows"][governor.account_of(flow_repo.cfg)]["five_hour"]["utilization"] == 0.92
+
+
+@pytest.mark.parametrize("breakage", ["garbage", "locked"])
+def test_a_broken_or_locked_window_file_never_touches_a_running_session(flow_repo, monkeypatch, breakage):
+    monkeypatch.setattr(governor, "LOCK_WAIT_S", 0.1)
+    path = governor.window_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    reset = int(time.time()) + 3600
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"windows": {"five_hour": 0.42}, "resets_at": reset, "result": DONE}]})
+    held = None
+    try:
+        if breakage == "garbage":
+            path.write_text('{"version": 1, "waiting": {"x": {"pid": "1", "rank": "a"}}, '
+                            '"windows": {"five_hour": {"utilization": NaN}}}', encoding="utf-8")
+        else:
+            held = open(path.with_name("usage_window.lock"), "a")  # noqa: SIM115 - held for the whole call
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        assert run_step(flow_repo) == "done"
+    finally:
+        if held is not None:
+            held.close()
+    assert flow_repo.events(run, "watchdog_fired") == [] and flow_repo.events(run, "runner_error") == []
+    assert [e["type"] for e in run.events.read() if e["type"] in ("agent_exited", "step_finished")] == \
+        ["agent_exited", "step_finished"]
+    path.unlink(missing_ok=True)  # the same call against a sound file: the argv is the same
+    second = flow_repo.new_run()
+    flow_repo.script({KEY: [{"windows": {"five_hour": 0.42}, "resets_at": reset, "result": DONE}]})
+    assert run_step(flow_repo) == "done"
+    first_argv, second_argv = (c["argv"] for c in flow_repo.calls()[:2])
+    assert [a.replace(run.id, "RUN") for a in first_argv if "/brief/" not in a] == \
+        [a.replace(second.id, "RUN") for a in second_argv if "/brief/" not in a]

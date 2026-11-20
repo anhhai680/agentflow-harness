@@ -35,6 +35,7 @@ from agentflow.agents import (
 from agentflow import workspace
 from agentflow.config import load_config
 from agentflow.layers import user_config_path
+from agentflow.pack import user_state_root
 from agentflow.state import runs_root
 from conftest import PYTHON_CONFIG
 
@@ -163,8 +164,8 @@ def test_runner_denies_edits_to_the_runs_root(repo_root):
 
 
 def test_claude_argv_without_a_runs_root_adds_no_rule_for_it(claude, call):
-    user_dir_rule = f"Edit(/{user_config_path().parent}/**)"
-    assert not [rule for rule in deny_rules(claude.argv(call)) if rule.startswith("Edit(//") and rule != user_dir_rule]
+    own = {f"Edit(/{user_config_path().parent}/**)", f"Edit(/{user_state_root()}/usage_window.*)"}
+    assert not [rule for rule in deny_rules(claude.argv(call)) if rule.startswith("Edit(//") and rule not in own]
 
 
 def test_runner_denies_edits_to_the_user_config_dir(claude, call, monkeypatch, tmp_path):
@@ -292,7 +293,8 @@ def test_read_only_allow_takes_plain_names(tmp_path):
 def test_other_calls_keep_their_argv(cfg, call, runs):
     # a literal copy of what a build call and a sizer call get today: the new flag changes neither
     deny = json.dumps({"permissions": {"deny": [*RUNNER_ONLY_DENY, f"Edit(/{runs}/**)",
-                                                 f"Edit(/{user_config_path().parent}/**)"]}})
+                                                 f"Edit(/{user_config_path().parent}/**)",
+                                                 f"Edit(/{user_state_root()}/usage_window.*)"]}})
     call = dataclasses.replace(call, runs_root=runs)
     claude = ClaudeAgent(cfg.agents["claude"], cfg.context)
     spec = cfg.agents["claude"]
@@ -1215,6 +1217,95 @@ def test_a_run_emits_only_the_windows_that_moved_since_the_runs_last(fake, fake_
     seeded = {"five_hour": {"utilization": 0.40, "resets_at": 1794910800, "status": "allowed", "at": "t"}}
     fake_claude.run(dataclasses.replace(call, usage_windows=seeded), on_event)
     assert [(p["window"], p["utilization"]) for n, p in events if n == "usage_window"] == [("seven_day", 0.41)]
+
+
+def _reading(five_hour=None, resets_at=1794910800):
+    """A `rate_limit_event` whose `five_hour` window has `five_hour` utilization (a number only when it is not None)."""
+    entry = {"status": "allowed"}
+    if five_hour is not None:
+        entry["utilization"] = five_hour
+    if resets_at is not None:
+        entry["resetsAt"] = resets_at
+    return json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "allowed", "resetsAt": resets_at, "rateLimitType": "five_hour", "unifiedWindows": {"five_hour": entry}}})
+
+
+def test_the_outcome_keeps_the_first_and_last_reading_per_window(cfg):
+    acc = _acc(cfg)
+    for line in (_reading(0.40), _reading(0.43), _reading(0.99, resets_at=None)):  # the last has no `resetsAt`
+        parse_claude_line(line, acc)
+    outcome = acc.to_outcome(0)
+    assert outcome.first_readings == {"five_hour": {"utilization": 0.40, "resets_at": 1794910800, "refused": False}}
+    assert outcome.last_readings == {"five_hour": {"utilization": 0.43, "resets_at": 1794910800, "refused": False}}
+    assert StreamAccumulator(default_window=1).to_outcome(0).last_readings == {}
+
+
+def test_the_readings_ignore_what_is_not_a_number(cfg):
+    acc = _acc(cfg)
+    line = json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "unifiedWindows": {
+        "five_hour": {"utilization": True, "resetsAt": 1794910800}, "seven_day": {"utilization": 0.5, "resetsAt": "x"},
+        "other_window": {"utilization": 0.5, "resetsAt": 1794910800}}}})
+    parse_claude_line(line, acc)
+    assert acc.last_readings == {} and acc.first_readings == {}
+
+
+def test_only_the_top_level_status_marks_a_reading_refused(cfg):
+    acc = _acc(cfg)
+    parse_claude_line(_limit("allowed", window="rejected"), acc)
+    assert acc.last_readings["five_hour"]["refused"] is False
+    parse_claude_line(_limit("rejected"), acc)
+    assert acc.last_readings["five_hour"] == {"utilization": 1.0, "resets_at": 1793439000, "refused": True}
+    assert acc.first_readings["five_hour"]["refused"] is False  # the first reading of the window stays
+
+
+def test_a_rejection_that_names_another_window_refuses_nothing(cfg):
+    acc = _acc(cfg)
+    line = json.loads(_limit("rejected"))
+    line["rate_limit_info"]["rateLimitType"] = "seven_day"
+    parse_claude_line(json.dumps(line), acc)
+    assert acc.last_readings["five_hour"]["refused"] is False
+    assert acc.last_readings["seven_day"] == {"utilization": 1.0, "resets_at": 1793439000, "refused": True}
+
+
+def test_a_rejection_with_no_window_entry_is_recorded_refused(cfg):
+    acc = _acc(cfg)
+    line = json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "rejected", "resetsAt": 1793439000, "rateLimitType": "five_hour"}})
+    parse_claude_line(line, acc)
+    assert acc.last_readings == {"five_hour": {"utilization": 1.0, "resets_at": 1793439000, "refused": True}}
+    assert acc.windows == {}  # the run-seeded dedupe map is not touched
+
+
+def test_a_rejection_of_an_unknown_window_is_not_recorded(cfg):
+    acc = _acc(cfg)
+    line = json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "rejected", "resetsAt": 1793439000, "rateLimitType": "seven_day_opus"}})
+    parse_claude_line(line, acc)
+    assert acc.last_readings == {} and acc.interruption(1).kind == "usage_limit"  # the CLI's own hold still covers it
+
+
+def test_a_run_session_may_not_edit_the_window_file(claude, call, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    rule = f"Edit(/{tmp_path / 'state' / 'agentflow'}/usage_window.*)"
+    assert rule.startswith("Edit(//") and rule in deny_rules(claude.argv(call))
+    assert rule in deny_rules(claude.argv(dataclasses.replace(call, read_only_role=True, add_dirs=[tmp_path / "ws"])))
+
+
+def test_the_stream_loop_reports_a_reading_as_it_arrives(fake, fake_claude, call):
+    fake.script({STEP: [{"windows": {"five_hour": 0.88}}, ]})
+    seen = []
+    fake_claude.run(dataclasses.replace(call, on_reading=lambda readings: seen.append(readings)), collect()[1])
+    assert seen and seen[-1]["five_hour"]["utilization"] == 0.88
+
+
+def test_a_reading_callback_that_raises_never_stops_the_call(fake, fake_claude, call):
+    fake.script({STEP: [{"windows": {"five_hour": 0.88}, "result": {"status": "done", "summary": "ok"}}]})
+
+    def boom(readings):
+        raise RuntimeError("the file is broken")
+
+    o = fake_claude.run(dataclasses.replace(call, on_reading=boom), collect()[1])
+    assert o.exit_code == 0 and o.interruption is None and o.last_readings["five_hour"]["utilization"] == 0.88
 
 
 # --------------------------------------------------------------------------- why a call ended

@@ -56,6 +56,7 @@ from agentflow.gates import (GateResult, agent_checks, failure_report, gates_ok,
 from agentflow.gates import resolve as resolve_gates
 from agentflow.gitops import (CommitRejected, GitError, NothingToCommit, changed_since, commit, commit_artifact,
                               commits_between, git_state_changes, head, outside_only, reconcile_baseline)
+from agentflow.governor_lane import GovernorLane
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, clean_fact, notify_run, park_hitl, raise_hitl, read_result
 from agentflow.route_lane import RouteLane
@@ -666,7 +667,7 @@ def _violation_text(violations: list[Violation]) -> str:
 # --------------------------------------------------------------------------- executor
 
 
-class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLane, RouteLane):
+class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLane, RouteLane, GovernorLane):
     """Runs a run's steps: `run_steps`/`run_step` (control flow, in `flow_control`), plan tasks and
     `finish` (in `feature_lane`), test expectations and fix-looping gate steps (in `bug_eval`) and the
     agent step lifecycle here. `dry_run` prints each agent's command line and calls nothing."""
@@ -1115,6 +1116,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             self_contained=self._self_contained(sr),
             max_turns=max_turns,
             budget_usd=budget_usd,
+            on_reading=self._on_reading,
         )
 
     @staticmethod
@@ -1163,7 +1165,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
 
         if turn.resume is None:
             self._record_lessons(sr, turn)
-        outcome = sr.agent.run(call, on_event)
+        outcome = self._metered(lambda: sr.agent.run(call, on_event))
         self._note_ignored_settings(sr, outcome)
         sr.session = outcome.session_id or turn.resume or sr.session
         window = outcome.context_window

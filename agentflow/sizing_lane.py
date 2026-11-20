@@ -471,7 +471,7 @@ class SizingLane:
             agent_profile=None, context_window=self.context_window_for(key, model), env=self.cfg.defaults.env,
             env_base=run_env.base(self.cfg), forbidden_paths=list(self.cfg.guardrails.forbidden_paths),
             max_turns=turns, read_only=True, self_contained=True,
-            usage_windows=dict(self.run.state.get("usage_window") or {}),
+            usage_windows=dict(self.run.state.get("usage_window") or {}), on_reading=self._on_reading,
         )
         seen: dict[str, object] = {"pid": None}
 
@@ -489,7 +489,7 @@ class SizingLane:
         outcome: AgentOutcome | None = None
         changed = ["unknown"]
         try:
-            outcome = self._run_sizer(agent, call, on_event)
+            outcome = self._metered(lambda: self._run_sizer(agent, call, on_event))
         except Exception:  # noqa: BLE001 - no answer; what it changed is still checked below
             outcome = None
         finally:
