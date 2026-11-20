@@ -2637,6 +2637,54 @@ def test_step_max_turns_checks(tmp_cfg):
         load_config(tmp_cfg(bad_retro))
 
 
+def _on_build_step(key, value):
+    def patch(data):
+        phase_step(data, "build", "build")[key] = value
+
+    return patch
+
+
+def test_carry_limits_default_off(tmp_cfg):
+    from agentflow.config import carry_limits
+
+    assert carry_limits(phase_step_of(load_config(tmp_cfg(None)), "build", "build")) == (1, 40)
+    for carry, limits in (({"max_tasks": 4}, (4, 40)), ({"max_tasks": 4, "max_context_pct": 30}, (4, 30)),
+                          ({"max_context_pct": 30}, (1, 30))):
+        step = phase_step_of(load_config(tmp_cfg(_on_build_step("carry", carry))), "build", "build")
+        assert step.carry == carry and carry_limits(step) == limits
+
+
+@pytest.mark.parametrize("carry, message", [
+    ("yes", "carry must be a mapping"),
+    ({"max_tasks": 0}, "max_tasks must be a whole number of at least 1"),
+    ({"max_tasks": True}, "max_tasks must be a whole number of at least 1"),
+    ({"max_tasks": 2.5}, "max_tasks must be a whole number of at least 1"),
+    ({"max_context_pct": 9}, "max_context_pct must be a number from 10 to 70"),
+    ({"max_context_pct": 71}, "max_context_pct must be a number from 10 to 70"),
+    ({"max_context_pct": "40"}, "max_context_pct must be a number from 10 to 70"),
+    ({"max_context_pct": False}, "max_context_pct must be a number from 10 to 70"),
+    ({"max_task": 4}, "carry takes only max_tasks and max_context_pct"),
+])
+def test_a_bad_carry_is_refused_when_the_config_loads(tmp_cfg, carry, message):
+    with pytest.raises(ConfigError, match=r"phases\.build.*carry") as raised:  # a run start never calls `validate`
+        load_config(tmp_cfg(_on_build_step("carry", carry)))
+    assert message in str(raised.value)
+
+
+def test_carry_off_a_plan_task_step_is_refused(tmp_cfg):
+    def on_verify(data):
+        step = next(s for s in data["phases"]["verify"]["steps"] if "foreach" not in s)
+        step["carry"] = {"max_tasks": 4}
+
+    with pytest.raises(ConfigError, match="only a `foreach: plan_task` step has `carry`"):
+        load_config(tmp_cfg(on_verify))
+
+
+def test_carry_on_the_build_step_validates_clean(tmp_cfg):
+    patch = _on_build_step("carry", {"max_tasks": 4, "max_context_pct": 40})
+    assert issues_for(tmp_cfg, patch) == issues_for(tmp_cfg, None)
+
+
 @pytest.mark.parametrize("key,arg,owner", [("base_args", ["-p", "--max-budget-usd", "5"], "session_budget_usd"),
                                            ("command", ["claude", "--max-turns=9"], "max_turns_by_role"),
                                            ("effort_arg", ["--max-turns", "9", "--effort", "{effort}"], "max_turns_by_role"),

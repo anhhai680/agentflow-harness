@@ -8,7 +8,8 @@ run's route profile when the plan or a task the sizer flagged `risk` calls for a
 never touched is passed over, and so is a task this run already committed. Each other task runs:
 
 1. the implementer, `<step>/task-<n>/implement`, in a fresh session (a small plan: the previous
-   task's session, with the `small_plan` skill), with the gates and the fix loop of `run_agent_step`;
+   task's session, with the `small_plan` skill; with the step's `carry`: the previous task's session while
+   `carry.decide` allows it), with the gates and the fix loop of `run_agent_step`;
 2. the reviewer, `<step>/task-<n>/review`, in a fresh session on the `review.role` model, given the
    diff range `<task start sha>..worktree`; blocking findings go back to the implementer's session
    once (with the pack's review-feedback skill, the gates again), then one re-review in a fresh session that gets
@@ -67,11 +68,11 @@ from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import overlays, route, sizing, sources, verification
+from agentflow import carry, overlays, route, sizing, sources, verification
 from agentflow.autonomy import AUTO_BY, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
-from agentflow.config import Config, Phase, Step, brief_files, for_lane
+from agentflow.config import Config, Phase, Step, brief_files, carry_limits, for_lane
 from agentflow.conformance import audit, clean_tree, render_section
 from agentflow.doubt import RECONCILE
 from agentflow.flow_control import current_refine, refine_note_block, refine_subject
@@ -266,6 +267,7 @@ class FeatureLane:
         held: set[int] = set()
         previous: str | None = None
         previous_n: int | None = None
+        carry_prev: str | None = None  # the task this walk ran and committed last, which the next one may carry
         attempted = False
         refine = self._refine_round(phase)
         tasks = sources.parse_plan(plan)
@@ -288,22 +290,30 @@ class FeatureLane:
                         held.add(task.n)  # parked in the refine round: independent tasks are refined on
                         continue
                 previous, previous_n = impl_key, task.n
+                carry_prev = None  # committed by an earlier walk: never a carry source
                 continue
             if self._parked(tkey) or any(dep in held for dep in task.depends_on):
                 held.add(task.n)
+                carry_prev = None
                 continue
             batch = (self._batch_of or {}).get(task.n) if not refine else None
             in_batch = bool(batch) and previous_n is not None and previous_n in (batch or [])
             share = previous if small.get("shared_session") or in_batch else None
+            carried = False
+            if share is None and not batch and not small.get("active") and not refine:
+                share = self._carry(step, tkey, carry_prev)
+                carried = share is not None
             attempted = True
             members = [texts[n] for n in batch] if batch else None
             if self._run_task(phase, step, plan, rel, task, tkey, small, share, batch=members,
-                              prefix=prefix) == "stopped":
+                              prefix=prefix, carried=carried) == "stopped":
                 if not self._parked(tkey):
                     return True, held, attempted
                 held.add(task.n)
+                carry_prev = None
                 continue
             previous, previous_n = impl_key, task.n
+            carry_prev = None if batch or small.get("active") or refine else tkey
         return False, held, attempted
 
     def _batches(self, phase: Phase, step: Step, plan: Path, prefix: str, small: dict) -> dict[int, list[int]]:
@@ -319,6 +329,30 @@ class FeatureLane:
                                            int(step.batch.get("max_files", 3)))
             self.run.emit("plan_batched", key=prefix, batches=batches)
         return {n: batch for batch in batches for n in batch}
+
+    def _carry(self, step: Step, tkey: str, carry_prev: str | None) -> str | None:
+        """The implement key whose session task `tkey`'s implementer resumes under the step's `carry`, or None for a
+        fresh one. Decided once per task and recorded (`session_carried` / `carry_declined`), so a restarted runner takes
+        the same answer; nothing is recorded with `carry` off, or with no task in this walk to carry (`carry_prev`)."""
+        key = f"{tkey}/implement"
+        max_tasks, max_context_pct = carry_limits(step)
+        steps = self.run.state["steps"]
+        if max_tasks <= 1 or (steps.get(key) or {}).get("session_id"):  # off, or the step has its own session
+            return None
+        events = self.run.events.read()
+        known = carry.recorded(events, key)
+        if known is not None:
+            return known[0]
+        if carry_prev is None:
+            return None
+        share, reason = carry.decide(events, steps, carry_prev, key, max_tasks, max_context_pct)
+        if share is None:
+            self.run.emit("carry_declined", key=key, reason=reason, **{"from": f"{carry_prev}/implement"})
+            return None
+        session = str(steps[share]["session_id"])
+        self.run.emit("session_carried", key=key, session_id=session, tasks=carry.tasks_in(events, session) + 1,
+                      **{"from": share})
+        return share
 
     def _small_plan(self, phase: Phase, step: Step, prefix: str) -> dict | None:
         """`small_plan` with `active: True` when its `when` holds, `{}` when it does not, None = stopped to ask."""
@@ -425,7 +459,7 @@ class FeatureLane:
 
     def _run_task(self, phase: Phase, step: Step, plan: Path, rel: str, task: sources.PlanTask, tkey: str,
                   small: dict, share: str | None, round_: int = 0, batch: list[sources.PlanTask] | None = None,
-                  prefix: str = "") -> Outcome:
+                  prefix: str = "", carried: bool = False) -> Outcome:
         """Implementer, reviewer, commit. In refine round `round_`, the same in the task's own sessions.
 
         In a batch (`step.batch`), a member after the first continues the previous member's session on the
@@ -435,7 +469,7 @@ class FeatureLane:
         continues = bool((self.run.state["steps"].get(share) or {}).get("session_id")) if share else False
         if batch and continues and step.batch and step.batch.get("prompt"):
             impl_step = dataclasses.replace(impl_step, prompt=str(step.batch["prompt"]), continuation=True)
-        elif continues and small.get("active") and small.get("shared_session"):  # its session holds the skill text
+        elif continues and (carried or (small.get("active") and small.get("shared_session"))):  # it holds the skill
             impl_step = dataclasses.replace(impl_step, continuation=True)
         extra = self._task_extra(task, rel)
         if self._task_agent(phase, impl_step, f"{tkey}/implement", extra, share) != "done":

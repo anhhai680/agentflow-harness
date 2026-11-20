@@ -1185,6 +1185,8 @@ def test_cap_fields_are_editable(shipped):
         assert refused, (key, value)
     with pytest.raises(Refused):  # a step's own turn cap is in the workflow, which the page does not edit
         form(shipped, (["phases", "build", "steps", "0", "max_turns"], 20))
+    with pytest.raises(Refused):  # ... and so is its `carry`
+        form(shipped, (["phases", "build", "steps", "0", "carry"], {"max_tasks": 4}))
 
 
 def test_context_run_brief_and_gate_lines_editable(shipped):
