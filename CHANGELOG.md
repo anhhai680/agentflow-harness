@@ -7,6 +7,8 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.0] - 2026-11-20
+
 ### Added
 
 - The usage-window governor (`usage.*`): above the soft mark no new run or phase starts, above the hard mark no new session; held runs go again closest to `finish` first; the dashboard header shows the window.
@@ -41,6 +43,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Changed
 
+- The engine is 3.0, a major version: a pack's `engine:` range must include 3, and a pack that declares `>=2,<3` is refused when its config loads until the range is edited (to `>=3,<4`, which `agentflow init` now writes). The pack format stays `version: 2`. The reason is that the usage-window governor is on by default and holds runs and sessions that 2.x would have started.
 - The prompts that told a session to run the build or verify gates before it finished (`task_inline`, `fix`, `ci_fix`, `fix_findings`, `sync_conflicts`) now say the runner runs them after the session, and to run only the tests it wrote, changed or covers; the fix turn's lead says to re-run only what failed, with quiet flags. The preamble's `## Shell` gains three lines (quiet flags for tests, Glob and Grep with a result limit instead of `grep -r`, `find` or `ls -R`, read a file once), and `agentflow-build` asks for quiet flags. `validate --fix` repairs a pack override that holds the old sentences (six new retired entries).
 - A pack's `agents.<name>.max_turns` no longer caps the roles `agents.claude.max_turns_by_role` names (`review`, `plan`, `build`, `debug` and `mechanical`): they get the role caps, and `max_turns` stays the cap for every other role. The Settings page's agent note says so. Upgrade impact: a pack that sets `agents.<name>.max_turns` now gets the role caps for those roles, so a run may stop at a cap it did not hit before (set a role to `0`, or raise it, to keep the old behaviour); and a pack that removes a role from `agents.claude.models` (for example `models: {mechanical: null}`) must also set `max_turns_by_role.<role>: null` and `session_budget_usd.<role>: null`, because the engine's caps still name the role and `validate` errors on a role not in `models`.
 - A doubt review after the first round (`spec_review`, `plan_review`) is shown the artifact's diff since the last review started, in front of the earlier findings and their dispositions, and gets half the resolved turn cap (the step's `max_turns`, else the role's `agents.<name>.max_turns_by_role` entry, else `agents.<name>.max_turns`; none when none is set or the role's entry is `0`). With no usable base (no earlier review in this round, an unreadable base, a deleted or new artifact, an empty diff or one over 400 lines), it gets the full prompt as before. The first round, the stop rules and the finding numbers are unchanged.

@@ -954,7 +954,7 @@ def test_every_skills_map_reference_in_the_defaults_resolves(tmp_path):
 
 def test_engine_defaults_match_the_code_fallbacks(tmp_path):
     node = yaml.safe_load(FULL_PACKS["node"].read_text(encoding="utf-8"))
-    minimal = {"version": 2, "engine": ">=2,<3",
+    minimal = {"version": 2, "engine": ">=3,<4",
                "project": {"base_branch": "main", "fork_from": "main", "branch": "b", "commit_trailer": ""},
                "agents": {"claude": {"command": ["claude"]}}, "guardrails": {}, "gates": {}, "gate_sets": {},
                "lanes": [], "phases": {}}
@@ -1067,7 +1067,7 @@ def test_a_user_file_cannot_revive_an_agent_the_pack_deleted(tmp_cfg):
 
 def test_a_recursive_anchor_in_the_pack_is_a_config_error_naming_it(tmp_path):
     target = tmp_path / "config.yaml"
-    target.write_text('version: 2\nengine: ">=2,<3"\nloop: &a {x: *a}\n', encoding="utf-8")
+    target.write_text('version: 2\nengine: ">=3,<4"\nloop: &a {x: *a}\n', encoding="utf-8")
     with pytest.raises(ConfigError) as err:
         load_config(target)
     assert str(target) in str(err.value)
@@ -1141,7 +1141,7 @@ def test_an_unreadable_user_file_location_is_a_config_error_naming_it(monkeypatc
 
 def _starter_pack(sparse_repo: Path, **extra) -> Path:
     path = pack.pack_config(sparse_repo)
-    data = {"version": 2, "engine": ">=2,<3", "agents": {"claude": {"permission_mode": "bypassPermissions"}}, **extra}
+    data = {"version": 2, "engine": ">=3,<4", "agents": {"claude": {"permission_mode": "bypassPermissions"}}, **extra}
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return path
 

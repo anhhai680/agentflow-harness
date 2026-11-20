@@ -225,7 +225,7 @@ def pack_repo_python(tmp_path: Path) -> Path:
 
 SPARSE_PACK = {  # a pack that states only what the engine defaults can't know: its gates and its permission line
     "version": 2,
-    "engine": ">=2,<3",
+    "engine": ">=3,<4",
     "gates": {"unit": {"run": "true"}},
     "gate_sets": {"setup": [], "build": ["unit"], "verify": ["unit"]},
     "agents": {"claude": {"permission_mode": "bypassPermissions"}},

@@ -181,7 +181,7 @@ def test_the_written_pack_loads_back_to_the_rendered_data(toy_repo):
     assert text == init.render_pack(found, base=base)
     multi = "bash -e -c " + shlex.quote("export CI=true\ncd app\npytest -q")
     assert yaml.safe_load(text) == init.pack_data(found, base=base) == {
-        "version": 2, "engine": ">=2,<3", "starter": "python-uv", "gates_confirmed": False,
+        "version": 2, "engine": ">=3,<4", "starter": "python-uv", "gates_confirmed": False,
         "agents": {"claude": {"permission_mode": "bypassPermissions"}},
         "project": {"docs": {"decisions": "docs/adr"}},  # docs/plans is the engine default: not written
         "gates": {"lint": {"run": "ruff check ."}, "tests": {"run": multi}},

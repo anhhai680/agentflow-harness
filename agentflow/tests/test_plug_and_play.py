@@ -211,7 +211,7 @@ def test_security_overlay_covers_the_new_modules() -> None:
 
 LESSONS_PACK = """\
 version: 2
-engine: ">=2,<3"
+engine: ">=3,<4"
 gates:
   unit: {run: "test -f fixed.txt"}
 gate_sets: {setup: [], build: [unit], verify: [unit]}
