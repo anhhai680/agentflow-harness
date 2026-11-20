@@ -20,8 +20,10 @@ from pathlib import Path
 
 from agentflow import hitl
 from agentflow.artifacts import PHASE_KINDS, NotFound, artifact_max_bytes, run_artifacts, run_findings
-from agentflow.config import Config
+from agentflow.config import Config, ConfigError, load_config
+from agentflow.config_trust import run_config_path
 from agentflow.events import parse_iso
+from agentflow.pack import PackError
 from agentflow.plan_view import run_plan
 from agentflow.run_control import available_actions
 from agentflow.run_files import _head
@@ -91,8 +93,8 @@ def item_title(item: dict) -> str:
 
 def approve_note(item: dict) -> str:
     """Whether an approval takes a note, as `hitl.approve` decides: `none` (it refuses one, or there is no approval),
-    `required` or `optional`."""
-    kind = item.get("kind")
+    `required` or `optional`. A parked item follows the kind of the stop that parked (`stop_kind`)."""
+    kind = item.get("stop_kind") or item.get("kind")
     # An environment stop takes no note here: a note makes `autonomy.recheck_environment` skip its machine recheck,
     # so only the CLI's `--note` overrides it.
     if kind == "phase_approval" or kind in hitl.CLEARED_BY_APPROVE or kind in ("preflight_failed", hitl.ENVIRONMENT) \
@@ -154,13 +156,31 @@ def _blast_radius(plan: dict, key: object) -> dict | None:
             "independent": [t["n"] for t in plan["tasks"] if t["status"] == "independent"]}
 
 
+def _constraint_offered(run: Run, item: dict, events: list[dict]) -> bool:
+    """Whether `agentflow approve --constraint` would be accepted on this stop: no questions, a stop and not a phase
+    approval or a checkpoint, and a gate of the run's own trusted config (never the dashboard's) failed on its key. A
+    run whose config cannot be loaded gets no button, as the approval would refuse it too."""
+    kind, key = item["kind"], str(item.get("key") or "")
+    if item.get("questions") or kind == "phase_approval" or kind in hitl.CLEARED_BY_APPROVE or not key:
+        return False
+    if not any(e.get("type") == "gate_result" and e.get("passed") is False
+               and (str(e.get("key")) == key or str(e.get("key")).startswith(key + "/")) for e in events):
+        return False  # no gate failed here, so no config is loaded to ask which gates are constraint gates
+    try:
+        return bool(hitl.constraint_gates_failed(load_config(run_config_path(run)), run, key))
+    except (ConfigError, PackError, OSError):
+        return False
+
+
 def _card(run: Run, repo: Path, cfg: Config, item: dict, events: list[dict], now: datetime, limit: int) -> dict:
     parked = item["kind"] == "parked"
     actions = [a for a in available_actions(run) if a in DECISIONS]
     if parked:
-        actions = ["answer"]
+        actions = ["answer"] if item["questions"] else ["approve"]
     elif not item["questions"]:
         actions = [a for a in actions if a != "answer"]  # an answer is for the item that has questions
+    if "approve" in actions and _constraint_offered(run, item, events):
+        actions.append("approve_constraint")
     text, truncated = _read_text(run, item["key"], limit)
     body, cli = split_cli(text)
     since = parse_iso(item["since"])

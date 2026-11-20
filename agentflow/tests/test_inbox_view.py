@@ -8,6 +8,7 @@ import pytest
 from conftest import awaiting
 
 from agentflow import hitl
+from agentflow.config_trust import start_options
 from agentflow.inbox_view import approve_note, inbox_view, item_title, split_cli
 
 
@@ -93,3 +94,81 @@ def test_held_and_stalled_runs_are_watched_without_buttons(flow_repo):
     run.emit("run_held", key="build/x", reason="usage limit", until="2026-11-16T18:00:00+00:00")
     (row,) = inbox_view(flow_repo.root, flow_repo.cfg, datetime.now(UTC))["watch"]
     assert row["reason"] == "held" and "usage limit" in row["text"]
+
+
+@pytest.fixture(autouse=True)
+def _a_persons_terminal(monkeypatch):
+    """The cards are drawn for a person, even when an agent session runs the suite."""
+    monkeypatch.delenv("AGENTFLOW_STEP", raising=False)
+    monkeypatch.delenv("AGENTFLOW_RUN", raising=False)
+
+
+OVERRIDE = {"guardrails": {"constraint_override": {"trailer": "Constraints-Approved-By", "gates": ["floor"]}}}
+TASK = "build/build/task-2/commit"
+
+
+def parked_card(flow_repo, kind, questions=(), key="build/build/task-4/implement"):
+    run = flow_repo.new_run()
+    run.emit("phase_started", phase="build")
+    run.emit("step_parked", key=key, kind=kind, summary="stopped", questions=list(questions))
+    (item,) = [i for i in inbox_view(flow_repo.root, flow_repo.cfg, datetime.now(UTC))["items"] if i["kind"] == "parked"]
+    return item
+
+
+def test_a_parked_stop_card_offers_approve(flow_repo):
+    item = parked_card(flow_repo, "blocked")
+    assert item["actions"] == ["approve"] and item["approve_note"] == "optional" and item["stop_kind"] == "blocked"
+
+
+def test_a_parked_stop_note_follows_its_stop_kind(flow_repo):
+    assert parked_card(flow_repo, "blocked_repeat")["approve_note"] == "required"
+
+
+def test_a_parked_stop_with_questions_offers_answer_only(flow_repo):
+    question = {"id": "q1", "question": "Which db?", "options": [{"key": "A", "label": "pg", "recommended": True}],
+                "evidence": [], "kind": "choice"}
+    item = parked_card(flow_repo, "needs_human", [question])
+    assert item["actions"] == ["answer"] and item["approve_note"] == "none"
+
+
+def test_approve_note_reads_the_stop_kind_of_a_parked_item():
+    assert approve_note({"kind": "parked", "stop_kind": "blocked_repeat", "questions": []}) == "required"
+    assert approve_note({"kind": "parked", "stop_kind": "preflight_failed", "questions": []}) == "none"
+    assert approve_note({"kind": "parked", "stop_kind": "blocked", "questions": []}) == "optional"
+    assert approve_note({"kind": "parked", "questions": []}) == "optional"
+
+
+def constraint_run(flow_repo, parked: bool, passed: bool = False):
+    """A run started on a config whose `floor` gate is a constraint gate, with `floor`'s result on a task and the stop."""
+    cfg = flow_repo.configure(OVERRIDE)
+    run = flow_repo.new_run()
+    run.emit("run_options", **start_options(cfg.path))
+    run.emit("phase_started", phase="build")
+    run.emit("gate_result", key=TASK, gate="floor", passed=passed, skipped=False, reason="", log=None, duration_s=0.1,
+             tree="t")
+    if parked:
+        run.emit("step_parked", key=TASK, kind="gate_failed", summary="Gates failed: floor.", questions=[])
+    else:
+        hitl.raise_hitl(cfg, run, "gate_failed", TASK, "Gates failed: floor.", notify=False)
+    return run
+
+
+@pytest.mark.parametrize("parked", [False, True])
+def test_a_failed_constraint_gate_offers_the_constraint_button(flow_repo, parked):
+    server_cfg = flow_repo.cfg  # the dashboard's config: it names no constraint gate, the run's own config does
+    constraint_run(flow_repo, parked)
+    (item,) = inbox_view(flow_repo.root, server_cfg, datetime.now(UTC))["items"]
+    assert "approve_constraint" in item["actions"] and "approve" in item["actions"]
+
+
+def test_a_passing_constraint_gate_offers_no_constraint_button(flow_repo):
+    constraint_run(flow_repo, parked=False, passed=True)
+    (item,) = inbox_view(flow_repo.root, flow_repo.cfg, datetime.now(UTC))["items"]
+    assert "approve_constraint" not in item["actions"]
+
+
+def test_a_run_whose_config_cannot_be_loaded_offers_no_constraint_button(flow_repo):
+    run = constraint_run(flow_repo, parked=False)
+    run.emit("run_options", config="/nowhere/else.yaml")  # a later config the run never started with: untrusted
+    (item,) = inbox_view(flow_repo.root, flow_repo.cfg, datetime.now(UTC))["items"]
+    assert "approve_constraint" not in item["actions"]

@@ -505,6 +505,59 @@ def test_dashboard_approve_equals_cli(dash):
     assert status == 409 and dash.spawned == []
 
 
+CONSTRAINT_KEY = "build/build/task-2/commit"
+CONSTRAINT_OVERRIDE = {"guardrails": {"constraint_override": {"trailer": "Constraints-Approved-By", "gates": ["floor"]}}}
+
+
+def constraint_stop(dash, monkeypatch):
+    """A run started on a config whose `floor` gate is a constraint gate, stopped on that gate. The dashboard's own
+    config (loaded before) names no constraint gate: only the run's trusted config does."""
+    from agentflow.config_trust import start_options
+
+    monkeypatch.delenv("AGENTFLOW_STEP", raising=False)  # a person's dashboard, even when an agent session runs the suite
+    monkeypatch.delenv("AGENTFLOW_RUN", raising=False)
+    cfg = dash.flow.configure(CONSTRAINT_OVERRIDE)
+    run = dash.flow.new_run()
+    run.emit("run_options", **start_options(cfg.path))
+    run.emit("phase_started", phase="build")
+    run.emit("gate_result", key=CONSTRAINT_KEY, gate="floor", passed=False, skipped=False, reason="", log=None,
+             duration_s=0.1, tree="t")
+    hitl.raise_hitl(cfg, run, "gate_failed", CONSTRAINT_KEY, "Gates failed: floor.", notify=False)
+    return run
+
+
+def test_approve_passes_constraint(dash, monkeypatch):
+    run = constraint_stop(dash, monkeypatch)
+    status, _, body = dash.post(f"/api/runs/{run.id}/approve", {"target": CONSTRAINT_KEY, "constraint": True})
+    assert status == 200, body
+    (approved,) = [e for e in run.events.read() if e["type"] == "hitl_approved"]
+    assert approved["constraint"] is True and approved["by"] == "dashboard" and approved["key"] == CONSTRAINT_KEY
+
+
+def test_a_plain_approve_of_a_constraint_stop_is_not_a_constraint(dash, monkeypatch):
+    run = constraint_stop(dash, monkeypatch)
+    assert dash.post(f"/api/runs/{run.id}/approve", {"target": CONSTRAINT_KEY})[0] == 200
+    (approved,) = [e for e in run.events.read() if e["type"] == "hitl_approved"]
+    assert "constraint" not in approved
+
+
+def test_a_constraint_approval_with_no_failed_constraint_gate_is_a_409(dash, monkeypatch):
+    run = constraint_stop(dash, monkeypatch)
+    run.emit("gate_result", key=CONSTRAINT_KEY, gate="floor", passed=True, skipped=False, reason="", log=None,
+             duration_s=0.1, tree="t")
+    status, _, body = dash.post(f"/api/runs/{run.id}/approve", {"target": CONSTRAINT_KEY, "constraint": True})
+    assert status == 409 and "no constraint gate failed" in payload(body)["error"]
+    assert not [e for e in run.events.read() if e["type"] == "hitl_approved"]
+
+
+@pytest.mark.parametrize("constraint", ["yes", 1, 0, "true", [True], {}])
+def test_a_non_bool_constraint_is_a_400(dash, monkeypatch, constraint):
+    run = constraint_stop(dash, monkeypatch)
+    status, _, body = dash.post(f"/api/runs/{run.id}/approve", {"target": CONSTRAINT_KEY, "constraint": constraint})
+    assert status == 400 and "constraint" in payload(body)["error"]
+    assert not [e for e in run.events.read() if e["type"] == "hitl_approved"]
+
+
 def test_approve_records_what_the_page_showed(dash):
     run = awaiting(dash.flow, phase="define")
     viewed = [{"path": "docs/specs/x.md", "sha": "a" * 40}]
@@ -2109,6 +2162,16 @@ def test_inbox_shortcuts_stay_out_of_text_fields_and_approve_takes_two_presses()
         assert needle in handler, needle
     assert "Press a again to approve" in inbox and "Dismiss" in inbox and "readOnly" in inbox
 
+
+
+def test_the_constraint_button_and_approve_all_arm_before_they_send():
+    inbox = (UI_DIR / "inbox.js").read_text(encoding="utf-8")
+    for needle in ("Approve the constraint", "Confirm approve the constraint", "Approve all ", "Confirm approve all ",
+                   "approve_constraint", "INBOX_ARM_ALL", "INBOX_ARM_CONSTRAINT"):
+        assert needle in inbox, needle
+    for function in ("approveConstraintItem", "approveAllItems"):
+        body = inbox[inbox.index(f"function {function}"):inbox.index("\n}\n", inbox.index(f"function {function}"))]
+        assert "armOrSend(" in body, function  # the first press only arms
 
 
 def test_the_events_route_pages_the_whole_log(dash):
