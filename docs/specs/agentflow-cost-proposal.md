@@ -253,6 +253,15 @@ The rule stays: **an author may continue, a reviewer starts fresh.** Independenc
 - **Decided (Q7): ships off.** C5 ships the option with the default `{max_tasks: 1}`, which is today's behaviour.
   - The default flips to `{max_tasks: 4, max_context_pct: 40}` in a later release, and only once a real run with carry on shows, in its scorecard, that `gate_first_pass:*` and the review blocking-finding rate didn't get worse.
   - It is the smallest saving and the largest change to session semantics, so evidence comes first.
+- *Amended for the C5 plan (`docs/plans/2026-11-20-agentflow-harness-cost-c5.md`, Decided 1–9):*
+  - **Only tasks nothing else shares carry.** A task in a batch of two or more, or of an active small plan, never carries and is never carried into; their own sharing rules stay as they are.
+  - **"Committed cleanly"** means the previous task's implementer ran in the same walk of the plan, it was committed in round 0, no task was held between the two, and no `hitl_raised` or `step_parked` names the previous task or any key under it. A refine round never carries: each task resumes its own session, as before.
+  - **Context** is the `context_pct` of the session's last `agent_turn`, which must be strictly below `max_context_pct`; a session with no turn counts as 0. **Rolled over** is a `rolled_over` on the previous implement key; **compacted** is any `compacted` with the session's id.
+  - **Effort:** a carried task runs at the session's effort, as every shared session does, so a task the plan sizer put above that effort starts fresh (`effort`). A task with no plan-sizer answers is not `risk`.
+  - **Counting:** a session holds its first task plus one per `session_carried` that names it, and carries while that count is below `max_tasks`.
+  - **One decision per task, recorded:** `session_carried {key, from, session_id, tasks}` or `carry_declined {key, from, reason}` (reasons, checked in this order: `no_session`, `not_clean`, `max_tasks`, `rolled_over`, `compacted`, `context`, `risk`, `effort`). A restarted runner takes the recorded one. `carry_declined` is written only when `max_tasks` is above 1, so a run without `carry` writes neither.
+  - **Values:** an absent `carry` is `{max_tasks: 1}`; a missing `max_context_pct` is 40. A bad value is refused when the config loads (a run start never calls `validate`). The engine defaults don't set the key, and it is protected with the workflow.
+  - **The carried prompt** is the task prompt built as a continuation (the skill isn't inlined again), not `batch.prompt`; the task's own `task_briefs` are still added.
 
 **L3b. Short resume prompts.** A resume turn sends only what changed:
 - the gate failure, cut to the failing tests and the first error lines, with at most `context.resume_gate_lines` lines (default 80);

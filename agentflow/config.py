@@ -96,6 +96,7 @@ STEP_KEYS = (
     "tdd",
     "small_plan",
     "batch",
+    "carry",
     "brief",
     "task_briefs",
     "name",
@@ -588,6 +589,7 @@ class Step:
     tdd: bool = True
     small_plan: dict | None = None
     batch: dict | None = None  # a `foreach: plan_task` step: neighbouring small tasks share a session and a review
+    carry: dict | None = None  # a `foreach: plan_task` step: the next task may resume the previous one's session
     brief: list[str] = field(default_factory=list)
     task_briefs: dict[str, str] = field(default_factory=dict)
     task_brief: list[str] = field(default_factory=list)  # run time only, never configured: the `task_briefs` a plan task matched
@@ -907,6 +909,40 @@ def _step_turns(value: Any, path: str) -> int | None:
     return value
 
 
+CARRY_KEYS = ("max_tasks", "max_context_pct")
+CARRY_DEFAULTS = (1, 40)  # off: one task per session, as before `carry`; and the context a carry must stay below
+CARRY_CONTEXT_RANGE = (10, 70)
+
+
+def _step_carry(value: Any, path: str, foreach: Any) -> dict | None:
+    """A plan-task step's `carry`, checked when the config loads (a run start never calls `validate`): unset, or a
+    mapping of `max_tasks` (a whole number, 1 or more) and `max_context_pct` (a number from 10 to 70)."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ConfigError(path, "carry must be a mapping")
+    if foreach != "plan_task":
+        raise ConfigError(path, "only a `foreach: plan_task` step has `carry`")
+    unknown = [str(key) for key in value if key not in CARRY_KEYS]
+    if unknown:
+        raise ConfigError(_join(path, unknown[0]), "carry takes only max_tasks and max_context_pct")
+    tasks = value.get("max_tasks")
+    if tasks is not None and (isinstance(tasks, bool) or not isinstance(tasks, int) or tasks < 1):
+        raise ConfigError(_join(path, "max_tasks"), "max_tasks must be a whole number of at least 1")
+    pct = value.get("max_context_pct")
+    low, high = CARRY_CONTEXT_RANGE
+    if pct is not None and (isinstance(pct, bool) or not isinstance(pct, (int, float)) or not low <= pct <= high):
+        raise ConfigError(_join(path, "max_context_pct"), f"max_context_pct must be a number from {low} to {high}")
+    return dict(value)
+
+
+def carry_limits(step: Step) -> tuple[int, int | float]:
+    """`(max_tasks, max_context_pct)` of a plan-task step's `carry`, with the defaults for what it leaves out."""
+    carry = step.carry or {}
+    tasks, pct = (carry.get(key) for key in CARRY_KEYS)
+    return (CARRY_DEFAULTS[0] if tasks is None else tasks, CARRY_DEFAULTS[1] if pct is None else pct)
+
+
 def _whole(data: dict, key: str, path: str, default: int) -> int:
     """An optional whole number; a bool, which YAML reads from `true`, is not one here."""
     value = _optional(data, key, path, int, default)
@@ -1021,6 +1057,7 @@ class _Builder:
             tdd=bool(raw.get("tdd", True)),
             small_plan=raw.get("small_plan"),
             batch=raw.get("batch"),
+            carry=_step_carry(raw.get("carry"), _join(path, "carry"), raw.get("foreach")),
             brief=brief_files(raw.get("brief"), _join(path, "brief")),
             task_briefs=dict(raw.get("task_briefs") or {}),
             name=raw.get("name"),
