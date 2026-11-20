@@ -1261,6 +1261,55 @@ def restore_paths(worktree: Path, paths: list[str], sha: str) -> None:
             (root / path).unlink(missing_ok=True)
 
 
+def shelf_ref(run_id: str, tkey: str) -> str:
+    """The ref that holds a parked task's shelved work; `ValueError` when git refuses the name."""
+    ref = f"refs/agentflow/shelf/{run_id}/{tkey.replace('/', '.')}"
+    if subprocess.run(["git", "check-ref-format", ref], capture_output=True).returncode != 0:
+        raise ValueError(f"not a valid shelf ref: {ref!r}")
+    return ref
+
+
+def shelve(worktree: Path, tree: str, ref: str, message: str) -> str:
+    """Keep `tree` (a `snapshot` of the working tree) in `ref` as a commit on `HEAD`, and return its sha.
+
+    Only an object and a ref are written: the index and the tree stay as they are, so the caller resets the paths
+    itself (`restore_paths`) once the shelf is safe."""
+    root = Path(worktree)
+    sha = _git_or_raise(root, *HARDENED, "commit-tree", tree, "-p", "HEAD", "-m", message).strip()
+    _git_or_raise(root, *HARDENED, "update-ref", ref, sha)
+    return sha
+
+
+def unshelve(worktree: Path, shelf: str, paths: list[str]) -> list[str]:
+    """Apply what the shelf commit `shelf` changed in `paths` to the index and the tree.
+
+    Returns `[]` once the change is applied (or when there is none). When it does not apply cleanly on top of
+    `HEAD`, nothing is changed and the sorted `paths` come back. The patch goes to `git apply` on stdin."""
+    root = Path(worktree)
+    if not paths:
+        return []
+    patch = subprocess.run(
+        ["git", *HARDENED, "--literal-pathspecs", "diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv",
+         "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", f"{shelf}^", shelf, "--", *paths],
+        cwd=root, capture_output=True, check=False)
+    if patch.returncode != 0:
+        detail = patch.stderr.decode("utf-8", "replace").strip() or f"exit {patch.returncode}"
+        raise GitError(f"git diff of the shelf {shelf} failed: {detail}")
+    if not patch.stdout:
+        return []
+    for extra in (["--check"], []):
+        applied = subprocess.run(["git", *HARDENED, "apply", "--index", "--whitespace=nowarn", *extra], cwd=root,
+                                 input=patch.stdout, capture_output=True, check=False)
+        if applied.returncode != 0:
+            return sorted(paths)
+    return []
+
+
+def drop_shelf(worktree: Path, ref: str) -> None:
+    """Delete the shelf ref; a ref that is already gone is fine."""
+    subprocess.run(["git", *HARDENED, "update-ref", "-d", ref], cwd=Path(worktree), capture_output=True, check=False)
+
+
 def dirty_paths(worktree: Path) -> list[str]:
     """Paths with staged, unstaged or untracked changes in the checkout at `worktree` (ignored files aside)."""
     return [line[3:] for line in _git_or_raise(Path(worktree), "status", "--porcelain").splitlines() if line.strip()]
