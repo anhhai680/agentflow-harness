@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from agentflow import pack
-from agentflow.config import CACHE_TTLS, ConfigError, Evidence, Issue, Usage, load_config, parse_evidence, validate
+from agentflow.config import CACHE_TTLS, ConfigError, Evidence, Issue, Usage, load_config, parse_evidence, validate, validate_usage
 from agentflow.flow import main, repo_root
 from conftest import PYTHON_CONFIG, with_doubt
 
@@ -1726,6 +1726,13 @@ def test_governor_is_a_reserved_step_id(tmp_cfg):
 def test_validate_refuses_bad_usage(tmp_cfg, block, path, message):
     found = issues_for(tmp_cfg, {"usage": block})
     assert any(i.level == "error" and i.path == path and message in i.message for i in found), found
+
+
+def test_validate_usage_is_the_usage_part_of_validate(tmp_cfg):
+    path = tmp_cfg({"usage": {"five_hour_soft": 0.95, "soft": 0.7}})
+    cfg = load_config(path)
+    mine = [i for i in validate(cfg, path.parent.parent) if i.path == "usage" or i.path.startswith("usage.")]
+    assert mine and validate_usage(cfg) == mine
 
 
 @pytest.mark.parametrize("block", [{"five_hour_soft": True}, {"finish_first": "yes"}])

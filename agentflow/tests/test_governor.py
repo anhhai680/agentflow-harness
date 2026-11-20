@@ -620,6 +620,35 @@ def test_current_usage_reloads_and_keeps_the_last_good(tmp_cfg):
     assert current_usage(cfg) is cfg.usage
 
 
+def test_current_usage_skips_the_load_while_the_layer_files_are_unchanged(tmp_cfg, monkeypatch):
+    path = tmp_cfg({"usage": {"five_hour_soft": 0.5}})
+    cfg = load_config(path)
+    first = current_usage(cfg)
+    loads = []
+    real = load_config
+
+    def spy(p, *args, **kwargs):
+        loads.append(p)
+        return real(p, *args, **kwargs)
+
+    monkeypatch.setattr("agentflow.governor.config.load_config", spy)
+    assert current_usage(cfg, first) is first
+    assert current_usage(cfg) is first
+    assert loads == []
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["usage"] = {"five_hour_soft": 0.6, "governor": "off"}
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    got = current_usage(cfg)
+    assert len(loads) == 1 and (got.five_hour_soft, got.governor) == (0.6, "off")
+    assert current_usage(cfg) is got
+    assert len(loads) == 1
+    data["usage"] = {"five_hour_soft": 2}  # an error is cached too, and returns each caller's own fallback
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    assert current_usage(cfg, got) is got
+    assert current_usage(cfg) is cfg.usage
+    assert len(loads) == 2
+
+
 def test_state_dir_default_is_under_user_state_root(monkeypatch, tmp_path, tmp_git):
     assert pack.state_dir(tmp_git).parent == pack.user_state_root()
     (tmp_path / "real").mkdir()

@@ -3066,6 +3066,13 @@ def _find_keys(node: Any, key: str, path: str = "") -> list[str]:
     return found
 
 
+def validate_usage(cfg: Config) -> list[Issue]:
+    """Only the problems under `usage`: it needs no repository, so the governor can re-check a reloaded config cheaply."""
+    v = _Validator(cfg, Path("."))
+    v.usage()
+    return v.issues
+
+
 def validate(cfg: Config, repo: Path) -> list[Issue]:
     """Return every problem found in `cfg`, checked against the checkout at `repo`."""
     v = _Validator(cfg, Path(repo))

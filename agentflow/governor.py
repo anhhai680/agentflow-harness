@@ -55,6 +55,7 @@ from typing import Any, TextIO
 
 from agentflow import config, events, pack, run_env, safeio
 from agentflow.config import Config, Usage
+from agentflow.config_trust import layers_sha256
 
 VERSION = 1
 USAGE_HOLD = "usage window"  # the `run_held` reason
@@ -311,16 +312,34 @@ def account_of(cfg: Config) -> str:
     return account_key(env.get("CLAUDE_CONFIG_DIR"))
 
 
+_USAGE_CACHE_MAX = 16
+# config path -> (layer digest, the config it was built from, the usage it gave or None when it was unusable)
+_usage_cache: dict[str, tuple[str, Config, Usage | None]] = {}
+
+
 def current_usage(cfg: Config, last: Usage | None = None) -> Usage:
     """`usage` as the layers of `cfg` say now, or `last` (else `cfg.usage`) when the reload fails or `validate`
-    reports an error under `usage`. Never raises."""
+    reports an error under `usage`. Never raises. The answer is cached on the digest of the layer files, so a call
+    that finds them unchanged reads their bytes and loads nothing; a changed file changes the digest."""
     fallback = last if last is not None else cfg.usage
     try:
+        key = str(Path(cfg.path).resolve())
+        entry = _usage_cache.get(key)
+        basis = entry[1] if entry is not None else cfg
+        try:
+            digest: str | None = layers_sha256(config.layer_files(basis))
+        except Exception:
+            digest = None
+        if digest is not None and entry is not None and entry[0] == digest:
+            return fallback if entry[2] is None else entry[2]
         fresh = config.load_config(cfg.path)
-        issues = config.validate(fresh, Path(cfg.path).parent.parent)
-        if any(i.level == "error" and (i.path == "usage" or i.path.startswith("usage.")) for i in issues):
-            return fallback
-        return fresh.usage
+        issues = config.validate_usage(fresh)
+        usage = None if any(i.level == "error" for i in issues) else fresh.usage
+        if digest is not None:
+            if len(_usage_cache) >= _USAGE_CACHE_MAX and key not in _usage_cache:
+                _usage_cache.pop(next(iter(_usage_cache)))
+            _usage_cache[key] = (digest, fresh, usage)
+        return fallback if usage is None else usage
     except Exception:
         return fallback
 
