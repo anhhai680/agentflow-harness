@@ -695,6 +695,10 @@ def quick_holds(monkeypatch):
     monkeypatch.setattr(lanes, "HOLD_SLACK_S", 0.0)
     monkeypatch.setattr(lanes, "BACKOFF_START_S", 0.01)
     monkeypatch.setattr(lanes, "BACKOFF_MAX_S", 0.02)
+    # The refusal is also a reading in the usage window file, which governs until `resets_at + governor.SLACK_S`:
+    # the same slack as `HOLD_SLACK_S`, so a call sent again after the hold is not held a second time.
+    monkeypatch.setattr(governor, "SLACK_S", 0.0)
+    monkeypatch.setattr(governor, "POLL_S", 0.01)
 
 
 def test_usage_limit_waits_for_the_reset_then_carries_on(flow_repo, quick_holds):

@@ -937,6 +937,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             if budget and spend >= budget:
                 which = "hard budget" if soft is not None else "budget"  # a run from before the soft budget has one
                 return self._stop(sr, "budget_exceeded", f"The run has spent ${spend:.2f} of its ${budget:.2f} {which}.")
+            # The hard mark holds a Claude step's fresh session and its first call, never a resume within the step.
+            first_call = not (self.run.state["steps"].get(sr.key) or {}).get("attempts", 0)
+            if sr.agent_name == "claude" and (turn.resume is None or first_call):
+                if not self.govern(sr.key, "hard", sr.phase.name):
+                    return "stopped"
 
             called = self._call(sr, turn)
             if called.brief_error is not None:  # no agent ran: the session can't have its brief, so a fresh one starts
