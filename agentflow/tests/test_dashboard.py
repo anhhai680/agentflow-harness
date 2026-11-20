@@ -2202,3 +2202,63 @@ def test_the_board_says_when_filters_hide_every_card():
     assert "No card matches these filters" in board and "Clear filters" in board and "Show all (" in board
     assert "new RegExp" not in board and "history.replaceState" in board
     assert 'id="board-filters"' in (UI_DIR.parent / "dashboard.html").read_text(encoding="utf-8")
+
+
+def test_the_board_carries_the_usage_window(flow_repo):
+    from conftest import prime
+
+    from agentflow.views import board
+
+    prime(0.82)
+    usage = board(flow_repo.root, flow_repo.cfg)["usage"]
+    assert usage["mode"] == "on" and usage["level"] == "soft" and usage["waiting"] == 0
+    assert usage["note"] is None and usage["error"] is None
+    five = usage["windows"]["five_hour"]
+    assert five["utilization"] == 0.82 and five["stale"] is False and "seven_day" not in usage["windows"]
+
+
+def test_the_board_carries_the_interactive_note_and_a_broken_file(flow_repo):
+    from agentflow import governor
+    from agentflow.views import board
+
+    path = governor.window_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    note = {"window": "five_hour", "rise": 0.09, "from": 0.41, "to": 0.50, "since": now - 3600, "at": now - 1200,
+            "resets_at": now + 3600}
+
+    def usage() -> dict:
+        return board(flow_repo.root, flow_repo.cfg)["usage"]
+
+    path.write_text(json.dumps({"version": 1, "interactive": note}), encoding="utf-8")
+    got = usage()["note"]
+    assert got.startswith("the 5h window rose 9 points (41% → 50%) between ")
+    assert got.endswith(" while no run had a session open: interactive use draws on the same window")
+    path.write_text(json.dumps({"version": 1, "interactive": {**note, "resets_at": now - 5}}), encoding="utf-8")
+    assert usage()["note"] is None
+    path.write_text("{garbage", encoding="utf-8")
+    broken = usage()
+    assert broken["error"] and broken["note"] is None and broken["level"] == "clear"
+
+
+def test_the_header_never_raises_on_a_broken_governor(flow_repo, monkeypatch):
+    from agentflow import governor
+    from agentflow.views import board
+
+    class Boom(governor.WindowFile):
+        def _snapshot(self, now):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(governor, "WindowFile", Boom)
+    got = governor.header(flow_repo.cfg.usage, governor.account_key(None), time.time())
+    assert got["level"] == "clear" and got["error"] and got["windows"] == {} and got["note"] is None
+    monkeypatch.setattr(governor, "account_of", lambda cfg: (_ for _ in ()).throw(RuntimeError("no account")))
+    assert board(flow_repo.root, flow_repo.cfg)["usage"]["level"] == "clear"
+
+
+def test_the_usage_header_is_set_without_innerhtml():
+    page = (UI_DIR.parent / "dashboard.html").read_text(encoding="utf-8")
+    assert 'id="usage"' in page and 'id="usage-note"' in page and ".pill.soft" in page and ".pill.hard" in page
+    board_js = (UI_DIR / "board.js").read_text(encoding="utf-8")
+    assert "innerHTML" not in board_js and '$("usage").textContent = label.text' in board_js
+    assert '$("usage-note").textContent = label.note' in board_js

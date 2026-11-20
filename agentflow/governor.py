@@ -650,3 +650,44 @@ def start_gate(usage: Usage, account: str, now: float | None = None, file: Windo
         return None
     except Exception:
         return None
+
+
+def _clock(at: Any) -> str:
+    return datetime.fromtimestamp(float(at)).strftime("%H:%M")
+
+
+def _note_text(note: Any, account: str, now: float) -> str | None:
+    """The interactive-use note while its window has not reset (and it is this account's), else None."""
+    if not isinstance(note, Mapping) or note.get("window") not in SPANS:
+        return None
+    if isinstance(note.get("account"), str) and note["account"] != account:
+        return None
+    nums = {key: _num(note.get(key)) for key in _NOTE_NUMBERS}
+    if any(n is None for n in nums.values()) or nums["resets_at"] <= now:  # type: ignore[operator]
+        return None
+    return (f"the {_LABELS[note['window']]} window rose {round(nums['rise'] * 100)} points "  # type: ignore[operator]
+            f"({round(nums['from'] * 100)}% \u2192 {round(nums['to'] * 100)}%) between "  # type: ignore[operator]
+            f"{_clock(nums['since'])} and {_clock(nums['at'])} while no run had a session open: "
+            "interactive use draws on the same window")
+
+
+def header(usage: Usage, account: str, now: float, file: WindowFile | None = None) -> dict:
+    """What the dashboard header shows of the usage window: `{mode, level, windows, waiting, note, error}`. `windows`
+    is `{name: {utilization, resets_at, stale}}` (stale: past its reset, held only by the slack); `waiting` counts the
+    waiters that count; `note` is the interactive-use note while its window runs; `error` is `read()`'s. Never raises."""
+    mode = getattr(usage, "governor", "on")
+    out: dict[str, Any] = {"mode": mode if mode in ("observe", "off") else "on", "level": "clear", "windows": {},
+                           "waiting": 0, "note": None, "error": None}
+    try:
+        data = (file if file is not None else WindowFile())._snapshot(now)
+        out["error"] = data["error"]
+        readings = data["windows"].get(account, {})
+        out["level"] = verdict(usage, readings, now).level
+        out["windows"] = {w: {"utilization": r["utilization"], "resets_at": r["resets_at"], "stale": r["resets_at"] <= now}
+                          for w in SPANS if (r := readings.get(w)) is not None}
+        out["waiting"] = len(_counting(data["waiting"], now, None))
+        out["note"] = _note_text(data["interactive"], account, now)
+    except Exception as exc:
+        return {**out, "level": "clear", "windows": {}, "waiting": 0, "note": None,
+                "error": out["error"] or f"the usage window can't be read ({type(exc).__name__})"}
+    return out
