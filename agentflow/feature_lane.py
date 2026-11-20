@@ -30,10 +30,10 @@ the task is committed on top as `Refine Task N: <title>` with the note in the bo
 answer `unchanged`. A task parked in the round holds back only the tasks that wait on it.
 A rejected stop inside one task (`refine.scope`, `<step>/task-<n>`) refines only that task: the other
 committed tasks are passed over as if committed in the round, unless a step of theirs still waits on an
-earlier round's refine. A stop inside a batch of several tasks refines the whole phase. An implementer
-that answers `unchanged`, leaves the tree as its round started, and started from the task's committed
-work gets no review (`review_skipped`) and no gate run: the task is recorded as committed in the round
-with no commit (`sha: null`).
+earlier round's refine. A stop inside a task that was ever in a batch of several (any `plan_batched`, also before
+a split) refines the whole phase. An implementer that answers `unchanged`, leaves the tree as its round started,
+and started from the task's committed work gets no review (`review_skipped`) and no gate run: the task is recorded
+as committed in the round with no commit (`sha: null`).
 
 A small plan has no per-task review. Under a route profile with `per_task_review: false` (`route.mode: on`), a task
 the plan sizer did not flag `risk`, outside the security overlay, gets none either: `review_skipped` records it once
@@ -56,9 +56,10 @@ stop on `<task>/unshelve`, and approving it takes the tree as the person left it
 taken over again by `pipeline.walk` (`handled`). Each state change is an event, so a resumed run picks every task up
 where it stopped, and first finishes a park a dead runner left half done (`_finish_shelving`). The events are
 `step_parked` (with `stop_class`, `blast_radius`, `shelf`, `shelved` and `demoted`), `unit_unparked` (the shelf applied
-back, with `conflict` when it did not apply), `hitl_notified` (a person was told of the stop: folded into
-`waiting.notified`, so a walk again, a resume or a restarted runner never sends the same stop's notice twice, with
-parking on or off), `forbidden_reverted` (a guard park's forbidden edit set aside) and `plan_batched` with `split`.
+back, with `conflict` when it did not apply and `head`, the `HEAD` it was applied on: the task's review range starts
+there, and a review session that stopped before it starts fresh), `hitl_notified` (a person was told of the stop:
+folded into `waiting.notified`, so a walk again, a resume or a restarted runner never sends the same stop's notice
+twice, with parking on or off), `forbidden_reverted` (a guard park's forbidden edit set aside) and `plan_batched` with `split`.
 A person's `approve --constraint` is `constraint_approved` (`constraint.py`) and the `constraint` field of
 `hitl_approved`.
 
@@ -410,7 +411,8 @@ class FeatureLane:
     def _split_out(self, prefix: str, n: int) -> None:
         """Take task `n` out of its batch, so it parks and later runs alone with a review of its own: every batch
         is kept, and `n`'s becomes the batch without `n`, then `[n]`, recorded as the last `plan_batched` so a
-        resume, `hitl.rejected_scope` and the review all see the split."""
+        resume and the review see the split (`hitl.rejected_scope` reads every `plan_batched`, so a rejected stop
+        of `n` still refines the whole phase)."""
         recorded = [e for e in self.run.events.read() if e["type"] == "plan_batched" and e.get("key") == prefix]
         batches: list[list[int]] = []
         for batch in (recorded[-1].get("batches") or []) if recorded else []:
@@ -736,11 +738,12 @@ class FeatureLane:
             if self.run.state["waiting"] is not None:
                 self.handled_waits.add(wait_id(self.run.state["waiting"]))
             return False
+        at = head(self.worktree)  # the task's work now sits uncommitted on top of it: where its review range starts
         if conflicts:
             self.run.emit("unit_unparked", key=item["key"], shelf=shelf, paths=paths, conflict=True,
-                          by=str(approvals[-1].get("by") or ""))
+                          by=str(approvals[-1].get("by") or ""), head=at)
         else:
-            self.run.emit("unit_unparked", key=item["key"], shelf=shelf, paths=paths, conflict=False)
+            self.run.emit("unit_unparked", key=item["key"], shelf=shelf, paths=paths, conflict=False, head=at)
             if not self._set_aside(shelf, paths):  # a shelf holding an edit set aside stays, so it can be recovered
                 drop_shelf(self.worktree, ref)
         if ukey in self.run.state["steps"]:
@@ -938,10 +941,14 @@ class FeatureLane:
 
     def _task_start(self, phase: Phase, impl_key: str) -> str:
         """Where the task's diff starts: `HEAD` when its implementer started (in a refine round: started
-        refining), or when it was last rebased (other tasks committed while it was parked), so the range
-        holds this task's work only."""
+        refining), or the later of when it was last rebased and when its shelf was last applied back (`unit_unparked`
+        `head`: other tasks committed while it was parked), so the range holds this task's work only."""
+        tkey = impl_key.rsplit("/", 1)[0]
         sha = ""
         for event in self._round_events(phase):
+            if event["type"] == "unit_unparked" and event.get("head") and under(str(event.get("key") or ""), tkey):
+                sha = str(event["head"])
+                continue
             if event.get("key") != impl_key:
                 continue
             if event["type"] == "step_started" and not sha:
@@ -956,13 +963,19 @@ class FeatureLane:
 
         A round that has not started gets a fresh session: `step_retry`, not a resume, so the earlier
         verdict reaches the reviewer only as the findings in its prompt. A stop inside a round
-        resumes that round's own session."""
+        resumes that round's own session, unless the task's shelf was applied back since that session started:
+        `HEAD` moved under it, so a fresh session gets the range as it is now."""
         results = [e for e in self._round_events(phase) if e["type"] == "review_result" and e.get("key") == key]
         if len(results) >= round_:
             return list(results[round_ - 1].get("blocking_findings") or [])
+        settled = ""
         if results and not self._reviewer_started_since(key, results[-1]):
             self.run.emit("step_retry", key=key, reason="re-review", round=round_)
-        extra = {**extra, "earlier_findings": self._earlier_findings(phase, key, results)}
+        elif self._unshelved_since_reviewer(key):
+            settled = self._settled_stop_text(key)  # what the person said at the stop, which a resume would have sent
+            self.run.emit("step_retry", key=key, reason="unshelved on a new HEAD", round=round_)
+        earlier = "\n\n".join(p for p in (self._earlier_findings(phase, key, results), settled) if p)
+        extra = {**extra, "earlier_findings": earlier}
         if self._task_agent(phase, review, key, extra, review=True) != "done":
             return None
         try:  # `unchanged` is no review: it is refused like any unreadable result
@@ -976,6 +989,37 @@ class FeatureLane:
         self.run.emit("review_result", key=key, round=round_, findings=findings, blocking=len(blocking),
                       blocking_findings=blocking, tree=snapshot(self.worktree))
         return blocking
+
+    def _unshelved_since_reviewer(self, key: str) -> bool:
+        """Whether the task's shelf was applied back (`unit_unparked`) after review `key`'s session last started."""
+        tkey = key.rsplit("/", 1)[0]
+        started = 0
+        unparked = 0
+        for event in self.run.events.read():
+            if event["type"] == "agent_started" and event.get("step") == key:
+                started = event["seq"]
+            elif event["type"] == "unit_unparked" and under(str(event.get("key") or ""), tkey):
+                unparked = event["seq"]
+        return bool(started) and unparked > started
+
+    def _settled_stop_text(self, key: str) -> str:
+        """A person's answers to, or note on approving, the stop of `key`'s last session, as text for a fresh one."""
+        answers: dict = {}
+        note = ""
+        for event in self.run.events.read():
+            if event["type"] == "agent_started" and event.get("step") == key:
+                answers, note = {}, ""
+            elif event["type"] == "hitl_answered" and event.get("key") == key:
+                answers = dict(event.get("answers") or {})
+            elif event["type"] == "hitl_approved" and event.get("key") == key:
+                note = str(event.get("note") or "")
+        parts = []
+        if answers:
+            lines = "\n".join(f"{qid}: {text}" for qid, text in answers.items())
+            parts.append(f"The last review session of this task stopped with questions, answered:\n\n{lines}")
+        if note:
+            parts.append(f"A human looked at the last review session's stop and said: {note}")
+        return "\n\n".join(parts)
 
     def _reviewer_started_since(self, key: str, result: dict) -> bool:
         return any(e["type"] == "agent_started" and e.get("step") == key and e["seq"] > result["seq"]

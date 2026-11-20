@@ -39,7 +39,7 @@ from agentflow.config import CONFORMANCE_FAILED, RETRO_PIPELINE, Config, ConfigE
 from agentflow.config_trust import run_config_path
 from agentflow import hitl, pack, safeio, sizing
 from agentflow.events import lock_state, parse_iso
-from agentflow.gitops import GitError, commits_between, dirty_paths
+from agentflow.gitops import GitError, commits_between, dirty_paths, drop_shelves
 from agentflow.issue_status import link, release
 from agentflow.state import TERMINAL, Run, display_status
 
@@ -137,7 +137,9 @@ def mark_done(run: Run, by: str) -> None:
 
 
 def archive(run: Run, by: str) -> None:
-    """File a finished run away as old data (`run_archived`), so its card leaves the phase it stopped in."""
+    """File a finished run away as old data (`run_archived`), so its card leaves the phase it stopped in, and delete
+    its shelf refs (`refs/agentflow/shelf/<run id>/`): kept until now, past `finish`, so shelved work stays
+    recoverable."""
     with run.locked():
         status = run.state["status"]
         if status not in TERMINAL:
@@ -145,6 +147,7 @@ def archive(run: Run, by: str) -> None:
         if run.state.get("archived"):
             raise ControlError(f"{run.id} is already archived")
         run.emit("run_archived", by=by)
+    drop_shelves(run.repo, run.id)
     # outside the lock, so a gh call never holds it: the second try for a link or a release that failed earlier
     link(run)
     release(run)

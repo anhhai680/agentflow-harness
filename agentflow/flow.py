@@ -369,7 +369,8 @@ def cmd_inbox(args: argparse.Namespace) -> int:
             if item["questions"]:
                 print(f"  agentflow answer {item['run_id']} --key {item['key']}")
             else:
-                print(f"  agentflow approve {item['run_id']} {item['key']}    |    agentflow pause {item['run_id']}, "
+                note = ' --note "..."' if item.get("stop_kind") == "blocked_repeat" else ""  # refused without one
+                print(f"  agentflow approve {item['run_id']} {item['key']}{note}    |    agentflow pause {item['run_id']}, "
                       f"then agentflow retry {item['run_id']} {item['key']}")
         elif item["questions"]:
             print(f"  agentflow answer {item['run_id']}")

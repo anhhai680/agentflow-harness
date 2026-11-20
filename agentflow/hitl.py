@@ -409,12 +409,18 @@ def _digest_unchanged(path: Path, text: str) -> bool:
 def notify_run(cfg: Config, run: Run, message: str) -> None:
     """`notify` with the run's configured title. With `hitl.digest` on it sends `digest_text` instead of `message`,
     and only when that differs from the line last sent (kept in the state dir): a note that changes no count is
-    never sent."""
+    never sent. A digest that cannot be built (another run's state unreadable, say) is logged as `notify_failed` and
+    `message` is sent instead: telling a person never raises."""
     if cfg.hitl.get("digest") is not True:
         notify(cfg, _title_for(cfg, run), message, run=run)
         return
-    text = digest_text(run.repo)
-    path = pack.state_dir(run.repo) / DIGEST_FILE
+    try:
+        text = digest_text(run.repo)
+        path = pack.state_dir(run.repo) / DIGEST_FILE
+    except Exception as exc:  # it reads every run of the repository: any failure falls back to `message`
+        _log_failure(run, "digest", f"could not build the digest: {exc}")
+        notify(cfg, _title_for(cfg, run), message, run=run)
+        return
     if _digest_unchanged(path, text):
         return
     notify(cfg, DIGEST_TITLE, text, run=run)
@@ -504,7 +510,7 @@ def park_wait(cfg: Config, run: Run, wait: dict, *, blast_radius: dict, shelf: s
     line = radius_line(radius)
     how = [f"Run `{run.id}` parked `{key}` ({kind}) and goes on with the tasks that do not wait on it.",
            _parked_ways_out(run, kind, key, bool(questions)),
-           *filter(None, [constraint_line(cfg, run, key, bool(questions))]),
+           *filter(None, [constraint_line(cfg, run, key, bool(questions), kind)]),
            f"Blast radius: {line}"]
     path = run.inbox_path(key)
     summary = str(wait.get("summary") or "")
@@ -530,16 +536,17 @@ def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Confi
     a constraint gate failed on `key`. `times` above 1 is a `blocked_repeat` stop that came back after a human's
     approval."""
     way = _way_on(run, kind, key, has_questions, cfg, times)
-    lifted = constraint_line(cfg, run, key, has_questions)
+    lifted = constraint_line(cfg, run, key, has_questions, kind)
     return f"{way}\n\n{lifted}" if lifted else way
 
 
-def constraint_line(cfg: Config, run: Run, key: str, has_questions: bool = False) -> str:
+def constraint_line(cfg: Config, run: Run, key: str, has_questions: bool = False, kind: str = "") -> str:
     """The inbox line for a stop a constraint gate failed on (`constraint_gates_failed`), else "": only a person lifts
-    it, with one approval."""
+    it, with one approval (with a note for a `blocked_repeat`, which `approve` refuses without one)."""
     if has_questions or run.state.get("pipeline") == RETRO_PIPELINE or not constraint_gates_failed(cfg, run, key):
         return ""
-    return f"Only a person can lift this constraint: `agentflow approve {run.id} {key} --constraint`."
+    note = ' --note "..."' if kind == "blocked_repeat" else ""
+    return f"Only a person can lift this constraint: `agentflow approve {run.id} {key} --constraint{note}`."
 
 
 def constraint_gates_failed(cfg: Config, run: Run, key: str) -> list[str]:
@@ -872,16 +879,18 @@ def task_scope(phase: str, key: str) -> tuple[str, int] | None:
 
 
 def rejected_scope(run: Run, phase: str, key: str) -> tuple[str, int] | None:
-    """`task_scope`, unless the task was one of a batch of several (`plan_batched`): the batch's members before
-    its last were committed without a review of their own, so a stop in the batch sends the whole phase back."""
+    """`task_scope`, unless the task was ever one of a batch of several (any `plan_batched`, also one recorded before
+    a split took it out): the batch's members before its last were committed without a review of their own, so a
+    stop in the batch sends the whole phase back."""
     scoped = task_scope(phase, key)
     if scoped is None:
         return None
     prefix = scoped[0].rsplit("/", 1)[0]
-    batched = [e for e in run.events.read() if e["type"] == "plan_batched" and e.get("key") == prefix]
-    batches = (batched[-1].get("batches") or []) if batched else []
-    if any(isinstance(b, list) and len(b) > 1 and scoped[1] in b for b in batches):
-        return None
+    for event in run.events.read():
+        if event["type"] != "plan_batched" or event.get("key") != prefix:
+            continue
+        if any(isinstance(b, list) and len(b) > 1 and scoped[1] in b for b in event.get("batches") or []):
+            return None
     return scoped
 
 

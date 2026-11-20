@@ -788,6 +788,14 @@ def test_inbox_cli_names_a_parked_stops_way_out(repo, run, cfg, macos_calls, cap
     assert f"agentflow approve {run.id} {PA}" in out and f"agentflow retry {run.id} {PA}" in out
 
 
+def test_inbox_cli_asks_for_a_note_on_a_parked_repeated_block(repo, run, cfg, macos_calls, capsys):
+    park(cfg, run, PA, kind="blocked_repeat")
+    capsys.readouterr()
+    assert main(["inbox"]) == 0
+    out = capsys.readouterr().out
+    assert f'agentflow approve {run.id} {PA} --note "..."' in out  # a plain approve of it is refused
+
+
 def test_approving_while_a_runner_is_live_only_records(repo, run, cfg, macos_calls, capsys):
     from agentflow.events import RunLock
 
@@ -1042,6 +1050,18 @@ def test_an_unreadable_last_digest_is_sent_again(repo, run, cfg, macos_calls):
     last.mkdir()  # not a regular file: it can't be read
     hitl.notify_run(on, run, "x")
     assert len(macos_calls) == 2
+
+
+def test_a_digest_that_cannot_be_built_sends_the_plain_message(repo, run, cfg, macos_calls, monkeypatch):
+    def broken(repo):
+        raise RuntimeError("another run's state is unreadable")
+
+    monkeypatch.setattr(hitl, "digest_text", broken)
+    hitl.notify_run(_digest_cfg(cfg), run, "blocked: something specific")  # never raises where it did not before
+    assert len(macos_calls) == 1 and "blocked: something specific" in macos_calls[0][2]
+    (failed,) = [e for e in run.events.read() if e["type"] == "notify_failed"]
+    assert failed["notifier"] == "digest" and "unreadable" in failed["error"]
+    assert not (pack.state_dir(repo) / "notify_digest.txt").exists()
 
 
 def test_with_the_digest_off_every_notification_is_sent(repo, run, cfg, macos_calls):

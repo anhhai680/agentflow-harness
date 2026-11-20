@@ -575,6 +575,52 @@ def test_a_blocked_task_parks_and_the_independent_ones_finish(lane, git):
     assert git(lane.root, "show", "HEAD:src/two.py") == "half again\n"
 
 
+def test_a_review_park_reviews_only_its_own_task_after_the_unshelve(lane, git):
+    run = begin_build(lane, plan_text({1: "none", 2: "none", 3: "none"}, count=3,
+                                      files={1: ["src/one.py"], 2: ["src/two.py"], 3: ["src/three.py"]}))
+    impl1, review1 = IMPL.format(n=1), REVIEW.format(n=1)
+    lane.script({impl1: [{"write": {"src/one.py": "one\n"}, "result": DONE_RESULT}],
+                 review1: [{"result": {"status": "blocked", "summary": "cannot review"}}, review()]})
+    assert build(lane, run) == ("stopped", True)
+    (parked,) = lane.events(run, "step_parked")
+    assert parked["key"] == review1 and parked["shelved"] == ["src/one.py"]
+    assert subjects(git, lane.root)[:2] == ["Task 3: Third thing", "Task 2: Second thing"]
+    task3 = lane.head()
+
+    n_before = len(lane.calls())
+    approve(run, review1, by="me", note="the log has it")
+    assert build(lane, run) == ("done", True)
+    after = lane.calls()[n_before:]
+    assert steps(after) == [review1]  # the implementer is done: only the review runs again
+    (unparked,) = lane.events(run, "unit_unparked")
+    assert unparked["head"] == task3  # HEAD the shelf was applied on
+    prompt = after[0]["argv"][-1]
+    assert f"`{task3}..worktree`" in prompt  # task 1's work only, not tasks 2 and 3's commits
+    assert "--resume" not in after[0]["argv"] and "said: the log has it" in prompt  # fresh, with the person's note
+    assert files_of(git, lane.root, "Task 1: First thing") == [PLAN_PATH, "src/one.py"]
+
+
+def test_an_unresolved_review_park_rereviews_only_its_own_task(lane, git):
+    run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
+    impl1, review1 = IMPL.format(n=1), REVIEW.format(n=1)
+    lane.script({impl1: [{"write": {"src/one.py": "one\n"}, "result": DONE_RESULT},
+                         {"write": {"src/one.py": "one fixed\n"}, "result": DONE_RESULT}],
+                 review1: [review(FINDING), review(FINDING), review()]})
+    assert build(lane, run) == ("stopped", True)
+    (parked,) = lane.events(run, "step_parked")
+    assert parked["key"] == review1 and parked["kind"] == "review_unresolved"
+    assert subjects(git, lane.root)[0] == "Task 2: Second thing"
+    task2 = lane.head()
+
+    n_before = len(lane.calls())
+    approve(run, review1, by="me")
+    assert build(lane, run) == ("done", True)
+    after = lane.calls()[n_before:]
+    assert steps(after) == [review1]
+    assert f"`{task2}..worktree`" in after[0]["argv"][-1]  # the third look starts where the shelf was applied
+    assert files_of(git, lane.root, "Task 1: First thing") == [PLAN_PATH, "src/one.py"]
+
+
 def test_a_task_naming_the_parked_tasks_file_waits(lane, git):
     run = begin_build(lane, plan_text({1: "none", 2: "none", 3: "none"}, count=3,
                                       files={1: ["src/shared.py"], 2: ["src/two.py"], 3: ["src/shared.py"]}))
@@ -1592,6 +1638,28 @@ def test_a_batch_member_held_behind_a_split_member_runs_alone(batched, git, plan
     committed = [e["n"] for e in batched.events(run, "task_committed")]
     assert all(any(n in members for members in covered.values()) for n in committed)  # no commit goes unreviewed
     assert covered == {1: [1], 2: [2], 3: [3]}
+
+
+def reviewed_tasks(calls: list[dict]) -> set[int]:
+    """The tasks some review session's prompt named, by title: what the reviews covered between them."""
+    return {n for c in calls if c["step"].endswith("/review") for n, title in TITLES.items() if title in c["argv"][-1]}
+
+
+def test_rejecting_a_task_split_out_of_a_batch_refines_the_whole_phase(batched):
+    from agentflow.hitl import reject
+
+    run = begin_build(batched, plan_text({1: "none", 2: "none", 3: "Task 2", 4: "none"}, count=4))
+    batched.script({IMPL.format(n=2): [{"result": {"status": "blocked", "summary": "stuck"}}]})
+    assert build(batched, run) == ("stopped", True)
+    assert [e["batches"] for e in batched.events(run, "plan_batched")] == [[[1, 2, 3]], [[1, 3], [2]]]
+    assert [e["key"] for e in batched.events(run, "task_committed")] == ["build/build/task-1", "build/build/task-4"]
+    assert run.state["waiting"]["key"] == IMPL.format(n=2) and run.state["waiting"]["promoted"] is True
+
+    reject(run, IMPL.format(n=2), "me", "do it the other way")  # 2 was a batch of one only after the split
+    assert "scope" not in run.state["refine"]  # task 1 was committed unreviewed, so the whole phase goes back
+    assert build(batched, run) == ("done", True)
+    committed = {e["n"] for e in batched.events(run, "task_committed")}
+    assert committed == {1, 2, 3, 4} and committed <= reviewed_tasks(batched.calls())  # no commit goes unreviewed
 
 
 def test_batches_are_decided_once_and_survive_ticked_tasks(batched):

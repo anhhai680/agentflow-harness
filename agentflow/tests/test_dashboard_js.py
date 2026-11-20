@@ -241,6 +241,25 @@ def test_batch_approvals_keeps_the_approvals_that_take_no_note():
     assert js(["inbox.js"], "batchApprovals(args).map(i => i.run_id)", items) == ["r1", "r2"]
 
 
+def test_approve_all_sends_only_the_approvals_shown_when_it_armed():
+    """An approval that arrives between the arming press and the confirming one is not approved unseen."""
+    got = js_async(["inbox.js"], """(async () => {
+      var sent = [];
+      setTimeout = () => 0; clearTimeout = () => {};
+      renderInbox = () => {};
+      act = async (run, action, body) => { sent.push(run + ":" + action); return true; };
+      viewedList = () => [];
+      ui = {inbox: {view: {items: args.slice(0, 2)}, armed: null, armedAt: 0, drafts: new Map(), busy: new Set(),
+                    sent: new Set()}};
+      approveAllItems();  // arms over r1 and r2
+      ui.inbox.view = {items: args};  // r3 arrives in the 4 seconds
+      approveAllItems();  // confirms
+      for (let i = 0; i < 50; i++) await null;
+      return sent;
+    })()""", [approval("r1"), approval("r2", phase="plan"), approval("r3")])
+    assert got == ["r1:approve", "r2:approve"]
+
+
 def test_a_constraint_approval_sends_the_flag_and_still_needs_a_required_note():
     item = {"run_id": "r", "kind": "gate_failed", "key": "build/build/task-2/commit", "approve_note": "optional",
             "actions": ["approve", "reject", "approve_constraint"]}

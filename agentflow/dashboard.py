@@ -64,6 +64,7 @@ It can approve checkpoints and start agents, so it is locked down:
 
 from __future__ import annotations
 
+import getpass
 import hmac
 import json
 import math
@@ -233,7 +234,11 @@ def _approve(run: Run, body: dict, cfg: Config, repo: Path | None = None) -> tup
     # `cfg=None`: a constraint approval reads the gates from the config the run continues with (its trusted one, as the
     # CLI's does), not the dashboard's, so it cannot be accepted here and never written by a runner on another config.
     try:
-        rested = hitl.approve(run, target, BY, budget=budget, hold=_rests(run, cfg), note=_text(body, "note"),
+        # A constraint approval is written into the override commit's trailer, which names the human (spec §4.1.6): the
+        # same default identity as the CLI's (`getpass.getuser()`; the dashboard is a token-guarded localhost tool run
+        # by that user). Every other dashboard action is recorded as the dashboard's.
+        by = getpass.getuser() if constraint else BY
+        rested = hitl.approve(run, target, by, budget=budget, hold=_rests(run, cfg), note=_text(body, "note"),
                               budget_step=cfg.defaults.run_budget_usd, viewed=viewed,
                               produced=_produced(run, repo, target) if repo is not None else None,
                               constraint=constraint)

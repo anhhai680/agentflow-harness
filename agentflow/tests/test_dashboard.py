@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import http.client
 import json
 import os
@@ -531,14 +532,15 @@ def test_approve_passes_constraint(dash, monkeypatch):
     status, _, body = dash.post(f"/api/runs/{run.id}/approve", {"target": CONSTRAINT_KEY, "constraint": True})
     assert status == 200, body
     (approved,) = [e for e in run.events.read() if e["type"] == "hitl_approved"]
-    assert approved["constraint"] is True and approved["by"] == "dashboard" and approved["key"] == CONSTRAINT_KEY
+    assert approved["constraint"] is True and approved["key"] == CONSTRAINT_KEY
+    assert approved["by"] == getpass.getuser()  # the trailer names the person, as the CLI's default does
 
 
 def test_a_plain_approve_of_a_constraint_stop_is_not_a_constraint(dash, monkeypatch):
     run = constraint_stop(dash, monkeypatch)
     assert dash.post(f"/api/runs/{run.id}/approve", {"target": CONSTRAINT_KEY})[0] == 200
     (approved,) = [e for e in run.events.read() if e["type"] == "hitl_approved"]
-    assert "constraint" not in approved
+    assert "constraint" not in approved and approved["by"] == "dashboard"  # only a constraint approval names the user
 
 
 def test_a_constraint_approval_with_no_failed_constraint_gate_is_a_409(dash, monkeypatch):

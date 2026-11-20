@@ -1335,6 +1335,33 @@ def drop_shelf(worktree: Path, ref: str) -> None:
     subprocess.run(["git", *HARDENED, "update-ref", "-d", ref], cwd=Path(worktree), capture_output=True, check=False)
 
 
+def drop_shelves(repo: Path, run_id: str) -> list[str]:
+    """Delete every shelf ref of run `run_id` (`refs/agentflow/shelf/<run id>/...`) and return the refs it deleted.
+    Never raises: a run id git refuses in a ref name, or a git that fails, deletes nothing (or what it could)."""
+    prefix = f"refs/agentflow/shelf/{run_id}/"
+    if not run_id or "/" in run_id:
+        return []
+    try:
+        if subprocess.run(["git", "check-ref-format", f"{prefix}x"], capture_output=True, timeout=30).returncode != 0:
+            return []
+        listed = subprocess.run(["git", *HARDENED, "for-each-ref", "--format=%(refname)", prefix], cwd=Path(repo),
+                                capture_output=True, text=True, check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    dropped = []
+    for ref in listed.stdout.splitlines() if listed.returncode == 0 else []:
+        if not ref.startswith(prefix):
+            continue
+        try:
+            done = subprocess.run(["git", *HARDENED, "update-ref", "-d", ref], cwd=Path(repo), capture_output=True,
+                                  check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0:
+            dropped.append(ref)
+    return dropped
+
+
 def dirty_paths(worktree: Path) -> list[str]:
     """Paths with staged, unstaged or untracked changes in the checkout at `worktree` (ignored files aside)."""
     return [line[3:] for line in _git_or_raise(Path(worktree), "status", "--porcelain").splitlines() if line.strip()]

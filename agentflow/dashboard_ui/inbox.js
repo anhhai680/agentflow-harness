@@ -24,6 +24,10 @@ function batchApprovals(items) {
   return (items || []).filter((i) => i.group === "approval" && (i.actions || []).includes("approve") && i.approve_note !== "required" && !i.goneText);
 }
 
+// The batch approvals among `items` that were already there when "Approve all" armed (`keys`): one that arrived since was
+// never seen, so it is decided on its own card.
+const armedApprovals = (items, keys) => batchApprovals(items).filter((i) => keys.has(inboxItemKey(i)));
+
 // Each question starts on the option the agent recommended ("" when it recommended none).
 function answerDefaults(questions) {
   const out = {};
@@ -169,6 +173,7 @@ function inboxDraft(item) {
 
 let inboxArmTimer = null;
 let inboxSeq = 0;
+let inboxArmedAll = new Set();  // the item keys "Approve all" showed when it armed: the confirming press sends only those
 
 function redrawInbox() { if (ui.inbox.view) renderInbox(ui.inbox.view); }
 
@@ -251,11 +256,14 @@ function approveConstraintItem(item) {
   });
 }
 
-// "Approve all N" in the approvals header: the first press arms it, the second sends one approve per item, one after the
-// other, and stops at the first that fails (the toast says why).
+// "Approve all N" in the approvals header: the first press arms it over the approvals shown then, the second sends one
+// approve per item of those still waiting, one after the other, and stops at the first that fails (the toast says why).
 function approveAllItems() {
+  const items = () => (ui.inbox.view ? ui.inbox.view.items : []);
+  if (ui.inbox.armed !== INBOX_ARM_ALL) inboxArmedAll = new Set(batchApprovals(items()).map(inboxItemKey));
+  const keys = inboxArmedAll;
   armOrSend(INBOX_ARM_ALL, async () => {
-    for (const item of batchApprovals(ui.inbox.view ? ui.inbox.view.items : [])) {
+    for (const item of armedApprovals(items(), keys)) {
       const got = approvePayload(item, { note: "" });
       if (!got.ok) { inboxRefuse(item, got.error); continue; }
       if (!(await inboxSend(item, "approve", got.body))) break;
@@ -471,8 +479,11 @@ function inboxGroupHead(d) {
 function inboxEntries(view, shown) {
   const entries = [];
   for (const group of shown.groups) {
-    const batch = ui.inbox.group === "kind" && group.key === "approval" ? batchApprovals(group.items).length : 0;
-    entries.push(entry("group:" + ui.inbox.group + ":" + group.key, { label: group.label, batch: batch, armed: batch > 0 && ui.inbox.armed === INBOX_ARM_ALL }, inboxGroupHead));
+    const approvals = ui.inbox.group === "kind" && group.key === "approval";
+    const armedAll = approvals && ui.inbox.armed === INBOX_ARM_ALL;
+    // armed, the count is what the confirming press sends: the approvals shown when it armed
+    const batch = !approvals ? 0 : armedAll ? armedApprovals(group.items, inboxArmedAll).length : batchApprovals(group.items).length;
+    entries.push(entry("group:" + ui.inbox.group + ":" + group.key, { label: group.label, batch: batch, armed: batch > 0 && armedAll }, inboxGroupHead));
     for (const item of group.items) {
       const key = inboxItemKey(item);
       const draft = inboxDraft(item);
@@ -577,7 +588,7 @@ function focusInboxCard(key) {
 
 // Whether what is armed still stands: its item is still in the Inbox, or (approve all) at least two approvals still go together.
 function inboxArmLive(armed, live, view) {
-  if (armed === INBOX_ARM_ALL) return ui.inbox.group === "kind" && batchApprovals(view.items).length >= 2;
+  if (armed === INBOX_ARM_ALL) return ui.inbox.group === "kind" && armedApprovals(view.items, inboxArmedAll).length >= 2;
   if (armed.startsWith(INBOX_ARM_CONSTRAINT)) return live.has(armed.slice(INBOX_ARM_CONSTRAINT.length));
   return live.has(armed);
 }

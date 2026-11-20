@@ -138,6 +138,15 @@ def test_a_person_approves_a_constraint_gate_failure(run, ccfg):
     assert run.state["waiting"] is None
 
 
+def test_the_constraint_line_of_a_repeated_block_asks_for_a_note(run, ccfg):
+    from agentflow.hitl import constraint_line
+
+    run.emit("gate_result", key=K, gate="floor", passed=False, skipped=False, reason="", log=None, duration_s=0.1,
+             tree="t")
+    assert constraint_line(ccfg, run, K, kind="blocked_repeat").endswith(f'{K} --constraint --note "..."`.')
+    assert constraint_line(ccfg, run, K, kind="gate_failed").endswith(f"{K} --constraint`.")
+
+
 def test_a_stop_with_no_constraint_gate_failed_has_no_constraint_line(run, ccfg):
     gate_failed_on(run, ccfg, gate="py_lint")
     assert "--constraint" not in run.inbox_path(K).read_text(encoding="utf-8")
