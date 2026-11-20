@@ -967,6 +967,9 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
     """Check that `key` may start now and record `item_starting`. `Refused` (409) says why not."""
     repo = Path(repo)
     kind, name = parse_key(key)
+    reason = module_queue.usage_hold(cfg)
+    if reason is not None:
+        raise Refused(f"the usage window holds new runs: {reason}")
     log = _log(repo)
     with log.locked():
         pic = _picture(cfg, repo)

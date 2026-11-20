@@ -205,6 +205,36 @@ def _print_retro_due(cfg, repo: Path) -> None:
         print(f"Retro due: {reason} → agentflow retro")
 
 
+def _print_usage_wait(cfg) -> None:
+    """`next`'s last line while the usage window holds new runs; nothing otherwise, and never an error."""
+    from agentflow.module_queue import usage_hold
+
+    reason = usage_hold(cfg)
+    if reason:
+        print(f"usage: {reason}; new runs wait")
+
+
+def _print_usage_note(cfg) -> None:
+    """One line before a run starts when a window governs it (soft or above), as the run then waits at its first
+    phase. A hold that comes only from runs waiting to go first prints nothing: the run's own gate waits for them.
+    Never an error."""
+    import time
+
+    from agentflow import governor
+
+    try:
+        usage = governor.current_usage(cfg)
+        if usage.governor in ("observe", "off"):
+            return
+        now = time.time()
+        windows = governor.WindowFile().read()["windows"].get(governor.account_of(cfg), {})
+        found = governor.verdict(usage, windows, now)
+        if found.level in ("soft", "hard"):
+            print(f"note: {governor.describe(found, usage, now)}; the run waits at its first phase")
+    except Exception:  # noqa: BLE001 - a scheduling aid never stops a run
+        pass
+
+
 def _by(args: argparse.Namespace) -> str:
     return args.by or getpass.getuser()
 
@@ -621,6 +651,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         if problem:
             print(f"error: {problem}")
             return 1
+        _print_usage_note(cfg)
         run = start(cfg, repo, args.lane, params, opts)
         print(f"Started {run.id} in {run.state['worktree']} on {run.state['branch']}.")
         if args.detach:
@@ -708,6 +739,7 @@ def cmd_next(args: argparse.Namespace) -> int:
         cfg, repo = _load_cfg(args), _find_repo()
         print(format_answer(next_step(cfg, repo)))
         _print_retro_due(cfg, repo)
+        _print_usage_wait(cfg)
     except _human_errors() as exc:
         print(f"error: {exc}")
         return 1

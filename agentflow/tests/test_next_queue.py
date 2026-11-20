@@ -7,15 +7,16 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
-from agentflow import hitl, module_queue
+from agentflow import governor, hitl, module_queue
 from agentflow.flow import main
 from agentflow.module_queue import NextAnswer, QueueBusy, QueueState, StartFailed, next_step, queue_tick
 from agentflow.state import runs_root
 
-from conftest import ENGINE, run_git
+from conftest import ENGINE, prime, release, run_git
 
 GH_BIN = ENGINE / "tests" / "bin"
 APPROVED_SPEC = "# Spec: {m}\n\n**Status: approved** 2026-10-28\n"
@@ -1463,3 +1464,134 @@ def test_a_retro_that_stays_open_is_not_started_again_by_each_cron_run(qrepo, mo
     assert len(logs[0]) == 1 and "already" not in logs[0][0]
     for later in logs[1:]:
         assert len(later) == 1 and "a retro is already waiting_human" in later[0] and "\n" not in later[0]
+
+
+# --------------------------------------------------------------------------- the usage window holds new runs
+
+
+SOFT = "the 5h usage window is at 80% (above usage.five_hour_soft 0.75)"
+
+
+def test_the_queue_starts_nothing_above_the_soft_mark(qrepo, monkeypatch):
+    _retro_before(qrepo)
+    _old_run(qrepo)
+    calls = _retro_queue(qrepo, monkeypatch)
+    prime(0.8)
+    messages: list[str] = []
+    go = Starter(qrepo)
+    assert module_queue.run_queue(qrepo.cfg, qrepo.root, 2, go, once=True, log=messages.append) == 0
+    assert go.started == [] and calls == []  # no module and no retro, but the assessment still ran
+    state = {m["id"]: m for m in QueueState.load(qrepo.root).modules}
+    assert state["platform"]["status"] == "backlog"
+    (line,) = [m for m in messages if "usage window" in m]
+    assert SOFT in line
+
+
+def test_the_queue_says_a_hold_once_until_its_reason_changes(qrepo):
+    prime(0.8)
+    messages: list[str] = []
+    seen: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        seen.append(seconds)
+        if len(seen) == 2:
+            prime(0.9)  # a higher reading: another reason
+        if len(seen) == 4:
+            raise KeyboardInterrupt
+
+    go = Starter(qrepo)
+    assert module_queue.run_queue(qrepo.cfg, qrepo.root, 2, go, interval=1.0, sleep=sleep, log=messages.append) == 0
+    held = [m for m in messages if "usage window" in m]
+    assert len(held) == 2 and "80%" in held[0] and "90%" in held[1]
+    assert go.started == []
+
+
+def test_the_queue_starts_nothing_while_a_ready_run_waits(qrepo):
+    now = time.time()
+    governor.WindowFile().wait("x", "/elsewhere", [0.8, 0.0], now, True, now)  # alive, fresh and ready
+    messages: list[str] = []
+    go = Starter(qrepo)
+    assert module_queue.run_queue(qrepo.cfg, qrepo.root, 2, go, once=True, log=messages.append) == 0
+    assert go.started == []
+    assert any("1 run(s) wait on the usage window and go first" in m for m in messages)
+
+
+def test_a_stale_waiter_does_not_stop_the_queue(qrepo):
+    old = time.time() - 600  # its last heartbeat was ten minutes ago
+    governor.WindowFile().wait("x", "/elsewhere", [0.8, 0.0], old, True, old)
+    go = Starter(qrepo)
+    assert module_queue.run_queue(qrepo.cfg, qrepo.root, 2, go, once=True, log=lambda m: None) == 0
+    assert go.started == ["platform"]
+
+
+def test_the_queue_starts_again_in_observe(qrepo):
+    qrepo.configure({"usage": {"governor": "observe"}})
+    prime(0.95)
+    go = Starter(qrepo)
+    assert module_queue.run_queue(qrepo.cfg, qrepo.root, 2, go, once=True, log=lambda m: None) == 0
+    assert go.started == ["platform"]
+
+
+def test_the_queue_starts_modules_when_the_governor_fails(qrepo, monkeypatch):
+    def broken(*_a, **_k):
+        raise RuntimeError("no account")
+
+    monkeypatch.setattr(governor, "account_of", broken)
+    prime(0.95)
+    go = Starter(qrepo)
+    assert module_queue.run_queue(qrepo.cfg, qrepo.root, 2, go, once=True, log=lambda m: None) == 0
+    assert go.started == ["platform"]
+
+
+def test_next_says_new_runs_wait(qrepo, capsys):
+    qrepo.install_pack()
+    write(qrepo.root, "docs/idea.md", "# idea\n")
+    prime(0.8)
+    assert main(["next"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[-1].startswith(f"usage: {SOFT}") and out[-1].endswith("; new runs wait")
+    release()
+    assert main(["next"]) == 0
+    assert "usage:" not in capsys.readouterr().out
+
+
+def _run_says(qrepo, monkeypatch, capsys) -> list[str]:
+    """What `agentflow run` prints before it calls `start` (which the test stops with an error)."""
+    from agentflow import pipeline
+
+    def stop(*_args, **_kwargs):
+        raise ValueError("stopped here")
+
+    monkeypatch.setattr(pipeline, "start", stop)
+    assert main(["run", "feature", "--module", "platform"]) == 1
+    return capsys.readouterr().out.splitlines()
+
+
+def test_run_names_a_window_that_governs(qrepo, monkeypatch, capsys):
+    qrepo.install_pack()
+    prime(0.8)
+    note, error = _run_says(qrepo, monkeypatch, capsys)
+    assert note.startswith(f"note: {SOFT}") and note.endswith("; the run waits at its first phase")
+    assert error == "error: stopped here"
+
+
+def test_run_says_nothing_for_a_reason_that_comes_only_from_waiters(qrepo, monkeypatch, capsys):
+    qrepo.install_pack()
+    now = time.time()
+    governor.WindowFile().wait("x", "/elsewhere", [0.8, 0.0], now, True, now)
+    assert _run_says(qrepo, monkeypatch, capsys) == ["error: stopped here"]
+
+
+def test_run_says_nothing_when_the_window_is_clear_or_observed(qrepo, monkeypatch, capsys):
+    from agentflow import flow
+
+    qrepo.install_pack()
+    assert _run_says(qrepo, monkeypatch, capsys) == ["error: stopped here"]
+    prime(0.8)
+    qrepo.configure({"usage": {"governor": "observe"}})
+    flow._print_usage_note(qrepo.cfg)
+    assert capsys.readouterr().out == ""
+    monkeypatch.setattr(governor, "account_of", lambda cfg: 1 / 0)
+    qrepo.configure()
+    flow._print_usage_note(qrepo.cfg)  # a governor that fails stops nothing and says nothing
+    assert capsys.readouterr().out == ""

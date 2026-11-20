@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agentflow import finished, gitops, pack, sources, work_source
+from agentflow import finished, gitops, governor, pack, sources, work_source
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.gitops import uncommitted_paths
 from agentflow.guards import path_matches
@@ -696,9 +696,11 @@ def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = 
 
 def queue_tick(
     cfg: Config, repo: Path, max_parallel: int, start: Callable[[str], str],
-    log: Callable[[str], None] | None = None,
+    log: Callable[[str], None] | None = None, hold: str | None = None,
 ) -> list[str]:
     """Start the ready modules in map order while fewer than `max_parallel` runs are live; return their ids.
+
+    With a `hold` reason (`usage_hold`) nothing starts, but the assessment, the state writes and the reports still run.
 
     A module that cannot move without a person (a failed or cancelled run, a merge state `gh` could not
     give, an unknown dependency, a dependency cycle, a start that failed) is reported through `log`; see
@@ -716,7 +718,7 @@ def queue_tick(
     for entry in entries:
         if entry["status"] != "backlog" or entry["run_id"] or entry["id"] in blocked or not set(entry["deps"]) <= done:
             continue
-        if occupied >= max_parallel:
+        if hold is not None or occupied >= max_parallel:
             break
         try:
             entry["run_id"] = start(entry["id"])
@@ -1042,6 +1044,16 @@ def _retro_if_due(cfg: Config, repo: Path, say: Callable[[str], None],
         return True
 
 
+def usage_hold(cfg: Config) -> str | None:
+    """Why no new run may start now: the usage window's reason (`governor.start_gate`), or None. It reads the `usage`
+    keys afresh, so `usage.governor: off` frees the queue and the Backlog with no restart. It fails open: a governor
+    that cannot answer holds nothing."""
+    try:
+        return governor.start_gate(governor.current_usage(cfg), governor.account_of(cfg))
+    except Exception:  # noqa: BLE001 - a scheduling aid never stops the queue
+        return None
+
+
 def run_queue(
     cfg: Config, repo: Path, max_parallel: int, start: Callable[[str], str], *,
     once: bool = False, interval: float = INTERVAL_S, sleep: Callable[[float], None] = time.sleep,
@@ -1057,13 +1069,19 @@ def run_queue(
     say = log or print
     retro_gave_up = False  # one failed retro per queue: the next tick would fail the same way
     say_first = _once(say)  # "run the first retro by hand" is said once per queue, not once per tick
+    held_for: str | None = None  # the usage hold last said, so a hold is said once until its reason changes
     with queue_lock(repo):
         try:
             while True:
                 gitops.fetch_remote_branch(repo, cfg.project.fork_from)  # where a merged plan lands (see _plan_finished)
-                if not retro_gave_up:
+                hold = usage_hold(cfg)
+                if hold != held_for:
+                    held_for = hold
+                    if hold is not None:
+                        say(f"usage: {hold}; no new run starts")
+                if not retro_gave_up and hold is None:
                     retro_gave_up = _retro_if_due(cfg, repo, say, say_first)
-                for module in queue_tick(cfg, repo, max_parallel, start, log=say):
+                for module in queue_tick(cfg, repo, max_parallel, start, log=say, hold=hold):
                     say(f"started {module}")
                 hitl.remind_due(cfg, repo, datetime.now(UTC))  # waits past `hitl.remind_after_h` are notified again
                 for run_id in preflight.recheck_waiting(cfg, repo, log=say):  # a fixed machine ends its wait
@@ -1143,5 +1161,5 @@ __all__ = [
     "Assessment", "NextAnswer", "OriginView", "QueueBusy", "QueueState", "StartFailed", "assess_modules",
     "cached_entries", "dependency_view", "done_reason", "format_answer", "issue_is_closed", "issue_of_module",
     "known_ids", "origin_view", "own_plans", "module_lane", "next_step", "queue_lock", "queue_tick", "run_queue",
-    "spawn_feature_run", "spawn_run",
+    "spawn_feature_run", "spawn_run", "usage_hold",
 ]
