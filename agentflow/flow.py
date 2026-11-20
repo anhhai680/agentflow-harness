@@ -214,13 +214,15 @@ def _print_usage_wait(cfg) -> None:
         print(f"usage: {reason}; new runs wait")
 
 
-def _print_usage_note(cfg) -> None:
+def _print_usage_note(cfg, from_phase: str | None = None) -> None:
     """One line before a run starts when a window governs it (soft or above), as the run then waits at its first
-    phase. A hold that comes only from runs waiting to go first prints nothing: the run's own gate waits for them.
-    Never an error."""
+    phase (`from_phase`, else the pack's first), unless that phase ships, which the soft mark never holds (the hard
+    mark still holds its sessions). A hold that comes only from runs waiting to go first prints nothing: the run's
+    own gate waits for them. Never an error."""
     import time
 
     from agentflow import governor
+    from agentflow.pipeline import _holds_ship
 
     try:
         usage = governor.current_usage(cfg)
@@ -230,7 +232,10 @@ def _print_usage_note(cfg) -> None:
         windows = governor.WindowFile().read()["windows"].get(governor.account_of(cfg), {})
         found = governor.verdict(usage, windows, now)
         if found.level in ("soft", "hard"):
-            print(f"note: {governor.describe(found, usage, now)}; the run waits at its first phase")
+            first = cfg.phases.get(from_phase or next(iter(cfg.phases)))
+            ships = found.level == "soft" and first is not None and _holds_ship(first.steps)
+            print(f"note: {governor.describe(found, usage, now)}; "
+                  + ("the run's first phase ships, so it is not held" if ships else "the run waits at its first phase"))
     except Exception:  # noqa: BLE001 - a scheduling aid never stops a run
         pass
 
@@ -651,7 +656,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         if problem:
             print(f"error: {problem}")
             return 1
-        _print_usage_note(cfg)
+        _print_usage_note(cfg, args.from_phase)
         run = start(cfg, repo, args.lane, params, opts)
         print(f"Started {run.id} in {run.state['worktree']} on {run.state['branch']}.")
         if args.detach:

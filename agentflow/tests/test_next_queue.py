@@ -1575,6 +1575,16 @@ def test_run_names_a_window_that_governs(qrepo, monkeypatch, capsys):
     assert error == "error: stopped here"
 
 
+def test_run_does_not_say_it_waits_when_the_first_phase_is_never_held(qrepo, monkeypatch, capsys):
+    qrepo.install_pack()
+    prime(0.8)
+    monkeypatch.setattr("agentflow.pipeline.start", lambda *a, **k: (_ for _ in ()).throw(ValueError("stopped here")))
+    assert main(["run", "feature", "--module", "platform", "--from", "ship"]) == 1
+    note, error = capsys.readouterr().out.splitlines()
+    assert note.startswith(f"note: {SOFT}") and note.endswith("; the run's first phase ships, so it is not held")
+    assert error == "error: stopped here"
+
+
 def test_run_says_nothing_for_a_reason_that_comes_only_from_waiters(qrepo, monkeypatch, capsys):
     qrepo.install_pack()
     now = time.time()
