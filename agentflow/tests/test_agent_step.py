@@ -2944,3 +2944,22 @@ def test_a_broken_or_locked_window_file_never_touches_a_running_session(flow_rep
     first_argv, second_argv = (c["argv"] for c in flow_repo.calls()[:2])
     assert [a.replace(run.id, "RUN") for a in first_argv if "/brief/" not in a] == \
         [a.replace(second.id, "RUN") for a in second_argv if "/brief/" not in a]
+
+
+def test_a_mid_session_reading_makes_one_lock_try_and_never_waits(flow_repo):
+    # `LOCK_WAIT_S` stays at its real 2.0: a reading that waited for the lock would stall the stream thread
+    assert governor.LOCK_WAIT_S == 2.0
+    path = governor.window_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flow_repo.new_run()
+    executor = flow_repo.executor()
+    reading = {"five_hour": {"utilization": 0.5, "resets_at": int(time.time()) + 3600, "refused": False}}
+    with open(path.with_name("usage_window.lock"), "a") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        executor._on_reading(reading)
+        elapsed = time.monotonic() - started
+    assert elapsed < 0.1
+    assert not path.exists() and _file().read()["windows"] == {}  # dropped, not queued
+    executor._on_reading(reading)  # the lock is free again: the same reading is recorded
+    assert _file().read()["windows"][governor.account_of(flow_repo.cfg)]["five_hour"]["utilization"] == 0.5
