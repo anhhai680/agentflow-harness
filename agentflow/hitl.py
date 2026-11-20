@@ -52,6 +52,7 @@ MESSAGE_MAX = 240
 CLEARED_BY_APPROVE = ("checkpoint", "max_rounds", RECONCILE_CHANGED)
 # A retro run walks no phase and is never resumed (`pipeline.advance` refuses it), so a stop of one has one way out.
 RETRO_WAY_OUT = "cancel it and run `agentflow retro` again"
+CAP_STOPS = ("turn_cap", "budget_cap")  # a session that hit its turn or spend cap (`lanes.CAP_KINDS`)
 
 
 class ResultError(Exception):
@@ -446,6 +447,13 @@ def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Confi
     if run.state.get("pipeline") == RETRO_PIPELINE:
         return (f"A retro run cannot be resumed, approved or answered: `agentflow cancel {run.id}`, then run "
                 "`agentflow retro` again (it reads the same runs, since this retro did not finish).")
+    if kind in CAP_STOPS:
+        return (f"- Raise the cap once: `agentflow approve {run.id} {key}` resumes the session, and each call has its own "
+                f"cap.\n"
+                f"- Split the step: `agentflow approve {run.id} {key} --note \"Finish <part> as done now and stop\"`, then "
+                f"add the rest as a new task.\n"
+                f"- Descope: `agentflow approve {run.id} {key} --note \"Drop <part>: <why>\"`.\n"
+                f"- Start over: `agentflow retry {run.id} {key}` starts a fresh session.")
     scoped = rejected_scope(run, key.split("/")[0], key)
     back = f"task {scoped[1]}" if scoped else "the phase"
     reject = f"`agentflow reject {run.id} {key} --note \"...\"` sends {back} back for a refine round."

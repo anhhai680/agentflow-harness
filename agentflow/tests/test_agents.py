@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from agentflow.agents import (
+    BASH_OUTPUT_ENV,
     READ_ONLY_ALLOW,
     READ_ONLY_DENY,
     READ_ONLY_WRITES,
@@ -363,7 +364,8 @@ def test_env(claude, codex, call):
     # D8: both adapters get the run vars and the auto-compact override; Claude also gets its cache TTL and lean switches
     run_vars = {"AGENTFLOW_RUN", "AGENTFLOW_STEP", "AGENTFLOW_RESULT", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"}
     assert set(codex.env(call)) == run_vars
-    assert set(env) == run_vars | {"FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_DISABLE_AUTO_MEMORY"}
+    assert set(env) == run_vars | {"FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_DISABLE_AUTO_MEMORY", BASH_OUTPUT_ENV}
+    assert env[BASH_OUTPUT_ENV] == "15000"
     assert {k: v for k, v in env.items() if k in run_vars} == codex.env(call)
     assert env["FORCE_PROMPT_CACHING_5M"] == "1" and env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
 
@@ -390,6 +392,8 @@ def test_the_keys_switch_off(cfg, call):
     agent = claude_with(cfg, lean=False, user_settings=True, cache_ttl="cli")
     assert not {"--exclude-dynamic-system-prompt-sections", "--setting-sources", "--strict-mcp-config"} & set(agent.argv(call))
     assert not set(TTL_VARS) & set(agent.env(call)) and "CLAUDE_CODE_DISABLE_AUTO_MEMORY" not in agent.env(call)
+    agent = claude_with(cfg, lean=False, user_settings=True, cache_ttl="cli", bash_output_chars=0)
+    assert BASH_OUTPUT_ENV not in agent.env(call)  # 0: the CLI's own cap, or the inherited environment's, stands
     assert agent.env_drop(call) == ("CLAUDE_CODE_DISABLE_CLAUDE_MDS",)  # `cli`: the inherited TTL choice stands
 
 
@@ -397,7 +401,7 @@ def test_a_one_hour_cache_ttl_sets_its_variable_and_drops_the_others(cfg, call):
     agent = claude_with(cfg, cache_ttl="1h")
     assert agent.env(call)["ENABLE_PROMPT_CACHING_1H"] == "1" and "FORCE_PROMPT_CACHING_5M" not in agent.env(call)
     assert set(agent.env_drop(call)) == {"FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_PROMPT_CACHE_TTL",
-                                         "CLAUDE_CODE_DISABLE_CLAUDE_MDS"}  # no brief carries the rules here
+                                         "CLAUDE_CODE_DISABLE_CLAUDE_MDS", "BASH_MAX_OUTPUT_LENGTH"}  # no brief carries the rules here
 
 
 def test_the_cache_ttl_wins_over_the_packs_env(cfg, call):
@@ -406,6 +410,61 @@ def test_the_cache_ttl_wins_over_the_packs_env(cfg, call):
     assert {name for name in TTL_VARS if name in env} == {"ENABLE_PROMPT_CACHING_1H"} and env["KEEP"] == "x"
     env = claude_with(cfg, cache_ttl="cli").env(call)  # `cli`: nothing dropped, nothing added
     assert {name: env[name] for name in TTL_VARS if name in env} == {"FORCE_PROMPT_CACHING_5M": "1"}
+
+
+def test_caps_on_the_argv(cfg, call, codex):
+    spec = cfg.agents["claude"]
+    both = ClaudeAgent(dataclasses.replace(spec, max_turns=80), cfg.context).argv(
+        dataclasses.replace(call, max_turns=60, budget_usd=10.0))
+    assert both[both.index("--max-turns"):both.index("--max-turns") + 4] == ["--max-turns", "60", "--max-budget-usd", "10.00"]
+    agent = ClaudeAgent(dataclasses.replace(spec, max_turns=80), cfg.context)
+    for budget in (None, 0.0, 0.004, float("nan"), float("inf")):  # none, none, below the CLI's 0.01 floor, not finite
+        assert "--max-budget-usd" not in agent.argv(dataclasses.replace(call, max_turns=60, budget_usd=budget))
+    assert ("--max-budget-usd", "0.01") in pairs(agent.argv(dataclasses.replace(call, budget_usd=0.01)))
+    assert "--max-turns" not in agent.argv(dataclasses.replace(call, max_turns=0))
+    assert ("--max-turns", "80") in pairs(agent.argv(dataclasses.replace(call, max_turns=None)))
+    assert codex.argv(dataclasses.replace(call, max_turns=60, budget_usd=10.0)) == codex.argv(call)
+
+
+def test_bash_output_cap_is_runner_owned(cfg, call):
+    agent = claude_with(cfg, bash_output_chars=15000)
+    capped = dataclasses.replace(call, env={BASH_OUTPUT_ENV: "999999"})
+    assert agent.env(capped)[BASH_OUTPUT_ENV] == "15000" and BASH_OUTPUT_ENV in agent.env_drop(capped)
+    off = claude_with(cfg, bash_output_chars=0)
+    assert BASH_OUTPUT_ENV not in off.env(call) and BASH_OUTPUT_ENV not in off.env_drop(call)
+
+
+def capped_outcome(*lines: dict, exit_code: int = 1):
+    acc = StreamAccumulator(default_window=200000)
+    for line in lines:
+        parse_claude_line(json.dumps({"type": "result", "session_id": "s", **line}), acc)
+    return acc.to_outcome(exit_code)
+
+
+def test_a_capped_result_is_not_an_interruption():
+    turns = capped_outcome({"subtype": "error_max_turns", "is_error": True, "terminal_reason": "max_turns"})
+    assert turns.capped == "turns" and turns.interruption is None
+    spend = capped_outcome({"subtype": "error_max_budget_usd", "is_error": True, "terminal_reason": "budget_exhausted"})
+    assert spend.capped == "budget" and spend.interruption is None
+    by_reason = capped_outcome({"subtype": "error_during_execution", "is_error": True, "terminal_reason": "budget_exhausted"})
+    assert by_reason.capped == "budget"
+    first_wins = capped_outcome({"subtype": "error_max_turns", "is_error": True, "terminal_reason": "max_turns"},
+                                {"subtype": "success", "is_error": False, "terminal_reason": "completed"})
+    assert first_wins.capped == "turns" and first_wins.interruption is None
+    ok = capped_outcome({"subtype": "success", "is_error": False, "terminal_reason": "completed"}, exit_code=0)
+    assert ok.capped is None and ok.interruption is None
+    failed = capped_outcome({"subtype": "error_during_execution", "is_error": True, "terminal_reason": "api_error"})
+    assert failed.capped is None and failed.interruption.kind == "transient"
+
+
+def test_a_refused_window_wins_over_a_cap():
+    acc = StreamAccumulator(default_window=200000)
+    parse_claude_line(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "rejected", "resetsAt": 1794910800, "rateLimitType": "five_hour"}}), acc)
+    parse_claude_line(json.dumps({"type": "result", "subtype": "error_max_turns", "is_error": True,
+                                  "terminal_reason": "max_turns"}), acc)
+    outcome = acc.to_outcome(1)
+    assert outcome.capped == "turns" and outcome.interruption.kind == "usage_limit"
 
 
 def test_a_codex_call_drops_nothing_from_the_environment(codex, call):

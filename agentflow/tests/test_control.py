@@ -138,6 +138,23 @@ def test_unknown_condition_agent_unsure_falls_back_to_human(flow_repo):
     assert called_steps(flow_repo) == ["build/x.when"]
 
 
+@pytest.mark.parametrize("acts", [
+    [{"capped": "turns"}, {"result": {"status": "done", "summary": "ran out", "signals": {"answer": "no"}}}],
+    [{"capped": "budget", "result": {"status": "done", "summary": "half read", "signals": {"answer": "no"}}}],
+], ids=["after_the_wrap_up", "written_before_the_cap"])
+def test_a_capped_condition_question_goes_to_a_human(flow_repo, acts):
+    """A condition question's session that hit a cap answered from a truncated read: never the agent's decision."""
+    flow_repo.configure({"conditions": {"spec_is_approved": {"on_unknown": "agent"}}})
+    run = flow_repo.new_run()
+    (flow_repo.root / "docs" / "specs").mkdir(parents=True)
+    (flow_repo.root / "docs" / "specs" / "SPEC-crm.md").write_text(NOSTATUS_SPEC, encoding="utf-8")
+    flow_repo.script({"build/x.when": acts})
+    assert run_steps(flow_repo, [agent("x", when="spec_is_approved")]) == ("stopped", False)
+    assert flow_repo.events(run, "condition_decided") == []
+    assert [e["kind"] for e in flow_repo.events(run, "hitl_raised")] == ["condition"]
+    assert set(called_steps(flow_repo)) == {"build/x.when"} and run.state["steps"].get("build/x", {}).get("status") != "skipped"
+
+
 # --------------------------------------------------------------------------- repeat / next / sub-lanes
 
 

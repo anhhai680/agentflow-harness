@@ -172,6 +172,8 @@ autonomy:                       # what the runner does on its own; which phases 
     fix_attempts_exhausted: 2
     red_test_passes: 2
     review_unresolved: 1
+    turn_cap: 1                   # a step that stopped at its turn cap
+    budget_cap: 1                 # a step that stopped at its spend cap
 
 ci:                             # the `ci` step in `ship`
   poll_s: 60

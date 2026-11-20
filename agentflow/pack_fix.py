@@ -179,6 +179,63 @@ RETIRED: tuple[Retired, ...] = (
         new=("Write your result as JSON to the step's result file (the path after \"Your result file is\" in the step's "
              "prompt), then stop. Use that exact path."),
     ),
+    Retired(
+        id="preamble-quiet-search-read-once",
+        file="_preamble.md",
+        retired_in="2.10",
+        detect="the runner's gates run it.\n- A denied command stays denied",
+        old="the runner's gates run it.\n- A denied command stays denied",
+        new=(
+            "the runner's gates run it.\n"
+            "- Use quiet flags for the tests you run (such as `-q`, no coverage report), and show only the failures.\n"
+            "- Find files with Glob and search with Grep, with a result limit, not `grep -r`, `find` or `ls -R` through "
+            "Bash.\n"
+            "- Read a file once, and read it again only after it changed.\n"
+            "- A denied command stays denied"
+        ),
+    ),
+    Retired(
+        id="task_inline-runner-runs-gates",
+        file="task_inline.md",
+        retired_in="2.10",
+        detect="Run the build gates before you finish",
+        old="Run the build gates before you finish.",
+        new="Run only the tests you wrote or changed: the runner runs the build gates after you.",
+    ),
+    Retired(
+        id="fix-runner-runs-gates",
+        file="fix.md",
+        retired_in="2.10",
+        detect="then run the build gates",
+        old="Run the test and see it go from red to green, then run the build gates.",
+        new="Run the test and see it go from red to green: the runner runs the gates after you.",
+    ),
+    Retired(
+        id="ci_fix-runner-runs-gates",
+        file="ci_fix.md",
+        retired_in="2.10",
+        detect="Run the verify gates before you finish. Do not commit",
+        old="Run the verify gates before you finish. Do not commit: the runner commits and pushes.",
+        new=("Run only the tests that cover your fix: the runner runs the verify gates after you. Do not commit: the "
+             "runner commits and pushes."),
+    ),
+    Retired(
+        id="fix_findings-runner-runs-gates",
+        file="fix_findings.md",
+        retired_in="2.10",
+        detect="do not review your own work. Run the verify gates",
+        old="so do not review your own work. Run the verify gates before you finish.",
+        new=("so do not review your own work. Run only the tests that cover your fixes: the runner runs the verify "
+             "gates after you."),
+    ),
+    Retired(
+        id="sync_conflicts-runner-runs-gates",
+        file="sync_conflicts.md",
+        retired_in="2.10",
+        detect="Run the verify gates before you finish",
+        old="\nRun the verify gates before you finish.\n",
+        new="\nRun only the tests that cover the files you merged: the runner runs the verify gates after you.\n",
+    ),
 )
 
 

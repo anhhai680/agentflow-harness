@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from agentflow import lanes
 from agentflow.flow import main
 from agentflow.gitops import gh_json
 from agentflow.hitl import answer, approve, inbox_items
@@ -1309,3 +1310,40 @@ def test_worktree_and_checkout_edits_never_reach_the_brief(flow_repo):
     for call in calls:
         assert call["system_prompt"] is not None and "RULE-MARKER" in call["system_prompt"], call["step"]
         assert "PLANTED" not in call["system_prompt"], call["step"]
+
+
+# --------------------------------------------------------------------------- a capped review
+
+
+CLEAN_REVIEW = {"status": "done", "summary": "reviewed", "findings": []}
+
+
+def test_a_capped_review_is_never_complete(lane, git):
+    run = begin_build(lane, plan_text(count=1))
+    review_key = REVIEW.format(n=1)
+    lane.script({review_key: [{"result": CLEAN_REVIEW, "capped": "turns"}]})
+    before = lane.head()
+    assert build(lane, run) == ("stopped", True)
+    assert steps(lane.calls()) == [IMPL.format(n=1), review_key]
+    waiting = run.state["waiting"]
+    assert waiting["kind"] == "turn_cap" and waiting["key"] == review_key
+    assert lane.head() == before and lane.events(run, "review_result") == []
+    assert [e for e in lane.events(run, "step_committed") if e["key"] == IMPL.format(n=1)] == []
+    assert [e["wrap_up"] for e in lane.events(run, "session_capped")] == [False]
+
+
+def test_a_capped_review_in_a_refused_window_is_held(lane, git, monkeypatch):
+    monkeypatch.setattr(lanes, "HOLD_POLL_S", 0.01)
+    monkeypatch.setattr(lanes, "HOLD_SLACK_S", 0.0)
+    monkeypatch.setattr(lanes, "BACKOFF_START_S", 0.01)
+    run = begin_build(lane, plan_text(count=1))
+    review_key = REVIEW.format(n=1)
+    refused = {"rate_limit": {"status": "rejected", "resetsAt": 1.0, "rateLimitType": "five_hour"}}
+    lane.script({review_key: [{"result": {**CLEAN_REVIEW, "findings": [FINDING]}, "capped": "turns", **refused},
+                              review()]})
+    assert build(lane, run) == ("done", True)
+    assert steps(lane.calls()) == [IMPL.format(n=1), review_key, review_key]
+    (held,) = lane.events(run, "run_held")
+    assert held["reason"] == "usage limit" and held["key"] == review_key
+    assert lane.events(run, "session_capped") == []
+    assert subjects(git, lane.root)[0] == "Task 1: First thing"

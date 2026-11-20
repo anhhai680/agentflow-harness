@@ -971,3 +971,11 @@ def test_a_route_profile_without_a_profile_is_refused(run):
     assert run.state["route"] is None
     skipped = replay([{"seq": 1, "ts": "2026-11-17T10:00:00.000+00:00", "type": "route_profile", "applied": True}])
     assert skipped["route"] is None and skipped["malformed_events"]
+
+
+@pytest.mark.parametrize("event", [{"key": "build/impl"}, {"cap": "turns"}])
+def test_a_session_capped_without_its_key_or_cap_is_malformed(event):
+    state = reduce(initial_state(), {"type": "session_capped", "seq": 1, "wrap_up": True, **event})
+    assert [m["type"] for m in state["malformed_events"]] == ["session_capped"]
+    ok = reduce(initial_state(), {"type": "session_capped", "seq": 1, "key": "build/impl", "cap": "turns", "wrap_up": True})
+    assert ok["malformed_events"] == []

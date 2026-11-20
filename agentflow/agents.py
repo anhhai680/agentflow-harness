@@ -67,6 +67,14 @@ BRIEF_ARG = "--append-system-prompt-file"  # a run session's brief (`lanes.build
 # Claude Code loads no `CLAUDE.md` with this set: only a call whose brief carries the repository's rules gets it, and every
 # other call has it dropped from the inherited environment and the pack's `defaults.env`, so its rules are never lost.
 NO_CLAUDE_MDS_ENV = "CLAUDE_CODE_DISABLE_CLAUDE_MDS"
+# A result that says the CLI stopped itself at a cap (`--max-turns`, `--max-budget-usd`): its `subtype`, or else its own
+# `terminal_reason`, mapped to what the runner calls the cap. Not a dead agent: the work it did stands (plan C4).
+CAP_SUBTYPES = {"error_max_turns": "turns", "error_max_budget_usd": "budget"}
+CAP_REASONS = {"max_turns": "turns", "budget_exhausted": "budget"}
+# `agents.claude.bash_output_chars`: the CLI's cap on a shell command's output. Runner-owned like `NO_CLAUDE_MDS_ENV`:
+# when the spec sets it, the pack's `defaults.env` and the inherited environment can't raise it.
+BASH_OUTPUT_ENV = "BASH_MAX_OUTPUT_LENGTH"
+MIN_BUDGET_USD = 0.01  # the smallest `--max-budget-usd` the CLI takes ("0.00" is refused)
 UNKNOWN_OPTION = re.compile(r"unknown option '(--[\w-]+)'")  # how the claude CLI refuses a flag it does not know
 CLAUDE_MIN_VERSION = "2.1.327"  # the oldest Claude Code that takes every flag above
 STDERR_TAIL_BYTES = 4096  # how much of a failed call's own stderr is read for a refused flag
@@ -102,7 +110,9 @@ class AgentCall:
     forbidden_paths: list[str] = field(default_factory=list)  # `guardrails.forbidden_paths`
     runs_root: Path | None = None  # the runner's own state (`state.runs_root`): no agent edits it
     env_base: Mapping[str, str] | None = None  # the inherited environment (`run_env.base`); None: this process's
-    max_turns: int | None = None  # this call's turn cap; None: the agent's own `max_turns`
+    # this call's turn cap: 0 passes no `--max-turns`; None: the agent's own `max_turns`
+    max_turns: int | None = None
+    budget_usd: float | None = None  # this call's spend cap in list-price USD (`--max-budget-usd`); None: none
     read_only: bool = False  # Claude gets only `READ_ONLY_TOOLS` and no MCP server; Codex a read-only sandbox (fresh session)
     # a `read_only_roles` session: `dontAsk`, `REVIEW_TOOLS`, read-only git, writes only in `add_dirs`, no MCP server
     read_only_role: bool = False
@@ -148,6 +158,7 @@ class AgentOutcome:
     stalled: bool = False  # the watchdog ended the session: no stream line for `idle_limit_s` (never with `timed_out`)
     idle_limit_s: float | None = None  # the limit that was in force when the watchdog fired
     usage: dict = field(default_factory=dict)  # this invocation's split (`StreamAccumulator.usage_payload`)
+    capped: str | None = None  # `turns` or `budget`: the CLI stopped itself at that cap (`CAP_SUBTYPES`); None: it didn't
 
 
 class Agent(Protocol):
@@ -200,6 +211,7 @@ class StreamAccumulator:
     main_ids: set[str] = field(default_factory=set)
     prefix_write: int | None = None  # the first main-thread message's `cache_creation_input_tokens`
     tool_output_chars: int = 0  # the text of main-thread `tool_result`s
+    capped: str | None = None  # `turns` | `budget`: the first result of the invocation that says a cap ended it
     terminal_reason: str | None = None  # the first result's that has one: a trailing `api_error` hides nothing
     auto_memory: bool | None = None  # the `init` event named memory paths; None: no `init` seen
     windows: dict[str, tuple[float, str]] = field(default_factory=dict)  # the last emitted utilization and status
@@ -222,6 +234,8 @@ class StreamAccumulator:
         resets_at = limit.get("resetsAt")
         if limit.get("status") == "rejected" and isinstance(resets_at, (int, float)):
             return Interruption("usage_limit", self.reached_model, float(resets_at), self.limit)
+        if self.capped:  # a cap is an end the runner asked for: the exit code and `is_error` say nothing more
+            return None
         if exit_code == 0 and not self.result_error:
             return None
         return Interruption("transient", self.reached_model, None, self.limit)
@@ -269,6 +283,7 @@ class StreamAccumulator:
             stalled=stalled,
             idle_limit_s=idle_limit_s if stalled else None,
             usage=self.usage_payload(),
+            capped=self.capped,
         )
 
 
@@ -591,6 +606,10 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
                 if isinstance(entry, dict):
                     _add_usage(acc.result_usage, str(name), entry)
         reason = event.get("terminal_reason")
+        if acc.capped is None:  # set once: a trailing result doesn't undo it
+            subtype = event.get("subtype")
+            acc.capped = (CAP_SUBTYPES.get(subtype) if isinstance(subtype, str) else None) or \
+                (CAP_REASONS.get(reason) if isinstance(reason, str) else None)
         if acc.terminal_reason is None and isinstance(reason, str) and reason:
             acc.terminal_reason = reason
         usage_by_model = event.get("modelUsage")
@@ -962,8 +981,12 @@ class ClaudeAgent(_CliAgent):
         if call.system_prompt_file is not None:
             argv += [BRIEF_ARG, str(call.system_prompt_file)]
         max_turns = call.max_turns if call.max_turns is not None else spec.max_turns
-        if max_turns is not None:
+        if max_turns:  # 0: no cap
             argv += ["--max-turns", str(max_turns)]
+        budget = call.budget_usd
+        if isinstance(budget, (int, float)) and not isinstance(budget, bool) and math.isfinite(budget) \
+                and budget >= MIN_BUDGET_USD:
+            argv += ["--max-budget-usd", f"{budget:.2f}"]
         if call.agent_profile:
             argv += ["--agent", call.agent_profile]
         if call.resume_session:
@@ -973,19 +996,23 @@ class ClaudeAgent(_CliAgent):
 
     def env(self, call: AgentCall) -> dict[str, str]:
         """`cache_ttl` other than `cli` owns the TTL variables: the pack's `defaults.env` can't set another one. The
-        runner owns `NO_CLAUDE_MDS_ENV`: `1` when the call's brief carries the rules, else never set."""
+        runner owns `NO_CLAUDE_MDS_ENV`: `1` when the call's brief carries the rules, else never set. It owns
+        `BASH_OUTPUT_ENV` too when `bash_output_chars` is above 0, set last so `defaults.env` can't override it."""
         spec = self.spec
         env = super().env(call)
         if spec.cache_ttl in TTL_ENV and spec.cache_ttl != "cli":
             env = {name: value for name, value in env.items() if name not in TTL_VARS}
         env.pop(NO_CLAUDE_MDS_ENV, None)
         rules = {NO_CLAUDE_MDS_ENV: "1"} if _carries_rules(call) else {}
-        return {**env, **TTL_ENV.get(spec.cache_ttl, {}), **(LEAN_ENV if spec.lean else {}), **rules}
+        bash = {BASH_OUTPUT_ENV: str(spec.bash_output_chars)} if spec.bash_output_chars > 0 else {}
+        return {**env, **TTL_ENV.get(spec.cache_ttl, {}), **(LEAN_ENV if spec.lean else {}), **rules, **bash}
 
     def env_drop(self, call: AgentCall) -> tuple[str, ...]:
         """The TTL variables `cache_ttl` doesn't set, so the inherited environment can't override it (none for `cli`),
-        and `NO_CLAUDE_MDS_ENV` unless the call's brief carries the rules (Claude then loads its own memory files)."""
-        rules = () if _carries_rules(call) else (NO_CLAUDE_MDS_ENV,)
+        `NO_CLAUDE_MDS_ENV` unless the call's brief carries the rules (Claude then loads its own memory files), and
+        `BASH_OUTPUT_ENV` when the spec sets it, so the inherited copy can't stand."""
+        rules = (*(() if _carries_rules(call) else (NO_CLAUDE_MDS_ENV,)),
+                 *((BASH_OUTPUT_ENV,) if self.spec.bash_output_chars > 0 else ()))
         if self.spec.cache_ttl not in TTL_ENV or self.spec.cache_ttl == "cli":
             return rules
         return (*(name for name in TTL_VARS if name not in TTL_ENV[self.spec.cache_ttl]), *rules)

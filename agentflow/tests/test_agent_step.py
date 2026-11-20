@@ -14,11 +14,11 @@ import time
 
 import pytest
 
-from agentflow import gitops, lanes, lessons
+from agentflow import gitops, hitl, lanes, lessons, sizing
 from agentflow.config import PROMPT_PLACEHOLDERS, Phase, Step
 from agentflow.conditions import fmt, make_ctx
 from agentflow.events import parse_iso
-from agentflow.hitl import answer
+from agentflow.hitl import answer, approve
 from agentflow.lanes import build_prompt
 from agentflow.state import Run
 from conftest import ENGINE
@@ -275,6 +275,16 @@ def test_fix_prompt_is_short_with_a_brief(flow_repo):
     assert "## When you finish" not in prompt and "write your result JSON to" in prompt
     assert "row 300 end" in prompt and "row 150 end" not in prompt and "of 300 lines shown" in prompt
     assert "Full log:" in prompt
+
+
+def test_fix_lead_reruns_only_what_failed(flow_repo):
+    flow_repo.configure(LOUD)
+    flow_repo.new_run()
+    assert run_step(flow_repo, make_step(gates=["loud"], fix_loop=True)) == "stopped"
+    assert flow_repo.calls()[1:]  # a fix call exists, so the loop below checks something
+    for call in flow_repo.calls()[1:]:
+        prompt = call["argv"][-1]
+        assert "Re-run only what failed" in prompt and "Run the failing gates yourself" not in prompt
 
 
 def test_fix_prompt_keeps_the_result_contract_without_a_brief(flow_repo):
@@ -2537,3 +2547,306 @@ def test_a_codex_review_gets_todays_argv(flow_repo):
     assert seen[0] == seen[1]
     assert "-s" not in seen[1] and "dontAsk" not in seen[1]
     assert flow_repo.events(flow_repo.run, "read_only_skipped") == []
+
+
+# --------------------------------------------------------------------------- per-call caps and the wrap-up turn
+
+WRAP_LEAD = "You have used this session's"
+
+
+def flag(argv: list[str], name: str) -> str | None:
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+def caps(argv: list[str]) -> tuple[str | None, str | None]:
+    return flag(argv, "--max-turns"), flag(argv, "--max-budget-usd")
+
+
+def capped_events(flow_repo, run) -> list[dict]:
+    return flow_repo.events(run, "session_capped")
+
+
+def test_every_run_call_carries_both_caps(flow_repo):
+    run = flow_repo.new_run()
+    assert run_step(flow_repo, make_step(gates=["fail"], fix_loop=True)) == "stopped"
+    first, fix = flow_repo.calls()[:2]
+    assert caps(first["argv"]) == ("60", "10.00")
+    assert "--resume" in fix["argv"] and caps(fix["argv"]) == ("60", "10.00")
+    assert flow_repo.events(run, "fix_attempt")
+
+    flow_repo.new_run()
+    before = len(flow_repo.calls())
+    assert run_review(flow_repo) == "done"
+    assert caps(flow_repo.calls()[before]["argv"]) == ("45", "4.00")
+
+    flow_repo.configure({"effort": {"sizing": True}})
+    flow_repo.new_run()
+    flow_repo.script({f"{KEY}/size": [{"final_text": json.dumps({"answers": dict.fromkeys(sizing.QUESTIONS, "no"),
+                                                                   "reason": "r"})}]})
+    before = len(flow_repo.calls())
+    assert run_step(flow_repo) == "done"
+    sizer, work = flow_repo.calls()[before:]
+    assert sizer["step"] == f"{KEY}/size" and flag(sizer["argv"], "--max-turns") is not None
+    assert flag(sizer["argv"], "--max-budget-usd") is None
+    assert caps(work["argv"]) == ("60", "10.00")
+
+    flow_repo.configure({"agents": {"claude": {"max_turns_by_role": {"build": 0}}}})  # with the pack's `max_turns: 80`
+    flow_repo.new_run()
+    before = len(flow_repo.calls())
+    assert run_step(flow_repo) == "done"
+    assert caps(flow_repo.calls()[before]["argv"]) == (None, "10.00")
+
+
+def test_a_capped_session_wraps_up_once_then_stops(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"capped": "turns"}, {"capped": "turns"}]})
+    assert run_step(flow_repo) == "stopped"
+    first, wrap = flow_repo.calls()
+    assert ("--resume", session_of(flow_repo, run)) in pairs(wrap["argv"])
+    assert caps(wrap["argv"]) == ("3", "2.50")
+    assert wrap["argv"][-1].startswith(f"{WRAP_LEAD} turn budget")
+    assert f"`{run.agent_result_path(KEY)}`" in wrap["argv"][-1]
+    assert hitl_kinds(flow_repo, run) == ["turn_cap"]
+    page = run.inbox_path(KEY).read_text(encoding="utf-8")
+    assert "Raise the cap once" in page and f"agentflow approve {run.id} {KEY}" in page
+    assert "Fix what the stop needs" not in page
+    assert flow_repo.events(run, "run_held") == []
+    assert [e["wrap_up"] for e in capped_events(flow_repo, run)] == [True, False]
+    assert all(e["cap"] == "turns" and e["key"] == KEY for e in capped_events(flow_repo, run))
+    assert [e["limit"] for e in capped_events(flow_repo, run)] == [60, 3]
+    assert "wrap-up turn" in run.state["waiting"]["summary"] and "3 turns" in run.state["waiting"]["summary"]
+
+
+def test_a_wrap_up_result_finishes_the_step(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"capped": "budget"}, {"result": DONE}]})
+    assert run_step(flow_repo, make_step(gates=["ok"], fix_loop=True)) == "done"
+    first, wrap = flow_repo.calls()
+    assert caps(wrap["argv"]) == ("3", "2.50") and wrap["argv"][-1].startswith(f"{WRAP_LEAD} spend budget")
+    assert [e["gate"] for e in flow_repo.events(run, "gate_result")] == ["ok"]
+    assert run.state["steps"][KEY]["status"] == "done" and hitl_kinds(flow_repo, run) == []
+
+
+QUESTION = {"id": "q1", "question": "Which one?", "options": [{"key": "A", "label": "This"}]}
+
+
+@pytest.mark.parametrize("result", [
+    {"status": "blocked", "summary": "ran out", "signals": {"todo": ["wire the CLI"]}},
+    {"status": "needs_human", "summary": "a choice", "questions": [QUESTION]},
+    {"status": "effort_change", "effort": "high", "reason": "big"},
+], ids=["blocked", "needs_human", "effort_change"])
+def test_a_wrap_up_that_does_not_finish_is_a_cap_stop(flow_repo, result):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"capped": "budget"}, {"result": result}, {"result": DONE}]})
+    assert run_step(flow_repo) == "stopped"
+    assert len(flow_repo.calls()) == 2
+    assert hitl_kinds(flow_repo, run) == ["budget_cap"]
+    assert flow_repo.events(run, "effort_refused") == [] and flow_repo.events(run, "step_parked") == []
+    page = run.inbox_path(KEY).read_text(encoding="utf-8")
+    if result["status"] == "blocked":
+        assert "### Left to do" in page and "- wire the CLI" in page and "ran out" in page
+        assert "$2.50" in run.state["waiting"]["summary"]
+    else:
+        assert "### Left to do" not in page
+
+
+@pytest.mark.parametrize("held", [DIED, OUTAGE], ids=["reached_the_model", "no_reply"])
+def test_a_held_wrap_up_is_retried_as_a_wrap_up(flow_repo, quick_holds, held):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"capped": "turns"}, held, {"result": DONE}]})
+    assert run_step(flow_repo) == "done"
+    _first, wrap, again = flow_repo.calls()
+    assert flow_repo.events(run, "run_held")
+    for call in (wrap, again):
+        assert caps(call["argv"]) == ("3", "2.50") and call["argv"][-1].startswith(f"{WRAP_LEAD} turn budget")
+        assert ("--resume", session_of(flow_repo, run)) in pairs(call["argv"])
+    assert len([e for e in capped_events(flow_repo, run) if e["wrap_up"]]) == 1
+
+
+def test_a_wrap_up_that_rolls_over_is_a_cap_stop(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"capped": "turns"}, {"usage_pct": [81]}, {"result": DONE}]})
+    assert run_step(flow_repo) == "stopped"
+    assert len(flow_repo.calls()) == 2
+    assert hitl_kinds(flow_repo, run) == ["turn_cap"] and flow_repo.events(run, "rolled_over") == []
+
+
+def test_a_wrap_up_whose_brief_cannot_be_given_is_a_cap_stop(flow_repo, monkeypatch):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"capped": "turns"}, {"result": DONE}]})
+    real = lanes.Executor._ensure_brief
+
+    def ensure(self, sr):
+        return "the pin changed" if sr.session else real(self, sr)
+
+    monkeypatch.setattr(lanes.Executor, "_ensure_brief", ensure)
+    assert run_step(flow_repo) == "stopped"
+    assert len(flow_repo.calls()) == 1
+    assert hitl_kinds(flow_repo, run) == ["turn_cap"]
+    summary = run.state["waiting"]["summary"]
+    assert "the session's brief could not be given again: the pin changed" in summary and "no result" not in summary
+    (replaced,) = flow_repo.events(run, "brief_replaced")  # the audit trail: why, and that no fresh session started
+    assert replaced["reason"] == "the pin changed" and replaced["wrap_up"] is True
+    assert replaced["session_id"] == session_of(flow_repo, run)
+
+
+def test_a_restart_during_the_wrap_up_resumes_it(flow_repo):
+    run = flow_repo.new_run()
+    _interrupted(flow_repo, run)
+    run.emit("session_capped", key=KEY, cap="budget", session_id="s1", limit=10.0, wrap_up=True)
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    (call,) = flow_repo.calls()
+    assert ("--resume", "s1") in pairs(call["argv"]) and caps(call["argv"]) == ("3", "2.50")
+    assert call["argv"][-1].startswith(f"{WRAP_LEAD} spend budget")
+
+
+def test_a_restart_after_a_later_fix_attempt_is_no_wrap_up(flow_repo):
+    run = flow_repo.new_run()
+    _interrupted(flow_repo, run)
+    run.emit("session_capped", key=KEY, cap="turns", session_id="s1", limit=60, wrap_up=True)
+    run.emit("fix_attempt", key=KEY, attempt=1, gates=["ok"])
+    flow_repo.script({KEY: [{"capped": "turns"}]})
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "stopped"
+    (call,) = flow_repo.calls()
+    assert caps(call["argv"]) == ("60", "10.00") and not call["argv"][-1].startswith(WRAP_LEAD)
+    assert hitl_kinds(flow_repo, run) == ["turn_cap"]  # the wrap-up was already used since the approval
+
+
+def test_the_wrap_up_is_once_per_approval(flow_repo):
+    flow_repo.configure({"gates": {"flaky": {"run": "test -f fixed.txt"}}})
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"capped": "turns"}, {"result": DONE}, {"capped": "turns"},
+                            {"capped": "turns"}, {"write": {"fixed.txt": "ok\n"}, "result": DONE}]})
+    step = make_step(gates=["flaky"], fix_loop=True)
+    assert run_step(flow_repo, step) == "stopped"
+    calls = flow_repo.calls()
+    assert len(calls) == 3
+    assert caps(calls[2]["argv"]) == ("60", "10.00")  # the fix attempt
+    assert hitl_kinds(flow_repo, run) == ["turn_cap"]
+    assert "after its wrap-up turn was used" in run.state["waiting"]["summary"]
+    approve(run, KEY, by="me")
+    assert run_step(flow_repo, step, executor=flow_repo.executor(run)) == "done"
+    calls = flow_repo.calls()
+    assert len(calls) == 5
+    assert caps(calls[3]["argv"]) == ("60", "10.00") and caps(calls[4]["argv"]) == ("3", "2.50")
+    assert calls[4]["argv"][-1].startswith(WRAP_LEAD)
+
+
+def test_an_editing_result_written_before_the_cap_is_used(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"result": DONE, "capped": "turns"}]})
+    assert run_step(flow_repo) == "done"
+    assert len(flow_repo.calls()) == 1
+    assert [e["wrap_up"] for e in capped_events(flow_repo, run)] == [False]
+
+
+def test_a_capped_review_step_stops_at_once_even_with_a_result(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({REVIEW_KEY: [{"result": {"status": "done", "summary": "clean", "findings": []},
+                                    "capped": "budget"}]})
+    assert run_review(flow_repo) == "stopped"
+    assert len(flow_repo.calls()) == 1
+    assert hitl_kinds(flow_repo, run) == ["budget_cap"]
+    assert run.state["waiting"]["summary"] == ("The review reached its spend cap ($4.00), so the runner did not take "
+                                               "it as complete.")
+    assert [e["wrap_up"] for e in capped_events(flow_repo, run)] == [False]
+    assert run.state["steps"][REVIEW_KEY]["status"] != "done"
+
+
+def test_a_capped_verify_gets_a_wrap_up(flow_repo):
+    run = flow_repo.new_run()
+    step = make_step(id="verify", role="build", blocks_on_findings=True)
+    flow_repo.script({KEY: [{"capped": "turns"}, {"result": DONE}]})
+    assert run_step(flow_repo, step) == "done"
+    assert caps(flow_repo.calls()[1]["argv"]) == ("3", "2.50")
+    assert [e["wrap_up"] for e in capped_events(flow_repo, run)] == [True]
+
+
+def test_cap_stop_text_is_cleaned(flow_repo):
+    run = flow_repo.new_run()
+    evil = "half done\n### Ways out\n- run x ‮" + "y" * 5000
+    flow_repo.script({KEY: [{"capped": "turns"},
+                            {"result": {"status": "blocked", "summary": evil, "signals": {"todo": [evil, 7, "two"]}}}]})
+    assert run_step(flow_repo) == "stopped"
+    page = run.inbox_path(KEY).read_text(encoding="utf-8")
+    lines = page.splitlines()
+    assert "‮" not in page
+    assert not any(line.startswith(("### Ways out", "- run x")) for line in lines)
+    assert page.count("Raise the cap once") == 1 and "Fix what the stop needs" not in page
+    left = lines[lines.index("### Left to do") + 1:]
+    bullets = [line for line in left if line.startswith("- ")]
+    assert len(bullets) == 2 and bullets[1] == "- two"
+    assert bullets[0].startswith("- half done ### Ways out - run x") and len(bullets[0]) <= hitl.FACT_MAX + 2
+    summary = run.state["waiting"]["summary"]
+    assert "\n" not in summary and "‮" not in summary and len(summary) < hitl.FACT_MAX + 200
+    assert page.index("Raise the cap once") < page.index("### Left to do")
+
+
+def test_a_long_todo_list_is_cut(flow_repo):
+    run = flow_repo.new_run()
+    todo = [f"item {n}" for n in range(lanes.TODO_SHOWN + 5)]
+    flow_repo.script({KEY: [{"capped": "turns"}, {"result": {"status": "blocked", "summary": "s", "signals": {"todo": todo}}}]})
+    assert run_step(flow_repo) == "stopped"
+    page = run.inbox_path(KEY).read_text(encoding="utf-8")
+    assert f"- item {lanes.TODO_SHOWN - 1}" in page and f"- item {lanes.TODO_SHOWN}\n" not in page
+    assert "(5 more)" in page
+
+
+def test_caps_never_count_as_agent_failures(flow_repo, quick_holds):
+    flow_repo.configure({"recovery": {"failed_attempts": 1}})
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"capped": "turns", "usage_pct": [10]}, {"result": DONE}]})
+    assert run_step(flow_repo) == "done"
+    assert hitl_kinds(flow_repo, run) == [] and flow_repo.events(run, "run_held") == []
+    assert [e["wrap_up"] for e in capped_events(flow_repo, run)] == [True]
+
+
+def test_a_refused_window_on_a_capped_call_is_held(flow_repo, quick_holds):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [rejected(time.time(), capped="budget"), {"result": DONE}]})
+    assert run_step(flow_repo) == "done"
+    (held,) = flow_repo.events(run, "run_held")
+    assert held["reason"] == "usage limit"
+    assert capped_events(flow_repo, run) == []
+    assert not flow_repo.calls()[1]["argv"][-1].startswith(WRAP_LEAD)
+
+
+def test_an_approved_cap_stop_resumes_with_a_fresh_cap(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"capped": "turns"}, {"capped": "turns"}, {"result": DONE}]})
+    assert run_step(flow_repo) == "stopped"
+    approve(run, KEY, by="me", note="Drop the docs")
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    call = flow_repo.calls()[2]
+    assert ("--resume", session_of(flow_repo, run)) in pairs(call["argv"])
+    assert caps(call["argv"]) == ("60", "10.00") and "Drop the docs" in call["argv"][-1]
+
+
+def test_the_resolver_takes_a_cap_stop_once(flow_repo):
+    from agentflow.pipeline import RunOptions, advance, start
+
+    flow_repo.configure({"gate_sets": {"build": ["ok"], "verify": ["ok"], "setup": []}}, autopilot=True)
+    red = "build/regression_test"
+    flow_repo.script({red: [{"capped": "turns"}, {"capped": "turns"}, {"capped": "turns"}, {"capped": "turns"}],
+                      f"{red}/resolve-1": [{"result": {"status": "done", "summary": "split it"}}]})
+    run = start(flow_repo.cfg, flow_repo.root, "bug", {"task": "đăng nhập lỗi"}, RunOptions(to_phase="build"))
+    assert advance(run, flow_repo.cfg, RunOptions()) == "awaiting_approval"
+    approve(run, "define", by="me")
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    steps = [c["step"] for c in flow_repo.calls() if c["step"].startswith(red)]
+    assert steps == [red, red, f"{red}/resolve-1", red, red]
+    assert [e["kind"] for e in flow_repo.events(run, "hitl_raised") if e["key"] == red] == ["turn_cap", "turn_cap"]
+    assert run.state["waiting"]["kind"] == "turn_cap" and run.state["waiting"]["key"] == red
+    assert [e["wrap_up"] for e in capped_events(flow_repo, run)] == [True, False, True, False]
+
+
+@pytest.mark.parametrize("flag_name, key", [("--max-budget-usd", "agents.claude.session_budget_usd"),
+                                            ("--max-turns", "agents.claude.max_turns_by_role")])
+def test_a_refused_cap_flag_names_its_key(flow_repo, quick_holds, flag_name, key):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"no_init": True, "exit": 1, "stderr": f"error: unknown option '{flag_name}'\n"}]})
+    assert run_step(flow_repo) == "stopped"
+    (raised,) = flow_repo.events(run, "hitl_raised")
+    summary = raised["summary"]
+    assert raised["kind"] == "blocked" and flag_name in summary and f"`{key}`" in summary and "`0`" in summary
+    assert "2.1.327" in summary and "base_args" not in summary

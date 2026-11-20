@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, Literal, TextIO
 from agentflow import doubt, route, sources
 from agentflow.conditions import Ctx, evaluate, fmt, paths_read
 from agentflow.commit_checks import runner_head
-from agentflow.config import RECONCILE_CHANGED, Config, Phase, Step, for_lane
+from agentflow.config import RECONCILE_CHANGED, Config, Phase, Step, for_lane, resolve_turn_cap
 from agentflow.gates import GateResult, gates_ok, record_results, resolve, run_gates_reusing, summarize
 from agentflow.guards import snapshot
 from agentflow.gitops import CommitRejected, NothingToCommit, commit
@@ -139,7 +139,7 @@ def writes_questions(step: Step) -> bool:
 
 class StepControl:
     """`run_steps`/`run_step` for `lanes.Executor`; relies on its `cfg`, `run`, `ctx`, `dry_run`,
-    `out`, `worktree`, `run_agent_step`, `dry_agent_argv` and `_gate_report`, and on `run_foreach`,
+    `out`, `worktree`, `run_agent_step`, `dry_agent_argv`, `_since_step_started` and `_gate_report`, and on `run_foreach`,
     `run_finish`, `record_decisions` and `_earlier_step_review` from `feature_lane.FeatureLane`."""
 
     cfg: Config
@@ -326,6 +326,10 @@ class StepControl:
                                       size=False)
         if outcome != "done":
             return _STOPPED, ""
+        # A session that hit a cap answered from a truncated read (in its wrap-up turn, or before the cap ended it):
+        # never the agent's decision, so a human decides instead.
+        if any(e["type"] == "session_capped" and e.get("key") == cond_key for e in self._since_step_started(cond_key)):
+            return None, "the question's session reached its cap"
         try:
             result = read_result(self.run.result_path(cond_key))
         except ResultError as exc:
@@ -418,13 +422,14 @@ class StepControl:
         if review and rerun and reconciling and doubt.is_doubt_reviewer(self.cfg, phase.name, step, self.ctx.values["lane"]):
             log = self.run.events.read()
             # A later round's reviewer is shown what the artifact changed since the last review, then the dispositions,
-            # and gets half the turn cap. With no usable base (`delta_for_review`) it is the full prompt as before.
+            # and gets half the resolved turn cap. With no usable base (`delta_for_review`) it is the full prompt as before.
             artifact = fmt(str(doubt.reconcile_steps(phase, self.ctx.values["lane"])[0].output), self.ctx)
             delta = doubt.delta_for_review(self.worktree, log, phase.name, key, artifact)
             earlier = "\n\n".join(part for part in (delta, doubt.earlier_for_review(log, phase.name)) if part)
             extra = {**(extra or {}), "earlier_findings": earlier}
             if delta:
-                turn_cap = doubt.delta_turn_cap(self.cfg.agents[phase.agent or self.cfg.defaults.agent].max_turns)
+                agent_name = phase.agent or self.cfg.defaults.agent
+                turn_cap = doubt.delta_turn_cap(resolve_turn_cap(self.cfg, agent_name, step, step.role))
         elif review and rerun:
             extra = {**(extra or {}), "earlier_findings": self._earlier_step_review(key, refine.get("note"))}
         mode = "refine" if rerun and not review else "first"

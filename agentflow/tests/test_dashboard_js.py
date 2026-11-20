@@ -376,3 +376,16 @@ def test_the_token_table_reads_one_row_per_step_kind():
 def test_compact_and_an_empty_table():
     assert js(["tokens.js"], "[compact(999), compact(1000), compact(2500000)]", None) == ["999", "1.0K", "2.5M"]
     assert js(["tokens.js"], "tokenRows(args)", []) == []
+
+
+DOM_STUB = str(Path(__file__).parent / "fixtures" / "js" / "_dom_stub.js")
+
+
+def test_a_number_map_sends_numbers_and_skips_an_empty_value():
+    """`session_budget_usd` is a `number` map: the Settings page must send numbers, which the server's check requires."""
+    values = js([DOM_STUB, "settings.js"], "args.map(v => mapValue({value: v}, 'number'))", ["7.5", "10", "0", "", "  ", "abc"])
+    assert values == [7.5, 10, 0, None, None, "abc"]  # `undefined` (an empty value: no entry) comes back as null; text stays text
+    assert js([DOM_STUB, "settings.js"], "mapValue({value: '3'}, 'int')", None) == 3
+    assert js([DOM_STUB, "settings.js"], "mapValue({value: ''}, 'int')", None) is None  # an `int` map still sends null for an empty value
+    assert js([DOM_STUB, "settings.js"], "mapValue({value: '7'}, 'text')", None) == "7"
+    assert js([DOM_STUB, "settings.js"], "args.map(v => mapValue({value: v}, 'number') === undefined)", ["", "5"]) == [True, False]

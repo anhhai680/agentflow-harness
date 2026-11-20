@@ -773,9 +773,12 @@ FULL_PACKS = {"python": PYTHON_CONFIG, "node": PACKS / "node" / ".agentflow" / "
 _RETRO_STEP = "the engine's retro step: a retro is the engine's pipeline, so no pack needs to state it"
 _WATCHDOG = "the engine's watchdog default (15 minutes): a pack states it only to change it"
 _READ_ONLY = "the engine's read-only roles (review): a pack states them only to change them"
+_CAPS = "the engine's per-role caps: a pack states them only to change them"
 _POLICY = "the engine's default obligations (verified, reviewed, ...) and the engine floor, which a pack states only to add to"
 INHERITED = {
-    "python": {"retro_step": _RETRO_STEP, "policy": _POLICY, "agents.claude.read_only_roles": _READ_ONLY},
+    "python": {"retro_step": _RETRO_STEP, "policy": _POLICY, "agents.claude.read_only_roles": _READ_ONLY,
+               "agents.claude.max_turns_by_role": _CAPS, "agents.claude.session_budget_usd": _CAPS,
+               "agents.claude.bash_output_chars": _CAPS},
     "node": {
         "policy": _POLICY,
         "agents.codex": "the engine's codex agent, disabled: it runs no step unless the pack enables it",
@@ -783,9 +786,13 @@ INHERITED = {
         "retro_step": _RETRO_STEP,
         "watchdog.no_progress_min": _WATCHDOG,
         "agents.claude.read_only_roles": _READ_ONLY,
+        "agents.claude.max_turns_by_role": _CAPS,
+        "agents.claude.session_budget_usd": _CAPS,
+        "agents.claude.bash_output_chars": _CAPS,
     },
     "this repo": {"retro_step": _RETRO_STEP, "policy": _POLICY, "watchdog.no_progress_min": _WATCHDOG,
-                  "agents.claude.read_only_roles": _READ_ONLY},
+                  "agents.claude.read_only_roles": _READ_ONLY, "agents.claude.max_turns_by_role": _CAPS,
+                  "agents.claude.session_budget_usd": _CAPS, "agents.claude.bash_output_chars": _CAPS},
 }
 # The keys of `defaults`, `context`, `effort` and `recovery` that load_config requires (no code fallback). The engine
 # defaults hold the values the engine's minimum fixture pack (`node`) writes for them.
@@ -891,7 +898,10 @@ def test_a_sparse_pack_dry_run_passes_the_effort(sparse_repo, monkeypatch, capsy
     monkeypatch.chdir(sparse_repo)
     assert main(["run", "feature", "--module", "greet", "--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "--effort medium" in out and "--permission-mode bypassPermissions" in out and "--max-turns" not in out
+    assert "--effort medium" in out and "--permission-mode bypassPermissions" in out
+    first = next(line for line in out.splitlines() if "--model" in line)  # the first step's command line
+    assert first.lstrip().startswith("define/draft:")  # `role: plan` in the engine defaults
+    assert "--max-turns 60" in first and "--max-budget-usd 10.00" in first
 
 
 def test_every_default_step_has_an_explicit_id_and_a_mapped_skill():
@@ -2474,3 +2484,164 @@ def test_read_only_idle_min_checks(sparse_repo):
     for fine in ({"no_progress_min": 15, "read_only_idle_min": 0}, {"no_progress_min": 0, "read_only_idle_min": 20}):
         found = _sparse_issues(sparse_repo, watchdog=fine)
         assert not [i for i in found if i.path == "watchdog.read_only_idle_min"], fine
+
+
+# --------------------------------------------------------------------------- C4: per-role turn and spend caps
+
+C4_TURNS = {"review": 45, "plan": 60, "build": 60, "debug": 60, "mechanical": 15}
+C4_BUDGET = {"review": 4.0, "plan": 10.0, "build": 10.0, "debug": 10.0}
+
+
+def _c4_issues(tmp_cfg, patch, prefix="agents."):
+    cfg_path = tmp_cfg(patch)
+    return [i for i in validate(load_config(cfg_path), cfg_path.parent.parent) if i.path.startswith(prefix)]
+
+
+def test_cost_c4_keys_default(sparse_repo):
+    spec = load_config(pack.pack_config(sparse_repo)).agents["claude"]  # the engine's defaults carry the workflow
+    assert spec.max_turns_by_role == C4_TURNS
+    assert spec.session_budget_usd == C4_BUDGET
+    assert spec.bash_output_chars == 15000
+    codex = load_config(pack.pack_config(sparse_repo)).agents["codex"]
+    assert (codex.max_turns_by_role, codex.session_budget_usd, codex.bash_output_chars) == ({}, {}, 0)
+    assert DEFAULTS["autonomy"]["resolve_kinds"]["turn_cap"] == 1 and DEFAULTS["autonomy"]["resolve_kinds"]["budget_cap"] == 1
+    packed = yaml.safe_load(PYTHON_CONFIG.read_text(encoding="utf-8"))["autonomy"]["resolve_kinds"]
+    assert packed["turn_cap"] == 1 and packed["budget_cap"] == 1
+
+
+def test_cap_maps_merge_and_switch_off(tmp_cfg):
+    def agents(patch):
+        return load_config(tmp_cfg(patch)).agents["claude"]
+
+    spec = agents({"agents": {"claude": {"max_turns_by_role": {"build": 0}}}})
+    assert spec.max_turns_by_role == {**C4_TURNS, "build": 0}
+    def stated(key, value):  # a pack layer that states `null` (a dict patch would drop the key instead)
+        def patch(data):
+            data["agents"]["claude"][key] = value
+
+        return patch
+
+    assert agents(stated("session_budget_usd", None)).session_budget_usd == {}
+    spec = agents(stated("session_budget_usd", {"review": None}))
+    assert spec.session_budget_usd == {k: v for k, v in C4_BUDGET.items() if k != "review"}
+    assert agents({"agents": {"claude": {"session_budget_usd": {}}}}).session_budget_usd == C4_BUDGET  # `{}` changes nothing
+    alone = load_config(tmp_cfg(stated("session_budget_usd", {"review": None, "build": 3})), layered=False)
+    assert alone.agents["claude"].session_budget_usd == {"build": 3.0}  # a null role is dropped at parse time
+
+
+def test_resolve_turn_cap_precedence(tmp_cfg):
+    from agentflow.config import resolve_turn_cap, session_budget
+
+    cfg = load_config(tmp_cfg())
+    assert cfg.agents["claude"].max_turns == 80
+    step = phase_step_of(cfg, "build", "build")
+    assert step.max_turns is None
+    assert resolve_turn_cap(cfg, "claude", dataclasses.replace(step, max_turns=20), "build") == 20  # the step wins
+    assert resolve_turn_cap(cfg, "claude", step, "build") == 60  # the role beats `max_turns: 80`
+    assert resolve_turn_cap(cfg, "claude", step, "design") == 80  # no entry: `max_turns`
+    off = load_config(tmp_cfg({"agents": {"claude": {"max_turns_by_role": {"build": 0}}}}))
+    assert resolve_turn_cap(off, "claude", step, "build") == 0  # no cap, and no fallback to `max_turns`
+    assert resolve_turn_cap(off, "claude", dataclasses.replace(step, max_turns=20), "build") == 20
+    assert session_budget(cfg, "claude", "build") == 10.0
+    assert session_budget(cfg, "claude", "design") is None
+    assert session_budget(off, "claude", "build") == 10.0  # the two maps are independent
+    zero = load_config(tmp_cfg({"agents": {"claude": {"session_budget_usd": {"build": 0}}}}))
+    assert session_budget(zero, "claude", "build") is None
+
+
+def test_cap_map_checks(tmp_cfg):
+    for key, bad in (("max_turns_by_role", {"reviewer": 10}), ("max_turns_by_role", {"build": -1}),
+                     ("max_turns_by_role", {"build": 1.5}),
+                     ("session_budget_usd", {"build": float("inf")}), ("session_budget_usd", {"build": 0.001}),
+                     ("session_budget_usd", {"build": 5000}), ("session_budget_usd", {"nobody": 1})):
+        found = [(i.level, i.path) for i in _c4_issues(tmp_cfg, {"agents": {"claude": {key: bad}}}) if i.level == "error"]
+        assert found == [("error", f"agents.claude.{key}")], (key, bad)
+    for key in ("max_turns_by_role", "session_budget_usd"):  # a role the engine's caps don't name: a typo, most likely
+        msg = next(i.message for i in _c4_issues(tmp_cfg, {"agents": {"claude": {key: {"nobody": 1}}}}) if i.level == "error")
+        assert "agents.claude.models" in msg and "check the role's name" in msg and ": null" not in msg
+    ok = {"agents": {"claude": {"max_turns_by_role": {"build": 0, "review": 7}, "session_budget_usd": {"build": 0, "plan": 0.01}}}}
+    assert not [i for i in _c4_issues(tmp_cfg, ok) if i.level == "error"]
+    for key in ("max_turns_by_role", "session_budget_usd"):
+        with pytest.raises(ConfigError, match=key):
+            load_config(tmp_cfg({"agents": {"claude": {key: {"build": "many"}}}}))
+        with pytest.raises(ConfigError, match=key):
+            load_config(tmp_cfg({"agents": {"claude": {key: ["build"]}}}))
+        with pytest.raises(ConfigError, match=f"{key}.build"):  # YAML's `true` is no number of turns or dollars
+            load_config(tmp_cfg({"agents": {"claude": {key: {"build": True}}}}))
+    with pytest.raises(ConfigError, match="session_budget_usd.build"):  # too large for a float: refused, not a crash
+        load_config(tmp_cfg({"agents": {"claude": {"session_budget_usd": {"build": 10 ** 400}}}}))
+
+
+def test_a_pack_that_drops_a_model_role_must_null_its_caps(tmp_cfg):
+    def dropping(caps):
+        def patch(data):
+            data["agents"]["claude"]["models"] = {"mechanical": None}
+            data["agents"]["claude"].update(caps)
+
+        return patch
+
+    bare = [i for i in _c4_issues(tmp_cfg, dropping({})) if i.level == "error"]
+    assert [i.path for i in bare] == ["agents.claude.max_turns_by_role"] and "max_turns_by_role.mechanical: null" in bare[0].message
+    both = {"max_turns_by_role": {"mechanical": None}, "session_budget_usd": {"mechanical": None}}
+    assert not [i for i in _c4_issues(tmp_cfg, dropping(both)) if i.level == "error"]
+
+
+def test_bash_output_chars_checks(tmp_cfg):
+    for bad in (500, 2_000_000, 999):
+        found = [(i.level, i.path) for i in _c4_issues(tmp_cfg, {"agents": {"claude": {"bash_output_chars": bad}}})
+                 if i.level == "error"]
+        assert found == [("error", "agents.claude.bash_output_chars")], bad
+    for good in (0, 15000, 1000, 1_000_000):
+        assert not [i for i in _c4_issues(tmp_cfg, {"agents": {"claude": {"bash_output_chars": good}}}) if i.level == "error"], good
+    for bad in ("lots", True, 15000.5):  # never reaches `BASH_MAX_OUTPUT_LENGTH`: refused when the config loads
+        with pytest.raises(ConfigError, match="bash_output_chars"):
+            load_config(tmp_cfg({"agents": {"claude": {"bash_output_chars": bad}}}))
+
+
+def test_cap_keys_on_codex_warn(tmp_cfg):
+    patch = {"agents": {"codex": {"max_turns_by_role": {"build": 5}, "session_budget_usd": {"build": 5}, "bash_output_chars": 2000}}}
+    found = [(i.level, i.path, i.message) for i in _c4_issues(tmp_cfg, patch, "agents.codex.")]
+    assert [(lv, p) for lv, p, _ in found] == [("warning", "agents.codex.max_turns_by_role"),
+                                               ("warning", "agents.codex.session_budget_usd"),
+                                               ("warning", "agents.codex.bash_output_chars")]
+    assert all("only the claude agent's calls are capped" in m and "no effect on `codex`" in m for _, _, m in found)
+    assert not [i for i in _c4_issues(tmp_cfg, None) if i.level == "warning"]
+
+
+def test_step_max_turns_checks(tmp_cfg):
+    def on_step(value):
+        def patch(data):
+            phase_step(data, "build", "build")["max_turns"] = value
+
+        return patch
+
+    for bad in (0, "x", True, 1.5, -3):  # refused when the config loads: a run start never calls `validate`
+        with pytest.raises(ConfigError, match=r"phases\.build.*max_turns"):
+            load_config(tmp_cfg(on_step(bad)))
+    assert not [i for i in _c4_issues(tmp_cfg, on_step(20), "phases.") if i.level == "error"]
+    assert phase_step_of(load_config(tmp_cfg(on_step(20))), "build", "build").max_turns == 20
+
+    def on_retro(data):
+        data.setdefault("retro_step", {"id": "retro", "skill": "agentflow-retro", "role": "review", "prompt": "retro.md"})
+        data["retro_step"]["max_turns"] = 20
+
+    cfg = load_config(tmp_cfg(on_retro))
+    assert cfg.retro_step.max_turns == 20
+    assert not [i for i in _c4_issues(tmp_cfg, on_retro, "retro_step") if i.level == "error"]
+
+    def bad_retro(data):
+        on_retro(data)
+        data["retro_step"]["max_turns"] = 0
+
+    with pytest.raises(ConfigError, match=r"retro_step\.max_turns"):
+        load_config(tmp_cfg(bad_retro))
+
+
+@pytest.mark.parametrize("key,arg,owner", [("base_args", ["-p", "--max-budget-usd", "5"], "session_budget_usd"),
+                                           ("command", ["claude", "--max-turns=9"], "max_turns_by_role"),
+                                           ("effort_arg", ["--max-turns", "9", "--effort", "{effort}"], "max_turns_by_role"),
+                                           ("effort_arg", ["--setting-sources", "user", "{effort}"], "user_settings")])
+def test_runner_flags_name_their_key(tmp_cfg, key, arg, owner):
+    found = [i for i in _c4_issues(tmp_cfg, {"agents": {"claude": {key: arg}}}) if i.level == "error"]
+    assert [i.path for i in found] == [f"agents.claude.{key}"]
+    assert f"agents.claude.{owner}" in found[0].message and "is not allowed" in found[0].message

@@ -906,6 +906,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "agent_started": (("session_id", "pid"),),
     "agent_session": ("session_id",),
     "brief_replaced": ("key", "reason"),
+    "session_capped": ("key", "cap"),
     "read_only_skipped": ("key", "reason"),
     "context_window": ("model", "tokens"),
     "usage_window": ("window",),

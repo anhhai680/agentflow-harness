@@ -306,8 +306,11 @@ def delta_for_review(worktree: Path, events: list[dict], phase: str, review_key:
 
 
 def delta_turn_cap(base: int | None) -> int | None:
-    """The turn cap of a later round's review: half the agent's `max_turns`, at least 1; None (no cap) when it has none."""
-    return None if base is None else max(1, base // 2)
+    """The turn cap of a later round's review: half the resolved turn cap, at least 1; None (no cap) when it has none,
+    and 0 (no cap, by `max_turns_by_role`) stays 0."""
+    if base is None or base == 0:
+        return base
+    return max(1, base // 2)
 
 
 # --------------------------------------------------------------------------- dispositions

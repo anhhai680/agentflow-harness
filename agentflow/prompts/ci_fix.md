@@ -10,7 +10,7 @@ The local gates passed before this ran, so look for what differs in CI first: a 
 - If the failure has nothing to do with the code (a network error, a runner problem, a flaky service), change nothing and say so in your summary: the runner then runs the failed jobs again.
 - Never weaken the repository's quality rules, skip a test or add a suppression.
 
-Run the verify gates before you finish. Do not commit: the runner commits and pushes.
+Run only the tests that cover your fix: the runner runs the verify gates after you. Do not commit: the runner commits and pushes.
 
 ## The `{skill}` skill
 

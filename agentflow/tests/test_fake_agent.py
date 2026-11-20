@@ -142,3 +142,17 @@ def test_acts_without_attempts_are_untouched(fake, agent, tmp_path, wt, ws):
     assert (wt / "src" / "b.py").read_text(encoding="utf-8") == "y = 1\n"  # `write` is not a tool call: no model decides it
     assert outcome.permission_denials == [{"tool_name": "Bash", "tool_input": {}}]
     assert "unavailable" not in result_event(call)
+
+
+def test_capped_act_ends_like_the_cli(fake, agent, tmp_path, wt, ws):
+    call = make_call(tmp_path, wt, ws, read_only_role=False, self_contained=False)
+    fake.script({STEP: [{"capped": "turns", "write": {"src/b.py": "y = 1\n"}, "result": {"status": "done"}}]})
+    outcome = agent.run(call, lambda name, payload: None)
+    assert outcome.exit_code == 1 and outcome.capped == "turns" and outcome.interruption is None
+    assert outcome.final_text == "" and outcome.usage["terminal_reason"] == "max_turns"
+    assert (wt / "src" / "b.py").exists() and call.result_path.exists()  # the act's other keys run as usual
+    event = result_event(call)
+    assert event["subtype"] == "error_max_turns" and event["is_error"] is True and event["result"] == ""
+    fake.script({STEP: [{"capped": "budget"}]})
+    outcome = agent.run(call, lambda name, payload: None)
+    assert outcome.exit_code == 1 and outcome.capped == "budget" and outcome.usage["terminal_reason"] == "budget_exhausted"

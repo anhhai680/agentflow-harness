@@ -1707,3 +1707,15 @@ def test_a_pack_without_a_retro_step_is_never_due_and_the_command_says_so(flow_r
     assert due(flow_repo.root, cfg, NOW + timedelta(days=30)) is None
     assert main(["retro", "--config", str(path)]) == 1
     assert "this pack has no retro step" in capsys.readouterr().out
+
+
+def test_a_capped_retro_names_the_retro_way_out(flow_repo, gh_log):
+    a, _b = _two_runs_failing(flow_repo, "unit")
+    flow_repo.fake.script({KEY: [_retro_result(add=[_add(sources=[f"{a}#{SEQ}"])], capped="turns")]})
+    out = run_retro(flow_repo.root, flow_repo.cfg, None, False, NOW)
+    assert out.pr_url is None and not _created(gh_log)
+    waiting = _waiting(flow_repo, out)
+    assert waiting["kind"] == "turn_cap" and waiting["key"] == KEY
+    assert len(flow_repo.fake.calls()) == 1  # a review: no wrap-up
+    page = _run(flow_repo, out).inbox_path(KEY).read_text(encoding="utf-8")
+    assert "A retro run cannot be resumed" in page and "Raise the cap once" not in page

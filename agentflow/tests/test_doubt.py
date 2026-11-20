@@ -655,4 +655,5 @@ def test_delta_for_review_ignores_a_review_of_an_earlier_human_round(tmp_path):
 
 def test_delta_turn_cap():
     assert doubt.delta_turn_cap(None) is None
-    assert [doubt.delta_turn_cap(n) for n in (1, 60, 61)] == [1, 30, 30]
+    assert doubt.delta_turn_cap(0) == 0  # 0 is "no cap": a later round gets none either
+    assert [doubt.delta_turn_cap(n) for n in (1, 45, 60, 61)] == [1, 22, 30, 30]

@@ -275,6 +275,7 @@ Today a resume prompt is 10–20K chars (median: implement 10.5K, plan 20K). The
 - **Unchanged:** the doubt stop rules (`unchanged`, `disputed`, `theater` and `bounded`), the numbering, and the floor that at least one refine round runs.
 - **Expected:** together with L4 and L5, −6% to −10% of spend. Spec and plan reviews are 28% of spend, and later rounds are about half of them.
 - *Amended for the C3 plan:* the round 2+ turn cap is `max(1, base // 2)`, where `base` is the agent's `max_turns` (unset by default, which means no cap). C4 swaps the base for `max_turns_by_role`.
+- *Amended for the C4 plan:* `base` is the resolved turn cap: the step's own `max_turns`, else the role's `agents.<name>.max_turns_by_role` entry, else `agents.<name>.max_turns`. A role set to `0` stays `0` (no cap), and no base at all is no cap. With the shipped `review: 45`, a round 2+ review gets 22.
 
 ### 3.4 L4 — Read-only tools for review roles
 
@@ -315,6 +316,12 @@ A `role: review` session doesn't need to edit the tree, run the test suite or ca
 - **Overrides:** a step can set its own `max_turns:`, and doubt rounds after the first get half of round 1's cap (L3c).
 - **Wrap-up:** when Claude ends with `error_max_turns`, the runner resumes the session **once** with a fixed wrap-up prompt and `--max-turns 3`: "You have used the turn budget. Write your result now with what you have; list what is left as `todo`." If there is still no result, the run stops as `turn_cap`. The resolver may take that stop, with the human's options: raise the cap once, split the step, or descope.
 - **Spirals:** the `session_turns_p90:<kind>` signal (L1) shows a step kind that keeps spiralling, so a lesson can target it.
+- *Amended for the C4 plan (Decided 1, 2, 4, 5, 6, 7):*
+  - **The unit and the shipped values:** a probe of the CLI (2026-11-19) found that `--max-turns` counts assistant API calls, not the `num_turns` a result reports (4 parallel `Read` calls in one message ran as 1 turn, with `num_turns` 5, under `--max-turns 2`). So the fallback values of this section ship, with `review` raised from 30 to 45 (1.5× the §1.2 review p90 of 31): `{review: 45, plan: 60, build: 60, debug: 60, mechanical: 15}`. A doubt round 2+ review gets half of the resolved cap (22 for `review`). The cap counts per invocation: a resume gets a fresh one (probe c), so approving a stop that a cap caused is "raise the cap once".
+  - **"Off" and the supersession:** `0` on a role means no cap for it, with no fallback to `agents.<name>.max_turns`; `null` on a role removes its entry; `{}` does nothing, because an empty mapping merges as nothing. The role map supersedes `max_turns` for the roles it names, so a pack that set `max_turns` gets the role caps for `review`, `plan`, `build`, `debug` and `mechanical`, and `max_turns` stays the cap for every other role (the changelog says so under `Changed`).
+  - **The wrap-up is for editing steps only.** A step whose `role` is `review` that hits a cap stops at once as `turn_cap` or `budget_cap`, even if it wrote a result: a capped review is never taken as complete, which keeps the refine floor and review independence. Any other step (`verify` included, which is `role: build`) that hits a cap with no valid result gets one wrap-up turn per step since the last human approval or reopen, under `--max-turns 3` and a spend cap of at most $2.5 (none when the role has none). A rollover or a replaced brief during the wrap-up stops the step as the cap's kind, as does any wrap-up result that is not `done`. A usage-window refusal is a hold, as before, whatever else the result says.
+  - **Ways out:** approving the stop resumes the session. Split and descope are `approve --note`, which the resumed session reads; `retry` starts fresh. `autonomy.resolve_kinds` gains `turn_cap: 1` and `budget_cap: 1`, so a resolver may take the stop once. A retro run's cap stop offers only the retro's own way out, because a retro is never resumed.
+  - **What the caps cover:** every call through `run_agent_step` (the resolver, the record step and the retro included). Sizers and the route triage keep their own turn caps and get no spend cap. A role with no entry falls back to `agents.<name>.max_turns` and has no spend cap. On a non-claude agent the keys are a `validate` warning and the argv is unchanged.
 
 **L5b. A spend cap per session** (the "action cap" of harness §3.11, built narrow). Decided (Q3): **on by default, as a backstop.**
 - **Key:** `agents.claude.session_budget_usd: {review: 4, plan: 10, build: 10, debug: 10}`, passed as `--max-budget-usd`.
@@ -326,6 +333,10 @@ A `role: review` session doesn't need to edit the tree, run the test suite or ca
   - the cap counts per invocation, so a resume gets a fresh cap.
 - **What the runner does at the cap:** the same as at the turn cap (L5a). It resumes once with the wrap-up prompt under its own small cap. With still no result, the run stops as `budget_cap`, with the same human options.
 - **No per-step cap** (decided, Q6). One step can spend up to about (1 + `fix_attempts` + wrap-up) × the cap. That range is already bounded by `fix_attempts`, the turn caps and `run_budget_hard_usd`. L1's per-step cost signal shows whether a step-level cap is ever needed.
+- *Amended for the C4 plan (Decided 2, 3, 5):*
+  - **"Off" is `0` or an absent role, not `{}`:** `session_budget_usd.<role>: 0` passes no `--max-budget-usd` for that role, `null` on a role removes its entry and `null` on the key removes all of them. The two maps (turns and spend) are independent.
+  - **The values stay as written here:** the post-C0 per-invocation p99 is build $1.47, plan $0.94 and review $0.78, so every cap is more than 3× p99, and no role is lowered. The flag gets the value in fixed notation (`4.00`), and `validate` takes `0` or a number from 0.01 to 1000.
+  - **No new per-step bound.** The "(1 + `fix_attempts` + wrap-up) × the cap" range above is wrong: each call is capped, but a step can make more calls than `fix_attempts` suggests, because a reminder, a hold, an approval or a reopen each start a call with a fresh cap. `run_budget_hard_usd` bounds the step's total and the run, as before; the per-call cap is a backstop and no step-level bound is added.
 
 **L5c. The idle limit** stays as T3 shipped it (15 minutes), plus `read_only_idle_min` (L4). The data shows no case for changing the default: 18 gaps over 15 minutes in 5,547 calls.
 - *Amended for the C3 plan:* `read_only_idle_min` applies only while no tool call is open (L4, Decided 5), and `0` gives read-only sessions today's limits.
@@ -346,6 +357,12 @@ Implementers ran `pytest` 262 times and lint 331 times in their sessions. The ga
 **L6c. Search with the tools, not the shell.** The preamble asks for `Grep` and `Glob` with limits instead of `grep -r` and `find` through Bash (the "search" category: 1.2M chars in implement alone), and for reading a file once (re-reads: 28–38%). These are prompt changes. Any reworded engine prompt text gets a `Retired` entry in `pack_fix.py`, as CLAUDE.md requires.
 
 **L6d. Files in the brief aren't read again.** With L2c, the prompt states which artifacts are already in the system prompt: spec, plan and rules.
+
+- *Amended for the C4 plan (Decided 8, 10, 11):*
+  - **L6a:** above 0 the runner sets `BASH_MAX_OUTPUT_LENGTH` and drops any copy from the inherited environment and `defaults.env`, as `cache_ttl` does with its variables; `0` leaves it to the environment. A project `.claude/settings*.json` `env` block can still set the variable, which costs only money. `validate` takes `0` or a whole number from 1000 to 1000000. The probe confirmed the CLI honours it (a 5000-line output came back at 2343 characters under a 2000 cap).
+  - **L6b:** five default prompts tell a session to run the build or verify gates although the runner runs a gate set after each of their steps: `task_inline.md`, `fix.md`, `ci_fix.md`, `fix_findings.md` and `sync_conflicts.md`. Their line now says the runner runs those gates after the session. `gate_fix.md` stays as it is, because its job is a failing gate, and the fix lead's text says to re-run only what failed. The bundled `agentflow-build` skill gains "quiet flags". A pack that puts one of these prompts on a step with no gates gets a session that skips the gates.
+  - **L6c:** the preamble gains three lines (quiet test flags, `Glob`/`Grep` with limits, reading a file once) and rewords none of its text.
+  - **`Retired` entries:** each reworded sentence gets one, with an `old` unique to its file, ordered longest first. `pack_fix` applies every entry to every pack prompt whatever its name, and three of these files retire the same sentence with different replacements.
 
 **Expected (L6):** −5% to −10% of spend, by shrinking the context that every later turn reads.
 
@@ -383,14 +400,14 @@ Every key ships with the four things CLAUDE.md requires: a Settings form field o
 | `agents.claude.lean` | `true` | run sessions only; Settings form field |
 | `agents.claude.user_settings` | `false` | `false` passes `--setting-sources project,local`; a personal key (`agents.claude.user_settings` in `layers.USER_KEYS`); Settings form field (Claude section only). `doctor` warns when the user's Claude settings hold `env`, `apiKeyHelper` or `permissions`, which runs would then skip. `validate` warns about a project `.mcp.json` under `lean`, and about an `overlays.security.review_agent` that isn't in `.claude/agents/`. |
 | `agents.claude.read_only_roles` | `[review]` | `validate`: only known roles; Settings form field |
-| `agents.claude.max_turns_by_role` | `{review: 30, plan: 60, build: 60, debug: 60, mechanical: 15}` | `agents.<name>.max_turns` stays as the fallback |
-| `agents.claude.session_budget_usd` | `{review: 4, plan: 10, build: 10, debug: 10}` | `{role: usd}`; `{}` turns it off; checked against C0's p99 |
-| `agents.claude.bash_output_chars` | `15000` | `0` leaves the CLI's default |
+| `agents.claude.max_turns_by_role` | `{review: 45, plan: 60, build: 60, debug: 60, mechanical: 15}` | `agents.<name>.max_turns` stays as the fallback for roles the map doesn't name; `0` on a role is no cap; *amended for the C4 plan:* `review` is 45 (the probe showed `--max-turns` counts API calls), `validate`: whole numbers of 0 or more, roles in `models`; Settings form field |
+| `agents.claude.session_budget_usd` | `{review: 4, plan: 10, build: 10, debug: 10}` | `{role: usd}`; checked against C0's p99; *amended for the C4 plan:* `0` or an absent role turns a role's cap off, `{}` changes nothing; `validate`: `0` or 0.01 to 1000, roles in `models`; Settings form field |
+| `agents.claude.bash_output_chars` | `15000` | `0` leaves the CLI's default; *amended for the C4 plan:* `validate`: `0` or 1000 to 1000000; Settings form field |
 | `context.run_brief` | `true` | |
 | `context.resume_gate_lines` | `80` | |
 | `project.agent_rules` | `[CLAUDE.md]` | files that make up the brief's rules section; read from the main checkout |
 | `phases.<p>.steps[].carry` | `{max_tasks: 1}` (off) | on a `foreach: plan_task` step; `validate`: `max_context_pct` between 10 and 70; the default flips only on evidence (Q7) |
-| `phases.<p>.steps[].max_turns` | unset | step override |
+| `phases.<p>.steps[].max_turns` | unset | step override; *amended for the C4 plan:* `validate`: a whole number of 1 or more; protected with the workflow; a doubt round 2+ gets half |
 | `watchdog.read_only_idle_min` | `5` | |
 | `usage.governor` | `on` | `on \| observe \| off` |
 | `usage.five_hour_soft` / `five_hour_hard` / `seven_day_soft` | `0.75` / `0.92` / `0.85` | `validate`: 0 < soft < hard ≤ 1 |

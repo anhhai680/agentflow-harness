@@ -21,7 +21,9 @@ stderr str (written to stderr before anything else, as a CLI that refuses a flag
 attempts [{tool_name, tool_input}] (tool calls the model tries, decided by the permission model below; a permitted
 `Write` writes `tool_input.content` to `file_path`; a denied call is added to the result event's `permission_denials`, and
 a call to a tool `--tools` leaves out to its `unavailable` list as `{tool_name, tool_input, kind: "unknown_tool"}`; a
-`file_path` of `$AGENTFLOW_RESULT` is the step's result file).
+`file_path` of `$AGENTFLOW_RESULT` is the step's result file), capped "turns"|"budget" (after the act's other keys, the
+result event is the CLI's cap error: `subtype` `error_max_turns` / `error_max_budget_usd`, `is_error`, `terminal_reason`
+`max_turns` / `budget_exhausted`, an empty `result`, and the process exits 1 whatever `exit` says).
 `write` is not a tool call and bypasses the model: it is the fake's own hand on the tree.
 
 The permission model of `attempts` is a model of the real CLI's, close enough for the runner's tests, not a copy.
@@ -242,6 +244,10 @@ def under_allow(allow: list[str], tool: str, path: Path, cwd: Path) -> bool:
     return "Edit" in allow or (tool in WRITE_TOOLS and tool in allow) or any(under_edit_rule(rule, path, cwd) for rule in allow)
 
 
+# act key `capped` -> the result event's `subtype` and `terminal_reason`, as the real CLI ends at a cap
+CAPS = {"turns": ("error_max_turns", "max_turns"), "budget": ("error_max_budget_usd", "budget_exhausted")}
+
+
 def main() -> int:
     argv = sys.argv[1:]
     step = os.environ.get("AGENTFLOW_STEP", "")
@@ -357,7 +363,8 @@ def main() -> int:
         text = act["result_raw"] if "result_raw" in act else json.dumps(act["result"])
         target.write_text(text, encoding="utf-8")
 
-    if exit_code != 0:
+    capped = act.get("capped")
+    if capped is None and exit_code != 0:
         return exit_code
     cost = session_total(session, float(act.get("cost", 0.01)))
     final_text = act.get("final_text", "done")
@@ -368,9 +375,14 @@ def main() -> int:
               "total_cost_usd": cost, "num_turns": 1, "terminal_reason": "completed",
               "permission_denials": denials, "modelUsage": cumulative,
               "model_usage_since_last_result": {model: {**this_call, "contextWindow": WINDOW}}, **base}
+    if capped:
+        subtype, reason = CAPS[capped]
+        result.update(subtype=subtype, is_error=True, result="", terminal_reason=reason)
     if unavailable:
         result["unavailable"] = unavailable
     emit(result)
+    if capped:
+        return 1
     for extra in act.get("results", []):
         emit({**result, "num_turns": 0, "model_usage_since_last_result": {}, **extra, **base})
     if act.get("linger"):
