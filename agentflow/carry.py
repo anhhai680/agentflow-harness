@@ -49,8 +49,7 @@ def decide(events: list[dict], steps: dict[str, dict], prev_tkey: str, key: str,
     if any(e["type"] in ("hitl_raised", "step_parked") and _under(str(e.get("key") or ""), prev_tkey)
            for e in events):
         return None, "not_clean"
-    tasks = 1 + sum(1 for e in events if e["type"] == "session_carried" and e.get("session_id") == session)
-    if tasks >= max_tasks:
+    if tasks_in(events, session) >= max_tasks:
         return None, "max_tasks"
     if any(e["type"] == "rolled_over" and e.get("key") == prev for e in events):
         return None, "rolled_over"
@@ -68,6 +67,11 @@ def decide(events: list[dict], steps: dict[str, dict], prev_tkey: str, key: str,
     if level in known and current in known and sizing.highest([level, current]) != current:
         return None, "effort"
     return prev, CARRIED
+
+
+def tasks_in(events: list[dict], session: str) -> int:
+    """How many plan tasks session `session` holds: its first, plus one per `session_carried` that names it."""
+    return 1 + sum(1 for e in events if e["type"] == "session_carried" and e.get("session_id") == session)
 
 
 def _under(key: str, tkey: str) -> bool:

@@ -221,6 +221,32 @@ def test_build_refines_every_task(flow_repo, git):
     assert approvals(flow_repo, run) == [("build", 0), ("build", 1)]
 
 
+def test_a_refine_round_after_a_carried_build_writes_no_carry_event(flow_repo, git):
+    def edit(data):
+        next(s for s in data["phases"]["build"]["steps"] if s.get("id") == "build")["carry"] = {"max_tasks": 4}
+
+    flow_repo.configure(BIG, edit=edit)
+    commit_spec_and_plan(flow_repo, git)
+    impl = "build/build/task-{n}/implement"
+    run = begin(flow_repo, "feature", from_phase="build")
+    assert go(flow_repo, run) == "awaiting_approval"
+    shared = session_of(flow_repo, run, impl.format(n=1))
+    assert session_of(flow_repo, run, impl.format(n=2)) == shared  # task 2 carried task 1's session
+    assert len(flow_repo.events(run, "session_carried")) == 1
+    before = len(flow_repo.calls())
+
+    reject(run, "build", "me", NOTE)
+    assert go(flow_repo, run) == "awaiting_approval"
+    refined = flow_repo.calls()[before:]
+    assert [c["step"] for c in refined] == [impl.format(n=1), "build/build/task-1/review",
+                                            impl.format(n=2), "build/build/task-2/review"]
+    for n in TITLES:  # each task resumes its own (here: the shared) session with the note
+        call = calls_for(refined, impl.format(n=n))[0]
+        assert ("--resume", shared) in pairs(call["argv"]) and NOTE in call["argv"][-1]
+    assert not any("--resume" in c["argv"] for c in refined if c["step"].endswith("/review"))
+    assert len(flow_repo.events(run, "session_carried")) == 1 and not flow_repo.events(run, "carry_declined")
+
+
 # --------------------------------------------------------------------------- sessions and conditions
 
 

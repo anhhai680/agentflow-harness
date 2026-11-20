@@ -1210,6 +1210,149 @@ def test_task_reviews_carry_the_tree(lane):
     assert all(e.get("tree") for e in reviews)
 
 
+# --------------------------------------------------------------------------- carrying the implementer
+
+
+def carry_on(flow_repo, carry: dict, batch: bool = False):
+    def edit(data):
+        next(s for s in data["phases"]["build"]["steps"] if s.get("id") == "build")["carry"] = carry
+
+    flow_repo.configure(BIG, batch=batch, edit=edit)
+    return flow_repo
+
+
+def decisions(flow_repo, run) -> tuple[list, list]:
+    carried = [(e["key"], e["from"], e["tasks"]) for e in flow_repo.events(run, "session_carried")]
+    declined = [(e["key"], e["reason"]) for e in flow_repo.events(run, "carry_declined")]
+    return carried, declined
+
+
+def test_carry_resumes_one_session_until_the_context_limit(flow_repo, git):
+    carry_on(flow_repo, {"max_tasks": 4})
+    run = begin_build(flow_repo, plan_text(count=4))
+    flow_repo.script({IMPL.format(n=3): [{"usage_pct": [45], "result": DONE_RESULT}]})  # over the default 40
+    assert build(flow_repo, run) == ("done", True)
+    s1 = session_of(flow_repo, run, IMPL.format(n=1))
+    assert {session_of(flow_repo, run, IMPL.format(n=n)) for n in (2, 3)} == {s1}
+    assert session_of(flow_repo, run, IMPL.format(n=4)) != s1
+    calls = flow_repo.calls()
+    assert steps(calls) == [step for n in range(1, 5) for step in (IMPL.format(n=n), REVIEW.format(n=n))]
+    assert "--resume" not in calls[0]["argv"]
+    for n in (2, 3):
+        assert ("--resume", s1) in pairs(calls[2 * (n - 1)]["argv"])
+    assert "--resume" not in calls[6]["argv"]
+    reviews = [c for c in calls if c["step"].endswith("/review")]
+    assert len(reviews) == 4 and not any("--resume" in c["argv"] for c in reviews)  # every reviewer is fresh
+    assert subjects(git, flow_repo.root)[:4] == [f"Task {n}: {TITLES[n]}" for n in (4, 3, 2, 1)]  # one commit per task
+    first = IMPL.format(n=1)
+    assert decisions(flow_repo, run) == ([(IMPL.format(n=2), first, 2), (IMPL.format(n=3), IMPL.format(n=2), 3)],
+                                         [(IMPL.format(n=4), "context")])
+
+
+def test_carry_goes_fresh_at_max_tasks(flow_repo):
+    carry_on(flow_repo, {"max_tasks": 2})
+    run = begin_build(flow_repo, plan_text(count=4))
+    assert build(flow_repo, run) == ("done", True)
+    s = {n: session_of(flow_repo, run, IMPL.format(n=n)) for n in range(1, 5)}
+    assert s[1] == s[2] and s[3] == s[4] and s[1] != s[3]
+    carried, declined = decisions(flow_repo, run)
+    assert [(key, tasks) for key, _, tasks in carried] == [(IMPL.format(n=2), 2), (IMPL.format(n=4), 2)]
+    assert declined == [(IMPL.format(n=3), "max_tasks")]
+
+
+def test_a_carried_prompt_is_a_continuation(flow_repo, monkeypatch):
+    carry_on(flow_repo, {"max_tasks": 4})
+    seen = []
+    real = lanes.build_prompt
+    monkeypatch.setattr(lanes, "build_prompt", lambda cfg, step, *rest, **kw: seen.append((step.id, step.continuation)) or real(cfg, step, *rest, **kw))
+    run = begin_build(flow_repo, plan_text(count=3))
+    assert build(flow_repo, run) == ("done", True)
+    assert [continuation for step_id, continuation in seen if step_id == "build"] == [False, True, True]
+    assert "Task 2: Second thing" in flow_repo.calls()[2]["argv"][-1]  # the task's own prompt, not a batch's
+
+
+def test_no_carry_key_changes_nothing(lane):
+    run = begin_build(lane, plan_text(count=3))
+    assert build(lane, run) == ("done", True)
+    assert len({session_of(lane, run, IMPL.format(n=n)) for n in (1, 2, 3)}) == 3
+    assert decisions(lane, run) == ([], [])
+
+
+def test_a_stopped_task_is_not_carried(flow_repo):
+    carry_on(flow_repo, {"max_tasks": 4})
+    run = begin_build(flow_repo, plan_text(count=2))
+    flow_repo.script({REVIEW.format(n=1): [review(FINDING, MINOR), review(FINDING), review(FINDING)]})
+    assert build(flow_repo, run) == ("stopped", True)
+    assert run.state["waiting"]["kind"] == "review_unresolved"
+    approve(run, REVIEW.format(n=1), by="me")
+    assert build(flow_repo, run) == ("done", True)
+    assert session_of(flow_repo, run, IMPL.format(n=2)) != session_of(flow_repo, run, IMPL.format(n=1))
+    assert decisions(flow_repo, run) == ([], [(IMPL.format(n=2), "not_clean")])
+
+
+def test_carry_never_crosses_a_parked_task(flow_repo):
+    carry_on(flow_repo, {"max_tasks": 4})
+    run = begin_build(flow_repo, plan_text({1: "none", 2: "none", 3: "none"}, count=3))
+    flow_repo.script({IMPL.format(n=2): [needs_human("ambiguity", can_continue=True)]})
+    assert build(flow_repo, run) == ("stopped", True)
+    assert [e["key"] for e in flow_repo.events(run, "step_parked")] == [IMPL.format(n=2)]
+    s1 = session_of(flow_repo, run, IMPL.format(n=1))
+    assert session_of(flow_repo, run, IMPL.format(n=2)) == s1  # task 2 carried task 1's session, then parked
+    assert session_of(flow_repo, run, IMPL.format(n=3)) != s1
+    # task 3 had no carry source (the task before it is held): nothing is recorded for it
+    assert decisions(flow_repo, run) == ([(IMPL.format(n=2), IMPL.format(n=1), 2)], [])
+
+
+def test_a_risk_task_starts_fresh(flow_repo):
+    carry_on(flow_repo, {"max_tasks": 4})
+    run = begin_build(flow_repo, plan_text(count=2))
+    answers = dict.fromkeys(("interface", "risk", "ambiguity", "breadth", "novelty", "mechanical"), "no")
+    run.emit("effort_decided", key=IMPL.format(n=2), level="medium", answers={**answers, "risk": "yes"})
+    assert build(flow_repo, run) == ("done", True)
+    assert session_of(flow_repo, run, IMPL.format(n=2)) != session_of(flow_repo, run, IMPL.format(n=1))
+    assert decisions(flow_repo, run) == ([], [(IMPL.format(n=2), "risk")])
+
+
+def test_a_compacted_session_is_not_carried(flow_repo):
+    carry_on(flow_repo, {"max_tasks": 4})
+    run = begin_build(flow_repo, plan_text(count=2))
+    flow_repo.script({IMPL.format(n=1): [{"compact": True, "result": DONE_RESULT}]})
+    assert build(flow_repo, run) == ("done", True)
+    assert decisions(flow_repo, run) == ([], [(IMPL.format(n=2), "compacted")])
+
+
+def test_carry_decision_survives_a_restart(flow_repo, monkeypatch):
+    carry_on(flow_repo, {"max_tasks": 4})
+    run = begin_build(flow_repo, plan_text(count=2))
+    real = lanes.Executor.run_agent_step
+    dead = [True]
+
+    def dies_before_task_two(self, phase, step, key, *args, **kwargs):  # the runner died before task 2's first call
+        if dead[0] and key == IMPL.format(n=2):
+            return "stopped"
+        return real(self, phase, step, key, *args, **kwargs)
+
+    monkeypatch.setattr(lanes.Executor, "run_agent_step", dies_before_task_two)
+    assert build(flow_repo, run)[0] == "stopped"
+    dead[0] = False
+    s1 = session_of(flow_repo, run, IMPL.format(n=1))
+    assert decisions(flow_repo, run)[0] == [(IMPL.format(n=2), IMPL.format(n=1), 2)]
+    executor = flow_repo.executor(run)
+    step = next(s for s in flow_repo.cfg.phases["build"].steps if s.id == "build")
+    assert executor._carry(step, "build/build/task-2", None) == IMPL.format(n=1)  # a new walk takes the record
+    assert build(flow_repo, run) == ("done", True)
+    assert session_of(flow_repo, run, IMPL.format(n=2)) == s1
+    assert decisions(flow_repo, run) == ([(IMPL.format(n=2), IMPL.format(n=1), 2)], [])  # still one decision
+
+
+def test_batched_tasks_do_not_carry(flow_repo):
+    carry_on(flow_repo, {"max_tasks": 4}, batch=True)
+    run = begin_build(flow_repo, plan_text(count=3))
+    assert build(flow_repo, run) == ("done", True)
+    assert [e["batches"] for e in flow_repo.events(run, "plan_batched")] == [[[1, 2, 3]]]
+    assert decisions(flow_repo, run) == ([], [])
+
+
 # --------------------------------------------------------------------------- the affected tier
 
 
