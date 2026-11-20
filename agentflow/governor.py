@@ -11,7 +11,8 @@ everything read from it is checked and a bad entry governs nothing.
 - **Valid readings.** `{utilization, resets_at, refused, ts}` is kept only when `utilization` is a finite number of
   at least 0 (above 1.5 is clamped to 1.5, so an overage still governs), `resets_at` is a whole number with
   `now - SLACK_S < resets_at <= now + span + SLACK_S`, and `refused` is a bool. Anything else is dropped when it is
-  recorded and when it is read, so a planted far-future reading governs nothing. A reading governs until
+  recorded and when it is read, so a planted far-future reading governs nothing. The interactive note's `resets_at`
+  gets the same range check. A reading governs until
   `resets_at + SLACK_S`, so a machine where every run is held still wakes after the reset.
 - **Accounts.** Readings are kept per account (`windows: {account: {window: reading}}`); the key is a hash of the
   effective `CLAUDE_CONFIG_DIR` (`account_of`). A run, the queue and the Backlog read only their own account's.
@@ -386,11 +387,15 @@ def _waiting(raw: Any) -> dict:
     return out
 
 
-def _note(raw: Any) -> dict | None:
+def _note(raw: Any, now: float) -> dict | None:
+    """The interactive-use note when it is well formed and its `resets_at` is in range like a reading's, so a planted
+    note with a far-future reset does not stay in the header."""
     if not isinstance(raw, dict) or raw.get("window") not in SPANS:
         return None
     numbers = {key: _num(raw.get(key)) for key in _NOTE_NUMBERS}
     if any(n is None for n in numbers.values()):
+        return None
+    if not now - SLACK_S < numbers["resets_at"] <= now + SPANS[raw["window"]] + SLACK_S:  # type: ignore[operator]
         return None
     note = {"window": raw["window"], **numbers}
     if isinstance(raw.get("account"), str):
@@ -431,7 +436,7 @@ class WindowFile:
         if version != VERSION:
             return state, f"{self.path} is version {version}, written by another engine", True
         state.update(windows=_windows(raw.get("windows"), now), sessions=_sessions(raw.get("sessions")),
-                     waiting=_waiting(raw.get("waiting")), interactive=_note(raw.get("interactive")))
+                     waiting=_waiting(raw.get("waiting")), interactive=_note(raw.get("interactive"), now))
         return state, None, False
 
     def _snapshot(self, now: float) -> dict:

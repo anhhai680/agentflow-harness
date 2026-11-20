@@ -392,6 +392,12 @@ def test_the_interactive_note(tmp_path):
     assert _note_case(tmp_path, "period", first_resets=int(time.time()) + 7200)[1]["interactive"] is None
 
 
+def test_the_cli_usage_limit_hold_outlasts_the_slack_a_refused_reading_goes_stale_after():
+    from agentflow import lanes
+
+    assert lanes.HOLD_SLACK_S >= SLACK_S
+
+
 def test_another_accounts_session_leaves_this_one_alone(tmp_path):
     now = time.time()
     wf = WindowFile(tmp_path / "f.json")
@@ -409,6 +415,12 @@ def test_a_bad_interactive_note_is_dropped(tmp_path):
     assert WindowFile(path).read()["interactive"] is None
     path.write_text(json.dumps({"version": 1, "interactive": {**note, "rise": 1e999}}), encoding="utf-8")
     assert WindowFile(path).read()["interactive"] is None
+    for resets_at in (now + 5 * 3600 + SLACK_S + 60, now - SLACK_S - 60):  # past the window's span; long reset
+        path.write_text(json.dumps({"version": 1, "interactive": {**note, "resets_at": resets_at}}), encoding="utf-8")
+        assert WindowFile(path).read()["interactive"] is None
+    path.write_text(json.dumps({"version": 1, "interactive": {**note, "window": "seven_day", "resets_at": now + 6 * 86400}}),
+                    encoding="utf-8")
+    assert WindowFile(path).read()["interactive"]["window"] == "seven_day"
 
 
 def test_a_held_lock_never_blocks_a_read_and_fails_a_write_open(tmp_path):

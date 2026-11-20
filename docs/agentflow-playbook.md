@@ -302,9 +302,10 @@ An issue that GitHub marks *blocked by* another issue (the Relationships menu) s
 | `max_rounds` (`define/grill_open_questions`) | the spec still has open questions after 2 grilling rounds, or after a round whose grill asked none (the condition and the grill disagree: the summary carries the condition's count, so check how the spec files its answered questions) | `approve` goes on as it is; `reject --note` sends the phase back |
 | `dirty_tree` (at `ship`) | uncommitted changes in the worktree | commit or discard them, then approve |
 
-**Holds are not stops.** A usage limit, an outage, or CI checks still pending after `ci.timeout_min` (with `ci.watch_max_h` above 0, reason `ci_pending`) need nothing from you. The run shows as `held` and notifies you once. It keeps its queue slot, except during a `ci_pending` hold, which frees the slot so `agentflow queue` can start another run while CI is watched. `agentflow status <run>` prints the reason and the time, and the Board's badge reads like `held until 14:30 (usage limit)`.
+**Holds are not stops.** A usage limit, a usage window governor hold (`run_held` reason `usage window`), an outage, or CI checks still pending after `ci.timeout_min` (with `ci.watch_max_h` above 0, reason `ci_pending`) need nothing from you. The run shows as `held` and notifies you once. It keeps its queue slot, except during a `ci_pending` hold, which frees the slot so `agentflow queue` can start another run while CI is watched. `agentflow status <run>` prints the reason and the time, and the Board's badge reads like `held until 14:30 (usage limit)`.
 
 - A usage limit waits for its reset time, with no cap.
+- A usage window hold waits until the window drops below its mark or resets. To end it early, set `usage.governor: off` (in the pack or the user layer: a held run takes it at its next poll) or delete `~/.local/state/agentflow/usage_window.json`.
 - An outage retries with a backoff of up to 15 minutes, for `recovery.give_up_h` (24) hours.
 - A call that reached the model and still died is retried, but the third such failure (`recovery.failed_attempts`) stops the step, because those calls cost money.
 
@@ -406,7 +407,7 @@ agentflow scorecard [--freeze]                      # the finished runs' signals
 | `validate` or `doctor` fails on a key the pack uses right after you pulled the harness (for example `work_source.path: missing`) | the installed engine is older than the checkout. Run `uv tool install --reinstall --from /path/to/agentflow-harness agentflow` (section 3), then `validate` again |
 | `agentflow validate` prints warnings or errors | the message names the YAML path (`phases.build.model`, `phases.define.steps[4].when`). Fix that line and re-run |
 | `run` says the agent command is not found | the preflight checks the `command` of each enabled agent. Install it or fix `agents.<name>.command` |
-| A run shows `held` | a usage limit or an outage. It carries on by itself (section 8); `pause` or `cancel` if you don't want it to |
+| A run shows `held` | a usage limit, the usage window governor (reason `usage window`: set `usage.governor: off` or delete `~/.local/state/agentflow/usage_window.json` to end it), or an outage. It carries on by itself (section 8); `pause` or `cancel` if you don't want it to |
 | A run shows `stalled` | the runner died (Ctrl-C, a crash, a reboot). A closed terminal does not cause this. `agentflow resume <run>` first waits for any agent that outlived its runner, up to the step timeout, then picks the step up from its recorded session |
 | A run shows `error` | the runner stopped on an unexpected exception (event `runner_error`). Fix the cause, then `agentflow resume <run>` |
 | Another runner is already on this run | the run lock refuses a second runner. Wait, or `agentflow status <run>` to see it |
