@@ -429,7 +429,8 @@ class _Loop:
         return self.settle(names, index, executor)
 
     def walk(self, phase: Phase, executor: Executor) -> tuple[Outcome, bool]:
-        """Run the phase's steps, letting the resolver settle what it can; `(outcome, any step ran)`."""
+        """Run the phase's steps, letting the resolver settle what it can; `(outcome, any step ran)`. A wait the plan
+        walk already handled (it ran the resolver on it, and parked it or told a person) is never taken over again."""
         resolver = Resolver(self.cfg, self.run, executor)
         ran = False
         while True:
@@ -437,6 +438,11 @@ class _Loop:
                 return "stopped", ran
             outcome, stepped = executor.run_steps(phase, phase.steps, phase.name)
             ran = ran or stepped
+            if outcome == "stopped":
+                self.run.refresh()
+                waiting = self.run.state["waiting"]
+                if waiting is not None and executor.handled(waiting):
+                    return outcome, ran
             if outcome != "stopped" or not resolver.take_over():
                 return outcome, ran
 

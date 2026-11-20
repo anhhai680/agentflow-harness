@@ -295,6 +295,35 @@ def test_unchecked_plan_goes_straight_to_build(pipe):
     assert run.state["waiting"]["key"] == "build_approved"
 
 
+TWO_TASKS = ("# Plan: demo\n\n### Task 1: First thing\n\n**Depends on:** none\n\n- Modify: `src/one.py`\n\n"
+             "- [ ] **Step 1: Do it**\n\n### Task 2: Second thing\n\n**Depends on:** none\n\n"
+             "- Modify: `src/two.py`\n\n- [ ] **Step 1: Do it**\n")
+
+
+def test_verify_never_starts_while_a_task_is_parked(pipe):
+    commit_files(pipe, {"docs/specs/SPEC-demo.md": APPROVED_SPEC, "src/toy/demo/__init__.py": "",
+                        PLAN_PATH: TWO_TASKS})
+    impl1 = "build/build/task-1/implement"
+    pipe.script({impl1: [{"write": {"src/one.py": "half\n"}, "result": {"status": "blocked", "summary": "stuck"}}]})
+    run = begin(pipe)
+    assert go(pipe, run) == "waiting_human"
+    assert run.state["waiting"]["key"] == impl1 and run.state["waiting"]["promoted"] is True
+    assert "build/build/task-2/implement" in steps_called(pipe)  # task 2 was built while task 1 was parked
+    assert types(pipe, run, "phase_started") == ["define", "build"]
+    assert go(pipe, run) == "waiting_human"  # nothing moves until a person settles task 1
+    assert types(pipe, run, "phase_started") == ["define", "build"] and types(pipe, run, "phase_approval_raised") == []
+
+    approve(run, impl1, by="me")
+    assert go(pipe, run) == "awaiting_approval" and run.state["waiting"]["key"] == "build_approved"
+    assert [e["n"] for e in pipe.events(run, "task_committed")] == [2, 1]
+    approve(run, "build", by="me")
+    go(pipe, run)
+    assert "verify" in types(pipe, run, "phase_started")
+    started = [e for e in run.events.read() if e["type"] == "phase_started" and e["phase"] == "verify"]
+    committed = [e for e in pipe.events(run, "task_committed") if e["n"] == 1]
+    assert committed[0]["seq"] < started[0]["seq"]
+
+
 def test_from_to(pipe):
     pipe.script({"plan/plan": [{"write": {PLAN_PATH: PLAN}, "result": DONE}]})
     run = begin(pipe, from_phase="plan", to_phase="verify")

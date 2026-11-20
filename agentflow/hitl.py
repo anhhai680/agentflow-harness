@@ -399,8 +399,9 @@ def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questio
                extra: str = "", notify: bool | None = None) -> Path:
     """Stop the run for a human: write the inbox file, record `hitl_raised`, notify. Returns the inbox path.
 
-    `notify`: None is the usual rule (quiet while the runner settles the stop itself: it tells a human if it cannot);
-    True always tells a human, False never does (a stop a human was already told of)."""
+    `notify`: None is the usual rule (quiet while the runner settles the stop itself, or while a plan task's stop may
+    still park: the runner tells a human if it cannot settle or park it); True always tells a human, False never does
+    (a stop a human was already told of)."""
     questions = list(questions)
     counted = {"times": _times_back(run, key)} if kind == "blocked_repeat" else {}
     how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).",
@@ -410,7 +411,7 @@ def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questio
     if notify is None:
         from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
 
-        notify = not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions])
+        notify = not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions]) and not parks_first(cfg, kind, key)
     run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
              questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:],
              notified=bool(notify), **counted)
@@ -447,24 +448,6 @@ def notice_text(wait: dict) -> str:
         return (f"{wait.get('key')} is blocked again for the same reason after {times - 1} approval(s): "
                 f"{clean_fact(summary)}")
     return summary
-
-
-def park_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questions: list[Question],
-              paths: list[str] | tuple = ()) -> Path:
-    """Ask a human without stopping: write the inbox file, record `step_parked`, notify.
-
-    The run goes on with tasks that do not depend on this one; it stops for this question only when no
-    runnable task remains. `paths` are the files the parked step changed so far: other tasks' commits
-    leave them out. Returns the inbox path.
-    """
-    how = [f"Run `{run.id}` parked `{key}` ({kind}) and goes on with the tasks that do not depend on it.",
-           f"Fill in the `Answer:` lines below, or run `agentflow answer {run.id} --key {key}`."]
-    path = run.inbox_path(key)
-    render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n".join(how))
-    run.emit("step_parked", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
-             questions=[asdict(q) for q in questions], inbox=str(path), paths=list(paths))
-    notify(cfg, _title_for(cfg, run), f"parked: {summary or key}", run=run)
-    return path
 
 
 def park_wait(cfg: Config, run: Run, wait: dict, *, blast_radius: dict, shelf: str | None, shelved: list[str],

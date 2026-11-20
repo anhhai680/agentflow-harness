@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, TextIO
@@ -35,7 +35,7 @@ from agentflow import lessons as lessons_mod
 from agentflow import doubt, gitops, overlays, pack, run_env, safeio, sizing, verification, workspace
 from agentflow.agents import (CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption,
                               ignored_settings, read_only_allow)
-from agentflow.autonomy import AUTO_BY, runner_settles
+from agentflow.autonomy import AUTO_BY
 from agentflow.bug_eval import BugEvalLane, exhausted_kind
 from agentflow.ci_lane import CILane
 from agentflow.commit_checks import RUNNER_COMMITS, runner_head
@@ -58,7 +58,7 @@ from agentflow.gitops import (CommitRejected, GitError, NothingToCommit, changed
                               commits_between, git_state_changes, head, outside_only, reconcile_baseline)
 from agentflow.governor_lane import GovernorLane
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
-from agentflow.hitl import ResultError, StepResult, clean_fact, notify_run, park_hitl, raise_hitl, read_result
+from agentflow.hitl import ResultError, StepResult, clean_fact, notify_run, raise_hitl, read_result
 from agentflow.route_lane import RouteLane
 from agentflow.run_control import wait_for_agents
 from agentflow.sizing_lane import SizingLane
@@ -694,6 +694,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         self.out = out
         self.briefs = briefs  # the retro's session gets none
         self._brief_texts: dict[str, tuple[str, dict]] = {}  # by digest: what this executor wrote, for shared sessions
+        self.handled_waits: set[tuple[str, str]] = set()  # waits the plan walk settled itself (`FeatureLane.handled`)
 
     @property
     def worktree(self) -> Path:
@@ -720,8 +721,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         dry run, is "skipped". A step whose record is `running` or `waiting_human` (the runner was
         stopped, or a human answered) resumes its recorded session at its recorded effort.
         `share_session_of` names a step whose session a new step continues (at that step's effort),
-        as the tasks of a small plan do. A step parked by a question that later
-        tasks need not wait for returns "stopped" with its record `parked`.
+        as the tasks of a small plan do.
         `fix_first` (gates that already failed, as for a gate step) starts a step that is not resuming
         in its fix loop: the first call is fix attempt 1, with the gate output.
         `turn_cap` replaces the agent's `max_turns` for every call of the step (a later doubt round's review).
@@ -1024,14 +1024,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 turn = self._effort_change(sr, called, result)
                 continue
             if result.status == "needs_human" and not writes_questions(sr.step):  # a grill's questions are its output
-                questions = [asdict(q) for q in result.questions]
-                # A set the runner answers itself is never parked: it is raised quietly, `Resolver.take_over` (the one
-                # place the runner answers) takes the recommended options, and the step resumes after any `record_step`.
-                if (result.can_continue_without and self.may_park(sr.key)
-                        and not runner_settles(self.cfg, self.run, "needs_human", sr.key, questions)):
-                    held = changed_paths(self.worktree, sr.start_tree, called.after)
-                    park_hitl(self.cfg, self.run, "needs_human", sr.key, result.summary, result.questions, held)
-                    return "stopped"
+                # Every question set is raised: `Resolver.take_over` (the one place the runner answers) takes the
+                # recommended options when it may, and a plan task's stop it cannot settle parks in the plan walk.
                 raise_hitl(self.cfg, self.run, "needs_human", sr.key, result.summary, result.questions)
                 return "stopped"
             if result.status == "blocked":

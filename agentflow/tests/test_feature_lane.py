@@ -21,7 +21,7 @@ PLAN_PATH = "docs/plans/2026-10-29-demo.md"
 IMPL = "build/build/task-{n}/implement"
 REVIEW = "build/build/task-{n}/review"
 PR_FOOTER = "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
-TITLES = {1: "First thing", 2: "Second thing", 3: "Third thing", 4: "Fourth thing"}
+TITLES = {1: "First thing", 2: "Second thing", 3: "Third thing", 4: "Fourth thing", 5: "Fifth thing"}
 BIG = {"gate_sets": {"build": ["ok"], "verify": ["ok"]}, "conditions": {"plan_is_small": {"max": 0}}}
 SMALL = {"gate_sets": {"build": ["ok"], "verify": ["ok"]}}
 FINDING = {"severity": "blocking", "file": "src/one.py", "line": 3, "text": "Thiếu kiểm tra lỗi khi token hết hạn"}
@@ -43,13 +43,16 @@ def review(*findings: dict) -> dict:
     return {"result": {"status": "done", "summary": "reviewed", "findings": list(findings)}}
 
 
-def plan_text(depends: dict[int, str] | None = None, ticked: tuple[int, ...] = (), count: int = 2) -> str:
-    depends = depends or {}
+def plan_text(depends: dict[int, str] | None = None, ticked: tuple[int, ...] = (), count: int = 2,
+              files: dict[int, list[str]] | None = None) -> str:
+    depends, files = depends or {}, files or {}
     parts = ["# Plan: demo\n\n## Global Constraints\n\n- [ ] not a task box\n"]
     for n in range(1, count + 1):
         box = "x" if n in ticked else " "
         dep = f"**Depends on:** {depends[n]}\n\n" if n in depends else ""
-        parts.append(f"### Task {n}: {TITLES[n]}\n\n{dep}- [{box}] **Step 1: Task {n} test**\n"
+        named = "".join(f"- Modify: `{path}`\n" for path in files.get(n, []))
+        named = f"{named}\n" if named else ""
+        parts.append(f"### Task {n}: {TITLES[n]}\n\n{dep}{named}- [{box}] **Step 1: Task {n} test**\n"
                      f"- [{box}] **Step 2: Task {n} code**\n")
     return "\n".join(parts)
 
@@ -62,6 +65,13 @@ def commit_plan(flow_repo, text: str) -> None:
     target.write_text(text, encoding="utf-8")
     run_git(flow_repo.root, "add", "-A")
     run_git(flow_repo.root, "commit", "-q", "-m", "Plan demo")
+
+
+@pytest.fixture
+def notified(monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr("agentflow.hitl.notify", lambda cfg, title, message, run=None: seen.append(message))
+    return seen
 
 
 @pytest.fixture
@@ -447,17 +457,21 @@ def test_parking_runs_independent_task(lane, git):
     assert subjects(git, lane.root)[0] == "Task 2: Second thing"
     task2 = git(lane.root, "show", "HEAD", "--name-only", "--format=").split()
     assert sorted(task2) == [PLAN_PATH, "src/two.py"]  # the parked task's half-done file stays out
-    assert (lane.root / "src" / "one.py").exists()
+    assert not (lane.root / "src" / "one.py").exists()  # shelved: it comes back when task 1 runs again
     assert "Task 1: First thing" not in subjects(git, lane.root)
     (parked,) = lane.events(run, "step_parked")
     assert parked["key"] == impl1 and parked["questions"][0]["id"] == "q1"
+    assert parked["paths"] == [] and parked["shelved"] == ["src/one.py"] and parked["shelf"]
     assert parked["seq"] < lane.events(run, "agent_started")[1]["seq"]  # parked before task 2 started
     assert run.state["status"] == "waiting_human"
     assert run.state["waiting"]["key"] == impl1 and run.state["waiting"]["kind"] == "needs_human"
+    assert run.state["waiting"]["promoted"] is True  # no runnable task remains
     assert run.state["waiting"]["questions"][0]["question"] == "Lưu bộ nhớ đệm token CRM?"
     assert run.inbox_path(impl1).exists()
+    raised = lane.events(run, "hitl_raised")  # the stop as it was raised, then promoted: no runnable task remains
+    assert [(e["key"], e.get("promoted")) for e in raised] == [(impl1, None), (impl1, True)]
     assert build(lane, run) == ("stopped", True)  # still waiting: nothing runs, nothing is raised again
-    assert len(lane.calls()) == 3 and len(lane.events(run, "hitl_raised")) == 1
+    assert len(lane.calls()) == 3 and len(lane.events(run, "hitl_raised")) == 2
 
     assert answer(run, impl1, {"q1": "A: giữ theo tiến trình"}, by="me")
     assert build(lane, run) == ("done", True)
@@ -468,9 +482,10 @@ def test_parking_runs_independent_task(lane, git):
     body = git(lane.root, "log", "-1", "--format=%B", commit_of(git, lane.root, "Task 1: First thing"))
     assert "q1 (ambiguity)" in body and "giữ theo tiến trình" in body  # ambiguity answers go in the body
     task1 = git(lane.root, "show", commit_of(git, lane.root, "Task 1: First thing"), "--name-only", "--format=").split()
-    assert "src/one.py" in task1
+    assert "src/one.py" in task1 and git(lane.root, "show", "HEAD:src/one.py") == "half\n"
+    assert [e["conflict"] for e in lane.events(run, "unit_unparked")] == [False]
     assert [e["key"] for e in lane.events(run, "step_rebased")] == [impl1]  # task 2's commit moved HEAD
-    assert not lane.events(run, "hitl_raised")[1:]  # no guard violation on the resumed task
+    assert len(lane.events(run, "hitl_raised")) == 2  # no guard violation on the resumed task
     assert subjects(git, lane.root)[0] == "Task 3: Third thing"
 
 
@@ -484,10 +499,10 @@ def test_parked_items_stay_answerable(lane, git):
     assert list(run.state["parked"]) == [impl2]
     assert {(i["key"], i["kind"]) for i in inbox_items(lane.root)} == {(impl1, "needs_human"), (impl2, "parked")}
 
-    # a parked item is answerable while another one waits, here through the CLI
+    # a parked item is answerable while another one waits, here through the CLI; the promoted wait is parked again
     assert main(["answer", run.id, "--key", impl2, "--set", "q2=B", "--no-continue"]) == 0
     run.refresh()
-    assert run.state["waiting"]["key"] == impl1 and run.state["parked"] == {}
+    assert run.state["waiting"] is None and list(run.state["parked"]) == [impl1]
     assert run.state["steps"][impl2]["status"] == "running"
     assert answer(run, impl1, {"q1": "A"}, by="me")
     assert run.state["waiting"] is None and run.state["status"] == "running"
@@ -495,13 +510,263 @@ def test_parked_items_stay_answerable(lane, git):
     assert {"Task 1: First thing", "Task 2: Second thing"} <= set(subjects(git, lane.root)[:2])
 
 
-def test_parking_off_stops_at_once(lane, git):
+@pytest.mark.parametrize("act", [needs_human("other", True), {"result": {"status": "blocked", "summary": "stuck"}}])
+def test_parking_off_stops_at_once(lane, git, act, notified):
     lane.configure({**BIG, "hitl": {"park_independent": False}})
     run = begin_build(lane, plan_text({1: "none", 2: "none"}))
-    lane.script({IMPL.format(n=1): [needs_human("other", True)]})
+    lane.script({IMPL.format(n=1): [act]})
     assert build(lane, run) == ("stopped", True)
     assert steps(lane.calls()) == [IMPL.format(n=1)]
     assert lane.events(run, "step_parked") == []
+    assert run.state["waiting"]["key"] == IMPL.format(n=1) and run.state["waiting"]["notified"] is True
+    assert len(notified) == 1  # told once, as the stop was raised: today's rule
+
+
+# --------------------------------------------------------------------------- every task stop parks (T4)
+
+
+FIVE = plan_text({n: "none" for n in range(1, 6)}, count=5,
+                 files={1: ["src/one.py"], 2: ["src/two.py"], 3: ["src/three.py"], 4: ["src/four.py"],
+                        5: ["src/five.py"]})
+BLOCKED = {"result": {"status": "blocked", "summary": "stuck"}}
+TWO = {"write": {"src/two.py": "two\n"}, "result": DONE_RESULT}
+SHELVES = "refs/agentflow/shelf"
+
+
+def shelves(git, root: Path) -> list[str]:
+    return git(root, "for-each-ref", "--format=%(refname)", SHELVES).split()
+
+
+def files_of(git, root: Path, subject: str) -> list[str]:
+    return git(root, "show", commit_of(git, root, subject), "--name-only", "--format=").split()
+
+
+def test_a_blocked_task_parks_and_the_independent_ones_finish(lane, git):
+    lane.configure({**BIG, "phases": {"build": {"resolve": True}}, "autonomy": {"resolve_kinds": {"blocked": 1}}})
+    run = begin_build(lane, FIVE)
+    impl2 = IMPL.format(n=2)
+    lane.script({impl2: [{"write": {"src/two.py": "half\n"}, **BLOCKED},
+                         {"write": {"src/two.py": "half again\n"}, "result": {"status": "blocked", "summary": "still"}}]})
+    assert build(lane, run) == ("stopped", True)
+    assert {"Task 1: First thing", "Task 3: Third thing", "Task 4: Fourth thing",
+            "Task 5: Fifth thing"} <= set(subjects(git, lane.root))
+    assert "Task 2: Second thing" not in subjects(git, lane.root)
+    assert not (lane.root / "src/two.py").exists()  # shelved, not in the tree
+    assert git(lane.root, "status", "--porcelain") == ""
+    (parked,) = lane.events(run, "step_parked")
+    assert parked["key"] == impl2 and parked["kind"] == "blocked"
+    assert parked["blast_radius"] == {"blocks": [2], "continue": [3, 4, 5]} and parked["shelf"]
+    assert parked["paths"] == [] and parked["shelved"] == ["src/two.py"]
+    assert shelves(git, lane.root) == [f"{SHELVES}/{run.id}/build.build.task-2"]
+    assert lane.events(run, "resolve_started")[0]["seq"] < parked["seq"]  # the resolver went first
+    assert run.state["waiting"]["key"] == impl2 and run.state["waiting"]["promoted"] is True
+    assert "Blast radius: blocks task 2" in run.inbox_path(impl2).read_text(encoding="utf-8")
+    n_before = len(lane.calls())
+    assert build(lane, run) == ("stopped", True)  # still the person's: nothing runs, nothing is raised again
+    assert len(lane.calls()) == n_before and len(lane.events(run, "hitl_raised")) == 3
+
+    approve(run, impl2, by="me")
+    assert build(lane, run) == ("done", True)
+    assert steps(lane.calls()[n_before:]) == [impl2, REVIEW.format(n=2)]  # task 2 only
+    (unparked,) = lane.events(run, "unit_unparked")
+    assert unparked["conflict"] is False and unparked["paths"] == ["src/two.py"] and unparked["shelf"] == parked["shelf"]
+    assert shelves(git, lane.root) == []
+    assert "src/two.py" in files_of(git, lane.root, "Task 2: Second thing")
+    assert git(lane.root, "show", "HEAD:src/two.py") == "half again\n"
+
+
+def test_a_task_naming_the_parked_tasks_file_waits(lane, git):
+    run = begin_build(lane, plan_text({1: "none", 2: "none", 3: "none"}, count=3,
+                                      files={1: ["src/shared.py"], 2: ["src/two.py"], 3: ["src/shared.py"]}))
+    impl1 = IMPL.format(n=1)
+    lane.script({impl1: [{"write": {"src/shared.py": "half\n"}, **BLOCKED}]})
+    assert build(lane, run) == ("stopped", True)
+    assert steps(lane.calls()) == [impl1, IMPL.format(n=2), REVIEW.format(n=2)]  # task 3 shares task 1's file
+    (parked,) = lane.events(run, "step_parked")
+    assert parked["blast_radius"] == {"blocks": [1, 3], "continue": [2]}
+    approve(run, impl1, by="me")
+    assert build(lane, run) == ("done", True)
+    assert steps(lane.calls())[3:] == [impl1, REVIEW.format(n=1), IMPL.format(n=3), REVIEW.format(n=3)]
+    assert subjects(git, lane.root)[:2] == ["Task 3: Third thing", "Task 1: First thing"]
+
+
+def test_a_gate_failure_before_the_commit_parks(lane, git):
+    from conftest import TEST_GATES
+
+    lane.configure({**BIG, "gates": {**TEST_GATES, "nobroken": {"run": "test ! -f broken.txt"}},
+                    "gate_sets": {"build": ["nobroken"], "verify": ["ok"]}})
+    run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
+    impl1, commit1 = IMPL.format(n=1), "build/build/task-1/commit"
+    lane.script({impl1: [{"write": {"src/one.py": "one\n"}, "result": DONE_RESULT}], IMPL.format(n=2): [TWO]})
+    edited: list[str] = []
+
+    def human(key):  # a person's edit that breaks the gate, made after task 1's implementer passed its gates
+        if key == REVIEW.format(n=1) and not edited:
+            edited.append(key)
+            (lane.root / "broken.txt").write_text("broken\n", encoding="utf-8")
+
+    assert build_with(wrap_agent(lane, run, human), lane) == ("stopped", True)
+    (parked,) = lane.events(run, "step_parked")
+    assert parked["key"] == commit1 and parked["kind"] == "gate_failed"
+    assert parked["shelved"] == ["broken.txt", "src/one.py"]
+    assert subjects(git, lane.root)[0] == "Task 2: Second thing"  # task 2's gates passed: the breakage is shelved
+    assert files_of(git, lane.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
+    assert run.state["waiting"]["key"] == commit1 and run.state["waiting"]["promoted"] is True
+
+    approve(run, commit1, by="me")
+    assert build(lane, run) == ("stopped", True)  # the shelf is back, and so is the failure: nothing else can run
+    assert len(lane.events(run, "step_parked")) == 1
+    assert run.state["waiting"]["key"] == commit1 and run.state["waiting"]["kind"] == "gate_failed"
+    assert (lane.root / "broken.txt").exists() and (lane.root / "src/one.py").exists()
+    (lane.root / "broken.txt").unlink()
+    approve(run, commit1, by="me")
+    assert build(lane, run) == ("done", True)
+    assert files_of(git, lane.root, "Task 1: First thing") == [PLAN_PATH, "src/one.py"]
+
+
+def test_no_park_when_every_other_task_waits_on_it(lane, git, notified):
+    run = begin_build(lane, plan_text(count=2))  # task 2 depends on task 1 (no `Depends on` line)
+    lane.script({IMPL.format(n=1): [{"write": {"src/one.py": "half\n"}, **BLOCKED}]})
+    assert build(lane, run) == ("stopped", True)
+    assert steps(lane.calls()) == [IMPL.format(n=1)]
+    assert lane.events(run, "step_parked") == [] and shelves(git, lane.root) == []
+    assert (lane.root / "src/one.py").read_text(encoding="utf-8") == "half\n"  # a stop leaves the tree as it is
+    waiting = run.state["waiting"]
+    assert waiting["key"] == IMPL.format(n=1) and waiting["kind"] == "blocked" and not waiting.get("promoted")
+    assert notified == ["stuck"]  # one stop, one notification
+
+
+def test_a_guard_stop_with_a_foreign_head_never_parks(lane, git, monkeypatch):
+    run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
+    impl1 = IMPL.format(n=1)
+    lane.script({impl1: [{"write": {"src/one.py": "x\n"}, "git_commit": "sneaky", **DONE_RESULT}]})
+    assert build(lane, run) == ("stopped", True)  # the agent moved HEAD: every later commit would be refused
+    assert steps(lane.calls()) == [impl1]
+    assert run.state["waiting"]["kind"] == "guard_violation" and "agent_commit" in run.state["waiting"]["summary"]
+    assert lane.events(run, "step_parked") == []
+
+
+FORBIDDEN_ACT = {"write": {"src/one.py": "x\n", "CONSTRAINTS.md": "weakened\n"}, **DONE_RESULT}
+
+
+def test_a_forbidden_path_stop_with_head_not_the_runners_never_parks(lane, git, monkeypatch):
+    run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
+    lane.script({IMPL.format(n=1): [FORBIDDEN_ACT]})
+    monkeypatch.setattr("agentflow.feature_lane.runner_head", lambda run: "0" * 40)
+    assert build(lane, run) == ("stopped", True)
+    assert lane.events(run, "step_parked") == [] and steps(lane.calls()) == [IMPL.format(n=1)]
+    assert run.state["waiting"]["kind"] == "guard_violation"
+
+
+def test_a_forbidden_path_stop_parks(lane, git):
+    run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
+    lane.script({IMPL.format(n=1): [FORBIDDEN_ACT], IMPL.format(n=2): [TWO]})
+    assert build(lane, run) == ("stopped", True)
+    (parked,) = lane.events(run, "step_parked")
+    assert parked["kind"] == "guard_violation" and parked["shelved"] == ["CONSTRAINTS.md", "src/one.py"]
+    assert files_of(git, lane.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
+
+
+def test_an_unshelve_conflict_stops_and_overwrites_nothing(lane, git):
+    run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
+    impl1, unshelve = IMPL.format(n=1), "build/build/task-1/unshelve"
+    lane.script({impl1: [{"write": {"src/one.py": "half\n"}, **BLOCKED}],
+                 IMPL.format(n=2): [{"write": {"src/two.py": "two\n", "src/one.py": "theirs\n"},  # names only two.py
+                                     "result": DONE_RESULT}]})
+    assert build(lane, run) == ("stopped", True)
+    assert git(lane.root, "show", "HEAD:src/one.py") == "theirs\n"
+    approve(run, impl1, by="me")
+    calls = len(lane.calls())
+    assert build(lane, run) == ("stopped", True)
+    assert len(lane.calls()) == calls  # no session on a tree the shelf did not apply to
+    waiting = run.state["waiting"]
+    ref = f"{SHELVES}/{run.id}/build.build.task-1"
+    assert waiting["key"] == unshelve and waiting["kind"] == "blocked"
+    assert ref in waiting["summary"] and "src/one.py" in waiting["summary"]
+    assert (lane.root / "src/one.py").read_text(encoding="utf-8") == "theirs\n"  # nothing overwritten
+    assert git(lane.root, "status", "--porcelain") == "" and shelves(git, lane.root) == [ref]
+    assert lane.events(run, "unit_unparked") == []
+
+    (lane.root / "src/one.py").write_text("merged\n", encoding="utf-8")  # the person applies the shelf by hand
+    approve(run, unshelve, by="me")
+    assert build(lane, run) == ("done", True)
+    (unparked,) = lane.events(run, "unit_unparked")
+    assert unparked["conflict"] is True and unparked["by"] == "me" and unparked["paths"] == ["src/one.py"]
+    assert steps(lane.calls()[calls:]) == [impl1, REVIEW.format(n=1)]
+    assert git(lane.root, "show", "HEAD:src/one.py") == "merged\n"  # the tree as the person left it
+    assert subjects(git, lane.root)[0] == "Task 1: First thing"
+    assert run.state["steps"][unshelve]["status"] == "done"
+
+
+def test_a_runner_killed_mid_park_finishes_the_shelving(lane, git, monkeypatch):
+    run = begin_build(lane, plan_text({1: "none", 2: "none"}, files={1: ["src/one.py"], 2: ["src/two.py"]}))
+    impl1 = IMPL.format(n=1)
+    lane.script({impl1: [{"write": {"src/one.py": "half\n"}, **BLOCKED}], IMPL.format(n=2): [TWO]})
+    from agentflow import feature_lane
+
+    real = feature_lane.restore_paths
+    kills: list[list[str]] = []
+
+    def killed(worktree, paths, sha):  # the runner dies after `step_parked`, before the paths are reset
+        if not kills:
+            kills.append(list(paths))
+            raise KeyboardInterrupt
+        real(worktree, paths, sha)
+
+    monkeypatch.setattr(feature_lane, "restore_paths", killed)
+    with pytest.raises(KeyboardInterrupt):
+        build(lane, run)
+    assert kills == [["src/one.py"]] and len(lane.events(run, "step_parked")) == 1
+    assert (lane.root / "src/one.py").exists()  # the parked work is still in the tree
+
+    assert build(lane, run) == ("stopped", True)
+    assert steps(lane.calls()) == [impl1, IMPL.format(n=2), REVIEW.format(n=2)]
+    assert files_of(git, lane.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]  # task 1's work stays out
+    assert not (lane.root / "src/one.py").exists()
+    approve(run, impl1, by="me")
+    assert build(lane, run) == ("done", True)
+    assert git(lane.root, "show", "HEAD:src/one.py") == "half\n"
+
+
+def test_approving_a_parked_stop_while_another_waits_runs_its_task(lane, git):
+    run = begin_build(lane, plan_text({1: "none", 2: "none", 3: "none"}, count=3,
+                                      files={1: ["src/one.py"], 2: ["src/two.py"], 3: ["src/three.py"]}))
+    impl1, impl2 = IMPL.format(n=1), IMPL.format(n=2)
+    lane.script({impl1: [{"write": {"src/one.py": "one\n"}, **BLOCKED}],
+                 impl2: [{"write": {"src/two.py": "two\n"}, **BLOCKED}]})
+    assert build(lane, run) == ("stopped", True)
+    assert subjects(git, lane.root)[0] == "Task 3: Third thing"
+    assert run.state["waiting"]["key"] == impl1 and run.state["waiting"]["promoted"] is True
+    assert list(run.state["parked"]) == [impl2]
+
+    approve(run, impl2, by="me")  # B, parked, while the run waits on the promoted A
+    assert run.state["waiting"] is None and set(run.state["parked"]) == {impl1}  # A is parked again, not lost
+    calls = len(lane.calls())
+    assert build(lane, run) == ("stopped", True)
+    assert steps(lane.calls()[calls:]) == [impl2, REVIEW.format(n=2)]  # B's task runs, A's does not
+    assert subjects(git, lane.root)[0] == "Task 2: Second thing"
+    assert git(lane.root, "show", "HEAD:src/two.py") == "two\n"
+    assert run.state["waiting"]["key"] == impl1 and run.state["waiting"]["promoted"] is True
+    assert not (lane.root / "src/one.py").exists()  # A's work is still on its shelf
+
+    approve(run, impl1, by="me")
+    assert build(lane, run) == ("done", True)
+    assert subjects(git, lane.root)[0] == "Task 1: First thing"
+    assert git(lane.root, "show", "HEAD:src/one.py") == "one\n"
+
+
+def test_a_question_parks_without_can_continue_without(lane, git):
+    run = begin_build(lane, plan_text({1: "none", 2: "none"}))
+    impl1 = IMPL.format(n=1)
+    lane.script({impl1: [needs_human("other", can_continue=False)]})
+    assert build(lane, run) == ("stopped", True)
+    assert steps(lane.calls()) == [impl1, IMPL.format(n=2), REVIEW.format(n=2)]
+    (parked,) = lane.events(run, "step_parked")
+    assert parked["key"] == impl1 and parked["questions"][0]["id"] == "q1" and parked["shelf"] is None
+    assert parked["blast_radius"] == {"blocks": [1], "continue": [2]}
+    assert answer(run, impl1, {"q1": "A"}, by="me")
+    assert build(lane, run) == ("done", True)
+    assert subjects(git, lane.root)[0] == "Task 1: First thing"
 
 
 # --------------------------------------------------------------------------- decisions and resuming
@@ -839,6 +1104,10 @@ def test_parked_question_answered_while_running_resumes_it(lane, git):
 
     assert build_with(wrap_agent(lane, run, human), lane) == ("done", True)
     assert subjects(git, lane.root)[:3] == ["Task 3: Third thing", "Task 1: First thing", "Task 2: Second thing"]
+    (parked,) = lane.events(run, "step_parked")
+    assert parked["paths"] == [] and parked["shelved"] == ["src/one.py"]  # shelved while task 2 ran
+    assert "src/one.py" not in files_of(git, lane.root, "Task 2: Second thing")
+    assert git(lane.root, "show", "HEAD~1:src/one.py") == "half\n"  # back on resume, in task 1's commit
     calls = steps(lane.calls())
     assert calls.index(IMPL.format(n=2)) < len(calls) - 1 - calls[::-1].index(impl1)  # task 1 ran again after
     resumed = [c for c in lane.calls() if c["step"] == impl1][1]

@@ -828,9 +828,10 @@ def test_a_parked_boundary_question_still_waits_for_a_human(auto, notified):
     run = begin_feature(auto)
     script_more(auto, {IMPL: [asks(question("boundary"), park=True)]})
     assert go(auto, run) == "waiting_human"
-    assert [e["key"] for e in auto.events(run, "step_parked")] == [IMPL]
+    assert auto.events(run, "step_parked") == []  # the plan's one task: nothing else could run, so it is a stop
+    assert run.state["waiting"]["key"] == IMPL and run.state["waiting"]["questions"][0]["kind"] == "boundary"
     assert not auto.events(run, "hitl_answered")
-    assert any("parked: cần quyết định" in text for text in notified)
+    assert [text for text in notified if "cần quyết định" in text] == ["cần quyết định"]  # told once
 
 
 def test_no_human_question_kinds_lets_the_runner_answer_a_boundary(flow_repo, notified):

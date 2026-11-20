@@ -269,21 +269,28 @@ def test_inbox_title_and_question_stay_on_one_line(tmp_path):
 
 def test_raise_hitl_notifies(run, cfg, macos_calls, capsys):
     asked = dataclasses.replace(one_question(), kind="boundary")  # one only a human answers, in any phase
-    path = raise_hitl(cfg, run, "needs_human", "plan/task-1/implement", "Task 1 needs a TTL", [asked])
-    assert path == run.inbox_path("plan/task-1/implement") and path.exists()
+    path = raise_hitl(cfg, run, "needs_human", "plan/plan", "Task 1 needs a TTL", [asked])
+    assert path == run.inbox_path("plan/plan") and path.exists()
     assert "\a" in capsys.readouterr().err
     (argv,) = macos_calls
     assert argv[:2] == ["osascript", "-e"]
     assert f"agentflow: {run.id} needs you" in argv[2]
     assert argv[2].startswith("display notification")
     assert run.state["waiting"]["kind"] == "needs_human"
-    assert run.state["waiting"]["key"] == "plan/task-1/implement"
+    assert run.state["waiting"]["key"] == "plan/plan"
     assert run.state["waiting"]["phase"] == "plan"
     assert run.state["waiting"]["summary"] == "Task 1 needs a TTL"
     assert run.state["waiting"]["questions"][0]["id"] == "q1"
     assert run.state["status"] == "waiting_human"
     assert parse_answers(path) == {"q1": ""}
     assert f"agentflow answer {run.id}" in path.read_text(encoding="utf-8")
+
+
+def test_a_task_stop_that_may_park_is_raised_without_a_notification(run, cfg, macos_calls, capsys):
+    asked = dataclasses.replace(one_question(), kind="boundary")  # the runner never answers it, but it may park
+    raise_hitl(cfg, run, "needs_human", "build/build/task-1/implement", "Task 1 needs a TTL", [asked])
+    assert macos_calls == [] and "\a" not in capsys.readouterr().err  # the plan walk tells a person if it can't park
+    assert run.state["waiting"]["notified"] is False
 
 
 def test_hitl_raised_keeps_the_extra_text_capped(run, cfg, macos_calls):

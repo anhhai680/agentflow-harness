@@ -12,6 +12,10 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 - `hitl.park_kinds` names the stops a plan task may park on (`needs_human`, `blocked`, `gate_failed` and the other task stops; `[]` parks nothing, and a run-wide `budget_exceeded` or `environment` stop never parks), and `hitl.park_independent` now defaults to `true`; both have `validate` checks and Settings form fields.
 - A parked task stop can be approved, answered or retried by its key (`agentflow approve <run> <key>`, `answer --key`, `retry <run> <key>`); settling one while the run waits on a promoted parked stop parks that one again, so the run goes on. `agentflow inbox` shows a parked stop's kind, its blast radius ("blocks task 2; task 3 continues") and its ways out, and `reject` refuses a parked key until it is the run's wait. An `approve` or `answer` while a runner is live only records, and that runner picks it up.
 
+### Changed
+
+- Any stop of a plan task's own step now parks (not only a `needs_human` the agent marked `can_continue_without`) once the resolver could not clear it and some other task can still run: the runner shelves the task's uncommitted work in a ref (`refs/agentflow/shelf/<run>/<task>`), puts those paths back to `HEAD`, and builds the tasks that neither depend on it nor name one of its files. The shelf is applied back before the task runs again; one that no longer applies changes nothing and stops on `<task>/unshelve`, and approving that goes on with the tree as you left it. A stop stays a stop when nothing else can run (one notification), for a guard stop where `HEAD` moved, and with `hitl.park_independent: false`; `verify` never starts while a task is parked.
+
 ## [3.0] - 2026-11-20
 
 ### Added
