@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 
+- `parallel.max_subagents` (1 = off, the default; at most 6) and `parallel.serial_paths` switch on waves of plan tasks built together by one session's sub-agents, with `skills.map.build_wave` (default `agentflow-build`) and a route profile's `wave_review` (`false` in the engine's `L`); `validate` checks them and warns when the build phase is not on `claude` or the pack's own `prompts/plan.md` never asks for a `Parallel group` line; the Settings form edits the two `parallel` keys; with waves off nothing a run does changes.
 - A plan task may carry a `**Parallel group:** <letter>` line under `**Depends on:**`, and the planner is asked to mark tasks that can be built at the same time; the runner reads the group (`PlanTask.group`) but it has no effect on a run yet.
 - `hitl.digest: true` turns each notification into one machine-wide line, such as "2 items need you (1 holds a run); 3 runs progressing", sent only when it differs from the last one sent (a digest that cannot be built falls back to the plain message, with a `notify_failed` event); it is off by default, has a `validate` check and a Settings form field.
 - `hitl.park_kinds` names the stops a plan task may park on (`needs_human`, `blocked`, `gate_failed` and the other task stops; `[]` parks nothing, and a run-wide `budget_exceeded` or `environment` stop never parks), and `hitl.park_independent` now defaults to `true`; both have `validate` checks and Settings form fields.

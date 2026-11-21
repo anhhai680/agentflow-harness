@@ -945,7 +945,7 @@ def test_every_skills_map_reference_in_the_defaults_resolves(tmp_path):
     skills = DEFAULTS["skills"]["map"]
     assert skills == {"decide": "agentflow-define", "define": "agentflow-define", "design_doc": "agentflow-define",
                       "plan": "agentflow-plan", "build": "agentflow-build", "build_small": "agentflow-build",
-                      "debug": "agentflow-debug", "verify": "agentflow-verify", "review": "agentflow-review",
+                      "build_wave": "agentflow-build", "debug": "agentflow-debug", "verify": "agentflow-verify", "review": "agentflow-review",
                       "review_feedback": "agentflow-respond", "doubt": "agentflow-doubt"}
     for name in skills.values():
         found = pack.skill_file(tmp_path, ".claude/skills", name)
@@ -2807,3 +2807,89 @@ def test_digest_must_be_a_bool(tmp_cfg, value):
 @pytest.mark.parametrize("value", [True, False])
 def test_digest_may_be_on_or_off(tmp_cfg, value):
     assert not [path for _, path in errors(issues_for(tmp_cfg, {"hitl": {"digest": value}})) if path.startswith("hitl")]
+
+
+# --------------------------------------------------------------------------- parallel build
+
+
+def parallel_issues(tmp_cfg, parallel, patch=None) -> list[Issue]:
+    def apply(data: dict) -> None:
+        data["parallel"] = parallel
+        if patch:
+            patch(data)
+    return issues_for(tmp_cfg, apply)
+
+
+def test_parallel_is_off_by_default(sparse_repo):
+    cfg = load_config(pack.pack_config(sparse_repo))
+    assert cfg.parallel.max_subagents == 1 and cfg.parallel.serial_paths == []
+    assert cfg.skills_map["build_wave"] == "agentflow-build"
+    assert cfg.route.profiles["L"].wave_review is False and cfg.route.profiles["M"].wave_review is True
+    assert [i for i in validate(cfg, sparse_repo) if "parallel" in i.path or "wave" in i.path] == []
+
+
+@pytest.mark.parametrize("parallel, path, text", [
+    ({"max_subagents": 7}, "parallel.max_subagents", "at most 6"),
+    ({"max_subagents": 0}, "parallel.max_subagents", "from 1 (off)"),
+    ({"max_subagents": True}, "parallel.max_subagents", "whole number"),
+    ({"max_subagents": "3"}, "parallel.max_subagents", "whole number"),
+    ({"serial_paths": "x"}, "parallel.serial_paths", "list of non-empty"),
+    ({"serial_paths": [""]}, "parallel.serial_paths", "list of non-empty"),
+    ({"foo": 1}, "parallel.foo", "max_subagents, serial_paths"),
+])
+def test_parallel_rejects_bad_values(tmp_cfg, parallel, path, text):
+    found = [i for i in parallel_issues(tmp_cfg, parallel) if i.level == "error" and i.path == path]
+    assert found, parallel_issues(tmp_cfg, parallel)
+    assert text in found[0].message
+
+
+@pytest.mark.parametrize("count", [1, 6])
+def test_parallel_accepts_its_bounds(tmp_cfg, count):
+    found = parallel_issues(tmp_cfg, {"max_subagents": count, "serial_paths": ["uv.lock"]})
+    assert [i for i in found if "parallel" in i.path and i.level == "error"] == []
+
+
+def test_a_bad_parallel_value_loads_as_off(tmp_cfg):
+    path = tmp_cfg(lambda data: data.update(parallel={"max_subagents": "3", "serial_paths": "x"}))
+    cfg = load_config(path)
+    assert cfg.parallel.max_subagents == 1 and cfg.parallel.serial_paths == []
+
+
+def test_a_wrong_wave_review_is_refused(tmp_cfg):
+    found = route_issues(tmp_cfg, {"profiles": {"M": {"wave_review": "no"}}})
+    assert ("error", "route.profiles.M.wave_review") in errors(found)
+    assert errors(route_issues(tmp_cfg, {"profiles": {"M": {"wave_review": False}}})) == []
+
+
+def test_waves_warn_when_the_build_phase_is_not_on_claude(tmp_cfg):
+    def codex_build(data: dict) -> None:
+        data["agents"]["codex"]["enabled"] = True
+        data["phases"]["build"]["agent"] = "codex"
+    found = parallel_issues(tmp_cfg, {"max_subagents": 3}, codex_build)
+    assert [i.level for i in found if i.path == "parallel.max_subagents"] == ["warning"]
+    assert any("waves need the claude agent" in i.message for i in found if i.path == "parallel.max_subagents")
+    off = parallel_issues(tmp_cfg, {"max_subagents": 1}, codex_build)
+    assert not [i for i in off if i.path == "parallel.max_subagents"]
+    assert not [i for i in parallel_issues(tmp_cfg, {"max_subagents": 3}) if i.path == "parallel.max_subagents"]
+
+
+def test_waves_warn_when_the_packs_plan_prompt_never_asks_for_a_group(tmp_cfg):
+    path = tmp_cfg(lambda data: data.update(parallel={"max_subagents": 3}))
+    repo = path.parent.parent
+    warn = "plans written with this prompt never form a wave"
+    assert not [i for i in validate(load_config(path), repo) if warn in i.message]  # no override: the engine's asks
+    own = path.parent / "prompts" / "plan.md"
+    own.write_text("Write the plan.\n", encoding="utf-8")
+    found = [i for i in validate(load_config(path), repo) if warn in i.message]
+    assert [(i.level, i.path) for i in found] == [("warning", "prompts/plan.md")]
+    own.write_text("Write the plan.\n**Parallel group:** A\n", encoding="utf-8")
+    assert not [i for i in validate(load_config(path), repo) if warn in i.message]
+    path.write_text(path.read_text(encoding="utf-8").replace("max_subagents: 3", "max_subagents: 1"), encoding="utf-8")
+    own.write_text("Write the plan.\n", encoding="utf-8")
+    assert not [i for i in validate(load_config(path), repo) if warn in i.message]
+
+
+def test_this_repositorys_pack_has_no_warnings_with_waves_off(repo_root):
+    cfg = load_config(repo_root / ".agentflow" / "config.yaml")
+    assert cfg.parallel.max_subagents == 1
+    assert [i for i in validate(cfg, repo_root) if "parallel" in i.path or "plan.md" in i.path] == []
