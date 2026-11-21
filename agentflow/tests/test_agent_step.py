@@ -626,6 +626,54 @@ def test_the_soft_budget_only_notifies(flow_repo, monkeypatch):
     assert run.state["steps"][KEY]["status"] == "done"
 
 
+def test_a_wave_step_gets_the_wave_timeout_and_budget(flow_repo, monkeypatch):
+    flow_repo.configure({"agents": {"claude": {"session_budget_usd": {"build": 2}}}})
+    flow_repo.new_run()
+    executor = flow_repo.executor()
+    seen = []
+    made = lanes.Executor._agent_call
+
+    def spy(self, sr, turn, attempt):
+        call = made(self, sr, turn, attempt)
+        seen.append(call)
+        return call
+
+    monkeypatch.setattr(lanes.Executor, "_agent_call", spy)
+    step = make_step(wave_size=3)
+    assert run_step(flow_repo, step, executor=executor) == "done"
+    (call,) = seen
+    assert call.budget_usd == 6.0 and flag(flow_repo.calls()[0]["argv"], "--max-budget-usd") == "6.00"
+    assert call.timeout_s == round(flow_repo.cfg.defaults.step_timeout_min * 60) + 900
+    assert executor._timeout_s() == round(flow_repo.cfg.defaults.step_timeout_min * 60)  # a step of no wave: as before
+    flow_repo.new_run()
+    seen.clear()
+    assert run_step(flow_repo) == "done"
+    assert seen[0].budget_usd == 2.0 and seen[0].timeout_s == round(flow_repo.cfg.defaults.step_timeout_min * 60)
+
+
+def test_a_wave_step_never_rolls_over(flow_repo):
+    run = flow_repo.new_run()
+    flow_repo.script({KEY: [{"usage_pct": [95]}, {"result": DONE}]})
+    assert run_step(flow_repo, make_step(wave_size=2)) == "stopped"
+    assert len(flow_repo.calls()) == 1  # no second session
+    assert hitl_kinds(flow_repo, run) == ["max_rollovers"]
+    assert "never rolls over" in run.refresh()["waiting"]["summary"]
+
+
+def test_a_reopened_step_with_no_session_gets_the_note_in_a_fresh_prompt(flow_repo):
+    run = flow_repo.new_run()
+    run.emit("step_started", key=KEY, phase="build", agent="claude", role="build")
+    run.emit("step_finished", key=KEY, status="done", summary="done in a wave")
+    run.emit("step_reopened", key=KEY, note="fix F1", reason="review")
+    assert run_step(flow_repo, executor=flow_repo.executor(run)) == "done"
+    (call,) = flow_repo.calls()
+    assert "--resume" not in call["argv"]
+    prompt = call["argv"][-1]
+    assert prompt.startswith("fix F1") and "## When you finish" not in prompt.split("\n\n", 1)[0]
+    assert "`" + str(run.agent_result_path(KEY)) + "`" in prompt  # the step's own prompt follows, with its contract
+    assert "Carry on" not in prompt.split("\n\n", 1)[0]
+
+
 def test_timeout_escalates(flow_repo, monkeypatch):
     run = flow_repo.new_run()
     monkeypatch.setattr(flow_repo.cfg.defaults, "step_timeout_min", 1 / 60)
@@ -987,6 +1035,17 @@ def test_build_prompt_parts(flow_repo):
     assert "commit" in first and "push" in first
     assert "docs/specs/SPEC-crm.md" in first
     assert first.index("/workspace/out/step.json") < first.index("spec-driven-development") < first.index("## When you finish")
+
+
+def test_a_card_prompt_has_no_result_contract(flow_repo):
+    run = flow_repo.new_run()
+    ctx = make_ctx(flow_repo.cfg, flow_repo.root, "feature", {"module": "crm"}, run)
+    extra = {"result_file": "/workspace/out/step.json"}
+    whole = build_prompt(flow_repo.cfg, make_step(), ctx, {}, extra, "first")
+    card = build_prompt(flow_repo.cfg, make_step(), ctx, {}, extra, "first", card=True)
+    assert "## When you finish" in whole and "## When you finish" not in card
+    assert card != whole and whole.startswith(card.rstrip("\n"))  # only the result contract is left out
+    assert "Use the `test-driven-development` skill" in card and str(run.progress_path()) in card
 
 
 def test_build_prompt_names_a_skill_the_template_leaves_out(flow_repo):

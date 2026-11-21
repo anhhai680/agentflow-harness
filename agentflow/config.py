@@ -626,6 +626,7 @@ class Step:
     task_briefs: dict[str, str] = field(default_factory=dict)
     task_brief: list[str] = field(default_factory=list)  # run time only, never configured: the `task_briefs` a plan task matched
     continuation: bool = False  # run time only: a later batch member or shared small_plan task; its session has the skill
+    wave_size: int = 0  # run time only, never configured: the member count of a wave step (0: not a wave step)
     name: str | None = None
     blocks_on_findings: bool = False  # its `findings` hold the phase back (`autonomy.phase_findings`)
     reconciles: bool = False  # in a `needs_approval: true` phase: the step that revises the artifact after a review's findings

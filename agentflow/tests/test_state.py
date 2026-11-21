@@ -770,6 +770,52 @@ def test_parking_a_stop_clears_its_wait_and_keeps_a_failed_row(run):
     assert state_json(run) == replay(run.events.read())
 
 
+def test_wave_dissolved_clears_its_wait_only(run):
+    wave = "build/build/wave-1"
+    run.emit("hitl_raised", kind="blocked", key=f"{wave}/implement", phase="build", summary="x", questions=[])
+    run.emit("step_finished", key=f"{wave}/implement", status="failed", summary="x")
+    run.emit("wave_dissolved", key=wave, wave=1, tasks=[1, 2], reason="a member stopped", shelf=None)
+    assert run.state["waiting"] is None and run.state["status"] == "running"
+    row = run.state["steps"][f"{wave}/implement"]
+    assert row["status"] == "skipped" and row["skip_reason"] == "wave dissolved: a member stopped"
+    alone = "build/build/task-2/implement"
+    run.emit("hitl_raised", kind="blocked", key=alone, phase="build", summary="y", questions=[])
+    run.emit("wave_dissolved", key=wave, wave=1, tasks=[1, 2], reason="again", shelf=None)
+    assert run.state["waiting"]["key"] == alone  # a task's wait stays
+    assert state_json(run) == replay(run.events.read())
+
+
+def test_review_wave_dropped_clears_its_wait_only(run):
+    wave = "build/build/wave-1"
+    run.emit("hitl_raised", kind="turn_cap", key=f"{wave}/review", phase="build", summary="x", questions=[])
+    run.emit("review_wave_dropped", key=wave, wave=1, reason="a reviewer stopped")
+    assert run.state["waiting"] is None
+    row = run.state["steps"][f"{wave}/review"]
+    assert row["status"] == "skipped" and "a reviewer stopped" in row["skip_reason"]
+    run.emit("hitl_raised", kind="blocked", key=f"{wave}/implement", phase="build", summary="y", questions=[])
+    run.emit("review_wave_dropped", key=wave, wave=1, reason="again")
+    assert run.state["waiting"]["key"] == f"{wave}/implement"  # the implementer's wait stays
+    assert state_json(run) == replay(run.events.read())
+
+
+def test_a_wave_dissolved_never_clears_a_phase_approval(run):
+    run.emit("phase_approval_raised", phase="build", summary="ok?")
+    before = copy.deepcopy(run.state["waiting"])
+    run.emit("wave_dissolved", key="build_approved", wave=1, tasks=[1], reason="r", shelf=None)  # even under the approval's key
+    assert run.state["waiting"] == before and run.state["status"] == "awaiting_approval"
+
+
+@pytest.mark.parametrize("etype, fields", [
+    ("wave_started", {"key": "build/build/wave-1"}), ("wave_started", {"wave": 1}),
+    ("scope_violation", {"key": "build/build/task-1/implement"}), ("wave_dissolved", {"key": "build/build/wave-1"}),
+    ("wave_attributed", {}), ("wave_finished", {}), ("parallel_demoted", {}), ("parallel_candidates", {}),
+    ("review_wave_dropped", {}),
+])
+def test_a_wave_event_without_its_required_fields_is_refused(run, etype, fields):
+    with pytest.raises(EventError):
+        run.emit(etype, **fields)
+
+
 def test_a_notified_wait_stays_notified_and_another_keys_notice_changes_nothing(run):
     run.emit("hitl_raised", kind="blocked", key=PARKED, phase="build", summary="x", questions=[], notified=False)
     run.emit("hitl_notified", key="build/build/task-2/implement")

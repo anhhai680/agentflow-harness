@@ -61,6 +61,9 @@ PARKABLE = ("needs_human", "blocked", "blocked_repeat", "gate_failed", "fix_atte
             "guard_violation", "step_timeout", "turn_cap", "budget_cap")
 # A stop on one of a plan task's own steps. A resolver's stop (`.../implement/resolve-1`) has a longer key.
 TASK_STOP = re.compile(r"/task-\d+/(implement|review|commit)$")
+# A stop on a parallel wave's implement or review session. A stopped wave dissolves into its tasks, which run alone, so
+# the stop itself tells no one.
+WAVE_STOP = re.compile(r"/wave-\d+/(implement|review)$")
 
 
 def park_kinds(cfg: Config) -> tuple[str, ...]:
@@ -447,9 +450,9 @@ def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questio
                extra: str = "", notify: bool | None = None) -> Path:
     """Stop the run for a human: write the inbox file, record `hitl_raised`, notify. Returns the inbox path.
 
-    `notify`: None is the usual rule (quiet while the runner settles the stop itself, or while a plan task's stop may
-    still park: the runner tells a human if it cannot settle or park it); True always tells a human, False never does
-    (a stop a human was already told of)."""
+    `notify`: None is the usual rule (quiet while the runner settles the stop itself, while a plan task's stop may
+    still park, or for a wave's stop, which dissolves the wave: the runner tells a human if it cannot settle, park or
+    dissolve it); True always tells a human, False never does (a stop a human was already told of)."""
     questions = list(questions)
     counted = {"times": _times_back(run, key)} if kind == "blocked_repeat" else {}
     how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).",
@@ -459,7 +462,8 @@ def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questio
     if notify is None:
         from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
 
-        notify = not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions]) and not parks_first(cfg, kind, key)
+        notify = (not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions]) and not parks_first(cfg, kind, key)
+                  and WAVE_STOP.search(key) is None)
     run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
              questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:],
              notified=bool(notify), **counted)

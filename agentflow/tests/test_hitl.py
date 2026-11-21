@@ -293,6 +293,16 @@ def test_a_task_stop_that_may_park_is_raised_without_a_notification(run, cfg, ma
     assert run.state["waiting"]["notified"] is False
 
 
+def test_a_wave_stop_raises_quietly(run, cfg, macos_calls, capsys):
+    asked = dataclasses.replace(one_question(), kind="boundary")  # the runner never answers it, and a wave stop never parks
+    raise_hitl(cfg, run, "needs_human", "build/build/wave-1/implement", "a member needs a TTL", [asked])
+    raise_hitl(cfg, run, "needs_human", "build/build/wave-1/review", "a reviewer needs a TTL", [asked])
+    assert macos_calls == [] and "\a" not in capsys.readouterr().err
+    assert [e["notified"] for e in hitl_raised_of(run)] == [False, False]
+    raise_hitl(cfg, run, "needs_human", "build/build/wave-1/gate", "a gate needs a TTL", [asked])  # not a wave's session
+    assert len(macos_calls) == 1
+
+
 def test_hitl_raised_keeps_the_extra_text_capped(run, cfg, macos_calls):
     raise_hitl(cfg, run, "gate_failed", "build/x", "s", extra="x" * 5000 + "END")
     ev = [e for e in run.events.read() if e["type"] == "hitl_raised"][-1]
