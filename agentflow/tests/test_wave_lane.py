@@ -783,6 +783,28 @@ def test_a_planted_review_card_path_drops_the_review_wave(waves, git, tmp_path):
     assert (tmp_path / "elsewhere.md").read_text(encoding="utf-8") == "not a card\n"
 
 
+@pytest.mark.parametrize("how", ["attribution", "dissolve"])
+def test_what_was_uncommitted_before_the_wave_survives_its_revert(waves, git, how):
+    # a person's file, uncommitted when the wave starts, is overwritten by a sub-agent: putting the wave's paths back
+    # restores it as it was then, not as `HEAD` has it (where it does not exist)
+    run = begin_build(waves, plan_text({1: "none", 2: "none"}, count=2, files=FILES, groups={1: "A", 2: "A"}))
+    (waves.root / "notes").mkdir()
+    (waves.root / "notes/mine.md").write_text("mine\n", encoding="utf-8")
+    overwrite = {"notes/mine.md": "stray\n"}
+    if how == "attribution":
+        act = wave_act(subs=[sub(1), sub(2, write={"src/two.py": "n = 2\n", **overwrite})],
+                       tasks=[report(1), report(2, files=["src/two.py", "notes/mine.md"])])
+    else:
+        act = wave_act(subs=[sub(1), {"description": "Task 7: x", "write": {"src/two.py": "n = 2\n", **overwrite}}],
+                       tasks=[report(1), report(2)])
+    waves.script({WAVE: [act], IMPL.format(n=1): [alone(1)], IMPL.format(n=2): [alone(2)]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert ((2, "scope_violation") in demoted(events)) if how == "attribution" else dissolved(events) == [
+        (W, "wave_dispatch")]
+    assert (waves.root / "notes/mine.md").read_text(encoding="utf-8") == "mine\n"
+
+
 def test_a_moved_head_keeps_the_wave_stop(waves, git, notified):
     run = begin_build(waves, wave_plan())
     waves.script({WAVE: [{**wave_act(), "write": {"src/two.py": "n = 2\n"}, "git_commit": "the wave committed"}],

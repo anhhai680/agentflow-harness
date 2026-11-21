@@ -432,7 +432,7 @@ class WaveLane:
                          rel: str) -> dict | str:
         """Shelve the tree, put the strays and the set-aside members' files back as at the wave's start, then record
         it. A shelf a runner wrote before it died is read instead of the tree, so the outcome is the same."""
-        number, start_head, start_tree = int(started["wave"]), str(started["start_head"]), str(started["start_tree"])
+        number, start_tree = int(started["wave"]), str(started["start_tree"])
         try:
             ref = shelf_ref(self.run.id, key)
         except ValueError:
@@ -460,7 +460,7 @@ class WaveLane:
             except (GitError, subprocess.CalledProcessError):
                 return "shelf_failed"  # nothing moved yet: the dissolve keeps the tree, or the run's wait does
         if moving:
-            restore_paths(self.worktree, moving, start_head)
+            restore_paths(self.worktree, moving, start_tree)  # the tree, so what was uncommitted before stays
         summaries = {str(n): clean_fact(r.summary) for n, r in reports.items() if n not in out}
         attributed = self.run.emit(
             "wave_attributed", key=key, wave=number, owners={str(n): p for n, p in found.owners.items()},
@@ -799,7 +799,8 @@ class WaveLane:
            aside members' work). Written once: a dissolve killed after it, part way through its restore, finds that
            shelf and keeps it, so it holds every path the wave changed. A shelf that cannot be written keeps the run's
            wait the same way: nothing is moved.
-        3. Every path still changed since the wave's start goes back as at its start `HEAD`.
+        3. Every path still changed since the wave's start goes back as its start tree has it, so what was
+           uncommitted before the wave stays.
         4. Each member is `parallel_demoted` (`dissolved`), then `wave_dissolved`, which clears the wait under the
            wave and skips its session's row, closes the wave."""
         session_key = f"{key}/implement"
@@ -823,7 +824,7 @@ class WaveLane:
             return self._keep_stop(session_key, wait, (
                 f"A member of {key} was already projected or committed, so the runner will not give the wave up: that "
                 "would put its committed files back as at the wave's start. Settle the stop by hand."))
-        start_head, start_tree = str(started["start_head"]), str(started["start_tree"])
+        start_tree = str(started["start_tree"])
         try:
             ref = shelf_ref(self.run.id, f"{key}/{DISSOLVED_SHELF}")
             tree = snapshot(self.worktree)
@@ -836,7 +837,7 @@ class WaveLane:
                 f"The work of {key} cannot be shelved ({clean_fact(str(exc))}), so the runner moved nothing. Keep what "
                 "you want of it, then approve: the wave is given up and its tasks are built alone."))
         if changed:
-            restore_paths(self.worktree, changed, start_head)
+            restore_paths(self.worktree, changed, start_tree)  # the tree, so what was uncommitted before stays
         for n in members:
             self._demote(prefix, n, "dissolved", number)
         self.run.emit("wave_dissolved", key=key, wave=number, tasks=members, reason=reason, shelf=shelf)
