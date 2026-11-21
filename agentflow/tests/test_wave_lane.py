@@ -174,6 +174,7 @@ def test_the_wave_prompt_names_one_card_per_member(waves):
     prompt = next(c for c in waves.calls() if c["step"] == WAVE)["argv"][-1]
     cards = run.agent_dir / "wave" / "wave-1"
     assert "Tasks 2, 3" in prompt and "{wave_cards}" not in prompt and "{wave_title}" not in prompt
+    assert "is your sub-agents' brief, not yours" in prompt  # the build skill is the cards', not the dispatcher's
     assert f"- Task 2: Second thing: `{cards / 'task-2.md'}`" in prompt
     assert f"- Task 3: Third thing: `{cards / 'task-3.md'}`" in prompt
     card = (cards / "task-2.md").read_text(encoding="utf-8")
