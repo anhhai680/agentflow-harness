@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agentflow import hitl
+from agentflow import hitl, pack
 from agentflow.autonomy import AUTO_BY
 from agentflow.flow import main
 from agentflow.hitl import (
@@ -269,21 +269,28 @@ def test_inbox_title_and_question_stay_on_one_line(tmp_path):
 
 def test_raise_hitl_notifies(run, cfg, macos_calls, capsys):
     asked = dataclasses.replace(one_question(), kind="boundary")  # one only a human answers, in any phase
-    path = raise_hitl(cfg, run, "needs_human", "plan/task-1/implement", "Task 1 needs a TTL", [asked])
-    assert path == run.inbox_path("plan/task-1/implement") and path.exists()
+    path = raise_hitl(cfg, run, "needs_human", "plan/plan", "Task 1 needs a TTL", [asked])
+    assert path == run.inbox_path("plan/plan") and path.exists()
     assert "\a" in capsys.readouterr().err
     (argv,) = macos_calls
     assert argv[:2] == ["osascript", "-e"]
     assert f"agentflow: {run.id} needs you" in argv[2]
     assert argv[2].startswith("display notification")
     assert run.state["waiting"]["kind"] == "needs_human"
-    assert run.state["waiting"]["key"] == "plan/task-1/implement"
+    assert run.state["waiting"]["key"] == "plan/plan"
     assert run.state["waiting"]["phase"] == "plan"
     assert run.state["waiting"]["summary"] == "Task 1 needs a TTL"
     assert run.state["waiting"]["questions"][0]["id"] == "q1"
     assert run.state["status"] == "waiting_human"
     assert parse_answers(path) == {"q1": ""}
     assert f"agentflow answer {run.id}" in path.read_text(encoding="utf-8")
+
+
+def test_a_task_stop_that_may_park_is_raised_without_a_notification(run, cfg, macos_calls, capsys):
+    asked = dataclasses.replace(one_question(), kind="boundary")  # the runner never answers it, but it may park
+    raise_hitl(cfg, run, "needs_human", "build/build/task-1/implement", "Task 1 needs a TTL", [asked])
+    assert macos_calls == [] and "\a" not in capsys.readouterr().err  # the plan walk tells a person if it can't park
+    assert run.state["waiting"]["notified"] is False
 
 
 def test_hitl_raised_keeps_the_extra_text_capped(run, cfg, macos_calls):
@@ -641,6 +648,184 @@ def test_raise_hitl_notify_overrides_who_is_told(run, cfg, macos_calls):
     assert len(macos_calls) == 1
 
 
+def test_raise_hitl_records_whether_a_person_was_told(run, cfg, macos_calls):
+    raise_hitl(cfg, run, "blocked", "build/a", "quiet", notify=False)
+    assert run.events.read()[-1]["notified"] is False and run.state["waiting"]["notified"] is False
+    raise_hitl(cfg, run, "blocked", "build/b", "told", notify=True)
+    assert run.events.read()[-1]["notified"] is True and run.state["waiting"]["notified"] is True
+
+
+# ------------------------------------------------------------------ parked stops (T4)
+
+PA = "build/build/task-1/implement"
+PB = "build/build/task-2/implement"
+RADIUS = {"blocks": [2], "continue": [3]}
+
+
+def park(cfg, run, key, kind="blocked", questions=(), radius=None, extra=""):
+    """What the plan walk does with a task stop it parks: raise the wait, then park it away."""
+    raise_hitl(cfg, run, kind, key, f"{key} is stuck", questions, notify=False)
+    return hitl.park_wait(cfg, run, dict(run.state["waiting"]), blast_radius=radius or RADIUS, shelf=None,
+                          shelved=[], stop_class=None, extra=extra)
+
+
+def promote(run, key):
+    """What the walk does once no runnable task is left: the parked item becomes the run's wait."""
+    item = run.state["parked"][key]
+    run.emit("hitl_raised", kind=item["kind"], key=key, phase="build", summary=item["summary"],
+             questions=item["questions"], promoted=True, notified=True)
+
+
+def test_park_wait_records_the_park_and_clears_the_wait(run, cfg, macos_calls):
+    path = park(cfg, run, PA, extra="the gate log")
+    assert path == run.inbox_path(PA)
+    ev = run.events.read()[-1]
+    assert ev["type"] == "step_parked" and ev["kind"] == "blocked" and ev["paths"] == []
+    assert ev["blast_radius"] == RADIUS and ev["shelf"] is None and ev["shelved"] == [] and ev["stop_class"] is None
+    assert "demoted" not in ev
+    assert run.state["waiting"] is None and run.state["status"] == "running" and list(run.state["parked"]) == [PA]
+    assert run.state["steps"][PA]["status"] == "parked"
+
+
+def test_the_parked_inbox_file_names_the_blast_radius(run, cfg, macos_calls):
+    text = park(cfg, run, PA, extra="the gate log").read_text(encoding="utf-8")
+    assert "Blast radius: blocks task 2; task 3 continues" in text and "the gate log" in text
+    assert f"agentflow approve {run.id} {PA}" in text and f"agentflow retry {run.id} {PA}" in text
+    assert f"agentflow pause {run.id}" in text and "agentflow answer" not in text
+    assert [c for c in macos_calls if f"parked {PA}: blocks task 2; task 3 continues" in c[-1]]
+    asked = park(cfg, run, PB, kind="needs_human", questions=[one_question()]).read_text(encoding="utf-8")
+    assert f"agentflow answer {run.id} --key {PB}" in asked and QUESTION in asked
+
+
+def test_a_parked_stop_is_approved_by_its_key(run, cfg, macos_calls):
+    park(cfg, run, PA)
+    assert approve(run, PA, "me") is False
+    ev = run.events.read()[-1]
+    assert ev["type"] == "hitl_approved" and ev["key"] == PA and ev["kind"] == "blocked" and ev["by"] == "me"
+    assert run.state["waiting"] is None and run.state["parked"] == {}
+    assert run.state["steps"][PA]["status"] == "running"
+
+
+def test_a_parked_blocked_repeat_needs_a_note(run, cfg, macos_calls):
+    park(cfg, run, PA, kind="blocked_repeat")
+    with pytest.raises(NotWaiting, match="blocked again with nothing changed"):
+        approve(run, PA, "me")
+    assert list(run.state["parked"]) == [PA]
+    approve(run, PA, "me", note="the import is fixed")
+    assert run.events.read()[-1]["note"] == "the import is fixed" and run.state["parked"] == {}
+
+
+def test_a_parked_question_is_answered_not_approved(run, cfg, macos_calls):
+    park(cfg, run, PA, kind="needs_human", questions=[one_question()])
+    with pytest.raises(NotWaiting, match="waiting for answers"):
+        approve(run, PA, "me")
+    assert answer(run, PA, {"q1": ANSWER}, "me") is True
+    assert run.state["parked"] == {} and run.state["waiting"] is None
+
+
+def test_a_parked_item_cannot_be_rejected(run, cfg, macos_calls):
+    park(cfg, run, PA)
+    with pytest.raises(NotWaiting) as caught:
+        reject(run, PA, "me", "redo it")
+    assert str(caught.value) == f"{PA} is parked: approve, answer or retry it; reject it once it is the run's wait"
+    assert list(run.state["parked"]) == [PA] and not run.state.get("refine")
+
+
+def test_settling_a_parked_item_demotes_the_promoted_wait(run, cfg, macos_calls):  # Review Focus 2
+    park(cfg, run, PA)
+    park(cfg, run, PB)
+    promote(run, PA)
+    assert run.state["waiting"]["key"] == PA and run.state["waiting"]["promoted"] is True
+    approve(run, PB, "me")
+    assert run.state["waiting"] is None and set(run.state["parked"]) == {PA}
+    assert run.state["status"] == "running"
+    last = run.events.read()[-1]
+    assert last["type"] == "step_parked" and last["demoted"] is True and last["key"] == PA
+    assert last["blast_radius"] == RADIUS
+    promote(run, PA)
+    approve(run, PA, "me")  # settling the promoted wait itself demotes nothing
+    assert run.state["waiting"] is None and run.state["parked"] == {}
+    assert run.events.read()[-1]["type"] == "hitl_approved"
+
+
+def test_answering_a_parked_item_demotes_the_promoted_wait(run, cfg, macos_calls):
+    park(cfg, run, PA)
+    park(cfg, run, PB, kind="needs_human", questions=[one_question()])
+    promote(run, PA)
+    assert answer(run, PB, {"q1": ANSWER}, "me") is True
+    assert run.state["waiting"] is None and set(run.state["parked"]) == {PA}
+    assert run.events.read()[-1]["demoted"] is True
+
+
+def test_a_parked_stop_is_retried_by_its_key(run, cfg, macos_calls):
+    from agentflow.run_control import ControlError, retry
+
+    park(cfg, run, PA)
+    park(cfg, run, PB)
+    park(cfg, run, "build/build/task-3/implement", kind="needs_human", questions=[one_question()])
+    with pytest.raises(ControlError, match="parked waiting for answers"):
+        retry(run, "build/build/task-3/implement", "me")
+    promote(run, PA)
+    assert retry(run, PB, "me") == PB
+    assert run.state["steps"][PB]["status"] == "pending" and PB not in run.state["parked"]
+    assert run.state["waiting"] is None and PA in run.state["parked"]
+    assert run.events.read()[-1]["demoted"] is True
+
+
+def test_inbox_items_carry_the_stop_kind_of_a_parked_item(repo, run, cfg, macos_calls):
+    park(cfg, run, PA, kind="guard_violation")
+    (item,) = inbox_items(repo)
+    assert item["kind"] == "parked" and item["stop_kind"] == "guard_violation" and item["key"] == PA
+    assert item["blast_radius"] == RADIUS and item["inbox_path"] == str(run.inbox_path(PA))
+
+
+def test_inbox_cli_names_a_parked_stops_way_out(repo, run, cfg, macos_calls, capsys):
+    park(cfg, run, PA)
+    capsys.readouterr()
+    assert main(["inbox"]) == 0
+    out = capsys.readouterr().out
+    assert "parked (blocked)" in out and "Blast radius: blocks task 2; task 3 continues" in out
+    assert f"agentflow approve {run.id} {PA}" in out and f"agentflow retry {run.id} {PA}" in out
+
+
+def test_inbox_cli_asks_for_a_note_on_a_parked_repeated_block(repo, run, cfg, macos_calls, capsys):
+    park(cfg, run, PA, kind="blocked_repeat")
+    capsys.readouterr()
+    assert main(["inbox"]) == 0
+    out = capsys.readouterr().out
+    assert f'agentflow approve {run.id} {PA} --note "..."' in out  # a plain approve of it is refused
+
+
+def test_approving_while_a_runner_is_live_only_records(repo, run, cfg, macos_calls, capsys):
+    from agentflow.events import RunLock
+
+    park(cfg, run, PA)
+    lock = RunLock(run.dir)
+    assert lock.acquire()
+    try:
+        assert main(["approve", run.id, PA]) == 0
+    finally:
+        lock.release()
+    assert f"recorded; the runner working on {run.id} picks it up" in capsys.readouterr().out
+    ev = Run.load(repo, run.id).events.read()[-1]
+    assert ev["type"] == "hitl_approved" and ev["key"] == PA
+
+
+def test_resuming_while_a_runner_is_live_records_nothing_and_is_refused(repo, run, cfg, capsys, monkeypatch):
+    from agentflow import flow
+    from agentflow.events import RunLock
+
+    monkeypatch.setattr(flow, "_preflight", lambda cfg: None)  # no agent CLI is needed to be refused
+    lock = RunLock(run.dir)
+    assert lock.acquire()
+    try:
+        assert main(["resume", run.id, "--config", str(cfg.path)]) == 1
+    finally:
+        lock.release()
+    out = capsys.readouterr().out
+    assert "recorded" not in out and f"another runner is working on {run.id}" in out
+
+
 # ------------------------------------------------------------------ inbox listing and CLI
 
 
@@ -765,3 +950,129 @@ def test_read_result_takes_dispositions(tmp_path):
 def test_read_result_refuses_dispositions_that_are_not_a_list(tmp_path, bad):
     with pytest.raises(ResultError, match="dispositions must be a list"):
         read_result(write_result(tmp_path / "r.json", {"status": "done", "summary": "x", "dispositions": bad}))
+
+
+# ------------------------------------------------------------------ which stops park a task (T4)
+
+TASK_IMPLEMENT = "build/build/task-2/implement"
+
+
+def _park_cfg(cfg, **hitl_keys):
+    return dataclasses.replace(cfg, hitl={**cfg.hitl, **hitl_keys})
+
+
+def test_parks_first_only_for_a_task_steps_parkable_stop(cfg):
+    assert hitl.parks_first(cfg, "blocked", TASK_IMPLEMENT)
+    assert hitl.parks_first(cfg, "gate_failed", "build/build/task-2/commit")
+    assert hitl.parks_first(cfg, "needs_human", "build/build/task-2/review")
+    assert not hitl.parks_first(cfg, "blocked", TASK_IMPLEMENT + "/resolve-1")  # a resolver's own stop
+    assert not hitl.parks_first(cfg, "blocked", "build/build/task-2/gate")
+    assert not hitl.parks_first(cfg, "blocked", "build/build/implement")  # not a task's step
+    assert not hitl.parks_first(cfg, "budget_exceeded", TASK_IMPLEMENT)
+    assert not hitl.parks_first(cfg, "environment", TASK_IMPLEMENT)
+    assert not hitl.parks_first(_park_cfg(cfg, park_independent=False), "blocked", TASK_IMPLEMENT)
+
+
+def test_park_kinds_default_to_every_parkable_stop_and_never_name_a_run_wide_one(cfg):
+    engine = _park_cfg(cfg)
+    assert hitl.park_kinds(dataclasses.replace(cfg, hitl={})) == hitl.PARKABLE
+    assert hitl.park_kinds(engine) == tuple(engine.hitl.get("park_kinds", hitl.PARKABLE))
+    assert "budget_exceeded" not in hitl.PARKABLE and "environment" not in hitl.PARKABLE
+    assert hitl.park_kinds(_park_cfg(cfg, park_kinds=["blocked"])) == ("blocked",)
+    assert hitl.park_kinds(_park_cfg(cfg, park_kinds=[])) == ()
+
+
+def test_parks_first_follows_park_kinds(cfg):
+    only_blocked = _park_cfg(cfg, park_independent=True, park_kinds=["blocked"])
+    assert hitl.parks_first(only_blocked, "blocked", TASK_IMPLEMENT)
+    assert not hitl.parks_first(only_blocked, "gate_failed", TASK_IMPLEMENT)
+    assert not hitl.parks_first(_park_cfg(cfg, park_independent=True, park_kinds=[]), "blocked", TASK_IMPLEMENT)
+    assert not hitl.parks_first(_park_cfg(cfg, park_independent="yes"), "blocked", TASK_IMPLEMENT)  # only `true` parks
+
+
+def test_the_engine_default_parks_a_task_stop():
+    import yaml
+
+    raw = yaml.safe_load((Path(hitl.__file__).parent / "defaults" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["hitl"]["park_independent"] is True
+    assert tuple(raw["hitl"]["park_kinds"]) == hitl.PARKABLE
+
+
+# ------------------------------------------------------------------ the notification digest (T4)
+
+
+def _digest_cfg(cfg):
+    return _park_cfg(cfg, digest=True)
+
+
+def test_the_digest_counts_items_and_runs(repo, run, cfg, macos_calls):
+    from agentflow.state import Run
+
+    assert hitl.digest_text(repo) == "Nothing needs you; 1 run progressing"
+    park(cfg, run, PA)  # a parked item needs a person, though its run is still progressing
+    assert hitl.digest_text(repo) == "1 item needs you; 1 run progressing"
+    other = Run.create(cfg, repo, "feature", {"module": "billing"})
+    third = Run.create(cfg, repo, "feature", {"module": "search"})
+    asked = dataclasses.replace(one_question(), kind="boundary")
+    raise_hitl(cfg, other, "needs_human", "plan/plan", "needs a TTL", [asked])  # a run's wait: it holds the run
+    assert hitl.digest_text(repo) == "2 items need you (1 holds a run); 2 runs progressing"
+    assert third.state["status"] == "running"
+
+
+def test_an_unchanged_digest_is_not_sent_again(repo, run, cfg, macos_calls):
+    on = _digest_cfg(cfg)
+    hitl.notify_run(on, run, "blocked: something specific")
+    assert len(macos_calls) == 1
+    assert "Nothing needs you; 1 run progressing" in macos_calls[0][2]
+    assert "blocked: something specific" not in macos_calls[0][2] and 'with title "agentflow"' in macos_calls[0][2]
+    hitl.notify_run(on, run, "blocked: something else")
+    assert len(macos_calls) == 1  # nothing changed
+    park(on, run, PA)  # a stop that parks is raised quietly, so only the digest can tell of it
+    hitl.notify_run(on, run, "parked")
+    assert len(macos_calls) == 2 and "1 item needs you; 1 run progressing" in macos_calls[1][2]
+    assert (pack.state_dir(repo) / "notify_digest.txt").read_text(encoding="utf-8") == (
+        "1 item needs you; 1 run progressing")
+
+
+def test_a_runner_note_never_reaches_the_digest(repo, run, cfg, macos_calls):
+    on = _digest_cfg(cfg)
+    hitl.notify_run(on, run, "needs you")
+    macos_calls.clear()
+    hitl.notify_run(on, run, "took the recommended answer(s) q1=A in plan/grill; the decision is recorded")
+    assert macos_calls == []
+
+
+def test_an_unreadable_last_digest_is_sent_again(repo, run, cfg, macos_calls):
+    on = _digest_cfg(cfg)
+    hitl.notify_run(on, run, "x")
+    last = pack.state_dir(repo) / "notify_digest.txt"
+    last.unlink()
+    last.mkdir()  # not a regular file: it can't be read
+    hitl.notify_run(on, run, "x")
+    assert len(macos_calls) == 2
+
+
+def test_a_digest_that_cannot_be_built_sends_the_plain_message(repo, run, cfg, macos_calls, monkeypatch):
+    def broken(repo):
+        raise RuntimeError("another run's state is unreadable")
+
+    monkeypatch.setattr(hitl, "digest_text", broken)
+    hitl.notify_run(_digest_cfg(cfg), run, "blocked: something specific")  # never raises where it did not before
+    assert len(macos_calls) == 1 and "blocked: something specific" in macos_calls[0][2]
+    (failed,) = [e for e in run.events.read() if e["type"] == "notify_failed"]
+    assert failed["notifier"] == "digest" and "unreadable" in failed["error"]
+    assert not (pack.state_dir(repo) / "notify_digest.txt").exists()
+
+
+def test_with_the_digest_off_every_notification_is_sent(repo, run, cfg, macos_calls):
+    hitl.notify_run(cfg, run, "one")
+    hitl.notify_run(cfg, run, "one")
+    assert len(macos_calls) == 2 and "one" in macos_calls[0][2]
+    assert not (pack.state_dir(repo) / "notify_digest.txt").exists()
+
+
+def test_the_engine_default_has_the_digest_off():
+    import yaml
+
+    raw = yaml.safe_load((Path(hitl.__file__).parent / "defaults" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["hitl"]["digest"] is False

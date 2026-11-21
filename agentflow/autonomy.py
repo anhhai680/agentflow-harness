@@ -286,9 +286,11 @@ class Resolver:
             return True
         return self._run_session(open_["key"], open_["kind"], open_.get("session_key"), {})
 
-    def take_over(self) -> bool:
+    def take_over(self, notify: bool = True) -> bool:
         """True when the run can go on without a human. A stop the runner tried and cannot settle notifies
-        here, because `raise_hitl` left it quiet for the runner."""
+        here, because `raise_hitl` left it quiet for the runner; with `notify=False` it does not (the plan walk, which
+        may park the stop instead, tells a person itself). The note on a recommended answer the runner took is sent
+        either way: it is no stop."""
         self.run.refresh()
         self._handed_over = False
         wait = self.run.state["waiting"]
@@ -305,10 +307,12 @@ class Resolver:
             notify_run(self.cfg, self.run, f"took the recommended answer(s) {taken} in {key}; the decision is recorded")
             return True
         settled = self._revert(key) if kind == GUARD_KIND else self._resolve(wait)
-        if not settled and not self._handed_over:  # a hand-over told the human already
+        if notify and not settled and not self._handed_over:  # a hand-over told the human already
             self.run.refresh()
-            if self.run.state["waiting"] is not None and self.run.state["waiting"]["key"] == key:
+            now = self.run.state["waiting"]
+            if now is not None and now["key"] == key and not now.get("notified"):  # told once, whoever looks again
                 notify_run(self.cfg, self.run, notice_text(wait) or f"{key} needs a decision")
+                self.run.emit("hitl_notified", key=key)
         return settled
 
     def _attempts(self, key: str) -> int:

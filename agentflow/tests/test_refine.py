@@ -535,10 +535,11 @@ PARK = {"result": {"status": "needs_human", "summary": "which TTL?", "questions"
                    "can_continue_without": True}}
 
 
-def commit_plan(flow_repo, git, titles: dict[int, str]) -> None:
+def commit_plan(flow_repo, git, titles: dict[int, str], depends: dict[int, str] | None = None) -> None:
     parts = ["# Plan: demo\n"]
     for n, title in titles.items():
-        parts.append(f"### Task {n}: {title}\n\n**Depends on:** none\n\n- [ ] **Step 1: Task {n} code**\n")
+        dep = (depends or {}).get(n, "none")
+        parts.append(f"### Task {n}: {title}\n\n**Depends on:** {dep}\n\n- [ ] **Step 1: Task {n} code**\n")
     for rel, text in ((SPEC, SPEC_PLAIN), (PLAN_PATH, "\n".join(parts))):
         target = flow_repo.root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -598,7 +599,7 @@ def test_rejecting_a_task_stop_refines_only_that_task(flow_repo, git):
 
 def test_a_scoped_round_still_refines_a_task_an_earlier_round_left(flow_repo, git):
     flow_repo.configure(BIG)
-    commit_plan(flow_repo, git, TITLES3)
+    commit_plan(flow_repo, git, TITLES3, depends={3: "Task 2"})  # task 3 waits on task 2, so task 2's stop can't park
     flow_repo.script({
         IMPL1: [{"write": {"src/one.py": "x = 1\n"}, **done("task one")},
                 {"write": {"src/one.py": "x = 10\n"}, **done("task one refined")}],

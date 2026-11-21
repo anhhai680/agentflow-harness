@@ -114,3 +114,35 @@ def test_the_status_ladder(spec_run, flow_repo):
 def test_a_parked_task_carries_its_stop(spec_run, flow_repo):
     by = _ladder(spec_run, flow_repo, park=True)
     assert by[8]["status"] == "parked" and by[8]["stop"]["summary"] == "which db?"
+
+
+SHARED = """# P
+### Task 1: One
+**Depends on:** none
+- Create: `src/one.py`
+- [ ] a
+### Task 2: Two
+**Depends on:** none
+- Modify: `src/shared.py`
+- [ ] a
+### Task 3: Three
+**Depends on:** none
+- Modify: `src/three.py`
+- [ ] a
+### Task 4: Four
+**Depends on:** none
+- Modify: `src/shared.py`
+- [ ] a
+"""
+
+
+def test_a_task_sharing_a_file_with_a_stopped_task_waits_on_it(spec_run, flow_repo):
+    spec_run.commit("plan/plan", write={"docs/plans/2026-11-16-crm.md": SHARED})
+    run, p = spec_run.run, "build/build"
+    run.emit("phase_started", phase="build", start_sha=spec_run.head())
+    run.emit("step_started", key=f"{p}/task-2/implement")
+    run.emit("hitl_raised", kind="blocked", key=f"{p}/task-2/implement/resolve-1", summary="stuck")
+    by = {t["n"]: t for t in run_plan(run, spec_run.repo, flow_repo.cfg)["tasks"]}
+    assert by[2]["status"] == "blocked" and by[2]["blocks"] == [4]
+    assert by[4]["status"] == "waiting" and by[4]["blocked_by"] == [2]
+    assert by[1]["status"] == by[3]["status"] == "independent" and by[1]["blocked_by"] == []

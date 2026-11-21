@@ -225,6 +225,50 @@ def test_a_phase_approval_carries_what_the_page_showed():
     assert got == {"ok": True, "body": {"target": "plan", "viewed": [{"path": "p.md", "sha": "abcdef1", "run": "r"}]}}
 
 
+def approval(run, **kw):
+    return {"run_id": run, "kind": "phase_approval", "group": "approval", "phase": "define", "key": "define_approved",
+            "actions": ["approve", "reject"], "approve_note": "none", **kw}
+
+
+def test_batch_approvals_keeps_the_approvals_that_take_no_note():
+    items = [approval("r1"), approval("r2", phase="plan"),
+             {"run_id": "r1", "kind": "blocked", "group": "stop", "key": "build/x", "actions": ["approve", "reject"],
+              "approve_note": "optional"},
+             approval("r3", approve_note="required"),
+             approval("r4", actions=["reject"]),
+             {"run_id": "r5", "kind": "parked", "group": "stop", "key": "build/y", "actions": ["approve"],
+              "approve_note": "optional"}]
+    assert js(["inbox.js"], "batchApprovals(args).map(i => i.run_id)", items) == ["r1", "r2"]
+
+
+def test_approve_all_sends_only_the_approvals_shown_when_it_armed():
+    """An approval that arrives between the arming press and the confirming one is not approved unseen."""
+    got = js_async(["inbox.js"], """(async () => {
+      var sent = [];
+      setTimeout = () => 0; clearTimeout = () => {};
+      renderInbox = () => {};
+      act = async (run, action, body) => { sent.push(run + ":" + action); return true; };
+      viewedList = () => [];
+      ui = {inbox: {view: {items: args.slice(0, 2)}, armed: null, armedAt: 0, drafts: new Map(), busy: new Set(),
+                    sent: new Set()}};
+      approveAllItems();  // arms over r1 and r2
+      ui.inbox.view = {items: args};  // r3 arrives in the 4 seconds
+      approveAllItems();  // confirms
+      for (let i = 0; i < 50; i++) await null;
+      return sent;
+    })()""", [approval("r1"), approval("r2", phase="plan"), approval("r3")])
+    assert got == ["r1:approve", "r2:approve"]
+
+
+def test_a_constraint_approval_sends_the_flag_and_still_needs_a_required_note():
+    item = {"run_id": "r", "kind": "gate_failed", "key": "build/build/task-2/commit", "approve_note": "optional",
+            "actions": ["approve", "reject", "approve_constraint"]}
+    assert js(["inbox.js"], "constraintPayload(args, {note: ' '})", item) == \
+        {"ok": True, "body": {"target": "build/build/task-2/commit", "constraint": True}}
+    again = dict(item, approve_note="required")
+    assert js(["inbox.js"], "constraintPayload(args, {note: ''})", again)["ok"] is False
+
+
 def test_questions_start_on_their_recommended_option():           # spec Verification U4
     qs = [{"id": "q1", "options": [{"key": "A"}, {"key": "B", "recommended": True}]}, {"id": "q2", "options": []}]
     assert js(["inbox.js"], "answerDefaults(args)", qs) == {"q1": "B", "q2": ""}

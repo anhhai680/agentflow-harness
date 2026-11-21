@@ -52,11 +52,11 @@ WAITS = {
     "ci_watching": "ci", "run_held": "hold", "run_paused": "down", "runner_error": "down",
 }
 HELD_BUCKETS = {"ci_pending": "ci"}  # a `run_held` reason charged to a bucket of its own; any other is `hold`
-# Events that end a wait: a person acted, the runner came back, or work started again.
+# Events that end a wait: a person acted, the runner came back, work started again, or the stop was parked away.
 WAIT_ENDS = {
     "hitl_answered", "hitl_approved", "phase_approved", "phase_rejected", "run_resumed", "run_hold_ended",
     "pr_marked_ready", "resolve_started", "ci_round", "phase_started", "step_started", "agent_started",
-    "checkpoint_cleared",
+    "checkpoint_cleared", "step_parked",
 }
 ENDS = {"run_finished", "run_failed", "run_cancelled", "run_archived"}
 REWORK_MARKS = {"step_reopened", "step_retry", "fix_attempt"}

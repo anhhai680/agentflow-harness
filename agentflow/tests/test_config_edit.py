@@ -284,6 +284,21 @@ def test_yaml_text_may_not_change_the_paths_the_runner_reads(shipped, old, new):
         config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
 
 
+def test_the_settings_page_refuses_constraint_override(shipped):
+    """Who may lift a constraint gate is a guardrail: neither the YAML tab nor the form may add, change or drop it."""
+    _, sha = config_edit.read(shipped)
+    line = '  reject_trailers: ["Constraints-Approved-By"]\n'
+    assert line in SHIPPED
+    added = SHIPPED.replace(line, line + '  constraint_override: {trailer: Constraints-Approved-By, gates: [floor]}\n')
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=added, repo=REPO)
+    with pytest.raises(EditError):
+        form(shipped, (["guardrails", "constraint_override"], {"trailer": "Constraints-Approved-By", "gates": ["floor"]}))
+    with pytest.raises(EditError):
+        form(shipped, (["guardrails", "constraint_override", "gates"], ["floor"]))
+    assert config_edit.read(shipped)[1] == sha
+
+
 def test_the_form_refuses_switching_refinement_off(shipped):
     with pytest.raises(EditError):
         form(shipped, (["autonomy", "finding_rounds"], 0))
@@ -1231,3 +1246,33 @@ def test_agent_rules_is_protected(shipped):
     _, sha = config_edit.read(shipped)
     with pytest.raises(Refused, match="protected"):
         config_edit.propose(shipped, sha, text=SHIPPED.replace("project:\n", "project:\n  agent_rules: [AGENTS.md]\n", 1), repo=REPO)
+
+
+def test_the_settings_form_has_the_park_keys(shipped):
+    from agentflow import hitl
+
+    fields = _fields(shipped)
+    park = fields[("hitl", "park_independent")]
+    assert (park["label"], park["kind"]) == ("Park a stopped task and go on", "bool")
+    kinds = fields[("hitl", "park_kinds")]
+    assert (kinds["label"], kinds["kind"]) == ("Stops that park a task", "list")
+    proposal = form(shipped, (["hitl", "park_kinds"], ["blocked", "gate_failed"]), (["hitl", "park_independent"], False))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    saved = load_config(shipped).hitl
+    assert saved["park_kinds"] == ["blocked", "gate_failed"] and saved["park_independent"] is False
+    again = _fields(shipped)
+    assert again[("hitl", "park_kinds")]["value"] == ["blocked", "gate_failed"]
+    assert again[("hitl", "park_independent")]["value"] is False
+    assert set(hitl.PARKABLE) >= {"blocked", "gate_failed"}
+
+
+def test_the_settings_form_has_the_digest_key(shipped):
+    field = _fields(shipped)[("hitl", "digest")]
+    assert (field["label"], field["kind"]) == ("One digest line instead of a notification per stop", "bool")
+    assert field["value"] is False
+    proposal = form(shipped, (["hitl", "digest"], True))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).hitl["digest"] is True
+    assert _fields(shipped)[("hitl", "digest")]["value"] is True

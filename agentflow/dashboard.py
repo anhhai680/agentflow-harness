@@ -30,6 +30,7 @@ Routes:
   the run's lock. A phase approval starts nothing: the phase rests as ready until a human continues it
   (`resume`) or marks it done (`done`, which ends in the draft pull request) (D16).
   An approve body may carry `viewed: [{path, sha}]`, the revisions the page showed, recorded on `phase_approved` with `produced`, the newest revision of each artifact the phase made.
+  An approve body may carry `constraint: true` (a boolean, else 400): the person lifts a constraint gate (`hitl.approve(constraint=True)`), judged against the run's own trusted config, not the dashboard's.
   An action the run is not in a state for (a second approve, a live runner) answers 409 with the reason.
 - `GET /api/runs/<id>/sessions` (every agent session of the run) and `/sessions/<s…>/transcript?after=<byte>` (its
   transcript as turns, in whole-line pages of at most `dashboard.artifact_max_kb`).
@@ -63,6 +64,7 @@ It can approve checkpoints and start agents, so it is locked down:
 
 from __future__ import annotations
 
+import getpass
 import hmac
 import json
 import math
@@ -225,10 +227,23 @@ def _approve(run: Run, body: dict, cfg: Config, repo: Path | None = None) -> tup
     if budget is not None and (isinstance(budget, bool) or not isinstance(budget, (int, float))
                                or not math.isfinite(budget)):
         raise BadRequest("budget must be a finite number")
+    constraint = body.get("constraint", False)
+    if not isinstance(constraint, bool):
+        raise BadRequest("constraint must be true or false")
     target = _text(body, "target") or _default_target(run)
-    rested = hitl.approve(run, target, BY, budget=budget, hold=_rests(run, cfg), note=_text(body, "note"),
-                          budget_step=cfg.defaults.run_budget_usd, viewed=viewed,
-                          produced=_produced(run, repo, target) if repo is not None else None)
+    # `cfg=None`: a constraint approval reads the gates from the config the run continues with (its trusted one, as the
+    # CLI's does), not the dashboard's, so it cannot be accepted here and never written by a runner on another config.
+    try:
+        # A constraint approval is written into the override commit's trailer, which names the human (spec §4.1.6): the
+        # same default identity as the CLI's (`getpass.getuser()`; the dashboard is a token-guarded localhost tool run
+        # by that user). Every other dashboard action is recorded as the dashboard's.
+        by = getpass.getuser() if constraint else BY
+        rested = hitl.approve(run, target, by, budget=budget, hold=_rests(run, cfg), note=_text(body, "note"),
+                              budget_step=cfg.defaults.run_budget_usd, viewed=viewed,
+                              produced=_produced(run, repo, target) if repo is not None else None,
+                              constraint=constraint)
+    except ConfigError as exc:  # the run's own config could not be loaded or is not trusted (constraint only)
+        raise hitl.NotWaiting(str(exc)) from exc
     return {}, not rested
 
 

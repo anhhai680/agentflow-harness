@@ -44,6 +44,11 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   `build.implement`. `compactions` counts `compacted` events and `usage_holds` the `run_held` events whose reason is
   `usage limit` (a CI or outage hold is not one); both are always present. A run from before usage was recorded has
   none of the other four.
+  `parked_units` counts the `step_parked` events of the run that are not a re-emitted park (`demoted`), and
+  `park_resume_rework` the tasks that were parked and afterwards had a `unit_unparked` with `conflict` or a
+  `step_retry` a person or a command asked for (its `by` is not the runner's) on one of their keys, once per task
+  (a retry before the task's first park is no rework, and neither is the runner's own `re-review`). Both are
+  always present (0 when nothing parked), and both are lower-is-better.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
 
@@ -53,6 +58,7 @@ Pure functions over data: nothing here reads a file or the clock. Fields added t
 
 from __future__ import annotations
 
+import re
 import statistics
 from collections import Counter
 from collections.abc import Collection
@@ -102,6 +108,8 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "tool_output_kchars": ("lower", True),    # a step kind: thousands of characters of tool output per session
     "compactions": ("lower", False),          # times a session's context was compacted
     "usage_holds": ("lower", False),          # times the run waited out a usage limit
+    "parked_units": ("lower", False),         # stops parked so the run could go on with other tasks
+    "park_resume_rework": ("lower", False),   # parked tasks that then needed a conflict settled or a step retried
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
@@ -110,11 +118,13 @@ FAMILIES: dict[str, tuple[str, bool]] = {
 COUNT_FAMILIES = frozenset({"fix_attempts", "guard_trips", "permission_denied", "stop", "human_rejections",
                             "ci_rounds", "rollovers", "progress_not_updated", "conformance_missing", "conformance_waived",
                             "gate_reruns", "refine_rounds", "effort_escalations", "undersized",
-                            "sizer_fallbacks", "full_suite_runs", "route_upgrades", "compactions", "usage_holds"})
+                            "sizer_fallbacks", "full_suite_runs", "route_upgrades", "compactions", "usage_holds",
+                            "parked_units", "park_resume_rework"})
 DOUBT_FIELDS = (("doubt_blocking", "first_blocking"), ("doubt_rounds", "rounds"), ("doubt_noise", "noise"),
                 ("doubt_misread", "misread"), ("doubt_open", "open"), ("doubt_actionable", "actionable"))
 RECONCILE = "reconcile"  # `phase_rejected.kind` of a round the runner opens on a doubt review's findings
 USAGE_HOLD = "usage limit"  # `run_held.reason` of a run waiting for its plan's usage limit to reset
+TASK_PREFIX = re.compile(r"^(.*?/task-\d+)(?:/|$)")  # a plan task's key: `<phase>/<step>/task-<n>`
 RUNNER = "runner"  # `phase_rejected.by` for what the runner settles itself; a person's name is never this
 
 
@@ -134,6 +144,33 @@ def parse_target(text: str) -> tuple[str, str | None] | None:
 
 def _phase_of(key: object) -> str | None:
     return str(key).split("/", 1)[0] if key else None
+
+
+def _park_signals(events: list[dict]) -> dict[str, int]:
+    """`parked_units`: the `step_parked` events that are a new park (a re-emitted one carries `demoted`).
+    `park_resume_rework`: the parked units (a plan task, else the parked key itself) that, after their first park, had
+    a `unit_unparked` that was a conflict or a `step_retry` on a key at or under theirs, once each. Only a retry
+    someone asked for counts: the runner emits `step_retry` itself for a re-review round, with `by` the runner's."""
+    parked = 0
+    units: set[str] = set()
+    redone: set[str] = set()
+
+    def unit_of(key: str) -> str:
+        match = TASK_PREFIX.match(key)
+        return match.group(1) if match else key
+
+    for ev in events:
+        etype, key = ev.get("type"), str(ev.get("key") or "")
+        if etype == "step_parked" and key:
+            if not ev.get("demoted"):
+                parked += 1
+            units.add(unit_of(key))
+        elif etype == "unit_unparked" and ev.get("conflict") is True:
+            if (unit := unit_of(key)) in units:
+                redone.add(unit)
+        elif etype == "step_retry" and ev.get("by") and ev["by"] != RUNNER:
+            redone.update(unit for unit in units if key == unit or key.startswith(f"{unit}/"))
+    return {"parked_units": parked, "park_resume_rework": len(redone)}
 
 
 def _first_pass(events: list[dict]) -> dict[str, float]:
@@ -384,6 +421,7 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
         out["full_suite_runs"] = _full_suite_runs(events, full_suite)
     out.update(_gate_cache_hit_rate(events))
     out.update(_cost_signals(metrics))
+    out.update(_park_signals(events))
     return out
 
 

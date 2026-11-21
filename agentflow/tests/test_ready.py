@@ -275,6 +275,20 @@ def test_archiving_a_spec_only_run_leaves_its_module_not_started(pipe):
     assert "demo" not in feature_runs(pipe.cfg, pipe.root)
 
 
+def test_archiving_a_run_deletes_its_shelf_refs_only(pipe):
+    from conftest import run_git
+
+    run = stopped_after_define(pipe)
+    shelf = "refs/agentflow/shelf"
+    mine = [f"{shelf}/{run.id}/build.build.task-1", f"{shelf}/{run.id}/build.build.task-2"]
+    other = f"{shelf}/{run.id}-later/build.build.task-1"  # another run whose id starts with this one's
+    for ref in [*mine, other]:
+        run_git(pipe.root, "update-ref", ref, "HEAD")
+    archive(run, by="me")
+    left = run_git(pipe.root, "for-each-ref", "--format=%(refname)", shelf).split()
+    assert left == [other]  # kept for recovery until its own run is archived
+
+
 def test_a_run_still_going_cannot_be_archived(pipe):
     run = begin(pipe)
     go(pipe, run)

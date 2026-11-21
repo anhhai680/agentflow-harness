@@ -6,6 +6,8 @@
 
 const INBOX_ARM_MS = 4000;  // an Approve click (or an `a`) arms the card this long; a second one in that time sends. inboxKey checks the same 4000.
 const INBOX_KINDS = [["approval", "Approvals"], ["question", "Questions"], ["stop", "Stops"]];
+const INBOX_ARM_ALL = "approve-all";  // the armed key of a group header's "Approve all N"
+const INBOX_ARM_CONSTRAINT = "constraint\0";  // the armed key of a card's "Approve the constraint" is this plus the item key
 const INBOX_NONE = "No longer waiting on you";
 const INBOX_SEVERITIES = ["critical", "high", "medium", "low", "unrated"];
 
@@ -15,6 +17,16 @@ const inboxItemKey = (item) => item.run_id + "\0" + item.key;
 
 // What a decision's target is: the phase for a phase approval, else the item's key.
 const inboxTarget = (item) => (item.kind === "phase_approval" ? item.phase : item.key);
+
+// The approvals one press may send: the approval-group items with an approve action that takes no note. A stop, a parked
+// item and an approval that needs a note (a repeated block) are each decided on their own card.
+function batchApprovals(items) {
+  return (items || []).filter((i) => i.group === "approval" && (i.actions || []).includes("approve") && i.approve_note !== "required" && !i.goneText);
+}
+
+// The batch approvals among `items` that were already there when "Approve all" armed (`keys`): one that arrived since was
+// never seen, so it is decided on its own card.
+const armedApprovals = (items, keys) => batchApprovals(items).filter((i) => keys.has(inboxItemKey(i)));
 
 // Each question starts on the option the agent recommended ("" when it recommended none).
 function answerDefaults(questions) {
@@ -40,6 +52,12 @@ function approvePayload(item, form) {
     if (viewed.length) body.viewed = viewed;
   }
   return { ok: true, body: body };
+}
+
+// `approvePayload`'s body, with `constraint: true`: the person lifts the constraint gate that failed on this stop.
+function constraintPayload(item, form) {
+  const got = approvePayload(item, form);
+  return got.ok ? { ok: true, body: Object.assign({}, got.body, { constraint: true }) } : got;
 }
 
 // `form` is `{[qid]: {choice, other}}`. A written answer beats the chosen option; a question with neither is left out.
@@ -155,6 +173,7 @@ function inboxDraft(item) {
 
 let inboxArmTimer = null;
 let inboxSeq = 0;
+let inboxArmedAll = new Set();  // the item keys "Approve all" showed when it armed: the confirming press sends only those
 
 function redrawInbox() { if (ui.inbox.view) renderInbox(ui.inbox.view); }
 
@@ -190,13 +209,15 @@ const inboxForgets = (action) => action !== "answer";
 // Run a decision's action once at a time. A success forgets the draft (see inboxForgets); the refresh that follows drops the card.
 async function inboxSend(item, action, body) {
   const key = inboxItemKey(item);
-  if (ui.inbox.busy.has(key)) return;
+  if (ui.inbox.busy.has(key)) return false;
   ui.inbox.busy.add(key);
   try {
-    if (await act(item.run_id, action, body)) {
+    const ok = await act(item.run_id, action, body);
+    if (ok) {
       if (inboxForgets(action)) ui.inbox.drafts.delete(key);
       else ui.inbox.sent.add(key);  // when the answered item leaves the view its card goes with it: this page decided it
     }
+    return ok;
   } finally {
     ui.inbox.busy.delete(key);
     redrawInbox();
@@ -219,6 +240,34 @@ function approveItem(item) {
     const again = approvePayload(item, { note: inboxDraft(item).note });  // the note may have changed after arming
     if (again.ok) inboxSend(item, "approve", again.body);
     else inboxRefuse(item, again.error);
+  });
+}
+
+// "Approve the constraint": the Approve click's arm-then-send, under its own armed key, with the constraint flag.
+function approveConstraintItem(item) {
+  const draft = inboxDraft(item);
+  const got = constraintPayload(item, { note: draft.note });
+  if (!got.ok) { disarmInbox(); inboxRefuse(item, got.error); return; }
+  draft.error = "";
+  armOrSend(INBOX_ARM_CONSTRAINT + inboxItemKey(item), () => {
+    const again = constraintPayload(item, { note: inboxDraft(item).note });
+    if (again.ok) inboxSend(item, "approve", again.body);
+    else inboxRefuse(item, again.error);
+  });
+}
+
+// "Approve all N" in the approvals header: the first press arms it over the approvals shown then, the second sends one
+// approve per item of those still waiting, one after the other, and stops at the first that fails (the toast says why).
+function approveAllItems() {
+  const items = () => (ui.inbox.view ? ui.inbox.view.items : []);
+  if (ui.inbox.armed !== INBOX_ARM_ALL) inboxArmedAll = new Set(batchApprovals(items()).map(inboxItemKey));
+  const keys = inboxArmedAll;
+  armOrSend(INBOX_ARM_ALL, async () => {
+    for (const item of armedApprovals(items(), keys)) {
+      const got = approvePayload(item, { note: "" });
+      if (!got.ok) { inboxRefuse(item, got.error); continue; }
+      if (!(await inboxSend(item, "approve", got.body))) break;
+    }
   });
 }
 
@@ -353,6 +402,7 @@ function inboxCard(item) {
   const actions = item.actions || [];
   const questions = item.questions || [];
   const armed = !gone && ui.inbox.armed === key;
+  const armedConstraint = !gone && ui.inbox.armed === INBOX_ARM_CONSTRAINT + key;
   const blast = item.blast_radius;
   const blocks = blast && (blast.blocks || []).length ? inboxPlural(blast.blocks.length, "task", "tasks") : "";
   const head = el("div", { class: "i-head" },
@@ -382,12 +432,17 @@ function inboxCard(item) {
     const label = armed ? "Confirm approve" : item.kind === "phase_approval" ? "Approve" : "Approve and resume";
     buttons.push(el("button", { type: "button", class: "primary", text: label, "data-field": "approve", onclick: () => approveItem(item) }));
   }
+  if (actions.includes("approve_constraint")) {
+    buttons.push(el("button", { type: "button", text: armedConstraint ? "Confirm approve the constraint" : "Approve the constraint", "data-field": "approve-constraint",
+      onclick: () => approveConstraintItem(item) }));
+  }
   if (actions.includes("answer")) buttons.push(el("button", { type: "button", class: "primary", text: "Answer", "data-field": "answer", onclick: () => answerItem(item) }));
   if (actions.includes("reject")) buttons.push(el("button", { type: "button", text: "Request changes…", "data-field": "reject-toggle", "aria-pressed": draft.reject.open ? "true" : "false",
     onclick: () => toggleReject(item) }));
   buttons.push(el("button", { type: "button", text: "Open run", onclick: () => goRun(item.run_id, "overview", "decision") }));
-  return card(armed ? " armed" : "", head, body, forms, draft.error ? el("div", { class: "gate-bad", role: "alert", text: draft.error }) : null,
+  return card(armed || armedConstraint ? " armed" : "", head, body, forms, draft.error ? el("div", { class: "gate-bad", role: "alert", text: draft.error }) : null,
     armed ? el("div", { class: "i-armed", role: "status", text: "Press a again to approve" }) : null,
+    armedConstraint ? el("div", { class: "i-armed", role: "status", text: "Press again to lift the constraint: the runner commits it with your name in the trailer." }) : null,
     el("div", { class: "moves" }, buttons));
 }
 
@@ -412,17 +467,29 @@ function inboxShown(view) {
   return { groups: groups, flat: groups.flatMap((g) => g.items) };
 }
 
+// The approvals group's heading, with "Approve all N" when two or more approvals can go at once.
+function inboxGroupHead(d) {
+  const button = d.batch >= 2
+    ? el("button", { type: "button", text: d.armed ? "Confirm approve all " + d.batch : "Approve all " + d.batch, "data-field": "approve-all", onclick: approveAllItems })
+    : null;
+  return el("h2", { class: "lane" }, d.label, button ? " " : null, button);
+}
+
 // The items of the view as patchChildren entries: a heading and the cards of each group, then the Watch group.
 function inboxEntries(view, shown) {
   const entries = [];
   for (const group of shown.groups) {
-    entries.push(entry("group:" + ui.inbox.group + ":" + group.key, group.label, (label) => el("h2", { class: "lane", text: label })));
+    const approvals = ui.inbox.group === "kind" && group.key === "approval";
+    const armedAll = approvals && ui.inbox.armed === INBOX_ARM_ALL;
+    // armed, the count is what the confirming press sends: the approvals shown when it armed
+    const batch = !approvals ? 0 : armedAll ? armedApprovals(group.items, inboxArmedAll).length : batchApprovals(group.items).length;
+    entries.push(entry("group:" + ui.inbox.group + ":" + group.key, { label: group.label, batch: batch, armed: batch > 0 && armedAll }, inboxGroupHead));
     for (const item of group.items) {
       const key = inboxItemKey(item);
       const draft = inboxDraft(item);
       // What the card shows but the item does not hold: typed text is not here, a patch rebuilds with it from the draft.
       const card = Object.assign({}, item, { age_s: Math.floor((item.age_s || 0) / 60) * 60 });  // the card reads minutes: it is rebuilt once a minute, not on every refresh
-      entries.push(entry("item:" + key, { item: card, armed: ui.inbox.armed === key, error: draft.error, rejecting: draft.reject.open }, (d) => inboxCard(d.item)));
+      entries.push(entry("item:" + key, { item: card, armed: ui.inbox.armed === key, armedConstraint: ui.inbox.armed === INBOX_ARM_CONSTRAINT + key, error: draft.error, rejecting: draft.reject.open }, (d) => inboxCard(d.item)));
     }
   }
   if (!shown.flat.length) entries.push(entry("empty", "empty", () => el("p", { class: "muted", text: "Nothing is waiting on you." })));
@@ -519,13 +586,20 @@ function focusInboxCard(key) {
   markInboxFocus();
 }
 
+// Whether what is armed still stands: its item is still in the Inbox, or (approve all) at least two approvals still go together.
+function inboxArmLive(armed, live, view) {
+  if (armed === INBOX_ARM_ALL) return ui.inbox.group === "kind" && armedApprovals(view.items, inboxArmedAll).length >= 2;
+  if (armed.startsWith(INBOX_ARM_CONSTRAINT)) return live.has(armed.slice(INBOX_ARM_CONSTRAINT.length));
+  return live.has(armed);
+}
+
 function renderInbox(view) {
   const prev = ui.inbox.view;
   ui.inbox.view = view;
   setInboxBadge(view.items.length);
   const live = inboxKeepGone(view, prev);
-  if (ui.inbox.armed !== null && !live.has(ui.inbox.armed)) ui.inbox.armed = null;
   const shown = inboxShown(view);
+  if (ui.inbox.armed !== null && !inboxArmLive(ui.inbox.armed, live, view)) ui.inbox.armed = null;
   ui.inbox.order = shown.flat;
   inboxSettleFocus(shown.flat);
   setInboxGroupButtons();

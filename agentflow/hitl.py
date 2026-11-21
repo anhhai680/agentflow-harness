@@ -22,8 +22,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from . import pack, safeio
 from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RECONCILE_CHANGED, RETRO_PIPELINE, Config
 from .events import nfc, parse_iso
+from .park import radius_line
 from .state import TERMINAL, Run, list_runs
 
 RESULT_STATUSES = ("done", "blocked", "needs_human", "effort_change", "unchanged")
@@ -53,6 +55,30 @@ CLEARED_BY_APPROVE = ("checkpoint", "max_rounds", RECONCILE_CHANGED)
 # A retro run walks no phase and is never resumed (`pipeline.advance` refuses it), so a stop of one has one way out.
 RETRO_WAY_OUT = "cancel it and run `agentflow retro` again"
 CAP_STOPS = ("turn_cap", "budget_cap")  # a session that hit its turn or spend cap (`lanes.CAP_KINDS`)
+# The stops a plan task may park (`hitl.park_kinds`). `budget_exceeded` and `environment` are the run's own, not a
+# task's, so they are never parked: they end or pause the whole run.
+PARKABLE = ("needs_human", "blocked", "blocked_repeat", "gate_failed", "fix_attempts_exhausted", "review_unresolved",
+            "guard_violation", "step_timeout", "turn_cap", "budget_cap")
+# A stop on one of a plan task's own steps. A resolver's stop (`.../implement/resolve-1`) has a longer key.
+TASK_STOP = re.compile(r"/task-\d+/(implement|review|commit)$")
+
+
+def park_kinds(cfg: Config) -> tuple[str, ...]:
+    """The stop kinds a task may park: `hitl.park_kinds`, or every `PARKABLE` one when unset. Only `PARKABLE` kinds
+    count, and a value that is not a list (which `validate` refuses) parks nothing."""
+    kinds = cfg.hitl.get("park_kinds")
+    if kinds is None:
+        return PARKABLE
+    if not isinstance(kinds, (list, tuple)):
+        return ()
+    return tuple(kind for kind in kinds if kind in PARKABLE)
+
+
+def parks_first(cfg: Config, kind: str, key: str) -> bool:
+    """Whether a stop is parked as it is raised: the setting is on (a bare `true`), the kind is one a task may
+    park, and the key is a plan task's own step."""
+    return (cfg.hitl.get("park_independent") is True and kind in park_kinds(cfg)
+            and TASK_STOP.search(key) is not None)
 
 
 class ResultError(Exception):
@@ -352,9 +378,56 @@ def notify(cfg: Config, title: str, message: str, run: Run | None = None) -> Non
             _log_failure(run, str(entry.get("type")), str(exc) or type(exc).__name__)
 
 
+DIGEST_TITLE = "agentflow"
+DIGEST_FILE = "notify_digest.txt"  # in the state dir: the digest line last sent
+DIGEST_MAX_BYTES = 1024
+PROGRESSING = ("running", "refining")  # a run no one waits on and that is neither done, paused nor ready
+
+
+def digest_text(repo: Path) -> str:
+    """The one machine-wide line of `hitl.digest`: the items that need a person, and the runs going on.
+    An item "holds a run" when it is a run's wait; a parked item needs a person but holds nothing, and its run still
+    counts as progressing."""
+    runs = list_runs(repo)
+    items = inbox_items(repo, runs)
+    holding = sum(1 for item in items if item["kind"] != "parked")
+    going = sum(1 for run in runs if run.state["status"] in PROGRESSING)
+    count = len(items)
+    need = "Nothing needs you" if not count else f"{count} item{'s' if count != 1 else ''} need{'' if count != 1 else 's'} you"
+    held = f" ({holding} hold{'s' if holding == 1 else ''} a run)" if holding else ""
+    return f"{need}{held}; {going} run{'' if going == 1 else 's'} progressing"
+
+
+def _digest_unchanged(path: Path, text: str) -> bool:
+    try:
+        last = safeio.read_bytes(path, DIGEST_MAX_BYTES)
+    except (OSError, ValueError):
+        return False  # it can't be read: send the digest
+    return last is not None and last.decode("utf-8", "replace") == text
+
+
 def notify_run(cfg: Config, run: Run, message: str) -> None:
-    """`notify` with the run's configured title."""
-    notify(cfg, _title_for(cfg, run), message, run=run)
+    """`notify` with the run's configured title. With `hitl.digest` on it sends `digest_text` instead of `message`,
+    and only when that differs from the line last sent (kept in the state dir): a note that changes no count is
+    never sent. A digest that cannot be built (another run's state unreadable, say) is logged as `notify_failed` and
+    `message` is sent instead: telling a person never raises."""
+    if cfg.hitl.get("digest") is not True:
+        notify(cfg, _title_for(cfg, run), message, run=run)
+        return
+    try:
+        text = digest_text(run.repo)
+        path = pack.state_dir(run.repo) / DIGEST_FILE
+    except Exception as exc:  # it reads every run of the repository: any failure falls back to `message`
+        _log_failure(run, "digest", f"could not build the digest: {exc}")
+        notify(cfg, _title_for(cfg, run), message, run=run)
+        return
+    if _digest_unchanged(path, text):
+        return
+    notify(cfg, DIGEST_TITLE, text, run=run)
+    try:
+        safeio.write_text(path, text)
+    except (OSError, ValueError) as exc:
+        _log_failure(run, "digest", f"could not keep the digest sent: {exc}")
 
 
 def _title_for(cfg: Config, run: Run) -> str:
@@ -374,20 +447,22 @@ def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questio
                extra: str = "", notify: bool | None = None) -> Path:
     """Stop the run for a human: write the inbox file, record `hitl_raised`, notify. Returns the inbox path.
 
-    `notify`: None is the usual rule (quiet while the runner settles the stop itself: it tells a human if it cannot);
-    True always tells a human, False never does (a stop a human was already told of)."""
+    `notify`: None is the usual rule (quiet while the runner settles the stop itself, or while a plan task's stop may
+    still park: the runner tells a human if it cannot settle or park it); True always tells a human, False never does
+    (a stop a human was already told of)."""
     questions = list(questions)
     counted = {"times": _times_back(run, key)} if kind == "blocked_repeat" else {}
     how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).",
            _how_to_go_on(run, kind, key, bool(questions), cfg, **counted)]
     path = run.inbox_path(key)
     render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
-    run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
-             questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:], **counted)
     if notify is None:
         from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
 
-        notify = not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions])
+        notify = not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions]) and not parks_first(cfg, kind, key)
+    run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
+             questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:],
+             notified=bool(notify), **counted)
     if notify:
         notify_run(cfg, run, notice_text({"key": key, "summary": summary, **counted}) or f"{key} needs a decision")
     return path
@@ -423,27 +498,73 @@ def notice_text(wait: dict) -> str:
     return summary
 
 
-def park_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questions: list[Question],
-              paths: list[str] | tuple = ()) -> Path:
-    """Ask a human without stopping: write the inbox file, record `step_parked`, notify.
-
-    The run goes on with tasks that do not depend on this one; it stops for this question only when no
-    runnable task remains. `paths` are the files the parked step changed so far: other tasks' commits
-    leave them out. Returns the inbox path.
-    """
-    how = [f"Run `{run.id}` parked `{key}` ({kind}) and goes on with the tasks that do not depend on it.",
-           f"Fill in the `Answer:` lines below, or run `agentflow answer {run.id} --key {key}`."]
+def park_wait(cfg: Config, run: Run, wait: dict, *, blast_radius: dict, shelf: str | None, shelved: list[str],
+              stop_class: str | None, extra: str = "") -> Path:
+    """Park a task stop's wait away so the run goes on with the tasks that do not wait on it: rewrite its inbox file
+    with the ways out and the blast radius, record `step_parked` (which clears the wait on the same key), and tell a
+    person `parked <key>: <blast radius>`. `shelf` and `shelved` are the ref and the paths the task's unfinished
+    work was put aside in; `extra` is the stop's report. Returns the inbox path."""
+    key, kind = str(wait["key"]), str(wait["kind"])
+    questions = _questions_from_state(wait.get("questions") or [])
+    radius = {"blocks": list(blast_radius.get("blocks") or []), "continue": list(blast_radius.get("continue") or [])}
+    line = radius_line(radius)
+    how = [f"Run `{run.id}` parked `{key}` ({kind}) and goes on with the tasks that do not wait on it.",
+           _parked_ways_out(run, kind, key, bool(questions)),
+           *filter(None, [constraint_line(cfg, run, key, bool(questions), kind)]),
+           f"Blast radius: {line}"]
     path = run.inbox_path(key)
-    render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n".join(how))
-    run.emit("step_parked", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
-             questions=[asdict(q) for q in questions], inbox=str(path), paths=list(paths))
-    notify(cfg, _title_for(cfg, run), f"parked: {summary or key}", run=run)
+    summary = str(wait.get("summary") or "")
+    render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
+    run.emit("step_parked", kind=kind, key=key, phase=wait.get("phase") or key.split("/")[0], summary=summary,
+             questions=[asdict(q) for q in questions], inbox=str(path), paths=[], stop_class=stop_class,
+             blast_radius=radius, shelf=shelf, shelved=list(shelved))
+    notify_run(cfg, run, f"parked {key}: {line}")
     return path
 
 
+def _parked_ways_out(run: Run, kind: str, key: str, has_questions: bool) -> str:
+    """The inbox line for a parked stop: answer it by its key, or approve it, or retry it once no runner is live."""
+    if has_questions:
+        return f"Fill in the `Answer:` lines below, or run `agentflow answer {run.id} --key {key}`."
+    note = ' --note "..."' if kind == "blocked_repeat" else ' [--note "..."]'
+    return (f"`agentflow approve {run.id} {key}{note}` settles it, and the run takes the task up again; or "
+            f"`agentflow pause {run.id}`, then `agentflow retry {run.id} {key}` starts the step in a fresh session.")
+
+
 def _how_to_go_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config, times: int = 1) -> str:
-    """The inbox line that says what each way out of this stop does. `times` above 1 is a `blocked_repeat` stop that
-    came back after a human's approval."""
+    """The inbox line that says what each way out of this stop does, and the constraint line (`constraint_line`) when
+    a constraint gate failed on `key`. `times` above 1 is a `blocked_repeat` stop that came back after a human's
+    approval."""
+    way = _way_on(run, kind, key, has_questions, cfg, times)
+    lifted = constraint_line(cfg, run, key, has_questions, kind)
+    return f"{way}\n\n{lifted}" if lifted else way
+
+
+def constraint_line(cfg: Config, run: Run, key: str, has_questions: bool = False, kind: str = "") -> str:
+    """The inbox line for a stop a constraint gate failed on (`constraint_gates_failed`), else "": only a person lifts
+    it, with one approval (with a note for a `blocked_repeat`, which `approve` refuses without one)."""
+    if has_questions or run.state.get("pipeline") == RETRO_PIPELINE or not constraint_gates_failed(cfg, run, key):
+        return ""
+    note = ' --note "..."' if kind == "blocked_repeat" else ""
+    return f"Only a person can lift this constraint: `agentflow approve {run.id} {key} --constraint{note}`."
+
+
+def constraint_gates_failed(cfg: Config, run: Run, key: str) -> list[str]:
+    """The gates of `guardrails.constraint_override.gates` whose last `gate_result` at `key`, or under `key/`, did not
+    pass (a skipped result is no failure), in the config's order."""
+    gates = cfg.guardrails.constraint_gates
+    if not gates or not cfg.guardrails.constraint_trailer:
+        return []
+    last: dict[str, dict] = {}
+    for event in run.events.read():
+        where = str(event.get("key") or "")
+        if event["type"] == "gate_result" and event.get("gate") in gates and (where == key or where.startswith(key + "/")):
+            last[str(event["gate"])] = event
+    return [g for g in gates if g in last and last[g].get("passed") is False and not last[g].get("skipped")]
+
+
+def _way_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config, times: int = 1) -> str:
+    """What each way out of a stop of this `kind` does (`_how_to_go_on`)."""
     if run.state.get("pipeline") == RETRO_PIPELINE:
         return (f"A retro run cannot be resumed, approved or answered: `agentflow cancel {run.id}`, then run "
                 "`agentflow retro` again (it reads the same runs, since this retro did not finish).")
@@ -549,9 +670,12 @@ def refuse_retro(run: Run) -> None:
 
 
 def _resolve(run: Run, target: str) -> tuple[str, str]:
-    """`("phase", name)` or `("checkpoint", key)` for what the run is waiting on, else `NotWaiting`."""
+    """`("phase", name)` or `("checkpoint", key)` for what the run is waiting on, `("parked", key)` for a parked
+    stop that is not the run's wait, else `NotWaiting`."""
     _refuse_ended(run)
     waiting = run.state["waiting"]
+    if target in (run.state.get("parked") or {}) and (waiting is None or waiting.get("key") != target):
+        return "parked", target
     if waiting is None:
         raise _not_waiting(run, target)
     if waiting["kind"] == "phase_approval":
@@ -602,12 +726,14 @@ def answer(run: Run, key: str, answers: dict[str, str], by: str, record: bool = 
             return False
         extra = {"record": True} if record else {}
         run.emit("hitl_answered", by=by, key=key, answers=final, **extra)
+        demote_promoted(run, key)
         return True
 
 
 def approve(run: Run, target: str, by: str, budget: float | None = None, hold: bool = False,
             note: str | None = None, budget_step: float | None = None,
-            viewed: list[dict] | None = None, produced: list[dict] | None = None) -> bool:
+            viewed: list[dict] | None = None, produced: list[dict] | None = None,
+            constraint: bool = False, cfg: Config | None = None) -> bool:
     """Approve a phase (`plan` or `plan_approved`), clear an inner checkpoint, or resume a runner stop.
 
     `hold` rests an approved phase as ready (`phase_ready`) instead of leaving the run to go on, and True is
@@ -624,17 +750,30 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
     `note` goes to the agent that the approval resumes. A `blocked_repeat` stop needs one: the session already
     blocked again with nothing changed, so a plain approval would only repeat that.
 
+    A parked stop (`state["parked"]`) is approved by its key the same way, by the rules of its own kind; a promoted
+    wait is then parked again (`demote_promoted`), so the run goes on with the approved stop's task.
+
     `viewed` (`[{path, sha}]`, the artifact revisions the dashboard page showed) is informational: a phase approval
     records it on `phase_approved` when it is not empty, and any other approval ignores it.
     `produced` (`[{path, sha}]`, the newest revision of each artifact the phase produced) is recorded the same way
     when it is not None, an empty list included: that says the phase produced nothing. `signals` reads both back.
+
+    `constraint` lifts a constraint gate (`guardrails.constraint_override`) as a person: `hitl_approved` carries
+    `constraint: True`, and the runner then writes the override commit with the person's name in the pack's human-only
+    trailer (`constraint.write`). Only a person does this, so it is refused, before any event is written, for the
+    runner's own `by` (`AUTO_BY`), inside an agent session (`AGENTFLOW_STEP` or `AGENTFLOW_RUN` set), for a name that
+    cleans to nothing, for a phase or a checkpoint, for an item with questions, and when no constraint gate failed on
+    the key (`constraint_gates_failed`, read with `cfg`, else the config the run continues with).
     """
+    if constraint:
+        _refuse_constraint_by(by)
     note = nfc(note).strip() if note else None
     if budget is not None and not math.isfinite(budget):
         raise ValueError(f"a budget must be a finite number of USD, not {budget!r}")
     with run.locked():
         kind, name = _resolve(run, target)
-        waiting_kind = (run.state["waiting"] or {}).get("kind")
+        item = run.state["parked"][name] if kind == "parked" else run.state["waiting"]  # every rule reads its kind
+        waiting_kind = (item or {}).get("kind")
         if note and (kind == "phase" or waiting_kind in CLEARED_BY_APPROVE):
             raise ValueError(f"no agent resumes from {name!r}, so nothing would read the note; use `agentflow reject`")
         if note and waiting_kind == "preflight_failed":
@@ -648,6 +787,8 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
             spend = float(run.state["spend_usd"] or 0.0)
             if budget <= spend:
                 raise ValueError(f"a budget of ${budget:.2f} is not above the ${spend:.2f} {run.id} has spent")
+        if constraint:
+            _refuse_constraint_item(run, kind, name, item, cfg)
         if kind == "phase":
             if budget is not None:
                 run.emit("run_updated", by=by, budget_usd=budget)
@@ -656,9 +797,10 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
             if hold:
                 run.emit("phase_ready", by=by, phase=name)
             return run.state["status"] == "ready"
-        waiting = run.state["waiting"]
+        waiting = item
         if waiting["questions"]:
-            raise NotWaiting(f"{name!r} is waiting for answers, not an approval; use `agentflow answer {run.id}`")
+            how = f"agentflow answer {run.id}" + (f" --key {name}" if kind == "parked" else "")
+            raise NotWaiting(f"{name!r} is waiting for answers, not an approval; use `{how}`")
         if waiting["kind"] == "budget_exceeded" and budget is None:
             spend = float(run.state["spend_usd"] or 0.0)
             soft = run.state.get("soft_budget_usd")
@@ -670,12 +812,64 @@ def approve(run: Run, target: str, by: str, budget: float | None = None, hold: b
                 budget = spend + float(step)
         if budget is not None:
             run.emit("run_updated", by=by, budget_usd=budget)
-        if waiting["kind"] in CLEARED_BY_APPROVE:
+        if waiting["kind"] in CLEARED_BY_APPROVE and kind != "parked":
             run.emit("checkpoint_cleared", by=by, key=name)
         else:
             extra = {"note": note} if note else {}
+            if constraint:
+                extra["constraint"] = True
             run.emit("hitl_approved", by=by, key=name, kind=waiting["kind"], summary=waiting["summary"], **extra)
+        demote_promoted(run, name)
         return False
+
+
+def _refuse_constraint_by(by: str) -> None:
+    """`NotWaiting` unless a person, outside any agent session, approves a constraint: the name the trailer would carry
+    (`clean_fact(by)[:100]`) is not empty and not the runner's, and no agent session's variables are set."""
+    from agentflow.autonomy import AUTO_BY  # autonomy imports this module
+
+    name = clean_fact(str(by or ""))[:100]
+    if name.casefold() == AUTO_BY:
+        raise NotWaiting("the runner cannot approve a constraint: only a person lifts it")
+    if "AGENTFLOW_STEP" in os.environ or "AGENTFLOW_RUN" in os.environ:  # set for every agent session, even empty
+        raise NotWaiting("a constraint cannot be approved from inside an agent session: only a person lifts it, "
+                         "from their own terminal or the dashboard")
+    if not name:
+        raise NotWaiting("a constraint approval needs the name of the person who gives it (--by)")
+
+
+def _refuse_constraint_item(run: Run, kind: str, name: str, item: dict | None, cfg: Config | None) -> None:
+    """`NotWaiting` unless `name` is a stop with no questions that a constraint gate failed on."""
+    if kind == "phase" or item is None:
+        raise NotWaiting(f"{name!r} is a phase approval; a constraint is lifted on the stop its gate failed on")
+    if item.get("questions"):
+        raise NotWaiting(f"{name!r} is waiting for answers, not a constraint approval")
+    if item.get("kind") in CLEARED_BY_APPROVE and kind != "parked":
+        raise NotWaiting(f"{name!r} is a checkpoint, which no constraint gate stops")
+    if cfg is None:
+        from agentflow.config import load_config  # only a constraint approval made with no config loads one
+        from agentflow.config_trust import run_config_path
+
+        cfg = load_config(run_config_path(run))
+    if not constraint_gates_failed(cfg, run, name):
+        gates = ", ".join(cfg.guardrails.constraint_gates) or "none: the pack sets no guardrails.constraint_override"
+        raise NotWaiting(f"no constraint gate failed on {name!r} (the constraint gates are {gates}); approve it "
+                         "without --constraint")
+
+
+def demote_promoted(run: Run, settled: str) -> None:
+    """Put the run's promoted wait back among the parked stops once a person settled another one (`settled`), so the
+    run goes on with that one's task: the last `step_parked` of the wait's key is recorded again with `demoted`.
+    Nothing happens when the wait is not promoted or is `settled` itself."""
+    with run.locked():
+        waiting = run.state["waiting"]
+        if waiting is None or not waiting.get("promoted") or waiting.get("key") == settled:
+            return
+        parks = [e for e in run.events.read() if e["type"] == "step_parked" and e.get("key") == waiting["key"]]
+        if not parks:
+            return
+        again = {k: v for k, v in parks[-1].items() if k not in ("seq", "ts", "type", "by", "demoted")}
+        run.emit("step_parked", **again, demoted=True)
 
 
 def task_scope(phase: str, key: str) -> tuple[str, int] | None:
@@ -685,16 +879,18 @@ def task_scope(phase: str, key: str) -> tuple[str, int] | None:
 
 
 def rejected_scope(run: Run, phase: str, key: str) -> tuple[str, int] | None:
-    """`task_scope`, unless the task was one of a batch of several (`plan_batched`): the batch's members before
-    its last were committed without a review of their own, so a stop in the batch sends the whole phase back."""
+    """`task_scope`, unless the task was ever one of a batch of several (any `plan_batched`, also one recorded before
+    a split took it out): the batch's members before its last were committed without a review of their own, so a
+    stop in the batch sends the whole phase back."""
     scoped = task_scope(phase, key)
     if scoped is None:
         return None
     prefix = scoped[0].rsplit("/", 1)[0]
-    batched = [e for e in run.events.read() if e["type"] == "plan_batched" and e.get("key") == prefix]
-    batches = (batched[-1].get("batches") or []) if batched else []
-    if any(isinstance(b, list) and len(b) > 1 and scoped[1] in b for b in batches):
-        return None
+    for event in run.events.read():
+        if event["type"] != "plan_batched" or event.get("key") != prefix:
+            continue
+        if any(isinstance(b, list) and len(b) > 1 and scoped[1] in b for b in event.get("batches") or []):
+            return None
     return scoped
 
 
@@ -707,6 +903,8 @@ def reject(run: Run, target: str, by: str, note: str) -> None:
         raise ValueError("a rejection needs a note")
     with run.locked():
         kind, name = _resolve(run, target)
+        if kind == "parked":
+            raise NotWaiting(f"{name} is parked: approve, answer or retry it; reject it once it is the run's wait")
         if (run.state["waiting"] or {}).get("kind") == "preflight_failed":
             raise NotWaiting("preflight has nothing to refine: approve it once the machine is fixed, or cancel the run")
         if (run.state["waiting"] or {}).get("kind") == ENVIRONMENT:
@@ -774,7 +972,8 @@ def remind_due(cfg: Config, repo: Path, now: datetime | None = None) -> list[str
 
 
 def inbox_items(repo: Path, runs: list[Run] | None = None) -> list[dict]:
-    """One dict per thing a human can act on: each run's wait, then its parked questions (kind `parked`).
+    """One dict per thing a human can act on: each run's wait, then its parked stops (kind `parked`, with the park's
+    own kind as `stop_kind` and its `blast_radius`).
     `runs` are the runs to read when the caller has loaded them already; else every run of `repo`."""
     items = []
     for run in list_runs(repo) if runs is None else runs:
@@ -802,5 +1001,6 @@ def inbox_items(repo: Path, runs: list[Run] | None = None) -> list[dict]:
                 "key": item["key"], "phase": item["phase"], "summary": item["summary"],
                 "questions": item["questions"], "since": item["since"],
                 "inbox_path": str(path) if path.exists() else None,
+                "stop_kind": item["kind"], "blast_radius": item.get("blast_radius"),
             })
     return items

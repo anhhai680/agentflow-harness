@@ -1,8 +1,8 @@
 """A run's plan tasks joined with the run's state, for the dashboard's Plan tab (read-only).
 
 - `run_plan(run, repo, cfg)`: the plan's tasks, each with its status, stop, review, cost, sessions, gates, wave and
-  blast radius. The plan is read from git (`artifacts.read_blob`), never from a worktree.
-- `waves(tasks)` and `dependents(tasks, n)`: the dependency graph's longest-path layers and a task's blast radius.
+  blast radius (`park.blocks`: dependents and tasks that share a file). The plan is read from git (`artifacts.read_blob`), never from a worktree.
+- `waves(tasks)` and `dependents(tasks, n)`: the dependency graph's longest-path layers and a task's dependents.
   Both ignore a dependency the plan does not have and always terminate on a cycle.
 
 A task's step keys are `<prefix>/task-<n>` followed by `/` or the end of the key (`_under`), never a bare prefix, so
@@ -15,6 +15,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
+from agentflow import park
 from agentflow.artifacts import NotFound, _git, normal_finding, read_blob, run_artifacts
 from agentflow.config import Config
 from agentflow.sources import PlanTask, is_plan_name, parse_plan_text, task_files
@@ -88,18 +89,6 @@ def dependents(tasks: list[PlanTask], n: int) -> list[int]:
                 todo.append(nxt)
     seen.discard(n)
     return sorted(seen)
-
-
-def _ancestors(by: dict[int, PlanTask], n: int) -> set[int]:
-    seen: set[int] = set()
-    todo = list(by[n].depends_on)
-    while todo:
-        dep = todo.pop()
-        if dep in by and dep not in seen:
-            seen.add(dep)
-            todo.extend(by[dep].depends_on)
-    seen.discard(n)
-    return seen
 
 
 # -- where the plan is
@@ -261,7 +250,6 @@ def run_plan(run: Run, repo: Path, cfg: Config, events: list[dict] | None = None
     if text is None:
         return {**empty, "path": path, "sha": head or newest}
     tasks = parse_plan_text(text)
-    by = {t.n: t for t in tasks}
     events = _events(run) if events is None else events
 
     def tkey_of(n: int) -> str | None:
@@ -273,16 +261,16 @@ def run_plan(run: Run, repo: Path, cfg: Config, events: list[dict] | None = None
     base = {t.n: _base_status(t, tkey_of(t.n), state, committed, restarted) for t in tasks}
     stopped = {n for n, s in base.items() if s in ("blocked", "parked")}
     layers = waves(tasks)
+    done = {n for n, s in base.items() if s in ("committed", "deferred", "done_before")}
     rows = []
     for task in tasks:
         tkey = tkey_of(task.n)
-        blocked_by = sorted(_ancestors(by, task.n) & stopped)
+        blocked_by = sorted(m for m in stopped if task.n in park.blocks(tasks, m, done))
         status = base[task.n] or ("waiting" if blocked_by else "independent" if stopped else "pending")
-        done = {n for n, s in base.items() if s in ("committed", "deferred", "done_before")}
         row = {"n": task.n, "title": task.title, "text": task.text, "depends_on": list(task.depends_on),
                "files": task_files(task), "wave": layers[task.n], "status": status, "stop": None, "attempts": 0,
                "rollovers": 0, "resolvers": 0, "review": None, "commit": None, "cost": 0.0, "sessions": [],
-               "gates": [], "blocks": [n for n in dependents(tasks, task.n) if n not in done],
+               "gates": [], "blocks": park.blocks(tasks, task.n, done),
                "blocked_by": blocked_by}
         if tkey is not None:
             implement = steps.get(f"{tkey}/implement", {})

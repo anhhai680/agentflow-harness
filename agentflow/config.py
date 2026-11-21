@@ -212,6 +212,8 @@ NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition"
                   CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed", "environment")
 PREFLIGHT_KEYS = ("enabled",)
 WATCHDOG_KEYS = ("no_progress_min", "read_only_idle_min")
+CONSTRAINT_KEYS = ("trailer", "gates")  # `guardrails.constraint_override`
+TRAILER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")  # a git trailer's token: no space, no colon, one line
 WATCHDOG_MAX_MIN = 1440  # `watchdog.no_progress_min` above a day is a typo, not a plan
 USAGE_KEYS = ("governor", "five_hour_soft", "five_hour_hard", "seven_day_soft", "finish_first")
 USAGE_GOVERNORS = ("on", "observe", "off")
@@ -570,6 +572,10 @@ class Guardrails:
     forbidden_paths: list[str]
     reject_trailers: list[str]
     user_only_skills: list[str]
+    # `constraint_override`: the human-only trailer the runner writes for a person's `approve --constraint`, and the
+    # gates (the pack's constraint gates) such an approval may lift. Both empty when the pack sets none.
+    constraint_trailer: str = ""
+    constraint_gates: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1487,6 +1493,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
     issues = _optional(raw, "issues", "", dict, {})
     policy = _optional(raw, "policy", "", dict, {})
     guardrails = _require(raw, "guardrails", "", dict)
+    override = _optional(guardrails, "constraint_override", "guardrails", dict, {})
     recovery = _optional(raw, "recovery", "", dict, {})
     preflight = _optional(raw, "preflight", "", dict, {})
     watchdog = _optional(raw, "watchdog", "", dict, {})
@@ -1562,6 +1569,8 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             ])),
             reject_trailers=_string_list(guardrails.get("reject_trailers", []), "guardrails.reject_trailers"),
             user_only_skills=_string_list(guardrails.get("user_only_skills", []), "guardrails.user_only_skills"),
+            constraint_trailer=_optional(override, "trailer", "guardrails.constraint_override", str, ""),
+            constraint_gates=_string_list(override.get("gates") or [], "guardrails.constraint_override.gates"),
         ),
         overlays=_optional(raw, "overlays", "", dict, {}),
         conditions=_optional(raw, "conditions", "", dict, {}),
@@ -2568,6 +2577,32 @@ class _Validator:
             if key not in PREFLIGHT_KEYS:
                 self.error(f"preflight.{key}", "unknown preflight key")
 
+    def guardrails(self) -> None:
+        """`guardrails.constraint_override`: the `trailer` and the `gates` a person's `approve --constraint` lifts, both or
+        neither. The trailer is a trailer name that `guardrails.reject_trailers` lists, so the runner refuses it from
+        every agent and every other commit; each gate is one of `gates`. A key that is not one of the block's is a typo."""
+        block = self.cfg.raw.get("guardrails")
+        override = block.get("constraint_override") if isinstance(block, dict) else None
+        if not isinstance(override, dict) or not override:
+            return
+        path = "guardrails.constraint_override"
+        for key in override:
+            if key not in CONSTRAINT_KEYS:
+                self.error(f"{path}.{key}", f"unknown constraint_override key (one of {', '.join(CONSTRAINT_KEYS)})")
+        trailer, gates = self.cfg.guardrails.constraint_trailer, self.cfg.guardrails.constraint_gates
+        if not trailer:
+            self.error(f"{path}.trailer", "missing: the override needs the trailer it writes and the gates it lifts")
+        elif not TRAILER_NAME.fullmatch(trailer):
+            self.error(f"{path}.trailer", "must be a trailer name: letters, digits and '-', at most 64 characters")
+        elif trailer not in self.cfg.guardrails.reject_trailers:
+            self.error(f"{path}.trailer", f"{trailer} is not in guardrails.reject_trailers: a trailer only a person "
+                       "writes must be one the runner refuses from agents")
+        if not gates:
+            self.error(f"{path}.gates", "missing: the override needs the trailer it writes and the gates it lifts")
+        for gate in gates:
+            if gate not in self.cfg.gates:
+                self.error(f"{path}.gates", f"{gate}: not a gate in `gates`")
+
     def watchdog(self) -> None:
         """`watchdog.no_progress_min`: 0 (off) or a finite number of minutes up to a day; a key that is not one of this
         block's is a typo. `read_only_idle_min` follows the same rule, and has no effect above a non-zero
@@ -2886,6 +2921,24 @@ class _Validator:
                 self.error(f"ci.{key}", "unknown ci key")
         self.early_pr_after()
 
+    def hitl(self) -> None:
+        """`hitl.park_independent` and `hitl.digest` (bools) and `hitl.park_kinds` (stops a plan task may park, none of
+        them a run's)."""
+        from agentflow.hitl import PARKABLE  # hitl imports config: imported here, not at the top
+
+        hitl = self.cfg.hitl
+        if not isinstance(hitl.get("park_independent", False), bool):
+            self.error("hitl.park_independent", "park_independent must be true or false")
+        if not isinstance(hitl.get("digest", False), bool):
+            self.error("hitl.digest", "digest must be true or false")
+        kinds = hitl.get("park_kinds", [])
+        if not isinstance(kinds, list) or any(not isinstance(kind, str) for kind in kinds):
+            self.error("hitl.park_kinds", f"park_kinds must be a list of stop kinds: {', '.join(PARKABLE)}")
+            return
+        for kind in kinds:
+            if kind not in PARKABLE:
+                self.error("hitl.park_kinds", f"{kind}: not a stop a task can park (one of {', '.join(PARKABLE)})")
+
     def early_pr_after(self) -> None:
         """`ci.early_pr_after`: empty, or a phase that comes before the phase holding the `finish` step, since the
         draft pull request it opens early is the one `finish` audits and updates."""
@@ -3093,10 +3146,12 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.issue_policy()
     v.preflight()
     v.watchdog()
+    v.guardrails()
     v.usage()
     v.policy()
     v.approval()
     v.autonomy()
+    v.hitl()
     v.route()
     v.overlays()
     v.dashboard()

@@ -295,6 +295,35 @@ def test_unchecked_plan_goes_straight_to_build(pipe):
     assert run.state["waiting"]["key"] == "build_approved"
 
 
+TWO_TASKS = ("# Plan: demo\n\n### Task 1: First thing\n\n**Depends on:** none\n\n- Modify: `src/one.py`\n\n"
+             "- [ ] **Step 1: Do it**\n\n### Task 2: Second thing\n\n**Depends on:** none\n\n"
+             "- Modify: `src/two.py`\n\n- [ ] **Step 1: Do it**\n")
+
+
+def test_verify_never_starts_while_a_task_is_parked(pipe):
+    commit_files(pipe, {"docs/specs/SPEC-demo.md": APPROVED_SPEC, "src/toy/demo/__init__.py": "",
+                        PLAN_PATH: TWO_TASKS})
+    impl1 = "build/build/task-1/implement"
+    pipe.script({impl1: [{"write": {"src/one.py": "half\n"}, "result": {"status": "blocked", "summary": "stuck"}}]})
+    run = begin(pipe)
+    assert go(pipe, run) == "waiting_human"
+    assert run.state["waiting"]["key"] == impl1 and run.state["waiting"]["promoted"] is True
+    assert "build/build/task-2/implement" in steps_called(pipe)  # task 2 was built while task 1 was parked
+    assert types(pipe, run, "phase_started") == ["define", "build"]
+    assert go(pipe, run) == "waiting_human"  # nothing moves until a person settles task 1
+    assert types(pipe, run, "phase_started") == ["define", "build"] and types(pipe, run, "phase_approval_raised") == []
+
+    approve(run, impl1, by="me")
+    assert go(pipe, run) == "awaiting_approval" and run.state["waiting"]["key"] == "build_approved"
+    assert [e["n"] for e in pipe.events(run, "task_committed")] == [2, 1]
+    approve(run, "build", by="me")
+    go(pipe, run)
+    assert "verify" in types(pipe, run, "phase_started")
+    started = [e for e in run.events.read() if e["type"] == "phase_started" and e["phase"] == "verify"]
+    committed = [e for e in pipe.events(run, "task_committed") if e["n"] == 1]
+    assert committed[0]["seq"] < started[0]["seq"]
+
+
 def test_from_to(pipe):
     pipe.script({"plan/plan": [{"write": {PLAN_PATH: PLAN}, "result": DONE}]})
     run = begin(pipe, from_phase="plan", to_phase="verify")
@@ -626,3 +655,30 @@ def test_defaults_env_reaches_the_agent_session_even_when_its_name_is_dropped(pi
     assert pipe.calls()
     assert {call["env"]["LEAKED_URL"] for call in pipe.calls()} == {"from-pack"}
     assert "leak-sentinel-7f3a" not in (run.dir / "events.jsonl").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- a person's constraint override (T4 Task 7)
+
+
+def test_walk_writes_a_persons_constraint_override_before_the_steps(flow_repo, git, monkeypatch):
+    from conftest import TEST_GATES
+
+    monkeypatch.delenv("AGENTFLOW_STEP", raising=False)  # a person's terminal, even when an agent runs the suite
+    monkeypatch.delenv("AGENTFLOW_RUN", raising=False)
+    trailer = "Constraints-Approved-By"
+    flow_repo.configure({"gates": {**TEST_GATES, "guard": {
+        "run": f"test ! -f guarded.txt || git log --format=%B | grep -q '^{trailer}:'"}},
+        "gate_sets": {"verify": ["guard"]},
+        "guardrails": {"constraint_override": {"trailer": trailer, "gates": ["guard"]}}})
+    commit_files(flow_repo, {"guarded.txt": "a change only a person may let through\n"})
+    run = begin(flow_repo, from_phase="verify", to_phase="verify")
+    assert go(flow_repo, run) == "waiting_human"
+    key = run.state["waiting"]["key"]
+    assert key.startswith("verify/")
+    approve(run, key, by="Hải", constraint=True, cfg=flow_repo.cfg)
+    assert go(flow_repo, run) == "awaiting_approval"  # the phase's steps passed: its approval is next
+    assert run.state["waiting"]["key"] == "verify_approved"
+    (ok,) = flow_repo.events(run, "constraint_approved")
+    worktree = Path(run.state["worktree"])
+    assert git(worktree, "log", "-1", "--format=%B", ok["sha"]).rstrip().endswith(f"{trailer}: Hải")
+    assert flow_repo.events(run, "guard_tripped") == []

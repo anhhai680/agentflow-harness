@@ -27,22 +27,41 @@ implementer resumes its own session with the note, its reviewer runs again on th
 fresh session over the refine diff (from the task's previous commit),
 with blocking findings, the fix round and `review_unresolved` as above counted within the round, and
 the task is committed on top as `Refine Task N: <title>` with the note in the body. A reviewer cannot
-answer `unchanged`. A task parked in the round holds back only the tasks that depend on it.
+answer `unchanged`. A task parked in the round holds back only the tasks that wait on it.
 A rejected stop inside one task (`refine.scope`, `<step>/task-<n>`) refines only that task: the other
 committed tasks are passed over as if committed in the round, unless a step of theirs still waits on an
-earlier round's refine. A stop inside a batch of several tasks refines the whole phase. An implementer
-that answers `unchanged`, leaves the tree as its round started, and started from the task's committed
-work gets no review (`review_skipped`) and no gate run: the task is recorded as committed in the round
-with no commit (`sha: null`).
+earlier round's refine. A stop inside a task that was ever in a batch of several (any `plan_batched`, also before
+a split) refines the whole phase. An implementer that answers `unchanged`, leaves the tree as its round started,
+and started from the task's committed work gets no review (`review_skipped`) and no gate run: the task is recorded
+as committed in the round with no commit (`sha: null`).
 
 A small plan has no per-task review. Under a route profile with `per_task_review: false` (`route.mode: on`), a task
 the plan sizer did not flag `risk`, outside the security overlay, gets none either: `review_skipped` records it once
-(`route profile <P>`), and the task is committed as a small plan's is. A task with no plan-sizer answers keeps it. A `needs_human` result with `can_continue_without` (and
-`hitl.park_independent`) parks the task: the question is asked without stopping, and tasks that do
-not depend on it (D12, transitively) go on. The run stops for the first parked question only when no
-runnable task remains; the others stay answerable (`state["parked"]`), and one answered while the
-run goes on lets its task (and its dependents) run in another walk of the plan. Each state change is an event,
-so a resumed run picks every task up where it stopped.
+(`route profile <P>`), and the task is committed as a small plan's is. A task with no plan-sizer answers keeps it.
+
+Parking. A stop on a task's own step (`<task>/implement`, `/review` or `/commit`) is settled inside the walk
+(`_settle_task_stop`): the resolver tries it first (`Resolver.take_over`), and one it cannot clear parks
+(`_park`) when `hitl.parks_first` holds and some other task can still run. A guard stop parks only when it names
+forbidden paths alone and `HEAD` is still the runner's. A member of a batch of several is split out of it
+(`_split_out`, a `plan_batched` with `split`) and parks alone, unless it is the batch's last, whose review is the only
+one of the members committed before it: that one stops. A member held behind a parked task is split out too, so it
+later runs alone with a review of its own, and the batch's review covers only the members that ran. The park
+shelves the task's uncommitted work in a ref (`gitops.shelve`), records `step_parked` with the stop's blast radius
+(`park.blast_radius`), then puts the shelved paths back to `HEAD`. A task waits on a held one when it depends on it
+or names one of its files (`park.waits_on`); the rest are built. The run stops for the first parked stop, promoted
+to the run's wait, only when no runnable task remains, and nothing runs while that wait is pending. The others stay
+answerable (`state["parked"]`): one settled while the run goes on lets its task (and the tasks waiting on it) run in
+another walk of the plan, once its shelf is applied back (`_unshelve`; a shelf that no longer applies is a `blocked`
+stop on `<task>/unshelve`, and approving it takes the tree as the person left it). A wait the walk handled is never
+taken over again by `pipeline.walk` (`handled`). Each state change is an event, so a resumed run picks every task up
+where it stopped, and first finishes a park a dead runner left half done (`_finish_shelving`). The events are
+`step_parked` (with `stop_class`, `blast_radius`, `shelf`, `shelved` and `demoted`), `unit_unparked` (the shelf applied
+back, with `conflict` when it did not apply and `head`, the `HEAD` it was applied on: the task's review range starts
+there, and a review session that stopped before it starts fresh), `hitl_notified` (a person was told of the stop:
+folded into `waiting.notified`, so a walk again, a resume or a restarted runner never sends the same stop's notice
+twice, with parking on or off), `forbidden_reverted` (a guard park's forbidden edit set aside) and `plan_batched` with `split`.
+A person's `approve --constraint` is `constraint_approved` (`constraint.py`) and the `constraint` field of
+`hitl_approved`.
 
 `record_decisions` runs before an answered step resumes: an answer to a `spec_gap` question (or one
 given with `--record`) runs `record_step` and commits its `message` (default `Decide <question> in the
@@ -65,17 +84,19 @@ import dataclasses
 import re
 import subprocess
 from collections import Counter
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import carry, overlays, route, sizing, sources, verification
-from agentflow.autonomy import AUTO_BY, as_finding, blocking_of, finding_line
+from agentflow import carry, constraint, overlays, park, route, sizing, sources, verification
+from agentflow.autonomy import AUTO_BY, FORBIDDEN, GUARD_KIND, Resolver, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
 from agentflow.config import Config, Phase, Step, brief_files, carry_limits, for_lane
 from agentflow.conformance import audit, clean_tree, render_section
 from agentflow.doubt import RECONCILE
-from agentflow.flow_control import current_refine, refine_note_block, refine_subject
+from agentflow.flow_control import current_refine, halted, refine_note_block, refine_subject
 from agentflow.gates import deferred_full, failure_report, gates_ok, record_results, run_gates_reusing
 from agentflow.gitops import (
     CommitRejected,
@@ -85,21 +106,37 @@ from agentflow.gitops import (
     commit,
     create_draft_pr,
     dirty_paths,
+    drop_shelf,
     head,
     push,
+    restore_paths,
+    shelf_ref,
+    shelve,
+    unshelve,
     update_pr_body,
 )
 from agentflow.guards import changed_paths, snapshot
-from agentflow.hitl import ResultError, clean_fact, notify_run, raise_hitl, read_result
+from agentflow.hitl import (
+    ResultError,
+    clean_fact,
+    notice_text,
+    notify_run,
+    park_wait,
+    parks_first,
+    raise_hitl,
+    read_result,
+)
 from agentflow.issue_status import link
 
 if TYPE_CHECKING:
     from agentflow.state import Run
 
 Outcome = Literal["done", "skipped", "stopped"]
+Settled = Literal["done", "parked", "stopped"]
 PR_FOOTER = "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
-TASK_KEY = re.compile(r"/task-\d+/(implement|review)$")
 TASK_N = re.compile(r"/task-(\d+)/")
+UNSHELVE = "unshelve"  # `<task>/unshelve`: the stop for a shelf that no longer applies on top of `HEAD`
+SHOWN_PATHS = 10
 DONE_STATUSES = ("done", "unchanged")
 SUMMARY_MAX = 60
 FINAL_FIX = "final_fix"  # `finish`'s session that fixes what the full verify run on the final tree found
@@ -119,6 +156,16 @@ def question_summary(text: str, limit: int = SUMMARY_MAX) -> str:
     return line
 
 
+def wait_id(wait: dict) -> tuple[str, str]:
+    """What tells one wait from another: its key and when it was raised."""
+    return str(wait.get("key")), str(wait.get("since"))
+
+
+def under(key: str, tkey: str) -> bool:
+    """Whether `key` is task `tkey` or one of its steps."""
+    return key == tkey or key.startswith(tkey + "/")
+
+
 def earlier_review(findings: list[dict], note: str | None) -> str:
     """All a fresh re-review knows of the last one: its blocking findings and a human's note, as text."""
     parts = []
@@ -132,14 +179,16 @@ def earlier_review(findings: list[dict], note: str | None) -> str:
 
 
 class FeatureLane:
-    """`run_foreach`, `record_decisions`, `may_park`, `run_finish` and `final_check` for `lanes.Executor`; relies on
+    """`run_foreach`, `record_decisions`, `handled`, `run_finish` and `final_check` for `lanes.Executor`; relies on
     its `cfg`, `run`, `ctx`, `worktree`, `run_agent_step`, `size_plan`, `decide`, `_waiting_on`, `_since_step_started`
-    and `_gate_report`, and on `run_sync`, `confirm_mergeable`, `_plain` and `_sync_report` from `sync_lane.SyncLane`."""
+    and `_gate_report`, and on `run_sync`, `confirm_mergeable`, `_plain` and `_sync_report` from `sync_lane.SyncLane`.
+    `Executor.__init__` sets `handled_waits`."""
 
     cfg: Config
     run: Run
     ctx: Ctx
     worktree: Path
+    handled_waits: set[tuple[str, str]]  # `wait_id`s of the waits the plan walk settled itself
 
     # ------------------------------------------------------------------ plan tasks
 
@@ -153,14 +202,10 @@ class FeatureLane:
             return None
         return {"n": int(match[1]), "of": self._task_total}
 
-    def may_park(self, key: str) -> bool:
-        """Whether a `needs_human` with `can_continue_without` on `key` parks instead of stopping."""
-        if not (self.cfg.hitl.get("park_independent") and TASK_KEY.search(key)):
-            return False
-        match = TASK_N.search(key)
-        # A batch member stops instead: parked work stays in the tree uncommitted, so a park would let the
-        # batch's single review miss members, or take in work that is not theirs.
-        return not (match and self._batch_of and int(match[1]) in self._batch_of)
+    def handled(self, wait: dict | None) -> bool:
+        """Whether the plan walk already handled this wait (resolved, parked or told a person of it), so
+        `pipeline.walk` must not take it over again."""
+        return wait is not None and wait_id(wait) in self.handled_waits
 
     def run_foreach(self, phase: Phase, step: Step, prefix: str) -> Outcome:
         """Every plan task in order, as described in the module docstring. "stopped" = a human is needed."""
@@ -172,6 +217,12 @@ class FeatureLane:
             module = self.ctx.values.get("module") or "?"
             raise_hitl(self.cfg, self.run, "blocked", prefix,
                        f"{prefix} runs once per plan task, but there is no plan for `{module}` yet.")
+            return "stopped"
+        self._finish_shelving(prefix)
+        self.run.refresh()
+        waiting = self.run.state["waiting"]
+        if waiting is not None and waiting.get("promoted"):  # the person's: nothing runs, and nothing is raised
+            self.handled_waits.add(wait_id(waiting))
             return "stopped"
         if self._needs_human_files(plan, prefix):
             return "stopped"
@@ -193,11 +244,11 @@ class FeatureLane:
                 return "done"
             if self._stop_for_parked(prefix):
                 return "stopped"
-            # Held tasks but nothing parked: a parked question was answered during this pass, so its
+            # Held tasks but nothing parked: a parked stop was settled during this pass, so its
             # task (and the tasks waiting on it) can run now. Walk the plan again.
             if not attempted:
                 raise_hitl(self.cfg, self.run, "blocked", prefix,
-                           f"Tasks {sorted(held)} of {prefix} are held back, but no parked question explains it.")
+                           f"Tasks {sorted(held)} of {prefix} are held back, but no parked stop explains it.")
                 return "stopped"
 
     def _scale_budget(self, plan: Path) -> None:
@@ -263,7 +314,13 @@ class FeatureLane:
 
     def _plan_pass(self, phase: Phase, step: Step, plan: Path, rel: str, prefix: str,
                    small: dict) -> tuple[bool, set[int], bool]:
-        """One walk over the plan: `(stopped, held task numbers, whether any task was attempted)`."""
+        """One walk over the plan: `(stopped, held task numbers, whether any task was attempted)`. It first writes the
+        override commits a person approved (`constraint.write`), while a parked task's work is still on its shelf."""
+        if not constraint.write(self.cfg, self.run, self.worktree):
+            self.run.refresh()
+            if self.run.state["waiting"] is not None:  # the person's: neither the resolver nor a park takes it
+                self.handled_waits.add(wait_id(self.run.state["waiting"]))
+            return True, set(), False
         held: set[int] = set()
         previous: str | None = None
         previous_n: int | None = None
@@ -280,35 +337,44 @@ class FeatureLane:
                 continue
             if self._committed(tkey):
                 if refine and not self._committed(tkey, refine) and self._sent_back(tkey):
-                    if self._parked(tkey) or any(dep in held for dep in task.depends_on):
+                    if self._parked(tkey) or park.waits_on(task, held, texts):
                         held.add(task.n)
                         continue
                     attempted = True
-                    if self._refine_task(phase, step, plan, rel, task, tkey, small, refine) == "stopped":
-                        if not self._parked(tkey):
-                            return True, held, attempted
+                    if not self._unshelve(tkey):
+                        return True, held, attempted
+                    settled = self._task_outcome(tkey, partial(self._refine_task, phase, step, plan, rel, task, tkey,
+                                                               small, refine))
+                    if settled == "stopped":
+                        return True, held, attempted
+                    if settled == "parked":
                         held.add(task.n)  # parked in the refine round: independent tasks are refined on
                         continue
                 previous, previous_n = impl_key, task.n
                 carry_prev = None  # committed by an earlier walk: never a carry source
                 continue
-            if self._parked(tkey) or any(dep in held for dep in task.depends_on):
+            batch = (self._batch_of or {}).get(task.n) if not refine else None
+            if self._parked(tkey) or park.waits_on(task, held, texts):
                 held.add(task.n)
                 carry_prev = None
+                if batch and task.n != batch[-1]:  # the batch's one review would cover a member that never ran
+                    self._split_out(prefix, task.n)
                 continue
-            batch = (self._batch_of or {}).get(task.n) if not refine else None
-            in_batch = bool(batch) and previous_n is not None and previous_n in (batch or [])
+            in_batch = self._continues_batch(batch, task.n, previous_n, tasks)
             share = previous if small.get("shared_session") or in_batch else None
             carried = False
             if share is None and not batch and not small.get("active") and not refine:
                 share = self._carry(step, tkey, carry_prev)
                 carried = share is not None
             attempted = True
+            if not self._unshelve(tkey):
+                return True, held, attempted
             members = [texts[n] for n in batch] if batch else None
-            if self._run_task(phase, step, plan, rel, task, tkey, small, share, batch=members,
-                              prefix=prefix, carried=carried) == "stopped":
-                if not self._parked(tkey):
-                    return True, held, attempted
+            settled = self._task_outcome(tkey, partial(self._run_task, phase, step, plan, rel, task, tkey, small, share,
+                                                       batch=members, prefix=prefix, carried=carried))
+            if settled == "stopped":
+                return True, held, attempted
+            if settled == "parked":
                 held.add(task.n)
                 carry_prev = None
                 continue
@@ -316,9 +382,21 @@ class FeatureLane:
             carry_prev = None if batch or small.get("active") or refine else tkey
         return False, held, attempted
 
+    @staticmethod
+    def _continues_batch(batch: list[int] | None, n: int, previous_n: int | None,
+                         tasks: list[sources.PlanTask]) -> bool:
+        """Whether task `n` continues the session of `previous_n`: the member before it in its batch, and the plan's
+        task right before it. A member split out between them ran in that session, and its work is shelved."""
+        if not batch or previous_n is None or n not in batch or batch.index(n) == 0:
+            return False
+        order = [t.n for t in tasks]
+        before = order[order.index(n) - 1] if order.index(n) > 0 else None
+        return previous_n == batch[batch.index(n) - 1] == before
+
     def _batches(self, phase: Phase, step: Step, plan: Path, prefix: str, small: dict) -> dict[int, list[int]]:
         """Task number -> its batch (`step.batch`), decided once per run and kept in a `plan_batched` event, so a
-        resume sees the same batches after their tasks were ticked. None in a small plan or a refine round."""
+        resume sees the same batches after their tasks were ticked. None in a small plan or a refine round. The last
+        `plan_batched` counts, so a member split out of its batch (`_split_out`) stays out; a batch of one is none."""
         if not step.batch or small.get("active") or self._refine_round(phase):
             return {}
         recorded = [e for e in self.run.events.read() if e["type"] == "plan_batched" and e.get("key") == prefix]
@@ -328,7 +406,20 @@ class FeatureLane:
             batches = sources.plan_batches(sources.parse_plan(plan), int(step.batch.get("max_tasks", 3)),
                                            int(step.batch.get("max_files", 3)))
             self.run.emit("plan_batched", key=prefix, batches=batches)
-        return {n: batch for batch in batches for n in batch}
+        return {n: batch for batch in batches if len(batch) > 1 for n in batch}
+
+    def _split_out(self, prefix: str, n: int) -> None:
+        """Take task `n` out of its batch, so it parks and later runs alone with a review of its own: every batch
+        is kept, and `n`'s becomes the batch without `n`, then `[n]`, recorded as the last `plan_batched` so a
+        resume and the review see the split (`hitl.rejected_scope` reads every `plan_batched`, so a rejected stop
+        of `n` still refines the whole phase)."""
+        recorded = [e for e in self.run.events.read() if e["type"] == "plan_batched" and e.get("key") == prefix]
+        batches: list[list[int]] = []
+        for batch in (recorded[-1].get("batches") or []) if recorded else []:
+            members = [int(m) for m in batch]
+            batches.extend([[m for m in members if m != n], [n]] if n in members else [members])
+        self.run.emit("plan_batched", key=prefix, batches=batches, split=n)
+        self._batch_of = {m: batch for batch in batches if len(batch) > 1 for m in batch}
 
     def _carry(self, step: Step, tkey: str, carry_prev: str | None) -> str | None:
         """The implement key whose session task `tkey`'s implementer resumes under the step's `carry`, or None for a
@@ -414,8 +505,8 @@ class FeatureLane:
                    for e in self.run.events.read())
 
     def _parked(self, tkey: str) -> bool:
-        steps = self.run.state["steps"]
-        return any((steps.get(f"{tkey}/{part}") or {}).get("status") == "parked" for part in ("implement", "review"))
+        """Whether a stop of task `tkey` (any of its steps) is parked."""
+        return any(under(key, tkey) for key in self.run.state.get("parked") or {})
 
     def _stop_for_parked(self, prefix: str) -> bool:
         """No runnable task remains: the first parked question becomes the run's wait. True = stopped;
@@ -429,9 +520,270 @@ class FeatureLane:
             return False
         item = items[0]
         self.run.emit("hitl_raised", kind=item["kind"], key=item["key"], phase=item["phase"], summary=item["summary"],
-                      questions=item["questions"], inbox=str(self.run.inbox_path(item["key"])))
-        notify_run(self.cfg, self.run, f"No runnable task remains: {len(items)} parked question(s) wait.")
+                      questions=item["questions"], inbox=str(self.run.inbox_path(item["key"])), promoted=True,
+                      notified=True)
+        self.run.refresh()
+        if self.run.state["waiting"] is not None:
+            self.handled_waits.add(wait_id(self.run.state["waiting"]))
+        notify_run(self.cfg, self.run, f"No runnable task remains: {len(items)} parked stop(s) wait.")
         return True
+
+    # ------------------------------------------------------------------ parking a task's stop
+
+    def _task_outcome(self, tkey: str, run_task: Callable[[], Outcome]) -> Settled:
+        """Run the task, and settle a stop it ends on (`_settle_task_stop`)."""
+        if run_task() != "stopped":
+            return "done"
+        return self._settle_task_stop(tkey, run_task)
+
+    def _settle_task_stop(self, tkey: str, rerun: Callable[[], Outcome]) -> Settled:
+        """Settle the stop task `tkey` just ended on: the resolver first (the task runs again when it clears the stop),
+        then a park. A stop that does neither stays the run's wait, and a person is told of it once, here, when its
+        raise left that to the runner. Every wait looked at is `handled`, so `pipeline.walk` does not take it over."""
+        resolver = Resolver(self.cfg, self.run, self)  # `self` is the Executor
+        while True:
+            self.run.refresh()
+            wait = self.run.state["waiting"]
+            if (halted(self.run.state["status"]) or wait is None or not under(str(wait.get("key")), tkey)
+                    or self.handled(wait)):
+                return "stopped"
+            if resolver.take_over(notify=False):
+                if rerun() != "stopped":
+                    return "done"
+                continue
+            self.run.refresh()
+            now = self.run.state["waiting"]
+            if now is not None and wait_id(now) != wait_id(wait):
+                continue  # the resolver raised a stop of its own, or handed this one over: settle that one
+            if now is None or halted(self.run.state["status"]):
+                return "stopped"
+            self.handled_waits.add(wait_id(wait))
+            if self._park(tkey, wait):
+                return "parked"
+            self._tell_once(wait)
+            return "stopped"
+
+    def _tell_once(self, wait: dict) -> None:
+        """Tell a person of a wait raised quietly, once: `hitl_notified` keeps that on the wait, so no later walk (a
+        fresh executor) or restarted runner tells them again. A promoted wait was told as it was promoted."""
+        if wait.get("notified") or wait.get("promoted"):
+            return
+        notify_run(self.cfg, self.run, notice_text(wait) or f"{wait['key']} needs a decision")
+        self.run.emit("hitl_notified", key=wait["key"])
+
+    def _park(self, tkey: str, wait: dict) -> bool:
+        """Park the stop `wait` of task `tkey` and shelve the task's work, when the task may park and some other task
+        can still run, or another task is already parked (the walk then promotes the first parked stop, which a person
+        settling any other one demotes again). False changes nothing. The order matters to a runner killed half way:
+        the shelf is written before `step_parked`, and the paths go back to `HEAD` only after it (`_finish_shelving`
+        ends that on resume).
+
+        A member of a batch of several is split out of it first (`_split_out`) and parks alone, unless it is the
+        batch's last, whose review is the only one of the members committed before it: that one stops.
+
+        A guard stop's forbidden paths stay in the shelf commit, recoverable from its ref, but are not `shelved`: they
+        go back to the runner's `HEAD` after `step_parked` (once `park_wait` has recorded it), recorded as
+        `forbidden_reverted` (as `Resolver._revert` does), so the task never gets them back and its restart is not
+        refused for them again. A runner killed in between has `_finish_shelving` do it on resume."""
+        kind, key = str(wait.get("kind")), str(wait.get("key"))
+        match = TASK_N.search(key)
+        if match is None or not parks_first(self.cfg, kind, key):
+            return False
+        events = self.run.events.read()
+        if kind == GUARD_KIND and not self._guard_parks(events, key):
+            return False
+        n = int(match[1])
+        batch = (self._batch_of or {}).get(n) or []
+        if len(batch) > 1 and n == batch[-1]:  # its review is the only one of the members committed before it
+            return False
+        rel = self.ctx.values.get("plan") or ""
+        plan = self.worktree / rel if rel else None
+        if plan is None or not plan.is_file():
+            return False
+        prefix = tkey.rsplit("/task-", 1)[0]
+        tasks = sources.parse_plan(plan)
+        done = self._walk_done(tasks, prefix)
+        view = [dataclasses.replace(t, checked=t.n in done, deferred=False) for t in tasks]  # open = not done
+        parked = self._parked_numbers(prefix) | {n}
+        held = park.held_tasks(view, parked, done)
+        if not any(t.n not in done and t.n not in held for t in view) and parked == {n}:
+            return False  # nothing else can run and nothing else is parked: it would only be promoted back at once
+        tree = snapshot(self.worktree)
+        theirs = self._held_paths(tkey)  # files an older engine's park left in the tree: not this task's
+        changed = [p for p in changed_paths(self.worktree, "HEAD^{tree}", tree) if p not in theirs]
+        forbidden = self._forbidden_tripped(events, key) if kind == GUARD_KIND else []
+        paths = [p for p in changed if p not in forbidden]
+        aside = [p for p in changed if p in forbidden]
+        shelf, ref = None, ""
+        if changed:
+            try:  # a ref name git refuses is no shelf either
+                ref = shelf_ref(self.run.id, tkey)
+                shelf = shelve(self.worktree, tree, ref, f"Shelve {tkey}")
+            except (GitError, ValueError, subprocess.CalledProcessError):
+                return False  # no shelf, no park: the work stays in the tree and the stop stays the run's wait
+        if len(batch) > 1:  # before `step_parked`: a runner killed between never leaves a parked task in a batch
+            self._split_out(prefix, n)
+        note = ""
+        if aside and shelf:
+            shown = ", ".join(f"`{p}`" for p in aside)
+            note = (f"The edit to {shown}, which no agent may touch in a run, was set aside: the runner put "
+                    f"{'it' if len(aside) == 1 else 'them'} back as at `HEAD`, and the task will not get the edit back. "
+                    f"It is kept in `{ref}` (commit {shelf[:12]}) if you want it.")
+        classes = [e for e in events if e["type"] == "stop_classified" and e.get("key") == key]
+        raised = [e for e in events if e["type"] == "hitl_raised" and e.get("key") == key]
+        extra = str(raised[-1].get("extra") or "") if raised else ""
+        park_wait(self.cfg, self.run, wait, blast_radius=park.blast_radius(view, parked, n, done), shelf=shelf,
+                  shelved=paths, stop_class=classes[-1].get("stop_class") if classes else None,
+                  extra="\n\n".join(part for part in (note, extra) if part))
+        restore_paths(self.worktree, paths, "HEAD")
+        if aside and shelf:
+            self._set_forbidden_aside(key, aside)
+        return True
+
+    def _set_forbidden_aside(self, key: str, paths: list[str]) -> None:
+        """Put a guard park's forbidden paths back as at the runner's `HEAD`, recorded as `Resolver._revert` does."""
+        restore_paths(self.worktree, paths, str(runner_head(self.run) or "HEAD"))
+        self.run.emit("forbidden_reverted", key=key, paths=paths)
+
+    @staticmethod
+    def _forbidden_tripped(events: list[dict], key: str) -> list[str]:
+        """The forbidden paths the last guard trip on `key` named."""
+        tripped = [e for e in events if e["type"] == "guard_tripped" and e.get("key") == key]
+        violations = (tripped[-1].get("violations") or []) if tripped else []
+        return [str(v.get("detail")) for v in violations if isinstance(v, dict) and v.get("kind") == FORBIDDEN]
+
+    def _guard_parks(self, events: list[dict], key: str) -> bool:
+        """A guard stop parks only when its last trip names forbidden paths alone and `HEAD` is still the one the
+        runner recorded: after an agent moved `HEAD`, every later task commit would be refused."""
+        tripped = [e for e in events if e["type"] == "guard_tripped" and e.get("key") == key]
+        violations = (tripped[-1].get("violations") or []) if tripped else []
+        if not violations or any(not isinstance(v, dict) or v.get("kind") != FORBIDDEN for v in violations):
+            return False
+        try:
+            return head(self.worktree) == runner_head(self.run)
+        except (GitError, subprocess.CalledProcessError):
+            return False
+
+    def _walk_done(self, tasks: list[sources.PlanTask], prefix: str) -> set[int]:
+        """The tasks this walk will not run again: those that are not open, or in a refine round those it does not
+        send back and those already committed in the round (a task never committed counts by its boxes)."""
+        phase = self.cfg.phases.get(prefix.split("/")[0])
+        refine = self._refine_round(phase) if phase is not None else 0
+        if not refine:
+            return {t.n for t in tasks if not t.open}
+        done: set[int] = set()
+        for task in tasks:
+            tkey = f"{prefix}/task-{task.n}"
+            if self._committed(tkey):
+                if not self._sent_back(tkey) or self._committed(tkey, refine):
+                    done.add(task.n)
+            elif not task.open:
+                done.add(task.n)
+        return done
+
+    def _parked_numbers(self, prefix: str) -> set[int]:
+        """The task numbers with a parked stop under `prefix`."""
+        found = set()
+        for key in self.run.state.get("parked") or {}:
+            match = TASK_N.search(key)
+            if match is not None and key.startswith(f"{prefix}/task-"):
+                found.add(int(match[1]))
+        return found
+
+    def _open_shelf(self, tkey: str) -> dict | None:
+        """The last `step_parked` of task `tkey` with a shelf, unless a `unit_unparked` for that shelf came after it."""
+        events = self.run.events.read()
+        last = None
+        for event in events:
+            if event["type"] == "step_parked" and under(str(event.get("key") or ""), tkey) and event.get("shelf"):
+                last = event
+        if last is None:
+            return None
+        if any(e["type"] == "unit_unparked" and e.get("shelf") == last["shelf"] and e["seq"] > last["seq"]
+               for e in events):
+            return None
+        return last
+
+    def _unshelve(self, tkey: str) -> bool:
+        """Apply task `tkey`'s open shelf back before the task runs again. False = stopped: on a shelf that no
+        longer applies on top of `HEAD` (nothing is changed, and the stop on `<tkey>/unshelve` names the paths and
+        the ref), or while any wait is pending. Approving that stop goes on with the tree as the person left it."""
+        item = self._open_shelf(tkey)
+        if item is None:
+            return True
+        self.run.refresh()
+        ukey = f"{tkey}/{UNSHELVE}"
+        waiting = self.run.state["waiting"]
+        if waiting is not None:  # nothing is applied while a person is needed
+            if waiting.get("key") == ukey:
+                self.handled_waits.add(wait_id(waiting))
+            return False
+        shelf, paths = str(item["shelf"]), [str(p) for p in item.get("shelved") or []]
+        ref = shelf_ref(self.run.id, tkey)
+        try:
+            conflicts, why = unshelve(self.worktree, shelf, paths), ""
+        except GitError as exc:
+            conflicts, why = sorted(paths), f" ({clean_fact(str(exc))})"
+        approvals = [e for e in self.run.events.read() if e["type"] == "hitl_approved" and e.get("key") == ukey
+                     and e["seq"] > item["seq"]]
+        if conflicts and not approvals:
+            shown = ", ".join(conflicts[:SHOWN_PATHS]) + (
+                f" and {len(conflicts) - SHOWN_PATHS} more" if len(conflicts) > SHOWN_PATHS else "")
+            raise_hitl(self.cfg, self.run, "blocked", ukey,
+                       f"The work {tkey} shelved when it parked no longer applies on top of HEAD{why}: {shown}. "
+                       f"Nothing was changed. It is kept in {ref} (commit {shelf[:12]}; `git diff {shelf[:12]}^ "
+                       f"{shelf[:12]}` shows it): bring in what you want of it, then approve, and the task runs again "
+                       f"on the tree as you leave it.", notify=True)
+            self.run.refresh()
+            if self.run.state["waiting"] is not None:
+                self.handled_waits.add(wait_id(self.run.state["waiting"]))
+            return False
+        at = head(self.worktree)  # the task's work now sits uncommitted on top of it: where its review range starts
+        if conflicts:
+            self.run.emit("unit_unparked", key=item["key"], shelf=shelf, paths=paths, conflict=True,
+                          by=str(approvals[-1].get("by") or ""), head=at)
+        else:
+            self.run.emit("unit_unparked", key=item["key"], shelf=shelf, paths=paths, conflict=False, head=at)
+            if not self._set_aside(shelf, paths):  # a shelf holding an edit set aside stays, so it can be recovered
+                drop_shelf(self.worktree, ref)
+        if ukey in self.run.state["steps"]:
+            self.run.emit("step_finished", key=ukey, status="done", summary="the shelved work was settled")
+        return True
+
+    def _set_aside(self, shelf: str, paths: list[str]) -> bool:
+        """Whether the shelf commit holds changes beyond `paths` (a guard park's forbidden edit); True when git
+        cannot tell, so the ref is kept."""
+        try:
+            return bool(set(changed_paths(self.worktree, f"{shelf}^", shelf)) - set(paths))
+        except (GitError, subprocess.CalledProcessError):
+            return True
+
+    def _finish_shelving(self, prefix: str) -> None:
+        """End a park a runner died in after `step_parked`: every shelved path of a still parked task that still holds
+        the shelved work goes back to `HEAD`, before any task runs, so no other task's commit takes it, and so does a
+        guard park's forbidden edit it had not yet set aside (`forbidden_reverted`). A path that changed since (a
+        later task's edit) is left alone, and so is a shelf git can no longer read."""
+        tkeys = {key[: m.end() - 1] for key in self.run.state.get("parked") or {}
+                 if key.startswith(prefix + "/") and (m := TASK_N.search(key)) is not None}
+        for tkey in sorted(tkeys):
+            item = self._open_shelf(tkey)
+            if item is None:
+                continue
+            try:
+                tree = snapshot(self.worktree)
+                differs = set(changed_paths(self.worktree, "HEAD^{tree}", tree))
+                moved = set(changed_paths(self.worktree, str(item["shelf"]), tree))
+            except (GitError, subprocess.CalledProcessError):
+                continue
+            stale = [str(p) for p in item.get("shelved") or [] if p in differs and p not in moved]
+            if stale:
+                restore_paths(self.worktree, stale, "HEAD")
+            if item.get("kind") == GUARD_KIND:
+                key = str(item["key"])
+                aside = [p for p in self._forbidden_tripped(self.run.events.read(), key)
+                         if p in differs and p not in moved]
+                if aside:
+                    self._set_forbidden_aside(key, aside)
 
     def _task_extra(self, task: sources.PlanTask, rel: str) -> dict[str, str]:
         return {"task_n": str(task.n), "task_title": f"Task {task.n}: {task.title}", "task_text": task.text,
@@ -498,8 +850,10 @@ class FeatureLane:
             rextra = extra
             if batch and len(batch) > 1:
                 start = self._task_start(phase, f"{prefix}/task-{batch[0].n}/implement")
-                rextra = {**extra, "task_title": f"Tasks {batch[0].n}-{task.n} ("
-                          + "; ".join(t.title for t in batch) + ")",
+                numbers = [t.n for t in batch]  # a batch a member was split out of is no range
+                shown = (f"{batch[0].n}-{task.n}" if numbers == list(range(batch[0].n, task.n + 1))
+                         else ", ".join(str(m) for m in numbers))
+                rextra = {**extra, "task_title": f"Tasks {shown} (" + "; ".join(t.title for t in batch) + ")",
                           "task_text": "\n\n".join(t.text for t in batch)}
             outcome, open_findings = self._review_task(phase, impl_step, review, tkey, extra, rextra, start)
             if outcome != "done":
@@ -587,10 +941,14 @@ class FeatureLane:
 
     def _task_start(self, phase: Phase, impl_key: str) -> str:
         """Where the task's diff starts: `HEAD` when its implementer started (in a refine round: started
-        refining), or when it was last rebased (other tasks committed while it was parked), so the range
-        holds this task's work only."""
+        refining), or the later of when it was last rebased and when its shelf was last applied back (`unit_unparked`
+        `head`: other tasks committed while it was parked), so the range holds this task's work only."""
+        tkey = impl_key.rsplit("/", 1)[0]
         sha = ""
         for event in self._round_events(phase):
+            if event["type"] == "unit_unparked" and event.get("head") and under(str(event.get("key") or ""), tkey):
+                sha = str(event["head"])
+                continue
             if event.get("key") != impl_key:
                 continue
             if event["type"] == "step_started" and not sha:
@@ -605,13 +963,19 @@ class FeatureLane:
 
         A round that has not started gets a fresh session: `step_retry`, not a resume, so the earlier
         verdict reaches the reviewer only as the findings in its prompt. A stop inside a round
-        resumes that round's own session."""
+        resumes that round's own session, unless the task's shelf was applied back since that session started:
+        `HEAD` moved under it, so a fresh session gets the range as it is now."""
         results = [e for e in self._round_events(phase) if e["type"] == "review_result" and e.get("key") == key]
         if len(results) >= round_:
             return list(results[round_ - 1].get("blocking_findings") or [])
+        settled = ""
         if results and not self._reviewer_started_since(key, results[-1]):
             self.run.emit("step_retry", key=key, reason="re-review", round=round_)
-        extra = {**extra, "earlier_findings": self._earlier_findings(phase, key, results)}
+        elif self._unshelved_since_reviewer(key):
+            settled = self._settled_stop_text(key)  # what the person said at the stop, which a resume would have sent
+            self.run.emit("step_retry", key=key, reason="unshelved on a new HEAD", round=round_)
+        earlier = "\n\n".join(p for p in (self._earlier_findings(phase, key, results), settled) if p)
+        extra = {**extra, "earlier_findings": earlier}
         if self._task_agent(phase, review, key, extra, review=True) != "done":
             return None
         try:  # `unchanged` is no review: it is refused like any unreadable result
@@ -625,6 +989,37 @@ class FeatureLane:
         self.run.emit("review_result", key=key, round=round_, findings=findings, blocking=len(blocking),
                       blocking_findings=blocking, tree=snapshot(self.worktree))
         return blocking
+
+    def _unshelved_since_reviewer(self, key: str) -> bool:
+        """Whether the task's shelf was applied back (`unit_unparked`) after review `key`'s session last started."""
+        tkey = key.rsplit("/", 1)[0]
+        started = 0
+        unparked = 0
+        for event in self.run.events.read():
+            if event["type"] == "agent_started" and event.get("step") == key:
+                started = event["seq"]
+            elif event["type"] == "unit_unparked" and under(str(event.get("key") or ""), tkey):
+                unparked = event["seq"]
+        return bool(started) and unparked > started
+
+    def _settled_stop_text(self, key: str) -> str:
+        """A person's answers to, or note on approving, the stop of `key`'s last session, as text for a fresh one."""
+        answers: dict = {}
+        note = ""
+        for event in self.run.events.read():
+            if event["type"] == "agent_started" and event.get("step") == key:
+                answers, note = {}, ""
+            elif event["type"] == "hitl_answered" and event.get("key") == key:
+                answers = dict(event.get("answers") or {})
+            elif event["type"] == "hitl_approved" and event.get("key") == key:
+                note = str(event.get("note") or "")
+        parts = []
+        if answers:
+            lines = "\n".join(f"{qid}: {text}" for qid, text in answers.items())
+            parts.append(f"The last review session of this task stopped with questions, answered:\n\n{lines}")
+        if note:
+            parts.append(f"A human looked at the last review session's stop and said: {note}")
+        return "\n\n".join(parts)
 
     def _reviewer_started_since(self, key: str, result: dict) -> bool:
         return any(e["type"] == "agent_started" and e.get("step") == key and e["seq"] > result["seq"]

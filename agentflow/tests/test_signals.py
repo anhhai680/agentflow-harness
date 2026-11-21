@@ -81,7 +81,8 @@ def test_stops_and_plain_counters():
 
 def test_a_run_with_nothing_to_report_has_only_the_always_present_counts():
     assert run_signals([], EMPTY_METRICS) == {"ci_rounds": 0, "rollovers": 0, "progress_not_updated": 0, "rework_pct": 0,
-                                              "gate_reruns": 0, "compactions": 0, "usage_holds": 0}
+                                              "gate_reruns": 0, "compactions": 0, "usage_holds": 0,
+                                              "parked_units": 0, "park_resume_rework": 0}
 
 
 def test_a_run_with_a_gate_failure_but_no_ci_rounds_reports_zero_ci_rounds():
@@ -101,7 +102,7 @@ def test_open_parameter_counts_stay_absent_and_count_families_are_lower_is_bette
     out = run_signals([], EMPTY_METRICS)
     assert not [k for k in out if k.split(":")[0] in ("guard_trips", "permission_denied", "stop")]
     assert COUNT_FAMILIES <= set(FAMILIES) and all(FAMILIES[f][0] == "lower" for f in COUNT_FAMILIES)
-    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 19
+    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 21
 
 
 def test_cost_per_task_divides_by_the_steps_that_called_an_agent():
@@ -132,7 +133,7 @@ def test_signals_survive_events_without_the_new_fields():
            _ev("phase_rejected", by="human")]
     assert run_signals(evs, EMPTY_METRICS) == {"ci_rounds": 0, "rollovers": 0, "progress_not_updated": 0, "rework_pct": 0,
                                            "review_blocking:build": 0, "gate_reruns": 0, "compactions": 0,
-                                           "usage_holds": 0}
+                                           "usage_holds": 0, "parked_units": 0, "park_resume_rework": 0}
 
 
 def test_parse_target_accepts_only_the_vocabulary():
@@ -145,7 +146,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 39
+    assert len(FAMILIES) == 41
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -463,3 +464,64 @@ def test_the_new_families_are_targets_and_lower_is_better():
     assert FAMILIES["session_turns_p90"] == ("lower", True) and FAMILIES["tool_output_kchars"] == ("lower", True)
     assert {"compactions", "usage_holds"} <= COUNT_FAMILIES
     assert not {"cache_write_share", "prefix_write_tokens", "session_turns_p90"} & COUNT_FAMILIES
+
+
+T2 = "build/build/task-2"
+
+
+def _park(key: str, **fields) -> dict:
+    return _ev("step_parked", key=key, kind="blocked", shelf=None, shelved=[], **fields)
+
+
+def test_parked_units_skip_demoted_parks():
+    evs = [_park(f"{T2}/implement"), _park(f"{T2}/implement", demoted=True), _park("build/build/task-3/review")]
+    assert run_signals(evs, EMPTY_METRICS)["parked_units"] == 2
+
+
+def test_rework_counts_a_conflict_and_a_retry_once_per_task():
+    evs = [_park(f"{T2}/implement"), _park("build/build/task-3/review"),
+           _ev("unit_unparked", key=f"{T2}/implement", shelf="r", paths=[], conflict=True, by="human"),
+           _ev("step_retry", by="human", key=f"{T2}/review"),
+           _ev("step_retry", by="human", key=f"{T2}/commit"),
+           _ev("unit_unparked", key="build/build/task-3/review", shelf="r", paths=[], conflict=False)]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert (out["parked_units"], out["park_resume_rework"]) == (2, 1)
+    evs.append(_ev("step_retry", by="human", key="build/build/task-3/implement"))
+    assert run_signals(evs, EMPTY_METRICS)["park_resume_rework"] == 2
+
+
+def test_rework_ignores_a_retry_before_the_park_and_one_on_another_task():
+    evs = [_ev("step_retry", by="human", key=f"{T2}/review"), _ev("unit_unparked", key=f"{T2}/implement", conflict=True),
+           _park(f"{T2}/implement"), _ev("step_retry", by="human", key="build/build/task-3/review"),
+           _ev("step_retry", by="human", key="build/build/task-22/review")]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert (out["parked_units"], out["park_resume_rework"]) == (1, 0)
+
+
+def test_a_run_with_no_park_has_zero_of_both():
+    out = run_signals([_ev("step_retry", by="human", key=f"{T2}/review")], EMPTY_METRICS)
+    assert (out["parked_units"], out["park_resume_rework"]) == (0, 0)
+    assert FAMILIES["parked_units"] == FAMILIES["park_resume_rework"] == ("lower", False)
+    assert {"parked_units", "park_resume_rework"} <= COUNT_FAMILIES
+    assert parse_target("park_resume_rework") == ("park_resume_rework", None)
+
+
+def test_rework_ignores_the_runners_own_review_round_retries():
+    runner_retry = {"seq": 1, "ts": "2026-11-03T09:00:00.000+00:00", "type": "step_retry", "by": "runner",
+                    "key": f"{T2}/review", "reason": "re-review", "round": 1}
+    evs = [_park(f"{T2}/implement"), runner_retry, {k: v for k, v in runner_retry.items() if k != "by"}]
+    assert run_signals(evs, EMPTY_METRICS)["park_resume_rework"] == 0
+    assert run_signals([*evs, _ev("step_retry", by="alice", key=f"{T2}/review")], EMPTY_METRICS)["park_resume_rework"] == 1
+
+
+def test_a_park_on_a_non_task_key_is_its_own_unit():
+    evs = [_park("build/verify-fix"), _ev("step_retry", by="human", key="build/verify-fix/gate"),
+           _ev("step_retry", by="human", key="build/verify-fix-2")]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert (out["parked_units"], out["park_resume_rework"]) == (1, 1)
+
+
+def test_the_same_task_parked_twice_counts_two_parks_and_one_task_of_rework():
+    evs = [_park(f"{T2}/implement"), _park(f"{T2}/review"), _ev("step_retry", by="human", key=f"{T2}/review")]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert (out["parked_units"], out["park_resume_rework"]) == (2, 1)

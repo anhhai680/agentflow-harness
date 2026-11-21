@@ -249,6 +249,31 @@ def commit(worktree: Path, message: str, cfg: Config, paths: list[str] | None = 
     return sha
 
 
+def commit_constraint(worktree: Path, message: str, expected_head: str) -> str:
+    """Write a person's constraint override as a commit on `HEAD` holding `HEAD`'s own tree, move `HEAD` to it, and
+    return its sha. It is the one runner commit whose message carries the pack's human-only trailer: `constraint.write`
+    builds `message` from a recorded `hitl_approved{constraint: True}`, and nothing else calls it (`commit`,
+    `check_message` and `reject_trailers` still refuse the trailer everywhere else).
+
+    It never touches the index or the working tree: `commit-tree <HEAD^{tree}> -p <HEAD>` (the message on stdin), then
+    `update-ref HEAD <new> <expected_head>`, so a `HEAD` that is not `expected_head`, before or during, raises
+    `GitError` and stays where it is. No hook runs (`HARDENED`); the commit is signed as the user's git config says,
+    like every runner commit."""
+    root = Path(worktree)
+    before = _git_or_raise(root, *HARDENED, "rev-parse", "--verify", "HEAD^{commit}").strip()
+    if not expected_head or before != expected_head:
+        raise GitError(f"HEAD is {before[:12]}, not the {expected_head[:12] or 'none'} the runner last recorded; the "
+                       "runner writes a constraint override only on top of its own commits")
+    tree = _git_or_raise(root, *HARDENED, "rev-parse", "--verify", f"{before}^{{tree}}").strip()
+    proc = subprocess.run(["git", *HARDENED, "commit-tree", tree, "-p", before, "-F", "-"], cwd=root,
+                          input=message.strip() + "\n", capture_output=True, text=True, encoding="utf-8", check=False)
+    if proc.returncode != 0:
+        raise GitError(f"git commit-tree failed: {proc.stderr.strip() or f'exit {proc.returncode}'}")
+    sha = proc.stdout.strip()
+    _git_or_raise(root, *HARDENED, "update-ref", "-m", "agentflow: constraint override", "HEAD", sha, before)
+    return sha
+
+
 def _status_entries(worktree: Path) -> list[tuple[str, str]]:
     """`(XY, path)` for every changed, staged or untracked path, read from `git status --porcelain -z`.
 
@@ -1259,6 +1284,82 @@ def restore_paths(worktree: Path, paths: list[str], sha: str) -> None:
         else:
             _git_or_raise(root, "rm", "-q", "--force", "--cached", "--ignore-unmatch", "--", path)
             (root / path).unlink(missing_ok=True)
+
+
+def shelf_ref(run_id: str, tkey: str) -> str:
+    """The ref that holds a parked task's shelved work; `ValueError` when git refuses the name."""
+    ref = f"refs/agentflow/shelf/{run_id}/{tkey.replace('/', '.')}"
+    if subprocess.run(["git", "check-ref-format", ref], capture_output=True).returncode != 0:
+        raise ValueError(f"not a valid shelf ref: {ref!r}")
+    return ref
+
+
+def shelve(worktree: Path, tree: str, ref: str, message: str) -> str:
+    """Keep `tree` (a `snapshot` of the working tree) in `ref` as a commit on `HEAD`, and return its sha.
+
+    Only an object and a ref are written: the index and the tree stay as they are, so the caller resets the paths
+    itself (`restore_paths`) once the shelf is safe."""
+    root = Path(worktree)
+    sha = _git_or_raise(root, *HARDENED, "commit-tree", tree, "-p", "HEAD", "-m", message).strip()
+    _git_or_raise(root, *HARDENED, "update-ref", ref, sha)
+    return sha
+
+
+def unshelve(worktree: Path, shelf: str, paths: list[str]) -> list[str]:
+    """Apply what the shelf commit `shelf` changed in `paths` to the index and the tree.
+
+    Returns `[]` once the change is applied (or when there is none). When it does not apply cleanly on top of
+    `HEAD`, nothing is changed and the sorted `paths` come back. The patch goes to `git apply` on stdin."""
+    root = Path(worktree)
+    if not paths:
+        return []
+    patch = subprocess.run(
+        ["git", *HARDENED, "--literal-pathspecs", "diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv",
+         "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", f"{shelf}^", shelf, "--", *paths],
+        cwd=root, capture_output=True, check=False)
+    if patch.returncode != 0:
+        detail = patch.stderr.decode("utf-8", "replace").strip() or f"exit {patch.returncode}"
+        raise GitError(f"git diff of the shelf {shelf} failed: {detail}")
+    if not patch.stdout:
+        return []
+    for extra in (["--check"], []):
+        applied = subprocess.run(["git", *HARDENED, "apply", "--index", "--whitespace=nowarn", *extra], cwd=root,
+                                 input=patch.stdout, capture_output=True, check=False)
+        if applied.returncode != 0:
+            return sorted(paths)
+    return []
+
+
+def drop_shelf(worktree: Path, ref: str) -> None:
+    """Delete the shelf ref; a ref that is already gone is fine."""
+    subprocess.run(["git", *HARDENED, "update-ref", "-d", ref], cwd=Path(worktree), capture_output=True, check=False)
+
+
+def drop_shelves(repo: Path, run_id: str) -> list[str]:
+    """Delete every shelf ref of run `run_id` (`refs/agentflow/shelf/<run id>/...`) and return the refs it deleted.
+    Never raises: a run id git refuses in a ref name, or a git that fails, deletes nothing (or what it could)."""
+    prefix = f"refs/agentflow/shelf/{run_id}/"
+    if not run_id or "/" in run_id:
+        return []
+    try:
+        if subprocess.run(["git", "check-ref-format", f"{prefix}x"], capture_output=True, timeout=30).returncode != 0:
+            return []
+        listed = subprocess.run(["git", *HARDENED, "for-each-ref", "--format=%(refname)", prefix], cwd=Path(repo),
+                                capture_output=True, text=True, check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    dropped = []
+    for ref in listed.stdout.splitlines() if listed.returncode == 0 else []:
+        if not ref.startswith(prefix):
+            continue
+        try:
+            done = subprocess.run(["git", *HARDENED, "update-ref", "-d", ref], cwd=Path(repo), capture_output=True,
+                                  check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0:
+            dropped.append(ref)
+    return dropped
 
 
 def dirty_paths(worktree: Path) -> list[str]:
