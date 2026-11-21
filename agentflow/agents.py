@@ -32,6 +32,9 @@ WATCH_MAX_POLL_S = 5.0  # the watchdog wakes at least this often, and four times
 WATCH_MIN_POLL_S = 0.05  # ... but never more often than this, however small the limit
 WATCHDOG_THREAD = "agentflow-watchdog"
 SUBAGENT_TOOLS = ("Agent", "Task")
+# A dispatching read-only call (`AgentCall.dispatches`) may start `general-purpose` sub-agents only: under `dontAsk` a
+# sub-agent of another type would run in the permission mode its own definition sets, so `dontAsk` refuses it instead.
+DISPATCH_ALLOW = tuple(f"{tool}(general-purpose)" for tool in SUBAGENT_TOOLS)
 AUTOCOMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"  # Claude Code's own cap on the window `autocompact_pct` is read against
 SHELL_ENV_FILE_ENV = "CLAUDE_ENV_FILE"  # a script Claude Code sources in its Bash tool's shell before each command
 SYNTHETIC_MODEL = "<synthetic>"  # Claude Code's own error messages, shown as assistant turns: no model replied
@@ -116,8 +119,8 @@ class AgentCall:
     read_only: bool = False  # Claude gets only `READ_ONLY_TOOLS` and no MCP server; Codex a read-only sandbox (fresh session)
     # a `read_only_roles` session: `dontAsk`, `REVIEW_TOOLS`, read-only git, writes only in `add_dirs`, no MCP server
     read_only_role: bool = False
-    # a wave session (`Step.wave_size`), which starts one sub-agent per member: a `read_only_role` call also gets (and
-    # is allowed) `SUBAGENT_TOOLS`. Its sub-agents run under the same `--tools`, mode and rules; nothing else changes.
+    # a wave session (`Step.wave_size`), which starts one sub-agent per member: a `read_only_role` call also gets
+    # `SUBAGENT_TOOLS`, allowed for `general-purpose` sub-agents only (`DISPATCH_ALLOW`). Nothing else changes.
     dispatches: bool = False
     idle_s: float | None = None  # end the session after this long with no stream line (`watchdog`); None: no watchdog
     tool_idle_s: float | None = None  # the same limit while a tool call is open, or for an agent that `tracks_tools` not
@@ -1077,7 +1080,7 @@ class ClaudeAgent(_CliAgent):
             pass
         permissions: dict = {"deny": deny}
         if call.read_only_role:  # deny rules win over the allow rules, so `git diff --output=` stays out of reach
-            permissions = {"allow": [*read_only_allow(call.add_dirs), *(SUBAGENT_TOOLS if call.dispatches else ())],
+            permissions = {"allow": [*read_only_allow(call.add_dirs), *(DISPATCH_ALLOW if call.dispatches else ())],
                            "deny": [*deny, *READ_ONLY_DENY]}
         argv += ["--settings", json.dumps({"permissions": permissions})]
         if call.system_prompt_file is not None:

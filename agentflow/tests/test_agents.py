@@ -283,7 +283,10 @@ def test_a_wave_review_call_gets_the_subagent_tools_and_stays_read_only(cfg, cal
     wave_perms = json.loads(wave[wave.index("--settings") + 1])["permissions"]
     plain_perms = json.loads(plain[plain.index("--settings") + 1])["permissions"]
     assert plain_perms["allow"] == read_only_allow([ws])
-    assert wave_perms["allow"] == [*read_only_allow([ws]), "Agent", "Task"]  # `dontAsk` runs only what is allowed
+    # `dontAsk` runs only what is allowed, and only a `general-purpose` sub-agent: a custom type would run in the
+    # permission mode its own definition sets, so it is refused (and its call comes back an error, `ok: false`)
+    assert wave_perms["allow"] == [*read_only_allow([ws]), "Agent(general-purpose)", "Task(general-purpose)"]
+    assert "Agent" not in wave_perms["allow"] and "Task" not in wave_perms["allow"]
     assert wave_perms["deny"] == plain_perms["deny"]  # the denies bind the session and its sub-agents alike
     assert ("--permission-mode", "dontAsk") in pairs(wave) and "bypassPermissions" not in wave
     assert "Edit" not in wave[wave.index("--tools") + 1].split(",")  # still no editing tool for anyone

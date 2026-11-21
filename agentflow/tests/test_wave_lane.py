@@ -547,6 +547,7 @@ def test_profile_L_keeps_a_review_session_per_task(waves):
 
 
 W = "build/build/wave-1"
+DISSOLVED_REF = SHELVES + "/{run}/build.build.wave-1.dissolved"  # the dissolve's own shelf, beside the attribution's
 
 
 def dissolved(events: list[dict]) -> list[tuple[str, str]]:
@@ -579,8 +580,8 @@ def assert_members_ran_alone(waves, git, run, reason: str) -> None:
     assert files_of(git, waves.root, "Task 3: Third thing") == [PLAN_PATH, "src/three.py"]
     assert git(waves.root, "show", "HEAD:src/two.py") == "alone = 2\n"  # the member's own build, not the wave's
     assert git(waves.root, "show", "HEAD:src/three.py") == "alone = 3\n"
-    assert shelves(git, waves.root) == [f"{SHELVES}/{run.id}/build.build.wave-1"]
-    assert event["shelf"] == git(waves.root, "rev-parse", f"{SHELVES}/{run.id}/build.build.wave-1").strip()
+    assert shelves(git, waves.root) == [DISSOLVED_REF.format(run=run.id)]
+    assert event["shelf"] == git(waves.root, "rev-parse", DISSOLVED_REF.format(run=run.id)).strip()
     assert once_each(git, waves.root) and git(waves.root, "status", "--porcelain") == ""
 
 
@@ -863,3 +864,79 @@ def test_the_review_wave_alone_may_start_reviewers(waves):
     assert ("--tools", "Read,Grep,Glob,Bash,Write") in pairs(member_argv)
     assert ("--permission-mode", "dontAsk") in pairs(wave_argv)
     assert "--tools" not in [c for c in calls if c["step"] == WAVE][-1]["argv"]  # the build wave is not read-only
+
+
+def test_a_dissolve_killed_part_way_through_its_restore_keeps_the_whole_shelf(waves, git, monkeypatch):
+    # the runner dies after the dissolve restored its first path: the resumed dissolve must not shelve the half-restored
+    # tree over the first shelf, so the shelf still holds every path the wave changed
+    from agentflow import wave_lane
+    from agentflow.gitops import restore_paths
+
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act(subs=[sub(2), {"description": "Task 7: x", "write": {"src/three.py": "n = 3\n"}}])],
+                  IMPL.format(n=2): [alone(2)], IMPL.format(n=3): [alone(3)]})
+    state = {"killed": False}
+
+    def dies_after_one(worktree, paths, sha):
+        if not state["killed"] and len(paths) > 1:
+            state["killed"] = True
+            restore_paths(worktree, paths[:1], sha)
+            raise KeyboardInterrupt
+        return restore_paths(worktree, paths, sha)
+
+    monkeypatch.setattr(wave_lane, "restore_paths", dies_after_one)
+    with pytest.raises(KeyboardInterrupt):
+        build(waves, run)
+    first = git(waves.root, "rev-parse", DISSOLVED_REF.format(run=run.id)).strip()
+    assert not dissolved(run.events.read())
+    assert build(waves, run) == ("done", True)
+    [event] = [e for e in run.events.read() if e["type"] == "wave_dissolved"]
+    assert event["shelf"] == first == git(waves.root, "rev-parse", DISSOLVED_REF.format(run=run.id)).strip()
+    assert git(waves.root, "show", f"{first}:src/two.py") == "n = 2\n"  # both of the wave's paths, kept
+    assert git(waves.root, "show", f"{first}:src/three.py") == "n = 3\n"
+    assert_members_ran_alone(waves, git, run, "wave_dispatch")
+
+
+def test_a_dissolve_after_attribution_keeps_the_attributions_shelf(waves, git):
+    # the attribution sets member 3 aside (it strayed) and shelves the wave's tree; the gates' fix then strays again
+    waves.configure({**BIG, **WAVES, "gates": {"two": {"run": "test ! -f src/two.py || grep -q fixed src/two.py"}},
+                     "gate_sets": {"build": ["two"]}})
+    run = begin_build(waves, wave_plan())
+    strays = sub(3, write={"src/three.py": "n = 3\n", "src/zz.py": "zz = 1\n"})
+    fix = {"write": {"src/two.py": "fixed = 2\n", "src/yy.py": "yy = 1\n"},
+           "result": {"status": "done", "summary": "fixed two", "tasks": [report(2)]}}
+    waves.script({WAVE: [wave_act(subs=[sub(2), strays], tasks=[report(2), report(3, files=["src/three.py",
+                                                                                         "src/zz.py"])]), fix],
+                  IMPL.format(n=2): [alone(2, "fixed = 2  # alone\n")], IMPL.format(n=3): [alone(3)]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert dissolved(events) == [(W, "scope_violation")]
+    first = next(e["shelf"] for e in events if e["type"] == "wave_attributed")
+    assert git(waves.root, "rev-parse", f"{SHELVES}/{run.id}/build.build.wave-1").strip() == first  # not overwritten
+    assert git(waves.root, "show", f"{first}:src/zz.py") == "zz = 1\n"  # the set-aside member's stray, still kept
+    shelf = next(e["shelf"] for e in events if e["type"] == "wave_dissolved")
+    assert shelf != first and git(waves.root, "show", f"{shelf}:src/yy.py") == "yy = 1\n"
+    assert sorted(shelves(git, waves.root)) == sorted([f"{SHELVES}/{run.id}/build.build.wave-1",
+                                                       DISSOLVED_REF.format(run=run.id)])
+    assert not {"src/zz.py", "src/yy.py"} & branch_files(git, waves.root) and once_each(git, waves.root)
+
+
+def test_a_wave_past_its_attribution_is_never_dissolved(waves, git, monkeypatch):
+    # task 3 commits while task 2 parks; on resume the dispatch rules have got stricter. The check ran before the
+    # attribution and is not run again, and a dissolve once a member committed refuses to move any path.
+    run = begin_build(waves, wave_plan())
+    two = {**F1, "file": "src/two.py", "text": "F2: two is wrong"}
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: [two], 3: []})],
+                  REVIEW.format(n=2): [review(two), review(two)]})
+    assert build(waves, run) == ("stopped", True)
+    assert "Task 3: Third thing" in subjects(git, waves.root)
+    monkeypatch.setattr("agentflow.wave.dispatch_violations", lambda subagents, members, model: ["stricter now"])
+    approve(run, REVIEW.format(n=2), by="me")
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert not dissolved(events) and not [e for e in events if e["type"] == "guard_tripped"]
+    assert git(waves.root, "show", "HEAD:src/three.py") == "n = 3\n" and "Task 2: Second thing" in subjects(git, waves.root)
+    tree = git(waves.root, "rev-parse", "HEAD^{tree}").strip()
+    assert waves.executor(run)._dissolve(W, "test") is False  # refused: nothing moves
+    assert not dissolved(run.events.read()) and git(waves.root, "rev-parse", "HEAD^{tree}").strip() == tree
+    assert git(waves.root, "status", "--porcelain") == "" and (waves.root / "src/three.py").read_text() == "n = 3\n"
