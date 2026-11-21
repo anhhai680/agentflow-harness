@@ -239,6 +239,53 @@ def test_a_member_writing_outside_its_files_is_reverted_and_runs_alone(waves, gi
     assert shelves(git, waves.root) == [f"{SHELVES}/{run.id}/build.build.wave-1"]
 
 
+def test_line_ranges_of_one_file_never_share_a_wave(waves, git):
+    # the writing-plans form: `Modify: \`path:line-line\``. Two ranges of one file are one shared file.
+    run = begin_build(waves, wave_plan(files={2: ["src/core.py:1-5"], 3: ["src/core.py:10-20"]}))
+    waves.script({IMPL.format(n=2): [{"write": {"src/core.py": "a = 2\n"}, "result": DONE_RESULT}],
+                  IMPL.format(n=3): [{"write": {"src/core.py": "a = 2\nb = 3\n"}, "result": DONE_RESULT}]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert demoted(events) == [(3, "shared_files")]
+    assert WAVE not in steps(waves.calls()) and not [e for e in events if e["type"] == "wave_started"]
+    assert files_of(git, waves.root, "Task 2: Second thing") == [PLAN_PATH, "src/core.py"]
+    assert files_of(git, waves.root, "Task 3: Third thing") == [PLAN_PATH, "src/core.py"]
+    assert git(waves.root, "show", "HEAD:src/core.py") == "a = 2\nb = 3\n"
+
+
+def test_a_wave_reads_line_ranged_files_as_their_paths(waves, git):
+    run = begin_build(waves, wave_plan(files={2: ["src/two.py:1-5"], 3: ["./src/three.py:10-20"]}))
+    waves.script({WAVE: [wave_act(tasks=[report(2, files=["src/two.py:1-5"]), report(3, files=["src/three.py"])])],
+                  RWAVE: [review_wave_act()]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    [attributed] = [e for e in events if e["type"] == "wave_attributed"]
+    assert attributed["owners"] == {"2": ["src/two.py"], "3": ["src/three.py"]} and attributed["strays"] == []
+    assert scope_violations(events) == [] and attributed["out"] == {}
+    assert files_of(git, waves.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
+    assert files_of(git, waves.root, "Task 3: Third thing") == [PLAN_PATH, "src/three.py"]
+    cards = run.agent_dir / "wave" / "wave-1"
+    assert "- `src/three.py`" in (cards / "task-3.md").read_text(encoding="utf-8")
+    review_card = (cards / "review-3.md").read_text(encoding="utf-8")
+    assert f"git diff {start_head(events)} -- ':(literal)src/three.py'" in review_card
+    assert "10-20" not in review_card.split("git diff", 1)[1].split("\n", 1)[0]
+
+
+def test_a_stray_both_reports_name_sets_both_members_aside(waves, git):
+    run = begin_build(waves, wave_plan())
+    shared = sub(3, write={"src/three.py": "n = 3\n", "src/zz.py": "zz = 1\n"})
+    waves.script({WAVE: [wave_act(subs=[sub(2), shared], tasks=[report(2, files=["src/two.py", "src/zz.py"]),
+                                                                report(3, files=["src/three.py", "src/zz.py"])])],
+                  IMPL.format(n=2): [alone(2)], IMPL.format(n=3): [alone(3)]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert scope_violations(events) == [(2, "src/zz.py"), (3, "src/zz.py")]
+    assert demoted(events) == [(2, "scope_violation"), (3, "scope_violation")]
+    assert git(waves.root, "show", "HEAD:src/two.py") == "alone = 2\n"  # neither kept with its work reverted
+    assert git(waves.root, "show", "HEAD:src/three.py") == "alone = 3\n"
+    assert "src/zz.py" not in branch_files(git, waves.root)
+
+
 def test_a_blocked_member_is_set_aside_and_the_other_commits(waves, git):
     run = begin_build(waves, plan_text(DEPENDS, count=4, files=FILES, groups=GROUPS))
     waves.script({WAVE: [wave_act(tasks=[report(2), report(3, status="blocked")])],
@@ -299,7 +346,8 @@ def test_grouped_tasks_are_never_batched(waves):
 def test_a_member_editing_a_parked_tasks_file_is_reverted(waves, git, monkeypatch, held):
     # Task 1 parks with its work shelved; tasks 2 and 3 do not wait on it and form the wave, whose third sub-agent
     # also writes the parked task's file (its report does not name it). `held`: the park records its paths as held
-    # (`step_parked.paths`, as an older engine's park did), so they are the parked task's to commit.
+    # (`step_parked.paths`, as an older engine's park did), so they are the parked task's to commit. No report names
+    # the stray, so the runner cannot tell whose work it reverted: both members are set aside and built alone.
     run = begin_build(waves, plan_text({1: "none", 2: "none", 3: "none"}, count=3, files=FILES, groups=GROUPS))
     if held:
         emit = run.emit
@@ -312,16 +360,18 @@ def test_a_member_editing_a_parked_tasks_file_is_reverted(waves, git, monkeypatc
         monkeypatch.setattr(run, "emit", recording_paths)
     intruder = sub(3, write={"src/three.py": "n = 3\n", "src/one.py": "not yours\n"})
     waves.script({IMPL.format(n=1): [{"write": {"src/one.py": "one = 1\n"}, **BLOCKED}],
-                  WAVE: [wave_act(subs=[sub(2), intruder])]})
+                  WAVE: [wave_act(subs=[sub(2), intruder])], IMPL.format(n=2): [alone(2)], IMPL.format(n=3): [alone(3)]})
     assert build(waves, run) == ("stopped", True)  # the parked task is the run's wait once nothing else can run
     events = run.events.read()
     (parked,) = [e for e in events if e["type"] == "step_parked"]
     assert parked["key"] == IMPL.format(n=1) and parked["shelved"] == ["src/one.py"]
     assert scope_violations(events) == [(None, "src/one.py")]
+    assert demoted(events) == [(2, "scope_violation"), (3, "scope_violation")]
     assert not (waves.root / "src/one.py").exists()  # back as the wave's start had it: the parked task's state
     assert "src/one.py" not in branch_files(git, waves.root)  # in no member's commit
     assert files_of(git, waves.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
     assert files_of(git, waves.root, "Task 3: Third thing") == [PLAN_PATH, "src/three.py"]
+    assert git(waves.root, "show", "HEAD:src/three.py") == "alone = 3\n"  # built alone, not the wave's
     assert git(waves.root, "show", f"{parked['shelf']}:src/one.py") == "one = 1\n"  # its own work, untouched
 
 
@@ -369,7 +419,7 @@ def test_one_review_wave_reviews_both_members(waves, git):
     assert f"- Review Task 2: Second thing: `{cards / 'review-2.md'}`" in prompt and "{wave_cards}" not in prompt
     card = (cards / "review-2.md").read_text(encoding="utf-8")
     assert "Task 2 test" in card and "Task 3 test" not in card  # the member's own task text
-    assert f"git diff {start_head(events)} -- src/two.py" in card and "{task_n}" not in card
+    assert f"git diff {start_head(events)} -- ':(literal)src/two.py'" in card and "{task_n}" not in card
     assert "## When you finish" not in card and '{"n": 2, "findings"' in card  # it reports in its final message
     assert subjects(git, waves.root)[:2] == ["Task 3: Third thing", "Task 2: Second thing"]
 
@@ -397,10 +447,10 @@ def test_a_members_review_range_holds_only_its_files(waves, git):
     assert build(waves, run) == ("done", True)
     sha = start_head(run.events.read())
     prompt = prompt_of(waves.calls(), REVIEW.format(n=3))  # the re-review, after Task 2 committed on the wave's start
-    assert f"git diff {sha} -- src/three.py" in prompt
+    assert f"git diff {sha} -- ':(literal)src/three.py'" in prompt
     assert f"`{sha}..worktree, limited to src/three.py`" in prompt
     card = (run.agent_dir / "wave" / "wave-1" / "review-3.md").read_text(encoding="utf-8")
-    assert f"git diff {sha} -- src/three.py" in card and "src/two.py" not in card
+    assert f"git diff {sha} -- ':(literal)src/three.py'" in card and "src/two.py" not in card
 
 
 @pytest.mark.parametrize(("fixer", "other"), [(3, 2), (2, 3)])
@@ -485,7 +535,7 @@ def test_a_missing_reviewer_report_falls_back_to_its_own_review(waves):
     calls = steps(waves.calls())
     assert calls[-2:] == [RWAVE, REVIEW.format(n=3)] and REVIEW.format(n=2) not in calls
     assert [e["key"] for e in wave_reviews(run.events.read())] == [REVIEW.format(n=2)]
-    assert "-- src/three.py" in prompt_of(waves.calls(), REVIEW.format(n=3))
+    assert "-- ':(literal)src/three.py'" in prompt_of(waves.calls(), REVIEW.format(n=3))
 
 
 def test_a_review_wave_that_stops_is_dropped(waves, notified):

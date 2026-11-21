@@ -147,7 +147,7 @@ class WaveLane:
         if last is None or str(n) in (last.get("out") or {}):
             return None
         task = self._plan_tasks().get(n) if n is not None else None
-        declared = sources.task_files(task) if task is not None else []
+        declared = wave.declared_paths(task) if task is not None else []
         return sorted({*(str(p) for p in (last.get("owners") or {}).get(str(n)) or []), *declared})
 
     def wave_revert_strays(self, tkey: str, owned: list[str], base: dict[str, str]) -> None:
@@ -168,7 +168,7 @@ class WaveLane:
         for member, paths in (last.get("owners") or {}).items():
             other = tasks.get(int(member)) if member.isdigit() and member != str(n) else None
             if other is not None:
-                others.update([*(str(p) for p in paths or []), *sources.task_files(other)])
+                others.update([*(str(p) for p in paths or []), *wave.declared_paths(other)])
         mine = set(owned)
         plan = self.ctx.values.get("plan") or ""
         now = snapshot(self.worktree)
@@ -267,7 +267,7 @@ class WaveLane:
         sized = self._sized_answers({f"{prefix}/task-{t.n}/implement" for t in tasks})
         risky = {t.n for t in tasks
                  if (answers := sized.get(f"{prefix}/task-{t.n}/implement")) is not None and sizing.flags(answers)["risk"]}
-        security = {t.n for t in tasks if overlays.touches_security(self.cfg, sources.task_files(t))}
+        security = {t.n for t in tasks if overlays.touches_security(self.cfg, wave.declared_paths(t))}
         committed = {t.n for t in tasks if not t.open or self._committed(f"{prefix}/task-{t.n}")}
         members, demotions = wave.form_wave(
             wave.group_candidates(tasks, task, skip), by_n, committed=committed,
@@ -384,7 +384,7 @@ class WaveLane:
             extra = {**self._step_extra(f"{prefix}/task-{task.n}/implement", self._task_extra(task, rel)),
                      "result_file": CARD_RESULT}
             body = build_prompt(self.cfg, member_step, self.ctx, {}, extra, "first", card=True)
-            allowed = [f"- `{path}`" for path in sources.task_files(task)]
+            allowed = [f"- `{path}`" for path in wave.declared_paths(task)]
             allowed += [f"- a new test file in `{folder or '.'}/`" for folder in sorted(wave.allowed_dirs(task))]
             member = fmt(rules, {"task_n": str(task.n), "allowed_files": "\n".join(allowed)})
             safeio.write_text(cards[task.n], f"{body.rstrip()}\n\n{member.strip()}\n")
@@ -431,13 +431,16 @@ class WaveLane:
         reports = self._reports(key, members)
         found = wave.attribute(self._changed(start_tree, tree), members, reports, rel)
         out: dict[int, str] = {}
+        # A stray no report names (the plan file aside: it is nobody's work) is the work of a member the runner cannot
+        # tell, so every member is set aside: none is committed with its work reverted.
+        unowned = any(not charged for path, charged in found.strays.items() if path != rel)
         for task in members:
             report = reports.get(task.n)
             if report is None:
                 out[task.n] = "no_report"
             elif report.status in SET_ASIDE:
                 out[task.n] = report.status
-            elif task.n in found.strays.values():
+            elif unowned or any(task.n in charged for charged in found.strays.values()):
                 out[task.n] = "scope_violation"
         moving = sorted({*found.strays, *(p for n in out for p in found.owners.get(n, []))})
         if moving and shelf is None:
@@ -474,10 +477,12 @@ class WaveLane:
         self._record_strays(prefix, key, number, found.strays)
         return "scope_violation" if found.strays else attributed
 
-    def _record_strays(self, prefix: str, key: str, number: int, strays: dict[str, int | None]) -> None:
-        for path, owner in sorted(strays.items()):
-            self.run.emit("scope_violation", key=f"{prefix}/task-{owner}" if owner is not None else key, task=owner,
-                          path=path, wave=number)
+    def _record_strays(self, prefix: str, key: str, number: int, strays: dict[str, tuple[int, ...]]) -> None:
+        """One `scope_violation` per stray and member whose report names it, or one on the wave's key when none does."""
+        for path, charged in sorted(strays.items()):
+            for owner in charged or (None,):
+                self.run.emit("scope_violation", key=f"{prefix}/task-{owner}" if owner is not None else key,
+                              task=owner, path=path, wave=number)
 
     def _attributed_since_done(self, key: str) -> bool:
         """Whether the wave was attributed after its session last finished `done`: its dispatch was checked then."""

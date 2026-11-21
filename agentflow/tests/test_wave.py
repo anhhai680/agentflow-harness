@@ -14,6 +14,8 @@ from agentflow.wave import (
     attribute,
     candidates,
     candidates_text,
+    declared_path,
+    declared_paths,
     depends_transitively,
     dispatch_violations,
     form_wave,
@@ -95,6 +97,50 @@ def test_a_member_failing_the_check_is_demoted(case, reason):
         task_block(4, "Task 1", group=None, files=("src/d.py",)),
     )
     assert wave_of(tasks, by_n, serial_paths=["migrations/**"]) == ([], [Demotion(3, reason)])
+
+
+@pytest.mark.parametrize(("entry", "path"), [
+    ("src/core.py", "src/core.py"),
+    ("src/core.py:123-145", "src/core.py"),  # the writing-plans skill's `Modify:` form
+    ("src/core.py:12", "src/core.py"),
+    ("src/core.py:3,9-11", "src/core.py"),
+    ("./src/core.py:1-5", "src/core.py"),
+    ("tests/test_core.py::test_name", "tests/test_core.py::test_name"),  # not a line suffix: left as it is
+    ("src/core.py (new)", None),
+    ("run pytest -q", None),
+    ("fn()", None),
+])
+def test_declared_path_cuts_line_suffixes_and_drops_non_paths(entry, path):
+    assert declared_path(entry) == path
+
+
+def test_declared_paths_read_the_writing_plans_form_once_each():
+    tasks, _ = plan(task_block(2, files=("src/core.py:1-5", "src/core.py:10-20", "./tests/test_core.py", "a b.py")))
+    assert declared_paths(tasks[0]) == ["src/core.py", "tests/test_core.py"]
+
+
+def test_line_ranges_of_one_file_are_shared_files():
+    tasks, by_n = plan(task_block(2, "Task 1", files=("src/core.py:1-5",)),
+                       task_block(3, "Task 1", files=("src/core.py:10-20",)))
+    assert wave_of(tasks, by_n) == ([], [Demotion(3, "shared_files")])
+    assert candidates(plan(task_block(2, group=None, files=("src/core.py:1-5",)),
+                           task_block(3, group=None, files=("src/core.py:10-20",)))[0], []) == []
+
+
+def test_a_line_range_on_a_serial_path_is_serial():
+    tasks, by_n = plan(task_block(2, "Task 1", files=("src/a.py",)),
+                       task_block(3, "Task 1", files=("migrations/0001.sql:1-9",)))
+    assert wave_of(tasks, by_n, serial_paths=["migrations/**"]) == ([], [Demotion(3, "serial_path")])
+
+
+def test_attribution_reads_declared_line_ranges_and_reported_ones():
+    tasks, _ = plan(task_block(2, files=("src/a.py:1-5", "tests/test_a.py:3")),
+                    task_block(3, files=("./src/b.py:2-9",)))
+    reports = {3: Report(3, "done", "", ("src/z.py:4",), ())}
+    att = attribute(["src/a.py", "src/b.py", "src/z.py", "tests/test_a2.py"], tasks, reports, "p.md")
+    assert att.owners == {2: ["src/a.py", "tests/test_a2.py"], 3: ["src/b.py"]}
+    assert att.strays == {"src/z.py": (3,)}
+    assert allowed_dirs(tasks[0]) == {"tests"}
 
 
 def test_a_dependency_through_another_task_is_a_dependency_on_the_member():
@@ -327,7 +373,7 @@ def test_attribution_by_declared_files_and_test_dirs():
     )
     assert isinstance(att, Attribution)
     assert att.owners == {2: ["src/a.py", "tests/test_a_extra.py"], 3: []}
-    assert att.strays == {"README.md": None}
+    assert att.strays == {"README.md": ()}
 
 
 def test_a_member_with_no_paths_gets_an_empty_list_and_order_follows_changed():
@@ -338,12 +384,12 @@ def test_a_member_with_no_paths_gets_an_empty_list_and_order_follows_changed():
 
 def test_a_stray_is_charged_to_the_member_that_reports_it():
     reports = {3: Report(3, "done", "", ("src/z.py",), ())}
-    assert attribute(["src/z.py"], two_tasks(), reports, "p.md").strays == {"src/z.py": 3}
+    assert attribute(["src/z.py"], two_tasks(), reports, "p.md").strays == {"src/z.py": (3,)}
 
 
-def test_a_stray_reported_by_several_members_goes_to_the_first_in_plan_order():
+def test_a_stray_reported_by_several_members_is_charged_to_each_of_them():
     reports = {n: Report(n, "done", "", ("src/z.py",), ()) for n in (2, 3)}
-    assert attribute(["src/z.py"], two_tasks(), reports, "p.md").strays == {"src/z.py": 2}
+    assert attribute(["src/z.py"], two_tasks(), reports, "p.md").strays == {"src/z.py": (2, 3)}
 
 
 def test_a_test_file_in_a_shared_dir_goes_to_the_member_that_reports_it():
@@ -357,35 +403,35 @@ def test_a_test_file_in_a_shared_dir_goes_to_the_member_that_reports_it():
 def test_a_test_file_in_a_shared_dir_nobody_reports_is_a_stray():
     att = attribute(["tests/test_new.py"], two_tasks(b_files=SHARED), {}, "p.md")
     assert att.owners == {2: [], 3: []}
-    assert att.strays == {"tests/test_new.py": None}
+    assert att.strays == {"tests/test_new.py": ()}
 
 
-def test_a_test_file_in_a_shared_dir_reported_by_two_members_is_a_stray_charged_to_the_first():
+def test_a_test_file_in_a_shared_dir_reported_by_two_members_is_a_stray_charged_to_both():
     reports = {n: Report(n, "done", "", ("tests/test_new.py",), ()) for n in (2, 3)}
     att = attribute(["tests/test_new.py"], two_tasks(b_files=SHARED), reports, "p.md")
     assert att.owners == {2: [], 3: []}
-    assert att.strays == {"tests/test_new.py": 2}
+    assert att.strays == {"tests/test_new.py": (2, 3)}
 
 
 def test_a_non_test_file_in_a_members_test_dir_is_a_stray():
     att = attribute(["tests/data.json"], two_tasks(), {}, "p.md")
-    assert att.strays == {"tests/data.json": None}
+    assert att.strays == {"tests/data.json": ()}
 
 
 def test_a_file_declared_by_two_members_falls_through_to_the_later_rules():
     tasks = two_tasks(a_files=("src/s.py", "tests/test_a.py"), b_files=("src/s.py", "tests/test_b.py"))
     att = attribute(["src/s.py"], tasks, {}, "p.md")
     assert att.owners == {2: [], 3: []}
-    assert att.strays == {"src/s.py": None}
+    assert att.strays == {"src/s.py": ()}
 
 
 def test_the_plan_file_is_always_a_stray_even_when_a_member_declares_it():
     tasks = two_tasks(a_files=("docs/plans/p.md", "tests/test_a.py"))
-    assert attribute(["docs/plans/p.md"], tasks, {}, "docs/plans/p.md").strays == {"docs/plans/p.md": None}
+    assert attribute(["docs/plans/p.md"], tasks, {}, "docs/plans/p.md").strays == {"docs/plans/p.md": ()}
     reports = {3: Report(3, "done", "", ("docs/plans/p.md",), ())}
     att = attribute(["docs/plans/p.md"], tasks, reports, "docs/plans/p.md")
     assert att.owners == {2: [], 3: []}
-    assert att.strays == {"docs/plans/p.md": 3}
+    assert att.strays == {"docs/plans/p.md": (3,)}
 
 
 @pytest.mark.parametrize(

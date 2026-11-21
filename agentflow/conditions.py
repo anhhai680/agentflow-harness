@@ -558,7 +558,7 @@ def _explain_waves(cfg: Config, phase: Phase, key: str, ctx: Ctx, model: str | N
         tasks = sources.parse_plan(ctx.repo / rel)
     except (OSError, UnicodeDecodeError):
         return []
-    security = {t.n for t in tasks if overlays.touches_security(cfg, sources.task_files(t))}
+    security = {t.n for t in tasks if overlays.touches_security(cfg, wave.declared_paths(t))}
     waves = wave.predict_waves(tasks, cap, cfg.parallel.serial_paths, security)
     return [
         ExplainLine(phase.name, f"{key}/wave-{i}", "run", f"wave-{i}: tasks {', '.join(map(str, members))}", model)

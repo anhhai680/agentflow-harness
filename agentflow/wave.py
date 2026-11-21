@@ -42,6 +42,10 @@ _PAIRS_LEAD = (
 
 REPORT_STATUSES = ("done", "blocked", "needs_human")
 TASK_DESCRIPTION = re.compile(r"^\s*(?:Review\s+)?Task\s+(\d+)\s*:")
+BUILD_DESCRIPTION = re.compile(r"^\s*Task\s+(\d+)\s*:")  # a wave's builder; its reviewer is `Review Task <n>:`
+REVIEW_DESCRIPTION = re.compile(r"^\s*Review\s+Task\s+(\d+)\s*:")
+_LINE_SUFFIX = re.compile(r":\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")  # `path:12`, `path:12-30`, `path:3,9-11`
+_NOT_A_PATH = re.compile(r"[\s()]")
 GENERAL_AGENT = "general-purpose"  # the only sub-agent type a wave may start: it runs the session's model
 _TEST_NAMES = ("test_*", "*_test.*", "*.test.*", "*.spec.*")
 
@@ -64,7 +68,25 @@ class Report:
 @dataclass(frozen=True)
 class Attribution:
     owners: dict[int, list[str]]
-    strays: dict[str, int | None]
+    strays: dict[str, tuple[int, ...]]  # each stray, and every member whose report names it (`()`: none does)
+
+
+def declared_path(text: str) -> str | None:
+    """The repository path a plan's file entry names: a trailing `:<line>[-<line>][,...]` and a leading `./` are cut
+    (`src/core.py:10-20` is `src/core.py`). None for an entry that is no path (it holds a space or a parenthesis)."""
+    path = _LINE_SUFFIX.sub("", text.strip())
+    while path.startswith("./"):
+        path = path[2:]
+    if not path or _NOT_A_PATH.search(path):
+        return None
+    return path
+
+
+def declared_paths(task: PlanTask) -> list[str]:
+    """The paths the task's file lines name (`sources.task_files`), each as `declared_path` reads it, once each and in
+    their order. Every wave read of a task's files goes through this."""
+    paths = (declared_path(entry) for entry in sources.task_files(task))
+    return list(dict.fromkeys(p for p in paths if p is not None))
 
 
 def depends_transitively(by_n: Mapping[int, PlanTask], start: int, target: int) -> bool:
@@ -122,7 +144,7 @@ def form_wave(
         )
         if reason is None:
             members.append(task)
-            member_files.update(sources.task_files(task))
+            member_files.update(declared_paths(task))
         elif not members:
             return [], [Demotion(task.n, reason)]
         else:
@@ -143,7 +165,7 @@ def _demotion_reason(
     security: Collection[int],
     model_of: Mapping[int, str],
 ) -> str | None:
-    files = sources.task_files(task)
+    files = declared_paths(task)
     if not files:
         return "no_files"
     if _touches_serial(files, serial_paths):
@@ -168,7 +190,7 @@ def candidates(tasks: Sequence[PlanTask], serial_paths: Sequence[str]) -> list[t
     disjoint, neither touches a serial path and neither depends, even through other tasks, on the other."""
     by_n = {t.n: t for t in tasks}
     files = {
-        t.n: sources.task_files(t)
+        t.n: declared_paths(t)
         for t in tasks
         if t.open and t.group is None
     }
@@ -275,7 +297,7 @@ def is_test_path(path: str) -> bool:
 
 def allowed_dirs(task: PlanTask) -> set[str]:
     """The directories of the task's declared files that are test paths: new test files may appear there."""
-    return {posixpath.dirname(path) for path in sources.task_files(task) if is_test_path(path)}
+    return {posixpath.dirname(path) for path in declared_paths(task) if is_test_path(path)}
 
 
 def attribute(
@@ -283,19 +305,21 @@ def attribute(
 ) -> Attribution:
     """Whose each changed path is. A declared file of exactly one member is that member's. A test path in the
     `allowed_dirs` of one member is that member's, and when several members hold the directory it goes to the one
-    member whose report names it. Any other path is a stray, charged to the first member in plan order whose report
-    names it, else to `None`; the plan file is always a stray."""
-    declared = {t.n: set(sources.task_files(t)) for t in members}
+    member whose report names it. Any other path is a stray, charged to every member whose report names it, in plan
+    order (`()` when no report does); the plan file is always a stray. Declared and reported paths are read as
+    `declared_path` reads them."""
+    declared = {t.n: set(declared_paths(t)) for t in members}
     dirs = {t.n: allowed_dirs(t) for t in members}
-    reported = {t.n: set(reports[t.n].files) for t in members if t.n in reports}
+    reported = {t.n: {p for p in map(declared_path, reports[t.n].files) if p is not None}
+                for t in members if t.n in reports}
     owners: dict[int, list[str]] = {t.n: [] for t in members}
-    strays: dict[str, int | None] = {}
+    strays: dict[str, tuple[int, ...]] = {}
     for path in dict.fromkeys(changed):
         owner = None if path == plan_rel else _owner(path, declared, dirs, reported)
         if owner is not None:
             owners[owner].append(path)
         else:
-            strays[path] = next((n for n in owners if path in reported.get(n, ())), None)
+            strays[path] = tuple(n for n in owners if path in reported.get(n, ()))
     return Attribution(owners, strays)
 
 

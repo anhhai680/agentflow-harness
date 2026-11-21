@@ -1001,11 +1001,12 @@ class FeatureLane:
                       owned: list[str] | None = None) -> dict[str, str]:
         """The review's `task_start_sha` and `diff_range`: from where the task started (`start_sha`, else
         `_task_start`), and for a wave member (`owned`, its files) cut to those files, so the wave's other members'
-        work, committed or not, is not in it."""
+        work, committed or not, is not in it. Each file is a `:(literal)` pathspec, so git's pathspec magic in a path
+        a plan names cannot widen the range."""
         sha = start_sha or self._task_start(phase, f"{tkey}/implement")
         if not owned:
             return {"task_start_sha": sha, "diff_range": f"{sha}..worktree"}
-        return {"task_start_sha": f"{sha} -- {' '.join(shlex.quote(p) for p in owned)}",
+        return {"task_start_sha": f"{sha} -- {' '.join(shlex.quote(f':(literal){p}') for p in owned)}",
                 "diff_range": f"{sha}..worktree, limited to {', '.join(owned)}"}
 
     def _fix_base(self, phase: Phase, tkey: str) -> dict[str, str]:
