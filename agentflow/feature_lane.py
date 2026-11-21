@@ -63,6 +63,15 @@ twice, with parking on or off), `forbidden_reverted` (a guard park's forbidden e
 A person's `approve --constraint` is `constraint_approved` (`constraint.py`) and the `constraint` field of
 `hitl_approved`.
 
+Waves. With `parallel.max_subagents` above 1 and the build phase on `claude` (`WaveLane.waves_on`: never in a refine
+round or a small plan's session), the walk asks `wave_lane.WaveLane.wave_at` before it builds a task. When the task has
+a `**Parallel group:**` and other open tasks of that group pass `wave.form_wave`'s checks, they are built together in
+one session that fans them out to sub-agents (`<step>/wave-<n>/implement`), the build gates run once on the combined
+tree, and each kept member is then reviewed and committed alone, in plan order, through `_run_task`. A member set aside
+by the wave's attribution, and a task the checks turn away (`parallel_demoted`), is built alone as above. A grouped task
+joins no batch. `_held_paths` holds the other uncommitted members' files, so a member's commit, park and shelf take
+only its own.
+
 `record_decisions` runs before an answered step resumes: an answer to a `spec_gap` question (or one
 given with `--record`) runs `record_step` and commits its `message` (default `Decide <question> in the
 <module> spec`) with only the files that step changed. `ambiguity`/`review_dispute`/`boundary` answers go in the task's
@@ -364,6 +373,21 @@ class FeatureLane:
                 previous, previous_n = impl_key, task.n
                 carry_prev = None  # committed by an earlier walk: never a carry source
                 continue
+            if self.waves_on(phase, step, small):
+                waved = self.wave_at(phase, step, plan, rel, prefix, task, tasks, held, small)
+                if waved == "stopped":
+                    return True, held, True
+                if waved == "ran":
+                    attempted = True
+                    self.run.refresh()
+                    carry_prev = None  # a wave's session is never a carry source
+                    if self._committed(tkey):
+                        previous, previous_n = impl_key, task.n
+                        continue
+                    if self._parked(tkey):
+                        held.add(task.n)
+                        continue
+                    # set aside by the wave's attribution: built alone below
             batch = (self._batch_of or {}).get(task.n) if not refine else None
             if self._parked(tkey) or park.waits_on(task, held, texts):
                 held.add(task.n)
@@ -407,15 +431,18 @@ class FeatureLane:
     def _batches(self, phase: Phase, step: Step, plan: Path, prefix: str, small: dict) -> dict[int, list[int]]:
         """Task number -> its batch (`step.batch`), decided once per run and kept in a `plan_batched` event, so a
         resume sees the same batches after their tasks were ticked. None in a small plan or a refine round. The last
-        `plan_batched` counts, so a member split out of its batch (`_split_out`) stays out; a batch of one is none."""
+        `plan_batched` counts, so a member split out of its batch (`_split_out`) stays out; a batch of one is none.
+        With waves on (`parallel.max_subagents` above 1), a task with a `**Parallel group:**` joins no batch."""
         if not step.batch or small.get("active") or self._refine_round(phase):
             return {}
         recorded = [e for e in self.run.events.read() if e["type"] == "plan_batched" and e.get("key") == prefix]
         if recorded:
             batches = [list(b) for b in recorded[-1].get("batches") or []]
         else:
-            batches = sources.plan_batches(sources.parse_plan(plan), int(step.batch.get("max_tasks", 3)),
-                                           int(step.batch.get("max_files", 3)))
+            tasks = sources.parse_plan(plan)
+            grouped = {t.n for t in tasks if t.group is not None} if self.cfg.parallel.max_subagents > 1 else set()
+            batches = sources.plan_batches(tasks, int(step.batch.get("max_tasks", 3)),
+                                           int(step.batch.get("max_files", 3)), skip=grouped)
             self.run.emit("plan_batched", key=prefix, batches=batches)
         return {n: batch for batch in batches if len(batch) > 1 for n in batch}
 
@@ -1123,11 +1150,13 @@ class FeatureLane:
     def _gates_hold(self, tkey: str, commit_key: str, gates: str | list[str]) -> bool:
         """The implementer's gates hold for the tree about to be committed. They run again unless the tree
         is the one they last passed on: a human may edit before approving a stop, and a reviewer could
-        edit too. A failure is a `gate_failed` stop on `<task>/commit`; approving it runs them again."""
+        edit too. A wave member's projected row also holds for a tree that differs from the wave's only by the boxes
+        the runner ticked and committed for the members before it (`WaveLane.wave_gated`). A failure is a
+        `gate_failed` stop on `<task>/commit`; approving it runs them again."""
         tree = snapshot(self.worktree)
         finished = [e for e in self.run.events.read()
                     if e["type"] == "step_finished" and e.get("key") == f"{tkey}/implement" and e.get("status") == "done"]
-        if finished and finished[-1].get("tree") == tree:
+        if finished and (finished[-1].get("tree") == tree or self.wave_gated(finished[-1], tree)):
             return True
         results = run_gates_reusing(self.cfg, self.run, commit_key, gates, self.worktree,
                                     self.run.gate_log_dir(commit_key), tree)
@@ -1141,8 +1170,9 @@ class FeatureLane:
         return False
 
     def _held_paths(self, tkey: str) -> set[str]:
-        """Files other parked tasks changed before they parked: theirs to commit, never this task's. A park
-        stops holding once its task commits after it (a task committed earlier can park in a refine round)."""
+        """Files other parked tasks changed before they parked, and the files the other uncommitted members of the
+        task's wave own (`WaveLane.wave_held`): theirs to commit, never this task's. A park stops holding once its task
+        commits after it (a task committed earlier can park in a refine round)."""
         events = self.run.events.read()
         last_commit = {e.get("key"): e["seq"] for e in events if e["type"] == "task_committed"}
         held: set[str] = set()
@@ -1152,7 +1182,7 @@ class FeatureLane:
             task = str(event.get("key", "")).rsplit("/", 1)[0]
             if task != tkey and last_commit.get(task, 0) < event["seq"]:
                 held.update(event.get("paths") or [])
-        return held
+        return held | self.wave_held(tkey)
 
     def _task_message(self, subject: str, tkey: str, open_findings: list[dict], refine: dict | None = None) -> str:
         parts = [subject]

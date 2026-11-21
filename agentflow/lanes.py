@@ -63,6 +63,7 @@ from agentflow.route_lane import RouteLane
 from agentflow.run_control import wait_for_agents
 from agentflow.sizing_lane import SizingLane
 from agentflow.sync_lane import SyncLane
+from agentflow.wave_lane import WaveLane
 from agentflow.state import TERMINAL, Run, workspaces_root
 
 Outcome = Literal["done", "skipped", "stopped"]
@@ -692,7 +693,7 @@ def _violation_text(violations: list[Violation]) -> str:
 # --------------------------------------------------------------------------- executor
 
 
-class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLane, RouteLane, GovernorLane):
+class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane, SizingLane, RouteLane, GovernorLane):
     """Runs a run's steps: `run_steps`/`run_step` (control flow, in `flow_control`), plan tasks and
     `finish` (in `feature_lane`), test expectations and fix-looping gate steps (in `bug_eval`) and the
     agent step lifecycle here. `dry_run` prints each agent's command line and calls nothing."""

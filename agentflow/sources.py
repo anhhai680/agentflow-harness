@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import re
 import stat
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -225,18 +225,20 @@ def task_size_warnings(task: PlanTask) -> list[str]:
     return warnings
 
 
-def plan_batches(tasks: list[PlanTask], max_tasks: int, max_files: int) -> list[list[int]]:
+def plan_batches(tasks: list[PlanTask], max_tasks: int, max_files: int,
+                 skip: Collection[int] = ()) -> list[list[int]]:
     """Runs of neighbouring small tasks that can share one implement session and one review.
 
     A task is small when it is open (unticked, not deferred) and names at most `max_files` files (every task has the same
     checkbox steps, so files are the only measure). It joins the open batch when it comes next in plan
     order, the batch holds fewer than `max_tasks`, and each task it depends on is in the batch or before
-    it, so running the batch in order never runs a task before its dependencies. Only batches of two or
+    it, so running the batch in order never runs a task before its dependencies. A task in `skip` (a grouped task
+    while waves are on) is never small: it joins no batch and ends the one before it. Only batches of two or
     more are returned. Pure: the same plan always gives the same batches."""
     batches: list[list[int]] = []
     current: list[int] = []
     for task in tasks:
-        small = task.open and task_size(task)[1] <= max_files
+        small = task.open and task.n not in skip and task_size(task)[1] <= max_files
         if (small and current and len(current) < max_tasks
                 and all(dep in current or dep < current[0] for dep in task.depends_on)):
             current.append(task.n)
