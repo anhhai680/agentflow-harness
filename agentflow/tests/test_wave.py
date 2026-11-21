@@ -6,12 +6,21 @@ import pytest
 from agentflow.sources import PlanTask, parse_plan_text
 from agentflow.wave import (
     REASONS,
+    TASK_DESCRIPTION,
+    Attribution,
     Demotion,
+    Report,
+    allowed_dirs,
+    attribute,
     candidates,
     candidates_text,
     depends_transitively,
+    dispatch_violations,
     form_wave,
     group_candidates,
+    is_test_path,
+    parse_reports,
+    parse_review_reports,
     predict_waves,
 )
 
@@ -224,3 +233,204 @@ def test_predict_waves_respects_the_cap_security_and_placed_tasks():
     assert predict_waves(tasks, 2, [], set()) == [[2, 3], [4, 5]]
     assert predict_waves(tasks, 3, [], {3}) == [[2, 4, 5]]
     assert predict_waves(tasks, 8, [], set()) == [[2, 3, 4, 5, 6]]
+
+
+def rep(n, *files, status="done"):
+    return {"n": n, "status": status, "summary": "s", "files": list(files), "tests_run": []}
+
+
+def test_reports_are_kept_for_members_only_and_read_into_tuples():
+    got = parse_reports(
+        [{"n": 2, "status": "done", "summary": "ok", "files": ["src/a.py"], "tests_run": ["pytest"]}, rep(9)],
+        {2, 3},
+    )
+    assert got == {2: Report(2, "done", "ok", ("src/a.py",), ("pytest",))}
+
+
+def test_missing_files_and_tests_run_mean_empty():
+    got = parse_reports([{"n": 2, "status": "blocked", "summary": ""}], {2})
+    assert got == {2: Report(2, "blocked", "", (), ())}
+
+
+def test_reports_fail_closed():
+    assert parse_reports([rep(2), rep(2), rep(9)], {2, 3}) == {}
+    assert parse_reports([rep(2), rep(2), rep(3)], {2, 3}).keys() == {3}
+    assert parse_reports("x", {2}) == {}
+    assert parse_reports({"n": 2}, {2}) == {}
+    assert parse_reports(None, {2}) == {}
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "task 2",
+        {"n": "2", "status": "done", "summary": ""},
+        {"n": True, "status": "done", "summary": ""},
+        {"n": 2, "status": "finished", "summary": ""},
+        {"n": 2, "status": "done", "summary": None},
+        {"n": 2, "status": "done", "summary": "", "files": "src/a.py"},
+        {"n": 2, "status": "done", "summary": "", "files": [1]},
+        {"n": 2, "status": "done", "summary": "", "tests_run": [None]},
+    ],
+)
+def test_a_malformed_report_is_dropped(entry):
+    assert parse_reports([entry], {1, 2}) == {}
+
+
+def test_a_malformed_duplicate_still_voids_the_member():
+    assert parse_reports([rep(2), {"n": 2, "status": "bad", "summary": ""}], {2}) == {}
+
+
+def test_review_reports_read_findings_and_fail_closed():
+    findings = [{"severity": "high", "text": "x"}]
+    assert parse_review_reports([{"n": 2, "findings": findings}, {"n": 3}], {2, 3}) == {2: findings, 3: []}
+    assert parse_review_reports([{"n": 2, "findings": findings}, {"n": 2, "findings": []}], {2}) == {}
+    assert parse_review_reports([{"n": 2, "findings": "none"}], {2}) == {}
+    assert parse_review_reports([{"n": 2, "findings": ["x"]}], {2}) == {}
+    assert parse_review_reports([{"n": 9, "findings": []}], {2}) == {}
+    assert parse_review_reports("x", {2}) == {}
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        ("tests/test_a.py", True),
+        ("src/a_test.go", True),
+        ("src/a.test.ts", True),
+        ("src/a.spec.ts", True),
+        ("src/a.py", False),
+        ("src/contest.py", False),
+        ("tests/conftest.py", False),
+        ("docs/test/notes.md", False),
+    ],
+)
+def test_is_test_path(path, expected):
+    assert is_test_path(path) is expected
+
+
+SHARED = ("src/b.py", "tests/test_b.py")
+
+
+def two_tasks(a_files=("src/a.py", "tests/test_a.py"), b_files=("src/b.py", "tests_b/test_b.py")):
+    tasks, _ = plan(task_block(2, files=a_files), task_block(3, files=b_files))
+    return tasks
+
+
+def test_allowed_dirs_are_the_directories_of_declared_test_paths():
+    t2 = two_tasks()[0]
+    assert allowed_dirs(t2) == {"tests"}
+
+
+def test_attribution_by_declared_files_and_test_dirs():
+    att = attribute(
+        ["src/a.py", "tests/test_a_extra.py", "README.md"], two_tasks(), {}, "docs/plans/p.md"
+    )
+    assert isinstance(att, Attribution)
+    assert att.owners == {2: ["src/a.py", "tests/test_a_extra.py"], 3: []}
+    assert att.strays == {"README.md": None}
+
+
+def test_a_member_with_no_paths_gets_an_empty_list_and_order_follows_changed():
+    att = attribute(["src/b.py", "src/a.py"], two_tasks(), {}, "p.md")
+    assert att.owners == {2: ["src/a.py"], 3: ["src/b.py"]}
+    assert list(att.owners) == [2, 3]
+
+
+def test_a_stray_is_charged_to_the_member_that_reports_it():
+    reports = {3: Report(3, "done", "", ("src/z.py",), ())}
+    assert attribute(["src/z.py"], two_tasks(), reports, "p.md").strays == {"src/z.py": 3}
+
+
+def test_a_stray_reported_by_several_members_goes_to_the_first_in_plan_order():
+    reports = {n: Report(n, "done", "", ("src/z.py",), ()) for n in (2, 3)}
+    assert attribute(["src/z.py"], two_tasks(), reports, "p.md").strays == {"src/z.py": 2}
+
+
+def test_a_test_file_in_a_shared_dir_goes_to_the_member_that_reports_it():
+    tasks = two_tasks(b_files=SHARED)
+    reports = {3: Report(3, "done", "", ("tests/test_new.py",), ())}
+    att = attribute(["tests/test_new.py"], tasks, reports, "p.md")
+    assert att.owners == {2: [], 3: ["tests/test_new.py"]}
+    assert att.strays == {}
+
+
+def test_a_test_file_in_a_shared_dir_nobody_reports_is_a_stray():
+    att = attribute(["tests/test_new.py"], two_tasks(b_files=SHARED), {}, "p.md")
+    assert att.owners == {2: [], 3: []}
+    assert att.strays == {"tests/test_new.py": None}
+
+
+def test_a_test_file_in_a_shared_dir_reported_by_two_members_is_a_stray_charged_to_the_first():
+    reports = {n: Report(n, "done", "", ("tests/test_new.py",), ()) for n in (2, 3)}
+    att = attribute(["tests/test_new.py"], two_tasks(b_files=SHARED), reports, "p.md")
+    assert att.owners == {2: [], 3: []}
+    assert att.strays == {"tests/test_new.py": 2}
+
+
+def test_a_non_test_file_in_a_members_test_dir_is_a_stray():
+    att = attribute(["tests/data.json"], two_tasks(), {}, "p.md")
+    assert att.strays == {"tests/data.json": None}
+
+
+def test_a_file_declared_by_two_members_falls_through_to_the_later_rules():
+    tasks = two_tasks(a_files=("src/s.py", "tests/test_a.py"), b_files=("src/s.py", "tests/test_b.py"))
+    att = attribute(["src/s.py"], tasks, {}, "p.md")
+    assert att.owners == {2: [], 3: []}
+    assert att.strays == {"src/s.py": None}
+
+
+def test_the_plan_file_is_always_a_stray_even_when_a_member_declares_it():
+    tasks = two_tasks(a_files=("docs/plans/p.md", "tests/test_a.py"))
+    assert attribute(["docs/plans/p.md"], tasks, {}, "docs/plans/p.md").strays == {"docs/plans/p.md": None}
+    reports = {3: Report(3, "done", "", ("docs/plans/p.md",), ())}
+    att = attribute(["docs/plans/p.md"], tasks, reports, "docs/plans/p.md")
+    assert att.owners == {2: [], 3: []}
+    assert att.strays == {"docs/plans/p.md": 3}
+
+
+@pytest.mark.parametrize(
+    "description, ok",
+    [
+        ("Task 2: add a", True),
+        ("  Review Task 3: add b", True),
+        ("task 2: x", False),
+        ("Task 5: x", False),
+        ("Review Task 5: x", False),
+        ("Task 2 add a", False),
+        ("Implement Task 2: x", False),
+        ("", False),
+    ],
+)
+def test_dispatch_descriptions(description, ok):
+    got = dispatch_violations([{"description": description, "model": "inherit"}], {2, 3}, "sonnet")
+    assert (got == []) is ok
+    if not ok:
+        assert len(got) == 1 and repr(description)[1:-1].strip() in got[0]
+
+
+def test_task_description_pattern_captures_the_number():
+    assert TASK_DESCRIPTION.match("Review Task 12: x").group(1) == "12"
+
+
+def test_dispatch_models():
+    ok = {"description": "Task 2: x"}
+    assert dispatch_violations([ok, {**ok, "model": "inherit"}, {**ok, "model": "sonnet"}], {2}, "sonnet") == []
+    got = dispatch_violations([{**ok, "model": "opus"}], {2}, "sonnet")
+    assert len(got) == 1 and "opus" in got[0]
+
+
+def test_dispatch_entry_without_a_string_description_is_a_violation():
+    got = dispatch_violations([{"model": "inherit"}, {"description": 4}], {2}, "sonnet")
+    assert len(got) == 2
+
+
+def test_dispatch_names_one_line_per_offending_entry():
+    entries = [
+        {"description": "Task 2: x", "model": "inherit"},
+        {"description": "Task 9: x", "model": "opus"},
+        {"description": "Task 3: x", "model": "haiku"},
+    ]
+    got = dispatch_violations(entries, {2, 3}, "sonnet")
+    assert len(got) == 3
+    assert any("Task 9" in line for line in got) and any("haiku" in line for line in got)
+    assert dispatch_violations([], {2}, "sonnet") == []
