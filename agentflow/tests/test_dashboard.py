@@ -517,6 +517,9 @@ def constraint_stop(dash, monkeypatch):
 
     monkeypatch.delenv("AGENTFLOW_STEP", raising=False)  # a person's dashboard, even when an agent session runs the suite
     monkeypatch.delenv("AGENTFLOW_RUN", raising=False)
+    # The OS user is `runner` on CI's hosted machines, the name the runner's own approvals carry (`autonomy.AUTO_BY`),
+    # which a constraint approval refuses: pin a person's name so the dashboard's `getpass.getuser()` is one.
+    monkeypatch.setattr(getpass, "getuser", lambda: "a-person")
     cfg = dash.flow.configure(CONSTRAINT_OVERRIDE)
     run = dash.flow.new_run()
     run.emit("run_options", **start_options(cfg.path))
@@ -533,7 +536,7 @@ def test_approve_passes_constraint(dash, monkeypatch):
     assert status == 200, body
     (approved,) = [e for e in run.events.read() if e["type"] == "hitl_approved"]
     assert approved["constraint"] is True and approved["key"] == CONSTRAINT_KEY
-    assert approved["by"] == getpass.getuser()  # the trailer names the person, as the CLI's default does
+    assert approved["by"] == "a-person"  # the trailer names the person, as the CLI's default does
 
 
 def test_a_plain_approve_of_a_constraint_stop_is_not_a_constraint(dash, monkeypatch):
