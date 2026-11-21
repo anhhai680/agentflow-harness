@@ -538,7 +538,32 @@ def _explain_steps(
             lines.append(ExplainLine(phase.name, f"{key}/review", verdict, "per-task review", review_model))
         if step.steps:
             lines.extend(_explain_steps(cfg, phase, step.steps, key, ctx, overrides))
+        if step.foreach == "plan_task":
+            lines.extend(_explain_waves(cfg, phase, key, ctx, model))
     return lines
+
+
+def _explain_waves(cfg: Config, phase: Phase, key: str, ctx: Ctx, model: str | None) -> list[ExplainLine]:
+    """The waves a `foreach: plan_task` step would build from the plan's `**Parallel group:**` lines, one line each.
+    None with waves off, on an agent other than claude, or with no plan to read: `explain` is then what it was."""
+    from agentflow import overlays, wave  # overlays imports this module
+
+    cap = cfg.parallel.max_subagents
+    if cap <= 1 or (phase.agent or cfg.defaults.agent) != "claude":
+        return []
+    rel = ctx.values.get("plan") or ""
+    if not rel:
+        return []
+    try:
+        tasks = sources.parse_plan(ctx.repo / rel)
+    except (OSError, UnicodeDecodeError):
+        return []
+    security = {t.n for t in tasks if overlays.touches_security(cfg, sources.task_files(t))}
+    waves = wave.predict_waves(tasks, cap, cfg.parallel.serial_paths, security)
+    return [
+        ExplainLine(phase.name, f"{key}/wave-{i}", "run", f"wave-{i}: tasks {', '.join(map(str, members))}", model)
+        for i, members in enumerate(waves, start=1)
+    ]
 
 
 def explain(cfg: Config, lane: str, ctx: Ctx, overrides: dict[str, str] | None = None,

@@ -21,7 +21,8 @@ PLAN_PATH = "docs/plans/2026-10-29-demo.md"
 IMPL = "build/build/task-{n}/implement"
 REVIEW = "build/build/task-{n}/review"
 PR_FOOTER = "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
-TITLES = {1: "First thing", 2: "Second thing", 3: "Third thing", 4: "Fourth thing", 5: "Fifth thing"}
+TITLES = {1: "First thing", 2: "Second thing", 3: "Third thing", 4: "Fourth thing", 5: "Fifth thing",
+          6: "Sixth thing", 7: "Seventh thing"}
 BIG = {"gate_sets": {"build": ["ok"], "verify": ["ok"]}, "conditions": {"plan_is_small": {"max": 0}}}
 SMALL = {"gate_sets": {"build": ["ok"], "verify": ["ok"]}}
 FINDING = {"severity": "blocking", "file": "src/one.py", "line": 3, "text": "Thiếu kiểm tra lỗi khi token hết hạn"}
@@ -44,12 +45,13 @@ def review(*findings: dict) -> dict:
 
 
 def plan_text(depends: dict[int, str] | None = None, ticked: tuple[int, ...] = (), count: int = 2,
-              files: dict[int, list[str]] | None = None) -> str:
-    depends, files = depends or {}, files or {}
+              files: dict[int, list[str]] | None = None, groups: dict[int, str] | None = None) -> str:
+    depends, files, groups = depends or {}, files or {}, groups or {}
     parts = ["# Plan: demo\n\n## Global Constraints\n\n- [ ] not a task box\n"]
     for n in range(1, count + 1):
         box = "x" if n in ticked else " "
         dep = f"**Depends on:** {depends[n]}\n\n" if n in depends else ""
+        dep += f"**Parallel group:** {groups[n]}\n\n" if n in groups else ""
         named = "".join(f"- Modify: `{path}`\n" for path in files.get(n, []))
         named = f"{named}\n" if named else ""
         parts.append(f"### Task {n}: {TITLES[n]}\n\n{dep}{named}- [{box}] **Step 1: Task {n} test**\n"

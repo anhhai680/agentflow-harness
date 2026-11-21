@@ -32,7 +32,7 @@ from typing import Literal, TextIO
 
 from agentflow import brief as brief_mod
 from agentflow import lessons as lessons_mod
-from agentflow import doubt, gitops, overlays, pack, run_env, safeio, sizing, verification, workspace
+from agentflow import doubt, gitops, overlays, pack, run_env, safeio, sizing, sources, verification, wave, workspace
 from agentflow.agents import (CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption,
                               ignored_settings, read_only_allow)
 from agentflow.autonomy import AUTO_BY
@@ -181,8 +181,24 @@ def _values(cfg: Config, step: Step, ctx: Ctx, extra: dict) -> dict[str, str]:
     values["code_map"] = _code_map(run)
     worktree = Path(run.state.get("worktree") or ctx.repo) if run is not None else ctx.repo
     values["self_checks"] = _self_checks(cfg, step, worktree)
+    values["parallel_candidates"] = _parallel_candidates(cfg, ctx, worktree)
     values.update({name: str(value) for name, value in extra.items()})
     return values
+
+
+def _parallel_candidates(cfg: Config, ctx: Ctx, worktree: Path) -> str:
+    """The note on ungrouped plan tasks that could share a `**Parallel group:**`, for the plan's doubt review. `""`
+    with waves off (`parallel.max_subagents` of 1), when the run has no plan file yet or the file can't be read."""
+    if cfg.parallel.max_subagents <= 1:
+        return ""
+    rel = ctx.values.get("plan") or ctx.values.get("plan_target") or ""
+    if not rel:
+        return ""
+    try:
+        tasks = sources.parse_plan(worktree / rel)
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return wave.candidates_text(wave.candidates(tasks, cfg.parallel.serial_paths))
 
 
 def _run_facts(run: Run | None) -> str:

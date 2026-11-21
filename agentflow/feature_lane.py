@@ -89,7 +89,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import carry, constraint, overlays, park, route, sizing, sources, verification
+from agentflow import carry, constraint, overlays, park, route, sizing, sources, verification, wave
 from agentflow.autonomy import AUTO_BY, FORBIDDEN, GUARD_KIND, Resolver, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
@@ -232,6 +232,7 @@ class FeatureLane:
         if small is None:
             return "stopped"
         self._batch_of = self._batches(phase, step, plan, prefix, small)
+        self._note_candidates(plan, prefix)
         if self.size_plan(phase, step, plan, prefix, small) == "stopped":
             return "stopped"
         if self.route_record() is not None:  # the plan sizer's answers can raise the route before the first task
@@ -250,6 +251,16 @@ class FeatureLane:
                 raise_hitl(self.cfg, self.run, "blocked", prefix,
                            f"Tasks {sorted(held)} of {prefix} are held back, but no parked stop explains it.")
                 return "stopped"
+
+    def _note_candidates(self, plan: Path, prefix: str) -> None:
+        """With waves on, once per run: record the pairs of open ungrouped tasks that could share a parallel group.
+        A resume or a refine pass finds the event already there and records nothing."""
+        if self.cfg.parallel.max_subagents <= 1:
+            return
+        if any(e["type"] == "parallel_candidates" for e in self.run.events.read()):
+            return
+        pairs = wave.candidates(sources.parse_plan(plan), self.cfg.parallel.serial_paths)
+        self.run.emit("parallel_candidates", key=prefix, pairs=[list(pair) for pair in pairs])
 
     def _scale_budget(self, plan: Path) -> None:
         """Once per run, raise the soft budget to fit the plan: `task_budget_usd` per unticked task on top of
