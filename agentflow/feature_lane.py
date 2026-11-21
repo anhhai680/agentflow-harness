@@ -91,6 +91,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import shlex
 import subprocess
 from collections import Counter
 from collections.abc import Callable
@@ -868,11 +869,7 @@ class FeatureLane:
         review = step.review if not small.get("active") or small.get("review") else None
         last = not batch or task.n == batch[-1].n
         if review is not None and last and (dropped := self._route_drops_review(tkey, batch, prefix)):
-            review_key = f"{tkey}/review"
-            reason = f"route profile {dropped}"
-            if not any(e["type"] == "review_skipped" and e.get("key") == review_key and e.get("reason") == reason
-                       for e in self.run.events.read()):
-                self.run.emit("review_skipped", key=review_key, reason=reason, round=round_)
+            self._skip_review(tkey, dropped, round_)
             review = None  # the task commits as a small plan's does with `review: false`
         if round_ and self._changed_nothing(tkey):  # nothing to review or gate: the tree passed before
             review_key = f"{tkey}/review"
@@ -913,6 +910,14 @@ class FeatureLane:
             return None
         return str(record["profile"])
 
+    def _skip_review(self, tkey: str, profile: str, round_: int = 0) -> None:
+        """Record once that the run's route profile `profile` drops task `tkey`'s review."""
+        review_key = f"{tkey}/review"
+        reason = f"route profile {profile}"
+        if not any(e["type"] == "review_skipped" and e.get("key") == review_key and e.get("reason") == reason
+                   for e in self.run.events.read()):
+            self.run.emit("review_skipped", key=review_key, reason=reason, round=round_)
+
     def _sized_answers(self, keys: set[str]) -> dict[str, dict[str, str] | None]:
         """Each step key's answers from its latest `effort_decided` (`sizing.parse_answers`), None when it has none."""
         raw: dict[str, object] = dict.fromkeys(keys)
@@ -942,16 +947,23 @@ class FeatureLane:
                      review_extra: dict[str, str] | None = None,
                      start_sha: str | None = None) -> tuple[Outcome, list[dict]]:
         """`("done", open findings)` once the task may be committed; ("stopped", []) when a human is needed.
-        A batch's review passes the range's start (its first member's) and the batch's title and texts."""
+        A batch's review passes the range's start (its first member's) and the batch's title and texts.
+
+        A wave member's range holds only its own files (`_review_range`), and its fix may change only those: any other
+        path it changed goes back to how it was before the fix (`WaveLane.wave_revert_strays`)."""
         impl_key, review_key = f"{tkey}/implement", f"{tkey}/review"
-        sha = start_sha or self._task_start(phase, impl_key)
-        rextra = {**(review_extra or extra), "task_start_sha": sha, "diff_range": f"{sha}..worktree"}
+        owned = self._wave_scope(phase, tkey)
+        rextra = {**(review_extra or extra), **self._review_range(phase, tkey, start_sha, owned)}
         first = self._review_round(phase, review, review_key, rextra, 1)
         if first is None:
             return "stopped", []
         if not first:
             return "done", []
-        if self._fix_round(phase, impl_step, impl_key, extra, first) != "done":
+        before = self._fix_base(phase, impl_key) if owned is not None else None
+        fixed = self._fix_round(phase, impl_step, impl_key, extra, first, tree=before)
+        if owned is not None and before:  # a fix that stopped too: a park or another member's commit must not take it
+            self.wave_revert_strays(tkey, owned, before)
+        if fixed != "done":
             return "stopped", []
         second = self._review_round(phase, review, review_key, rextra, 2)
         if second is None:
@@ -976,6 +988,28 @@ class FeatureLane:
             raise_hitl(self.cfg, self.run, "review_unresolved", review_key,
                        f"{len(findings)} blocking review finding(s) are still open after the fix rounds in {tkey}.",
                        extra=f"### Open findings\n\n{lines}")
+
+    def _wave_scope(self, phase: Phase, tkey: str) -> list[str] | None:
+        """The files a wave member's review and fix are held to (`WaveLane.wave_owned`), on the first pass only; None
+        for a task in no wave, and in a refine round, where the task's range starts at its own refine session."""
+        return None if self._refine_round(phase) else self.wave_owned(tkey)
+
+    def _review_range(self, phase: Phase, tkey: str, start_sha: str | None = None,
+                      owned: list[str] | None = None) -> dict[str, str]:
+        """The review's `task_start_sha` and `diff_range`: from where the task started (`start_sha`, else
+        `_task_start`), and for a wave member (`owned`, its files) cut to those files, so the wave's other members'
+        work, committed or not, is not in it."""
+        sha = start_sha or self._task_start(phase, f"{tkey}/implement")
+        if not owned:
+            return {"task_start_sha": sha, "diff_range": f"{sha}..worktree"}
+        return {"task_start_sha": f"{sha} -- {' '.join(shlex.quote(p) for p in owned)}",
+                "diff_range": f"{sha}..worktree, limited to {', '.join(owned)}"}
+
+    def _fix_base(self, phase: Phase, impl_key: str) -> str:
+        """The tree a wave member's fix round started from: the one its review reopen recorded, else the tree now."""
+        reopened = [e for e in self._round_events(phase) if e["type"] == "step_reopened" and e.get("key") == impl_key
+                    and e.get("reason") == "review"]
+        return str(reopened[-1].get("tree") or "") if reopened else snapshot(self.worktree)
 
     def _task_start(self, phase: Phase, impl_key: str) -> str:
         """Where the task's diff starts: `HEAD` when its implementer started (in a refine round: started
@@ -1080,8 +1114,9 @@ class FeatureLane:
         return earlier_review(blocking_of(self.cfg, findings), note)
 
     def _fix_round(self, phase: Phase, impl_step: Step, impl_key: str, extra: dict[str, str],
-                   blocking: list[dict]) -> Outcome:
-        """The one round in which the implementer's session gets the blocking findings back."""
+                   blocking: list[dict], tree: str | None = None) -> Outcome:
+        """The one round in which the implementer's session gets the blocking findings back. `tree` (a wave member's:
+        the tree before the fix) is kept on the reopen, so a later walk checks the fix against it."""
         reopened = any(e["type"] == "step_reopened" and e.get("key") == impl_key and e.get("reason") == "review"
                        for e in self._round_events(phase))
         self.run.refresh()
@@ -1098,7 +1133,8 @@ class FeatureLane:
                      f"fits), say in your summary why any does not, then run the gates.")
             if skill is not None:
                 note += f"\n\n{skill}"
-            self.run.emit("step_reopened", key=impl_key, reason="review", round=1, note=note)
+            self.run.emit("step_reopened", key=impl_key, reason="review", round=1, note=note,
+                          **({"tree": tree} if tree else {}))
         return self._task_agent(phase, impl_step, impl_key, extra)
 
     def _unresolved_approver(self, phase: Phase, review_key: str) -> str | None:

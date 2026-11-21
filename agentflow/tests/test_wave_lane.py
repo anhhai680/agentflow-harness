@@ -86,6 +86,7 @@ def test_candidates_are_not_counted_with_waves_off(flow_repo):
 
 
 WAVE = "build/build/wave-1/implement"
+RWAVE = "build/build/wave-1/review"
 FILES = {1: ["src/one.py"], 2: ["src/two.py"], 3: ["src/three.py"], 4: ["src/four.py"]}
 DEPENDS = {1: "none", 2: "Task 1", 3: "Task 1", 4: "Task 1"}
 GROUPS = {2: "A", 3: "A"}
@@ -110,6 +111,14 @@ def wave_act(subs: list[dict] | None = None, tasks: list[dict] | None = None) ->
             "result": {"status": "done", "summary": "dispatched both", "tasks": tasks or [report(2), report(3)]}}
 
 
+def review_wave_act(findings: dict[int, list[dict]] | None = None) -> dict:
+    """The review wave's dispatch: one reviewer per member it reports on, and each member's findings in `tasks`."""
+    findings = {2: [], 3: []} if findings is None else findings
+    return {"parallel_subagents": [{"description": f"Review Task {n}: {TITLES[n]}"} for n in findings],
+            "result": {"status": "done", "summary": "reviewed the wave", "findings": [],
+                       "tasks": [{"n": n, "findings": found} for n, found in findings.items()]}}
+
+
 def demoted(events: list[dict]) -> list[tuple[int, str]]:
     return [(e["task"], e["reason"]) for e in events if e["type"] == "parallel_demoted"]
 
@@ -131,14 +140,15 @@ def waves(flow_repo):
 
 def test_two_grouped_tasks_build_in_one_wave_session(waves, git):  # the spec's first T5 check
     run = begin_build(waves, wave_plan())
-    waves.script({WAVE: [wave_act()]})
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act()]})
     assert build(waves, run) == ("done", True)
     calls = waves.calls()
-    # each member still gets its own review session until the review wave (Task 8)
-    assert steps(calls) == [IMPL.format(n=1), REVIEW.format(n=1), WAVE, REVIEW.format(n=2), REVIEW.format(n=3)]
+    assert steps(calls) == [IMPL.format(n=1), REVIEW.format(n=1), WAVE, RWAVE]  # one review wave, no per-task review
     events = run.events.read()
-    started = [e["seq"] for e in events if e["type"] == "subagent_started"]
-    finished = [e["seq"] for e in events if e["type"] == "subagent_finished"]
+    builders = [e for e in events if e["type"] in ("subagent_started", "subagent_finished")
+                and e["description"].startswith("Task ")]  # the review wave's reviewers are `Review Task <n>: …`
+    started = [e["seq"] for e in builders if e["type"] == "subagent_started"]
+    finished = [e["seq"] for e in builders if e["type"] == "subagent_finished"]
     assert len(started) == 2 and max(started) < min(finished)  # both were dispatched before either came back
     assert subjects(git, waves.root)[:2] == ["Task 3: Third thing", "Task 2: Second thing"]
     assert files_of(git, waves.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]  # its own files only
@@ -312,3 +322,180 @@ def test_a_member_editing_a_parked_tasks_file_is_reverted(waves, git, monkeypatc
     assert files_of(git, waves.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
     assert files_of(git, waves.root, "Task 3: Third thing") == [PLAN_PATH, "src/three.py"]
     assert git(waves.root, "show", f"{parked['shelf']}:src/one.py") == "one = 1\n"  # its own work, untouched
+
+
+# --------------------------------------------------------------------------- the review wave (Task 8)
+
+
+F1 = {"severity": "blocking", "file": "src/three.py", "line": 1, "text": "F1: three forgets the empty case"}
+
+
+@pytest.fixture
+def notified(monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr("agentflow.hitl.notify", lambda cfg, title, message, run=None: seen.append(message))
+    return seen
+
+
+def wave_reviews(events: list[dict]) -> list[dict]:
+    """The round-1 `review_result`s the review wave recorded for its members."""
+    return [e for e in events if e["type"] == "review_result" and e.get("wave") == 1]
+
+
+def prompt_of(calls: list[dict], key: str) -> str:
+    """The prompt of the last call of step `key`."""
+    return [c for c in calls if c["step"] == key][-1]["argv"][-1]
+
+
+def start_head(events: list[dict]) -> str:
+    return next(e["start_head"] for e in events if e["type"] == "wave_started")
+
+
+def test_one_review_wave_reviews_both_members(waves, git):
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act()]})
+    assert build(waves, run) == ("done", True)
+    calls, events = waves.calls(), run.events.read()
+    assert RWAVE in steps(calls) and REVIEW.format(n=2) not in steps(calls) and REVIEW.format(n=3) not in steps(calls)
+    assert [(e["key"], e["round"], e["blocking"]) for e in wave_reviews(events)] == [
+        (REVIEW.format(n=2), 1, 0), (REVIEW.format(n=3), 1, 0)]
+    started = [e["description"] for e in events if e["type"] == "subagent_started" and e["description"].startswith("Review")]
+    assert started == ["Review Task 2: Second thing", "Review Task 3: Third thing"]
+    [effort] = [e for e in events if e["type"] == "effort_decided" and e["key"] == RWAVE]
+    assert effort["source"] == "wave"
+    prompt = prompt_of(calls, RWAVE)
+    cards = run.agent_dir / "wave" / "wave-1"
+    assert f"- Review Task 2: Second thing: `{cards / 'review-2.md'}`" in prompt and "{wave_cards}" not in prompt
+    card = (cards / "review-2.md").read_text(encoding="utf-8")
+    assert "Task 2 test" in card and "Task 3 test" not in card  # the member's own task text
+    assert f"git diff {start_head(events)} -- src/two.py" in card and "{task_n}" not in card
+    assert "## When you finish" not in card and '{"n": 2, "findings"' in card  # it reports in its final message
+    assert subjects(git, waves.root)[:2] == ["Task 3: Third thing", "Task 2: Second thing"]
+
+
+def test_a_blocking_finding_reopens_only_its_member(waves, git):
+    run = begin_build(waves, wave_plan())
+    fix = {"write": {"src/three.py": "n = 3  # fixed\n"}, "result": {"status": "done", "summary": "fixed F1"}}
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: [], 3: [F1]})], IMPL.format(n=3): [fix]})
+    assert build(waves, run) == ("done", True)
+    calls = waves.calls()
+    # the fix in a fresh single-task session, then that member's own re-review
+    assert steps(calls) == [IMPL.format(n=1), REVIEW.format(n=1), WAVE, RWAVE, IMPL.format(n=3), REVIEW.format(n=3)]
+    fix_argv = [c for c in calls if c["step"] == IMPL.format(n=3)][-1]["argv"]
+    assert "--resume" not in fix_argv and "F1" in fix_argv[-1]
+    assert "F1" in prompt_of(calls, REVIEW.format(n=3))  # the re-review checks what blocked
+    results = [(e["key"], e["round"], e["blocking"]) for e in run.events.read() if e["type"] == "review_result"]
+    assert results[1:] == [(REVIEW.format(n=2), 1, 0), (REVIEW.format(n=3), 1, 1), (REVIEW.format(n=3), 2, 0)]
+    assert subjects(git, waves.root)[:2] == ["Task 3: Third thing", "Task 2: Second thing"]
+    assert git(waves.root, "show", "HEAD:src/three.py") == "n = 3  # fixed\n"
+
+
+def test_a_members_review_range_holds_only_its_files(waves, git):
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: [], 3: [F1]})]})
+    assert build(waves, run) == ("done", True)
+    sha = start_head(run.events.read())
+    prompt = prompt_of(waves.calls(), REVIEW.format(n=3))  # the re-review, after Task 2 committed on the wave's start
+    assert f"git diff {sha} -- src/three.py" in prompt
+    assert f"`{sha}..worktree, limited to src/three.py`" in prompt
+    card = (run.agent_dir / "wave" / "wave-1" / "review-3.md").read_text(encoding="utf-8")
+    assert f"git diff {sha} -- src/three.py" in card and "src/two.py" not in card
+
+
+@pytest.mark.parametrize(("fixer", "other"), [(3, 2), (2, 3)])
+def test_a_member_fix_that_strays_is_reverted(waves, git, fixer, other):
+    # `fixer`'s single-task fix also edits `other`'s file: 2's is committed by then, 3's is not yet
+    run = begin_build(waves, wave_plan())
+    finding = {**F1, "file": FILES[fixer][0]}
+    fix = {"write": {FILES[fixer][0]: f"n = {fixer}  # fixed\n", FILES[other][0]: "not yours\n"},
+           "result": {"status": "done", "summary": "fixed it"}}
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: [], 3: []} | {fixer: [finding]})],
+                  IMPL.format(n=fixer): [fix]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert scope_violations(events)[-1] == (fixer, FILES[other][0])
+    [violation] = [e for e in events if e["type"] == "scope_violation"]
+    assert violation["key"] == f"build/build/task-{fixer}" and violation["wave"] == 1
+    assert files_of(git, waves.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
+    assert files_of(git, waves.root, "Task 3: Third thing") == [PLAN_PATH, "src/three.py"]
+    assert git(waves.root, "show", f"HEAD:{FILES[other][0]}") == f"n = {other}\n"  # the wave's version
+    assert git(waves.root, "show", f"HEAD:{FILES[fixer][0]}") == f"n = {fixer}  # fixed\n"
+    assert git(waves.root, "status", "--porcelain") == ""
+
+
+def test_a_member_fix_that_strays_and_stops_is_reverted_before_it_parks(waves, git):
+    run = begin_build(waves, wave_plan())
+    fix = {"write": {"src/two.py": "n = 2  # half\n", "src/three.py": "not yours\n"}, **BLOCKED}
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: [{**F1, "file": "src/two.py"}], 3: []})],
+                  IMPL.format(n=2): [fix]})
+    assert build(waves, run) == ("stopped", True)  # task 2 parked, then its stop is the run's wait
+    events = run.events.read()
+    assert scope_violations(events) == [(2, "src/three.py")]
+    assert any(e["type"] == "step_parked" and e["key"] == IMPL.format(n=2) for e in events)
+    assert files_of(git, waves.root, "Task 3: Third thing") == [PLAN_PATH, "src/three.py"]
+    assert git(waves.root, "show", "HEAD:src/three.py") == "n = 3\n"  # the wave's version, not the stray
+
+
+def test_a_missing_reviewer_report_falls_back_to_its_own_review(waves):
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: []})]})
+    assert build(waves, run) == ("done", True)
+    calls = steps(waves.calls())
+    assert calls[-2:] == [RWAVE, REVIEW.format(n=3)] and REVIEW.format(n=2) not in calls
+    assert [e["key"] for e in wave_reviews(run.events.read())] == [REVIEW.format(n=2)]
+    assert "-- src/three.py" in prompt_of(waves.calls(), REVIEW.format(n=3))
+
+
+def test_a_review_wave_that_stops_is_dropped(waves, notified):
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act()], RWAVE: [{"result": {"status": "blocked", "summary": "no reviewers"}}]})
+    assert build(waves, run) == ("done", True)
+    [dropped] = waves.events(run, "review_wave_dropped")
+    assert (dropped["key"], dropped["wave"], dropped["reason"]) == ("build/build/wave-1", 1, "blocked")
+    assert run.state["steps"][RWAVE]["status"] == "skipped" and run.state["waiting"] is None
+    assert {REVIEW.format(n=2), REVIEW.format(n=3)} <= set(steps(waves.calls()))  # each member is reviewed alone
+    assert wave_reviews(run.events.read()) == [] and notified == []
+
+
+def test_a_review_wave_guard_stop_stays_the_runs_wait(waves, notified):
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act()], RWAVE: [{**review_wave_act(), "write": {"src/two.py": "edited\n"}}]})
+    assert build(waves, run) == ("stopped", True)
+    waiting = run.refresh()["waiting"]
+    assert waiting["kind"] == "guard_violation" and waiting["key"] == RWAVE
+    assert waves.events(run, "review_wave_dropped") == [] and len(notified) == 1  # a person is told, once
+    assert [e["key"] for e in waves.events(run, "hitl_notified")] == [RWAVE]
+
+
+def test_a_runner_killed_in_the_review_wave_drops_it_on_resume(waves, monkeypatch):
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act()]})
+    from agentflow.lanes import Executor
+
+    real = Executor.run_agent_step
+
+    def killed(self, phase, step, key, *args, **kwargs):  # the runner dies once the review wave's session started
+        if key == RWAVE:
+            self.run.emit("step_started", key=key, phase=phase.name)
+            raise KeyboardInterrupt
+        return real(self, phase, step, key, *args, **kwargs)
+
+    monkeypatch.setattr(Executor, "run_agent_step", killed)
+    with pytest.raises(KeyboardInterrupt):
+        build(waves, run)
+    monkeypatch.setattr(Executor, "run_agent_step", real)
+    assert build(waves, run) == ("done", True)
+    [dropped] = waves.events(run, "review_wave_dropped")
+    assert dropped["reason"] == "interrupted"
+    assert {REVIEW.format(n=2), REVIEW.format(n=3)} <= set(steps(waves.calls()))
+
+
+def test_profile_L_keeps_a_review_session_per_task(waves):
+    waves.configure({**BIG, **WAVES, "route": {"mode": "on", "lanes": [], "profiles": {"L": {"wave_review": False}}}})
+    run = begin_build(waves, wave_plan())
+    run.emit("route_profile", profile="L", applied=True, proposed_by="rule", upgraded_from=None, facts={}, reason="")
+    waves.script({WAVE: [wave_act()]})
+    assert build(waves, run) == ("done", True)
+    calls = steps(waves.calls())
+    assert RWAVE not in calls and {REVIEW.format(n=2), REVIEW.format(n=3)} <= set(calls)
+    assert waves.events(run, "review_wave_dropped") == []  # never formed, so nothing to drop
