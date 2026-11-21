@@ -62,6 +62,7 @@ import re
 import statistics
 from collections import Counter
 from collections.abc import Collection
+from datetime import datetime
 from typing import Any
 
 from agentflow.events import parse_iso
@@ -110,6 +111,12 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "usage_holds": ("lower", False),          # times the run waited out a usage limit
     "parked_units": ("lower", False),         # stops parked so the run could go on with other tasks
     "park_resume_rework": ("lower", False),   # parked tasks that then needed a conflict settled or a step retried
+    "waves": ("higher", False),               # waves of plan tasks built together by one session's sub-agents
+    "parallel_demoted": ("lower", False),     # tasks a wave turned away or set aside (a dissolve counts apart)
+    "scope_violations": ("lower", False),     # paths a wave member changed that were not its own
+    "waves_dissolved": ("lower", False),      # waves undone because they stopped, dispatched wrongly or were cut off
+    "parallel_candidates": ("lower", False),  # independent ungrouped task pairs the plan left on the table
+    "agent_parallelism": ("higher", False),   # agent seconds of the build window over its wall seconds
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
@@ -119,12 +126,15 @@ COUNT_FAMILIES = frozenset({"fix_attempts", "guard_trips", "permission_denied", 
                             "ci_rounds", "rollovers", "progress_not_updated", "conformance_missing", "conformance_waived",
                             "gate_reruns", "refine_rounds", "effort_escalations", "undersized",
                             "sizer_fallbacks", "full_suite_runs", "route_upgrades", "compactions", "usage_holds",
-                            "parked_units", "park_resume_rework"})
+                            "parked_units", "park_resume_rework", "waves", "parallel_demoted", "scope_violations",
+                            "waves_dissolved", "parallel_candidates"})
 DOUBT_FIELDS = (("doubt_blocking", "first_blocking"), ("doubt_rounds", "rounds"), ("doubt_noise", "noise"),
                 ("doubt_misread", "misread"), ("doubt_open", "open"), ("doubt_actionable", "actionable"))
 RECONCILE = "reconcile"  # `phase_rejected.kind` of a round the runner opens on a doubt review's findings
 USAGE_HOLD = "usage limit"  # `run_held.reason` of a run waiting for its plan's usage limit to reset
 TASK_PREFIX = re.compile(r"^(.*?/task-\d+)(?:/|$)")  # a plan task's key: `<phase>/<step>/task-<n>`
+DISSOLVED = "dissolved"  # `parallel_demoted.reason` of a task a dissolved wave handed back: counted by the dissolve
+BUILD = "build"  # the phase whose window `agent_parallelism` measures
 RUNNER = "runner"  # `phase_rejected.by` for what the runner settles itself; a person's name is never this
 
 
@@ -171,6 +181,74 @@ def _park_signals(events: list[dict]) -> dict[str, int]:
         elif etype == "step_retry" and ev.get("by") and ev["by"] != RUNNER:
             redone.update(unit for unit in units if key == unit or key.startswith(f"{unit}/"))
     return {"parked_units": parked, "park_resume_rework": len(redone)}
+
+
+def _wave_signals(events: list[dict]) -> dict[str, int]:
+    """The wave counts. `parallel_demoted` is one per `(task, reason)` (a resumed runner may say it again) and leaves
+    out the `dissolved` reason; `parallel_candidates` is the pair count of the run's last such event."""
+    waves = violations = dissolved = candidates = 0
+    demoted: set[tuple[str, str]] = set()
+    for ev in events:
+        etype = ev.get("type")
+        if etype == "wave_started":
+            waves += 1
+        elif etype == "parallel_demoted":
+            if ev.get("reason") != DISSOLVED:
+                demoted.add((str(ev.get("task") or ev.get("key")), str(ev.get("reason"))))
+        elif etype == "scope_violation":
+            violations += 1
+        elif etype == "wave_dissolved":
+            dissolved += 1
+        elif etype == "parallel_candidates":
+            pairs = ev.get("pairs")
+            candidates = len(pairs) if isinstance(pairs, list) else 0
+    return {"waves": waves, "parallel_demoted": len(demoted), "scope_violations": violations,
+            "waves_dissolved": dissolved, "parallel_candidates": candidates}
+
+
+def _build_windows(events: list[dict]) -> list[tuple[datetime, datetime]]:
+    """Each `phase_started` of `build` to the next `phase_started`, or to the log's last timestamp."""
+    starts = [(parse_iso(ev.get("ts")), ev.get("phase")) for ev in events if ev.get("type") == "phase_started"]
+    last = max((t for ev in events if (t := parse_iso(ev.get("ts"))) is not None), default=None)
+    windows = []
+    for i, (start, phase) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else last
+        if phase == BUILD and start is not None and end is not None and end > start:
+            windows.append((start, end))
+    return windows
+
+
+def _overlap(start: datetime | None, end: datetime | None, window: tuple[datetime, datetime]) -> float:
+    if start is None or end is None:
+        return 0.0
+    return max(0.0, (min(end, window[1]) - max(start, window[0])).total_seconds())
+
+
+def _agent_parallelism(events: list[dict], metrics: dict) -> dict[str, float]:
+    """`agent_parallelism`: see the module docstring. The main sessions are the ones `metrics` pairs; a session with
+    no end yet runs to the end of its window."""
+    windows = _build_windows(events)
+    wall = sum((end - start).total_seconds() for start, end in windows)
+    if wall <= 0:
+        return {}
+    main = [(parse_iso(s.get("started_at")), parse_iso(s.get("ended_at")), s.get("ended_at") is None)
+            for phase in metrics.get("phases") or [] for step in phase.get("steps") or []
+            for s in step.get("sessions") or []]
+    opened: dict[str, datetime] = {}
+    subs: list[tuple[datetime, datetime]] = []
+    for ev in events:
+        etype, ident = ev.get("type"), str(ev.get("tool_use_id") or "")
+        if not ident or (at := parse_iso(ev.get("ts"))) is None:
+            continue
+        if etype == "subagent_started":
+            opened.setdefault(ident, at)
+        elif etype == "subagent_finished" and ident in opened:
+            subs.append((opened.pop(ident), at))
+    main_s = sub_s = 0.0
+    for window in windows:
+        main_s += sum(_overlap(start, window[1] if live else end, window) for start, end, live in main)
+        sub_s += sum(_overlap(start, end, window) for start, end in subs)
+    return {"agent_parallelism": round((main_s + sub_s) / wall, 4)} if main_s > 0 else {}
 
 
 def _first_pass(events: list[dict]) -> dict[str, float]:
@@ -422,6 +500,8 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
     out.update(_gate_cache_hit_rate(events))
     out.update(_cost_signals(metrics))
     out.update(_park_signals(events))
+    out.update(_wave_signals(events))
+    out.update(_agent_parallelism(events, metrics))
     return out
 
 
