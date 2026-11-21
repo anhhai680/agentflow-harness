@@ -30,7 +30,8 @@ these stages, and each first checks its own event, so a walk that comes back to 
 
 A wave session is never resumed or salvaged. It is **dissolved** (`_dissolve`, `wave_dissolved`) when it stops (the
 stop's kind is the reason), when its sub-agents were not dispatched as the runner asked (`wave_dispatch`: a sub-agent
-that names no member, runs another model or agent type, or whose call failed, recorded as one `guard_tripped`), when its
+that names no member, runs another model or agent type, whose call failed or that had not finished, or a member with no
+sub-agent or more than one in the session's first pass, recorded as one `guard_tripped`), when its
 gates' fix left a path no member owns (`scope_violation`) or its gates still fail after its fix loop passed
 (`gate_failed`), and when a walk finds it started and not done, so a runner died in it (`interrupted`, once its agents
 are waited for). Its tree goes into its own shelf, `shelf_ref(run, "W/dissolved")`, the paths it changed go back to
@@ -317,8 +318,9 @@ class WaveLane:
         while True:
             if self._wave_session(phase, step, impl_step, prefix, key, number, members, rel, small) != "done":
                 return self._session_stopped(key)
+            numbers = [t.n for t in members]
             if not self._attributed_since_done(key) and self._dispatch_tripped(
-                    f"{key}/implement", [t.n for t in members], str(started.get("model") or "")):
+                    f"{key}/implement", numbers, str(started.get("model") or ""), required=numbers):
                 return self._dissolved(key, WAVE_DISPATCH)  # checked before attribution only: nothing moved yet
             attributed = self._attribute(prefix, key, started, members, rel)
             if isinstance(attributed, str):
@@ -559,7 +561,8 @@ class WaveLane:
         if status not in ("done", "unchanged"):
             if self._review_wave_session(phase, review, rel, prefix, key, number, members) != "done":
                 return self._review_wave_stopped(key, number)
-        if self._dispatch_tripped(session_key, [t.n for t in kept], self._session_model(session_key, "")):
+        if self._dispatch_tripped(session_key, [t.n for t in kept], self._session_model(session_key, ""),
+                                  required=[t.n for t in members], review=True):
             self._drop_review_wave(key, number, WAVE_DISPATCH)
             return "done"
         self._record_wave_reviews(phase, prefix, key, number, members)
@@ -671,17 +674,24 @@ class WaveLane:
         started = [e for e in self.run.events.read() if e["type"] == "step_started" and e.get("key") == session_key]
         return str((started[-1].get("model") if started else None) or default)
 
-    def _dispatch_tripped(self, session_key: str, members: list[int], model: str) -> bool:
-        """Whether the wave session `session_key` started a sub-agent the runner did not ask for (`wave.dispatch_violations`
-        over the sub-agents of the session's agent rows, live and exited, which the runner built from the stream), the
-        model being the session's own. Recorded once since the session last finished, as a `guard_tripped` of kind
-        `wave_dispatch` with one violation per line."""
+    def _dispatch_tripped(self, session_key: str, members: list[int], model: str, required: list[int],
+                          review: bool = False) -> bool:
+        """Whether the wave session `session_key` did not dispatch its sub-agents as the runner asked: one it started
+        that the runner did not ask for or that had not finished (`wave.dispatch_violations` over the sub-agents of the
+        session's agent rows, live and exited, which the runner built from the stream; the model being the session's
+        own), or a member of `required` with no sub-agent or more than one in the session's first pass
+        (`wave.dispatch_count_violations`: the calls before the gates reopened it, whose fix dispatches only for the
+        members the failure points to; the whole session for a review wave). Recorded once since the session last
+        finished, as a `guard_tripped` of kind `wave_dispatch` with one violation per line."""
         self.run.refresh()
         state = self.run.state
-        rows = [*(state.get("exited") or []), *(state.get("agents") or {}).values()]
-        subagents = [sub for row in rows if isinstance(row, dict) and row.get("step") == session_key
-                     for sub in row.get("subagents") or [] if isinstance(sub, dict)]
-        lines = wave.dispatch_violations(subagents, members, self._session_model(session_key, model))
+        rows = [row for row in [*(state.get("exited") or []), *(state.get("agents") or {}).values()]
+                if isinstance(row, dict) and row.get("step") == session_key and not row.get("sizer")]
+        subs = [[sub for sub in row.get("subagents") or [] if isinstance(sub, dict)] for row in rows]
+        first = subs[:self._first_pass_calls(session_key)] if not review else subs
+        lines = [*wave.dispatch_violations([s for row in subs for s in row], members,
+                                           self._session_model(session_key, model)),
+                 *wave.dispatch_count_violations([s for row in first for s in row], required, review=review)]
         if not lines:
             return False
         events = self.run.events.read()
@@ -693,6 +703,15 @@ class WaveLane:
             self.run.emit("guard_tripped", key=session_key,  # the lines quote descriptions a model wrote
                           violations=[{"kind": WAVE_DISPATCH, "detail": clean_fact(line)} for line in lines])
         return True
+
+    def _first_pass_calls(self, session_key: str) -> int:
+        """How many agent calls of the wave session `session_key` came before the gates first reopened it (all of them
+        when they never did): its rows in that order are the first pass, which dispatched each member once."""
+        events = self.run.events.read()
+        reopened = min((e["seq"] for e in events if e["type"] == "step_reopened" and e.get("key") == session_key
+                        and e.get("reason") == "gates"), default=None)
+        return sum(1 for e in events if e["type"] == "agent_started" and (e.get("step") or e.get("key")) == session_key
+                   and not e.get("sizer") and (reopened is None or e["seq"] < reopened))
 
     def _left_over(self, key: str) -> WaveOutcome | None:
         """What a walk finds of the wave's session from before, settled; None when there is nothing to settle: it never

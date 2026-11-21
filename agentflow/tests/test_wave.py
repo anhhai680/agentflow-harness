@@ -17,6 +17,7 @@ from agentflow.wave import (
     declared_path,
     declared_paths,
     depends_transitively,
+    dispatch_count_violations,
     dispatch_violations,
     form_wave,
     group_candidates,
@@ -501,3 +502,28 @@ def test_dispatch_a_subagent_that_errored_is_a_violation():
                {"description": "Task 3: y"}]  # no outcome recorded (an older engine's row): not counted against it
     got = dispatch_violations(entries, {2, 3}, "sonnet")
     assert len(got) == 1 and "Task 3: x" in got[0]
+
+
+def test_dispatch_a_subagent_that_did_not_finish_is_a_violation():
+    entries = [{"description": "Task 2: x", "done": True}, {"description": "Task 3: x", "done": False},
+               {"description": "Task 3: y"}]  # no `done` recorded (an older engine's row): not counted against it
+    assert dispatch_violations(entries, {2, 3}, "sonnet") == ["sub-agent did not finish: 'Task 3: x'"]
+
+
+def test_dispatch_count_wants_exactly_one_per_member():
+    one_each = [{"description": "Task 2: a"}, {"description": "Task 3: b"}]
+    assert dispatch_count_violations(one_each, {2, 3}, review=False) == []
+    assert dispatch_count_violations([], {2, 3}, review=False) == [
+        "no sub-agent was started for Task 2", "no sub-agent was started for Task 3"]
+    assert dispatch_count_violations([*one_each, {"description": "Task 2: again"}], {2, 3}, review=False) == [
+        "2 sub-agents were started for Task 2, not one"]
+
+
+def test_dispatch_count_reads_builders_and_reviewers_apart():
+    reviewers = [{"description": "Review Task 2: a"}, {"description": "Review Task 3: b"}]
+    assert dispatch_count_violations(reviewers, {2, 3}, review=True) == []
+    assert dispatch_count_violations(reviewers, {2}, review=False) == ["no sub-agent was started for Task 2"]
+    assert dispatch_count_violations([{"description": "Task 2: a"}], {2}, review=True) == [
+        "no sub-agent was started for Review Task 2"]
+    assert dispatch_count_violations([{"description": 4}, {}], {2}, review=True) == [
+        "no sub-agent was started for Review Task 2"]

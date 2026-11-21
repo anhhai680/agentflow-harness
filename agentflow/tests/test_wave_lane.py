@@ -112,10 +112,11 @@ def wave_act(subs: list[dict] | None = None, tasks: list[dict] | None = None) ->
             "result": {"status": "done", "summary": "dispatched both", "tasks": tasks or [report(2), report(3)]}}
 
 
-def review_wave_act(findings: dict[int, list[dict]] | None = None) -> dict:
-    """The review wave's dispatch: one reviewer per member it reports on, and each member's findings in `tasks`."""
+def review_wave_act(findings: dict[int, list[dict]] | None = None, dispatch: list[int] | None = None) -> dict:
+    """The review wave's dispatch: one reviewer per member in `dispatch` (by default each member it reports on), and
+    each member's findings in `tasks`."""
     findings = {2: [], 3: []} if findings is None else findings
-    return {"parallel_subagents": [{"description": f"Review Task {n}: {TITLES[n]}"} for n in findings],
+    return {"parallel_subagents": [{"description": f"Review Task {n}: {TITLES[n]}"} for n in dispatch or findings],
             "result": {"status": "done", "summary": "reviewed the wave", "findings": [],
                        "tasks": [{"n": n, "findings": found} for n, found in findings.items()]}}
 
@@ -530,7 +531,7 @@ def test_a_persons_edit_at_a_member_fix_stop_is_kept(waves, git):
 
 def test_a_missing_reviewer_report_falls_back_to_its_own_review(waves):
     run = begin_build(waves, wave_plan())
-    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: []})]})
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: []}, dispatch=[2, 3])]})
     assert build(waves, run) == ("done", True)
     calls = steps(waves.calls())
     assert calls[-2:] == [RWAVE, REVIEW.format(n=3)] and REVIEW.format(n=2) not in calls
@@ -662,10 +663,57 @@ def test_a_wrong_dispatch_dissolves_the_wave(waves, git, notified, wrong):  # Re
     assert build(waves, run) == ("done", True)
     events = run.events.read()
     [tripped] = [e for e in events if e["type"] == "guard_tripped" and e["key"] == WAVE]
-    assert [v["kind"] for v in tripped["violations"]] == ["wave_dispatch"]
+    assert {v["kind"] for v in tripped["violations"]} == {"wave_dispatch"}  # one `guard_tripped`, a line each
     assert_members_ran_alone(waves, git, run, "wave_dispatch")
     assert not [e for e in events if e["type"] == "wave_attributed"]  # no member's work was taken from the wave
     assert notified == []
+
+
+@pytest.mark.parametrize("subs", [
+    [],  # the session wrote the members' files itself and started no sub-agent
+    [sub(2), sub(2, write={"src/two.py": "n = 2  # again\n"}), sub(3)],  # two sub-agents for task 2
+    [sub(2), sub(3) | {"unfinished": True}],  # task 3's sub-agent had not finished when the session ended
+], ids=["none", "duplicate", "unfinished"])
+def test_a_member_dispatched_other_than_once_dissolves_the_wave(waves, git, notified, subs):  # Review Focus 4
+    run = begin_build(waves, wave_plan())
+    act = wave_act(subs=subs) if subs else {"write": {"src/two.py": "n = 2\n", "src/three.py": "n = 3\n"},
+                                            "result": wave_act()["result"]}
+    waves.script({WAVE: [act], IMPL.format(n=2): [alone(2)], IMPL.format(n=3): [alone(3)]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    [tripped] = [e for e in events if e["type"] == "guard_tripped" and e["key"] == WAVE]
+    assert {v["kind"] for v in tripped["violations"]} == {"wave_dispatch"}
+    assert_members_ran_alone(waves, git, run, "wave_dispatch")
+    assert not [e for e in events if e["type"] == "wave_attributed"] and notified == []
+
+
+def test_an_unfinished_sub_agent_of_the_gates_fix_dissolves_the_wave(waves, git):
+    # the fix dispatches only for the member the failure points to, which is allowed; it must still finish
+    waves.configure({**BIG, **WAVES, "gates": {"three": {"run": "test ! -f src/three.py || grep -q fixed src/three.py"}},
+                     "gate_sets": {"build": ["three"]}})
+    run = begin_build(waves, wave_plan())
+    fix = {"parallel_subagents": [sub(3, write={"src/three.py": "fixed = 3\n"}) | {"unfinished": True}],
+           "result": {"status": "done", "summary": "fixed three", "tasks": [report(2), report(3)]}}
+    waves.script({WAVE: [wave_act(), fix], IMPL.format(n=2): [alone(2)],
+                  IMPL.format(n=3): [alone(3, "fixed = 3  # alone = 3\n")]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert dissolved(events) == [(W, "wave_dispatch")]
+    [tripped] = [e for e in events if e["type"] == "guard_tripped" and e["key"] == WAVE]
+    assert [v["detail"] for v in tripped["violations"]] == ["sub-agent did not finish: 'Task 3: Third thing'"]
+
+
+def test_a_gates_fix_for_one_member_keeps_the_wave(waves, git):
+    waves.configure({**BIG, **WAVES, "gates": {"three": {"run": "test ! -f src/three.py || grep -q fixed src/three.py"}},
+                     "gate_sets": {"build": ["three"]}})
+    run = begin_build(waves, wave_plan())
+    fix = {"parallel_subagents": [sub(3, write={"src/three.py": "fixed = 3\n"})],
+           "result": {"status": "done", "summary": "fixed three", "tasks": [report(2), report(3)]}}
+    waves.script({WAVE: [wave_act(), fix], RWAVE: [review_wave_act()]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert not dissolved(events) and not [e for e in events if e["type"] == "guard_tripped"]
+    assert git(waves.root, "show", "HEAD:src/three.py") == "fixed = 3\n"
 
 
 def test_a_moved_head_keeps_the_wave_stop(waves, git, notified):
@@ -895,17 +943,30 @@ def test_a_wrong_review_dispatch_drops_the_review_wave(waves, git, wrong):
     assert build(waves, run) == ("done", True)
     events = run.events.read()
     [tripped] = [e for e in events if e["type"] == "guard_tripped" and e["key"] == RWAVE]
-    assert [v["kind"] for v in tripped["violations"]] == ["wave_dispatch"]
+    assert {v["kind"] for v in tripped["violations"]} == {"wave_dispatch"}
     [dropped] = waves.events(run, "review_wave_dropped")
     assert dropped["reason"] == "wave_dispatch" and wave_reviews(events) == []  # none of its findings count
     assert {REVIEW.format(n=2), REVIEW.format(n=3)} <= set(steps(waves.calls()))  # each member reviewed alone
     assert not dissolved(events) and subjects(git, waves.root)[:2] == ["Task 3: Third thing", "Task 2: Second thing"]
 
 
+def test_a_review_wave_with_no_reviewer_for_a_member_is_dropped(waves, git):
+    # the session reports on both members but started a reviewer for task 2 only: task 3's findings are made up
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act(dispatch=[2])]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    [tripped] = [e for e in events if e["type"] == "guard_tripped" and e["key"] == RWAVE]
+    assert [v["detail"] for v in tripped["violations"]] == ["no sub-agent was started for Review Task 3"]
+    [dropped] = waves.events(run, "review_wave_dropped")
+    assert dropped["reason"] == "wave_dispatch" and wave_reviews(events) == []
+    assert {REVIEW.format(n=2), REVIEW.format(n=3)} <= set(steps(waves.calls()))
+
+
 def test_the_review_wave_alone_may_start_reviewers(waves):
     # read-only review sessions get `--tools` without `Agent`; the review wave dispatches, so it gets `Agent`/`Task`
     run = begin_build(waves, wave_plan())
-    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: []})]})
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: []}, dispatch=[2, 3])]})
     assert build(waves, run) == ("done", True)
     calls = waves.calls()
     wave_argv = [c for c in calls if c["step"] == RWAVE][-1]["argv"]

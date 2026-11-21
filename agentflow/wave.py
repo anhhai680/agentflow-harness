@@ -340,7 +340,9 @@ def dispatch_violations(subagents: Sequence[Mapping], members: Collection[int], 
     """One line for each sub-agent a wave session started that names no member (its description must start
     `Task <n>:` or `Review Task <n>:`), runs a model that is neither `inherit`, missing, nor the wave's own, is of an
     agent type other than `general-purpose` (a custom type with no `model` runs its own model, which the stream still
-    calls `inherit`), or whose call came back as an error (`ok` False: a refused call looks like a good one otherwise)."""
+    calls `inherit`), whose call came back as an error (`ok` False: a refused call looks like a good one otherwise), or
+    that had not finished when the session ended (`done` False). A row with no `ok` or `done` (an older engine's) is not
+    counted against it."""
     lines: list[str] = []
     for entry in subagents:
         description = entry.get("description")
@@ -355,4 +357,28 @@ def dispatch_violations(subagents: Sequence[Mapping], members: Collection[int], 
             lines.append(f"sub-agent type is not {GENERAL_AGENT}: {agent_type!r} ({description!r})")
         if entry.get("ok") is False:
             lines.append(f"sub-agent call failed: {description!r}")
+        if entry.get("done") is False:
+            lines.append(f"sub-agent did not finish: {description!r}")
+    return lines
+
+
+def dispatch_count_violations(subagents: Sequence[Mapping], members: Collection[int], *, review: bool) -> list[str]:
+    """One line for each of `members` that has no sub-agent among `subagents`, or more than one: a wave asks for
+    exactly one per member. A build wave's sub-agents are counted by a description that starts `Task <n>:`, a review
+    wave's by `Review Task <n>:`. Whether each finished is `dispatch_violations`' check."""
+    pattern = REVIEW_DESCRIPTION if review else BUILD_DESCRIPTION
+    label = "Review Task" if review else "Task"
+    counts: dict[int, int] = {}
+    for entry in subagents:
+        description = entry.get("description")
+        match = pattern.match(description) if isinstance(description, str) else None
+        if match is not None:
+            counts[int(match.group(1))] = counts.get(int(match.group(1)), 0) + 1
+    lines: list[str] = []
+    for n in sorted(members):
+        found = counts.get(n, 0)
+        if found == 0:
+            lines.append(f"no sub-agent was started for {label} {n}")
+        elif found > 1:
+            lines.append(f"{found} sub-agents were started for {label} {n}, not one")
     return lines
