@@ -636,6 +636,13 @@ def assert_members_ran_alone(waves, git, run, reason: str) -> None:
     assert once_each(git, waves.root) and git(waves.root, "status", "--porcelain") == ""
 
 
+def agent_ran(run, key: str) -> None:
+    """An agent of step `key` started and is gone, as one the runner was killed under leaves its events."""
+    run.emit("agent_started", step=key, pid=None, agent="claude", model="sonnet", effort="high", role="build",
+             session_id=f"dead-{key}", sizer=False)
+    run.emit("agent_exited", session_id=f"dead-{key}", exit_code=0, cost=0.0, key=key)
+
+
 def test_a_wave_session_stop_dissolves_it_and_members_run_alone(waves, git, notified):
     # the wave's tree fails the build gate, and its own fix loop runs out: fix_attempts_exhausted
     waves.configure({**BIG, **WAVES, "gates": {"three": {"run": "test ! -f src/three.py || ! grep -q wave src/three.py"}},
@@ -746,6 +753,7 @@ def test_a_moved_head_found_on_resume_keeps_the_run_waiting(waves, git, notified
         if key == WAVE:
             self.run.emit("step_started", key=key, phase=phase.name,
                           start_head=git(waves.root, "rev-parse", "HEAD").strip())
+            agent_ran(self.run, key)
             (waves.root / "src").mkdir(exist_ok=True)
             (waves.root / "src/two.py").write_text("n = 2\n", encoding="utf-8")
             git(waves.root, "add", "-A")
@@ -774,6 +782,7 @@ def test_a_runner_killed_mid_wave_dissolves_it_on_resume(waves, git, monkeypatch
     def killed(self, phase, step, key, *args, **kwargs):  # the runner dies while the wave's sub-agents write
         if key == WAVE:
             self.run.emit("step_started", key=key, phase=phase.name)
+            agent_ran(self.run, key)
             (waves.root / "src").mkdir(exist_ok=True)
             (waves.root / "src/two.py").write_text("half = 2\n", encoding="utf-8")
             raise KeyboardInterrupt
@@ -795,6 +804,35 @@ def test_a_runner_killed_mid_wave_dissolves_it_on_resume(waves, git, monkeypatch
     assert_members_ran_alone(waves, git, run, "interrupted")
     shelf = next(e["shelf"] for e in run.events.read() if e["type"] == "wave_dissolved")
     assert git(waves.root, "show", f"{shelf}:src/two.py") == "half = 2\n"
+
+
+def test_a_wave_paused_before_its_first_call_starts_fresh_on_resume(waves, git, monkeypatch):
+    # the run is paused while the wave session waits at the usage governor, before any agent ran: nothing to dissolve
+    from agentflow.lanes import Executor
+    from agentflow.run_control import pause, resume
+
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act()]})
+    real = Executor.govern
+    held = {"done": False}
+
+    def govern(self, key, mark, phase):
+        if key == WAVE and not held["done"]:
+            held["done"] = True
+            pause(self.run, by="me")
+            return False
+        return real(self, key, mark, phase)
+
+    monkeypatch.setattr(Executor, "govern", govern)
+    assert build(waves, run)[0] == "stopped"
+    assert run.refresh()["steps"][WAVE]["status"] == "running"
+    assert not [e for e in run.events.read() if e["type"] == "agent_started" and e.get("step") == WAVE]
+    assert resume(run, by="me")
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert not dissolved(events) and len([c for c in waves.calls() if c["step"] == WAVE]) == 1
+    assert "--resume" not in [c for c in waves.calls() if c["step"] == WAVE][0]["argv"]
+    assert subjects(git, waves.root)[:2] == ["Task 3: Third thing", "Task 2: Second thing"] and once_each(git, waves.root)
 
 
 def kill_once(monkeypatch, cls, name: str, before=None) -> None:

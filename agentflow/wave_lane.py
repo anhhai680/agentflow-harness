@@ -715,7 +715,8 @@ class WaveLane:
 
     def _left_over(self, key: str) -> WaveOutcome | None:
         """What a walk finds of the wave's session from before, settled; None when there is nothing to settle: it never
-        started, it is done, or the gates reopened it and it was not called since (its fix loop resumes it). Otherwise
+        started, it is done, the gates reopened it and it was not called since (its fix loop resumes it), or no agent
+        ran since it started (the run was paused before its first call: starting it then is no resume). Otherwise
         it is never resumed: a stop of it still waiting is settled (`_session_stopped`), one a person settled after it
         was kept (`HEAD` had moved) dissolves the wave with its kind, and a session with neither is one a runner died
         in: its agents are waited for, then the wave dissolves (`interrupted`). While a person is needed elsewhere,
@@ -740,6 +741,8 @@ class WaveLane:
         if last in SETTLED:
             raised = [e for e in events if e["type"] == "hitl_raised" and e.get("key") == session_key]
             return self._dissolved(key, str((raised[-1].get("kind") if raised else None) or "stopped"))
+        if last == "step_started":  # no agent ran since it started (a pause before its first call): it starts fresh
+            return None
         wait_for_agents(self.run, self.cfg, session_key, self._timeout_s(wave=True))
         return self._dissolved(key, "interrupted")
 
