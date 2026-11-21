@@ -723,6 +723,19 @@ def test_a_gates_fix_for_one_member_keeps_the_wave(waves, git):
     assert git(waves.root, "show", "HEAD:src/three.py") == "fixed = 3\n"
 
 
+@pytest.mark.parametrize("path", [".agentflow/notes.md", "secrets/key.txt"])
+def test_a_forbidden_path_trip_of_the_wave_is_told_once_then_dissolves(waves, git, notified, path):
+    waves.configure({**BIG, **WAVES, "guardrails": {"forbidden_paths": ["secrets/**"]}})
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act(subs=[sub(2), sub(3, write={"src/three.py": "n = 3\n", path: "planted\n"})])],
+                  IMPL.format(n=2): [alone(2)], IMPL.format(n=3): [alone(3)]})
+    assert build(waves, run) == ("done", True)
+    assert len(notified) == 1  # a person hears of the forbidden edit, though the runner settles the stop
+    assert [e["key"] for e in waves.events(run, "hitl_notified")] == [WAVE]
+    assert dissolved(run.events.read()) == [(W, "guard_violation")]
+    assert not (waves.root / path).exists() and path not in branch_files(git, waves.root)
+
+
 def test_a_moved_head_keeps_the_wave_stop(waves, git, notified):
     run = begin_build(waves, wave_plan())
     waves.script({WAVE: [{**wave_act(), "write": {"src/two.py": "n = 2\n"}, "git_commit": "the wave committed"}],

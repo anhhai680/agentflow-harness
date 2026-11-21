@@ -82,6 +82,7 @@ SESSION_MARKS = ("step_started", "agent_started", "step_finished", "step_reopene
 SETTLED = ("hitl_approved", "hitl_answered", "step_retry")  # a person settled the stop the wave was kept on
 DISSOLVED_SHELF = "dissolved"  # the dissolve's shelf is `shelf_ref(run, "<W>/dissolved")`, beside the attribution's
 SET_ASIDE = ("blocked", "needs_human")  # a member that reports one of these is built alone
+FORBIDDEN_KIND = "forbidden_path"  # the guard's violation kind for `guardrails.forbidden_paths` and `.agentflow/**`
 CARD_RESULT = "none: a wave member writes no result file (see the rules at the end of this card)"
 REVIEW_CARD_RESULT = "none: a wave reviewer writes no result file (see the rules at the end of this card)"
 FIX_NOTE = ("The runner ran the build gates once on the wave's combined tree, and they failed:\n\n{report}\n\n"
@@ -747,13 +748,23 @@ class WaveLane:
         return self._dissolved(key, "interrupted")
 
     def _session_stopped(self, key: str) -> WaveOutcome:
-        """The wave session stopped: the wave dissolves, with the stop's kind as the reason. A stop elsewhere (the run's
-        own) is left as it is."""
+        """The wave session stopped: the wave dissolves, with the stop's kind as the reason. A guard stop for a forbidden
+        path (one of `guardrails.forbidden_paths` or `.agentflow/**`) is told to a person once first, since dissolving
+        settles it with no one asked. A stop elsewhere (the run's own) is left as it is."""
         self.run.refresh()
         wait = self.run.state["waiting"]
-        if halted(self.run.state["status"]) or wait is None or not under(str(wait.get("key") or ""), f"{key}/implement"):
+        session_key = f"{key}/implement"
+        if halted(self.run.state["status"]) or wait is None or not under(str(wait.get("key") or ""), session_key):
             return "stopped"
+        if wait.get("kind") == GUARD_KIND and self._forbidden_trip(session_key):
+            self._tell_once(wait)
         return self._dissolved(key, str(wait.get("kind") or "stopped"))
+
+    def _forbidden_trip(self, session_key: str) -> bool:
+        """Whether the last `guard_tripped` of `session_key` names a forbidden path."""
+        trips = [e for e in self.run.events.read() if e["type"] == "guard_tripped" and e.get("key") == session_key]
+        return bool(trips) and any(isinstance(v, dict) and v.get("kind") == FORBIDDEN_KIND
+                                   for v in trips[-1].get("violations") or [])
 
     def _dissolved(self, key: str, reason: str) -> WaveOutcome:
         """`_dissolve` as `wave_at` says it: "none" (each member is built alone), or "stopped" (the run's wait)."""
