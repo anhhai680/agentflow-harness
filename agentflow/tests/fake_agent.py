@@ -8,7 +8,10 @@ step, system_prompt}` to the file named by `AGENTFLOW_FAKE_CALLS`; `system_promp
 `--append-system-prompt-file` names (the run brief), or None when there is no such flag (or no such file).
 
 Act keys: write {relpath: text}, result {...}, result_raw str, usage_pct [..], tool_calls
-[{name, input}], subagents [{subagent_type, model}], compact bool, git_commit msg, sleep s,
+[{name, input}], subagents [{subagent_type, model}], parallel_subagents [{description, model?, subagent_type?, write?:
+{path: text}, output_tokens?}] (one `assistant` line holding every `Agent` call, then one `assistant` line per
+sub-agent carrying its `parent_tool_use_id`, its usage (`output_tokens`, default 20, priced as `model_id`) and its
+`write`s applied, then one `user` line holding every result: the sub-agents run concurrently), compact bool, git_commit msg, sleep s,
 exit n, no_init bool, final_text str, cost float (this call's, default 0.01; the result event reports
 the session's total, as Claude does), permission_denials [{tool_name, tool_input}] (copied into the
 result event), rate_limit {...} (sent as a `rate_limit_event`'s `rate_limit_info`), result_error bool
@@ -343,6 +346,27 @@ def main() -> int:
     for sub in act.get("subagents", []):
         tool_turn("Agent", {"description": "fake subagent", "prompt": "fake",
                             "subagent_type": sub["subagent_type"], "model": sub.get("model")})
+    parallel = act.get("parallel_subagents", [])
+    if parallel:
+        ids = [f"toolu_fake_par_{i}" for i in range(len(parallel))]
+        emit({"type": "assistant", "message": {"role": "assistant", "model": model, "usage": usage(2000), "content": [
+            {"type": "tool_use", "id": call_id, "name": "Agent", "input": {
+                "description": sub.get("description", "fake subagent"), "prompt": "fake",
+                "subagent_type": sub.get("subagent_type", "general-purpose"), "model": sub.get("model")}}
+            for call_id, sub in zip(ids, parallel)]}, "parent_tool_use_id": None, **base})
+        for call_id, sub in zip(ids, parallel):
+            for relpath, text in sub.get("write", {}).items():
+                target = Path(relpath)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            emit({"type": "assistant", "message": {
+                "role": "assistant", "id": f"msg_{call_id}", "model": model,
+                "content": [{"type": "text", "text": "working"}],
+                "usage": {**usage(2000), "output_tokens": int(sub.get("output_tokens", 20))}},
+                "parent_tool_use_id": call_id, **base})
+        emit({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": call_id, "content": "ok"} for call_id in ids]},
+              "parent_tool_use_id": None, **base})
     if act.get("compact"):
         emit({"type": "system", "subtype": "compact_boundary",
               "compact_metadata": {"trigger": "auto", "pre_tokens": 120000}, **base})

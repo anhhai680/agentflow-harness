@@ -590,6 +590,7 @@ def test_parse_fixture():
         "subagent_type": "Explore",
         "model": "inherit",
         "tool_use_id": "toolu_02",
+        "description": "Check layout",
     }
 
 
@@ -1507,3 +1508,84 @@ def test_ignored_settings_is_quiet_when_the_cli_did_what_was_asked(cfg):
 def test_ignored_settings_gives_both_when_both_apply(cfg):
     usage = {"tokens": {"cache_write_1h": 10}, "auto_memory": True}
     assert ignored_settings(_spec(cfg, cache_ttl="5m", lean=True), usage) == ["cache_ttl", "auto_memory"]
+
+
+# ------------------------------------------------------------------ sub-agent descriptions, cost and concurrency
+
+
+def _parallel_events(fake, fake_claude, call, subs):
+    fake.script({STEP: [{"model_id": SONNET, "parallel_subagents": subs}]})
+    events, on_event = collect()
+    fake_claude.run(call, on_event)
+    return events
+
+
+def test_two_task_calls_in_one_message_start_before_either_finishes(fake, fake_claude, call, wt):
+    events = _parallel_events(fake, fake_claude, call, [
+        {"description": "Task 2: a", "write": {"src/a.py": "a = 1\n"}, "output_tokens": 1000},
+        {"description": "Task 3: b", "write": {"src/b.py": "b = 1\n"}, "output_tokens": 5000}])
+    names = [n for n, _ in events if n.startswith("subagent_")]
+    assert names == ["subagent_started", "subagent_started", "subagent_finished", "subagent_finished"]
+    assert [p["description"] for n, p in events if n == "subagent_started"] == ["Task 2: a", "Task 3: b"]
+    assert [p["description"] for n, p in events if n == "subagent_finished"] == ["Task 2: a", "Task 3: b"]
+    assert (wt / "src" / "a.py").read_text() == "a = 1\n" and (wt / "src" / "b.py").read_text() == "b = 1\n"
+
+
+def test_a_subagents_cost_comes_from_its_own_usage_lines(fake, fake_claude, call):
+    events = _parallel_events(fake, fake_claude, call, [
+        {"description": "Task 2: a", "output_tokens": 1000}, {"description": "Task 3: b", "output_tokens": 5000}])
+    finished = [p for n, p in events if n == "subagent_finished"]
+    assert finished[0]["cost_usd"] > 0 and finished[0]["cost_usd"] != finished[1]["cost_usd"]
+    assert finished[1]["cost_usd"] > finished[0]["cost_usd"]
+
+
+def _call_line(*calls, parent=None):
+    return json.dumps({"type": "assistant", "parent_tool_use_id": parent, "message": {"content": [
+        {"type": "tool_use", "id": i, "name": "Agent", "input": d} for i, d in calls]}})
+
+
+def _sub_line(parent, msg_id, output_tokens=1000):
+    return json.dumps({"type": "assistant", "parent_tool_use_id": parent, "message": {
+        "id": msg_id, "model": SONNET, "content": [], "usage": {"input_tokens": 10, "output_tokens": output_tokens}}})
+
+
+def _finish_line(*ids):
+    return json.dumps({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+        {"type": "tool_result", "tool_use_id": i, "content": "ok"} for i in ids]}})
+
+
+def test_a_subagent_description_is_cut_and_a_missing_or_odd_one_is_empty(cfg):
+    acc = _acc(cfg)
+    events = parse_claude_line(_call_line(("t1", {"description": "x" * 500}), ("t2", {}), ("t3", {"description": 7})), acc)
+    assert [p["description"] for _, p in events if _ == "subagent_started"] == ["x" * 200, "", ""]
+
+
+def test_untrusted_stream_lines_never_raise_nor_inflate_a_subagents_cost(cfg):
+    acc = _acc(cfg)
+    parse_claude_line(_call_line(("t1", {"description": "one"}), ("t2", {"description": "two"})), acc)
+    for line in ("{not json", "[]", '{"type": "assistant", "message": "text"}', '{"type": "assistant", "message": []}',
+                 '{"type": "user", "message": {"content": "x"}}', _call_line(("t9", "not a dict")),
+                 json.dumps({"type": "assistant", "parent_tool_use_id": ["t1"], "message": {"usage": {"output_tokens": 9}}}),
+                 json.dumps({"type": "assistant", "parent_tool_use_id": "unknown", "message": {
+                     "id": "u", "model": SONNET, "usage": {"output_tokens": 999999}}})):
+        parse_claude_line(line, acc)
+    assert set(acc.subagent_usage) == {"t1", "t2", "t9"}  # only calls that started; "unknown" is not tracked
+    parse_claude_line(_sub_line("t1", "m1"), acc)
+    done = parse_claude_line(_finish_line("t1", "t2"), acc)
+    costs = [p["cost_usd"] for n, p in done if n == "subagent_finished"]
+    assert costs[0] > 0 and costs[1] == 0
+    assert acc.subagent_usage == {"t9": {}}  # a finished call is forgotten: a late line naming it is ignored
+    parse_claude_line(_sub_line("t1", "late"), acc)
+    assert acc.subagent_usage == {"t9": {}}
+
+
+def test_a_subagents_lines_stay_out_of_the_main_threads_numbers(cfg):
+    plain = _acc(cfg)
+    parse_claude_line(_assistant("m1", {"input_tokens": 10, "output_tokens": 20}, SONNET), plain)
+    acc = _acc(cfg)
+    parse_claude_line(_call_line(("t1", {"description": "one"})), acc)
+    parse_claude_line(_sub_line("t1", "s1", 5000), acc)
+    parse_claude_line(_assistant("m1", {"input_tokens": 10, "output_tokens": 20}, SONNET), acc)
+    assert acc.main_calls == plain.main_calls == 1 and acc.line_type == plain.line_type == "assistant"
+    assert acc.context_pct == plain.context_pct
+    assert acc.usage_payload()["turns"] == plain.usage_payload()["turns"] == 1

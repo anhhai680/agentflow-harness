@@ -204,6 +204,9 @@ class StreamAccumulator:
     line_type: str = ""  # "assistant" | "user" | "result" for a main-thread line, else ""
     over_threshold: bool = False
     open_subagents: dict[str, dict] = field(default_factory=dict)
+    # Per open sub-agent call id, the usage of the `assistant` lines that carry it as `parent_tool_use_id`, in the shape of
+    # `usage_by_message`. Only ids of calls that started and haven't finished are kept (`track_subagent_usage`).
+    subagent_usage: dict[str, dict[str, tuple[str, dict]]] = field(default_factory=dict)
     open_tools: set[str] = field(default_factory=set)  # main-thread `tool_use` ids with no `tool_result` yet
     limit: dict | None = None  # the latest `rate_limit_event`'s `rate_limit_info`
     reached_model: bool = False
@@ -517,6 +520,37 @@ def _usage_tokens(usage: Any) -> int | None:
     return sum(int(usage.get(key) or 0) for key in keys)
 
 
+SUBAGENT_DESCRIPTION_MAX = 200
+
+
+def subagent_description(tool_input: dict) -> str:
+    """A sub-agent call's `description`, cut to `SUBAGENT_DESCRIPTION_MAX` characters; `""` when it is missing or not a
+    string. Model text, stored as it came: whoever shows it to a person cleans it first."""
+    description = tool_input.get("description")
+    return description[:SUBAGENT_DESCRIPTION_MAX] if isinstance(description, str) else ""
+
+
+# The cost of one sub-agent: a separable unit, so it can be dropped if the CLI's stream doesn't tag a sub-agent's own lines
+# with `parent_tool_use_id`. `start_subagent_usage` and `track_subagent_usage` fold the lines in, `subagent_cost` reads it.
+
+
+def start_subagent_usage(acc: StreamAccumulator, call_id: str) -> None:
+    """Begin tracking the lines of the sub-agent call `call_id`. Only a call that started is ever tracked."""
+    acc.subagent_usage.setdefault(call_id, {})
+
+
+def track_subagent_usage(acc: StreamAccumulator, parent: Any, key: str, model: str, usage: dict) -> None:
+    """Keep one `assistant` line's usage for the sub-agent call `parent` names. A line naming a call that isn't open
+    (unknown, finished, or not a string) is ignored, so no other call's cost grows from it."""
+    if isinstance(parent, str) and parent in acc.subagent_usage:
+        acc.subagent_usage[parent][key] = (model, usage)
+
+
+def subagent_cost(acc: StreamAccumulator, call_id: str) -> float:
+    """USD for the call `call_id`'s own lines, priced as the session is; stops tracking the call."""
+    return round(estimate_cost(acc.prices, acc.subagent_usage.pop(call_id, {})), 6)
+
+
 def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict]]:
     """Fold one stream-json line into `acc` and return the runner events it caused."""
     acc.line_type = ""
@@ -558,7 +592,8 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
         return out
 
     if kind == "assistant":
-        message = event.get("message") or {}
+        message = event.get("message")
+        message = message if isinstance(message, dict) else {}
         acc.reached_model = acc.reached_model or message.get("model") != SYNTHETIC_MODEL
         last_tool = None
         started: list[tuple[str, dict]] = []
@@ -576,20 +611,23 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
                     "subagent_type": tool_input.get("subagent_type") or "general-purpose",
                     "model": tool_input.get("model") or "inherit",
                     "tool_use_id": block.get("id"),
-                    "description": tool_input.get("description"),
+                    "description": subagent_description(tool_input),
                 }
                 acc.subagents.append(sub)
                 acc.open_subagents[str(block.get("id"))] = sub
+                start_subagent_usage(acc, str(block.get("id")))
                 started.append(("subagent_started", {
                     "parent_session": acc.session_id,
                     "subagent_type": sub["subagent_type"],
                     "model": sub["model"],
                     "tool_use_id": sub["tool_use_id"],
+                    "description": sub["description"],
                 }))
         usage = message.get("usage")
         if isinstance(usage, dict):
             key = str(message.get("id") or f"line-{len(acc.usage_by_message)}")  # one entry per API call
             acc.usage_by_message[key] = (str(message.get("model") or acc.model or ""), usage)
+            track_subagent_usage(acc, event.get("parent_tool_use_id"), key, acc.usage_by_message[key][0], usage)
             if not acc.cost_reported:  # a reported cost is never replaced by the estimate
                 acc.cost_usd = estimate_cost(acc.prices, acc.usage_by_message)
             if main_thread and message.get("model") != SYNTHETIC_MODEL and key not in acc.main_ids:
@@ -627,6 +665,8 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
                     "subagent_type": sub["subagent_type"],
                     "model": sub["model"],
                     "tool_use_id": sub["tool_use_id"],
+                    "description": sub["description"],
+                    "cost_usd": subagent_cost(acc, str(sub["tool_use_id"])),
                 }))
         return out
 
