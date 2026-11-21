@@ -25,6 +25,8 @@ BOX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+)\[( |x|X)\]")
 _DEFERRED = re.compile(r"^\s*>\s*\*\*Deferred\b")
 _DEPENDS = re.compile(r"^\*\*Depends on:\*\*\s*(.*?)\s*$")
 _DEPENDS_TASK = re.compile(r"\bTask\s+(\d+)\b", re.IGNORECASE)
+_GROUP = re.compile(r"^\*\*Parallel group:\*\*\s*(.*?)\s*$")
+GROUP_MAX = 40  # a parallel group's name is cut to this many characters
 _FILE_LINE = re.compile(r"^\s*[-*+]\s+(?:Create|Modify|Test|Delete|Rename)\s*:", re.IGNORECASE)
 _BACKTICKED = re.compile(r"`([^`]+)`")
 _ROW_SPLIT = re.compile(r"(?<!\\)\|")
@@ -57,6 +59,7 @@ class PlanTask:
     checked: bool
     depends_on: list[int]
     deferred: bool = False  # its body says `> **Deferred (...)**`: built later, once another module merges
+    group: str | None = None  # its `**Parallel group:**` name: tasks of one group may be built together
 
     @property
     def open(self) -> bool:
@@ -126,6 +129,16 @@ def _depends_on(n: int, body: list[str]) -> list[int]:
     return [n - 1] if n > 1 else []
 
 
+def _parallel_group(body: list[str], fenced: list[bool]) -> str | None:
+    """The first `**Parallel group:**` line outside a code fence, cut to `GROUP_MAX`; `none` or empty is no group."""
+    for line, inside in zip(body, fenced, strict=True):
+        match = None if inside else _GROUP.match(line.strip())
+        if match:
+            value = match.group(1)[:GROUP_MAX].strip()
+            return None if not value or value.lower() == "none" else value
+    return None
+
+
 def parse_plan(path: Path) -> list[PlanTask]:
     """Every `### Task N: Title` in the plan, in file order."""
     return parse_plan_text(_read(path))
@@ -149,6 +162,7 @@ def parse_plan_text(text: str) -> list[PlanTask]:
                 checked=bool(boxes) and all(b in "xX" for b in boxes),
                 depends_on=_depends_on(n, body[1:]),
                 deferred=any(not fenced[start + k] and _DEFERRED.match(line) for k, line in enumerate(body)),
+                group=_parallel_group(body[1:], fenced[start + 1 : start + len(body)]),
             )
         )
     return tasks

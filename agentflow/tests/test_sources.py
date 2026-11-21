@@ -11,6 +11,7 @@ from agentflow.sources import (
     capability_map,
     find_plan,
     parse_plan,
+    parse_plan_text,
     spec_status,
     forbidden_task_files,
     task_files,
@@ -85,6 +86,30 @@ def test_parse_plan_marks_a_deferred_task_closed_without_ticking_it(tmp_path):
 def test_depends_on_defaults_and_overrides():
     tasks = parse_plan(FIXTURES / "plan-sample.md")
     assert [t.depends_on for t in tasks] == [[], [1], [1, 2], []]
+
+
+def test_a_task_names_its_parallel_group():
+    tasks = parse_plan_text("### Task 1: A\n\n**Depends on:** none\n**Parallel group:** B\n- [ ] x\n")
+    assert tasks[0].group == "B"
+
+
+def test_no_group_line_or_none_is_no_group():
+    text = (
+        "### Task 1: No line\n\n**Depends on:** none\n- [ ] x\n\n"
+        "### Task 2: None value\n\n**Depends on:** none\n**Parallel group:** None\n- [ ] x\n\n"
+        "### Task 3: Empty value\n\n**Depends on:** none\n**Parallel group:**\n- [ ] x\n"
+    )
+    assert [t.group for t in parse_plan_text(text)] == [None, None, None]
+
+
+def test_a_group_line_in_a_code_fence_is_not_read():
+    fenced = "### Task 1: A\n\n**Depends on:** none\n\n```\n**Parallel group:** B\n```\n- [ ] x\n"
+    assert parse_plan_text(fenced)[0].group is None
+
+
+def test_a_long_group_value_is_cut_to_40_characters():
+    tasks = parse_plan_text("### Task 1: A\n\n**Parallel group:** " + "x" * 60 + "\n- [ ] x\n")
+    assert tasks[0].group == "x" * 40
 
 
 def test_tick_task_flips_only_that_tasks_boxes(tmp_path):

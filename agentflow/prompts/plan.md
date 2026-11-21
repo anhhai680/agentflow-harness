@@ -5,6 +5,7 @@ If `{run_dir}/issue.md` exists, it is the GitHub issue this module comes from: r
 Read `{spec}` (approved), the repository's quality rules and the architecture part of the repository's agent instructions.
 Split the work into tasks of one testable slice each, with files, an **Interfaces** list (the existing code each task calls, as `path:line` and signature, and what it takes from and gives to other tasks) and exact test commands. Follow TDD: tests first. A task's commands run only the tests that task adds or changes: never the whole suite, another module's suites or an end-to-end stack, because the runner's gates run those.
 Give every task a `**Depends on:**` line naming the tasks it needs (`**Depends on:** Task 2, Task 4`, or `**Depends on:** none`). Without one, the runner assumes the task depends on the previous one.
+Tasks that can be built at the same time get the same `**Parallel group:** <letter>` line under `**Depends on:**`. Such tasks depend on none of each other, share no file, change no contract the others use, and each one names its files. The runner checks the files and dependencies itself and may still build them one at a time.
 A task that can't be built until another module merges stays in the plan with no checkboxes, and its body starts with `> **Deferred (<reason>).**`. The runner skips it, and the module counts as done without it.
 On a security-sensitive path (authentication, authorisation, secrets, untrusted input, personal data), add the security checks to the tasks.
 
