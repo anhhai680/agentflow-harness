@@ -49,6 +49,18 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   `step_retry` a person or a command asked for (its `by` is not the runner's) on one of their keys, once per task
   (a retry before the task's first park is no rework, and neither is the runner's own `re-review`). Both are
   always present (0 when nothing parked), and both are lower-is-better.
+  `waves` counts the `wave_started` events (higher is better), `parallel_demoted` the tasks a wave turned away or set
+  aside, once per task and reason and leaving out `dissolved` (a dissolve is counted by `waves_dissolved`),
+  `scope_violations` the `scope_violation` events, `waves_dissolved` the `wave_dissolved` events, and
+  `parallel_candidates` the pairs in the run's last `parallel_candidates` event (the independent tasks the plan left
+  ungrouped). All five are counts, always present (0 for a run with no wave), and lower is better but for `waves`.
+  `agent_parallelism` (higher is better) is (main-session seconds + sub-agent seconds) over wall seconds of the build
+  window, which runs from each `phase_started` of `build` to the next `phase_started` (the log's last event ends one
+  still open). Main sessions are the ones `metrics` pairs for agent time (its steps' `sessions`), sub-agents are
+  paired from `subagent_started` to `subagent_finished` by `tool_use_id` (one never finished is left out), and both
+  are clipped to the window. 1.0 is one agent at a time, above it sub-agents ran together. It is present only when
+  build had agent time (wall time and a main session in the window), and it counts seconds, never cost: a session's
+  cost already holds its sub-agents'.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
 
