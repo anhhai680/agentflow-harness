@@ -180,10 +180,11 @@ def test_candidates_are_ungrouped_independent_disjoint_pairs():
 
 
 def test_candidates_see_a_transitive_dependency():
+    # Task 2 is done, so only (1, 3) could be a pair, and 3 reaches 1 only through 2.
     tasks, _ = plan(
-        task_block(1, group=None, files=("a",)),
-        task_block(2, "Task 1", group=None, files=("b",)),
-        task_block(3, "Task 2", group=None, files=("c",)),
+        task_block(1, group=None, files=("src/a.py",)),
+        task_block(2, "Task 1", group=None, files=("src/b.py",), checked=True),
+        task_block(3, "Task 2", group=None, files=("src/c.py",)),
     )
     assert candidates(tasks, []) == []
 
