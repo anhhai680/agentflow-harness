@@ -28,8 +28,17 @@ these stages, and each first checks its own event, so a walk that comes back to 
 8. Each kept member through `FeatureLane._run_task` in plan order, then `wave_finished`. A member's review range and
    its fix stay on its own files (`FeatureLane._review_range`, `wave_revert_strays`).
 
-A stop of the wave session stays the run's wait for now, and a person is told of it once (`_wave_stopped`); so does a
-stray the fix loop left (`_wave_failed`), and a guard stop of the review wave.
+A wave session is never resumed or salvaged. It is **dissolved** (`_dissolve`, `wave_dissolved`) when it stops (the
+stop's kind is the reason), when its sub-agents were not dispatched as the runner asked (`wave_dispatch`: a sub-agent
+that names no member, runs another model or agent type, or whose call failed, recorded as one `guard_tripped`), when its
+gates' fix left a path no member owns (`scope_violation`) or its gates still fail after its fix loop passed
+(`gate_failed`), and when a walk finds it started and not done, so a runner died in it (`interrupted`, once its agents
+are waited for). Its tree goes into the shelf `shelf_ref(run, W)`, the paths it changed go back to the wave's start, and
+each member is built alone (`parallel_demoted`, `dissolved`); a dissolved wave never forms again. The one exception is
+`HEAD` moved away from the runner's: that stop stays the run's wait, and a person is told of it once; once they put
+`HEAD` back and settle it, the wave dissolves. The review wave is never dissolved: a stop of it that is not a guard trip,
+a wrong dispatch of its reviewers, and a session found started and not done drop it (`review_wave_dropped`), and its
+guard stop stays the run's wait, told once.
 """
 
 from __future__ import annotations
@@ -44,14 +53,17 @@ from typing import TYPE_CHECKING, Literal
 
 from agentflow import overlays, pack, park, route, safeio, sizing, sources, wave
 from agentflow.autonomy import GUARD_KIND, blocking_of
+from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, fmt
 from agentflow.config import Config, Phase, Step, resolve_model
 from agentflow.events import nfc
 from agentflow.feature_lane import TASK_N, under, wait_id
+from agentflow.flow_control import halted
 from agentflow.gates import GateResult, failure_report, record_results, run_gates_reusing
 from agentflow.gitops import GitError, commit_at, head, restore_paths, shelf_ref, shelve
 from agentflow.guards import changed_paths, snapshot
 from agentflow.hitl import clean_fact, raise_hitl
+from agentflow.run_control import wait_for_agents
 
 if TYPE_CHECKING:
     from agentflow.state import Run
@@ -62,6 +74,11 @@ REVIEW_WAVE_PROMPT = "task_review_wave.md"
 REVIEWER_RULES = "_wave_reviewer.md"
 WAVE_SKILL = "agentflow-build"  # `skills.map.build_wave` when a pack's map has none
 WaveOutcome = Literal["none", "ran", "stopped"]
+WAVE_DISPATCH = "wave_dispatch"  # the `guard_tripped` kind, and the reason, of a wave whose sub-agents were not dispatched as asked
+# Events on a wave session's key that tell what a walk finds of it (`_left_over`): the last one decides.
+SESSION_MARKS = ("step_started", "agent_started", "step_finished", "step_reopened", "hitl_raised", "hitl_approved",
+                 "hitl_answered", "step_retry")
+SETTLED = ("hitl_approved", "hitl_answered", "step_retry")  # a person settled the stop the wave was kept on
 SET_ASIDE = ("blocked", "needs_human")  # a member that reports one of these is built alone
 CARD_RESULT = "none: a wave member writes no result file (see the rules at the end of this card)"
 REVIEW_CARD_RESULT = "none: a wave reviewer writes no result file (see the rules at the end of this card)"
@@ -73,10 +90,11 @@ FIX_NOTE = ("The runner ran the build gates once on the wave's combined tree, an
 
 class WaveLane:
     """`waves_on`, `wave_at`, `wave_held`, `wave_owned`, `wave_gated` and `wave_revert_strays` for `lanes.Executor`;
-    relies on its `cfg`, `run`, `ctx`, `worktree`, `overrides`, `handled_waits`, `run_agent_step` and `_step_extra`, and
+    relies on its `cfg`, `run`, `ctx`, `worktree`, `overrides`, `handled_waits`, `run_agent_step`, `_step_extra` and
+    `_timeout_s`, and
     on `FeatureLane`'s `_impl_step`, `_task_extra`, `_task_payload`, `_committed`, `_parked`, `_parked_numbers`,
     `_sized_answers`, `_refine_round`, `_round_events`, `_route_drops_review`, `_skip_review`, `_review_range`,
-    `_task_outcome`, `_run_task`, `_unshelve`, `_tell_once` and `_waiting_on`."""
+    `_task_outcome`, `_run_task`, `_unshelve` and `_tell_once`."""
 
     cfg: Config
     run: Run
@@ -94,7 +112,8 @@ class WaveLane:
     def wave_at(self, phase: Phase, step: Step, plan: Path, rel: str, prefix: str, task: sources.PlanTask,
                 tasks: list[sources.PlanTask], held: set[int], small: dict) -> WaveOutcome:
         """Build the wave that holds `task`: the open one, else one formed at it. "none": no wave of two or more holds
-        it (it is built alone); "ran": every kept member is committed or parked; "stopped": a human is needed."""
+        it, or its wave dissolved (it is built alone); "ran": every kept member is committed or parked; "stopped": a
+        human is needed."""
         started = self._open_wave(prefix, task.n)
         if started is None:
             started = self._form_wave(phase, step, prefix, task, tasks, held, small)
@@ -291,12 +310,17 @@ class WaveLane:
         by_n = {t.n: t for t in tasks}
         members = [by_n[m] for m in started.get("tasks") or [] if m in by_n]
         impl_step = self._impl_step(step, small)
+        left = self._left_over(key)
+        if left is not None:
+            return left
         while True:
             if self._wave_session(phase, step, impl_step, prefix, key, number, members, rel, small) != "done":
-                return self._wave_stopped(key)
+                return self._session_stopped(key)
+            if self._dispatch_tripped(f"{key}/implement", [t.n for t in members], str(started.get("model") or "")):
+                return self._dissolved(key, WAVE_DISPATCH)
             attributed = self._attribute(prefix, key, started, members, rel)
-            if attributed is None:
-                return "stopped"
+            if isinstance(attributed, str):
+                return self._dissolved(key, attributed)
             kept = [t for t in members if str(t.n) not in (attributed.get("out") or {})]
             if not kept or self._projected(prefix, number, kept):
                 break
@@ -304,8 +328,7 @@ class WaveLane:
             if not failed:
                 break
             if self._gates_reopened(key):  # its own fix loop passed on this tree: nothing changed it since
-                self._wave_failed(key, f"The build gates fail on {key}'s tree after its fix loop passed.")
-                return "stopped"
+                return self._dissolved(key, "gate_failed")
             note = FIX_NOTE.format(report=failure_report(failed))
             self.run.emit("step_reopened", key=f"{key}/implement", reason="gates", note=note)
             self.run.emit("fix_attempt", key=f"{key}/implement", attempt=1, gates=[r.name for r in failed])
@@ -365,15 +388,16 @@ class WaveLane:
             safeio.write_text(cards[task.n], f"{body.rstrip()}\n\n{member.strip()}\n")
 
     def _attribute(self, prefix: str, key: str, started: dict, members: list[sources.PlanTask],
-                   rel: str) -> dict | None:
-        """Stage 4: the wave's attribution since its session last finished (`wave_attributed`), made once; None when
-        the run stopped instead."""
+                   rel: str) -> dict | str:
+        """Stage 4: the wave's attribution since its session last finished (`wave_attributed`), made once; a reason to
+        dissolve the wave instead: `scope_violation` for a stray the gates' fix left (an attribution after the first
+        that names strays, which nothing moved back), `shelf_failed` when the first one could not keep the tree."""
         events = self.run.events.read()
         finished = [e for e in events if e["type"] == "step_finished" and e.get("key") == f"{key}/implement"
                     and e.get("status") == "done"]
         attributed = [e for e in events if e["type"] == "wave_attributed" and e.get("key") == key]
         if attributed and (not finished or attributed[-1]["seq"] > finished[-1]["seq"]):
-            return attributed[-1]
+            return "scope_violation" if len(attributed) > 1 and attributed[-1].get("strays") else attributed[-1]
         if attributed:
             return self._attribute_fix(prefix, key, started, members, rel, attributed[-1])
         return self._attribute_first(prefix, key, started, members, rel)
@@ -392,14 +416,14 @@ class WaveLane:
         return wave.parse_reports(raw.get("tasks") if isinstance(raw, dict) else None, [t.n for t in members])
 
     def _attribute_first(self, prefix: str, key: str, started: dict, members: list[sources.PlanTask],
-                         rel: str) -> dict | None:
+                         rel: str) -> dict | str:
         """Shelve the tree, put the strays and the set-aside members' files back as at the wave's start, then record
         it. A shelf a runner wrote before it died is read instead of the tree, so the outcome is the same."""
         number, start_head, start_tree = int(started["wave"]), str(started["start_head"]), str(started["start_tree"])
         try:
             ref = shelf_ref(self.run.id, key)
-        except ValueError as exc:
-            return self._wave_failed(key, f"The wave's work cannot be shelved: {exc}.")
+        except ValueError:
+            return "shelf_failed"
         shelf = commit_at(self.worktree, ref)
         tree = f"{shelf}^{{tree}}" if shelf else snapshot(self.worktree)
         reports = self._reports(key, members)
@@ -417,23 +441,24 @@ class WaveLane:
         if moving and shelf is None:
             try:
                 shelf = shelve(self.worktree, tree, ref, f"Shelve {key}")
-            except (GitError, subprocess.CalledProcessError) as exc:
-                return self._wave_failed(key, f"The wave's work cannot be shelved: {clean_fact(str(exc))}.")
+            except (GitError, subprocess.CalledProcessError):
+                return "shelf_failed"  # nothing moved yet: the dissolve keeps the tree, or the run's wait does
         if moving:
             restore_paths(self.worktree, moving, start_head)
         summaries = {str(n): clean_fact(r.summary) for n, r in reports.items() if n not in out}
-        self.run.emit("wave_attributed", key=key, wave=number, owners={str(n): p for n, p in found.owners.items()},
-                      out={str(n): reason for n, reason in out.items()}, strays=sorted(found.strays),
-                      shelf=shelf if moving else None, summaries=summaries)
+        attributed = self.run.emit(
+            "wave_attributed", key=key, wave=number, owners={str(n): p for n, p in found.owners.items()},
+            out={str(n): reason for n, reason in out.items()}, strays=sorted(found.strays),
+            shelf=shelf if moving else None, summaries=summaries)
         self._record_strays(prefix, key, number, found.strays)
         for n, reason in out.items():
             self._demote(prefix, n, reason, number)
-        return self._last_wave_attribution(key)
+        return attributed
 
     def _attribute_fix(self, prefix: str, key: str, started: dict, members: list[sources.PlanTask], rel: str,
-                       last: dict) -> dict | None:
+                       last: dict) -> dict | str:
         """The attribution again after the gates' fix loop, over the kept members: a path none of them owns is a new
-        stray, and the run stops on it."""
+        stray, recorded (`scope_violation`), and the wave dissolves on it."""
         number, start_tree = int(started["wave"]), str(started["start_tree"])
         out = dict(last.get("out") or {})
         kept = [t for t in members if str(t.n) not in out]
@@ -442,22 +467,15 @@ class WaveLane:
         owners = {**{n: [] for n in out}, **{str(n): p for n, p in found.owners.items()}}
         summaries = {**(last.get("summaries") or {}),
                      **{str(n): clean_fact(r.summary) for n, r in reports.items() if r.status == "done"}}
-        self.run.emit("wave_attributed", key=key, wave=number, owners=owners, out=out, strays=sorted(found.strays),
-                      shelf=last.get("shelf"), summaries=summaries)
+        attributed = self.run.emit("wave_attributed", key=key, wave=number, owners=owners, out=out,
+                                   strays=sorted(found.strays), shelf=last.get("shelf"), summaries=summaries)
         self._record_strays(prefix, key, number, found.strays)
-        if found.strays:
-            shown = clean_fact(", ".join(f"`{p}`" for p in sorted(found.strays)))  # names an agent chose
-            return self._wave_failed(key, f"The fix of {key}'s gates changed files no member of the wave owns: {shown}.")
-        return self._last_wave_attribution(key)
+        return "scope_violation" if found.strays else attributed
 
     def _record_strays(self, prefix: str, key: str, number: int, strays: dict[str, int | None]) -> None:
         for path, owner in sorted(strays.items()):
             self.run.emit("scope_violation", key=f"{prefix}/task-{owner}" if owner is not None else key, task=owner,
                           path=path, wave=number)
-
-    def _last_wave_attribution(self, key: str) -> dict | None:
-        found = [e for e in self.run.events.read() if e["type"] == "wave_attributed" and e.get("key") == key]
-        return found[-1] if found else None
 
     def _gates_reopened(self, key: str) -> bool:
         return any(e["type"] == "step_reopened" and e.get("key") == f"{key}/implement" and e.get("reason") == "gates"
@@ -508,7 +526,8 @@ class WaveLane:
                      kept: list[sources.PlanTask]) -> Literal["done", "stopped"]:
         """Stage 7: the members' round-1 reviews from one session (`<W>/review`). "done" also when no review wave runs
         (each member is then reviewed alone by `_run_task`); "stopped" when its guard stop is the run's wait, or the run
-        stopped. A session a runner died in is not resumed: it is dropped (`interrupted`)."""
+        stopped. A session a runner died in is not resumed: it is dropped (`interrupted`) once its agents are waited
+        for, and so is one whose reviewers were not dispatched as asked (`wave_dispatch`, against the kept members)."""
         key, number = str(started["key"]), int(started["wave"])
         session_key = f"{key}/review"
         review = step.review
@@ -520,11 +539,15 @@ class WaveLane:
         if status in (None, "pending") and not self._reviews_as_wave(prefix, members):
             return "done"
         if status == "running":
+            wait_for_agents(self.run, self.cfg, session_key, self._timeout_s(wave=True))
             self._drop_review_wave(key, number, "interrupted")
             return "done"
         if status not in ("done", "unchanged"):
             if self._review_wave_session(phase, review, rel, prefix, key, number, members) != "done":
                 return self._review_wave_stopped(key, number)
+        if self._dispatch_tripped(session_key, [t.n for t in kept], self._session_model(session_key, "")):
+            self._drop_review_wave(key, number, WAVE_DISPATCH)
+            return "done"
         self._record_wave_reviews(phase, prefix, key, number, members)
         return "done"
 
@@ -619,7 +642,7 @@ class WaveLane:
         if wait is None or not under(str(wait.get("key") or ""), f"{key}/review"):
             return "stopped"
         if wait.get("kind") == GUARD_KIND:
-            return self._wave_stopped(key)
+            return self._keep_wait(wait)
         self._drop_review_wave(key, number, str(wait.get("kind") or "stopped"))
         return "done"
 
@@ -629,21 +652,138 @@ class WaveLane:
 
     # ------------------------------------------------------------------ when the wave cannot go on
 
-    def _wave_stopped(self, key: str) -> WaveOutcome:
-        """The wave session stopped. For now its stop stays the run's wait, and a person is told of it once (a wave's
-        stop is raised quietly); the walk settled it, so `pipeline.walk` does not take it over."""
+    def _session_model(self, session_key: str, default: str) -> str:
+        """The model the wave session `session_key` was started on (its last `step_started`), else `default`."""
+        started = [e for e in self.run.events.read() if e["type"] == "step_started" and e.get("key") == session_key]
+        return str((started[-1].get("model") if started else None) or default)
+
+    def _dispatch_tripped(self, session_key: str, members: list[int], model: str) -> bool:
+        """Whether the wave session `session_key` started a sub-agent the runner did not ask for (`wave.dispatch_violations`
+        over the sub-agents of the session's agent rows, live and exited, which the runner built from the stream), the
+        model being the session's own. Recorded once since the session last finished, as a `guard_tripped` of kind
+        `wave_dispatch` with one violation per line."""
+        self.run.refresh()
+        state = self.run.state
+        rows = [*(state.get("exited") or []), *(state.get("agents") or {}).values()]
+        subagents = [sub for row in rows if isinstance(row, dict) and row.get("step") == session_key
+                     for sub in row.get("subagents") or [] if isinstance(sub, dict)]
+        lines = wave.dispatch_violations(subagents, members, self._session_model(session_key, model))
+        if not lines:
+            return False
+        events = self.run.events.read()
+        done = max((e["seq"] for e in events if e["type"] == "step_finished" and e.get("key") == session_key
+                    and e.get("status") == "done"), default=0)
+        if not any(e["type"] == "guard_tripped" and e.get("key") == session_key and e["seq"] > done
+                   and any(isinstance(v, dict) and v.get("kind") == WAVE_DISPATCH for v in e.get("violations") or [])
+                   for e in events):
+            self.run.emit("guard_tripped", key=session_key,  # the lines quote descriptions a model wrote
+                          violations=[{"kind": WAVE_DISPATCH, "detail": clean_fact(line)} for line in lines])
+        return True
+
+    def _left_over(self, key: str) -> WaveOutcome | None:
+        """What a walk finds of the wave's session from before, settled; None when there is nothing to settle: it never
+        started, it is done, or the gates reopened it and it was not called since (its fix loop resumes it). Otherwise
+        it is never resumed: a stop of it still waiting is settled (`_session_stopped`), one a person settled after it
+        was kept (`HEAD` had moved) dissolves the wave with its kind, and a session with neither is one a runner died
+        in: its agents are waited for, then the wave dissolves (`interrupted`). While a person is needed elsewhere,
+        nothing is touched ("stopped")."""
+        session_key = f"{key}/implement"
+        self.run.refresh()
+        state = self.run.state
+        events = self.run.events.read()
+        status = (state["steps"].get(session_key) or {}).get("status")
+        if status in ("done", "unchanged", "skipped") or not any(
+                e["type"] == "step_started" and e.get("key") == session_key for e in events):
+            return None
+        wait = state["waiting"]
+        if halted(state["status"]) or (wait is not None and not under(str(wait.get("key") or ""), session_key)):
+            return "stopped"
+        if wait is not None:
+            return self._session_stopped(key)
+        marks = [e for e in events if e["type"] in SESSION_MARKS and (e.get("key") or e.get("step")) == session_key]
+        last = marks[-1]["type"] if marks else None
+        if last == "step_reopened":
+            return None
+        if last in SETTLED:
+            raised = [e for e in events if e["type"] == "hitl_raised" and e.get("key") == session_key]
+            return self._dissolved(key, str((raised[-1].get("kind") if raised else None) or "stopped"))
+        wait_for_agents(self.run, self.cfg, session_key, self._timeout_s(wave=True))
+        return self._dissolved(key, "interrupted")
+
+    def _session_stopped(self, key: str) -> WaveOutcome:
+        """The wave session stopped: the wave dissolves, with the stop's kind as the reason. A stop elsewhere (the run's
+        own) is left as it is."""
         self.run.refresh()
         wait = self.run.state["waiting"]
-        if wait is not None and under(str(wait.get("key") or ""), key):
-            self.handled_waits.add(wait_id(wait))
-            self._tell_once(wait)
-        return "stopped"
+        if halted(self.run.state["status"]) or wait is None or not under(str(wait.get("key") or ""), f"{key}/implement"):
+            return "stopped"
+        return self._dissolved(key, str(wait.get("kind") or "stopped"))
 
-    def _wave_failed(self, key: str, summary: str) -> None:
-        """The runner cannot go on with the wave (its tree could not be shelved, or the gates' fix left a stray): a
-        `blocked` stop on its session, told to a person at once."""
+    def _dissolved(self, key: str, reason: str) -> WaveOutcome:
+        """`_dissolve` as `wave_at` says it: "none" (each member is built alone), or "stopped" (the run's wait)."""
+        return "none" if self._dissolve(key, reason) else "stopped"
+
+    def _dissolve(self, key: str, reason: str) -> bool:
+        """Give the wave up (`reason`), so each member is built alone; False when it stays the run's wait instead. In
+        this order, each repeated with the same outcome by a runner killed before the next:
+
+        1. `HEAD` is not the one the runner last recorded (an agent committed): the wave session's stop stays the run's
+           wait (one is raised, told at once, when there is none), handled here and told to a person once.
+        2. The tree, when it changed since the wave's start, goes into the shelf `shelf_ref(run, W)` (a shelf that
+           cannot be written keeps the run's wait the same way: nothing is moved). Unchanged, the shelf is the one a
+           dissolve killed after its restore wrote.
+        3. Every path changed since the wave's start goes back as at its start `HEAD`.
+        4. Each member is `parallel_demoted` (`dissolved`), then `wave_dissolved`, which clears the wait under the
+           wave and skips its session's row, closes the wave."""
         session_key = f"{key}/implement"
-        if not self._waiting_on(session_key):
+        started = next(e for e in self.run.events.read() if e["type"] == "wave_started" and e.get("key") == key)
+        number, members = int(started["wave"]), [int(m) for m in started.get("tasks") or []]
+        self.run.refresh()
+        wait = self.run.state["waiting"]
+        wait = wait if wait is not None and under(str(wait.get("key") or ""), session_key) else None
+        try:
+            now, known = head(self.worktree), runner_head(self.run)
+        except (GitError, subprocess.CalledProcessError) as exc:
+            return self._keep_stop(session_key, wait, f"The runner cannot read {key}'s HEAD ({clean_fact(str(exc))}), "
+                                   "so it cannot give the wave up safely.")
+        if now != known:
+            return self._keep_stop(session_key, wait, (
+                f"HEAD is {now[:12]}, not the {str(known)[:12]} the runner last recorded: something committed during "
+                f"{key}. Put HEAD back (the wave's work can stay in the tree), then approve: the wave is given up and "
+                "its tasks are built alone."))
+        start_head, start_tree = str(started["start_head"]), str(started["start_tree"])
+        try:
+            ref = shelf_ref(self.run.id, key)
+            tree = snapshot(self.worktree)
+            changed = changed_paths(self.worktree, start_tree, tree)
+            shelf = shelve(self.worktree, tree, ref, f"Shelve {key}") if changed else commit_at(self.worktree, ref)
+        except (GitError, ValueError, subprocess.CalledProcessError) as exc:
+            return self._keep_stop(session_key, wait, (
+                f"The work of {key} cannot be shelved ({clean_fact(str(exc))}), so the runner moved nothing. Keep what "
+                "you want of it, then approve: the wave is given up and its tasks are built alone."))
+        if changed:
+            restore_paths(self.worktree, changed, start_head)
+        prefix = key.rsplit("/wave-", 1)[0]
+        for n in members:
+            self._demote(prefix, n, "dissolved", number)
+        self.run.emit("wave_dissolved", key=key, wave=number, tasks=members, reason=reason, shelf=shelf)
+        self.run.refresh()
+        return True
+
+    def _keep_stop(self, session_key: str, wait: dict | None, summary: str) -> bool:
+        """The wave stays the run's wait: its session's stop (`wait`), or a `blocked` stop raised and told at once when
+        it has none (a runner died in it). False, as `_dissolve` returns it."""
+        if wait is None:
             raise_hitl(self.cfg, self.run, "blocked", session_key, summary, notify=True)
-        self._wave_stopped(key)
-        return None
+            self.run.refresh()
+            wait = self.run.state["waiting"]
+        if wait is not None:
+            self._keep_wait(wait)
+        return False
+
+    def _keep_wait(self, wait: dict) -> Literal["stopped"]:
+        """A wave's stop stays the run's wait: a person is told of it once (a wave's stop is raised quietly), and the
+        walk settled it, so `pipeline.walk` does not take it over."""
+        self.handled_waits.add(wait_id(wait))
+        self._tell_once(wait)
+        return "stopped"

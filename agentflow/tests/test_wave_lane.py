@@ -14,7 +14,8 @@ from agentflow.hitl import answer, approve
 from agentflow.pipeline import RunOptions, advance, start
 from conftest import with_doubt
 from test_feature_lane import (BIG, DONE_RESULT, IMPL, PLAN_PATH, REVIEW, SHELVES, TITLES, begin_build, build,
-                               commit_of, files_of, needs_human, plan_text, sessions_of, shelves, steps, subjects)
+                               commit_of, files_of, needs_human, pairs, plan_text, review, sessions_of, shelves, steps,
+                               subjects)
 from test_sizing_lane import PLAN_SIZE, plan_answer
 
 WAVES = {"parallel": {"max_subagents": 2}}
@@ -540,3 +541,325 @@ def test_profile_L_keeps_a_review_session_per_task(waves):
     calls = steps(waves.calls())
     assert RWAVE not in calls and {REVIEW.format(n=2), REVIEW.format(n=3)} <= set(calls)
     assert waves.events(run, "review_wave_dropped") == []  # never formed, so nothing to drop
+
+
+# --------------------------------------------------------------------------- when a wave fails (Task 9)
+
+
+W = "build/build/wave-1"
+
+
+def dissolved(events: list[dict]) -> list[tuple[str, str]]:
+    return [(e["key"], e["reason"]) for e in events if e["type"] == "wave_dissolved"]
+
+
+def alone(n: int, text: str | None = None) -> dict:
+    """Task `n` built on its own after its wave dissolved: it writes its file again, its own way."""
+    return {"write": {FILES[n][0]: text or f"alone = {n}\n"}, "result": DONE_RESULT}
+
+
+def once_each(git, root) -> bool:
+    """Every commit subject of the branch appears once: nothing was committed twice."""
+    found = subjects(git, root)
+    return len(found) == len(set(found))
+
+
+def assert_members_ran_alone(waves, git, run, reason: str) -> None:
+    """The wave dissolved for `reason`, its work is kept in its shelf and in no commit, and each member was built alone."""
+    events = run.events.read()
+    assert dissolved(events) == [(W, reason)]
+    [event] = [e for e in events if e["type"] == "wave_dissolved"]
+    assert event["wave"] == 1 and event["tasks"] == [2, 3]
+    assert [(n, r) for n, r in demoted(events) if r == "dissolved"] == [(2, "dissolved"), (3, "dissolved")]
+    assert run.state["steps"][WAVE]["status"] == "skipped"
+    waiting = run.state["waiting"]
+    assert waiting is None or not waiting["key"].startswith(f"{W}/")
+    assert {IMPL.format(n=2), IMPL.format(n=3)} <= set(steps(waves.calls()))
+    assert files_of(git, waves.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
+    assert files_of(git, waves.root, "Task 3: Third thing") == [PLAN_PATH, "src/three.py"]
+    assert git(waves.root, "show", "HEAD:src/two.py") == "alone = 2\n"  # the member's own build, not the wave's
+    assert git(waves.root, "show", "HEAD:src/three.py") == "alone = 3\n"
+    assert shelves(git, waves.root) == [f"{SHELVES}/{run.id}/build.build.wave-1"]
+    assert event["shelf"] == git(waves.root, "rev-parse", f"{SHELVES}/{run.id}/build.build.wave-1").strip()
+    assert once_each(git, waves.root) and git(waves.root, "status", "--porcelain") == ""
+
+
+def test_a_wave_session_stop_dissolves_it_and_members_run_alone(waves, git, notified):
+    # the wave's tree fails the build gate, and its own fix loop runs out: fix_attempts_exhausted
+    waves.configure({**BIG, **WAVES, "gates": {"three": {"run": "test ! -f src/three.py || ! grep -q wave src/three.py"}},
+                     "gate_sets": {"build": ["three"]}})
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act(subs=[sub(2), sub(3, write={"src/three.py": "wave = 3\n"})])],
+                  IMPL.format(n=2): [alone(2)], IMPL.format(n=3): [alone(3)]})
+    assert build(waves, run) == ("done", True)
+    assert_members_ran_alone(waves, git, run, "fix_attempts_exhausted")
+    shelf = next(e["shelf"] for e in run.events.read() if e["type"] == "wave_dissolved")
+    assert git(waves.root, "show", f"{shelf}:src/three.py") == "wave = 3\n"  # the wave's work, kept
+    assert notified == []  # settled by the runner: no person is needed
+
+
+@pytest.mark.parametrize("wrong", [
+    {"description": "Task 7: x"},  # a task that is not in the wave
+    {"description": "Task 3: Third thing", "model": "opus"},  # another model than the wave's
+    {"description": "Task 3: Third thing", "subagent_type": "Explore"},  # a custom type runs its own model
+    {"description": "Task 3: Third thing", "error": True},  # a refused dispatch looks like a good one otherwise
+])
+def test_a_wrong_dispatch_dissolves_the_wave(waves, git, notified, wrong):  # Review Focus 4
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act(subs=[sub(2), {**wrong, "write": {"src/three.py": "n = 3\n"}}])],
+                  IMPL.format(n=2): [alone(2)], IMPL.format(n=3): [alone(3)]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    [tripped] = [e for e in events if e["type"] == "guard_tripped" and e["key"] == WAVE]
+    assert [v["kind"] for v in tripped["violations"]] == ["wave_dispatch"]
+    assert_members_ran_alone(waves, git, run, "wave_dispatch")
+    assert not [e for e in events if e["type"] == "wave_attributed"]  # no member's work was taken from the wave
+    assert notified == []
+
+
+def test_a_moved_head_keeps_the_wave_stop(waves, git, notified):
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [{**wave_act(), "write": {"src/two.py": "n = 2\n"}, "git_commit": "the wave committed"}],
+                  IMPL.format(n=2): [alone(2)], IMPL.format(n=3): [alone(3)]})
+    assert build(waves, run) == ("stopped", True)
+    waiting = run.refresh()["waiting"]
+    assert waiting["key"] == WAVE and waiting["kind"] == "guard_violation" and not dissolved(run.events.read())
+    assert len(notified) == 1  # a wave's stop is raised quietly: the runner tells a person once
+    assert build(waves, run) == ("stopped", True) and len(notified) == 1  # a later walk does not tell them again
+    assert IMPL.format(n=2) not in steps(waves.calls())
+    # A person undoes the commit (the work stays in the tree) and approves: the wave dissolves and its members run alone.
+    git(waves.root, "reset", "-q", "HEAD~1")
+    approve(run, WAVE, by="me")
+    assert build(waves, run) == ("done", True)
+    assert_members_ran_alone(waves, git, run, "guard_violation")
+    assert "the wave committed" not in subjects(git, waves.root)
+    assert len([c for c in waves.calls() if c["step"] == WAVE]) == 1  # never resumed
+
+
+def test_a_moved_head_found_on_resume_keeps_the_run_waiting(waves, git, notified, monkeypatch):
+    # the runner died in the wave session, whose agent had committed: no stop was raised, so the dissolve raises one
+    run = begin_build(waves, wave_plan())
+    from agentflow.lanes import Executor
+
+    real = Executor.run_agent_step
+
+    def killed(self, phase, step, key, *args, **kwargs):
+        if key == WAVE:
+            self.run.emit("step_started", key=key, phase=phase.name,
+                          start_head=git(waves.root, "rev-parse", "HEAD").strip())
+            (waves.root / "src").mkdir(exist_ok=True)
+            (waves.root / "src/two.py").write_text("n = 2\n", encoding="utf-8")
+            git(waves.root, "add", "-A")
+            git(waves.root, "commit", "-q", "-m", "the dead session committed")
+            raise KeyboardInterrupt
+        return real(self, phase, step, key, *args, **kwargs)
+
+    monkeypatch.setattr(Executor, "run_agent_step", killed)
+    with pytest.raises(KeyboardInterrupt):
+        build(waves, run)
+    monkeypatch.setattr(Executor, "run_agent_step", real)
+    assert build(waves, run) == ("stopped", True)
+    waiting = run.refresh()["waiting"]
+    assert waiting["key"] == WAVE and not dissolved(run.events.read()) and len(notified) == 1
+    assert "HEAD" in waiting["summary"]
+
+
+def test_a_runner_killed_mid_wave_dissolves_it_on_resume(waves, git, monkeypatch):  # Review Focus 1
+    run = begin_build(waves, wave_plan())
+    waves.script({IMPL.format(n=2): [alone(2)], IMPL.format(n=3): [alone(3)]})
+    from agentflow import wave_lane
+    from agentflow.lanes import Executor
+
+    real = Executor.run_agent_step
+
+    def killed(self, phase, step, key, *args, **kwargs):  # the runner dies while the wave's sub-agents write
+        if key == WAVE:
+            self.run.emit("step_started", key=key, phase=phase.name)
+            (waves.root / "src").mkdir(exist_ok=True)
+            (waves.root / "src/two.py").write_text("half = 2\n", encoding="utf-8")
+            raise KeyboardInterrupt
+        return real(self, phase, step, key, *args, **kwargs)
+
+    monkeypatch.setattr(Executor, "run_agent_step", killed)
+    with pytest.raises(KeyboardInterrupt):
+        build(waves, run)
+    monkeypatch.setattr(Executor, "run_agent_step", real)
+    waited: list[tuple[str, int]] = []
+    real_wait = wave_lane.wait_for_agents
+    monkeypatch.setattr(wave_lane, "wait_for_agents",
+                        lambda run, cfg, key, timeout_s: waited.append((key, timeout_s)) or real_wait(run, cfg, key, timeout_s))
+    assert build(waves, run) == ("done", True)
+    executor = waves.executor(run)
+    assert waited == [(WAVE, executor._timeout_s(wave=True))]  # its agents are waited for before anything moves
+    assert dissolved(run.events.read())[-1][1] == "interrupted"
+    assert WAVE not in steps(waves.calls())  # the wave's session is never resumed
+    assert_members_ran_alone(waves, git, run, "interrupted")
+    shelf = next(e["shelf"] for e in run.events.read() if e["type"] == "wave_dissolved")
+    assert git(waves.root, "show", f"{shelf}:src/two.py") == "half = 2\n"
+
+
+def kill_once(monkeypatch, cls, name: str, before=None) -> None:
+    """`cls.name` raises KeyboardInterrupt on its first call (after `before(self)`), then works as it did."""
+    real = getattr(cls, name)
+    state = {"killed": False}
+
+    def dying(self, *args, **kwargs):
+        if not state["killed"]:
+            state["killed"] = True
+            if before is not None:
+                before(self)
+            raise KeyboardInterrupt
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(cls, name, dying)
+
+
+def test_a_runner_killed_before_attribution_attributes_on_resume(waves, git, monkeypatch):  # Review Focus 1
+    from agentflow.wave_lane import WaveLane
+
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act()]})
+    kill_once(monkeypatch, WaveLane, "_attribute")  # the session is done, its attribution not yet made
+    with pytest.raises(KeyboardInterrupt):
+        build(waves, run)
+    assert run.refresh()["steps"][WAVE]["status"] == "done"
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert len([e for e in events if e["type"] == "wave_attributed"]) == 1 and not dissolved(events)
+    assert len([c for c in waves.calls() if c["step"] == WAVE]) == 1
+    assert subjects(git, waves.root)[:2] == ["Task 3: Third thing", "Task 2: Second thing"] and once_each(git, waves.root)
+
+
+def test_a_runner_killed_part_way_through_attribution_reads_the_shelf_on_resume(waves, git, monkeypatch):
+    # the shelf was written and a stray already restored, then the runner died before `wave_attributed`
+    from agentflow.gitops import shelf_ref, shelve
+    from agentflow.guards import snapshot
+    from agentflow.wave_lane import WaveLane
+
+    run = begin_build(waves, wave_plan())
+    strays = sub(3, write={"src/three.py": "n = 3\n", "src/zz.py": "zz = 1\n"})
+    waves.script({WAVE: [wave_act(subs=[sub(2), strays], tasks=[report(2), report(3, files=["src/three.py",
+                                                                                         "src/zz.py"])])],
+                  IMPL.format(n=3): [alone(3)]})
+
+    def shelved_then_died(self):
+        shelve(self.worktree, snapshot(self.worktree), shelf_ref(self.run.id, W), f"Shelve {W}")
+        (self.worktree / "src/zz.py").unlink()  # as the restore would
+
+    kill_once(monkeypatch, WaveLane, "_attribute", before=shelved_then_died)
+    with pytest.raises(KeyboardInterrupt):
+        build(waves, run)
+    assert not [e for e in run.events.read() if e["type"] == "wave_attributed"]
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    [attributed] = [e for e in events if e["type"] == "wave_attributed"]
+    assert attributed["strays"] == ["src/zz.py"] and attributed["out"] == {"3": "scope_violation"}
+    assert len([c for c in waves.calls() if c["step"] == WAVE]) == 1 and not dissolved(events)
+    assert len([e for e in events if e["type"] == "wave_finished"]) == 1
+    assert "src/zz.py" not in branch_files(git, waves.root) and not (waves.root / "src/zz.py").exists()
+    assert files_of(git, waves.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
+    assert git(waves.root, "show", "HEAD:src/three.py") == "alone = 3\n" and once_each(git, waves.root)
+
+
+def test_a_runner_killed_after_a_member_committed_finishes_the_wave_once(waves, git, monkeypatch):
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act()]})
+    emit = run.emit
+
+    def dies_after_task_2(etype, **data):
+        out = emit(etype, **data)
+        if etype == "task_committed" and data.get("key") == "build/build/task-2":
+            raise KeyboardInterrupt
+        return out
+
+    monkeypatch.setattr(run, "emit", dies_after_task_2)
+    with pytest.raises(KeyboardInterrupt):
+        build(waves, run)
+    monkeypatch.setattr(run, "emit", emit)
+    assert subjects(git, waves.root)[0] == "Task 2: Second thing"
+    assert build(waves, run) == ("done", True)  # a fresh executor, as `agentflow resume` makes
+    events = run.events.read()
+    assert len([c for c in waves.calls() if c["step"] in (WAVE, RWAVE)]) == 2  # each wave session ran once
+    assert len([e for e in events if e["type"] == "wave_attributed"]) == 1
+    [finished] = [e for e in events if e["type"] == "wave_finished"]
+    assert finished["committed"] == [2, 3] and not dissolved(events)
+    assert subjects(git, waves.root)[:2] == ["Task 3: Third thing", "Task 2: Second thing"] and once_each(git, waves.root)
+    assert files_of(git, waves.root, "Task 3: Third thing") == [PLAN_PATH, "src/three.py"]
+
+
+def test_a_member_parked_at_review_shelves_only_its_own_files(waves, git):  # Review Focus 3
+    run = begin_build(waves, wave_plan())
+    two = {**F1, "file": "src/two.py", "text": "F2: two is wrong"}
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: [two], 3: []})],
+                  REVIEW.format(n=2): [review(two), review(two)]})  # 2's review stays unresolved
+    assert build(waves, run) == ("stopped", True)
+    events = run.events.read()
+    parked = next(e for e in events if e["type"] == "step_parked")
+    assert parked["key"] == REVIEW.format(n=2) and parked["shelved"] == ["src/two.py"]
+    assert git(waves.root, "show", f"{parked['shelf']}:src/two.py") == "n = 2\n"
+    assert files_of(git, waves.root, "Task 3: Third thing") == [PLAN_PATH, "src/three.py"]
+    assert git(waves.root, "show", "HEAD:src/three.py") == "n = 3\n"
+    assert "Task 2: Second thing" not in subjects(git, waves.root)
+
+
+def test_a_dissolved_wave_never_forms_again(waves, git):
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act(subs=[sub(2), {"description": "Task 7: x"}])],
+                  IMPL.format(n=2): [{**needs_human("other")}, alone(2)], IMPL.format(n=3): [alone(3)]})
+    assert build(waves, run) == ("stopped", True)  # 2, built alone, asks; 3 was built meanwhile
+    assert answer(run, IMPL.format(n=2), {"q1": "A"}, by="me")
+    assert build(waves, run) == ("done", True)  # a fresh executor walks the plan again
+    events = run.events.read()
+    assert len([e for e in events if e["type"] == "wave_started"]) == 1
+    assert dissolved(events) == [(W, "wave_dispatch")]
+    assert len([c for c in waves.calls() if c["step"] == WAVE]) == 1
+
+
+def test_a_stray_left_by_the_wave_fix_dissolves_the_wave(waves, git):
+    waves.configure({**BIG, **WAVES, "gates": {"three": {"run": "test ! -f src/three.py || grep -q fixed src/three.py"}},
+                     "gate_sets": {"build": ["three"]}})
+    run = begin_build(waves, wave_plan())
+    fix = {"write": {"src/three.py": "fixed = 3\n", "src/zz.py": "zz = 1\n"},
+           "result": {"status": "done", "summary": "fixed three", "tasks": [report(2), report(3)]}}
+    waves.script({WAVE: [wave_act(), fix],
+                  IMPL.format(n=2): [alone(2)], IMPL.format(n=3): [alone(3, "fixed = 3  # alone = 3\n")]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert dissolved(events) == [(W, "scope_violation")]
+    assert "src/zz.py" in [p for _, p in scope_violations(events)]
+    assert not (waves.root / "src/zz.py").exists() and "src/zz.py" not in branch_files(git, waves.root)
+    shelf = next(e["shelf"] for e in events if e["type"] == "wave_dissolved")
+    assert git(waves.root, "show", f"{shelf}:src/zz.py") == "zz = 1\n"
+    assert files_of(git, waves.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
+    assert git(waves.root, "show", "HEAD:src/two.py") == "alone = 2\n" and once_each(git, waves.root)
+
+
+@pytest.mark.parametrize("wrong", [{"description": "Review Task 9: x"},
+                                   {"description": "Review Task 3: Third thing", "subagent_type": "Explore"}])
+def test_a_wrong_review_dispatch_drops_the_review_wave(waves, git, wrong):
+    run = begin_build(waves, wave_plan())
+    act = review_wave_act()
+    act["parallel_subagents"] = [act["parallel_subagents"][0], wrong]
+    waves.script({WAVE: [wave_act()], RWAVE: [act]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    [tripped] = [e for e in events if e["type"] == "guard_tripped" and e["key"] == RWAVE]
+    assert [v["kind"] for v in tripped["violations"]] == ["wave_dispatch"]
+    [dropped] = waves.events(run, "review_wave_dropped")
+    assert dropped["reason"] == "wave_dispatch" and wave_reviews(events) == []  # none of its findings count
+    assert {REVIEW.format(n=2), REVIEW.format(n=3)} <= set(steps(waves.calls()))  # each member reviewed alone
+    assert not dissolved(events) and subjects(git, waves.root)[:2] == ["Task 3: Third thing", "Task 2: Second thing"]
+
+
+def test_the_review_wave_alone_may_start_reviewers(waves):
+    # read-only review sessions get `--tools` without `Agent`; the review wave dispatches, so it gets `Agent`/`Task`
+    run = begin_build(waves, wave_plan())
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: []})]})
+    assert build(waves, run) == ("done", True)
+    calls = waves.calls()
+    wave_argv = [c for c in calls if c["step"] == RWAVE][-1]["argv"]
+    member_argv = [c for c in calls if c["step"] == REVIEW.format(n=3)][-1]["argv"]
+    assert ("--tools", "Read,Grep,Glob,Bash,Write,Agent,Task") in pairs(wave_argv)
+    assert ("--tools", "Read,Grep,Glob,Bash,Write") in pairs(member_argv)
+    assert ("--permission-mode", "dontAsk") in pairs(wave_argv)
+    assert "--tools" not in [c for c in calls if c["step"] == WAVE][-1]["argv"]  # the build wave is not read-only

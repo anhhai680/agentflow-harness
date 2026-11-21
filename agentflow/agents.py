@@ -116,6 +116,9 @@ class AgentCall:
     read_only: bool = False  # Claude gets only `READ_ONLY_TOOLS` and no MCP server; Codex a read-only sandbox (fresh session)
     # a `read_only_roles` session: `dontAsk`, `REVIEW_TOOLS`, read-only git, writes only in `add_dirs`, no MCP server
     read_only_role: bool = False
+    # a wave session (`Step.wave_size`), which starts one sub-agent per member: a `read_only_role` call also gets (and
+    # is allowed) `SUBAGENT_TOOLS`. Its sub-agents run under the same `--tools`, mode and rules; nothing else changes.
+    dispatches: bool = False
     idle_s: float | None = None  # end the session after this long with no stream line (`watchdog`); None: no watchdog
     tool_idle_s: float | None = None  # the same limit while a tool call is open, or for an agent that `tracks_tools` not
     self_contained: bool = False  # the prompt is the whole brief (a sizer): Claude gets no skills listing
@@ -667,6 +670,7 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
                     "tool_use_id": sub["tool_use_id"],
                     "description": sub["description"],
                     "cost_usd": subagent_cost(acc, str(sub["tool_use_id"])),
+                    "ok": not bool(block.get("is_error")),  # a call the CLI refused comes back as an error result
                 }))
         return out
 
@@ -1016,6 +1020,11 @@ def read_only_allow(add_dirs: list[Path]) -> list[str]:
     return [*READ_ONLY_ALLOW, *(f"Edit(/{directory}/{READ_ONLY_WRITES}/**)" for directory in add_dirs)]
 
 
+def _role_tools(call: AgentCall) -> tuple[str, ...]:
+    """The tools of a `read_only_role` call: `REVIEW_TOOLS`, then `SUBAGENT_TOOLS` for a wave session that dispatches."""
+    return (*REVIEW_TOOLS, *SUBAGENT_TOOLS) if call.dispatches else REVIEW_TOOLS
+
+
 def _carries_rules(call: AgentCall) -> bool:
     """The call passes a brief that holds the repository's rules."""
     return call.carries_rules and call.system_prompt_file is not None
@@ -1040,7 +1049,7 @@ class ClaudeAgent(_CliAgent):
         if locked:
             # `--tools` is an allowlist that holds in every permission mode, `bypassPermissions` included.
             # It is variadic like `--add-dir`, so it goes before the next option and never reaches the prompt.
-            argv += ["--tools", ",".join(REVIEW_TOOLS if call.read_only_role else READ_ONLY_TOOLS)]
+            argv += ["--tools", ",".join(_role_tools(call) if call.read_only_role else READ_ONLY_TOOLS)]
         # `--strict-mcp-config` once: lean keeps only the servers `base_args` names, a read-only call none at all
         if spec.lean:
             argv += LEAN_ARGS
@@ -1068,7 +1077,8 @@ class ClaudeAgent(_CliAgent):
             pass
         permissions: dict = {"deny": deny}
         if call.read_only_role:  # deny rules win over the allow rules, so `git diff --output=` stays out of reach
-            permissions = {"allow": read_only_allow(call.add_dirs), "deny": [*deny, *READ_ONLY_DENY]}
+            permissions = {"allow": [*read_only_allow(call.add_dirs), *(SUBAGENT_TOOLS if call.dispatches else ())],
+                           "deny": [*deny, *READ_ONLY_DENY]}
         argv += ["--settings", json.dumps({"permissions": permissions})]
         if call.system_prompt_file is not None:
             argv += [BRIEF_ARG, str(call.system_prompt_file)]

@@ -434,3 +434,24 @@ def test_dispatch_names_one_line_per_offending_entry():
     assert len(got) == 3
     assert any("Task 9" in line for line in got) and any("haiku" in line for line in got)
     assert dispatch_violations([], {2}, "sonnet") == []
+
+
+@pytest.mark.parametrize(("subagent_type", "ok"), [(None, True), ("general-purpose", True), ("Explore", False),
+                                                   ("security-auditor", False), ("", False)])
+def test_dispatch_agent_types(subagent_type, ok):
+    # an omitted `model` on a custom agent type runs that type's own model while the stream says `inherit`
+    entry = {"description": "Task 2: x", "model": "inherit"}
+    if subagent_type is not None:
+        entry["subagent_type"] = subagent_type
+    got = dispatch_violations([entry], {2}, "sonnet")
+    assert (got == []) is ok
+    if not ok:
+        assert len(got) == 1 and repr(subagent_type) in got[0]
+
+
+def test_dispatch_a_subagent_that_errored_is_a_violation():
+    # a refused `Task` call looks like a good one unless its result says it failed
+    entries = [{"description": "Task 2: x", "ok": True}, {"description": "Task 3: x", "ok": False},
+               {"description": "Task 3: y"}]  # no outcome recorded (an older engine's row): not counted against it
+    got = dispatch_violations(entries, {2, 3}, "sonnet")
+    assert len(got) == 1 and "Task 3: x" in got[0]

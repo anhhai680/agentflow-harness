@@ -210,8 +210,22 @@ def test_compaction_and_subagents_on_the_row(run):
     run.emit("subagent_finished", parent_session="s-2", subagent_type="Explore", model="haiku", tool_use_id="t1")
     (sub,) = run.state["agents"]["s-2"]["subagents"]
     assert sub["subagent_type"] == "Explore" and sub["done"] is True
+    assert sub["description"] is None and sub["ok"] is None  # an older engine's events name neither
     run.emit("rolled_over", key="plan/x", session_id="s-2")
     assert run.state["steps"]["plan/x"]["rollovers"] == 1
+
+
+def test_a_subagent_row_keeps_its_description_and_outcome(run):
+    # the wave's dispatch check reads these rows (`wave.dispatch_violations`), also once the session has exited
+    run.emit("agent_started", agent="claude", pid=5, model="opus", effort="medium", step="build/x", sizing=False,
+             session_id="s-3")
+    run.emit("subagent_started", parent_session="s-3", subagent_type="general-purpose", model="inherit",
+             tool_use_id="t1", description="Task 2: a")
+    run.emit("subagent_finished", parent_session="s-3", subagent_type="general-purpose", model="inherit",
+             tool_use_id="t1", description="Task 2: a", cost_usd=0.1, ok=False)
+    run.emit("agent_exited", session_id="s-3", exit_code=0, cost=0.0)
+    (sub,) = run.state["exited"][-1]["subagents"]
+    assert (sub["description"], sub["done"], sub["ok"]) == ("Task 2: a", True, False)
 
 
 def test_context_window_is_cached_per_model(run):

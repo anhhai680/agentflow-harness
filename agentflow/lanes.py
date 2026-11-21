@@ -1146,6 +1146,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
             carries_rules=bool(sr.brief is not None and sr.brief.get("rules") is True),
             # Every call of a session keeps the setting the session started with (`_decide_read_only`).
             read_only_role=sr.read_only,
+            dispatches=sr.step.wave_size > 0,
             self_contained=self._self_contained(sr),
             max_turns=max_turns,
             budget_usd=budget_usd,

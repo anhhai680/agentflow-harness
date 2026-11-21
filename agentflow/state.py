@@ -463,7 +463,7 @@ def _on_subagent_started(state: dict, ev: dict) -> None:
     if row is not None:
         row["subagents"].append({
             "tool_use_id": ev.get("tool_use_id"), "subagent_type": ev.get("subagent_type"),
-            "model": ev.get("model"), "done": False,
+            "model": ev.get("model"), "description": ev.get("description"), "done": False, "ok": None,
         })
 
 
@@ -473,6 +473,7 @@ def _on_subagent_finished(state: dict, ev: dict) -> None:
         for sub in row["subagents"]:
             if sub["tool_use_id"] == ev.get("tool_use_id"):
                 sub["done"] = True
+                sub["ok"] = ev.get("ok")  # False: the call came back as an error (None: an older engine's event)
 
 
 def _on_context_window(state: dict, ev: dict) -> None:

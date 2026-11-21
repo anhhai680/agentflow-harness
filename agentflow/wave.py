@@ -42,6 +42,7 @@ _PAIRS_LEAD = (
 
 REPORT_STATUSES = ("done", "blocked", "needs_human")
 TASK_DESCRIPTION = re.compile(r"^\s*(?:Review\s+)?Task\s+(\d+)\s*:")
+GENERAL_AGENT = "general-purpose"  # the only sub-agent type a wave may start: it runs the session's model
 _TEST_NAMES = ("test_*", "*_test.*", "*.test.*", "*.spec.*")
 
 
@@ -313,7 +314,9 @@ def _owner(path: str, declared: Mapping[int, set[str]], dirs: Mapping[int, set[s
 
 def dispatch_violations(subagents: Sequence[Mapping], members: Collection[int], model: str) -> list[str]:
     """One line for each sub-agent a wave session started that names no member (its description must start
-    `Task <n>:` or `Review Task <n>:`) or runs a model that is neither `inherit`, missing, nor the wave's own."""
+    `Task <n>:` or `Review Task <n>:`), runs a model that is neither `inherit`, missing, nor the wave's own, is of an
+    agent type other than `general-purpose` (a custom type with no `model` runs its own model, which the stream still
+    calls `inherit`), or whose call came back as an error (`ok` False: a refused call looks like a good one otherwise)."""
     lines: list[str] = []
     for entry in subagents:
         description = entry.get("description")
@@ -323,4 +326,9 @@ def dispatch_violations(subagents: Sequence[Mapping], members: Collection[int], 
         agent_model = entry.get("model")
         if agent_model not in (None, "inherit", model):
             lines.append(f"sub-agent model is not the wave's ({model}): {agent_model!r}")
+        agent_type = entry.get("subagent_type", GENERAL_AGENT)
+        if agent_type not in (None, GENERAL_AGENT):
+            lines.append(f"sub-agent type is not {GENERAL_AGENT}: {agent_type!r} ({description!r})")
+        if entry.get("ok") is False:
+            lines.append(f"sub-agent call failed: {description!r}")
     return lines
