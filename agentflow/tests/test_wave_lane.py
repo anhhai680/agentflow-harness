@@ -282,3 +282,33 @@ def test_grouped_tasks_are_never_batched(waves):
     phase = waves.cfg.phases["build"]
     step = dataclasses.replace(next(s for s in phase.steps if s.id == "build"), batch={"max_tasks": 4, "max_files": 3})
     assert executor._batches(phase, step, executor.worktree / PLAN_PATH, "build/build", {}) == {}
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_a_member_editing_a_parked_tasks_file_is_reverted(waves, git, monkeypatch, held):
+    # Task 1 parks with its work shelved; tasks 2 and 3 do not wait on it and form the wave, whose third sub-agent
+    # also writes the parked task's file (its report does not name it). `held`: the park records its paths as held
+    # (`step_parked.paths`, as an older engine's park did), so they are the parked task's to commit.
+    run = begin_build(waves, plan_text({1: "none", 2: "none", 3: "none"}, count=3, files=FILES, groups=GROUPS))
+    if held:
+        emit = run.emit
+
+        def recording_paths(etype, **data):
+            if etype == "step_parked":
+                data["paths"] = list(data.get("shelved") or [])
+            return emit(etype, **data)
+
+        monkeypatch.setattr(run, "emit", recording_paths)
+    intruder = sub(3, write={"src/three.py": "n = 3\n", "src/one.py": "not yours\n"})
+    waves.script({IMPL.format(n=1): [{"write": {"src/one.py": "one = 1\n"}, **BLOCKED}],
+                  WAVE: [wave_act(subs=[sub(2), intruder])]})
+    assert build(waves, run) == ("stopped", True)  # the parked task is the run's wait once nothing else can run
+    events = run.events.read()
+    (parked,) = [e for e in events if e["type"] == "step_parked"]
+    assert parked["key"] == IMPL.format(n=1) and parked["shelved"] == ["src/one.py"]
+    assert scope_violations(events) == [(None, "src/one.py")]
+    assert not (waves.root / "src/one.py").exists()  # back as the wave's start had it: the parked task's state
+    assert "src/one.py" not in branch_files(git, waves.root)  # in no member's commit
+    assert files_of(git, waves.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
+    assert files_of(git, waves.root, "Task 3: Third thing") == [PLAN_PATH, "src/three.py"]
+    assert git(waves.root, "show", f"{parked['shelf']}:src/one.py") == "one = 1\n"  # its own work, untouched

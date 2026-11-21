@@ -62,7 +62,7 @@ FIX_NOTE = ("The runner ran the build gates once on the wave's combined tree, an
 class WaveLane:
     """`waves_on`, `wave_at`, `wave_held`, `wave_owned` and `wave_gated` for `lanes.Executor`; relies on its `cfg`, `run`,
     `ctx`, `worktree`, `overrides`, `handled_waits`, `run_agent_step` and `_step_extra`, and on `FeatureLane`'s
-    `_impl_step`, `_task_extra`, `_task_payload`, `_committed`, `_parked`, `_parked_numbers`, `_held_paths`,
+    `_impl_step`, `_task_extra`, `_task_payload`, `_committed`, `_parked`, `_parked_numbers`,
     `_sized_answers`, `_refine_round`, `_task_outcome`, `_run_task`, `_unshelve`, `_tell_once` and `_waiting_on`."""
 
     cfg: Config
@@ -317,9 +317,10 @@ class WaveLane:
             return self._attribute_fix(prefix, key, started, members, rel, attributed[-1])
         return self._attribute_first(prefix, key, started, members, rel)
 
-    def _changed(self, key: str, start_tree: str, tree: str) -> list[str]:
-        held = self._held_paths(key)  # a wave key is no task: every parked task's files are held, none is the wave's
-        return [p for p in changed_paths(self.worktree, start_tree, tree) if p not in held]
+    def _changed(self, start_tree: str, tree: str) -> list[str]:
+        """Every path the wave changed since its start. A parked task's file is not left out: the wave started with it
+        as `HEAD` has it, so a change to it is a sub-agent's, and a stray like any other."""
+        return changed_paths(self.worktree, start_tree, tree)
 
     def _reports(self, key: str, members: list[sources.PlanTask]) -> dict[int, wave.Report]:
         """The members' reports in the wave session's last result (the runner's checked copy)."""
@@ -341,7 +342,7 @@ class WaveLane:
         shelf = commit_at(self.worktree, ref)
         tree = f"{shelf}^{{tree}}" if shelf else snapshot(self.worktree)
         reports = self._reports(key, members)
-        found = wave.attribute(self._changed(key, start_tree, tree), members, reports, rel)
+        found = wave.attribute(self._changed(start_tree, tree), members, reports, rel)
         out: dict[int, str] = {}
         for task in members:
             report = reports.get(task.n)
@@ -376,7 +377,7 @@ class WaveLane:
         out = dict(last.get("out") or {})
         kept = [t for t in members if str(t.n) not in out]
         reports = self._reports(key, kept)
-        found = wave.attribute(self._changed(key, start_tree, snapshot(self.worktree)), kept, reports, rel)
+        found = wave.attribute(self._changed(start_tree, snapshot(self.worktree)), kept, reports, rel)
         owners = {**{n: [] for n in out}, **{str(n): p for n, p in found.owners.items()}}
         summaries = {**(last.get("summaries") or {}),
                      **{str(n): clean_fact(r.summary) for n, r in reports.items() if r.status == "done"}}
