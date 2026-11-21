@@ -28,7 +28,7 @@ these stages, and each first checks its own event, so a walk that comes back to 
 8. Each kept member through `FeatureLane._run_task` in plan order, then `wave_finished`. A member's review range and
    its fix stay on its own files (`FeatureLane._review_range`, `wave_revert_strays`).
 
-A wave session is never resumed or salvaged. It is **dissolved** (`_dissolve`, `wave_dissolved`) when it stops (the
+A wave session is never resumed after a stop or a killed runner (only its own gate fix loop resumes it) or salvaged. It is **dissolved** (`_dissolve`, `wave_dissolved`) when it stops (the
 stop's kind is the reason), when its sub-agents were not dispatched as the runner asked (`wave_dispatch`: a sub-agent
 that names no member, runs another model or agent type, whose call failed or that had not finished, or a member with no
 sub-agent or more than one in the session's first pass, recorded as one `guard_tripped`), when its

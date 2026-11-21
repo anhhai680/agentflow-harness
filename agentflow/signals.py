@@ -54,7 +54,8 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   `scope_violations` the `scope_violation` events, `waves_dissolved` the `wave_dissolved` events, and
   `parallel_candidates` the pairs in the run's last `parallel_candidates` event (the independent tasks the plan left
   ungrouped). All five are counts, always present (each is 0 when the run has no such event: the feature lane records
-  `parallel_candidates` at plan time whether or not a wave forms), and lower is better but for `waves`.
+  `parallel_candidates` once, when the build's plan walk starts with `parallel.max_subagents` above 1, whether or
+  not a wave forms), and lower is better but for `waves`.
   `agent_parallelism` (higher is better) is (main-session seconds + sub-agent seconds) over wall seconds of the build
   window, which runs from each `phase_started` of `build` to the next `phase_started` (the last window ends at the
   log's last event). Main sessions are the ones `metrics` pairs for agent time (its steps' `sessions`), sub-agents are
