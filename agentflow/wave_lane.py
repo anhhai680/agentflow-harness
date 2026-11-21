@@ -82,6 +82,7 @@ SESSION_MARKS = ("step_started", "agent_started", "step_finished", "step_reopene
 SETTLED = ("hitl_approved", "hitl_answered", "step_retry")  # a person settled the stop the wave was kept on
 DISSOLVED_SHELF = "dissolved"  # the dissolve's shelf is `shelf_ref(run, "<W>/dissolved")`, beside the attribution's
 SET_ASIDE = ("blocked", "needs_human")  # a member that reports one of these is built alone
+CARDS = "cards"  # the reason a wave dissolves, or its review wave is dropped, when the runner cannot write its cards
 FORBIDDEN_KIND = "forbidden_path"  # the guard's violation kind for `guardrails.forbidden_paths` and `.agentflow/**`
 CARD_RESULT = "none: a wave member writes no result file (see the rules at the end of this card)"
 REVIEW_CARD_RESULT = "none: a wave reviewer writes no result file (see the rules at the end of this card)"
@@ -317,7 +318,10 @@ class WaveLane:
         if left is not None:
             return left
         while True:
-            if self._wave_session(phase, step, impl_step, prefix, key, number, members, rel, small) != "done":
+            session = self._wave_session(phase, step, impl_step, prefix, key, number, members, rel, small)
+            if session == CARDS:
+                return self._dissolved(key, CARDS)
+            if session != "done":
                 return self._session_stopped(key)
             numbers = [t.n for t in members]
             if not self._attributed_since_done(key) and self._dispatch_tripped(
@@ -358,7 +362,8 @@ class WaveLane:
 
     def _wave_session(self, phase: Phase, step: Step, impl_step: Step, prefix: str, key: str, number: int,
                       members: list[sources.PlanTask], rel: str, small: dict) -> str:
-        """Stage 3: the wave's one session (`<W>/implement`), with the step's gates once they have reopened it."""
+        """Stage 3: the wave's one session (`<W>/implement`), with the step's gates once they have reopened it; `CARDS`
+        when its cards cannot be written (something planted at a card's path), so the wave dissolves."""
         session_key = f"{key}/implement"
         gates = impl_step.gates if self._gates_reopened(key) else None
         wave_step = dataclasses.replace(
@@ -367,7 +372,10 @@ class WaveLane:
             wave_size=len(members))
         cards = {t.n: self.run.agent_dir / "wave" / f"wave-{number}" / f"task-{t.n}.md" for t in members}
         if (self.run.state["steps"].get(session_key) or {}).get("status") not in ("done", "unchanged"):
-            self._write_cards(step, prefix, members, cards, rel, small)
+            try:
+                self._write_cards(step, prefix, members, cards, rel, small)
+            except (OSError, ValueError):  # `safeio` refuses a symlink or a non-file there
+                return CARDS
         extra = {"wave_title": "Tasks " + ", ".join(str(t.n) for t in members),
                  "wave_cards": "\n".join(f"- Task {t.n}: {t.title}: `{cards[t.n]}`" for t in members)}
         return self.run_agent_step(phase, wave_step, session_key, extra=extra, size=False)
@@ -560,7 +568,11 @@ class WaveLane:
             self._drop_review_wave(key, number, "interrupted")
             return "done"
         if status not in ("done", "unchanged"):
-            if self._review_wave_session(phase, review, rel, prefix, key, number, members) != "done":
+            session = self._review_wave_session(phase, review, rel, prefix, key, number, members)
+            if session == CARDS:
+                self._drop_review_wave(key, number, CARDS)
+                return "done"
+            if session != "done":
                 return self._review_wave_stopped(key, number)
         if self._dispatch_tripped(session_key, [t.n for t in kept], self._session_model(session_key, ""),
                                   required=[t.n for t in members], review=True):
@@ -596,7 +608,7 @@ class WaveLane:
     def _review_wave_session(self, phase: Phase, review: Step, rel: str, prefix: str, key: str, number: int,
                              members: list[sources.PlanTask]) -> str:
         """The review wave's one session (on the members' `review` step), at the highest of the members' review
-        levels, after its cards."""
+        levels, after its cards; `CARDS` when they cannot be written, so the review wave is dropped."""
         session_key = f"{key}/review"
         events = self.run.events.read()
         numbers = [t.n for t in members]
@@ -604,7 +616,10 @@ class WaveLane:
             self.run.emit("effort_decided", key=session_key, level=self._wave_effort(prefix, numbers, events, "review"),
                           source="wave", reason=f"the highest level of tasks {', '.join(str(n) for n in numbers)}")
         cards = {t.n: self.run.agent_dir / "wave" / f"wave-{number}" / f"review-{t.n}.md" for t in members}
-        self._write_review_cards(phase, review, rel, prefix, members, cards)
+        try:
+            self._write_review_cards(phase, review, rel, prefix, members, cards)
+        except (OSError, ValueError):  # `safeio` refuses a symlink or a non-file there
+            return CARDS
         wave_step = dataclasses.replace(review, prompt=REVIEW_WAVE_PROMPT, wave_size=len(members))
         extra = {"wave_title": "Tasks " + ", ".join(str(n) for n in numbers),
                  "wave_cards": "\n".join(f"- Review Task {t.n}: {t.title}: `{cards[t.n]}`" for t in members)}

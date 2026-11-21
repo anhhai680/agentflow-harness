@@ -736,6 +736,38 @@ def test_a_forbidden_path_trip_of_the_wave_is_told_once_then_dissolves(waves, gi
     assert not (waves.root / path).exists() and path not in branch_files(git, waves.root)
 
 
+def plant_link(run, name: str, tmp_path) -> None:
+    """A symlink at the wave card `name`, as something in the agent workspace could leave there."""
+    target = tmp_path / "elsewhere.md"
+    target.write_text("not a card\n", encoding="utf-8")
+    card = run.agent_dir / "wave" / "wave-1" / name
+    card.parent.mkdir(parents=True, exist_ok=True)
+    card.symlink_to(target)
+
+
+def test_a_planted_card_path_dissolves_the_wave(waves, git, tmp_path):
+    run = begin_build(waves, wave_plan())
+    plant_link(run, "task-3.md", tmp_path)
+    waves.script({IMPL.format(n=2): [alone(2)], IMPL.format(n=3): [alone(3)]})
+    assert build(waves, run) == ("done", True)
+    events = run.events.read()
+    assert dissolved(events) == [(W, "cards")] and WAVE not in steps(waves.calls())
+    assert {IMPL.format(n=2), IMPL.format(n=3)} <= set(steps(waves.calls()))
+    assert (tmp_path / "elsewhere.md").read_text(encoding="utf-8") == "not a card\n"
+    assert build(waves, run) == ("done", True)  # a later walk does not crash on it
+
+
+def test_a_planted_review_card_path_drops_the_review_wave(waves, git, tmp_path):
+    run = begin_build(waves, wave_plan())
+    plant_link(run, "review-3.md", tmp_path)
+    waves.script({WAVE: [wave_act()]})
+    assert build(waves, run) == ("done", True)
+    [dropped] = waves.events(run, "review_wave_dropped")
+    assert dropped["reason"] == "cards" and RWAVE not in steps(waves.calls())
+    assert {REVIEW.format(n=2), REVIEW.format(n=3)} <= set(steps(waves.calls()))
+    assert (tmp_path / "elsewhere.md").read_text(encoding="utf-8") == "not a card\n"
+
+
 def test_a_moved_head_keeps_the_wave_stop(waves, git, notified):
     run = begin_build(waves, wave_plan())
     waves.script({WAVE: [{**wave_act(), "write": {"src/two.py": "n = 2\n"}, "git_commit": "the wave committed"}],
