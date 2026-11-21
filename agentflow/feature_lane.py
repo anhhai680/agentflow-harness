@@ -148,6 +148,9 @@ TASK_N = re.compile(r"/task-(\d+)/")
 UNSHELVE = "unshelve"  # `<task>/unshelve`: the stop for a shelf that no longer applies on top of `HEAD`
 SHOWN_PATHS = 10
 DONE_STATUSES = ("done", "unchanged")
+# What settles a stop of a task (a person's answer, approval or retry, its shelf applied back): a wave member's fix is
+# checked against the tree from then on (`FeatureLane._fix_base`), never against changes made before it.
+FIX_SETTLED = ("hitl_approved", "hitl_answered", "step_retry", "unit_unparked")
 SUMMARY_MAX = 60
 FINAL_FIX = "final_fix"  # `finish`'s session that fixes what the full verify run on the final tree found
 FINAL_FIX_MESSAGE = "Fix what the full verify run found"
@@ -950,7 +953,7 @@ class FeatureLane:
         A batch's review passes the range's start (its first member's) and the batch's title and texts.
 
         A wave member's range holds only its own files (`_review_range`), and its fix may change only those: any other
-        path it changed goes back to how it was before the fix (`WaveLane.wave_revert_strays`)."""
+        path it changed goes back to how it was before the fix (`WaveLane.wave_revert_strays`, against `_fix_base`)."""
         impl_key, review_key = f"{tkey}/implement", f"{tkey}/review"
         owned = self._wave_scope(phase, tkey)
         rextra = {**(review_extra or extra), **self._review_range(phase, tkey, start_sha, owned)}
@@ -959,10 +962,10 @@ class FeatureLane:
             return "stopped", []
         if not first:
             return "done", []
-        before = self._fix_base(phase, impl_key) if owned is not None else None
-        fixed = self._fix_round(phase, impl_step, impl_key, extra, first, tree=before)
-        if owned is not None and before:  # a fix that stopped too: a park or another member's commit must not take it
-            self.wave_revert_strays(tkey, owned, before)
+        base = self._fix_base(phase, tkey) if owned is not None else None
+        fixed = self._fix_round(phase, impl_step, impl_key, extra, first, base=base)
+        if owned is not None and base is not None:  # a fix that stopped too: a park or another commit must not take it
+            self.wave_revert_strays(tkey, owned, base)
         if fixed != "done":
             return "stopped", []
         second = self._review_round(phase, review, review_key, rextra, 2)
@@ -1005,11 +1008,25 @@ class FeatureLane:
         return {"task_start_sha": f"{sha} -- {' '.join(shlex.quote(p) for p in owned)}",
                 "diff_range": f"{sha}..worktree, limited to {', '.join(owned)}"}
 
-    def _fix_base(self, phase: Phase, impl_key: str) -> str:
-        """The tree a wave member's fix round started from: the one its review reopen recorded, else the tree now."""
-        reopened = [e for e in self._round_events(phase) if e["type"] == "step_reopened" and e.get("key") == impl_key
-                    and e.get("reason") == "review"]
-        return str(reopened[-1].get("tree") or "") if reopened else snapshot(self.worktree)
+    def _fix_base(self, phase: Phase, tkey: str) -> dict[str, str]:
+        """The tree and `HEAD` a wave member's fix is checked against: before its review reopen, the tree now (the
+        reopen records it); then the last one recorded, unless a stop of the task was settled since (a person's answer,
+        approval or retry, or its shelf applied back, after other tasks committed): the tree then holds what is not the
+        fix's, so it is taken again and recorded (`fix_rebased`)."""
+        impl_key = f"{tkey}/implement"
+        events = self._round_events(phase)
+        base = None
+        for event in events:
+            if event.get("key") == impl_key and (event["type"] == "fix_rebased" or (
+                    event["type"] == "step_reopened" and event.get("reason") == "review")):
+                base = event
+        if base is not None and not any(e["type"] in FIX_SETTLED and e["seq"] > base["seq"]
+                                        and under(str(e.get("key") or ""), tkey) for e in events):
+            return {"tree": str(base.get("tree") or ""), "head": str(base.get("head") or "")}
+        now = {"tree": snapshot(self.worktree), "head": head(self.worktree)}
+        if base is not None:
+            self.run.emit("fix_rebased", key=impl_key, **now)
+        return now
 
     def _task_start(self, phase: Phase, impl_key: str) -> str:
         """Where the task's diff starts: `HEAD` when its implementer started (in a refine round: started
@@ -1114,9 +1131,9 @@ class FeatureLane:
         return earlier_review(blocking_of(self.cfg, findings), note)
 
     def _fix_round(self, phase: Phase, impl_step: Step, impl_key: str, extra: dict[str, str],
-                   blocking: list[dict], tree: str | None = None) -> Outcome:
-        """The one round in which the implementer's session gets the blocking findings back. `tree` (a wave member's:
-        the tree before the fix) is kept on the reopen, so a later walk checks the fix against it."""
+                   blocking: list[dict], base: dict[str, str] | None = None) -> Outcome:
+        """The one round in which the implementer's session gets the blocking findings back. `base` (a wave member's:
+        the tree and `HEAD` before the fix) is kept on the reopen, so a later walk checks the fix against it."""
         reopened = any(e["type"] == "step_reopened" and e.get("key") == impl_key and e.get("reason") == "review"
                        for e in self._round_events(phase))
         self.run.refresh()
@@ -1133,8 +1150,7 @@ class FeatureLane:
                      f"fits), say in your summary why any does not, then run the gates.")
             if skill is not None:
                 note += f"\n\n{skill}"
-            self.run.emit("step_reopened", key=impl_key, reason="review", round=1, note=note,
-                          **({"tree": tree} if tree else {}))
+            self.run.emit("step_reopened", key=impl_key, reason="review", round=1, note=note, **(base or {}))
         return self._task_agent(phase, impl_step, impl_key, extra)
 
     def _unresolved_approver(self, phase: Phase, review_key: str) -> str | None:

@@ -130,13 +130,16 @@ class WaveLane:
         declared = sources.task_files(task) if task is not None else []
         return sorted({*(str(p) for p in (last.get("owners") or {}).get(str(n)) or []), *declared})
 
-    def wave_revert_strays(self, tkey: str, owned: list[str], before: str) -> None:
-        """After a wave member's own fix session: each path it changed since `before` (the tree the fix started from)
-        that is not its own (`owned`, or a new test file in one of its `wave.allowed_dirs` that no other member of the
-        wave holds) goes back to how it was in `before`, with one `scope_violation` each."""
+    def wave_revert_strays(self, tkey: str, owned: list[str], base: dict[str, str]) -> None:
+        """After a wave member's own fix session: each path it changed since `base` (the tree and `HEAD` the fix is
+        checked against, `FeatureLane._fix_base`) that is not its own (`owned`, or a new test file in one of its
+        `wave.allowed_dirs` that no other member of the wave holds) goes back to how it was in that tree, with one
+        `scope_violation` each. Never the plan file, nor what the runner committed since `base` (a path as `HEAD` has
+        it); a committed path the fix changed after the commit goes back to `HEAD`."""
+        before, base_head = base.get("tree") or "", base.get("head") or ""
         events = self.run.events.read()
         last, n = self._last_attribution(events, tkey)
-        if last is None or n is None:
+        if last is None or n is None or not before:
             return
         tasks = self._plan_tasks()
         task = tasks.get(n)
@@ -147,8 +150,15 @@ class WaveLane:
             if other is not None:
                 others.update([*(str(p) for p in paths or []), *sources.task_files(other)])
         mine = set(owned)
-        strays = [p for p in changed_paths(self.worktree, before, snapshot(self.worktree)) if p not in mine
-                  and not (p not in others and wave.is_test_path(p) and posixpath.dirname(p) in dirs)]
+        plan = self.ctx.values.get("plan") or ""
+        now = snapshot(self.worktree)
+        committed: set[str] = set()
+        if base_head and base_head != head(self.worktree):
+            committed = set(changed_paths(self.worktree, f"{base_head}^{{tree}}", "HEAD^{tree}"))
+        unlike_head = set(changed_paths(self.worktree, "HEAD^{tree}", now))
+        strays = [p for p in changed_paths(self.worktree, before, now) if p not in mine and p != plan
+                  and not (p not in others and wave.is_test_path(p) and posixpath.dirname(p) in dirs)
+                  and not (p in committed and p not in unlike_head)]
         if not strays:
             return
         impl_key = f"{tkey}/implement"
@@ -159,7 +169,8 @@ class WaveLane:
         for path in strays:
             if path not in recorded:
                 self.run.emit("scope_violation", key=tkey, task=n, path=path, wave=int(last["wave"]))
-        restore_paths(self.worktree, strays, before)
+        restore_paths(self.worktree, [p for p in strays if p not in committed], before)
+        restore_paths(self.worktree, [p for p in strays if p in committed], "HEAD")
 
     def _plan_tasks(self) -> dict[int, sources.PlanTask]:
         """The run's plan tasks by number; empty when the plan cannot be read."""

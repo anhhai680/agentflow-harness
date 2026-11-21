@@ -982,6 +982,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "scope_violation": ("key", "path"),
     "wave_dissolved": ("key", "wave"),
     "review_wave_dropped": ("key",),
+    "fix_rebased": ("key", "tree"),
     "wave_finished": ("key",),
     "parallel_candidates": ("key",),
     "resolve_started": ("key",),

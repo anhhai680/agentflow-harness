@@ -436,6 +436,47 @@ def test_a_member_fix_that_strays_and_stops_is_reverted_before_it_parks(waves, g
     assert git(waves.root, "show", "HEAD:src/three.py") == "n = 3\n"  # the wave's version, not the stray
 
 
+def test_an_unparked_member_fix_keeps_a_later_members_commit(waves, git):
+    # Task 2's fix stops and parks; Task 3 fixes and commits; Task 2's fix then resumes on the moved HEAD and finishes.
+    run = begin_build(waves, wave_plan())
+    half = {"write": {"src/two.py": "n = 2  # half\n"}, **BLOCKED}
+    fixed2 = {"write": {"src/two.py": "n = 2  # fixed\n"}, "result": {"status": "done", "summary": "fixed 2"}}
+    fixed3 = {"write": {"src/three.py": "n = 3  # fixed\n"}, "result": {"status": "done", "summary": "fixed 3"}}
+    waves.script({WAVE: [wave_act()],
+                  RWAVE: [review_wave_act({2: [{**F1, "file": "src/two.py"}], 3: [F1]})],
+                  IMPL.format(n=2): [half, fixed2], IMPL.format(n=3): [fixed3]})
+    assert build(waves, run) == ("stopped", True)
+    assert "Task 3: Third thing" in subjects(git, waves.root)
+    approve(run, run.refresh()["waiting"]["key"], by="me")
+    assert build(waves, run) == ("done", True)
+    assert scope_violations(run.events.read()) == []  # the runner's own commit is no stray of task 2's
+    assert git(waves.root, "show", "HEAD:src/three.py") == "n = 3  # fixed\n"
+    assert git(waves.root, "show", "HEAD:src/two.py") == "n = 2  # fixed\n"
+    plan = git(waves.root, "show", f"HEAD:{PLAN_PATH}")
+    assert "- [x] **Step 1: Task 3 test**" in plan and "- [x] **Step 1: Task 2 test**" in plan
+    assert files_of(git, waves.root, "Task 2: Second thing") == [PLAN_PATH, "src/two.py"]
+    assert git(waves.root, "status", "--porcelain") == ""
+
+
+def test_a_persons_edit_at_a_member_fix_stop_is_kept(waves, git):
+    waves.configure({**BIG, **WAVES, "hitl": {"park_independent": False}})
+    run = begin_build(waves, wave_plan())
+    half = {"write": {"src/two.py": "n = 2  # half\n"}, **BLOCKED}
+    fixed = {"write": {"src/two.py": "n = 2  # fixed\n"}, "result": {"status": "done", "summary": "fixed 2"}}
+    waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: [{**F1, "file": "src/two.py"}], 3: []})],
+                  IMPL.format(n=2): [half, fixed]})
+    assert build(waves, run) == ("stopped", True)
+    waiting = run.refresh()["waiting"]
+    assert waiting["key"] == IMPL.format(n=2)
+    (waves.root / "docs" / "note.md").write_text("a person's note\n", encoding="utf-8")  # edited at the stop
+    approve(run, waiting["key"], by="me")
+    assert build(waves, run) == ("done", True)
+    assert scope_violations(run.events.read()) == []
+    assert git(waves.root, "show", "HEAD:docs/note.md") == "a person's note\n"
+    rebased = waves.events(run, "fix_rebased")
+    assert [e["key"] for e in rebased] == [IMPL.format(n=2)]
+
+
 def test_a_missing_reviewer_report_falls_back_to_its_own_review(waves):
     run = begin_build(waves, wave_plan())
     waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: []})]})
