@@ -73,7 +73,7 @@ class Attribution:
 
 def declared_path(text: str) -> str | None:
     """The repository path a plan's file entry names: a trailing `:<line>[-<line>][,...]` and a leading `./` are cut
-    (`src/core.py:10-20` is `src/core.py`). None for an entry that is no path (it holds a space or a parenthesis)."""
+    (`lib/app.py:10-20` is `lib/app.py`). None for an entry that is no path (it holds a space or a parenthesis)."""
     path = _LINE_SUFFIX.sub("", text.strip())
     while path.startswith("./"):
         path = path[2:]

@@ -4,7 +4,7 @@
 `waves_on` holds, the plan walk (`FeatureLane._plan_pass`) asks `wave_at` before it builds a task. A wave goes through
 these stages, and each first checks its own event, so a walk that comes back to a wave picks it up where it stopped:
 
-1. `wave_started` (`<prefix>/wave-<n>`): the members `wave.form_wave` lets through, with the start `HEAD` and tree, and
+1. `wave_started` (`<prefix>/wave-<n>`): the members `waves.form_wave` lets through, with the start `HEAD` and tree, and
    an `effort_decided` (`source: "wave"`) at the highest of the members' levels. A candidate it turns away is
    `parallel_demoted` (once per task and reason) and is built alone, as with no group.
 2. One card per member in the run's agent workspace, `wave/wave-<n>/task-<m>.md`: the member's own task prompt as a fresh
@@ -52,7 +52,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import overlays, pack, park, route, safeio, sizing, sources, wave
+from agentflow import overlays, pack, park, route, safeio, sizing, sources, waves
 from agentflow.autonomy import GUARD_KIND, blocking_of
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, fmt
@@ -148,13 +148,13 @@ class WaveLane:
         if last is None or str(n) in (last.get("out") or {}):
             return None
         task = self._plan_tasks().get(n) if n is not None else None
-        declared = wave.declared_paths(task) if task is not None else []
+        declared = waves.declared_paths(task) if task is not None else []
         return sorted({*(str(p) for p in (last.get("owners") or {}).get(str(n)) or []), *declared})
 
     def wave_revert_strays(self, tkey: str, owned: list[str], base: dict[str, str]) -> None:
         """After a wave member's own fix session: each path it changed since `base` (the tree and `HEAD` the fix is
         checked against, `FeatureLane._fix_base`) that is not its own (`owned`, or a new test file in one of its
-        `wave.allowed_dirs` that no other member of the wave holds) goes back to how it was in that tree, with one
+        `waves.allowed_dirs` that no other member of the wave holds) goes back to how it was in that tree, with one
         `scope_violation` each. Never the plan file, nor what the runner committed since `base` (a path as `HEAD` has
         it); a committed path the fix changed after the commit goes back to `HEAD`."""
         before, base_head = base.get("tree") or "", base.get("head") or ""
@@ -164,12 +164,12 @@ class WaveLane:
             return
         tasks = self._plan_tasks()
         task = tasks.get(n)
-        dirs = wave.allowed_dirs(task) if task is not None else set()
+        dirs = waves.allowed_dirs(task) if task is not None else set()
         others: set[str] = set()  # every other member's owned and declared paths
         for member, paths in (last.get("owners") or {}).items():
             other = tasks.get(int(member)) if member.isdigit() and member != str(n) else None
             if other is not None:
-                others.update([*(str(p) for p in paths or []), *wave.declared_paths(other)])
+                others.update([*(str(p) for p in paths or []), *waves.declared_paths(other)])
         mine = set(owned)
         plan = self.ctx.values.get("plan") or ""
         now = snapshot(self.worktree)
@@ -178,7 +178,7 @@ class WaveLane:
             committed = set(changed_paths(self.worktree, f"{base_head}^{{tree}}", "HEAD^{tree}"))
         unlike_head = set(changed_paths(self.worktree, "HEAD^{tree}", now))
         strays = [p for p in changed_paths(self.worktree, before, now) if p not in mine and p != plan
-                  and not (p not in others and wave.is_test_path(p) and posixpath.dirname(p) in dirs)
+                  and not (p not in others and waves.is_test_path(p) and posixpath.dirname(p) in dirs)
                   and not (p in committed and p not in unlike_head)]
         if not strays:
             return
@@ -268,10 +268,10 @@ class WaveLane:
         sized = self._sized_answers({f"{prefix}/task-{t.n}/implement" for t in tasks})
         risky = {t.n for t in tasks
                  if (answers := sized.get(f"{prefix}/task-{t.n}/implement")) is not None and sizing.flags(answers)["risk"]}
-        security = {t.n for t in tasks if overlays.touches_security(self.cfg, wave.declared_paths(t))}
+        security = {t.n for t in tasks if overlays.touches_security(self.cfg, waves.declared_paths(t))}
         committed = {t.n for t in tasks if not t.open or self._committed(f"{prefix}/task-{t.n}")}
-        members, demotions = wave.form_wave(
-            wave.group_candidates(tasks, task, skip), by_n, committed=committed,
+        members, demotions = waves.form_wave(
+            waves.group_candidates(tasks, task, skip), by_n, committed=committed,
             serial_paths=self.cfg.parallel.serial_paths, risky=risky, security=security,
             model_of=dict.fromkeys(by_n, model), cap=self.cfg.parallel.max_subagents)
         for demotion in demotions:
@@ -386,8 +386,8 @@ class WaveLane:
             extra = {**self._step_extra(f"{prefix}/task-{task.n}/implement", self._task_extra(task, rel)),
                      "result_file": CARD_RESULT}
             body = build_prompt(self.cfg, member_step, self.ctx, {}, extra, "first", card=True)
-            allowed = [f"- `{path}`" for path in wave.declared_paths(task)]
-            allowed += [f"- a new test file in `{folder or '.'}/`" for folder in sorted(wave.allowed_dirs(task))]
+            allowed = [f"- `{path}`" for path in waves.declared_paths(task)]
+            allowed += [f"- a new test file in `{folder or '.'}/`" for folder in sorted(waves.allowed_dirs(task))]
             member = fmt(rules, {"task_n": str(task.n), "allowed_files": "\n".join(allowed)})
             safeio.write_text(cards[task.n], f"{body.rstrip()}\n\n{member.strip()}\n")
 
@@ -411,13 +411,13 @@ class WaveLane:
         as `HEAD` has it, so a change to it is a sub-agent's, and a stray like any other."""
         return changed_paths(self.worktree, start_tree, tree)
 
-    def _reports(self, key: str, members: list[sources.PlanTask]) -> dict[int, wave.Report]:
+    def _reports(self, key: str, members: list[sources.PlanTask]) -> dict[int, waves.Report]:
         """The members' reports in the wave session's last result (the runner's checked copy)."""
         try:
             raw = json.loads(self.run.result_path(f"{key}/implement").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
-        return wave.parse_reports(raw.get("tasks") if isinstance(raw, dict) else None, [t.n for t in members])
+        return waves.parse_reports(raw.get("tasks") if isinstance(raw, dict) else None, [t.n for t in members])
 
     def _attribute_first(self, prefix: str, key: str, started: dict, members: list[sources.PlanTask],
                          rel: str) -> dict | str:
@@ -431,7 +431,7 @@ class WaveLane:
         shelf = commit_at(self.worktree, ref)
         tree = f"{shelf}^{{tree}}" if shelf else snapshot(self.worktree)
         reports = self._reports(key, members)
-        found = wave.attribute(self._changed(start_tree, tree), members, reports, rel)
+        found = waves.attribute(self._changed(start_tree, tree), members, reports, rel)
         out: dict[int, str] = {}
         # A stray no report names (the plan file aside: it is nobody's work) is the work of a member the runner cannot
         # tell, so every member is set aside: none is committed with its work reverted.
@@ -470,7 +470,7 @@ class WaveLane:
         out = dict(last.get("out") or {})
         kept = [t for t in members if str(t.n) not in out]
         reports = self._reports(key, kept)
-        found = wave.attribute(self._changed(start_tree, snapshot(self.worktree)), kept, reports, rel)
+        found = waves.attribute(self._changed(start_tree, snapshot(self.worktree)), kept, reports, rel)
         owners = {**{n: [] for n in out}, **{str(n): p for n, p in found.owners.items()}}
         summaries = {**(last.get("summaries") or {}),
                      **{str(n): clean_fact(r.summary) for n, r in reports.items() if r.status == "done"}}
@@ -635,7 +635,7 @@ class WaveLane:
             raw = json.loads(self.run.result_path(f"{key}/review").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             raw = None
-        reports = wave.parse_review_reports(raw.get("tasks") if isinstance(raw, dict) else None,
+        reports = waves.parse_review_reports(raw.get("tasks") if isinstance(raw, dict) else None,
                                             [t.n for t in members])
         events = self._round_events(phase)
         tree = None
@@ -677,10 +677,10 @@ class WaveLane:
     def _dispatch_tripped(self, session_key: str, members: list[int], model: str, required: list[int],
                           review: bool = False) -> bool:
         """Whether the wave session `session_key` did not dispatch its sub-agents as the runner asked: one it started
-        that the runner did not ask for or that had not finished (`wave.dispatch_violations` over the sub-agents of the
+        that the runner did not ask for or that had not finished (`waves.dispatch_violations` over the sub-agents of the
         session's agent rows, live and exited, which the runner built from the stream; the model being the session's
         own), or a member of `required` with no sub-agent or more than one in the session's first pass
-        (`wave.dispatch_count_violations`: the calls before the gates reopened it, whose fix dispatches only for the
+        (`waves.dispatch_count_violations`: the calls before the gates reopened it, whose fix dispatches only for the
         members the failure points to; the whole session for a review wave). Recorded once since the session last
         finished, as a `guard_tripped` of kind `wave_dispatch` with one violation per line."""
         self.run.refresh()
@@ -689,9 +689,9 @@ class WaveLane:
                 if isinstance(row, dict) and row.get("step") == session_key and not row.get("sizer")]
         subs = [[sub for sub in row.get("subagents") or [] if isinstance(sub, dict)] for row in rows]
         first = subs[:self._first_pass_calls(session_key)] if not review else subs
-        lines = [*wave.dispatch_violations([s for row in subs for s in row], members,
+        lines = [*waves.dispatch_violations([s for row in subs for s in row], members,
                                            self._session_model(session_key, model)),
-                 *wave.dispatch_count_violations([s for row in first for s in row], required, review=review)]
+                 *waves.dispatch_count_violations([s for row in first for s in row], required, review=review)]
         if not lines:
             return False
         events = self.run.events.read()

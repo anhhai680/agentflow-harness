@@ -216,7 +216,7 @@ def test_compaction_and_subagents_on_the_row(run):
 
 
 def test_a_subagent_row_keeps_its_description_and_outcome(run):
-    # the wave's dispatch check reads these rows (`wave.dispatch_violations`), also once the session has exited
+    # the wave's dispatch check reads these rows (`waves.dispatch_violations`), also once the session has exited
     run.emit("agent_started", agent="claude", pid=5, model="opus", effort="medium", step="build/x", sizing=False,
              session_id="s-3")
     run.emit("subagent_started", parent_session="s-3", subagent_type="general-purpose", model="inherit",

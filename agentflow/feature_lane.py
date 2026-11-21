@@ -65,7 +65,7 @@ A person's `approve --constraint` is `constraint_approved` (`constraint.py`) and
 
 Waves. With `parallel.max_subagents` above 1 and the build phase on `claude` (`WaveLane.waves_on`: never in a refine
 round or a small plan's session), the walk asks `wave_lane.WaveLane.wave_at` before it builds a task. When the task has
-a `**Parallel group:**` and other open tasks of that group pass `wave.form_wave`'s checks, they are built together in
+a `**Parallel group:**` and other open tasks of that group pass `waves.form_wave`'s checks, they are built together in
 one session that fans them out to sub-agents (`<step>/wave-<n>/implement`), the build gates run once on the combined
 tree, and each kept member is then reviewed and committed alone, in plan order, through `_run_task`. A member set aside
 by the wave's attribution, and a task the checks turn away (`parallel_demoted`), is built alone as above. A grouped task
@@ -99,7 +99,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import carry, constraint, overlays, park, route, sizing, sources, verification, wave
+from agentflow import carry, constraint, overlays, park, route, sizing, sources, verification, waves
 from agentflow.autonomy import AUTO_BY, FORBIDDEN, GUARD_KIND, Resolver, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
@@ -272,7 +272,7 @@ class FeatureLane:
             return
         if any(e["type"] == "parallel_candidates" for e in self.run.events.read()):
             return
-        pairs = wave.candidates(sources.parse_plan(plan), self.cfg.parallel.serial_paths)
+        pairs = waves.candidates(sources.parse_plan(plan), self.cfg.parallel.serial_paths)
         self.run.emit("parallel_candidates", key=prefix, pairs=[list(pair) for pair in pairs])
 
     def _scale_budget(self, plan: Path) -> None:

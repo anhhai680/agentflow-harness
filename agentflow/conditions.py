@@ -546,7 +546,7 @@ def _explain_steps(
 def _explain_waves(cfg: Config, phase: Phase, key: str, ctx: Ctx, model: str | None) -> list[ExplainLine]:
     """The waves a `foreach: plan_task` step would build from the plan's `**Parallel group:**` lines, one line each.
     None with waves off, on an agent other than claude, or with no plan to read: `explain` is then what it was."""
-    from agentflow import overlays, wave  # overlays imports this module
+    from agentflow import overlays, waves  # overlays imports this module
 
     cap = cfg.parallel.max_subagents
     if cap <= 1 or (phase.agent or cfg.defaults.agent) != "claude":
@@ -558,11 +558,11 @@ def _explain_waves(cfg: Config, phase: Phase, key: str, ctx: Ctx, model: str | N
         tasks = sources.parse_plan(ctx.repo / rel)
     except (OSError, UnicodeDecodeError):
         return []
-    security = {t.n for t in tasks if overlays.touches_security(cfg, wave.declared_paths(t))}
-    waves = wave.predict_waves(tasks, cap, cfg.parallel.serial_paths, security)
+    security = {t.n for t in tasks if overlays.touches_security(cfg, waves.declared_paths(t))}
+    predicted = waves.predict_waves(tasks, cap, cfg.parallel.serial_paths, security)
     return [
         ExplainLine(phase.name, f"{key}/wave-{i}", "run", f"wave-{i}: tasks {', '.join(map(str, members))}", model)
-        for i, members in enumerate(waves, start=1)
+        for i, members in enumerate(predicted, start=1)
     ]
 
 

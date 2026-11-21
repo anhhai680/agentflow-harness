@@ -32,7 +32,7 @@ from typing import Literal, TextIO
 
 from agentflow import brief as brief_mod
 from agentflow import lessons as lessons_mod
-from agentflow import doubt, gitops, overlays, pack, run_env, safeio, sizing, sources, verification, wave, workspace
+from agentflow import doubt, gitops, overlays, pack, run_env, safeio, sizing, sources, verification, waves, workspace
 from agentflow.agents import (CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption,
                               ignored_settings, read_only_allow)
 from agentflow.autonomy import AUTO_BY
@@ -199,7 +199,7 @@ def _parallel_candidates(cfg: Config, ctx: Ctx, worktree: Path) -> str:
         tasks = sources.parse_plan(worktree / rel)
     except (OSError, UnicodeDecodeError):
         return ""
-    return wave.candidates_text(wave.candidates(tasks, cfg.parallel.serial_paths))
+    return waves.candidates_text(waves.candidates(tasks, cfg.parallel.serial_paths))
 
 
 def _run_facts(run: Run | None) -> str:

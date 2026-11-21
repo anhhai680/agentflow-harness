@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from agentflow.sources import PlanTask, parse_plan_text
-from agentflow.wave import (
+from agentflow.waves import (
     REASONS,
     TASK_DESCRIPTION,
     Attribution,
