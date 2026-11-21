@@ -645,8 +645,10 @@ class WaveLane:
 
     def _record_wave_reviews(self, phase: Phase, prefix: str, key: str, number: int,
                              members: list[sources.PlanTask]) -> None:
-        """Each member the done review wave reported on gets its round-1 `review_result`, once; a member with no
-        report gets none, so `_review_round` gives it a session of its own."""
+        """Each member the done review wave reported on gets its round-1 `review_result`, once, with its reviewer's
+        `risks` (its "Declined to judge" lines, which a review session puts in its result's `risks`, so the phase's
+        handoff lists them: `pipeline._risks`); a member with no report gets none, so `_review_round` gives it a
+        session of its own."""
         try:
             raw = json.loads(self.run.result_path(f"{key}/review").read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -660,11 +662,12 @@ class WaveLane:
             if task.n not in reports or any(e["type"] == "review_result" and e.get("key") == review_key
                                              for e in events):
                 continue
-            findings = nfc(reports[task.n])  # as `hitl.read_result` gives a review session's findings
+            findings = nfc(reports[task.n].findings)  # as `hitl.read_result` gives a review session's findings
             blocking = blocking_of(self.cfg, findings)
             tree = tree or snapshot(self.worktree)
+            risks = [clean_fact(risk) for risk in reports[task.n].risks if risk.strip()]  # model text a person reads
             self.run.emit("review_result", key=review_key, round=1, findings=findings, blocking=len(blocking),
-                          blocking_findings=blocking, tree=tree, wave=number)
+                          blocking_findings=blocking, tree=tree, wave=number, risks=risks)
 
     def _review_wave_stopped(self, key: str, number: int) -> Literal["done", "stopped"]:
         """The review wave's session stopped. A guard stop stays the run's wait, and a person is told of it once; any

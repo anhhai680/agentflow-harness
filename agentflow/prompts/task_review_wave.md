@@ -7,11 +7,11 @@ You run a review wave: the review of {wave_title} of the plan, one reviewer sub-
    - `prompt`: "Read `<card path>` and follow it.", with the card's path from its line below;
    - leave `model` out, and `subagent_type` too: every reviewer runs on your model.
 2. Dispatch nothing else: no reviewer for a task that has no card here, no second reviewer for a card, no builder.
-3. Wait until every reviewer has finished. Each one ends with a short report: `n` and `findings` (a list, maybe empty).
-4. Then write your result file with `status: done`, an empty top-level `findings`, and one `tasks` entry per card, with the findings copied from its reviewer's report as they are:
+3. Wait until every reviewer has finished. Each one ends with a short report: `n`, `findings` and `risks` (lists, maybe empty).
+4. Then write your result file with `status: done`, an empty top-level `findings`, and one `tasks` entry per card, with the findings and the risks copied from its reviewer's report as they are:
 
 ```json
-{"status": "done", "summary": "One line on the wave's review.", "findings": [], "tasks": [{"n": 2, "findings": [{"severity": "blocking", "file": "lib/a.py", "line": 12, "text": "what is wrong and why"}]}]}
+{"status": "done", "summary": "One line on the wave's review.", "findings": [], "tasks": [{"n": 2, "findings": [{"severity": "blocking", "file": "lib/a.py", "line": 12, "text": "what is wrong and why"}], "risks": []}]}
 ```
 
 A reviewer that ended with no report, or a report you cannot read, gets no entry: never write one for it, and never make up its findings. The runner then reviews that task in a session of its own.

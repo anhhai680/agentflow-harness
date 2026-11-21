@@ -529,6 +529,21 @@ def test_a_persons_edit_at_a_member_fix_stop_is_kept(waves, git):
     assert [e["key"] for e in rebased] == [IMPL.format(n=2)]
 
 
+def test_a_reviewers_risks_reach_the_handoff_as_a_review_sessions_do(waves):
+    from agentflow.pipeline import _risks
+
+    run = begin_build(waves, wave_plan())
+    act = review_wave_act()
+    act["result"]["tasks"][0]["risks"] = ["Declined to judge: the‮ cache path"]
+    waves.script({WAVE: [wave_act()], RWAVE: [act]})
+    assert build(waves, run) == ("done", True)
+    [two, three] = wave_reviews(run.events.read())
+    assert two["risks"] == ["Declined to judge: the cache path"] and three["risks"] == []  # cleaned, as model text
+    assert f"- `{REVIEW.format(n=2)}`: Declined to judge: the cache path" in _risks(waves.cfg, run, "build")
+    card = (run.agent_dir / "wave" / "wave-1" / "review-2.md").read_text(encoding="utf-8")
+    assert '"risks": [' in card and "{task_n}" not in card
+
+
 def test_a_missing_reviewer_report_falls_back_to_its_own_review(waves):
     run = begin_build(waves, wave_plan())
     waves.script({WAVE: [wave_act()], RWAVE: [review_wave_act({2: []}, dispatch=[2, 3])]})

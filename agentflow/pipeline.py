@@ -642,6 +642,10 @@ def _risks(cfg: Config, run: Run, phase: str) -> list[str]:
         risks = result.get("risks") if isinstance(result, dict) else None
         for risk in risks if isinstance(risks, list) else []:
             lines.append(f"- `{key}`: {_one_line(risk if isinstance(risk, str) else str(risk))}")
+    for event in run.events.read():  # a review wave's members' risks, which no result file of theirs holds
+        key = str(event.get("key") or "")
+        if event["type"] == "review_result" and event.get("wave") is not None and key.split("/")[0] == phase:
+            lines += [f"- `{key}`: {_one_line(risk)}" for risk in event.get("risks") or [] if isinstance(risk, str)]
     if phase in cfg.phases:  # the doubt review's open findings, low findings and trade-offs, so `build` sees them
         lines += [f"- {_one_line(risk)}" for risk in doubt.handoff_risks(cfg, run, phase, run.state["pipeline"])]
     return lines

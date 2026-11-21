@@ -8,7 +8,7 @@ A review wave session dispatched you, beside other reviewers that each review an
 - End with your report as your final message, this JSON and nothing after it, with each finding written as the card above describes (`severity`, `file`, `line`, `text`):
 
 ```json
-{"n": {task_n}, "findings": [{"severity": "blocking", "file": "path", "line": 12, "text": "what is wrong and why"}]}
+{"n": {task_n}, "findings": [{"severity": "blocking", "file": "path", "line": 12, "text": "what is wrong and why"}], "risks": ["one line the brief's \"Declined to judge\" section holds"]}
 ```
 
-`findings` is `[]` when you found nothing.
+`findings` is `[]` when you found nothing. `risks` holds what the card above says goes in the result's `risks` list (each line of the brief's "Declined to judge" section, as a string), and is `[]` when there is none.

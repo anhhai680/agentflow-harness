@@ -66,6 +66,12 @@ class Report:
 
 
 @dataclass(frozen=True)
+class ReviewReport:
+    findings: list[dict]
+    risks: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Attribution:
     owners: dict[int, list[str]]
     strays: dict[str, tuple[int, ...]]  # each stray, and every member whose report names it (`()`: none does)
@@ -279,14 +285,15 @@ def parse_reports(raw: object, members: Collection[int]) -> dict[int, Report]:
     return reports
 
 
-def parse_review_reports(raw: object, members: Collection[int]) -> dict[int, list[dict]]:
-    """The per-task findings of a wave review session, under the rules of `parse_reports`. A missing `findings` is
-    `[]`."""
-    reviews: dict[int, list[dict]] = {}
+def parse_review_reports(raw: object, members: Collection[int]) -> dict[int, ReviewReport]:
+    """The per-task findings and risks (the review's "Declined to judge" lines) of a wave review session, under the
+    rules of `parse_reports`: a member whose `findings` is not a list of objects, or whose `risks` is not a list of
+    strings, has no report. A missing `findings` or `risks` is empty."""
+    reviews: dict[int, ReviewReport] = {}
     for n, entry in _members_once(raw, members).items():
-        findings = entry.get("findings", [])
-        if isinstance(findings, list) and all(isinstance(item, dict) for item in findings):
-            reviews[n] = findings
+        findings, risks = entry.get("findings", []), _strings(entry.get("risks"))
+        if isinstance(findings, list) and all(isinstance(item, dict) for item in findings) and risks is not None:
+            reviews[n] = ReviewReport(findings, risks)
     return reviews
 
 

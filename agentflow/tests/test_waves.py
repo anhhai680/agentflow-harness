@@ -10,6 +10,7 @@ from agentflow.waves import (
     Attribution,
     Demotion,
     Report,
+    ReviewReport,
     allowed_dirs,
     attribute,
     candidates,
@@ -330,12 +331,22 @@ def test_a_malformed_duplicate_still_voids_the_member():
 
 def test_review_reports_read_findings_and_fail_closed():
     findings = [{"severity": "high", "text": "x"}]
-    assert parse_review_reports([{"n": 2, "findings": findings}, {"n": 3}], {2, 3}) == {2: findings, 3: []}
+    assert parse_review_reports([{"n": 2, "findings": findings}, {"n": 3}], {2, 3}) == {
+        2: ReviewReport(findings, ()), 3: ReviewReport([], ())}
     assert parse_review_reports([{"n": 2, "findings": findings}, {"n": 2, "findings": []}], {2}) == {}
     assert parse_review_reports([{"n": 2, "findings": "none"}], {2}) == {}
     assert parse_review_reports([{"n": 2, "findings": ["x"]}], {2}) == {}
     assert parse_review_reports([{"n": 9, "findings": []}], {2}) == {}
     assert parse_review_reports("x", {2}) == {}
+
+
+def test_review_reports_keep_risks_and_fail_closed_on_them():
+    got = parse_review_reports([{"n": 2, "findings": [], "risks": ["the cache path", "the retry loop"]}], {2})
+    assert got == {2: ReviewReport([], ("the cache path", "the retry loop"))}
+    assert parse_review_reports([{"n": 2, "risks": "the cache path"}], {2}) == {}  # not a list
+    assert parse_review_reports([{"n": 2, "risks": ["ok", 3]}], {2}) == {}  # not strings only
+    assert parse_review_reports([{"n": 2, "risks": ["ok"]}, {"n": 3, "risks": [{}]}], {2, 3}) == {
+        2: ReviewReport([], ("ok",))}
 
 
 @pytest.mark.parametrize(
