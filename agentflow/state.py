@@ -177,6 +177,24 @@ def _approval_pending(state: dict) -> bool:
     return state["waiting"] is not None and state["waiting"].get("kind") == "phase_approval"
 
 
+def speculating(state: dict) -> dict | None:
+    """The speculation record while the approval of the phase it follows (`after`) is still the run's wait, else None:
+    the runner is looking ahead at `phase` while a human decides on `after`."""
+    record = state.get("speculation")
+    if record and _approval_pending(state) and state["waiting"].get("phase") == record.get("after"):
+        return record
+    return None
+
+
+def _on_speculation_started(state: dict, ev: dict) -> None:
+    state["speculation"] = {"phase": ev["phase"], "after": ev["after"], "basis": copy.deepcopy(ev["basis"]),
+                            "sha": ev.get("sha"), "since": ev.get("ts")}
+
+
+def _on_speculation_ended(state: dict, ev: dict) -> None:
+    state["speculation"] = None
+
+
 def _on_run_started(state: dict, ev: dict) -> None:
     state["run_id"] = ev.get("run_id", state["run_id"])
     state["pipeline"] = ev.get("pipeline", state["pipeline"])
@@ -535,7 +553,7 @@ def _on_hitl_raised(state: dict, ev: dict) -> None:
     }
     if "times" in ev:  # a `blocked_repeat` stop that came back after a human's approval
         wait["times"] = ev["times"]
-    for mark in ("promoted", "notified"):  # a parked item made the wait once no task could run; a person was told
+    for mark in ("promoted", "notified", "speculative"):  # a parked item made the wait once no task could run; a person was told; a stop of a speculated phase
         if mark in ev:
             wait[mark] = ev[mark]
     if state["status"] in TERMINAL:  # a stop raised after a cancel is logged, never a wait to act on
@@ -748,6 +766,8 @@ def _on_phase_approved(state: dict, ev: dict) -> None:
     waiting = state["waiting"]
     if waiting is not None and waiting.get("kind") == "phase_approval" and waiting.get("phase") == phase:
         _clear_wait(state)
+        if state["status"] == "running" and state.get("refine"):  # another phase's round, run while this one waited
+            state["status"] = "refining"
 
 
 def _on_phase_ready(state: dict, ev: dict) -> None:
@@ -804,6 +824,10 @@ def _on_phase_rejected(state: dict, ev: dict) -> None:
     parked = state.setdefault("parked", {})
     for key in [k for k, item in parked.items() if item.get("phase") == phase and _in_scope(k, scope, keys)]:
         parked.pop(key)  # its step runs again in the refine round
+    if _approval_pending(state) and state["waiting"].get("phase") != phase:
+        return  # another phase's round (speculation): the pending approval, its queue and its status stay
+    # the waiting phase itself is sent back: the stops queued from its speculated phase no longer apply
+    state["waiting_queue"] = [w for w in state["waiting_queue"] if not w.get("speculative")]
     state["waiting"] = None
     if state["status"] not in TERMINAL:
         state["status"] = "refining"
@@ -890,6 +914,8 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "phase_approved": _on_phase_approved,
     "phase_ready": _on_phase_ready,
     "phase_rejected": _on_phase_rejected,
+    "speculation_started": _on_speculation_started,
+    "speculation_ended": _on_speculation_ended,
     "step_started": _on_step_started,
     "step_finished": _on_step_finished,
     "step_skipped": _on_step_skipped,
@@ -955,6 +981,8 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "phase_ready": ("phase",),
     "run_marked_done": ("phase",),
     "phase_rejected": ("phase",),
+    "speculation_started": ("phase", "after", "basis"),
+    "speculation_ended": ("phase", "outcome"),
     "step_started": ("key",),
     "step_finished": ("key",),
     "step_skipped": (("key", "step"),),

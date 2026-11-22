@@ -320,6 +320,42 @@ def test_a_question_the_runner_takes_is_raised_without_a_notification(run, cfg, 
     assert macos_calls == [] and "\a" not in capsys.readouterr().err
 
 
+def speculate_plan(run):
+    run.emit("phase_approval_raised", phase="define", round=0)
+    run.emit("speculation_started", phase="plan", after="define", basis={"docs/specs/S.md": "a" * 64}, sha="s1")
+
+
+def test_a_stop_under_the_speculated_phase_is_raised_quietly(run, cfg, macos_calls, capsys):
+    speculate_plan(run)
+    asked = dataclasses.replace(one_question(), kind="boundary")
+    raise_hitl(cfg, run, "needs_human", "plan/plan", "needs a TTL", [asked])
+    (event,) = hitl_raised_of(run)
+    assert event["speculative"] is True and event["notified"] is False
+    assert macos_calls == [] and "\a" not in capsys.readouterr().err
+    assert run.state["waiting"]["key"] == "define_approved"
+    assert run.state["waiting_queue"][0]["speculative"] is True
+
+
+def test_a_stop_under_the_speculated_phase_stays_quiet_even_when_asked_to_notify(run, cfg, macos_calls):
+    speculate_plan(run)
+    raise_hitl(cfg, run, "gate_failed", "plan/plan", "s", notify=True)
+    assert macos_calls == [] and hitl_raised_of(run)[0]["notified"] is False
+
+
+def test_a_stop_of_another_phase_is_not_speculative(run, cfg, macos_calls):
+    speculate_plan(run)
+    asked = dataclasses.replace(one_question(), kind="boundary")  # one only a human answers
+    raise_hitl(cfg, run, "needs_human", "build/x", "s", [asked])
+    (event,) = hitl_raised_of(run)
+    assert "speculative" not in event and event["notified"] is True and len(macos_calls) == 1
+
+
+def test_a_stop_without_a_speculation_is_not_speculative(run, cfg, macos_calls):
+    raise_hitl(cfg, run, "gate_failed", "plan/plan", "s")
+    (event,) = hitl_raised_of(run)
+    assert "speculative" not in event and event["notified"] is True
+
+
 REPEAT_KEY = "plan/write_plan"
 
 

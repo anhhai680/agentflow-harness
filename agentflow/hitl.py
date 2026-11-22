@@ -26,7 +26,7 @@ from . import pack, safeio
 from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RECONCILE_CHANGED, RETRO_PIPELINE, Config
 from .events import nfc, parse_iso
 from .park import radius_line
-from .state import TERMINAL, Run, list_runs
+from .state import TERMINAL, Run, list_runs, speculating
 
 RESULT_STATUSES = ("done", "blocked", "needs_human", "effort_change", "unchanged")
 # What a resolver may name as a stop's cause (`StepResult.stop_class`). Advisory: the runner acts on `flaky` and
@@ -452,21 +452,26 @@ def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questio
 
     `notify`: None is the usual rule (quiet while the runner settles the stop itself, while a plan task's stop may
     still park, or for a wave's stop, which dissolves the wave: the runner tells a human if it cannot settle, park or
-    dissolve it); True always tells a human, False never does (a stop a human was already told of)."""
+    dissolve it); True always tells a human, False never does (a stop a human was already told of). A stop under the
+    phase the runner is speculating on is raised quietly and marked `speculative`, whatever `notify` says: it is queued
+    behind the approval it waits for, and a person is told once it becomes the run's wait."""
     questions = list(questions)
     counted = {"times": _times_back(run, key)} if kind == "blocked_repeat" else {}
     how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).",
            _how_to_go_on(run, kind, key, bool(questions), cfg, **counted)]
     path = run.inbox_path(key)
     render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
-    if notify is None:
+    speculative = (record := speculating(run.state)) is not None and key.split("/")[0] == record["phase"]
+    if speculative:
+        notify = False
+    elif notify is None:
         from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
 
         notify = (not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions]) and not parks_first(cfg, kind, key)
                   and WAVE_STOP.search(key) is None)
     run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
              questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:],
-             notified=bool(notify), **counted)
+             notified=bool(notify), **({"speculative": True} if speculative else {}), **counted)
     if notify:
         notify_run(cfg, run, notice_text({"key": key, "summary": summary, **counted}) or f"{key} needs a decision")
     return path
