@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import test_feature_lane
+from conftest import with_doubt
 from test_feature_lane import SMALL, begin_finish, created, gh_calls, review
 
 from agentflow.conditions import Ctx
@@ -539,6 +540,31 @@ def test_the_audit_refuses_a_ramp_approval_once_the_overlay_holds(flow_repo, gh,
         assert plan["status"] == "missing" and "security overlay" in plan["note"]
     else:
         assert plan["status"] == "satisfied" and plan["note"] == "approval ramp"
+
+
+@pytest.mark.parametrize("reviewed", [True, False])
+def test_a_ramp_approval_refused_under_the_overlay_names_the_retry_that_asks_a_person(flow_repo, gh, git, reviewed):
+    """Ruling Z: the stop names `agentflow retry <run> <phase>/<step>`, the phase's `role: review` step when it ran in
+    this run (else its first step), which walks the phase again and raises its approval for a person."""
+    run = begin_finish(flow_repo)
+    flow_repo.configure({**SMALL, "policy": {"enforce": "block"},
+                         "conditions": {"security_path": {"any": None, "check": "file_exists", "path": "README.md"}}},
+                        edit=with_doubt)  # `plan` has its review
+    run.emit("step_finished", key="verify/verify", status="done", summary="")
+    run.emit("step_finished", key="plan/plan", status="done", summary="")
+    if reviewed:
+        run.emit("step_finished", key="plan/plan_review", status="done", summary="")
+    else:  # an XS route skips the plan's review
+        run.emit("step_skipped", key="plan/plan_review", phase="plan", reason="route XS")
+    run.emit("phase_approved", phase="plan", by="runner", ramp={"samples": 5, "profile": "S"})
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    raised = last(flow_repo, run, "hitl_raised")
+    assert raised["kind"] == "conformance_failed" and not pushed(git, flow_repo, run)
+    inbox = " ".join(Path(raised["inbox"]).read_text(encoding="utf-8").split())
+    step = "plan/plan_review" if reviewed else "plan/plan"
+    assert (f"The approval ramp approved `plan`, but the security overlay holds, so a person must approve it: "
+            f"`agentflow retry {run.id} {step}` runs `{step}` again and raises `plan`'s approval; once you approve "
+            f"it, `{FINISH}` audits again.") in inbox
 
 
 def test_block_mode_stops_before_the_push(flow_repo, gh, git):

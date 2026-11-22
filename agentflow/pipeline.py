@@ -577,7 +577,11 @@ class _Loop:
             if speculation.replan_due(run.state, run.events.read(), nxt, basis):  # it was walked on an older revision
                 self.replan(names, names.index(nxt), basis)
             write_handoff(self.cfg, run, after)  # provisional, for the walked phase's `{handoff}`: no `handoff_written`
-            run.emit("speculation_started", phase=nxt, after=after, basis=basis, sha=head(self.worktree))
+            try:  # what was uncommitted before the walk: never the walk's to discard (`discard_left`)
+                dirty: dict = {"dirty": uncommitted_paths(self.worktree)}
+            except GitError:
+                dirty = {}
+            run.emit("speculation_started", phase=nxt, after=after, basis=basis, sha=head(self.worktree), **dirty)
         self._speculating = nxt
         self._yield_if = partial(speculation.cut, after=after)
         try:
@@ -588,7 +592,7 @@ class _Loop:
         state = run.refresh()
         cut = speculation.cut(state, after)
         if cut == "rejected":
-            run.emit("speculation_ended", phase=nxt, outcome="rejected")
+            run.emit("speculation_ended", phase=nxt, outcome="rejected", **self.discard_left(nxt, executor))
             return self.phase(names, index)
         if state["status"] in TERMINAL:
             run.emit("speculation_ended", phase=nxt, outcome="halted")
@@ -598,7 +602,8 @@ class _Loop:
         if speculating(state) is not None:  # the approval still waits
             queued = any(w.get("speculative") and str(w.get("key") or "").split("/")[0] == nxt
                          for w in state["waiting_queue"])
-            run.emit("speculation_ended", phase=nxt, outcome="stopped" if queued else "finished")
+            left = self.discard_left(nxt, executor, keep_outputs=True) if queued else {}
+            run.emit("speculation_ended", phase=nxt, outcome="stopped" if queued else "finished", **left)
             return "awaiting_approval"
         run.emit("speculation_ended", phase=nxt, outcome="approved")
         self.tell_speculative()
@@ -619,21 +624,46 @@ class _Loop:
 
     def discard_walked(self, after: str, executor: Executor) -> None:
         """Before `after`'s refine round walks: put back, to `HEAD`, the uncommitted changes to the `output`s of the phase
-        last walked behind its approval (a step of it stopped mid-step). Only those paths: the walked phase is walked or
-        re-planned again on the revision, and its edits must never go into `after`'s commit (`git add -A`). Nothing is
-        read but the log when no phase was walked behind `after`."""
-        walked = next((e["phase"] for e in reversed(self.run.events.read())
+        last walked behind its approval (a step of it stopped mid-step), unless they were uncommitted before that walk
+        (its `dirty`). The walked phase is walked or re-planned again on the revision, and its edits must never go into
+        `after`'s commit (`git add -A`); anything else the walk left was discarded when it ended (`discard_left`).
+        Nothing is read but the log when no phase was walked behind `after`."""
+        record = next((e for e in reversed(self.run.events.read())
                        if e["type"] == "speculation_started" and e.get("after") == after), None)
-        if walked is None or walked not in self.cfg.phases:
+        if record is None or record["phase"] not in self.cfg.phases:
             return
-        outputs = speculation.outputs(self.cfg.phases[walked], self.run.state["pipeline"], executor.ctx)
+        outputs = speculation.outputs(self.cfg.phases[record["phase"]], self.run.state["pipeline"], executor.ctx)
+        before = set(record.get("dirty") or [])
         try:
             dirty = set(uncommitted_paths(self.worktree))
-            paths = [path for path in outputs if path in dirty]
+            paths = [path for path in outputs if path in dirty and path not in before]
             if paths:
                 restore_paths(self.worktree, paths, "HEAD")
         except GitError:
             return
+
+    def discard_left(self, walked: str, executor: Executor, keep_outputs: bool = False) -> dict:
+        """As the walk of `walked` ends behind an approval that still waits or was rejected: put back, to `HEAD`, every
+        uncommitted path that was not uncommitted when it started (its `speculation_started.dirty`), and name them
+        (`{"discarded": [...]}`, for `speculation_ended`; `{}` when there were none). A walked phase can change only its
+        `output`s (the fence), so the rest is what a step the fence stopped left: nothing written before the approval
+        may reach the branch, as `after`'s refine commit (`git add -A`) or a later commit of `walked`. With
+        `keep_outputs` (the walk stopped and its stop waits behind the approval) the phase's own `output`s stay for the
+        stopped step; a rejection discards them too. A record from before `dirty` (or a tree git cannot read) keeps
+        everything, as before."""
+        record, _ = speculation.last_record(self.run.events.read(), walked)
+        if record is None or not isinstance(record.get("dirty"), list) or walked not in self.cfg.phases:
+            return {}
+        keep = set(record["dirty"])
+        if keep_outputs:
+            keep |= set(speculation.outputs(self.cfg.phases[walked], self.run.state["pipeline"], executor.ctx))
+        try:
+            paths = [path for path in uncommitted_paths(self.worktree) if path not in keep]
+            if paths:
+                restore_paths(self.worktree, paths, "HEAD")
+        except GitError:
+            return {}
+        return {"discarded": paths} if paths else {}
 
     def replan_after_approval(self, names: list[str], index: int, executor: Executor) -> bool:
         """Before `names[index]` walks, not behind an approval: re-plan it (`replan`) when it was walked behind the
@@ -656,16 +686,20 @@ class _Loop:
 
     def end_left_speculation(self) -> None:
         """End a speculation no runner walks any more (this one was stopped, or died, mid-walk) once the person decided
-        on the approval it waited behind: `rejected` for a rejection, else `approved`. Before anything else of the
-        phase runs, so a re-raised approval never finds the old record and queues the walked phase's stops on it."""
+        on the approval it waited behind: `rejected` for a rejection (with what the walk left discarded, `discard_left`),
+        else `approved`. Before anything else of the phase runs, so a re-raised approval never finds the old record and
+        queues the walked phase's stops on it."""
         if self._speculating is not None:
             return
         state = self.run.state
         record = state.get("speculation")
         if not record or speculating(state) is not None:
             return
-        outcome = "rejected" if speculation.cut(state, record["after"]) == "rejected" else "approved"
-        self.run.emit("speculation_ended", phase=record["phase"], outcome=outcome)
+        if speculation.cut(state, record["after"]) == "rejected":
+            self.run.emit("speculation_ended", phase=record["phase"], outcome="rejected",
+                          **self.discard_left(record["phase"], self.executor()))
+        else:
+            self.run.emit("speculation_ended", phase=record["phase"], outcome="approved")
 
     def catch_up_handoffs(self, names: list[str], index: int, executor: Executor) -> None:
         """Write the handoff of each phase before `names[index]` a person approved while the runner walked on (an

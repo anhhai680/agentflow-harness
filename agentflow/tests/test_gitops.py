@@ -1490,3 +1490,13 @@ def test_uncommitted_paths_lists_each_file_of_a_new_folder(tmp_path):
     _commit(repo)
     _write(repo, "docs/plans/p.md", "p\n")  # a folder git has never seen: listed file by file, never as `docs/`
     assert gitops.uncommitted_paths(repo) == ["docs/plans/p.md"]
+
+
+def test_restore_paths_reads_each_name_as_a_path_never_a_glob(tmp_path):
+    repo = _shelf_repo(tmp_path)  # `a.py` is changed, `b.py` is new
+    _write(repo, "*.py", "stray\n")
+    _write(repo, "[ab].py", "stray\n")
+    gitops.restore_paths(repo, ["*.py", "[ab].py"], "HEAD")
+    assert gitops.uncommitted_paths(repo) == ["a.py", "b.py"]  # only the two named files went
+    assert (repo / "a.py").read_text() == "one\nTWO\nthree\n" and (repo / "b.py").read_text() == "new\n"
+    assert run_git(repo, "ls-files", "a.py").strip() == "a.py"

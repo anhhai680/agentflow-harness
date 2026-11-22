@@ -3039,6 +3039,23 @@ def test_a_speculated_phase_holds_only_artifact_steps(tmp_cfg):
     assert [i.path for i in found] == ["autonomy.speculate"] and "step plan_review is not an artifact step" in found[0].message
 
 
+def test_a_speculated_review_must_run_read_only(tmp_cfg):  # Ruling AA (a)
+    def not_read_only(data: dict) -> None:
+        data["agents"]["claude"]["read_only_roles"] = []
+    found = ramp_errors(tmp_cfg, {"speculate": ["plan"]}, not_read_only)
+    assert [i.path for i in found] == ["autonomy.speculate"]
+    assert "plan: step plan_review is a `role: review` step agent claude does not run read-only" in found[0].message
+    assert "agents.claude.read_only_roles" in found[0].message
+    assert ramp_errors(tmp_cfg, {}, not_read_only) == []  # only a speculated phase needs it
+
+    def on_codex(data: dict) -> None:
+        data["agents"]["codex"].update(enabled=True, read_only_roles=["review"])
+        data["phases"]["plan"]["agent"] = "codex"
+    found = ramp_errors(tmp_cfg, {"speculate": ["plan"]}, on_codex)
+    assert [i.path for i in found] == ["autonomy.speculate"]
+    assert "agent codex does not run read-only" in found[0].message and "has no read-only mode" in found[0].message
+
+
 def test_approvals_map_an_approval_phase_to_a_mode(tmp_cfg):
     from agentflow.config import APPROVAL_MODES
 

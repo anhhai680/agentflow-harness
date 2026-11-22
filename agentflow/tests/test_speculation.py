@@ -626,7 +626,8 @@ def test_a_rejection_drops_the_walked_phase_s_uncommitted_output(flow):  # Rulin
     sha = [e["sha"] for e in events(run, "step_committed") if e["key"] == DRAFT][-1]
     files = run_git(worktree, "show", "--name-only", "--format=", sha).split()
     assert SPEC in files and plan_path(flow) not in files
-    assert (worktree / "notes.txt").exists()  # only the walked phase's `output` is put back
+    assert not (worktree / "notes.txt").exists()  # Ruling W: the fence's stray goes too, not only the walked output
+    assert events(run, "speculation_ended")[0]["discarded"] == ["notes.txt"]
 
 
 def test_a_new_basis_ends_the_open_record_it_replaces(flow, monkeypatch):  # Ruling P
@@ -667,3 +668,120 @@ def test_a_dropped_speculative_question_is_asked_afresh_after_the_approval(flow,
     wait = run.state["waiting"]
     assert (wait["key"], wait.get("speculative")) == (PLAN, None)  # a real stop, asked again
     assert len([n for n in notices if "cần quyết định" in n]) == 1
+
+
+# --------------------------------------------------------------------------- final review (Rulings W, X, Y, Z)
+
+STRAY = "src/one.py"
+
+
+def strays(flow) -> dict:
+    """A `plan/plan` act that writes the plan and a file outside it: the fence's `outside_output` stop."""
+    return {"write": {plan_path(flow): PLAN_TEXT, STRAY: "x = 1\n"}, **done("planned")}
+
+
+def branch_files(run: Run) -> str:
+    return run_git(Path(run.state["worktree"]), "log", "--name-only", "--format=", f"{run.state['base_sha']}..HEAD")
+
+
+def test_a_stopped_walk_leaves_nothing_a_rejected_spec_s_round_commits(flow):  # Ruling W
+    run = begin(flow, {**acts(flow, strays(flow), planned(flow)), DRAFT: [DRAFTED, revised(1)]}, to=None)
+    assert go(flow, run) == "awaiting_approval"
+    assert [(w["kind"], w["key"]) for w in run.state["waiting_queue"]] == [("guard_violation", PLAN)]
+    (started,) = events(run, "speculation_started")
+    assert started["dirty"] == []  # the tree the walk started on
+    (ended,) = events(run, "speculation_ended")
+    assert (ended["outcome"], ended["discarded"]) == ("stopped", [STRAY])  # the fence's stray, never the plan
+    worktree = Path(run.state["worktree"])
+    assert not (worktree / STRAY).exists() and (worktree / plan_path(flow)).exists()
+    reject(run, "define", "me", "Thêm rollback")
+    assert go(flow, run) == "awaiting_approval"
+    sha = [e["sha"] for e in events(run, "step_committed") if e["key"] == DRAFT][-1]
+    assert run_git(worktree, "show", "--name-only", "--format=", sha).split() == [SPEC]
+    assert STRAY not in branch_files(run)
+
+
+def test_a_rejection_mid_walk_discards_all_the_walk_left(flow, monkeypatch):  # Ruling W
+    run = begin(flow, {**acts(flow, strays(flow), planned(flow)), DRAFT: [DRAFTED, revised(1)]}, to=None)
+    assert reject_after(run, monkeypatch, PLAN) is not None
+    assert go(flow, run) == "awaiting_approval"
+    ended = events(run, "speculation_ended")[0]
+    assert (ended["outcome"], ended["discarded"]) == ("rejected", sorted([plan_path(flow), STRAY]))
+    sha = [e["sha"] for e in events(run, "step_committed") if e["key"] == DRAFT][-1]
+    assert run_git(Path(run.state["worktree"]), "show", "--name-only", "--format=", sha).split() == [SPEC]
+    assert STRAY not in branch_files(run)
+
+
+def test_what_was_uncommitted_before_the_walk_is_kept(flow, monkeypatch):  # Ruling W
+    from agentflow import pipeline
+
+    real = pipeline.raise_phase_approval
+
+    def raised(cfg, run, phase):
+        path = real(cfg, run, phase)
+        (Path(run.state["worktree"]) / "notes.txt").write_text("của tôi\n", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(pipeline, "raise_phase_approval", raised)
+    run = begin(flow, {**acts(flow, strays(flow)), DRAFT: [DRAFTED, revised(1)]}, to=None)
+    assert go(flow, run) == "awaiting_approval"
+    assert events(run, "speculation_started")[0]["dirty"] == ["notes.txt"]
+    assert "discarded" not in events(run, "speculation_ended")[0]  # the fenced step refused that tree: nothing it left
+    assert (Path(run.state["worktree"]) / "notes.txt").read_text(encoding="utf-8") == "của tôi\n"
+
+
+def test_a_plan_a_person_approved_is_never_walked_again(flow):  # Ruling Y
+    from agentflow.run_control import retry
+
+    run = begin(flow, {REVIEW: [found(LOW), found(HIGH), found(LOW)],
+                       RECONCILE: [revised(1, disp("R1-F1", "actionable"))], PLAN: [planned(flow)]}, to=None)
+    assert go(flow, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    assert go(flow, run) == "awaiting_approval" and run.state["waiting"]["key"] == "plan_approved"
+    approve(run, "plan", by="me")
+    retry(run, REVIEW, by="me")  # a person checks the spec again, and the reconcile edits it
+    assert go(flow, run) == "awaiting_approval"
+    assert run.state["waiting"]["key"] == "define_approved"
+    assert called(flow, RECONCILE) == [RECONCILE]  # the spec did change under the approved plan
+    assert run.state["phases"]["plan"]["status"] == "approved"
+    assert len(events(run, "speculation_started")) == 1 and not replans(run)
+    assert called(flow, "plan/") == [PLAN, PLAN_REVIEW]
+    assert "the runner drafts" not in approval_text(flow.cfg, run, "define")
+    assert "the runner drafts" not in run.inbox_path("define_approved").read_text(encoding="utf-8")
+
+
+def test_due_is_none_once_the_next_phase_is_approved_or_a_later_one_started(flow):  # Ruling Y
+    run = begin(flow, acts(flow), to=None)
+    assert go(flow, run) == "awaiting_approval"
+    names = list(flow.cfg.phases)
+    index = names.index("define")
+    assert speculation.due(flow.cfg, run, names, index, None) == "plan"
+    run.emit("phase_started", phase="build", start_sha="s")
+    assert speculation.due(flow.cfg, run, names, index, None) is None
+    assert "the runner drafts" not in approval_text(flow.cfg, run, "define")
+
+
+def test_a_hold_given_while_the_walked_plan_refines_starts_no_build(flow, monkeypatch):  # Ruling X
+    flow.configure({**SPECULATE, "phases": {"plan": {"needs_approval": False}}}, autopilot=True, edit=with_doubt)
+    gap = {"severity": "high", "file": plan_path(flow), "line": 1, "text": "Thiếu bước rollback"}
+    run = begin(flow, {**acts(flow, planned(flow), planned(flow)), PLAN_REVIEW: [found(gap), done("sạch")]}, to=None)
+    real = Executor.run_step
+    held: list[bool] = []
+
+    def run_step(self, phase, step, prefix):
+        outcome = real(self, phase, step, prefix)
+        state = run.refresh()
+        if f"{prefix}/{step.id}" == PLAN and (state.get("refine") or {}).get("phase") == "plan" and not held:
+            held.append(True)  # plan's finding round is open: the person approves the spec with `hold`
+            approve(run, "define", by="me", hold=True)
+        return outcome
+
+    monkeypatch.setattr(Executor, "run_step", run_step)
+    assert go(flow, run) == "ready"
+    assert held and run.state["ready"]["phase"] == "define"
+    assert called(flow, "plan/") == [PLAN, PLAN_REVIEW, PLAN]  # it yielded at the round's next step boundary
+    assert not called(flow, "build/") and not [e for e in events(run, "step_started") if e["key"].startswith("build/")]
+    assert events(run, "speculation_ended")[-1]["outcome"] == "approved"
+    monkeypatch.setattr(Executor, "run_step", real)
+    go(flow, run)  # a person goes on: the round finishes, then build
+    assert called(flow, "plan/") == [PLAN, PLAN_REVIEW, PLAN, PLAN_REVIEW] and called(flow, "build/")

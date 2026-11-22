@@ -3,8 +3,9 @@
 The rules are pure reads of the config, the run's state and its log; `pipeline._Loop.speculate` acts on them.
 
 - `due` says whether a phase that just raised its approval (`after`) is followed by a phase in `autonomy.speculate`
-  the runner may walk now: never when the run ends at `after` (`--to`), was marked done, or `after` still holds a
-  blocking finding (a spec a reviewer doubts is not worth planning on).
+  the runner may walk now: never when the run ends at `after` (`--to`), was marked done, `after` still holds a
+  blocking finding (a spec a reviewer doubts is not worth planning on), or the run already left `after` (the phase to
+  walk is approved, or a later one started). The approval page's line (`page_line`) follows the same rule.
 - `basis` pins what the speculated phase is planned on: the bytes of each committed `output` of `after`.
   A revision is speculated once (`last_record`): the same basis after a finished speculation walks nothing again.
 - `planned_on` and `replan_due` say whether a phase that was walked (or re-planned) on one basis now follows another:
@@ -47,9 +48,16 @@ def next_phase(cfg: Config, names: list[str], index: int, lane: str) -> str | No
 
 def due(cfg: Config, run: Run, names: list[str], index: int, to_phase: str | None) -> str | None:
     """The phase to walk while `names[index]`'s approval waits (`next_phase`), or None: the run ends at that phase
-    (`to_phase`), it was marked done, or that phase still holds a blocking finding."""
+    (`to_phase`), it was marked done, that phase still holds a blocking finding, the phase to walk was approved, or a
+    phase after it started (the approval came back to a phase the run had already left, by a person's retry): an
+    approved phase is never sent back (`pipeline._Loop.replan_after_approval`), and the walk never goes past the run."""
     nxt = next_phase(cfg, names, index, run.state["pipeline"])
     if nxt is None or to_phase == names[index] or run.state.get("marked_done"):
+        return None
+    rows = run.state["phases"]
+    if (rows.get(nxt) or {}).get("status") == "approved":
+        return None
+    if any((rows.get(name) or {}).get("status") not in UNSTARTED for name in names[names.index(nxt) + 1:]):
         return None
     if blocking_of(cfg, phase_findings(cfg, run, names[index])):
         return None

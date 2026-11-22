@@ -1298,13 +1298,14 @@ def push(worktree: Path, branch: str, sha: str | None = None) -> None:
 
 
 def restore_paths(worktree: Path, paths: list[str], sha: str) -> None:
-    """Put exactly `paths` back as they are at `sha`, in the index and the tree; a path `sha` lacks is removed."""
+    """Put exactly `paths` back as they are at `sha`, in the index and the tree; a path `sha` lacks is removed. Each
+    name is a literal pathspec (`--literal-pathspecs`): a file an agent named `*.py` never matches another file."""
     root = Path(worktree)
     for path in paths:
         if subprocess.run(["git", "cat-file", "-e", f"{sha}:{path}"], cwd=root, capture_output=True).returncode == 0:
-            _git_or_raise(root, "restore", f"--source={sha}", "--staged", "--worktree", "--", path)
+            _git_or_raise(root, "--literal-pathspecs", "restore", f"--source={sha}", "--staged", "--worktree", "--", path)
         else:
-            _git_or_raise(root, "rm", "-q", "--force", "--cached", "--ignore-unmatch", "--", path)
+            _git_or_raise(root, "--literal-pathspecs", "rm", "-q", "--force", "--cached", "--ignore-unmatch", "--", path)
             (root / path).unlink(missing_ok=True)
 
 

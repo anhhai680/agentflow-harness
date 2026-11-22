@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agentflow import pack
+from agentflow import pack, speculation
 from agentflow.events import EventError, EventLog, RunLock, lock_state
 from agentflow.flow import _human_errors, main
 from agentflow.state import (
@@ -475,6 +475,60 @@ def test_approving_with_nothing_refining_runs_as_before(run):
     start_speculating(run)
     run.emit("phase_approved", phase="define", by="me")
     assert run.state["status"] == "running"
+
+
+def test_a_hold_given_while_the_walked_phase_refines_is_kept(run):  # Ruling X
+    start_speculating(run)
+    run.emit("phase_rejected", phase="plan", round=1, note="fix", by="runner", kind="reconcile")
+    run.emit("phase_approved", phase="define", by="me")
+    run.emit("phase_ready", phase="define", by="me")  # `approve --hold`
+    assert run.state["ready"]["phase"] == "define" and run.state["status"] == "ready"
+    assert speculation.cut(run.state, "define") == "ready"  # the walk yields at its next step boundary
+    run.emit("run_resumed", by="me")
+    assert run.state["ready"] is None and run.state["status"] == "refining"  # the round goes on once a person continues
+
+
+def test_a_hold_given_while_a_speculative_stop_waits_is_kept_until_it_clears(run):  # Ruling X
+    start_speculating(run)
+    run.emit("hitl_raised", kind="needs_human", key="plan/plan", phase="plan", summary="q", questions=[], speculative=True)
+    run.emit("phase_approved", phase="define", by="me")
+    run.emit("phase_ready", phase="define", by="me")
+    assert run.state["waiting"]["key"] == "plan/plan" and run.state["status"] == "waiting_human"  # the stop comes first
+    assert run.state["ready"]["phase"] == "define" and speculation.cut(run.state, "define") == "ready"
+    run.emit("hitl_answered", key="plan/plan", by="me", answers={})
+    assert run.state["waiting"] is None and run.state["status"] == "ready"  # then the run rests, as the person held it
+
+
+def test_a_hold_after_the_walk_ended_with_its_stop_queued_is_kept(run):  # Ruling X
+    start_speculating(run)
+    run.emit("hitl_raised", kind="needs_human", key="plan/plan", phase="plan", summary="q", questions=[], speculative=True)
+    run.emit("speculation_ended", phase="plan", outcome="stopped")
+    run.emit("phase_approved", phase="define", by="me")
+    run.emit("phase_ready", phase="define", by="me")
+    assert run.state["ready"]["phase"] == "define" and run.state["status"] == "waiting_human"
+    run.emit("hitl_approved", key="plan/plan", by="me", kind="needs_human", summary="q")
+    assert run.state["status"] == "ready"
+
+
+def test_a_hold_with_a_queued_wait_and_no_speculation_is_dropped_as_before(run):  # Ruling X: off means today
+    run.emit("phase_started", phase="define", start_sha="s0")
+    run.emit("hitl_raised", kind="needs_human", key="define/q", phase="define", summary="q", questions=[])
+    run.emit("phase_approval_raised", phase="define", round=0, sha="s1")
+    run.emit("hitl_raised", kind="needs_human", key="define/r", phase="define", summary="r", questions=[])
+    run.emit("phase_approved", phase="define", by="me")
+    run.emit("phase_ready", phase="define", by="me")
+    assert run.state["ready"] is None and run.state["status"] == "waiting_human"
+    run.emit("hitl_answered", key="define/r", by="me", answers={})
+    assert run.state["status"] == "running" and run.state["ready"] is None
+
+
+def test_approving_while_the_walked_phase_refines_and_its_stop_waits_shows_the_stop(run):  # Task 2 (deferred)
+    start_speculating(run)
+    run.emit("phase_rejected", phase="plan", round=1, note="fix", by="runner", kind="reconcile")
+    run.emit("hitl_raised", kind="needs_human", key="plan/plan", phase="plan", summary="q", questions=[], speculative=True)
+    run.emit("phase_approved", phase="define", by="me")
+    assert run.state["waiting"]["key"] == "plan/plan" and run.state["status"] == "waiting_human"
+    assert run.state["refine"]["phase"] == "plan"
 
 
 def test_speculation_events_set_and_clear_the_record(run):

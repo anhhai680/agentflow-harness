@@ -172,6 +172,26 @@ def _ramped(event: dict) -> bool:
             and isinstance(samples, int) and not isinstance(samples, bool))
 
 
+def ramp_refused_note(phase: str) -> str:
+    """The note of an `approval:<phase>` item the ramp approved where the security overlay holds (`ramp_refused`)."""
+    return f"the approval ramp approved {phase}, but the security overlay holds: a person must approve it"
+
+
+def ramp_refused(event: dict | None) -> list[str]:
+    """The phases whose `approval:` evidence a `conformance_checked` event found missing because only the approval
+    ramp gave it while the security overlay holds (`ramp_refused_note`), each once, in order: no retry of a missing
+    step brings that evidence, only a person's approval of the phase."""
+    phases: list[str] = []
+    for finding in (event or {}).get("obligations") or []:
+        if not isinstance(finding, dict) or finding.get("status") != "missing":
+            continue
+        for item in finding.get("require") or []:
+            kind, _, phase = str(item).partition(":")
+            if kind == "approval" and phase not in phases and ramp_refused_note(phase) in str(finding.get("note") or ""):
+                phases.append(phase)
+    return phases
+
+
 def _approval(events: list[dict], phase: str, security: bool = False) -> _Item:
     approved = _last([e for e in events if e.get("type") == "phase_approved" and e.get("phase") == phase
                       and e.get("by") != AUTO_BY])
@@ -179,8 +199,7 @@ def _approval(events: list[dict], phase: str, security: bool = False) -> _Item:
         return _Item(True, [approved["seq"]])
     ramped = _last([e for e in events if e.get("phase") == phase and _ramped(e)])
     if ramped is not None and security:  # the ramp may have approved it before the run touched a security path
-        return _Item(False, [ramped["seq"]], f"the approval ramp approved {phase}, but the security overlay holds: "
-                     "a person must approve it")
+        return _Item(False, [ramped["seq"]], ramp_refused_note(phase))
     if ramped is not None:
         return _Item(True, [ramped["seq"]], RAMP_APPROVAL)
     skipped = _last([e for e in events if e.get("type") == "phase_skipped" and e.get("phase") == phase

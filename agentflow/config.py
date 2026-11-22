@@ -729,6 +729,25 @@ def speculation_shape(phase: Phase) -> str | None:
     return None
 
 
+def speculation_writes(cfg: Config, phase: Phase) -> str | None:
+    """Why a `role: review` step of `phase` could write while the approval before it waits, or None. The fence holds
+    only a step with an `output`; a review step has none, so it must run read-only: its role is in its agent's
+    `read_only_roles`, and the agent has a read-only mode (`agents.ADAPTERS`, as the runner reads it)."""
+    from agentflow.agents import ADAPTERS  # it imports this module
+
+    name = phase.agent or cfg.defaults.agent
+    agent = cfg.agents.get(name)
+    for step in phase.steps:
+        if step.role != "review":
+            continue
+        if not getattr(ADAPTERS.get(name), "takes_read_only_role", False):
+            return f"step {step.id} is a `role: review` step agent {name} does not run read-only: {name} has no read-only mode"
+        if agent is None or step.role not in agent.read_only_roles:
+            return (f"step {step.id} is a `role: review` step agent {name} does not run read-only: add `review` to "
+                    f"`agents.{name}.read_only_roles`")
+    return None
+
+
 def for_lane(steps: list[Step], lane: str) -> list[Step]:
     """The steps a run of `lane` walks: those with no `lanes:` tag, and those tagged with `lane`."""
     return [step for step in steps if not step.lanes or lane in step.lanes]
@@ -3090,7 +3109,7 @@ class _Validator:
             if not cfg.phases[before].needs_approval:
                 self.error("autonomy.speculate", f"{name}: the phase before it, {before}, does not need an approval")
                 continue
-            reason = speculation_shape(cfg.phases[name])
+            reason = speculation_shape(cfg.phases[name]) or speculation_writes(cfg, cfg.phases[name])
             if reason:
                 self.error("autonomy.speculate", f"{name}: {reason}")
         modes = cfg.autonomy.get("approvals", {})

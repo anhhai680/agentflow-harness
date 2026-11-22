@@ -162,14 +162,15 @@ def _find_agent(state: dict, event: dict) -> tuple[str | None, dict | None]:
 
 
 def _clear_wait(state: dict) -> None:
-    """Drop the current wait and promote the next queued one, if any."""
+    """Drop the current wait and promote the next queued one, if any. The last one cleared leaves the run `ready` when
+    a person held an approval while it waited (`_on_phase_ready`, speculation only), else `running`."""
     state["waiting"] = None
     if state["waiting_queue"]:
         state["waiting"] = state["waiting_queue"].pop(0)
         if state["status"] not in TERMINAL:
             state["status"] = "waiting_human"
     elif state["status"] in ("waiting_human", "awaiting_approval"):
-        state["status"] = "running"
+        state["status"] = "ready" if (state.get("ready") or {}).get("speculative") else "running"
 
 
 def _approval_pending(state: dict) -> bool:
@@ -775,11 +776,28 @@ def _on_phase_approved(state: dict, ev: dict) -> None:
             state["status"] = "refining"
 
 
+def _behind_speculation(state: dict, phase: str) -> bool:
+    """Whether a phase was walked behind `phase`'s approval and is not done with it: the speculation record names
+    `phase`, or a stop the walk queued quietly is still the wait or queued."""
+    if (state.get("speculation") or {}).get("after") == phase:
+        return True
+    return any(w.get("speculative") and w.get("phase") != phase for w in [state["waiting"] or {}, *state["waiting_queue"]])
+
+
 def _on_phase_ready(state: dict, ev: dict) -> None:
-    """An approved phase rests until a human continues the run or marks it done. A queued wait comes first."""
+    """An approved phase rests until a human continues the run or marks it done. A queued wait comes first.
+
+    Under speculation, a hold on the approval a phase was walked behind is never dropped: it is recorded whatever the
+    status (the walked phase's round made it `refining`, or the walk's queued stop became the wait), so the walk
+    yields to it (`speculation.cut`) and the run never goes on past the held phase. The status is `ready` at once when
+    nothing waits, else once the last wait clears (`_clear_wait`)."""
     if state["status"] in ("running", "paused") and state["waiting"] is None:
         state["ready"] = {"phase": ev["phase"], "since": ev.get("ts")}
         state["status"] = "ready"
+    elif state["status"] not in TERMINAL and _behind_speculation(state, ev["phase"]):
+        state["ready"] = {"phase": ev["phase"], "since": ev.get("ts"), "speculative": True}
+        if state["waiting"] is None:
+            state["status"] = "ready"
 
 
 def _on_run_marked_done(state: dict, ev: dict) -> None:
