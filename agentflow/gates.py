@@ -10,8 +10,10 @@ root does not block a step, but the summary always shows them.
 
 Groups (`run_gates`): gates with the same `group` run in set order in one thread, and the groups run at the same time; the
 gates with no `group` form one group of their own, so a set with no `group` runs exactly as it always did, in order and
-with no thread. A gate with a `resource` holds that name's lock while it runs, so two gates sharing one never overlap
-(within one run). The results keep the set's order. However `run_gates` is left, every gate's process group is killed.
+with no thread. A gate with a `resource` holds that name's lock while its command runs, on every path, so two gates
+sharing one never overlap, in a run or across the runs of the repository (a file lock in the state dir's `locks/`);
+the seconds it waited are `GateResult.waited_s`, kept out of `duration_s`. The results keep the set's order. However
+`run_gates` is left, every gate's process group is killed.
 
 Doc checks (`run_doc_checks`) are the design lane's built-in gates, named in a step's `checks:`. They
 read `git diff` from a base commit to the working tree as it is now (committed, staged, unstaged and
@@ -42,6 +44,7 @@ as an ordinary full-tier result; so does one whose `{paths}` is not its own unqu
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -54,13 +57,13 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
-from agentflow import run_env, safeio
+from agentflow import pack, run_env, safeio
 from agentflow.config import Config, Gate, unquoted_paths_word
 from agentflow.guards import HARDENED, path_matches, snapshot
 
@@ -68,6 +71,8 @@ if TYPE_CHECKING:
     from agentflow.state import Run
 
 KILL_WAIT_S = 5
+# How long a gate that found its `resource` taken sleeps between two tries at the lock.
+RESOURCE_POLL_S = 0.2
 # Above this many matched paths an `affected` command would risk the argument limit: the gate runs its whole `run`.
 MAX_AFFECTED_PATHS = 200
 # A rendered `affected` command longer than this (bytes) runs the whole `run` instead: one argv string has a limit
@@ -89,6 +94,7 @@ class GateResult:
     reused_from: str | None = None  # the step key of the earlier pass this result stands for (`run_gates_reusing`)
     input_hash: str | None = None  # `hash_inputs` of the gate's `inputs` on the tree it ran on; None for a gate with none
     tier: str = "full"  # "affected": its `affected` command ran (or it skipped for no affected path); never evidence
+    waited_s: float = 0.0  # seconds the gate waited for its `resource` lock (not in `duration_s`); 0 when it was free
 
 
 def _resolve(cfg: Config, names: str | list[str]) -> list[Gate]:
@@ -352,6 +358,37 @@ def _run_gate(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min
     return GateResult(gate.name, passed, False, "" if passed else f"exit {code}", log_path, tail)
 
 
+class _Left(Exception):
+    """The run left while a gate waited for its resource: the group stops (`run_group`), and nothing ran."""
+
+
+@contextlib.contextmanager
+def resource_lock(cwd: Path, name: str, live: _Live | None = None) -> Iterator[float]:
+    """Hold the repository's lock for the resource `name` (a file lock in the state dir's `locks/`, so it holds across
+    runs and processes, and a crashed holder frees it) and yield the seconds spent waiting for it: `0.0` when the first
+    try got it. Raises `_Left` while waiting once `live` is closed, so a run that leaves does not run the gate."""
+    root = safeio.ensure_dir(pack.state_dir(cwd))
+    locks = root / "locks"
+    locks.mkdir(mode=0o700, exist_ok=True)
+    safeio.ensure_dir(locks)
+    fd = os.open(locks / f"{name}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        waited_from: float | None = None
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if live is not None and live.closed:
+                    raise _Left from None
+                if waited_from is None:
+                    waited_from = time.monotonic()
+                time.sleep(RESOURCE_POLL_S)
+        yield 0.0 if waited_from is None else time.monotonic() - waited_from
+    finally:
+        os.close(fd)  # closing the descriptor drops the lock
+
+
 def _collect(futures: list[Future]) -> None:
     """Wait for every future, then re-raise the first exception (in order). `run_gates` leaves through here."""
     wait(futures)
@@ -370,9 +407,9 @@ def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path, *,
     environment without the variables a run does not inherit) with `defaults.env` on top.
 
     The gates with no `group` form one group of their own. One group runs in set order, in this thread. With
-    several, each group runs in its own thread (in set order inside it), and a gate with a `resource` holds
-    that name's lock while it runs. The results are in set order. Leaving early (an exception, Ctrl-C) kills
-    every gate's process group, whichever thread started it.
+    several, each group runs in its own thread (in set order inside it). A gate with a `resource` holds that name's
+    lock (`resource_lock`, across runs) while its command runs, on either path. The results are in set order. Leaving
+    early (an exception, Ctrl-C) kills every gate's process group, whichever thread started it.
 
     At `tier="affected"` a gate with `affected` runs that command on the paths of `changed` it takes (`_tiered`), and
     its result has `tier="affected"`; a gate without one runs its `run`, at the full tier.
@@ -391,25 +428,26 @@ def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path, *,
         job, job_tier = jobs[i]
         if isinstance(job, GateResult):  # nothing to run at this tier
             return job
-        result = _run_one(job, cwd, log_dir, cfg.context.gate_output_lines, timeout, cfg.defaults.env, env_base, live)
-        return replace(result, tier=job_tier)
+        args = (job, cwd, log_dir, cfg.context.gate_output_lines, timeout, cfg.defaults.env, env_base, live)
+        if not job.resource:
+            return replace(_run_one(*args), tier=job_tier)
+        with resource_lock(cwd, job.resource, live) as waited:  # only the command is held, never `_tiered`'s choice
+            result = _run_one(*args)
+        return replace(result, tier=job_tier, waited_s=round(waited, 3))
 
     if len(groups) <= 1:  # no `group` anywhere, or all in one: today's plain loop
         return [run(i) for i in range(len(gates))]
     live = _Live()
-    locks = {r: threading.Lock() for r in {g.resource for g in gates if g.resource}}
     results: dict[int, GateResult] = {}
 
     def run_group(indexes: list[int]) -> None:
         for i in indexes:
             if live.closed:
                 return
-            gate = gates[i]
-            if gate.resource:
-                with locks[gate.resource]:
-                    results[i] = run(i, live)
-            else:
+            try:
                 results[i] = run(i, live)
+            except _Left:  # the run is leaving, so `run_gates` raises and no result is read
+                return
 
     pool = ThreadPoolExecutor(max_workers=len(groups), thread_name_prefix="gates")
     try:
@@ -558,6 +596,8 @@ def record_results(run: Run, key: str, results: list[GateResult], tree: str, *, 
             data["cmd"] = r.cmd
         if r.input_hash is not None:
             data["input_hash"] = r.input_hash
+        if r.waited_s > 0:  # only a gate that found its resource taken
+            data["resource_wait_s"] = round(r.waited_s, 3)
         if r.tier == "affected":  # written only for these: a result with no `tier` is a full one, as it always was
             data["tier"] = "affected"
         if with_tail:  # "" for a gate that passed or was skipped

@@ -591,7 +591,7 @@ class Gate:
     baseline: str | None = None  # `red`: it failed on the base branch when the pack was set up (a human fixes or deletes it)
     agent_check: bool = False  # the build prompt lists it as a check the implementer runs itself (`{self_checks}`)
     group: str | None = None  # gates of different groups run at the same time; one group runs in order (`gates.run_gates`)
-    resource: str | None = None  # gates that share a resource never run at the same time, within one run
+    resource: str | None = None  # gates that share a resource never run at the same time, in a run or across runs
     inputs: list[str] = field(default_factory=list)  # globs of the files the gate reads: its pass holds while none of them changes
     affected: Affected | None = None  # the command a `gate_tier: affected` step runs instead, on the files it changed
 
