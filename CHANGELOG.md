@@ -7,6 +7,11 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.3] - 2026-11-22
+
+### Fixed
+- The bundled skills' `SKILL.md` frontmatter is valid YAML again: each `description` is quoted, so GitHub's preview and strict skill loaders no longer fail with "mapping values are not allowed in this context".
+
 ## [3.2] - 2026-11-22
 
 ### Added
