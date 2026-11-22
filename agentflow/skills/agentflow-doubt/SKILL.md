@@ -1,6 +1,6 @@
 ---
 name: agentflow-doubt
-description: Use when a step asks you to doubt an artifact before a human approves it: try to disprove it against its contract, rate each finding critical, high, medium or low, and never validate.
+description: "Use when a step asks you to doubt an artifact before a human approves it: try to disprove it against its contract, rate each finding critical, high, medium or low, and never validate."
 ---
 
 # Doubt: try to disprove the artifact

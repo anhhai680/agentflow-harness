@@ -1,6 +1,6 @@
 ---
 name: agentflow-respond
-description: Use when a step hands you review findings to act on: check each one against the code, fix the ones that hold, and say why for any that do not.
+description: "Use when a step hands you review findings to act on: check each one against the code, fix the ones that hold, and say why for any that do not."
 ---
 
 # Respond: act on review findings with evidence

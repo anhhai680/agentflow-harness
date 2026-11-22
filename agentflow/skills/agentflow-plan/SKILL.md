@@ -1,6 +1,6 @@
 ---
 name: agentflow-plan
-description: Use when a step asks for an implementation plan: split the approved spec into small tasks, each with files, test-first steps and a testable result.
+description: "Use when a step asks for an implementation plan: split the approved spec into small tasks, each with files, test-first steps and a testable result."
 ---
 
 # Plan: split the spec into tasks

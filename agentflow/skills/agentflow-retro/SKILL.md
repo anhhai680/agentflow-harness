@@ -1,6 +1,6 @@
 ---
 name: agentflow-retro
-description: Use when a step asks you to run a retro over a digest of finished runs: propose lessons, config notes and engine issues, each backed by cited evidence, and change no file.
+description: "Use when a step asks you to run a retro over a digest of finished runs: propose lessons, config notes and engine issues, each backed by cited evidence, and change no file."
 ---
 
 # Retro: turn what the runs showed into rules future runs follow

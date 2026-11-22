@@ -1,6 +1,6 @@
 ---
 name: agentflow-build
-description: Use when a step asks you to implement a task from a plan: work test first, stay inside the task, leave the gates and the commit to the runner.
+description: "Use when a step asks you to implement a task from a plan: work test first, stay inside the task, leave the gates and the commit to the runner."
 ---
 
 # Build: implement one task
