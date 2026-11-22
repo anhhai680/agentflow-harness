@@ -440,6 +440,35 @@ def test_approving_while_another_phase_refines_leaves_it_refining(run):
     assert run.state["refine"]["phase"] == "plan"
 
 
+def test_a_rejection_of_the_waiting_phase_keeps_the_walked_phase_s_round_for_its_next_raise(run):
+    start_speculating(run)
+    run.emit("phase_rejected", phase="plan", round=1, note="re-plan", by="runner", kind="replan")
+    run.emit("phase_rejected", phase="define", round=1, note="more", by="me")
+    assert run.state["refine"]["phase"] == "define"
+    run.emit("phase_approval_raised", phase="define", round=1, sha="s2")
+    assert (run.state["refine"]["phase"], run.state["refine"]["kind"]) == ("plan", "replan")
+    assert run.state["status"] == "awaiting_approval" and "refine_stash" not in run.state
+    run.emit("phase_approved", phase="define", by="me")
+    assert run.state["status"] == "refining" and run.state["refine"]["phase"] == "plan"
+
+
+def test_a_kept_round_is_not_given_back_once_its_phase_left_it(run):
+    start_speculating(run)
+    run.emit("phase_rejected", phase="plan", round=1, note="re-plan", by="runner", kind="replan")
+    run.emit("phase_rejected", phase="define", round=1, note="more", by="me")
+    run.emit("phase_approved", phase="plan", by="runner")  # plan is no longer refining
+    run.emit("phase_approval_raised", phase="define", round=1, sha="s2")
+    assert run.state["refine"] is None
+
+
+def test_a_rejection_with_no_other_round_keeps_nothing(run):
+    start_speculating(run)
+    run.emit("phase_rejected", phase="define", round=1, note="more", by="me")
+    assert "refine_stash" not in run.state
+    run.emit("phase_approval_raised", phase="define", round=1, sha="s2")
+    assert run.state["refine"] is None
+
+
 def test_approving_with_nothing_refining_runs_as_before(run):
     start_speculating(run)
     run.emit("phase_approved", phase="define", by="me")

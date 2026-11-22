@@ -749,6 +749,11 @@ def _on_phase_approval_raised(state: dict, ev: dict) -> None:
         "since": ev.get("ts"),
     }
     state["refine"] = None
+    stash = state.get("refine_stash")  # only ever set under speculation (`_on_phase_rejected`)
+    if stash and stash.get("after") == phase:
+        state.pop("refine_stash")
+        if _refining_row(state, stash["refine"].get("phase")):
+            state["refine"] = stash["refine"]  # the round a rejection of this phase cut in the phase walked behind it
     state["phase"] = phase
     state["status"] = "awaiting_approval"
 
@@ -800,8 +805,18 @@ def _in_scope(key: str, scope: str | None, keys: list[str] | None = None) -> boo
 RECONCILE_KIND = "reconcile"  # `doubt.RECONCILE`: a round the runner opens on a doubt review's findings, not a human's
 
 
+def _refining_row(state: dict, phase: object) -> bool:
+    return isinstance(phase, str) and (state["phases"].get(phase) or {}).get("status") == "refining"
+
+
 def _on_phase_rejected(state: dict, ev: dict) -> None:
     phase, round_ = ev["phase"], ev.get("round", 1)
+    prior = state.get("refine") or {}
+    if (_approval_pending(state) and state["waiting"].get("phase") == phase and prior.get("phase") != phase
+            and _refining_row(state, prior.get("phase"))):
+        # The waiting phase is sent back while the phase walked behind it (speculation) is in a round of its own: keep
+        # that round, so the waiting phase's next raise gives it back (`_on_phase_approval_raised`) and it goes on as one.
+        state["refine_stash"] = {"after": phase, "refine": copy.deepcopy(prior)}
     scope = ev.get("scope") or None
     keys = ev.get("keys") if isinstance(ev.get("keys"), list) else None
     row = _phase_row(state, phase)

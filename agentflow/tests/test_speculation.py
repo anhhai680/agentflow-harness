@@ -381,17 +381,20 @@ def replans(run: Run) -> list[dict]:
     return [e for e in events(run, "phase_rejected") if e.get("kind") == speculation.REPLAN]
 
 
-def reject_after(run: Run, monkeypatch, key: str, times: int = 1) -> list[bool]:
-    """Reject `define` right after the walking runner's `key` returns, the first `times` times it runs: the person
-    acts while the runner is between that step and the next."""
+def reject_after(run: Run, monkeypatch, key: str, times: int = 1, skip: int = 0) -> list[bool]:
+    """Reject `define` right after the walking runner's `key` returns, the first `times` times it runs (after the first
+    `skip`): the person acts while the runner is between that step and the next."""
     real = Executor.run_step
     done_: list[bool] = []
+    seen: list[bool] = []
 
     def run_step(self, phase, step, prefix):
         outcome = real(self, phase, step, prefix)
-        if f"{prefix}/{step.id}" == key and len(done_) < times:
-            done_.append(True)
-            reject(run, "define", "me", "Thêm rollback")
+        if f"{prefix}/{step.id}" == key:
+            seen.append(True)
+            if len(seen) > skip and len(done_) < times:
+                done_.append(True)
+                reject(run, "define", "me", "Thêm rollback")
         return outcome
 
     monkeypatch.setattr(Executor, "run_step", run_step)
@@ -416,10 +419,10 @@ def test_planned_on_and_replan_due_read_the_last_basis():
 
 
 def test_the_replan_note_names_the_paths_and_the_diff():
-    note = speculation.replan_note(["a.md", "b.md"], "0123456789abcdef")
-    assert note == ("The `a.md`, `b.md` changed after this phase's work was written (at 0123456789ab). Read the "
-                    "change with `git diff 0123456789ab HEAD -- `a.md`, `b.md``, then update what this phase wrote to "
-                    "match it; keep what still holds.")
+    note = speculation.replan_note(["a.md", "docs/b c.md"], "0123456789abcdef")
+    assert note == ("The `a.md`, `docs/b c.md` changed after this phase's work was written (at 0123456789ab). Read the "
+                    "change with `git diff 0123456789ab HEAD -- a.md 'docs/b c.md'`, then update what this phase wrote "
+                    "to match it; keep what still holds.")  # the command runs as it is: quoted, space-joined paths
 
 
 def test_rejecting_mid_speculation_refines_the_spec_then_replans(flow, monkeypatch):  # Review Focus 2
@@ -542,3 +545,104 @@ def test_a_spec_left_as_it_was_during_its_replan_finishes_that_round_after_appro
     assert go(flow, run) == "awaiting_approval"
     assert run.state["waiting"]["key"] == "plan_approved" and len(replans(run)) == 1
     assert called(flow, "plan/") == [PLAN, PLAN, PLAN_REVIEW]  # the round's step left goes on from its row
+
+
+# --------------------------------------------------------------------------- fix round 1 (Rulings L, N, O, P)
+
+PLAN_RECONCILE = "plan/plan_reconcile"
+
+
+def test_a_replan_cut_before_its_step_ran_keeps_its_note_when_the_spec_stays(flow, monkeypatch):  # Ruling L (i)
+    run = begin(flow, {**acts(flow), DRAFT: [DRAFTED, revised(1), done("giữ nguyên")]}, to=None)
+    real = Executor.run_step
+    seen: list[str] = []
+
+    def run_step(self, phase, step, prefix):
+        key = f"{prefix}/{step.id}"
+        if key == PLAN:
+            seen.append(key)
+            if len(seen) == 2:  # the re-plan opened, its `plan/plan` has not run: the person rejects again
+                reject(run, "define", "me", "Xem lại")
+        outcome = real(self, phase, step, prefix)
+        if key == PLAN and len(seen) == 1:
+            reject(run, "define", "me", "Thêm rollback")
+        return outcome
+
+    monkeypatch.setattr(Executor, "run_step", run_step)
+    assert go(flow, run) == "awaiting_approval"
+    (replan,) = replans(run)
+    assert called(flow, "plan/") == [PLAN]  # the re-plan's step was cut before it ran
+    assert (run.state["refine"]["phase"], run.state["refine"]["kind"]) == ("plan", speculation.REPLAN)
+    assert run.state["waiting"]["key"] == "define_approved"
+    monkeypatch.setattr(Executor, "run_step", real)
+    approve(run, "define", by="me")
+    assert go(flow, run) == "awaiting_approval"
+    assert run.state["waiting"]["key"] == "plan_approved" and len(replans(run)) == 1
+    assert called(flow, "plan/") == [PLAN, PLAN, PLAN_REVIEW]
+    second = [c for c in flow.calls() if c["step"] == PLAN][1]
+    assert replan["note"] in second["argv"][-1]  # it ran as the re-plan, in refine mode with its note
+
+
+def test_a_reconcile_round_cut_by_a_rejection_goes_on_as_one_when_the_spec_stays(flow, monkeypatch):  # Ruling L (ii)
+    gap = {"severity": "high", "file": plan_path(flow), "line": 5, "text": "Task 1 không có lệnh kiểm thử"}
+    run = begin(flow, {**acts(flow), DRAFT: [DRAFTED, done("giữ nguyên")], PLAN_REVIEW: [found(gap), done("sạch")],
+                       PLAN_RECONCILE: [revised(1, disp("R1-F1", "actionable"), path=plan_path(flow),
+                                                text=PLAN_TEXT + "\nRun: `true`\n")]}, to=None)
+    reject_after(run, monkeypatch, PLAN_RECONCILE, skip=1)  # it is skipped in the first walk: reject once it ran
+    assert go(flow, run) == "awaiting_approval"
+    assert called(flow, "plan/") == [PLAN, PLAN_REVIEW, PLAN_RECONCILE]
+    assert (run.state["refine"]["phase"], run.state["refine"]["kind"]) == ("plan", "reconcile")
+    assert not replans(run) and run.state["waiting"]["key"] == "define_approved"
+    approve(run, "define", by="me")
+    assert go(flow, run) == "awaiting_approval"
+    assert called(flow, "plan/") == [PLAN, PLAN_REVIEW, PLAN_RECONCILE, PLAN_REVIEW]
+    second = [c for c in flow.calls() if c["step"] == PLAN_REVIEW][1]
+    assert "Earlier reviews of this artifact found these" in second["argv"][-1]  # the round's reviewer, not a fresh one
+    assert run.state["waiting"]["key"] == "plan_approved"
+
+
+def test_the_spec_refine_prompt_leaves_out_the_speculated_plan(flow):  # Ruling N
+    run = begin(flow, {**acts(flow), DRAFT: [DRAFTED, revised(1)]}, to=None)
+    assert go(flow, run) == "awaiting_approval"
+    reject(run, "define", "me", "Thêm rollback")
+    assert go(flow, run) == "awaiting_approval"
+    prompt = [c for c in flow.calls() if c["step"] == DRAFT][1]["argv"][-1]
+    assert "Thêm rollback" in prompt and f"- `{SPEC}`" in prompt
+    assert plan_path(flow) not in prompt
+
+
+def test_a_rejection_drops_the_walked_phase_s_uncommitted_output(flow):  # Ruling O
+    stops = {"write": {plan_path(flow): PLAN_TEXT, "notes.txt": "giữ\n"},
+             "result": {"status": "needs_human", "summary": "cần quyết định", "questions": [BOUNDARY]}}
+    run = begin(flow, {**acts(flow, stops, planned(flow)), DRAFT: [DRAFTED, revised(1)]}, to=None)
+    assert go(flow, run) == "awaiting_approval"
+    worktree = Path(run.state["worktree"])
+    assert (worktree / plan_path(flow)).exists() and not [e for e in events(run, "step_committed") if e["key"] == PLAN]
+    reject(run, "define", "me", "Thêm rollback")
+    go(flow, run)
+    sha = [e["sha"] for e in events(run, "step_committed") if e["key"] == DRAFT][-1]
+    files = run_git(worktree, "show", "--name-only", "--format=", sha).split()
+    assert SPEC in files and plan_path(flow) not in files
+    assert (worktree / "notes.txt").exists()  # only the walked phase's `output` is put back
+
+
+def test_a_new_basis_ends_the_open_record_it_replaces(flow, monkeypatch):  # Ruling P
+    run = begin(flow, acts(flow), to=None)
+    real = Executor.run_step
+
+    def run_step(self, phase, step, prefix):
+        if f"{prefix}/{step.id}" == PLAN_REVIEW:
+            raise KeyboardInterrupt
+        return real(self, phase, step, prefix)
+
+    monkeypatch.setattr(Executor, "run_step", run_step)
+    with pytest.raises(KeyboardInterrupt):
+        go(flow, run)
+    monkeypatch.setattr(Executor, "run_step", real)
+    spec = Path(run.state["worktree"]) / SPEC
+    spec.write_text(spec.read_text(encoding="utf-8") + "\nSửa tay.\n", encoding="utf-8")
+    go(flow, run)
+    log = [e for e in run.events.read() if e["type"] in ("speculation_started", "speculation_ended")]
+    assert [(e["type"], e.get("outcome")) for e in log[:3]] == [
+        ("speculation_started", None), ("speculation_ended", "stopped"), ("speculation_started", None)]
+    assert len(replans(run)) == 1

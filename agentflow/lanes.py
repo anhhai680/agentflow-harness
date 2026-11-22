@@ -33,7 +33,8 @@ from typing import Literal, TextIO
 
 from agentflow import brief as brief_mod
 from agentflow import lessons as lessons_mod
-from agentflow import doubt, gitops, overlays, pack, run_env, safeio, sizing, sources, verification, waves, workspace
+from agentflow import (doubt, gitops, overlays, pack, run_env, safeio, sizing, sources, speculation, verification, waves,
+                       workspace)
 from agentflow.agents import (CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption,
                               ignored_settings, read_only_allow)
 from agentflow.autonomy import AUTO_BY
@@ -240,17 +241,20 @@ def _refine_values(ctx: Ctx, rec: dict) -> dict[str, str]:
 
 
 def _phase_artifacts(ctx: Ctx, phase: str | None) -> str:
-    """The files the phase has changed so far (committed or not), one `- path` line each."""
+    """The files the phase has changed so far (committed or not), one `- path` line each, without what a phase walked
+    behind its approval committed (`speculation.walked_paths`), which is not this phase's to refine."""
     run = ctx.run
     row = (run.state["phases"].get(phase) or {}) if run is not None and phase else {}
     sha = row.get("start_sha")
     if not sha:
         return "(not recorded)"
+    worktree = Path(run.state.get("worktree") or ctx.repo)
     try:
-        paths = changed_since(Path(run.state.get("worktree") or ctx.repo), sha)
+        paths = changed_since(worktree, sha)
     except GitError as exc:
         return f"(could not list them: {exc})"
-    return "\n".join(f"- `{path}`" for path in paths) or "(none yet)"
+    hidden = set(speculation.walked_paths(run.events.read(), str(phase), worktree))
+    return "\n".join(f"- `{path}`" for path in paths if path not in hidden) or "(none yet)"
 
 
 def _read_file_skills(text: str, skills_dir: str, inlined: frozenset[str] = frozenset(),

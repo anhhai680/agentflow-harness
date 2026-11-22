@@ -72,10 +72,11 @@ from agentflow.gitops import (
     changed_between,
     changed_since,
     commit,
-    commit_paths,
     diff_stat,
     excluding,
     head,
+    restore_paths,
+    uncommitted_paths,
 )
 from agentflow.guards import snapshot
 from agentflow.hitl import notify_run, open_refine, parks_first, raise_hitl
@@ -438,6 +439,7 @@ class _Loop:
             state = run.state
         row = state["phases"].get(name) or {}
         if refining(state, name):
+            self.discard_walked(name, executor)
             if self.walk(phase, executor)[0] == "stopped":
                 return self.status()
             return self.settle(names, index, executor)
@@ -561,6 +563,8 @@ class _Loop:
         if same and ended:
             return "awaiting_approval"
         if not same:
+            if record is not None and not ended:  # an open walk on another basis (a spec edited while it was stopped)
+                run.emit("speculation_ended", phase=nxt, outcome="stopped")
             if speculation.replan_due(run.state, run.events.read(), nxt, basis):  # it was walked on an older revision
                 self.replan(names, names.index(nxt), basis)
             write_handoff(self.cfg, run, after)  # provisional, for the walked phase's `{handoff}`: no `handoff_written`
@@ -603,6 +607,24 @@ class _Loop:
         note = speculation.replan_note(speculation.changed(old, basis), sha)
         open_refine(self.run, name, AUTO_BY, note, extra={"kind": speculation.REPLAN, "basis": basis, "from_sha": sha})
         self.run.refresh()
+
+    def discard_walked(self, after: str, executor: Executor) -> None:
+        """Before `after`'s refine round walks: put back, to `HEAD`, the uncommitted changes to the `output`s of the phase
+        last walked behind its approval (a step of it stopped mid-step). Only those paths: the walked phase is walked or
+        re-planned again on the revision, and its edits must never go into `after`'s commit (`git add -A`). Nothing is
+        read but the log when no phase was walked behind `after`."""
+        walked = next((e["phase"] for e in reversed(self.run.events.read())
+                       if e["type"] == "speculation_started" and e.get("after") == after), None)
+        if walked is None or walked not in self.cfg.phases:
+            return
+        outputs = speculation.outputs(self.cfg.phases[walked], self.run.state["pipeline"], executor.ctx)
+        try:
+            dirty = set(uncommitted_paths(self.worktree))
+            paths = [path for path in outputs if path in dirty]
+            if paths:
+                restore_paths(self.worktree, paths, "HEAD")
+        except GitError:
+            return
 
     def replan_after_approval(self, names: list[str], index: int, executor: Executor) -> bool:
         """Before `names[index]` walks, not behind an approval: re-plan it (`replan`) when it was walked behind the
@@ -764,24 +786,9 @@ def _one_line(text: str) -> str:
 
 
 def _walked_paths(run: Run, phase: str) -> list[str]:
-    """The files the phases walked behind `phase`'s approval (`speculate`) committed, and no step of `phase` did: what
-    `phase`'s page and handoff leave out, so a person deciding on it (also after a rejection, when the walked phase's
-    commits sit among its own) sees its own work only. `[]` when no phase was walked behind it, as before."""
-    events = run.events.read()
-    walked = {e["phase"] for e in events if e["type"] == "speculation_started" and e.get("after") == phase}
+    """`speculation.walked_paths` of the run's log and worktree."""
     worktree = run.state.get("worktree")
-    if not walked or not worktree:
-        return []
-
-    def shas(phases: set[str]) -> list[str]:
-        return [e.get("sha") for e in events
-                if e["type"] == "step_committed" and str(e.get("key") or "").split("/")[0] in phases]
-
-    try:
-        own = set(commit_paths(Path(worktree), shas({phase})))
-        return [path for path in commit_paths(Path(worktree), shas(walked)) if path not in own]
-    except GitError:
-        return []
+    return speculation.walked_paths(run.events.read(), phase, Path(worktree)) if worktree else []
 
 
 def _artifacts(run: Run, phase: str) -> list[str]:

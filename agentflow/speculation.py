@@ -19,10 +19,11 @@ emits. With `autonomy.speculate: []` (the default) `due` is always None, so no e
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agentflow import doubt
+from agentflow import doubt, gitops
 from agentflow.autonomy import blocking_of, phase_findings
 from agentflow.conditions import Ctx, fmt
 from agentflow.config import Config, Phase, for_lane
@@ -109,8 +110,33 @@ def changed(old: dict[str, str], new: dict[str, str]) -> list[str]:
 def replan_note(paths: list[str], sha: str) -> str:
     """The note of a `replan` round: which of the approval phase's files changed and the diff to read."""
     names = ", ".join(f"`{path}`" for path in paths)
+    args = " ".join(shlex.quote(path) for path in paths)  # the command runs as it is written
     return (f"The {names} changed after this phase's work was written (at {sha[:12]}). Read the change with "
-            f"`git diff {sha[:12]} HEAD -- {names}`, then update what this phase wrote to match it; keep what still holds.")
+            f"`git diff {sha[:12]} HEAD -- {args}`, then update what this phase wrote to match it; keep what still holds.")
+
+
+def walked_paths(events: list[dict], phase: str, worktree: Path) -> list[str]:
+    """The files the phases walked behind `phase`'s approval committed (their `step_committed` commits), and no step of
+    `phase` did: what `phase`'s page, handoff and refine prompt leave out, so `phase` is shown its own work only (also
+    after a rejection, when the walked phase's commits sit among its own). `[]` when no phase was walked behind it."""
+    walked = {e["phase"] for e in events if e["type"] == "speculation_started" and e.get("after") == phase}
+    if not walked:
+        return []
+
+    def shas(phases: set[str]) -> list[str]:
+        return [e.get("sha") for e in events
+                if e["type"] == "step_committed" and str(e.get("key") or "").split("/")[0] in phases]
+
+    try:
+        own = set(gitops.commit_paths(worktree, shas({phase})))
+        return [path for path in gitops.commit_paths(worktree, shas(walked)) if path not in own]
+    except gitops.GitError:
+        return []
+
+
+def outputs(phase: Phase, lane: str, ctx: Ctx) -> list[str]:
+    """The `output` of each of the phase's top-level steps for `lane`: all a walked phase may write (its fence)."""
+    return sorted({fmt(str(step.output), ctx) for step in for_lane(phase.steps, lane) if step.output})
 
 
 def cut(state: dict, after: str) -> str | None:
