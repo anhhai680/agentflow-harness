@@ -7,6 +7,8 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.1] - 2026-11-22
+
 ### Added
 
 - Six signals read the waves of a build and join the vocabulary a lesson can target and the scorecard compares: `waves`, `parallel_demoted` (the tasks a wave turned away or set aside, a dissolve counted apart), `scope_violations`, `waves_dissolved` and `parallel_candidates` (the pairs in the run's last `parallel_candidates` event) are always present (0 with no wave), and `agent_parallelism` is the agent seconds of the build window (main sessions plus each sub-agent, from `subagent_started` to `subagent_finished`) over its wall seconds, present only when build had agent time, higher is better. The scorecard's baseline for them starts at the next `agentflow scorecard --freeze`.
