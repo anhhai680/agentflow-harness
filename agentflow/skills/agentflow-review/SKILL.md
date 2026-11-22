@@ -1,6 +1,6 @@
 ---
 name: agentflow-review
-description: Use when a step asks you to review a change against its plan and spec: label each finding Critical, Important or Minor, and list what you declined to judge.
+description: "Use when a step asks you to review a change against its plan and spec: label each finding Critical, Important or Minor, and list what you declined to judge."
 ---
 
 # Review: judge the diff against the plan and the spec

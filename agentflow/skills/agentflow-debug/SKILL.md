@@ -1,6 +1,6 @@
 ---
 name: agentflow-debug
-description: Use when a step asks you to fix a bug: reproduce it, find the cause before changing anything, then fix it and prove the fix with a test.
+description: "Use when a step asks you to fix a bug: reproduce it, find the cause before changing anything, then fix it and prove the fix with a test."
 ---
 
 # Debug: reproduce, isolate, fix, prove

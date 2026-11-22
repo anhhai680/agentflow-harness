@@ -398,6 +398,16 @@ def test_every_bundled_skill_names_itself_in_its_frontmatter():
         assert any(line.startswith("description: ") and line[13:].strip() for line in lines[2:end]), directory.name
 
 
+def test_every_bundled_skill_frontmatter_is_valid_yaml():
+    # Strict YAML readers (GitHub's preview, the agent CLIs' skill loaders) reject an unquoted ": " in a value.
+    for directory in BUNDLED:
+        lines = (directory / "SKILL.md").read_text(encoding="utf-8").splitlines()
+        end = lines.index("---", 1)
+        meta = yaml.safe_load("\n".join(lines[1:end]))
+        assert isinstance(meta, dict) and meta.get("name") == directory.name, directory.name
+        assert isinstance(meta.get("description"), str) and meta["description"].strip(), directory.name
+
+
 def _bundled_text(stage: str) -> str:
     return (pack.ENGINE_SKILLS / f"agentflow-{stage}" / "SKILL.md").read_text(encoding="utf-8")
 

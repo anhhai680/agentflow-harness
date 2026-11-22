@@ -1,6 +1,6 @@
 ---
 name: agentflow-define
-description: Use when a step asks for a spec: write the spec file at the path the step names, with its scope, acceptance criteria and open questions.
+description: "Use when a step asks for a spec: write the spec file at the path the step names, with its scope, acceptance criteria and open questions."
 ---
 
 # Define: write the spec

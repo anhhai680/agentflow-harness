@@ -1,6 +1,6 @@
 ---
 name: agentflow-verify
-description: Use when a step asks you to prove the work is done: read the gates' fresh output, run only what no gate covers, debug what fails, and claim nothing without evidence.
+description: "Use when a step asks you to prove the work is done: read the gates' fresh output, run only what no gate covers, debug what fails, and claim nothing without evidence."
 ---
 
 # Verify: prove it works
