@@ -335,7 +335,7 @@ def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metri
     waiting = state.get("waiting")
     step = state.get("step")
     issue = (state.get("params") or {}).get("issue")
-    slot = state.get("slot")
+    slot = state.get("slot") if state.get("status") not in TERMINAL else None  # an ended run gave its number back
     return {
         "run_id": run.id,
         "lane": state.get("pipeline"),

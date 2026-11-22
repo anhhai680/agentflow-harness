@@ -342,10 +342,10 @@ def _slot_cfg(qrepo, count: int, human_slot: int):
     return qrepo.configure({"slots": {"count": count}, "queue": {"human_slot": human_slot}})
 
 
-def test_the_queue_leaves_the_human_slot_free(qrepo, monkeypatch):
+def test_the_queue_leaves_the_human_slot_free(qrepo):
     cfg = _slot_cfg(qrepo, 3, 1)
     go = SlotStarter(qrepo, cfg)
-    # four ready modules: platform alone is ready first, then its dependents; make them all roots
+    # MAP_FLAT: four modules with no dependencies, so all four are ready at once
     write(qrepo.root, "docs/specs/CAPABILITY-MAP.md", MAP_FLAT)
     commit_all(qrepo.root)
     messages: list[str] = []

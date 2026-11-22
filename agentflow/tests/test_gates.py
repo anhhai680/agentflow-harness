@@ -364,6 +364,18 @@ def test_a_free_resource_waits_for_nothing(tmp_git, tmp_path):
     assert r2.waited_s == 0.0
 
 
+@pytest.mark.parametrize("name", ["../x", "a/b", "", "x" * 41])
+def test_a_resource_name_that_is_no_label_is_refused_before_any_open(tmp_git, name):
+    from agentflow import pack
+    from agentflow.gates import resource_lock
+
+    root = pack.state_dir(tmp_git)
+    with pytest.raises(ValueError, match="resource name"):
+        with resource_lock(tmp_git, name):
+            pass
+    assert not (root / "x.lock").exists() and not (root / "locks").exists()  # nothing opened, nothing made
+
+
 def test_a_gate_skipped_at_its_tier_takes_no_lock(tmp_git, tmp_path):
     import threading
 

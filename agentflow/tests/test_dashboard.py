@@ -2276,6 +2276,15 @@ def test_a_card_lists_its_parked_items_and_its_slot(dash):
     assert card["parked"][1]["summary"] == "stuck"
 
 
+@pytest.mark.parametrize("ending", [("run_finished", {}), ("run_failed", {"reason": "x"}), ("run_cancelled", {})])
+def test_a_finished_card_shows_no_slot(dash, ending):
+    run = dash.flow.new_run({"module": "crm"})
+    run.emit("phase_started", phase="build")
+    run.emit("slot_acquired", slot=1, count=2)
+    run.emit(ending[0], **ending[1])
+    assert card_of(dash)["slot"] is None  # the number went back when the run ended
+
+
 def test_a_card_with_no_slot_and_nothing_parked_says_so(dash):
     dash.flow.new_run({"module": "crm"}).emit("phase_started", phase="build")
     card = card_of(dash)

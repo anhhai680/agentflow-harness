@@ -64,7 +64,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from agentflow import pack, run_env, safeio
-from agentflow.config import Config, Gate, unquoted_paths_word
+from agentflow.config import GATE_LABEL, Config, Gate, unquoted_paths_word
 from agentflow.guards import HARDENED, path_matches, snapshot
 
 if TYPE_CHECKING:
@@ -367,12 +367,17 @@ def resource_lock(cwd: Path, name: str, live: _Live | None = None) -> Iterator[f
     """Hold the repository's lock for the resource `name` (a file lock in the state dir's `locks/`, so it holds across
     runs and processes, and a crashed holder frees it) and yield the seconds spent waiting for it: `0.0` when the first
     try got it. Raises `_Left` once `live` is closed, whether it was still waiting or just got the lock, so a run that
-    leaves never starts the gate's command."""
+    leaves never starts the gate's command. A `name` that is not a label (`GATE_LABEL`, as `validate` checks) raises
+    `ValueError` before anything is made or opened, so it never names a path outside `locks/`."""
+    if not isinstance(name, str) or GATE_LABEL.fullmatch(name) is None:
+        raise ValueError(f"resource name {name!r} is not a label: letters, digits, '_', '.' or '-', 1 to 40 of them")
     root = safeio.ensure_dir(pack.state_dir(cwd))
     locks = root / "locks"
-    locks.mkdir(mode=0o700, exist_ok=True)
+    locks.mkdir(mode=0o700, exist_ok=True)  # the mode, for a new one; `ensure_dir` refuses a symlink there
     safeio.ensure_dir(locks)
-    fd = os.open(locks / f"{name}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    # O_NONBLOCK: a FIFO planted at the path must not hang the open (it means nothing for a regular file, and the
+    # flock below still polls)
+    fd = os.open(locks / f"{name}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         waited_from: float | None = None
         while True:
