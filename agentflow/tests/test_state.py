@@ -419,9 +419,11 @@ def test_a_rejection_of_the_waiting_phase_drops_speculative_stops(run):
     start_speculating(run)
     run.emit("hitl_raised", kind="needs_human", key="plan/plan", phase="plan", summary="q", questions=[], speculative=True)
     assert [w["key"] for w in run.state["waiting_queue"]] == ["plan/plan"]
+    assert run.state["steps"]["plan/plan"]["status"] == "waiting_human"
     run.emit("phase_rejected", phase="define", round=1, note="more", by="me")
     assert run.state["waiting"] is None and run.state["waiting_queue"] == []
     assert run.state["status"] == "refining" and run.state["refine"]["phase"] == "define"
+    assert (run.state["steps"]["plan/plan"]["status"], run.state["steps"]["plan/plan"]["session_id"]) == ("pending", None)
 
 
 def test_a_rejection_keeps_the_queued_stops_that_are_not_speculative(run):

@@ -842,6 +842,11 @@ def _on_phase_rejected(state: dict, ev: dict) -> None:
     if _approval_pending(state) and state["waiting"].get("phase") != phase:
         return  # another phase's round (speculation): the pending approval, its queue and its status stay
     # the waiting phase itself is sent back: the stops queued from its speculated phase no longer apply
+    for wait in [w for w in state["waiting_queue"] if w.get("speculative")]:
+        step = state["steps"].get(wait.get("key"))
+        if step is not None and step["status"] == "waiting_human":  # it starts afresh, not as a session resumed on a question nobody answered
+            step["status"] = "pending"
+            step["session_id"] = None
     state["waiting_queue"] = [w for w in state["waiting_queue"] if not w.get("speculative")]
     state["waiting"] = None
     if state["status"] not in TERMINAL:

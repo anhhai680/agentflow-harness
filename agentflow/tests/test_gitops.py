@@ -1482,3 +1482,11 @@ def test_commit_paths_lists_what_the_commits_changed_and_drops_what_is_not_a_com
     assert gitops.diff_stat(repo, spec, ["plan dir/plan.md", "a.md"]) == ""
     assert "spec.md" not in gitops.diff_stat(repo, spec) and "plan dir/plan.md" in gitops.diff_stat(repo, spec)
     assert gitops.excluding([]) == []
+
+
+def test_uncommitted_paths_lists_each_file_of_a_new_folder(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "a.md", "a\n")
+    _commit(repo)
+    _write(repo, "docs/plans/p.md", "p\n")  # a folder git has never seen: listed file by file, never as `docs/`
+    assert gitops.uncommitted_paths(repo) == ["docs/plans/p.md"]

@@ -618,6 +618,9 @@ def test_a_rejection_drops_the_walked_phase_s_uncommitted_output(flow):  # Rulin
     assert go(flow, run) == "awaiting_approval"
     worktree = Path(run.state["worktree"])
     assert (worktree / plan_path(flow)).exists() and not [e for e in events(run, "step_committed") if e["key"] == PLAN]
+    base = run.state["base_sha"]
+    tracked = run_git(worktree, "ls-tree", "-r", "--name-only", base).splitlines()
+    assert not [p for p in tracked if p.startswith("docs/plans/")]  # the plan's folder is new: wholly untracked
     reject(run, "define", "me", "Thêm rollback")
     go(flow, run)
     sha = [e["sha"] for e in events(run, "step_committed") if e["key"] == DRAFT][-1]
@@ -646,3 +649,21 @@ def test_a_new_basis_ends_the_open_record_it_replaces(flow, monkeypatch):  # Rul
     assert [(e["type"], e.get("outcome")) for e in log[:3]] == [
         ("speculation_started", None), ("speculation_ended", "stopped"), ("speculation_started", None)]
     assert len(replans(run)) == 1
+
+
+def test_a_dropped_speculative_question_is_asked_afresh_after_the_approval(flow, notices):  # Ruling Q
+    asks = {"result": {"status": "needs_human", "summary": "cần quyết định", "questions": [BOUNDARY]}}
+    run = begin(flow, {**acts(flow, asks, asks), DRAFT: [DRAFTED, done("giữ nguyên")]}, to=None)
+    assert go(flow, run) == "awaiting_approval"
+    assert [(w["key"], w.get("speculative")) for w in run.state["waiting_queue"]] == [(PLAN, True)]
+    reject(run, "define", "me", "Xem lại")
+    assert run.state["waiting_queue"] == []
+    assert (run.state["steps"][PLAN]["status"], run.state["steps"][PLAN]["session_id"]) == ("pending", None)
+    assert go(flow, run) == "awaiting_approval" and not replans(run)  # the spec stayed as it was
+    approve(run, "define", by="me")
+    assert go(flow, run) == "waiting_human"
+    first, second = [c for c in flow.calls() if c["step"] == PLAN]
+    assert "--resume" not in second["argv"] and "Carry on where you left off" not in second["argv"][-1]
+    wait = run.state["waiting"]
+    assert (wait["key"], wait.get("speculative")) == (PLAN, None)  # a real stop, asked again
+    assert len([n for n in notices if "cần quyết định" in n]) == 1
