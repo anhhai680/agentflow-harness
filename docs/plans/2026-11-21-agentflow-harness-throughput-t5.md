@@ -100,6 +100,10 @@ Out of scope: Codex waves (with `agents.codex` every task runs alone); slots and
   - If `parent_ids=no`, drop `cost_usd` from Task 5 and say so in its commit message.
   - With `effort_field=yes`, nothing changes in T5. Note it for a later slice: the same-model rule stays.
 
+  Result (2026-11-22, `claude-opus-5-5`): concurrent=yes, parent_ids=yes, effort_field=no.
+  - Both `Agent` tool uses came in one assistant message, which the CLI streams as two lines with the same message id. Both `date` values are `1795313458`, and `real` is 37.2 s: one 20 s sleep, since both ran at once, plus CLI start-up and the model turns. That is over the plan's 35 s line, but the equal timestamps settle it.
+  - The init event lists tool names only. The `Agent` input carried `description`, `prompt`, `subagent_type` and `run_in_background` (false), and no effort field.
+
 ---
 
 ### Task 1: `**Parallel group:**` in plans
