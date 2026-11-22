@@ -286,6 +286,7 @@ from agentflow.gates import run_gates
 shared, wt, with_resource = Path(sys.argv[3]), Path(sys.argv[4]), sys.argv[5] == "1"
 script = f"mkdir {shared}/db.lock || exit 1; sleep 0.5; rmdir {shared}/db.lock"
 cfg = cfg_with({"g": Gate("g", script, resource="db" if with_resource else None)})
+(shared / f"ready-{wt.name}").write_text("")
 while not (shared / "go").exists():
     time.sleep(0.01)
 (r,) = run_gates(cfg, ["g"], wt, shared / ("logs-" + wt.name))
@@ -311,7 +312,10 @@ def _two_processes(tmp_git, tmp_path, with_resource: bool) -> list[dict]:
     tests = str(Path(__file__).resolve().parent)
     kids = [subprocess.Popen([sys.executable, "-c", _CHILD, root, tests, str(shared), str(wt), "1" if with_resource else "0"],
                              stdout=subprocess.PIPE, text=True) for wt in trees]
-    time.sleep(1.0)  # both are polling for `go` by now
+    deadline = time.monotonic() + 30
+    while not all((shared / f"ready-{wt.name}").exists() for wt in trees):  # both children are up and polling for `go`
+        assert time.monotonic() < deadline, "a child never got ready"
+        time.sleep(0.01)
     (shared / "go").write_text("", encoding="utf-8")
     outs = [kid.communicate(timeout=60)[0] for kid in kids]
     assert [kid.returncode for kid in kids] == [0, 0], outs
@@ -429,8 +433,58 @@ def test_a_gate_waiting_on_a_resource_stops_when_the_run_leaves(tmp_git, tmp_pat
     finally:
         release.set()
         thread.join()
-    assert returned - left[0] < 0.2 * 5
+    assert returned - left[0] < gates.RESOURCE_POLL_S * 5
     assert not (tmp_git / "a.ran").exists()
+
+
+def test_a_gate_that_gets_its_resource_after_the_run_left_never_starts(tmp_git, tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from agentflow import gates
+
+    monkeypatch.setattr(gates, "RESOURCE_POLL_S", 0.3)
+    held, release, polled = threading.Event(), threading.Event(), threading.Event()
+    real_flock = gates.fcntl.flock
+
+    def noticing(fd, op):
+        if threading.current_thread().name.startswith("gates"):
+            polled.set()
+        return real_flock(fd, op)
+
+    monkeypatch.setattr(gates.fcntl, "flock", noticing)
+    real_kill_all = gates._Live.kill_all
+
+    def kill_all_then_release(self):
+        real_kill_all(self)
+        release.set()  # the other run lets go of the resource right after this run left
+
+    monkeypatch.setattr(gates._Live, "kill_all", kill_all_then_release)
+
+    def interrupted(futures):
+        assert polled.wait(10), "the gate never polled"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gates, "_collect", interrupted)
+
+    def hold():
+        with gates.resource_lock(tmp_git, "db"):
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert held.wait(5)
+    cfg = cfg_with({"a": Gate("a", "touch a.ran", group="x", resource="db"), "b": Gate("b", "true", group="y")})
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_gates(cfg, ["a", "b"], tmp_git, tmp_path / "logs")
+    finally:
+        release.set()
+        thread.join()
+    time.sleep(0.1)
+    assert not (tmp_git / "a.ran").exists()
+    assert not (tmp_path / "logs" / "a.log").exists()
 
 
 def test_a_waited_gate_records_its_wait():

@@ -366,7 +366,8 @@ class _Left(Exception):
 def resource_lock(cwd: Path, name: str, live: _Live | None = None) -> Iterator[float]:
     """Hold the repository's lock for the resource `name` (a file lock in the state dir's `locks/`, so it holds across
     runs and processes, and a crashed holder frees it) and yield the seconds spent waiting for it: `0.0` when the first
-    try got it. Raises `_Left` while waiting once `live` is closed, so a run that leaves does not run the gate."""
+    try got it. Raises `_Left` once `live` is closed, whether it was still waiting or just got the lock, so a run that
+    leaves never starts the gate's command."""
     root = safeio.ensure_dir(pack.state_dir(cwd))
     locks = root / "locks"
     locks.mkdir(mode=0o700, exist_ok=True)
@@ -384,6 +385,8 @@ def resource_lock(cwd: Path, name: str, live: _Live | None = None) -> Iterator[f
                 if waited_from is None:
                     waited_from = time.monotonic()
                 time.sleep(RESOURCE_POLL_S)
+        if live is not None and live.closed:  # the run left while this waited, and the lock came free first
+            raise _Left
         yield 0.0 if waited_from is None else time.monotonic() - waited_from
     finally:
         os.close(fd)  # closing the descriptor drops the lock
