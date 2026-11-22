@@ -464,6 +464,7 @@ def _on_subagent_started(state: dict, ev: dict) -> None:
         row["subagents"].append({
             "tool_use_id": ev.get("tool_use_id"), "subagent_type": ev.get("subagent_type"),
             "model": ev.get("model"), "description": ev.get("description"), "done": False, "ok": None,
+            "background": ev.get("background"),  # True: started with `run_in_background` (None: an older engine's event)
         })
 
 

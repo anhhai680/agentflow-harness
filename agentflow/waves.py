@@ -348,8 +348,9 @@ def dispatch_violations(subagents: Sequence[Mapping], members: Collection[int], 
     `Task <n>:` or `Review Task <n>:`), runs a model that is neither `inherit`, missing, nor the wave's own, is of an
     agent type other than `general-purpose` (a custom type with no `model` runs its own model, which the stream still
     calls `inherit`), whose call came back as an error (`ok` False: a refused call looks like a good one otherwise), or
-    that had not finished when the session ended (`done` False). A row with no `ok` or `done` (an older engine's) is not
-    counted against it."""
+    that had not finished when the session ended (`done` False), or that was started in the background
+    (`background` True: its call returns before it finishes). A row with no `ok`, `done` or `background` (an older
+    engine's) is not counted against it."""
     lines: list[str] = []
     for entry in subagents:
         description = entry.get("description")
@@ -366,6 +367,8 @@ def dispatch_violations(subagents: Sequence[Mapping], members: Collection[int], 
             lines.append(f"sub-agent call failed: {description!r}")
         if entry.get("done") is False:
             lines.append(f"sub-agent did not finish: {description!r}")
+        if entry.get("background") is True:
+            lines.append(f"sub-agent was started in the background: {description!r}")
     return lines
 
 

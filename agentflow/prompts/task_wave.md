@@ -5,7 +5,8 @@ You run a wave: {wave_title} of the plan, built at the same time by one sub-agen
 1. In **one message**, call the `Task` tool once for each task card below, all in that one message, so the sub-agents run at the same time. For each card:
    - `description`: `Task <n>: <title>`, exactly as the card's line below gives it;
    - `prompt`: "Read `<card path>` and follow it.", with the card's path from its line below;
-   - leave `model` out, and `subagent_type` too: every sub-agent runs on your model.
+   - leave `model` out, and `subagent_type` too: every sub-agent runs on your model;
+   - leave `run_in_background` out, or set it `false`: every sub-agent must finish inside its call.
 2. Dispatch nothing else: no task that has no card here, no second sub-agent for a card, no reviewer.
 3. Wait until every sub-agent has finished. Each one ends with a short report: `n`, `status` (`done`, `blocked` or `needs_human`), `summary`, `files` (the files it changed) and `tests_run`.
 4. Then write your result file with `status: done` and one `tasks` entry per card, copied from its sub-agent's report:

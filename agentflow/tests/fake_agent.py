@@ -9,10 +9,11 @@ step, system_prompt}` to the file named by `AGENTFLOW_FAKE_CALLS`; `system_promp
 
 Act keys: write {relpath: text}, result {...}, result_raw str, usage_pct [..], tool_calls
 [{name, input}], subagents [{subagent_type, model}], parallel_subagents [{description, model?, subagent_type?, write?:
-{path: text}, output_tokens?, error?, unfinished?}] (one `assistant` line holding every `Agent` call, then one `assistant` line per
+{path: text}, output_tokens?, error?, unfinished?, background?}] (one `assistant` line holding every `Agent` call, then one `assistant` line per
 sub-agent carrying its `parent_tool_use_id`, its usage (`output_tokens`, default 20, priced as `model_id`) and its
 `write`s applied, then one `user` line holding every result, an `is_error` one for `error: true`, as the CLI answers a
-call it refused, and none for an `unfinished: true` one: the sub-agents run concurrently), compact bool, git_commit msg, sleep s,
+call it refused, and none for an `unfinished: true` one; `background: true` puts `run_in_background: true` in the
+call's input: the sub-agents run concurrently), compact bool, git_commit msg, sleep s,
 exit n, no_init bool, final_text str, cost float (this call's, default 0.01; the result event reports
 the session's total, as Claude does), permission_denials [{tool_name, tool_input}] (copied into the
 result event), rate_limit {...} (sent as a `rate_limit_event`'s `rate_limit_info`), result_error bool
@@ -353,7 +354,8 @@ def main() -> int:
         emit({"type": "assistant", "message": {"role": "assistant", "model": model, "usage": usage(2000), "content": [
             {"type": "tool_use", "id": call_id, "name": "Agent", "input": {
                 "description": sub.get("description", "fake subagent"), "prompt": "fake",
-                "subagent_type": sub.get("subagent_type", "general-purpose"), "model": sub.get("model")}}
+                "subagent_type": sub.get("subagent_type", "general-purpose"), "model": sub.get("model"),
+                **({"run_in_background": True} if sub.get("background") else {})}}
             for call_id, sub in zip(ids, parallel)]}, "parent_tool_use_id": None, **base})
         for call_id, sub in zip(ids, parallel):
             for relpath, text in sub.get("write", {}).items():

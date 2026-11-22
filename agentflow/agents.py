@@ -618,6 +618,7 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
                     "model": tool_input.get("model") or "inherit",
                     "tool_use_id": block.get("id"),
                     "description": subagent_description(tool_input),
+                    "background": bool(tool_input.get("run_in_background")),  # fail closed: any truthy value counts
                 }
                 acc.subagents.append(sub)
                 acc.open_subagents[str(block.get("id"))] = sub
@@ -628,6 +629,7 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
                     "model": sub["model"],
                     "tool_use_id": sub["tool_use_id"],
                     "description": sub["description"],
+                    "background": sub["background"],
                 }))
         usage = message.get("usage")
         if isinstance(usage, dict):
@@ -672,6 +674,7 @@ def parse_claude_line(line: str, acc: StreamAccumulator) -> list[tuple[str, dict
                     "model": sub["model"],
                     "tool_use_id": sub["tool_use_id"],
                     "description": sub["description"],
+                    "background": sub["background"],
                     "cost_usd": subagent_cost(acc, str(sub["tool_use_id"])),
                     "ok": not bool(block.get("is_error")),  # a call the CLI refused comes back as an error result
                 }))

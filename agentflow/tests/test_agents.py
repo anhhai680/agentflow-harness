@@ -623,6 +623,7 @@ def test_parse_fixture():
         "model": "inherit",
         "tool_use_id": "toolu_02",
         "description": "Check layout",
+        "background": False,
     }
 
 
@@ -1595,6 +1596,17 @@ def test_a_subagent_that_errored_is_not_ok(cfg):
         {"type": "tool_result", "tool_use_id": "t2", "content": "Agent type 'x' not found", "is_error": True}]}})
     done = [p for n, p in parse_claude_line(line, acc) if n == "subagent_finished"]
     assert [(p["description"], p["ok"]) for p in done] == [("Task 2: a", True), ("Task 3: b", False)]
+
+
+@pytest.mark.parametrize("extra, background", [({}, False), ({"run_in_background": False}, False),
+                                               ({"run_in_background": True}, True),
+                                               ({"run_in_background": "yes"}, True)])  # fail closed: any truthy value
+def test_a_subagent_started_in_the_background_is_marked_on_both_events(cfg, extra, background):
+    acc = _acc(cfg)
+    started = [p for n, p in parse_claude_line(_call_line(("t1", {"description": "Task 2: a", **extra})), acc)
+               if n == "subagent_started"]
+    done = [p for n, p in parse_claude_line(_finish_line("t1"), acc) if n == "subagent_finished"]
+    assert [p["background"] for p in started] == [background] and [p["background"] for p in done] == [background]
 
 
 def test_a_subagent_description_is_cut_and_a_missing_or_odd_one_is_empty(cfg):

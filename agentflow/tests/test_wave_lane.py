@@ -678,6 +678,7 @@ def test_a_wave_session_stop_dissolves_it_and_members_run_alone(waves, git, noti
     {"description": "Task 3: Third thing", "model": "opus"},  # another model than the wave's
     {"description": "Task 3: Third thing", "subagent_type": "Explore"},  # a custom type runs its own model
     {"description": "Task 3: Third thing", "error": True},  # a refused dispatch looks like a good one otherwise
+    {"description": "Task 3: Third thing", "background": True},  # its call returns before the sub-agent has finished
 ])
 def test_a_wrong_dispatch_dissolves_the_wave(waves, git, notified, wrong):  # Review Focus 4
     run = begin_build(waves, wave_plan())
@@ -1055,7 +1056,8 @@ def test_a_stray_left_by_the_wave_fix_dissolves_the_wave(waves, git):
 
 
 @pytest.mark.parametrize("wrong", [{"description": "Review Task 9: x"},
-                                   {"description": "Review Task 3: Third thing", "subagent_type": "Explore"}])
+                                   {"description": "Review Task 3: Third thing", "subagent_type": "Explore"},
+                                   {"description": "Review Task 3: Third thing", "background": True}])
 def test_a_wrong_review_dispatch_drops_the_review_wave(waves, git, wrong):
     run = begin_build(waves, wave_plan())
     act = review_wave_act()

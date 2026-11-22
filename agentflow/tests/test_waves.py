@@ -521,6 +521,13 @@ def test_dispatch_a_subagent_that_did_not_finish_is_a_violation():
     assert dispatch_violations(entries, {2, 3}, "sonnet") == ["sub-agent did not finish: 'Task 3: x'"]
 
 
+def test_dispatch_a_subagent_started_in_the_background_is_a_violation():
+    # its call returns before it finishes, so `done` and `ok` say nothing about its work
+    entries = [{"description": "Task 2: x", "background": False}, {"description": "Task 3: x", "background": True},
+               {"description": "Task 3: y"}]  # no `background` recorded (an older engine's row): not counted against it
+    assert dispatch_violations(entries, {2, 3}, "sonnet") == ["sub-agent was started in the background: 'Task 3: x'"]
+
+
 def test_dispatch_count_wants_exactly_one_per_member():
     one_each = [{"description": "Task 2: a"}, {"description": "Task 3: b"}]
     assert dispatch_count_violations(one_each, {2, 3}, review=False) == []
