@@ -51,7 +51,7 @@ _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and p
     "version", "engine", "gates", "gates_confirmed", "gate_sets", "guardrails", "conditions", "overlays", "project",
     "phase_approval", "record_step", "resolve_step", "retro_step", "paths", "defaults.env", "defaults.env_inherit", "context.autocompact_env", "context.progress_file",
     "hitl.notify", "dashboard.host", "work_source", "skills", "starter", "policy",
-    "route.lanes", "route.profiles",
+    "route.lanes", "route.profiles", "autonomy.approvals", "autonomy.ramp_samples",
 )
 PROTECTED = (
     *_PROTECTED_KEYS,
@@ -200,6 +200,7 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
          {"kind": "list", "options": list(QUESTION_KINDS)}),
         (("autonomy", "revert_forbidden"), "Forbidden-path reverts per step", _INT),
         (("autonomy", "resolve_kinds"), "Resolver sessions per stop kind", {"kind": "map", "value_kind": "int", "min": 1}),
+        (("autonomy", "speculate"), "Phases run while the approval before them waits", {"kind": "list"}),
     ]),
     ("Route", "How much ceremony a run's route gets, sized at its start.", [
         (("route", "mode"), "Route profiles", {"kind": "enum", "options": list(ROUTE_MODES)}),

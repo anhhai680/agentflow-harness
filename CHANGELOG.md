@@ -7,6 +7,9 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+- `autonomy.speculate` (phases that run while the approval before them waits), `autonomy.approvals` (the `off`, `observe` or `auto` ramp for each phase approval, `goal` never `auto`) and `autonomy.ramp_samples` (3 to 50, default 5) are config keys with `validate` checks; `speculate` is a Settings form field, and the other two are protected. They are off by default and do nothing yet.
+
 ## [3.3] - 2026-11-22
 
 ### Fixed
