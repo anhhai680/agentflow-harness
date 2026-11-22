@@ -38,7 +38,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
 from typing import TextIO
@@ -516,6 +516,15 @@ class _Loop:
                     return outcome
             if self.held_back(name):
                 return "awaiting_approval"
+            # imported here: approval_ramp reads the scorecard, which reads `retro`, which imports this module
+            from agentflow import approval_ramp
+
+            decision = approval_ramp.decide(self.cfg, self.run, name, executor.ctx, datetime.now(UTC))
+            if decision is not None and decision["auto"]:  # the ramp approves it: no person is asked
+                self.run.emit("phase_approved", by=AUTO_BY, phase=name, sha=head(self.worktree),
+                              ramp={"samples": decision["samples"], "profile": decision["profile"]})
+                self.hand_off(names, index, executor)
+                return None
             raise_phase_approval(self.cfg, self.run, name)
             return self.speculate(names, index, executor)
         findings = phase_findings(self.cfg, self.run, name)

@@ -35,6 +35,7 @@ Status = Literal["satisfied", "waived", "missing", "not_applicable"]
 
 HUMAN_OVERRIDE = "human override"
 ON_BASE = "on base"
+RAMP_APPROVAL = "approval ramp"
 GREEN, RED = "green", "red"
 
 
@@ -166,6 +167,10 @@ def _approval(events: list[dict], phase: str) -> _Item:
                       and e.get("by") != AUTO_BY])
     if approved is not None:
         return _Item(True, [approved["seq"]])
+    ramped = _last([e for e in events if e.get("type") == "phase_approved" and e.get("phase") == phase
+                    and e.get("by") == AUTO_BY and e.get("ramp")])  # the runner approved it on the ramp (`approval_ramp`)
+    if ramped is not None:
+        return _Item(True, [ramped["seq"]], RAMP_APPROVAL)
     skipped = _last([e for e in events if e.get("type") == "phase_skipped" and e.get("phase") == phase
                      and e.get("via") == "skip_if"  # not mark-done, not "all steps skipped"; older logs have no `via`
                      and e.get("decided_by") != "agent"])  # a model's guess is no proof the artifact is on base

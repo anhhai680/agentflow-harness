@@ -180,6 +180,31 @@ def test_runner_approval_is_not_approval(cfg):
     assert finding.status == "satisfied" and finding.evidence == [2]
 
 
+def test_a_ramp_approval_is_evidence_for_approval(cfg):
+    planned = ob("plan_approved", "approval:plan")
+    ramped = [ev(2, "phase_approved", phase="plan", by="runner", ramp={"samples": 5, "profile": "S"})]
+    finding = evaluate(cfg, ramped, [planned], "t")[0]
+    assert finding.status == "satisfied" and finding.evidence == [2] and finding.note == "approval ramp"
+    # a person's approval is still the evidence when there is one
+    both = [*ramped, ev(3, "phase_approved", phase="plan", by="me")]
+    finding = evaluate(cfg, both, [planned], "t")[0]
+    assert finding.status == "satisfied" and finding.evidence == [3] and finding.note == ""
+    # the ramp never overrides a step's blocking findings: that stays a person's
+    reviewed = ob("reviewed", "step:plan")
+    flagged = [finished(1, "plan/plan"),
+               ev(2, "step_findings", key="plan/plan", findings=[{"severity": "high", "text": "x"}]),
+               ev(3, "phase_approved", phase="plan", by="runner", ramp={"samples": 5, "profile": "S"})]
+    assert evaluate(cfg, flagged, [reviewed], "t")[0].status == "missing"
+
+
+def test_a_plain_runner_approval_is_not(cfg):
+    planned = ob("plan_approved", "approval:plan")
+    for event in (ev(2, "phase_approved", phase="plan", by="runner"),
+                  ev(2, "phase_approved", phase="plan", by="runner", ramp=None),
+                  ev(2, "phase_approved", phase="other", by="runner", ramp={"samples": 5, "profile": "S"})):
+        assert evaluate(cfg, [event], [planned], "t")[0].status == "missing"
+
+
 def test_skip_if_skip_is_on_base(cfg):
     planned = ob("plan_approved", "approval:plan")
     skipped = evaluate(cfg, [ev(2, "phase_skipped", phase="plan", reason="plan exists on origin/main", via="skip_if")], [planned], "t")[0]

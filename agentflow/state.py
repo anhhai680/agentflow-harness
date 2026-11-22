@@ -1003,6 +1003,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "phase_rejected": ("phase",),
     "speculation_started": ("phase", "after", "basis"),
     "speculation_ended": ("phase", "outcome"),
+    "would_auto_approve": ("phase", "verdict"),
     "step_started": ("key",),
     "step_finished": ("key",),
     "step_skipped": (("key", "step"),),
