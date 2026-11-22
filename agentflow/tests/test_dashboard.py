@@ -2259,6 +2259,29 @@ def test_a_card_names_its_issue_and_its_step_in_words(dash):
     assert card["step_label"] == step_title(card["step"]) and card["issue"] is None
 
 
+def test_a_card_lists_its_parked_items_and_its_slot(dash):
+    run = dash.flow.new_run({"module": "crm"})
+    run.emit("phase_started", phase="build")
+    run.emit("slot_acquired", slot=1, count=2)
+    time.sleep(0.01)  # `since` is a millisecond timestamp, and a tie would fall back to the key
+    run.emit("step_parked", key="build/build/task-3/implement", phase="build", kind="needs_human", summary="x" * 300)
+    time.sleep(0.01)
+    run.emit("step_parked", key="build/build/task-2/implement", phase="build", kind="blocked", summary="stuck")
+    card = card_of(dash)
+    assert card["slot"] == 1
+    assert [(p["key"], p["kind"]) for p in card["parked"]] == [
+        ("build/build/task-3/implement", "needs_human"), ("build/build/task-2/implement", "blocked")]
+    first = card["parked"][0]
+    assert first["label"] == step_title(first["key"]) and first["since"] and len(first["summary"]) == 200
+    assert card["parked"][1]["summary"] == "stuck"
+
+
+def test_a_card_with_no_slot_and_nothing_parked_says_so(dash):
+    dash.flow.new_run({"module": "crm"}).emit("phase_started", phase="build")
+    card = card_of(dash)
+    assert card["slot"] is None and card["parked"] == []
+
+
 def test_the_card_draws_its_strip_and_marker():
     board = (UI_DIR / "board.js").read_text(encoding="utf-8")
     for needle in ("card.strip", "strip-", "needs you", "step_label"):
