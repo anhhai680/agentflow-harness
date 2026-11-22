@@ -17,7 +17,7 @@ other run holds keeps it, and writes nothing. A resumed run whose number was tak
 (`slot_acquired` carries `previous`). With no free number, `SlotsFull` names every holder. `queue_hold` is the
 reason `agentflow queue` waits, so it leaves `queue.human_slot` numbers free for a run started by hand.
 
-`render` returns a copy of the config with the token filled in. It is applied once, to the run's own copy, and its
+`render` returns a copy of the config with the token filled in (the config itself when it holds no token). It is applied once, to the run's own copy, and its
 output is never rendered again (`gates` turns `{{` into `{` when it fills `{paths}`, and `SLOT_TOKEN` leaves a shell
 `${slot}` and a doubled `{{slot}}` alone).
 """
@@ -49,9 +49,21 @@ def _fill(text: str, slot: int) -> str:
     return SLOT_TOKEN.sub(str(slot), text)
 
 
+def _has_token(cfg: Config) -> bool:
+    texts = list(cfg.defaults.env.values())
+    for gate in cfg.gates.values():
+        texts.append(gate.run)
+        if gate.affected is not None:
+            texts.append(gate.affected.run)
+    return any(SLOT_TOKEN.search(text) for text in texts)
+
+
 def render(cfg: Config, slot: int) -> Config:
     """A copy of `cfg` with `{slot}` replaced by `slot` in `defaults.env` values, each gate's `run` and each
-    gate's `affected.run`. Nothing else changes and `cfg` is not mutated."""
+    gate's `affected.run`. Nothing else changes and `cfg` is not mutated. A config with no token anywhere is
+    returned as it is (the same object): there is nothing to fill in."""
+    if not _has_token(cfg):
+        return cfg
     env = {name: _fill(value, slot) for name, value in cfg.defaults.env.items()}
     gates = {}
     for name, gate in cfg.gates.items():

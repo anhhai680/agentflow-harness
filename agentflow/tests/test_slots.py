@@ -199,6 +199,17 @@ def test_render_replaces_the_token_in_env_and_gate_commands(flow_repo):
     assert out.gates["ok"] == cfg.gates["ok"]  # a gate without the token is unchanged
 
 
+def test_render_returns_the_same_config_when_it_holds_no_token(flow_repo):
+    cfg = flow_repo.configure()
+    assert slots.render(cfg, 1) is cfg
+
+    def edit(data: dict) -> None:
+        data["gates"]["shell"] = {"run": "echo ${slot} {{slot}}"}  # neither is the token
+
+    cfg = flow_repo.configure(edit=edit)
+    assert slots.render(cfg, 1) is cfg
+
+
 def test_render_leaves_a_shell_dollar_brace_and_a_doubled_brace_alone(flow_repo):
     def edit(data: dict) -> None:
         data["gates"]["shell"] = {"run": "echo ${slot} {slot}"}
