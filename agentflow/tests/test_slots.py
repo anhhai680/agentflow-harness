@@ -420,16 +420,94 @@ def test_a_failure_taking_the_slot_does_not_leak_the_run_lock(flow_repo, monkeyp
     lock.release()
 
 
-def test_a_start_that_loses_the_slot_race_ends_failed_with_no_worktree(flow_repo, monkeypatch):
+def test_a_start_that_loses_the_slot_race_leaves_no_run(flow_repo, monkeypatch):
     piped(flow_repo, monkeypatch, 2)
     begin(flow_repo)
-    begin(flow_repo, {"module": "other"})
     trees, dirs = worktrees(flow_repo), run_dirs(flow_repo)
-    monkeypatch.setattr(pipeline.slots, "check_free", lambda cfg, repo: None)  # the quick look passes: acquire loses
-    with pytest.raises(slots.SlotsFull):
+    real, rival = pipeline.gather, []
+
+    def gather_then_lose(*args, **kwargs):  # the quick look passed; while this start reads its inputs, a rival
+        if not rival:  # takes the last slot
+            rival.append(None)
+            rival[0] = begin(flow_repo, {"module": "rival"})
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "gather", gather_then_lose)
+    with pytest.raises(slots.SlotsFull, match="all 2 slots are held"):
         begin(flow_repo, {"module": "third"})
-    (new,) = run_dirs(flow_repo) - dirs
-    lost = Run.load(flow_repo.root, new)
-    assert lost.state["status"] == "failed" and "slot" not in lost.state
-    assert [e["reason"] for e in flow_repo.events(lost, "run_failed")][0].startswith("SlotsFull: all 2 slots are held")
-    assert worktrees(flow_repo) == trees
+    assert rival[0].state["slot"] == 1
+    assert run_dirs(flow_repo) == dirs | {rival[0].id}  # the check, the run and its number are one locked step
+    assert len(worktrees(flow_repo).splitlines()) == len(trees.splitlines()) + 1
+
+
+# --------------------------------------------------------------------------- a run live before slots were on
+
+
+def test_a_run_live_before_slots_were_on_counts_as_holding_zero(flow_repo, monkeypatch):
+    from agentflow.state import RETRO_PIPELINE
+
+    piped(flow_repo, monkeypatch, 1)
+    a = begin(flow_repo)  # slots off: no number, but it renders `{slot}` as 0
+    assert "slot" not in a.state and a.state["worktree"]
+    retro = Run.create(flow_repo.cfg, flow_repo.root, RETRO_PIPELINE, {}, engine_pipeline=True)
+    retro.emit("run_updated", branch="retro", worktree=str(flow_repo.root), base_sha=flow_repo.head())
+    on = piped(flow_repo, monkeypatch, 3)
+    assert slots.held(on, flow_repo.root) == {0: a.id}  # the retro run renders no `{slot}`: it holds nothing
+    b = begin(flow_repo, {"module": "other"})
+    assert b.state["slot"] == 1
+    assert take(on, a) == 0  # 0 was its own all along: it keeps it, and now its state says so
+    (event,) = acquired(flow_repo, a)
+    assert event == {**event, "slot": 0, "count": 3} and "previous" not in event
+    assert take(on, a) == 0 and len(acquired(flow_repo, a)) == 1
+
+
+def test_a_run_from_before_slots_takes_the_lowest_free_number_when_zero_is_taken(flow_repo, monkeypatch):
+    piped(flow_repo, monkeypatch, 1)
+    a = begin(flow_repo)
+    on = piped(flow_repo, monkeypatch, 3)
+    x = new_run(flow_repo)
+    x.emit("slot_acquired", slot=0, count=3)  # another run already holds 0 (it took it before `a` was counted)
+    assert take(on, a) == 1
+    (event,) = acquired(flow_repo, a)
+    assert event["slot"] == 1 and "previous" not in event
+
+
+def live_before_slots(flow_repo, monkeypatch):
+    """A run started with slots off and stopped at a human wait, its runner (`_Loop`) still live."""
+    cfg = piped(flow_repo, monkeypatch, 1)
+    monkeypatch.setattr(pack, "pack_config", lambda repo: Path(cfg.path))
+    a = begin(flow_repo)
+    loop = pipeline._Loop(a, cfg, RunOptions(), slots.acquire(cfg, a))
+    assert loop.go() == "awaiting_approval"
+    assert "slot" not in a.state and set(ports(flow_repo)) == {"55430"}
+    return a, loop
+
+
+def test_turning_slots_on_under_a_live_run_never_shares_its_number(flow_repo, monkeypatch):
+    a, loop = live_before_slots(flow_repo, monkeypatch)
+    piped(flow_repo, monkeypatch, 2)
+    b = begin(flow_repo, {"module": "other"})
+    approve(a, "define", by="me")
+    calls = len(flow_repo.calls())
+    assert loop.go() == "awaiting_approval"
+    a_ports = ports(flow_repo)[calls:]
+    assert flow_repo.events(a, "config_reloaded") and a.state["slot"] == 0
+    calls = len(flow_repo.calls())
+    assert go(flow_repo, b) == "awaiting_approval"
+    b_ports = ports(flow_repo)[calls:]
+    assert b.state["slot"] == 1
+    assert a_ports and set(a_ports) == {"55430"} and b_ports and set(b_ports) == {"55431"}
+
+
+def test_a_live_run_finding_every_slot_taken_keeps_its_config(flow_repo, monkeypatch):
+    a, loop = live_before_slots(flow_repo, monkeypatch)
+    before = loop.cfg
+    piped(flow_repo, monkeypatch, 2)
+    for n in (0, 1):  # two runs took both numbers before `a` was counted
+        new_run(flow_repo, {"module": f"m{n}"}).emit("slot_acquired", slot=n, count=2)
+    approve(a, "define", by="me")
+    loop.reload()
+    (skipped,) = flow_repo.events(a, "config_reload_skipped")
+    assert "all 2 slots are held" in skipped["reason"]
+    assert loop.cfg is before and loop.slot == 0 and "slot" not in a.state
+    assert not flow_repo.events(a, "config_reloaded")

@@ -97,7 +97,7 @@ def _live_loop(pipe, monkeypatch):
 
     monkeypatch.setattr(pack, "pack_config", lambda repo: Path(pipe.cfg.path))  # the run's repo's own pack
     run = pipe.new_run()
-    return pipeline._Loop(run, pipe.cfg, RunOptions()), run
+    return pipeline._Loop(run, pipe.cfg, RunOptions(), 0), run
 
 
 def test_a_changed_user_file_between_phases_is_reloaded(pipe, monkeypatch):

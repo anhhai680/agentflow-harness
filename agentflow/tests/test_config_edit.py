@@ -503,7 +503,7 @@ def test_the_yaml_tab_may_send_the_whole_file(dash):
 def _loop(flow_repo, monkeypatch):
     monkeypatch.setattr(pack, "pack_config", lambda repo: Path(flow_repo.cfg.path))  # the run's repo's own pack
     run = flow_repo.new_run()
-    return pipeline._Loop(run, flow_repo.cfg, RunOptions()), run
+    return pipeline._Loop(run, flow_repo.cfg, RunOptions(), 0), run
 
 
 def _rewrite(path: Path, edit) -> None:
@@ -542,7 +542,7 @@ def test_a_live_runner_keeps_its_config_when_the_new_one_is_not_usable(flow_repo
 def test_a_runner_on_another_config_never_reloads_it(flow_repo, monkeypatch):
     monkeypatch.setattr(pack, "pack_config", lambda repo: PYTHON_CONFIG)
     run = flow_repo.new_run()
-    loop = pipeline._Loop(run, flow_repo.cfg, RunOptions())
+    loop = pipeline._Loop(run, flow_repo.cfg, RunOptions(), 0)
     _rewrite(Path(flow_repo.cfg.path), lambda d: d["defaults"].update(step_timeout_min=7))
     loop.reload()
     assert loop.cfg is flow_repo.cfg

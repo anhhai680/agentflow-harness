@@ -11,11 +11,17 @@ run's containers are still up on that number. A number at or above a lowered `sl
 holder is read from the runs' own state (`slot_acquired` reduces to `state["slot"]`), so a crash leaves nothing to
 clean up: a run that ends gives its number back by ending.
 
+A live run with no number (one that started while slots were off) renders `{slot}` as `0`, so once they are on it
+counts as holding `0` until it takes a number of its own at its next phase or resume. The retro run renders no
+`{slot}` and holds nothing.
+
 `acquire` takes the lowest free number under one file lock (`runs/slots.lock`) and records it with `slot_acquired`,
 so two runners starting at once never take the same number. A run that already holds a number below `count` that no
-other run holds keeps it, and writes nothing. A resumed run whose number was taken meanwhile takes another one
-(`slot_acquired` carries `previous`). With no free number, `SlotsFull` names every holder. `queue_hold` is the
-reason `agentflow queue` waits, so it leaves `queue.human_slot` numbers free for a run started by hand.
+other run holds keeps it, and writes nothing. A run whose number is lowered away takes another one (`slot_acquired`
+carries `previous`); one with no number takes `0` when no other run holds it, else the lowest free one. With no free
+number, `SlotsFull` names every holder. `starting` is the same lock held across a start: the check, the new run and
+its number, so a start that finds no free number creates nothing. `queue_hold` is the reason `agentflow queue` waits,
+so it leaves `queue.human_slot` numbers free for a run started by hand.
 
 `render` returns a copy of the config with the token filled in (the config itself when it holds no token). It is applied once, to the run's own copy, and its
 output is never rendered again (`gates` turns `{{` into `{` when it fills `{paths}`, and `SLOT_TOKEN` leaves a shell
@@ -27,12 +33,13 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 
+from agentflow import safeio
 from agentflow.config import SLOT_TOKEN, Config
-from agentflow.state import TERMINAL, Run, list_runs, runs_root
+from agentflow.state import ENGINE_PIPELINES, TERMINAL, Run, list_runs, runs_root
 
 LOCK_NAME = "slots.lock"
 
@@ -81,17 +88,23 @@ def slot_of(run: Run) -> int:
 
 
 def _holds(cfg: Config, run: Run) -> int | None:
-    slot = run.state.get("slot")
-    if run.state["status"] in TERMINAL or not isinstance(slot, int) or isinstance(slot, bool):
+    state = run.state
+    if state["status"] in TERMINAL or state.get("pipeline") in ENGINE_PIPELINES:
+        return None
+    if "slot" not in state:  # started while slots were off: once it has a worktree it renders `{slot}` as 0
+        return 0 if state.get("worktree") else None
+    slot = state["slot"]
+    if not isinstance(slot, int) or isinstance(slot, bool):
         return None
     return slot if 0 <= slot < cfg.slots.count else None
 
 
-def held(cfg: Config, repo: Path) -> dict[int, str]:
-    """Slot number to the id of the live run that holds it (the oldest, were two to claim one)."""
+def held(cfg: Config, repo: Path, exclude: str | None = None) -> dict[int, str]:
+    """Slot number to the id of the live run that holds it (the oldest, were two to claim one), leaving out the run
+    whose id is `exclude`."""
     out: dict[int, str] = {}
     for run in list_runs(repo):
-        slot = _holds(cfg, run)
+        slot = None if run.id == exclude else _holds(cfg, run)
         if slot is not None:
             out.setdefault(slot, run.id)
     return out
@@ -107,26 +120,48 @@ def _full(cfg: Config, taken: dict[int, str]) -> SlotsFull:
     return SlotsFull(f"all {cfg.slots.count} slots are held: {who}; cancel one of them or raise slots.count")
 
 
-def check_free(cfg: Config, repo: Path) -> None:
-    """Raise `SlotsFull` when slots are on and every one is held. Only a quick look: `acquire` decides."""
-    if not enabled(cfg):
-        return
+def _check(cfg: Config, repo: Path) -> None:
     taken = held(cfg, repo)
     if len(taken) >= cfg.slots.count:
         raise _full(cfg, taken)
 
 
+def check_free(cfg: Config, repo: Path) -> None:
+    """Raise `SlotsFull` when slots are on and every one is held. Only a quick look: `acquire` and `starting`
+    decide."""
+    if enabled(cfg):
+        _check(cfg, repo)
+
+
 @contextlib.contextmanager
 def _lock(repo: Path) -> Iterator[None]:
-    """The repository's slots lock: held while a run reads who holds what and records its own number."""
-    root = runs_root(repo)
-    root.mkdir(parents=True, exist_ok=True)
-    fd = os.open(root / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    """The repository's slots lock: held while a run reads who holds what and records its own number. It is a lock on
+    a descriptor of its own, so two holds conflict even in one process: nothing under it takes it again."""
+    root = safeio.ensure_dir(runs_root(repo))
+    # O_NONBLOCK: a FIFO planted at the path must not hang the open (it means nothing for a regular file, and the
+    # flock below still waits)
+    fd = os.open(root / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         os.close(fd)  # closing the descriptor drops the lock
+
+
+def _acquire(cfg: Config, run: Run) -> int:
+    """`acquire`'s work, with the slots lock already held by the caller."""
+    run.refresh()
+    taken = held(cfg, run.repo, exclude=run.id)
+    own = run.state.get("slot")
+    own = own if isinstance(own, int) and not isinstance(own, bool) else None
+    if own is not None and 0 <= own < cfg.slots.count and own not in taken:
+        return own
+    for n in range(cfg.slots.count):
+        if n not in taken:
+            extra = {"previous": own} if own is not None else {}
+            run.emit("slot_acquired", slot=n, count=cfg.slots.count, **extra)
+            return n
+    raise _full(cfg, taken)
 
 
 def acquire(cfg: Config, run: Run) -> int:
@@ -135,18 +170,21 @@ def acquire(cfg: Config, run: Run) -> int:
     if not enabled(cfg):
         return 0
     with _lock(run.repo):
-        run.refresh()
-        taken = {n: rid for n, rid in held(cfg, run.repo).items() if rid != run.id}
-        own = run.state.get("slot")
-        own = own if isinstance(own, int) and not isinstance(own, bool) else None
-        if own is not None and 0 <= own < cfg.slots.count and own not in taken:
-            return own
-        for n in range(cfg.slots.count):
-            if n not in taken:
-                extra = {"previous": own} if own is not None else {}
-                run.emit("slot_acquired", slot=n, count=cfg.slots.count, **extra)
-                return n
-        raise _full(cfg, taken)
+        return _acquire(cfg, run)
+
+
+@contextlib.contextmanager
+def starting(cfg: Config, repo: Path) -> Iterator[Callable[[Run], int]]:
+    """One hold of the slots lock across a start. Raises `SlotsFull`, before the caller creates anything, when every
+    number is held; else yields `take`, which gives the run the caller creates inside the hold its number, so no other
+    start can take that number between the check and the run. With slots off there is no lock, and `take` returns
+    `0` and writes nothing."""
+    if not enabled(cfg):
+        yield lambda run: 0
+        return
+    with _lock(repo):
+        _check(cfg, repo)
+        yield lambda run: _acquire(cfg, run)
 
 
 def queue_hold(cfg: Config, repo: Path) -> str | None:

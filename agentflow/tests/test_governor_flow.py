@@ -211,7 +211,7 @@ def test_a_skipped_phase_and_the_ship_phase_are_never_held(flow_repo, quick, mon
     flow_repo.configure(edit=skip_define)
     prime(0.8)
     run = begin(flow_repo)
-    loop = pipeline._Loop(run, flow_repo.cfg, RunOptions())
+    loop = pipeline._Loop(run, flow_repo.cfg, RunOptions(), 0)
     loop.worktree = Path(run.state["worktree"])
     names = list(flow_repo.cfg.phases)
     assert loop.phase(names, 0) is None
