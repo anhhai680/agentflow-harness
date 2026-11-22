@@ -236,7 +236,9 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
     """Run phases until a human is needed or the run ends; returns the run's status then.
 
     An unexpected exception is recorded as `runner_error` (the run's status becomes `error`, which a
-    `resume` goes on from) before the lock is released and the exception goes on to the caller."""
+    `resume` goes on from) before the lock is released and the exception goes on to the caller. Taking the run's
+    slot comes first: `slots.SlotsFull` (or any failure of that step) releases the lock and is raised with no
+    `runner_error`, so the run's status is left as it was."""
     if run.refresh().get("pipeline") == RETRO_PIPELINE:  # it walks no phase: resuming one would run the whole workflow
         raise ValueError(f"{run.id} is a retro run, which cannot be resumed; cancel it and run `agentflow retro` again")
     lock = run.lock()
@@ -244,8 +246,8 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
         raise RunLocked(f"another runner is working on {run.id}; see `agentflow status {run.id}`")
     try:
         slot = slots.slot_of(run) if run.refresh()["status"] in TERMINAL else slots.acquire(cfg, run)
-    except slots.SlotsFull:
-        lock.release()  # nothing ran and the run is not terminal, so there is no issue label for `release` to take off
+    except BaseException:  # `SlotsFull`, or a failure reading or writing the slot: nothing ran, so no `runner_error`, and
+        lock.release()  # no issue label for `release` to take off (the run is not terminal); the lock must not outlive this
         raise
     try:
         with keepawake.holding():  # until a human is needed or the run ends

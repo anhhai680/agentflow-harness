@@ -391,3 +391,34 @@ def test_status_prints_the_slot(flow_repo, monkeypatch, capsys):
     off = begin(flow_repo, {"module": "off"})
     assert main(["status", off.id]) == 0
     assert "slot:" not in capsys.readouterr().out
+
+
+def test_a_failure_taking_the_slot_does_not_leak_the_run_lock(flow_repo, monkeypatch):
+    piped(flow_repo, monkeypatch, 2)
+    run = begin(flow_repo)
+
+    def boom(cfg, run):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(slots, "acquire", boom)
+    with pytest.raises(OSError):
+        go(flow_repo, run)
+    assert not flow_repo.events(run, "runner_error")
+    lock = run.lock()
+    assert lock.acquire()
+    lock.release()
+
+
+def test_a_start_that_loses_the_slot_race_ends_failed_with_no_worktree(flow_repo, monkeypatch):
+    piped(flow_repo, monkeypatch, 2)
+    begin(flow_repo)
+    begin(flow_repo, {"module": "other"})
+    trees, dirs = worktrees(flow_repo), run_dirs(flow_repo)
+    monkeypatch.setattr(pipeline.slots, "check_free", lambda cfg, repo: None)  # the quick look passes: acquire loses
+    with pytest.raises(slots.SlotsFull):
+        begin(flow_repo, {"module": "third"})
+    (new,) = run_dirs(flow_repo) - dirs
+    lost = Run.load(flow_repo.root, new)
+    assert lost.state["status"] == "failed" and "slot" not in lost.state
+    assert [e["reason"] for e in flow_repo.events(lost, "run_failed")][0].startswith("SlotsFull: all 2 slots are held")
+    assert worktrees(flow_repo) == trees
