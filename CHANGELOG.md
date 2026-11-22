@@ -7,6 +7,10 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+
+- `slots.count` (1 = off, at most 16) and `queue.human_slot` (default 1) are config keys with a Settings form section and `validate` checks, and `{slot}` is allowed in a gate's `affected.run` beside `{paths}`; `validate` warns when slots are on and nothing uses `{slot}`, or when `human_slot` is not below `count`. Nothing reads them yet, so a run behaves as before.
+
 ## [3.1] - 2026-11-22
 
 ### Added

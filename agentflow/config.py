@@ -219,6 +219,11 @@ PREFLIGHT_KEYS = ("enabled",)
 WATCHDOG_KEYS = ("no_progress_min", "read_only_idle_min")
 PARALLEL_KEYS = ("max_subagents", "serial_paths")
 PARALLEL_MAX = 6  # `parallel.max_subagents` above this is a typo, not a plan: a wave's members are one session's sub-agents
+SLOTS_KEYS = ("count",)
+SLOTS_MAX = 16  # `slots.count` above this is a typo, not a plan: each slot is a whole stack of ports and databases
+QUEUE_KEYS = ("human_slot",)
+# `{slot}` in a `defaults.env` value, a gate's `run` or its `affected.run`; a shell `${slot}` and a doubled `{{slot}}` are not it
+SLOT_TOKEN = re.compile(r"(?<![{$])\{slot\}(?!\})")
 CONSTRAINT_KEYS = ("trailer", "gates")  # `guardrails.constraint_override`
 TRAILER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")  # a git trailer's token: no space, no colon, one line
 WATCHDOG_MAX_MIN = 1440  # `watchdog.no_progress_min` above a day is a typo, not a plan
@@ -351,6 +356,16 @@ class Watchdog:
 class Parallel:
     max_subagents: int = 1  # plan tasks one build session may build at once as sub-agents (a wave); 1 = off
     serial_paths: list[str] = field(default_factory=list)  # globs of paths a task of a wave may never touch
+
+
+@dataclass
+class Slots:
+    count: int = 1  # live runs that each get their own `{slot}` (0 ... count-1); 1 = off
+
+
+@dataclass
+class Queue:
+    human_slot: int = 1  # with slots on, `agentflow queue` leaves this many slots free for a run started by hand
 
 
 @dataclass
@@ -678,6 +693,8 @@ class Config:
     preflight: Preflight = field(default_factory=Preflight)
     watchdog: Watchdog = field(default_factory=Watchdog)
     parallel: Parallel = field(default_factory=Parallel)
+    slots: Slots = field(default_factory=Slots)
+    queue: Queue = field(default_factory=Queue)
     usage: Usage = field(default_factory=Usage)
     autonomy: dict = field(default_factory=dict)
     resolve_step: Step | None = None
@@ -1486,6 +1503,19 @@ def _build_parallel(raw: dict) -> Parallel:
     )
 
 
+def _build_slots(raw: dict) -> Slots:
+    """The `slots` block as data. A value of the wrong type loads as today's (off), and `validate` names it from the
+    text, so a typo never turns slots on."""
+    count = _optional(raw, "slots", "", dict, {}).get("count", 1)
+    return Slots(count=count if isinstance(count, int) and not isinstance(count, bool) else 1)
+
+
+def _build_queue(raw: dict) -> Queue:
+    """The `queue` block as data; a value of the wrong type loads as the default and `validate` names it."""
+    human = _optional(raw, "queue", "", dict, {}).get("human_slot", 1)
+    return Queue(human_slot=human if isinstance(human, int) and not isinstance(human, bool) and human >= 0 else 1)
+
+
 def _build_policy(policy: dict, disabled: tuple[str, ...]) -> Policy:
     """The obligations, in layer order, then the engine floor, whatever the layers say. An evidence item that does
     not parse becomes `UNRECOGNISED`, which `conformance.evaluate` never counts as met, so a typo fails closed;
@@ -1621,6 +1651,8 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
         watchdog=Watchdog(no_progress_min=_float(watchdog, "no_progress_min", "watchdog", 0),
                           read_only_idle_min=_float(watchdog, "read_only_idle_min", "watchdog", 5)),
         parallel=_build_parallel(raw),
+        slots=_build_slots(raw),
+        queue=_build_queue(raw),
         usage=Usage(governor=_governor(usage.get("governor")),
                     five_hour_soft=_float(usage, "five_hour_soft", "usage", 0.75),
                     five_hour_hard=_float(usage, "five_hour_hard", "usage", 0.92),
@@ -2375,7 +2407,7 @@ class _Validator:
                     self.error(f"gate_sets.{name}[{i}]", f"'{member}' is not a defined gate")
 
     def affected(self, affected: Affected, path: str) -> None:
-        """`affected.run` is a non-empty command whose one placeholder is `{paths}` (`{{` and `}}` are braces);
+        """`affected.run` is a non-empty command whose placeholders are `{paths}` and `{slot}` (`{{` and `}}` are braces);
         `affected.paths` is a non-empty list of relative globs with no `..` part."""
         run = affected.run
         try:
@@ -2383,9 +2415,9 @@ class _Validator:
                       if name is not None]
         except ValueError:
             fields = None
-        if not run.strip() or fields is None or any(f != ("paths", "", None) for f in fields):
-            self.error(_join(path, "run"), "affected.run is a non-empty command whose only placeholder is `{paths}`; "
-                       "write a literal brace as `{{` or `}}`")
+        if not run.strip() or fields is None or any(f not in (("paths", "", None), ("slot", "", None)) for f in fields):
+            self.error(_join(path, "run"), "affected.run is a non-empty command whose only placeholders are `{paths}` "
+                       "and `{slot}`; write a literal brace as `{{` or `}}`")
         elif not unquoted_paths_word(run):
             self.error(_join(path, "run"), "`{paths}` must be its own unquoted word: not inside quotes, "
                        "`$(...)` or `${...}`, never after a backslash or a here-document, in a template with no "
@@ -2686,6 +2718,41 @@ class _Validator:
             if "Parallel group" not in text:
                 self.add("warning", "prompts/plan.md", "plans written with this prompt never form a wave: it does not "
                          "ask for a `Parallel group` line on a task (see the engine's plan.md)")
+
+    def slots(self) -> None:
+        """`slots.count` is a whole number from 1 (off) to `SLOTS_MAX`, `queue.human_slot` a whole number of 0 or more
+        (the Form caps it lower, which is the Form's choice, not a rule); any other key of either block is a typo.
+        Read from the text, so a value the dataclass smoothed over is still named. With slots on, two things that
+        make them pointless are warned: nothing uses `{slot}`, and the queue keeps every slot free."""
+        raw = self.cfg.raw.get("slots")
+        block = raw if isinstance(raw, dict) else {}
+        count = block.get("count", 1)
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= SLOTS_MAX:
+            self.error("slots.count", f"count must be a whole number from 1 (off) to at most {SLOTS_MAX}")
+        for key in block:
+            if key not in SLOTS_KEYS:
+                self.error(f"slots.{key}", f"unknown slots key; known: {', '.join(SLOTS_KEYS)}")
+        raw = self.cfg.raw.get("queue")
+        block = raw if isinstance(raw, dict) else {}
+        human = block.get("human_slot", 1)
+        if isinstance(human, bool) or not isinstance(human, int) or human < 0:
+            self.error("queue.human_slot", "human_slot must be a whole number of 0 or more")
+        for key in block:
+            if key not in QUEUE_KEYS:
+                self.error(f"queue.{key}", f"unknown queue key; known: {', '.join(QUEUE_KEYS)}")
+        if self.cfg.slots.count <= 1:
+            return
+        templates = list(self.cfg.defaults.env.values())
+        for gate in self.cfg.gates.values():
+            templates.append(gate.run)
+            if gate.affected is not None:
+                templates.append(gate.affected.run)
+        if not any(SLOT_TOKEN.search(text) for text in templates if isinstance(text, str)):
+            self.add("warning", "slots.count", "slots are on but nothing uses {slot}: put it in a `defaults.env` "
+                     "value, a gate's `run` or its `affected.run`, or every run shares the same ports and databases")
+        if self.cfg.queue.human_slot >= self.cfg.slots.count:
+            self.add("warning", "queue.human_slot", f"human_slot ({self.cfg.queue.human_slot}) is not below "
+                     f"slots.count ({self.cfg.slots.count}), so `agentflow queue` never starts a run")
 
     def usage(self) -> None:
         """`usage.governor`: `on`, `observe` or `off` (a bare `off` loads as `off` and warns, since YAML turns it into
@@ -3213,6 +3280,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.preflight()
     v.watchdog()
     v.parallel()
+    v.slots()
     v.guardrails()
     v.usage()
     v.policy()

@@ -1168,6 +1168,22 @@ def test_the_form_sets_the_parallel_keys(shipped):
         form(shipped, (["parallel", "serial_paths"], "uv.lock"))
 
 
+def test_the_form_sets_the_slot_keys(shipped):
+    fields = {tuple(f["key"]): f for s in config_edit.form_fields(shipped)["sections"] for f in s["fields"]}
+    assert fields[("slots", "count")]["kind"] == "int"
+    assert (fields[("slots", "count")]["min"], fields[("slots", "count")]["max"]) == (1, 16)
+    assert fields[("queue", "human_slot")]["kind"] == "int"
+    assert (fields[("queue", "human_slot")]["min"], fields[("queue", "human_slot")]["max"]) == (0, 16)
+    proposal = form(shipped, (["slots", "count"], 3), (["queue", "human_slot"], 0))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    cfg = load_config(shipped)
+    assert cfg.slots.count == 3 and cfg.queue.human_slot == 0
+    for bad in (0, 17, True, "3"):
+        with pytest.raises(EditError):
+            form(shipped, (["slots", "count"], bad))
+
+
 def test_the_wave_skill_and_review_keys_are_protected(shipped):
     assert "skills" in config_edit.PROTECTED and "route.profiles" in config_edit.PROTECTED
     for key, value in ((["skills", "map", "build_wave"], "agentflow-build"),

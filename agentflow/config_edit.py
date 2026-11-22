@@ -145,6 +145,12 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
          {"kind": "int", "min": 1, "max": 6}),
         (("parallel", "serial_paths"), "Paths that never go in a wave", {"kind": "list"}),
     ]),
+    ("Several runs at once", "Slots give each live run its own number for ports and databases ({slot}); the queue "
+                             "leaves some for you.", [
+        (("slots", "count"), "Slots (1 = off, at most 16)", {"kind": "int", "min": 1, "max": 16}),
+        (("queue", "human_slot"), "Slots the queue keeps free for a run you start",
+         {"kind": "int", "min": 0, "max": 16}),
+    ]),
     ("Usage window", "When runs stop starting new work because the plan's usage window is nearly spent; the soft mark "
                      "is your headroom.", [
         (("usage", "governor"), "Governor", {"kind": "enum", "options": ["on", "observe", "off"]}),

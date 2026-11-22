@@ -69,6 +69,12 @@ parallel:
   max_subagents: 1    # plan tasks one build session builds at once (a wave); 1 = off, at most 6; waves need the claude agent
   serial_paths: []    # globs of paths that never go in a wave (migrations, lockfiles, `package.json`, generated clients)
 
+slots:
+  count: 1        # live runs that each get their own {slot} (0 … count-1) in defaults.env and gate commands; 1 = off, at most 16
+
+queue:
+  human_slot: 1   # with slots on, `agentflow queue` leaves this many slots free for a run you start by hand
+
 watchdog:
   no_progress_min: 15   # end a session that writes nothing to its stream this many minutes (0 = off; 15 is a safe start)
   read_only_idle_min: 5   # end a read-only session this quiet with no tool call open (0 = use no_progress_min)
