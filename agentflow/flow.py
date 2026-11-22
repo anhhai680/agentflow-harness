@@ -940,7 +940,7 @@ def cmd_scorecard(args: argparse.Namespace) -> int:
             data = freeze(repo, args.lane, date_from, date_to, args.replace, now, full_suite=full_suite)
             print(f"froze the baseline of {', '.join(data['lanes']) or 'no lanes'}")
             return 0
-        view = scorecard_view(repo, args.lane, date_from, date_to, now, full_suite=full_suite)
+        view = scorecard_view(repo, args.lane, date_from, date_to, now, full_suite=full_suite, cfg=cfg)
     except FileExistsError as exc:
         print(f"error: {exc}")
         return 1

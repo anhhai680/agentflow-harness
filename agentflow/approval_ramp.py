@@ -26,6 +26,7 @@ from agentflow.events import parse_iso
 from agentflow.lessons import run_logs
 from agentflow.pipeline import _ctx  # loaded by `scorecard` already (through `retro`); pipeline imports this module late
 from agentflow.retro import _ended_at, finished_runs
+from agentflow.signals import ramp_decision
 from agentflow.state import Run
 
 CHECKS = ("no_open_findings", "small_route", "no_security_overlay", "first_raise")
@@ -93,21 +94,16 @@ def verdict(cfg: Config, run: Run, phase: str) -> tuple[list[str], list[str]]:
 
 
 def _sample(events: list[dict], run_id: str, profile: str, phase: str, ended: datetime | None) -> Sample | None:
-    first = next((i for i, e in enumerate(events) if e.get("type") == EVENT and e.get("phase") == phase
-                  and e.get("verdict") is True), None)
-    if first is None or ended is None or events[first].get("profile") != profile:
+    found = ramp_decision(events, phase)  # the one rule of a decision (`signals`), shared with `ramp_agreement`
+    if found is None or ended is None or found[0].get("profile") != profile:
         return None
-    for event in events[first + 1:]:
-        if event.get("phase") != phase or event.get("type") not in ("phase_approved", "phase_rejected"):
-            continue
-        if event["type"] == "phase_approved" and event.get("by") == AUTO_BY and event.get("ramp"):
-            audits = [e for e in events if e.get("type") == "conformance_checked"]
-            missed = bool(audits) and any(isinstance(o, dict) and o.get("status") == "missing"
-                                          for o in audits[-1].get("obligations") or [])
-            return Sample(run_id, ended, True, not missed)
-        if event.get("by") != AUTO_BY:  # a runner's own refine round on the phase is no decision on its approval
-            return Sample(run_id, ended, False, event["type"] == "phase_approved")
-    return None
+    decision = found[1]
+    if decision.get("by") == AUTO_BY:  # `ramp_decision` gives a runner approval only when it carries `ramp`
+        audits = [e for e in events if e.get("type") == "conformance_checked"]
+        missed = bool(audits) and any(isinstance(o, dict) and o.get("status") == "missing"
+                                      for o in audits[-1].get("obligations") or [])
+        return Sample(run_id, ended, True, not missed)
+    return Sample(run_id, ended, False, decision["type"] == "phase_approved")
 
 
 def samples(runs: list[Run], lane: str, profile: str, phase: str) -> list[Sample]:
