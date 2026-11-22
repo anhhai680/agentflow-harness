@@ -27,6 +27,8 @@ dashboard's Settings page, or by hand, reaches a live run at its next phase: `co
 does not load or validate, or that changes the phases' names or order, is not taken (`config_reload_skipped`,
 with the reason); the run goes on with the one it has, and the next `resume` loads the file as it is then.
 A run on another config (`--config`) keeps it as it was loaded: `config_trust` decides when that file may change.
+With `slots.count` above 1 a run holds a slot for as long as it is live (`slots.acquire`, at `start` and again at every
+`advance`), and the runner's config is a copy with `{slot}` filled in (`slots.render`, also after a reload).
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ from agentflow.autonomy import (
     phase_findings,
     round_limit,
 )
-from agentflow import constraint, doubt, governor, pack, preflight, route_lane, run_env, work_source
+from agentflow import constraint, doubt, governor, pack, preflight, route_lane, run_env, slots, work_source
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
@@ -148,6 +150,7 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     if not branch_exists(repo, fork):
         raise GitError(f"project.fork_from {fork!r} is not a local branch of {repo}")
 
+    slots.check_free(cfg, repo)  # the common refusal, before a run or a worktree exists; `_set_up` takes the number
     params, inputs = gather(params, repo, cfg.issues.epic_labels)
     # `{date}` (in `plan_target`) is the day the run started, every day it runs: a step resumed tomorrow still names
     # the file the plan step wrote today, and a reconcile step may edit only that file.
@@ -164,6 +167,7 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
 
 
 def _set_up(cfg: Config, repo: Path, run: Run, pipeline: str, params: dict, inputs: dict, opts: RunOptions) -> None:
+    slots.acquire(cfg, run)  # first: a lost race ends the run as failed before it has a worktree
     save(run, inputs)
     run.emit("run_options", from_phase=opts.from_phase, to_phase=opts.to_phase,
              model_overrides=dict(opts.model_overrides), **start_options(cfg.path, layer_files(cfg)))
@@ -239,8 +243,13 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
     if not lock.acquire():
         raise RunLocked(f"another runner is working on {run.id}; see `agentflow status {run.id}`")
     try:
+        slot = slots.slot_of(run) if run.refresh()["status"] in TERMINAL else slots.acquire(cfg, run)
+    except slots.SlotsFull:
+        lock.release()  # nothing ran and the run is not terminal, so there is no issue label for `release` to take off
+        raise
+    try:
         with keepawake.holding():  # until a human is needed or the run ends
-            return _Loop(run, cfg, _effective(run, opts)).go()
+            return _Loop(run, cfg, _effective(run, opts), slot).go()
     except Exception as exc:
         run.emit("runner_error", error=str(exc) or repr(exc), exception=type(exc).__name__)
         raise
@@ -250,11 +259,12 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
 
 
 class _Loop:
-    def __init__(self, run: Run, cfg: Config, opts: RunOptions) -> None:
+    def __init__(self, run: Run, cfg: Config, opts: RunOptions, slot: int = 0) -> None:
         self.run = run
-        self.cfg = cfg
+        self.slot = slot
+        self.cfg = slots.render(cfg, slot)  # the run's own copy: `{slot}` is its number from here on
         self.opts = opts
-        self.agents = make_agents(cfg)
+        self.agents = make_agents(self.cfg)
         self.config_sha = self._config_sha()
 
     def _config_sha(self) -> str | None:
@@ -289,8 +299,8 @@ class _Loop:
         if errors:
             self.run.emit("config_reload_skipped", sha256=sha, reason="; ".join(errors)[:2000])
             return
-        self.cfg = cfg
-        self.agents = make_agents(cfg)
+        self.cfg = slots.render(cfg, self.slot)
+        self.agents = make_agents(self.cfg)
         self.run.emit("config_reloaded", sha256=sha)
 
     def status(self) -> str:

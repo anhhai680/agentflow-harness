@@ -10,6 +10,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 ### Added
 
 - `slots.count` (1 = off, at most 16) and `queue.human_slot` (default 1) are config keys with a Settings form section and `validate` checks, and `{slot}` is allowed in a gate's `affected.run` beside `{paths}`; `validate` warns when slots are on and nothing uses `{slot}`, or when `human_slot` is not below `count`. Nothing reads them yet, so a run behaves as before.
+- With `slots.count` above 1, every run takes a slot number (`0` to `count - 1`) when it starts and keeps it while it is live (`slot_acquired`, the run's `state.json` `slot`), and `{slot}` in `defaults.env`, a gate's `run` and its `affected.run` is that number in the runner's config. A start with every slot held is refused before it creates a run or a worktree (`error: all N slots are held: ...`), a resumed run whose number was taken or lowered away takes a free one (or is refused, changing nothing), and `agentflow status <run>` shows `slot:`. With `slots.count: 1` nothing changes.
 
 ## [3.1] - 2026-11-22
 

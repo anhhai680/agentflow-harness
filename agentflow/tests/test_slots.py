@@ -10,8 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from agentflow import gates, slots
-from agentflow.state import Run
+from agentflow import gates, pack, pipeline, run_control, slots
+from agentflow.flow import main
+from agentflow.hitl import approve
+from agentflow.pipeline import RunOptions, advance, start
+from agentflow.state import Run, runs_root
 
 CHILD = """
 import sys, time
@@ -233,3 +236,158 @@ def test_queue_hold_keeps_the_human_slot(flow_repo):
         "waiting for a free slot: 2 of 3 held, queue.human_slot keeps 1 free")
     off = make(flow_repo, 1, queue={"human_slot": 1})
     assert slots.queue_hold(off, flow_repo.root) is None
+
+
+# --------------------------------------------------------------------------- the pipeline: start, advance, render
+
+PIPE = {"gate_sets": {"build": ["ok"], "verify": ["ok"]}, "defaults": {"env": {"AF_PORT": "5543{slot}"}}}
+
+
+def piped(flow_repo, monkeypatch, count: int, **extra):
+    monkeypatch.setenv("AGENTFLOW_FAKE_ENV", "AF_PORT")
+    return flow_repo.configure({"slots": {"count": count}, **PIPE, **extra})
+
+
+def begin(flow_repo, params: dict | None = None):
+    return start(flow_repo.cfg, flow_repo.root, "feature", params or {"module": "demo"}, RunOptions())
+
+
+def go(flow_repo, run: Run) -> str:
+    return advance(run, flow_repo.cfg, RunOptions())
+
+
+def ports(flow_repo) -> list[str]:
+    return [c["env"]["AF_PORT"] for c in flow_repo.calls()]
+
+
+def run_dirs(flow_repo) -> set[str]:
+    root = runs_root(flow_repo.root)
+    return {p.name for p in root.iterdir() if p.is_dir()} if root.exists() else set()
+
+
+def worktrees(flow_repo) -> str:
+    return subprocess.run(["git", "worktree", "list"], cwd=flow_repo.root, capture_output=True, text=True,
+                          check=True).stdout
+
+
+def acquired(flow_repo, run: Run) -> list[dict]:
+    return flow_repo.events(run, "slot_acquired")
+
+
+def test_two_live_runs_get_different_slots_in_their_agents_env(flow_repo, monkeypatch):
+    piped(flow_repo, monkeypatch, 2)
+    a, b = begin(flow_repo), begin(flow_repo, {"module": "other"})
+    assert go(flow_repo, a) == "awaiting_approval" and go(flow_repo, b) == "awaiting_approval"
+    assert {a.state["slot"], b.state["slot"]} == {0, 1}
+    assert set(ports(flow_repo)) == {"55430", "55431"}
+    assert len(acquired(flow_repo, a)) == 1  # advance kept the number start took
+
+
+def test_a_third_run_is_refused_before_it_exists(flow_repo, monkeypatch, capsys):
+    piped(flow_repo, monkeypatch, 2)
+    flow_repo.install_pack()
+    begin(flow_repo)
+    begin(flow_repo, {"module": "other"})
+    dirs, trees = run_dirs(flow_repo), worktrees(flow_repo)
+    with pytest.raises(slots.SlotsFull):
+        begin(flow_repo, {"module": "third"})
+    assert run_dirs(flow_repo) == dirs and worktrees(flow_repo) == trees
+    capsys.readouterr()
+    assert main(["run", "feature", "--module", "x"]) != 0
+    assert "error: all 2 slots are held" in capsys.readouterr().out
+    assert run_dirs(flow_repo) == dirs and worktrees(flow_repo) == trees
+
+
+def test_a_cancelled_run_frees_its_slot_for_the_next_start(flow_repo, monkeypatch):
+    piped(flow_repo, monkeypatch, 2)
+    a, b = begin(flow_repo), begin(flow_repo, {"module": "other"})
+    run_control.cancel(a, "me", flow_repo.cfg)
+    c = begin(flow_repo, {"module": "third"})
+    assert c.state["slot"] == a.state["slot"] == 0 and b.state["slot"] == 1
+
+
+def three_runs_with_a_on_slot_two(flow_repo, monkeypatch):
+    """Count 3: x holds 0, y holds 1 and `a` holds 2, stopped at a human wait."""
+    piped(flow_repo, monkeypatch, 3)
+    x, y = begin(flow_repo), begin(flow_repo, {"module": "x"})
+    a = begin(flow_repo, {"module": "a"})
+    assert (x.state["slot"], y.state["slot"], a.state["slot"]) == (0, 1, 2)
+    assert go(flow_repo, a) == "awaiting_approval"
+    assert ports(flow_repo) and set(ports(flow_repo)) == {"55432"}
+    return x, y, a
+
+
+def test_a_retried_run_takes_a_free_slot_again(flow_repo, monkeypatch):
+    x, y, a = three_runs_with_a_on_slot_two(flow_repo, monkeypatch)
+    run_control.cancel(x, "me", flow_repo.cfg)
+    run_control.cancel(y, "me", flow_repo.cfg)
+    b = begin(flow_repo, {"module": "b"})
+    assert b.state["slot"] == 0
+    lowered = piped(flow_repo, monkeypatch, 2)  # a's number is gone with the count
+    approve(a, "define", by="me")
+    calls = len(flow_repo.calls())
+    advance(a, lowered, RunOptions())
+    (event,) = [e for e in acquired(flow_repo, a) if e.get("previous") is not None]
+    assert event["slot"] == 1 and event["previous"] == 2 and event["count"] == 2
+    assert a.state["slot"] == 1
+    assert [c["env"]["AF_PORT"] for c in flow_repo.calls()[calls:]] == ["55431"] * (len(flow_repo.calls()) - calls) != []
+
+
+def test_resume_with_no_free_slot_changes_nothing(flow_repo, monkeypatch):
+    x, y, a = three_runs_with_a_on_slot_two(flow_repo, monkeypatch)
+    run_control.cancel(x, "me", flow_repo.cfg)
+    b = begin(flow_repo, {"module": "b"})
+    assert b.state["slot"] == 0 and y.state["slot"] == 1
+    lowered = piped(flow_repo, monkeypatch, 2)
+    approve(a, "define", by="me")
+    status, seen, calls = a.refresh()["status"], len(a.events.read()), len(flow_repo.calls())
+    with pytest.raises(slots.SlotsFull):
+        advance(a, lowered, RunOptions())
+    assert a.refresh()["status"] == status
+    assert not flow_repo.events(a, "runner_error")
+    assert len(acquired(flow_repo, a)) == 1 and len(flow_repo.calls()) == calls
+    assert [e["type"] for e in a.events.read()[seen:]] == []
+    assert a.lock().acquire()  # the lock was let go
+
+
+def test_a_reloaded_config_is_rendered_again(flow_repo, monkeypatch):
+    cfg = piped(flow_repo, monkeypatch, 2)
+    monkeypatch.setattr(pack, "pack_config", lambda repo: Path(cfg.path))
+    other = begin(flow_repo, {"module": "other"})
+    run = begin(flow_repo)
+    assert (other.state["slot"], run.state["slot"]) == (0, 1)
+    loop = pipeline._Loop(run, cfg, RunOptions(), slots.acquire(cfg, run))
+    assert loop.slot == 1 and loop.cfg.defaults.env["AF_PORT"] == "55431"
+    assert loop.go() == "awaiting_approval"
+    assert set(ports(flow_repo)) == {"55431"}
+    path = Path(cfg.path)
+    path.write_text(path.read_text(encoding="utf-8").replace("5543{slot}", "6543{slot}"), encoding="utf-8")
+    approve(run, "define", by="me")
+    assert loop.go() == "awaiting_approval"
+    assert flow_repo.events(run, "config_reloaded")
+    assert ports(flow_repo)[-1] == "65431" and "{slot}" not in "".join(ports(flow_repo))
+    assert loop.cfg.defaults.env["AF_PORT"] == "65431"
+
+
+def test_slots_off_leaves_a_run_as_it_was(flow_repo, monkeypatch):
+    piped(flow_repo, monkeypatch, 1)
+    a, b = begin(flow_repo), begin(flow_repo, {"module": "other"})
+    assert go(flow_repo, a) == "awaiting_approval" and go(flow_repo, b) == "awaiting_approval"
+    assert set(ports(flow_repo)) == {"55430"}
+    for run in (a, b):
+        assert not acquired(flow_repo, run)
+        assert "slot" not in run.state
+
+
+def test_status_prints_the_slot(flow_repo, monkeypatch, capsys):
+    piped(flow_repo, monkeypatch, 2)
+    flow_repo.install_pack()
+    begin(flow_repo, {"module": "other"})
+    run = begin(flow_repo)
+    capsys.readouterr()
+    assert main(["status", run.id]) == 0
+    assert "slot:     1" in capsys.readouterr().out
+    piped(flow_repo, monkeypatch, 1)
+    off = begin(flow_repo, {"module": "off"})
+    assert main(["status", off.id]) == 0
+    assert "slot:" not in capsys.readouterr().out
