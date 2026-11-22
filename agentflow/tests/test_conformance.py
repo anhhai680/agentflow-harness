@@ -205,6 +205,22 @@ def test_a_plain_runner_approval_is_not(cfg):
         assert evaluate(cfg, [event], [planned], "t")[0].status == "missing"
 
 
+def test_a_ramp_approval_needs_whole_samples(cfg):
+    planned = ob("plan_approved", "approval:plan")
+    for ramp in ("yes", [5], {"profile": "S"}, {"samples": "5", "profile": "S"}, {"samples": True, "profile": "S"}):
+        event = ev(2, "phase_approved", phase="plan", by="runner", ramp=ramp)
+        assert evaluate(cfg, [event], [planned], "t")[0].status == "missing", ramp
+
+
+def test_a_ramp_approval_is_not_evidence_where_the_security_overlay_holds(cfg):
+    planned = ob("plan_approved", "approval:plan")
+    ramped = [ev(2, "phase_approved", phase="plan", by="runner", ramp={"samples": 5, "profile": "S"})]
+    finding = evaluate(cfg, ramped, [planned], "t", security=True)[0]
+    assert finding.status == "missing" and "security overlay" in finding.note
+    human = [*ramped, ev(3, "phase_approved", phase="plan", by="me")]  # a person's approval stands either way
+    assert evaluate(cfg, human, [planned], "t", security=True)[0].status == "satisfied"
+
+
 def test_skip_if_skip_is_on_base(cfg):
     planned = ob("plan_approved", "approval:plan")
     skipped = evaluate(cfg, [ev(2, "phase_skipped", phase="plan", reason="plan exists on origin/main", via="skip_if")], [planned], "t")[0]
@@ -505,6 +521,24 @@ def test_finish_audits_and_reports_in_report_mode(flow_repo, gh, git):
     assert "Conformance: " in body and "`reviewed` missing" in body
     assert body.index("## Gates") < body.index("## Conformance") < body.index("## Skipped steps")
     assert pushed(git, flow_repo, run) and len(created(gh)) == 1
+
+
+@pytest.mark.parametrize("overlay", [False, True])
+def test_the_audit_refuses_a_ramp_approval_once_the_overlay_holds(flow_repo, gh, git, overlay):
+    """Ruling T: `define` or `plan` may be approved on the ramp before the run touches a security path; the audit at
+    `finish` reads the overlay on the tree it is about to push."""
+    run = begin_finish(flow_repo)
+    if overlay:
+        flow_repo.configure({**SMALL, "conditions": {"security_path": {"any": None, "check": "file_exists",
+                                                                         "path": "README.md"}}})
+    run.emit("step_finished", key="verify/verify", status="done", summary="")
+    run.emit("phase_approved", phase="plan", by="runner", ramp={"samples": 5, "profile": "S"})
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    [plan] = [o for o in last(flow_repo, run, "conformance_checked")["obligations"] if o["id"] == "plan_approved"]
+    if overlay:
+        assert plan["status"] == "missing" and "security overlay" in plan["note"]
+    else:
+        assert plan["status"] == "satisfied" and plan["note"] == "approval ramp"
 
 
 def test_block_mode_stops_before_the_push(flow_repo, gh, git):

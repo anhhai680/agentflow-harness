@@ -519,7 +519,7 @@ class _Loop:
             # imported here: approval_ramp reads the scorecard, which reads `retro`, which imports this module
             from agentflow import approval_ramp
 
-            decision = approval_ramp.decide(self.cfg, self.run, name, executor.ctx, datetime.now(UTC))
+            decision = approval_ramp.decide(self.cfg, self.run, name, datetime.now(UTC))
             if decision is not None and decision["auto"]:  # the ramp approves it: no person is asked
                 self.run.emit("phase_approved", by=AUTO_BY, phase=name, sha=head(self.worktree),
                               ramp={"samples": decision["samples"], "profile": decision["profile"]})

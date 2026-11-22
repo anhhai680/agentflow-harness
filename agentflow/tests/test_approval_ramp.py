@@ -5,15 +5,17 @@ once `ramp_samples` human decisions in a row agreed with it and the scorecard is
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import dataclasses
+from datetime import UTC, date, datetime
 
 import pytest
 
 from agentflow import approval_ramp, scorecard
 from agentflow.approval_ramp import CHECKS, RAMP_PROFILES, Sample, eligible, ramp_view, samples
 from agentflow.autonomy import AUTO_BY
-from agentflow.config import load_config
-from agentflow.hitl import reject
+from agentflow.conditions import make_ctx
+from agentflow.config import CONFORMANCE_FAILED, load_config
+from agentflow.hitl import approve, reject
 from agentflow.pipeline import RunOptions, advance, start
 from agentflow.retro import finished_runs
 from agentflow.state import Run
@@ -247,7 +249,7 @@ def test_auto_approves_after_n_agreeing_runs_and_a_green_scorecard(flow):
     assert not [e for e in events(run, "phase_approval_raised") if e["phase"] == "define"]
     assert [e["phase"] for e in events(run, "handoff_written")][:1] == ["define"]
     assert PLAN in called(flow, "plan/")  # plan starts
-    assert run.state["waiting"]["key"] == "plan_approved"
+    assert run.state["waiting"]["key"] == "plan_approved", run.state["waiting"]
 
 
 @pytest.mark.parametrize("case", ["security_path", "four_samples", "one_rejection", "no_baseline", "auto_regressed"])
@@ -319,3 +321,61 @@ def test_ramp_view_rows(tmp_git, tmp_cfg):
         {"lane": "feature", "phase": "define", "profile": "S", "mode": "auto", "human": 5, "agreeing": 5, "auto": 1,
          "regressions": 1, "eligible": False, "why": "an auto-approved run since missed an obligation"},
     ]
+
+
+# --------------------------------------------------------------------------- fix round 1
+
+
+def test_the_security_check_reads_the_tree_at_the_decision(flow):
+    """Ruling S: the plan a step wrote in this phase names a `when_keywords` word, so the overlay holds now, though the
+    context the phase walked with was built before the plan existed."""
+    flow.configure({**PIPE, "autonomy": {"approvals": {"plan": "auto"}}}, autopilot=True, edit=with_doubt)
+    agreeing(flow.cfg, flow.root, phase="plan")
+    freeze(flow.root)
+    params = {"module": "demo", "date": date.today().isoformat()}
+    plan = make_ctx(flow.cfg, flow.root, "feature", params).values["plan_target"]
+    planned = {"write": {plan: "# Plan: demo\n\n### Task 1: Store the API token\n\n- [ ] **Step 1: Do it**\n"},
+               **done("planned")}
+    run = begin(flow, {REVIEW: [found(LOW)], PLAN: [planned]}, to=None)
+    assert go(flow, run) == "awaiting_approval"
+    approve(run, "define", by="me")
+    status = go(flow, run)
+    assert status == "awaiting_approval", run.state["waiting"]
+    assert run.state["waiting"]["key"] == "plan_approved"
+    [event] = [e for e in events(run, "would_auto_approve") if e["phase"] == "plan"]
+    assert event["missing"] == ["no_security_overlay"] and event["eligible"] is False
+    assert not [e for e in events(run, "phase_approved") if e["phase"] == "plan"]
+
+
+@pytest.mark.parametrize("value", [2, 51, 0, True, "5"])
+def test_ramp_samples_out_of_range_falls_back_to_the_default(cfg, value):
+    odd = dataclasses.replace(cfg, autonomy={**cfg.autonomy, "ramp_samples": value})
+    assert approval_ramp.ramp_samples(odd) == 5
+
+
+def test_a_lane_the_baseline_does_not_cover_is_not_eligible(tmp_git, cfg):
+    past(cfg, tmp_git, lane="bug", missing=0)
+    freeze(tmp_git)  # a baseline of the bug lane only
+    agreeing(cfg, tmp_git)
+    ok, why, _n = eligible(tmp_git, cfg, "feature", "S", "define", datetime.now(UTC))
+    assert (ok, why) == (False, "the scorecard baseline has no conformance for feature")
+
+
+def test_a_baseline_without_conformance_is_not_eligible(tmp_git, cfg):
+    for _ in range(5):
+        past(cfg, tmp_git)  # never audited: the baseline has no `conformance_missing`
+    freeze(tmp_git)
+    ok, why, _n = eligible(tmp_git, cfg, "feature", "S", "define", datetime.now(UTC))
+    assert (ok, why) == (False, "the scorecard baseline has no conformance for feature")
+
+
+def test_a_ramp_run_blocked_at_its_audit_is_a_regression(tmp_git, cfg):
+    agreeing(cfg, tmp_git)
+    freeze(tmp_git)
+    blocked = Run.create(cfg, tmp_git, "feature", {"module": "blocked"})
+    blocked.emit("would_auto_approve", phase="define", mode="auto", verdict=True, held=[], missing=[], profile="S")
+    blocked.emit("phase_approved", by=AUTO_BY, phase="define", ramp={"samples": 5, "profile": "S"})
+    assert eligible(tmp_git, cfg, "feature", "S", "define", datetime.now(UTC))[0] is True  # not stopped yet
+    blocked.emit("hitl_raised", kind=CONFORMANCE_FAILED, key="ship/finish", summary="1 obligation missing")
+    assert eligible(tmp_git, cfg, "feature", "S", "define", datetime.now(UTC))[:2] == (
+        False, "an auto-approved run since missed an obligation")
