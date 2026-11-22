@@ -27,6 +27,10 @@ dashboard's Settings page, or by hand, reaches a live run at its next phase: `co
 does not load or validate, or that changes the phases' names or order, is not taken (`config_reload_skipped`,
 with the reason); the run goes on with the one it has, and the next `resume` loads the file as it is then.
 A run on another config (`--config`) keeps it as it was loaded: `config_trust` decides when that file may change.
+With `slots.count` above 1 a run holds a slot for as long as it is live (`slots.starting` at `start`, `slots.acquire`
+at every `advance` and every reload, so a run that started with slots off takes one at its next phase), and the
+runner's config is a copy with `{slot}` filled in (`slots.render`, also after a reload; a reload that finds no free
+slot is skipped).
 """
 
 from __future__ import annotations
@@ -50,7 +54,7 @@ from agentflow.autonomy import (
     phase_findings,
     round_limit,
 )
-from agentflow import constraint, doubt, governor, pack, preflight, route_lane, run_env, work_source
+from agentflow import constraint, doubt, governor, pack, preflight, route_lane, run_env, slots, work_source
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
@@ -148,16 +152,23 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     if not branch_exists(repo, fork):
         raise GitError(f"project.fork_from {fork!r} is not a local branch of {repo}")
 
+    slots.check_free(cfg, repo)  # the common refusal, before the inputs are read
     params, inputs = gather(params, repo, cfg.issues.epic_labels)
     # `{date}` (in `plan_target`) is the day the run started, every day it runs: a step resumed tomorrow still names
     # the file the plan step wrote today, and a reconcile step may edit only that file.
     if params.get("date") in (None, ""):
         params["date"] = date.today().isoformat()
-    run = Run.create(cfg, repo, pipeline, params)
+    run = None
     try:
+        # one hold of the slots lock: the check again, the run and its number, so a start that lost the last number
+        # while it read its inputs raises `SlotsFull` with no run created
+        with slots.starting(cfg, repo) as take:
+            run = Run.create(cfg, repo, pipeline, params)
+            take(run)
         _set_up(cfg, repo, run, pipeline, params, inputs, opts)
-    except Exception as exc:  # the run exists now: it must never be left `running` with nothing behind it
-        run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}")
+    except Exception as exc:  # once the run exists it must never be left `running` with nothing behind it
+        if run is not None:
+            run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}")
         raise
     mark(cfg, run)
     return run
@@ -232,15 +243,22 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
     """Run phases until a human is needed or the run ends; returns the run's status then.
 
     An unexpected exception is recorded as `runner_error` (the run's status becomes `error`, which a
-    `resume` goes on from) before the lock is released and the exception goes on to the caller."""
+    `resume` goes on from) before the lock is released and the exception goes on to the caller. Taking the run's
+    slot comes first: `slots.SlotsFull` (or any failure of that step) releases the lock and is raised with no
+    `runner_error`, so the run's status is left as it was."""
     if run.refresh().get("pipeline") == RETRO_PIPELINE:  # it walks no phase: resuming one would run the whole workflow
         raise ValueError(f"{run.id} is a retro run, which cannot be resumed; cancel it and run `agentflow retro` again")
     lock = run.lock()
     if not lock.acquire():
         raise RunLocked(f"another runner is working on {run.id}; see `agentflow status {run.id}`")
     try:
+        slot = slots.slot_of(run) if run.refresh()["status"] in TERMINAL else slots.acquire(cfg, run)
+    except BaseException:  # `SlotsFull`, or a failure reading or writing the slot: nothing ran, so no `runner_error`, and
+        lock.release()  # no issue label for `release` to take off (the run is not terminal); the lock must not outlive this
+        raise
+    try:
         with keepawake.holding():  # until a human is needed or the run ends
-            return _Loop(run, cfg, _effective(run, opts)).go()
+            return _Loop(run, cfg, _effective(run, opts), slot).go()
     except Exception as exc:
         run.emit("runner_error", error=str(exc) or repr(exc), exception=type(exc).__name__)
         raise
@@ -250,11 +268,12 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
 
 
 class _Loop:
-    def __init__(self, run: Run, cfg: Config, opts: RunOptions) -> None:
+    def __init__(self, run: Run, cfg: Config, opts: RunOptions, slot: int) -> None:
         self.run = run
-        self.cfg = cfg
+        self.slot = slot
+        self.cfg = slots.render(cfg, slot)  # the run's own copy: `{slot}` is its number from here on
         self.opts = opts
-        self.agents = make_agents(cfg)
+        self.agents = make_agents(self.cfg)
         self.config_sha = self._config_sha()
 
     def _config_sha(self) -> str | None:
@@ -286,11 +305,17 @@ class _Loop:
             errors = [f"{exc.path}: {exc.message}" if exc.path else exc.message]
         if not errors and list(cfg.phases) != list(self.cfg.phases):
             errors = ["the phases' names or order changed; a live run keeps its phases (resume to take them)"]
+        if not errors:
+            try:  # a run that started with slots off takes its number here when they were turned on
+                slot = slots.acquire(cfg, self.run)
+            except slots.SlotsFull as exc:
+                errors = [f"no free slot for this run: {exc}"]
         if errors:
             self.run.emit("config_reload_skipped", sha256=sha, reason="; ".join(errors)[:2000])
             return
-        self.cfg = cfg
-        self.agents = make_agents(cfg)
+        self.slot = slot
+        self.cfg = slots.render(cfg, self.slot)
+        self.agents = make_agents(self.cfg)
         self.run.emit("config_reloaded", sha256=sha)
 
     def status(self) -> str:

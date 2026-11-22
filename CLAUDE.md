@@ -53,6 +53,13 @@ The full suite is slow. While you work, run the test files you touched, and run 
 
 `CHANGELOG.md` records every change a user can see, in [Keep a Changelog](https://keepachangelog.com) format. A change adds one line under `## [Unreleased]` (`Added`, `Changed`, `Fixed` or `Removed`). A release bumps `pyproject.toml` and `pack.ENGINE_VERSION` together, renames `[Unreleased]` to the new version and date, and opens a fresh `[Unreleased]`. The dashboard header shows `pack.ENGINE_VERSION`. `test_packaging` fails if the changelog has no entry for it.
 
+**Every new PR bumps the version.** Each PR is a release, whatever it changes, including PRs that change only docs or tests. Before you make the PR's last commit and create the PR, you MUST do the following and commit it on the PR's branch:
+1. Raise the version in both `pyproject.toml` (`[project] version`) and `agentflow/pack.py` (`ENGINE_VERSION`) to the same number. The default is the next minor (`3.1` → `3.2`). Bump the major (`3.x` → `4.0`) only for a change that breaks existing packs, and then widen the `engine: ">=3,<4"` range in `.agentflow/config.yaml` and the fixture packs in the same change.
+2. Rename `## [Unreleased]` in `CHANGELOG.md` to `## [<new version>] - YYYY-MM-DD` (today's date), and add a fresh, empty `## [Unreleased]` above it.
+3. Run `test_packaging.py`, which checks that the two versions match and that the changelog has the entry.
+
+Don't create a PR until the bump is committed. Never reuse a version that's already on `main`: if `main` moved on after you bumped, bump again past it. The pack's `version:` key in `.agentflow/config.yaml` is the pack schema version, not the engine version, so leave it alone.
+
 A change that drops or rewords text in an engine prompt (`agentflow/prompts/*.md`) also adds a `Retired` entry to `agentflow/pack_fix.py`, so `validate` can find packs whose overrides still carry the old text and `validate --fix` can repair them (`docs/specs/agentflow-validate-fix-proposal.md`).
 
 ## Engine architecture

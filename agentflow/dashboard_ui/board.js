@@ -140,6 +140,11 @@ function needsYouNode(card) {
   return el("div", { class: "needs-you", text: "● needs you" + when, title: card.waiting.summary || null });
 }
 
+// One label per parked step of the card: "parked: Task 3 · implement", its summary as the title.
+function parkedLabels(card) {
+  return ((card && card.parked) || []).map((p) => ({ text: "parked: " + (p.label || p.key), title: p.summary || "" }));
+}
+
 function cardNode(card) {
   const many = card.agents && card.agents.length > 1;
   const agent = many
@@ -154,6 +159,7 @@ function cardNode(card) {
     el("span", { class: g.skipped ? "gate-skip" : g.passed ? "gate-ok" : "gate-bad", text: (g.skipped ? "– " : g.passed ? "✓ " : "✗ ") + g.gate + " " })));
   // A refine round's implementer changed nothing, so its task was not reviewed again.
   const skips = (card.review_skipped || []).map((r) => el("span", { class: "gate-skip", title: "review skipped: " + r.reason, text: "– review task " + r.task + " (" + r.reason + ") " }));
+  const parked = parkedLabels(card);
   if (!card.agent) lastActivity.delete(card.run_id);  // no live agent: its last tool is history
   const seen = lastActivity.get(card.run_id);
   const node = el("article", { class: "card " + card.status, tabindex: "0", role: "button", draggable: card.ready ? "true" : null,
@@ -169,6 +175,8 @@ function cardNode(card) {
       " · " + money(card.spend) + limits(card.soft_budget, card.budget)),
     card.gates.length ? gates : null,
     skips.length ? el("div", { class: "sub" }, skips) : null,
+    parked.length ? el("div", { class: "sub" }, parked.map((p) => el("span", { class: "badge", text: p.text, title: p.title }))) : null,
+    typeof card.slot === "number" ? el("span", { class: "badge lock", text: "slot " + card.slot }) : null,
     el("div", { class: "sub", text: "in phase " + ago(card.time_in_phase_s) + " · total " + dur(card.wall_s) }),
     card.pr_link ? prNode(card) : null,
     card.ready ? movesNode(card) : null);

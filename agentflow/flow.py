@@ -252,10 +252,11 @@ def _human_errors() -> tuple[type[Exception], ...]:
     from agentflow.pack import PackError
     from agentflow.pipeline import RunLocked
     from agentflow.run_control import ControlError
+    from agentflow.slots import SlotsFull
     from agentflow.state import RunNotFound
 
     return (RunNotFound, NotWaiting, EventError, ConfigError, PackError, ValueError, GitError, GhError, RunLocked,
-            ControlError)
+            ControlError, SlotsFull)
 
 
 def _money(value: float | None) -> str:
@@ -286,6 +287,8 @@ def _print_run_detail(run) -> None:
     task = f"  task {st['task']['n']}/{st['task']['of']}" if st["task"] else ""
     print(f"where:    phase {st['phase'] or '-'}  step {st['step'] or '-'}{task}")
     print(f"spend:    {_spend(st)}")
+    if isinstance(st.get("slot"), int) and not isinstance(st["slot"], bool):
+        print(f"slot:     {st['slot']}")
     for label, value in (("branch", st["branch"]), ("worktree", st["worktree"]), ("pr", st["pr_url"])):
         if value:
             print(f"{label}:".ljust(10) + str(value))

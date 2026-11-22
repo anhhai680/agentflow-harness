@@ -317,6 +317,10 @@ def _on_agent_started(state: dict, ev: dict) -> None:
                 row["read_only_pending"] = read_only
 
 
+def _on_slot_acquired(state: dict, ev: dict) -> None:
+    state["slot"] = ev["slot"]
+
+
 def _on_run_held(state: dict, ev: dict) -> None:
     state["hold"] = {"key": ev["key"], "reason": ev["reason"], "until": ev["until"]}
 
@@ -938,6 +942,7 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "permission_denied": _on_permission_denied,
     "progress_not_updated": _on_progress_not_updated,
     "checkpoint_reused": _on_checkpoint_reused,
+    "slot_acquired": _on_slot_acquired,
 }
 
 
@@ -1008,6 +1013,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "gate_cache_hit": ("key", "gate", "input_hash"),
     "early_pr_failed": ("phase",),
     "pr_updated": ("url", "key"),
+    "slot_acquired": ("slot",),
 }
 TEXT_FIELDS = ("key", "step", "phase", "model", "kind")
 HANDLER_ERRORS = (KeyError, TypeError, AttributeError, ValueError, IndexError)

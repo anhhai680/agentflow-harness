@@ -2855,6 +2855,101 @@ def test_a_bad_parallel_value_loads_as_off(tmp_cfg):
     assert cfg.parallel.max_subagents == 1 and cfg.parallel.serial_paths == []
 
 
+def slot_issues(tmp_cfg, patch) -> list[Issue]:
+    return issues_for(tmp_cfg, patch if callable(patch) else (lambda data: data.update(patch)))
+
+
+def test_slots_and_the_queue_are_off_by_default(sparse_repo):
+    cfg = load_config(pack.pack_config(sparse_repo))
+    assert (cfg.slots.count, cfg.queue.human_slot) == (1, 1)
+    assert [i for i in validate(cfg, sparse_repo) if i.path.startswith(("slots", "queue"))] == []
+
+
+@pytest.mark.parametrize("block, path, text", [
+    ({"count": 0}, "slots.count", "at most 16"),
+    ({"count": 17}, "slots.count", "at most 16"),
+    ({"count": True}, "slots.count", "at most 16"),
+    ({"count": "2"}, "slots.count", "at most 16"),
+    ({"foo": 1}, "slots.foo", "count"),
+])
+def test_slots_rejects_bad_values(tmp_cfg, block, path, text):
+    found = [i for i in slot_issues(tmp_cfg, {"slots": block}) if i.level == "error" and i.path == path]
+    assert found, block
+    assert text in found[0].message
+
+
+@pytest.mark.parametrize("block, path, text", [
+    ({"human_slot": -1}, "queue.human_slot", "whole number"),
+    ({"human_slot": True}, "queue.human_slot", "whole number"),
+    ({"human_slot": "1"}, "queue.human_slot", "whole number"),
+    ({"foo": 1}, "queue.foo", "human_slot"),
+])
+def test_queue_rejects_bad_values(tmp_cfg, block, path, text):
+    found = [i for i in slot_issues(tmp_cfg, {"queue": block}) if i.level == "error" and i.path == path]
+    assert found, block
+    assert text in found[0].message
+
+
+@pytest.mark.parametrize("slots, queue", [({"count": 1}, {"human_slot": 0}), ({"count": 16}, {"human_slot": 1}),
+                                          ({"count": 1}, {"human_slot": 99})])
+def test_slots_and_the_queue_accept_their_bounds(tmp_cfg, slots, queue):
+    found = slot_issues(tmp_cfg, {"slots": slots, "queue": queue})
+    assert [i for i in found if i.path.startswith(("slots", "queue")) and i.level == "error"] == []
+
+
+def test_a_bad_slots_value_loads_as_off(tmp_cfg):
+    cfg = load_config(tmp_cfg(lambda data: data.update(slots={"count": "x"}, queue={"human_slot": "y"})))
+    assert cfg.slots.count == 1 and cfg.queue.human_slot == 1
+    assert load_config(tmp_cfg(lambda data: data.update(slots={"count": 3}, queue={"human_slot": 0}))).slots.count == 3
+
+
+def test_slots_warn_when_nothing_uses_the_slot(tmp_cfg):
+    def warned(patch) -> list[Issue]:
+        return [i for i in slot_issues(tmp_cfg, patch) if i.level == "warning" and i.path == "slots.count"]
+
+    found = warned({"slots": {"count": 2}})
+    assert found and "uses {slot}" in found[0].message
+    assert not warned({"slots": {"count": 1}})
+    assert not warned({"slots": {"count": 2}, "defaults": {"env": {"PORT": "5543{slot}"}}})
+
+    def in_run(data: dict) -> None:
+        data["slots"] = {"count": 2}
+        data["gates"]["floor"]["run"] = "pytest --db app-test-{slot}"
+    assert not warned(in_run)
+
+    def in_affected(data: dict) -> None:
+        data["slots"] = {"count": 2}
+        data["gates"]["floor"]["affected"] = {"run": "pytest -p app-{slot} {paths}"}
+    assert not warned(in_affected)
+
+    def doubled(data: dict) -> None:
+        data["slots"] = {"count": 2}
+        data["defaults"]["env"] = {"A": "${slot}", "B": "{{slot}}"}
+    assert warned(doubled)  # a shell `${slot}` and a doubled `{{slot}}` are not the token
+
+
+def test_slots_warn_when_the_queue_keeps_them_all_free(tmp_cfg):
+    def warned(slots, queue) -> list[Issue]:
+        found = slot_issues(tmp_cfg, {"slots": slots, "queue": queue, "defaults": {"env": {"P": "{slot}"}}})
+        return [i for i in found if i.level == "warning" and i.path == "queue.human_slot"]
+
+    found = warned({"count": 2}, {"human_slot": 2})
+    assert found and "never starts a run" in found[0].message
+    assert not warned({"count": 2}, {"human_slot": 1})
+    assert not warned({"count": 1}, {"human_slot": 5})
+
+
+def test_affected_allows_the_slot_placeholder_too(tmp_cfg):
+    def affected(run):
+        return {"gates": {"floor": {"run": "true", "affected": {"run": run, "paths": ["**/*.py"]}}}}
+
+    assert ("error", "gates.floor.affected.run") not in errors(
+        issues_for(tmp_cfg, affected("pytest -p app-{slot} {paths}")))
+    found = [i for i in issues_for(tmp_cfg, affected("pytest {other} {paths}")) if i.level == "error"
+             and i.path == "gates.floor.affected.run"]
+    assert found and "`{paths}` and `{slot}`" in found[0].message
+
+
 def test_a_wrong_wave_review_is_refused(tmp_cfg):
     found = route_issues(tmp_cfg, {"profiles": {"M": {"wave_review": "no"}}})
     assert ("error", "route.profiles.M.wave_review") in errors(found)

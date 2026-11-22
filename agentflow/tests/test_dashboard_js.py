@@ -401,6 +401,17 @@ def test_the_board_query_round_trips_through_the_hash():
     assert js([VIEWS_STUB, "run.js"], "parseRoute(args).view", "#/run/r1/gates") == "run"
 
 
+def test_parked_labels_name_each_parked_step():
+    card = {"parked": [{"key": "build/build/task-3/implement", "label": "Task 3 · implement", "kind": "needs_human",
+                        "summary": "needs a decision", "since": "2026-11-22T00:00:00+00:00"},
+                       {"key": "build/build/task-2/implement", "label": "", "kind": "blocked", "summary": "", "since": None}]}
+    assert js(["board.js"], "parkedLabels(args.card)", {"card": card}) == [
+        {"text": "parked: Task 3 · implement", "title": "needs a decision"},
+        {"text": "parked: build/build/task-2/implement", "title": ""}]
+    assert js(["board.js"], "parkedLabels(args.card)", {"card": {"parked": []}}) == []
+    assert js(["board.js"], "parkedLabels(args.card)", {"card": {}}) == []
+
+
 def test_done_shows_the_newest_first_up_to_the_cap():
     done = [{"run_id": f"r{i}", "ended_at": f"2026-11-{10 + i:02d}T00:00:00+00:00"} for i in range(5)]
     got = js(["board.js"], "doneCards(args, 3, false)", done)

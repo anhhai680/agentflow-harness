@@ -7,6 +7,19 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.2] - 2026-11-22
+
+### Added
+
+- A board card shows a live run's slot number (a run that has ended shows none) and a badge for each parked step, with its summary as the badge title.
+- `slots.count` (1 = off, at most 16) and `queue.human_slot` (default 1) are config keys with a Settings form section and `validate` checks, and `{slot}` is allowed in a gate's `affected.run` beside `{paths}`; `validate` warns when slots are on and nothing uses `{slot}`, or when `human_slot` is not below `count`. The keys do their work through the lines below, and with `slots.count: 1` a run behaves as before.
+- With `slots.count` above 1, every run takes a slot number (`0` to `count - 1`) when it starts and keeps it while it is live (`slot_acquired`, the run's `state.json` `slot`), and `{slot}` in `defaults.env`, a gate's `run` and its `affected.run` is that number in the runner's config. A start with every slot held is refused before it creates a run or a worktree (`error: all N slots are held: ...`); a resumed run keeps its number unless `slots.count` was lowered below it, when it takes a free one (or is refused, changing nothing); and `agentflow status <run>` shows `slot:`. Slots can be turned on while runs are live: a live run that started with them off counts as holding `0` and takes its number at its next phase or resume, and a reload that finds no free slot is skipped (`config_reload_skipped`). With `slots.count: 1` nothing changes.
+- With `slots.count` above 1, `agentflow queue` starts a run only while more than `queue.human_slot` slots are free, so a slot stays open for a run started by hand, and it reports `waiting for a free slot: ...` once per change; `--max-parallel` still caps it, and with slots off nothing changes.
+
+### Changed
+
+- A gate's `resource` now holds across the runs of a repository, not only within one run: the gate takes a file lock in the state dir's `locks/` around its command, on the plain path too, and a gate that had to wait records `resource_wait_s` on its `gate_result`.
+
 ## [3.1] - 2026-11-22
 
 ### Added

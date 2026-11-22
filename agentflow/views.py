@@ -307,6 +307,17 @@ def _card_agents(run: Run, live: list[dict]) -> list[dict]:
     return out
 
 
+PARKED_SUMMARY_MAX = 200
+
+
+def _card_parked(state: dict) -> list[dict]:
+    """The run's parked steps for its card, oldest first: `{key, label, kind, summary, since}`."""
+    items = [i for i in (state.get("parked") or {}).values() if isinstance(i, dict) and i.get("key")]
+    items.sort(key=lambda i: (i.get("since") or "", i["key"]))
+    return [{"key": i["key"], "label": step_title(i["key"]), "kind": i.get("kind"),
+             "summary": str(i.get("summary") or "")[:PARKED_SUMMARY_MAX], "since": i.get("since")} for i in items]
+
+
 def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metrics: dict) -> dict:
     state = run.state
     phases = list(cfg.phases)
@@ -324,6 +335,7 @@ def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metri
     waiting = state.get("waiting")
     step = state.get("step")
     issue = (state.get("params") or {}).get("issue")
+    slot = state.get("slot") if state.get("status") not in TERMINAL else None  # an ended run gave its number back
     return {
         "run_id": run.id,
         "lane": state.get("pipeline"),
@@ -346,6 +358,8 @@ def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metri
         "soft_budget": state.get("soft_budget_usd"),  # None: a run started before the soft budget
         "gates": _last_gates(state),
         "review_skipped": _review_skips(state),
+        "slot": slot if isinstance(slot, int) and not isinstance(slot, bool) else None,
+        "parked": _card_parked(state),
         "phase_since": since,
         "time_in_phase_s": _age(now, since),
         "waiting": {k: waiting.get(k) for k in ("kind", "key", "summary", "since")} if waiting else None,

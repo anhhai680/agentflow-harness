@@ -503,7 +503,7 @@ def test_the_yaml_tab_may_send_the_whole_file(dash):
 def _loop(flow_repo, monkeypatch):
     monkeypatch.setattr(pack, "pack_config", lambda repo: Path(flow_repo.cfg.path))  # the run's repo's own pack
     run = flow_repo.new_run()
-    return pipeline._Loop(run, flow_repo.cfg, RunOptions()), run
+    return pipeline._Loop(run, flow_repo.cfg, RunOptions(), 0), run
 
 
 def _rewrite(path: Path, edit) -> None:
@@ -542,7 +542,7 @@ def test_a_live_runner_keeps_its_config_when_the_new_one_is_not_usable(flow_repo
 def test_a_runner_on_another_config_never_reloads_it(flow_repo, monkeypatch):
     monkeypatch.setattr(pack, "pack_config", lambda repo: PYTHON_CONFIG)
     run = flow_repo.new_run()
-    loop = pipeline._Loop(run, flow_repo.cfg, RunOptions())
+    loop = pipeline._Loop(run, flow_repo.cfg, RunOptions(), 0)
     _rewrite(Path(flow_repo.cfg.path), lambda d: d["defaults"].update(step_timeout_min=7))
     loop.reload()
     assert loop.cfg is flow_repo.cfg
@@ -1166,6 +1166,22 @@ def test_the_form_sets_the_parallel_keys(shipped):
             form(shipped, (["parallel", "max_subagents"], bad))
     with pytest.raises(EditError):
         form(shipped, (["parallel", "serial_paths"], "uv.lock"))
+
+
+def test_the_form_sets_the_slot_keys(shipped):
+    fields = {tuple(f["key"]): f for s in config_edit.form_fields(shipped)["sections"] for f in s["fields"]}
+    assert fields[("slots", "count")]["kind"] == "int"
+    assert (fields[("slots", "count")]["min"], fields[("slots", "count")]["max"]) == (1, 16)
+    assert fields[("queue", "human_slot")]["kind"] == "int"
+    assert (fields[("queue", "human_slot")]["min"], fields[("queue", "human_slot")]["max"]) == (0, 16)
+    proposal = form(shipped, (["slots", "count"], 3), (["queue", "human_slot"], 0))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    cfg = load_config(shipped)
+    assert cfg.slots.count == 3 and cfg.queue.human_slot == 0
+    for bad in (0, 17, True, "3"):
+        with pytest.raises(EditError):
+            form(shipped, (["slots", "count"], bad))
 
 
 def test_the_wave_skill_and_review_keys_are_protected(shipped):
