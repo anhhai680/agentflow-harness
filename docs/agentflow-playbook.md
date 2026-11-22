@@ -392,7 +392,23 @@ The queue reads the pack's `work_source`: a capability map's rows (`kind: capabi
 
 A module is done when its plan is fully checked and its PR is merged. A module `issue-<N>` (an issue-backed run's) is also done, as `issue closed`, once issue #N is closed on GitHub and no run of it is live; `agentflow backlog undone` overrides that, as it does origin evidence. The queue starts ready modules in the work source's order, never above `--max-parallel`. A run that is waiting for you, paused or held keeps its slot but does not block the others. The one exception is a run held on `ci_pending` (watching CI checks still pending, `ci.watch_max_h`): it frees its slot while it waits. The queue prints `queue: <module> blocked — <reason>` once per change: an unauthenticated `gh`, a failed, cancelled or crashed run, a start that failed, an unknown dependency, a dependency cycle. Failed and crashed runs are never restarted automatically. Only one `agentflow queue` runs at a time, and its start output goes to `<state dir>/runs/queue.log`.
 
-**Slots and the human slot.** With `slots.count` above 1, a run also holds a slot number from its start until it is terminal, and that includes a run waiting for you, paused, held or watching CI (`ci_pending`): its containers are still up on that number, so unlike the `--max-parallel` count, a CI watch does not free it. The queue then starts a run only while both limits allow it: fewer than `--max-parallel` runs are counting, and more than `queue.human_slot` slots are free (so `slots.count - queue.human_slot` runs at most). The slots left are for a run you start by hand, which may take the reserved one. A module the queue holds back for want of a slot is reported once as `queue: <module> blocked — waiting for a free slot: <held> of <count> held, queue.human_slot keeps <n> free`, and it starts on a later tick once a run ends. With `slots.count: 1` slots are off and `queue.human_slot` does nothing.
+**Several runs at once.** Runs of one repository share its ports, databases and containers, so by default two live runs would collide. `slots.count` (1 by default, which is off; at most 16) gives each live run its own number, from `0` to `count - 1`, and `{slot}` in a `defaults.env` value, a gate's `run` and its `affected.run` is replaced by that number in the runner's config (§14 lists where the token is and isn't replaced). Put it wherever a run needs a thing of its own:
+
+```yaml
+slots: {count: 3}
+defaults:
+  env:
+    POSTGRES_HOST_PORT: "5543{slot}"      # 55430, 55431, 55432
+gates:
+  postgres_up:
+    run: docker compose -p app-test-{slot} up -d --wait
+```
+
+A run takes the lowest free number when it starts (`slot_acquired`, and `slot` in `agentflow status <run>` and on the Board card). It keeps the number while it is live: waiting for you, awaiting approval, paused, held, stopped with an error, or watching CI (`ci_pending`), because its containers are still up. It gives the number back only at `done`, `failed` or `cancelled`. A resumed run keeps its number, unless `slots.count` was lowered below it: it then takes a free one (`slot_acquired` with `previous`), and a retried run may come back on another number, so its earlier gate passes are not reused. A start with every slot held is refused before it creates anything: `error: all 3 slots are held: 0 by <run>, 1 by <run>, 2 by <run>; cancel one of them or raise slots.count`. Free one with `agentflow cancel <run>`, or raise `slots.count`. With `slots.count: 1` there is no `slot_acquired` event, no run is refused and `{slot}` renders as `0`.
+
+What cannot be multiplied (a shared cache, a license server, one tool that takes a global lock) is a `resource` on its gates (§14): a file lock in the state dir holds it across all runs, so two such gates never overlap. A gate that had to wait for it records `resource_wait_s` on its `gate_result`, which is how you see what the lock costs. A `{slot}` is for what can be multiplied; a `resource` is for what cannot.
+
+**Slots and the human slot.** The queue counts slots too. With `slots.count` above 1 it starts a run only while both limits allow it: fewer than `--max-parallel` runs are counting, and more than `queue.human_slot` slots are free (so `slots.count - queue.human_slot` runs at most). Unlike the `--max-parallel` count, a CI watch does not free a slot. The slots left are for a run you start by hand, which may take the reserved one. A module the queue holds back for want of a slot is reported once as `queue: <module> blocked — waiting for a free slot: <held> of <count> held, queue.human_slot keeps <n> free`, and it starts on a later tick once a run ends. With `slots.count: 1` slots are off and `queue.human_slot` does nothing. On the Board, a card shows `slot N` and a `parked: <step>` badge for each task a stop parked (§8), so a run that goes on with its other tasks is easy to tell from one that waits on you.
 
 ## 10. Cheat sheet
 
