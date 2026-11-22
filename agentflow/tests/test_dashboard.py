@@ -1180,6 +1180,14 @@ def test_approving_plan_starts_build_and_approving_define_rests(dash, flow_repo)
     assert status == 200 and define.refresh()["status"] == "ready"  # `plan` still has its human
 
 
+def test_an_approval_does_not_rest_a_speculating_run(dash, flow_repo):
+    dash.server.cfg = flow_repo.configure(autopilot=True)
+    run = awaiting(flow_repo, "ops", "define")
+    run.emit("speculation_started", phase="plan", after="define", basis={}, sha=None)  # the runner is drafting `plan`
+    status, _, body = dash.post(f"/api/runs/{run.id}/approve", {"target": "define"})
+    assert status == 200 and run.refresh()["status"] != "ready"  # that work is already running: nothing rests
+
+
 def test_a_lane_with_no_plan_steps_goes_straight_on_after_define(dash, flow_repo):
     dash.server.cfg = flow_repo.configure(autopilot=True)
     run = Run.create(flow_repo.cfg, flow_repo.root, "bug", {"task": "lỗi"})

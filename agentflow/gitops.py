@@ -1257,6 +1257,12 @@ def changed_since(worktree: Path, sha: str) -> list[str]:
     return sorted({p for p in (tracked + untracked).split("\0") if p})
 
 
+def changed_between(worktree: Path, a: str, b: str) -> list[str]:
+    """Files that differ between commits `a` and `b`: neither the work tree nor the index is read."""
+    out = _git_or_raise(Path(worktree), "diff", "--name-only", "--no-renames", "-z", a, b)
+    return sorted({p for p in out.split("\0") if p})
+
+
 def diff_stat(worktree: Path, sha: str) -> str:
     """`git diff --stat` of the work tree against `sha` (untracked files are not in it)."""
     return _git_or_raise(Path(worktree), "diff", "--stat", sha).rstrip()

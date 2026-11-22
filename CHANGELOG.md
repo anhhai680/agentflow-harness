@@ -9,6 +9,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Added
 - `autonomy.speculate` (phases that run while the approval before them waits), `autonomy.approvals` (the `off`, `observe` or `auto` ramp for each phase approval, `goal` never `auto`) and `autonomy.ramp_samples` (3 to 50, default 5) are config keys with `validate` checks; `speculate` is a Settings form field, and the other two are protected. They are off by default and do nothing yet.
+- With a phase in `autonomy.speculate`, the runner walks it while the approval before it waits (`plan` while the spec waits), once per revision and only when that approval's review left nothing blocking: the approval stays the run's wait, the walked phase settles at it (it never raises its own approval or approves itself), its steps may change only their `output`, and a stop in it is queued quietly behind the approval and told once it becomes the run's wait. Approving keeps the work and goes on, mid-walk too; rejecting ends the walk at the next step and runs the refine round; approving with `hold` ends it and rests the run as ready. A runner that died or was paused mid-walk goes on with it. The approval page says the phase is being drafted, the approved phase's handoff lists only what it changed up to its approval, and the dashboard doesn't rest a run whose next phase is already being walked (`speculation_started`, `speculation_ended`).
 
 ## [3.3] - 2026-11-22
 

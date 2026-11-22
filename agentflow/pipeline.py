@@ -39,6 +39,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from functools import partial
 from pathlib import Path
 from typing import TextIO
 
@@ -54,7 +55,7 @@ from agentflow.autonomy import (
     phase_findings,
     round_limit,
 )
-from agentflow import constraint, doubt, governor, pack, preflight, route_lane, run_env, slots, work_source
+from agentflow import constraint, doubt, governor, pack, preflight, route_lane, run_env, slots, speculation, work_source
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
@@ -67,6 +68,7 @@ from agentflow.gitops import (
     GitError,
     add_worktree,
     branch_exists,
+    changed_between,
     changed_since,
     commit,
     diff_stat,
@@ -77,7 +79,7 @@ from agentflow.hitl import notify_run, open_refine, raise_hitl
 from agentflow.intake import gather, save
 from agentflow.issue_status import mark, release
 from agentflow.lanes import Executor, Outcome, footer_next
-from agentflow.state import MARKED_DONE_SKIP, TERMINAL, Run
+from agentflow.state import MARKED_DONE_SKIP, TERMINAL, Run, speculating
 
 DEFAULT_SHOW = ["handoff", "diff", "step_results", "skipped_steps", "gates", "review_findings"]
 DONE_STEPS = ("done", "unchanged")
@@ -275,6 +277,8 @@ class _Loop:
         self.opts = opts
         self.agents = make_agents(self.cfg)
         self.config_sha = self._config_sha()
+        self._speculating: str | None = None  # the phase walked while the approval before it waits (`speculate`)
+        self._yield_if = None  # what ends that walk at a step boundary (`speculation.cut`)
 
     def _config_sha(self) -> str | None:
         """The digest of the layer files (engine defaults, the pack, the user file) when the config is the repository's
@@ -323,8 +327,13 @@ class _Loop:
         return self.run.state["status"]
 
     def executor(self) -> Executor:
-        """A fresh executor per phase, so the context (the plan path, ...) reflects the tree now."""
-        return Executor(self.cfg, self.run, self.agents, _ctx(self.cfg, self.run, self.worktree), self.opts.model_overrides)
+        """A fresh executor per phase, so the context (the plan path, ...) reflects the tree now. While the runner walks a
+        phase behind a pending approval, it carries that phase and the check that ends the walk."""
+        executor = Executor(self.cfg, self.run, self.agents, _ctx(self.cfg, self.run, self.worktree),
+                            self.opts.model_overrides)
+        executor.speculating = self._speculating
+        executor.yield_if = self._yield_if
+        return executor
 
     def finish(self) -> str:
         self.run.emit("run_finished")
@@ -353,6 +362,7 @@ class _Loop:
         if state["status"] in ("paused", "error", "ready"):  # a human resumed, or the last runner stopped on an error
             run.emit("run_resumed")
         self.record_env()
+        self.tell_speculative()
         names = list(self.cfg.phases)
         first = self.opts.from_phase or names[0]
         if self.cfg.preflight.enabled and self.preflight(f"{first}/{preflight.PREFLIGHT_STEP}"):
@@ -412,9 +422,14 @@ class _Loop:
         state = run.state
         if halted(state["status"]):  # cancelled, or paused by a human since the last phase
             return state["status"]
+        self.end_left_speculation()
+        state = run.state
         waiting = state["waiting"]
         if waiting is not None and waiting.get("kind") == "phase_approval":
-            return "awaiting_approval"
+            if waiting.get("phase") == name:  # a resumed runner picks up the walk behind this approval
+                return self.speculate(names, index, self.executor())
+            if self._speculating != name:
+                return "awaiting_approval"
         row = state["phases"].get(name) or {}
         executor = self.executor()
         if refining(state, name):
@@ -469,8 +484,10 @@ class _Loop:
             ran = ran or stepped
             if outcome == "stopped":
                 self.run.refresh()
-                waiting = self.run.state["waiting"]
+                waiting = executor.current_wait()
                 if waiting is not None and executor.handled(waiting):
+                    return outcome, ran
+                if waiting is not self.run.state["waiting"]:  # queued behind the approval it walks behind: not the wait
                     return outcome, ran
             if outcome != "stopped" or not resolver.take_over():
                 return outcome, ran
@@ -483,28 +500,119 @@ class _Loop:
         `reconciles` step gets reconcile rounds on its doubt review's findings first (`settle_doubt`)."""
         name = names[index]
         phase = self.cfg.phases[name]
+        self.catch_up_handoffs(names, index, executor)
         if needs_approval(phase):
             lane = self.run.state["pipeline"]
             if doubt.reconcile_steps(phase, lane):  # any other approval phase settles exactly as it always has
                 walked, outcome = self.settle_doubt(names, index, executor, lane)
                 if walked:
                     return outcome
+            if self.held_back(name):
+                return "awaiting_approval"
             raise_phase_approval(self.cfg, self.run, name)
-            return "awaiting_approval"
+            return self.speculate(names, index, executor)
         findings = phase_findings(self.cfg, self.run, name)
         tree = snapshot(self.worktree) if findings else ""
         for key in dict.fromkeys(f["key"] for f in findings):  # for the pull request: this round's, kept per step
             self.run.emit("step_findings", key=key, findings=[f for f in findings if f["key"] == key], tree=tree)
         blocking = blocking_of(self.cfg, findings)
         if not blocking:
+            if self.held_back(name):
+                return "awaiting_approval"
             self.run.emit("phase_approved", by=AUTO_BY, phase=name, sha=head(self.worktree))
             self.hand_off(names, index, executor)
             return None
         if finding_rounds(self.run, name) < round_limit(self.cfg, name, self.run.state.get("route")):
             open_refine(self.run, name, AUTO_BY, findings_note(blocking))
             return self.phase(names, index)
+        if self.held_back(name):
+            return "awaiting_approval"
         raise_phase_approval(self.cfg, self.run, name)
-        return "awaiting_approval"
+        return self.speculate(names, index, executor)
+
+    def held_back(self, name: str) -> bool:
+        """Whether `name` is the phase walked behind a pending approval: it settles at that approval, so it never
+        approves itself or raises its own (either would take the approval's place as the run's wait)."""
+        record = speculating(self.run.refresh())
+        return record is not None and record["phase"] == name
+
+    def speculate(self, names: list[str], index: int, executor: Executor) -> str | None:
+        """`names[index]` raised its approval: walk the phase after it while the approval waits, when
+        `speculation.due` says so. The walk settles at that approval; a stop in it is queued behind the approval,
+        quietly. Between steps the walk reads what the person did (`speculation.cut`): an approval lets it go on as a
+        normal phase, a rejection ends it and the approval phase's refine round runs now, and an approval with `hold`
+        ends it and the run rests as ready. A revision of the approval phase is walked once (`speculation.basis`); a
+        runner that died or was paused mid-walk goes on with it (no new `speculation_started`)."""
+        run, after = self.run, names[index]
+        if self._speculating is not None or self.opts.dry_run:  # never more than one phase ahead
+            return "awaiting_approval"
+        run.refresh()
+        nxt = speculation.due(self.cfg, run, names, index, self.opts.to_phase)
+        if nxt is None:
+            return "awaiting_approval"
+        basis = speculation.basis(self.cfg.phases[after], run.state["pipeline"], executor.ctx, self.worktree)
+        record, ended = speculation.last_record(run.events.read(), nxt)
+        same = record is not None and record.get("after") == after and record.get("basis") == basis
+        if same and ended:
+            return "awaiting_approval"
+        if not same:
+            write_handoff(self.cfg, run, after)  # provisional, for the walked phase's `{handoff}`: no `handoff_written`
+            run.emit("speculation_started", phase=nxt, after=after, basis=basis, sha=head(self.worktree))
+        self._speculating = nxt
+        self._yield_if = partial(speculation.cut, after=after)
+        try:
+            outcome = self.phase(names, names.index(nxt))
+        finally:
+            self._speculating = None
+            self._yield_if = None
+        state = run.refresh()
+        cut = speculation.cut(state, after)
+        if cut == "rejected":
+            run.emit("speculation_ended", phase=nxt, outcome="rejected")
+            return self.phase(names, index)
+        if state["status"] in TERMINAL:
+            run.emit("speculation_ended", phase=nxt, outcome="halted")
+            return state["status"]
+        if state["status"] == "paused":  # the record stays open: the next `advance` goes on with the walk
+            return state["status"]
+        if speculating(state) is not None:  # the approval still waits
+            queued = any(w.get("speculative") and str(w.get("key") or "").split("/")[0] == nxt
+                         for w in state["waiting_queue"])
+            run.emit("speculation_ended", phase=nxt, outcome="stopped" if queued else "finished")
+            return "awaiting_approval"
+        run.emit("speculation_ended", phase=nxt, outcome="approved")
+        self.tell_speculative()
+        if cut == "ready":  # approved with `hold`: the run rests, and the walked phase goes on from its rows later
+            return self.status()
+        return outcome
+
+    def end_left_speculation(self) -> None:
+        """End a speculation no runner walks any more (this one was stopped, or died, mid-walk) once the person decided
+        on the approval it waited behind: `rejected` for a rejection, else `approved`. Before anything else of the
+        phase runs, so a re-raised approval never finds the old record and queues the walked phase's stops on it."""
+        if self._speculating is not None:
+            return
+        state = self.run.state
+        record = state.get("speculation")
+        if not record or speculating(state) is not None:
+            return
+        outcome = "rejected" if speculation.cut(state, record["after"]) == "rejected" else "approved"
+        self.run.emit("speculation_ended", phase=record["phase"], outcome=outcome)
+
+    def catch_up_handoffs(self, names: list[str], index: int, executor: Executor) -> None:
+        """Write the handoff of each phase before `names[index]` a person approved while the runner walked on (an
+        approval that came mid-speculation): before this phase settles, so its handoff comes first."""
+        for i, name in enumerate(names[:index]):
+            row = self.run.refresh()["phases"].get(name) or {}
+            if row.get("status") == "approved" and not row.get("handoff"):
+                self.hand_off(names, i, executor)
+
+    def tell_speculative(self) -> None:
+        """Tell a person, once, of the run's wait when it is a stop the walked phase queued quietly behind an approval
+        that has since been given (`_tell_once` keeps `hitl_notified` on it)."""
+        wait = self.run.refresh()["waiting"]
+        if wait is not None and wait.get("speculative"):
+            self.executor()._tell_once(wait)
 
     def settle_doubt(self, names: list[str], index: int, executor: Executor, lane: str) -> tuple[bool, str | None]:
         """A `needs_approval: true` phase with a reconcile step: open a reconcile round on its review's blocking
@@ -614,11 +722,16 @@ def _one_line(text: str) -> str:
 
 
 def _artifacts(run: Run, phase: str) -> list[str]:
-    sha = (run.state["phases"].get(phase) or {}).get("start_sha")
+    """What the phase changed: since it started, or, once approved, up to the commit its approval was asked on, so a
+    phase the runner walked behind that approval (`speculate`) never shows in it."""
+    row = run.state["phases"].get(phase) or {}
+    sha = row.get("start_sha")
     worktree = run.state.get("worktree")
     if not sha or not worktree:
         return []
     try:
+        if row.get("status") == "approved" and row.get("approval_sha"):
+            return changed_between(Path(worktree), sha, row["approval_sha"])
         return changed_since(Path(worktree), sha)
     except GitError:
         return []
@@ -802,6 +915,11 @@ def approval_text(cfg: Config, run: Run, phase: str) -> str:
     }
     shown = [builders[item]() for item in cfg.phase_approval.get("show", DEFAULT_SHOW) if item in builders]
     lead += _approval_note(cfg, run, phase)
+    names = list(cfg.phases)
+    nxt = (speculation.due(cfg, run, names, names.index(phase), (run.state.get("options") or {}).get("to_phase"))
+           if phase in names else None)
+    if nxt is not None:  # the runner walks it behind this approval (`_Loop.speculate`)
+        lead.append(speculation.page_line(phase, nxt))
     previous = (run.state["phases"].get(phase) or {}).get("approval_sha")
     if round_ and previous:  # after a human's refine round: what changed since they last looked, step by step
         shown = [

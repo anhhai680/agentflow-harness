@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -55,7 +56,7 @@ from agentflow.gates import (GateResult, agent_checks, failure_report, gates_ok,
                              resume_report, run_doc_checks, run_gates_reusing)
 from agentflow.gates import resolve as resolve_gates
 from agentflow.gitops import (CommitRejected, GitError, NothingToCommit, changed_since, commit, commit_artifact,
-                              commits_between, git_state_changes, head, outside_only, reconcile_baseline)
+                              commits_between, git_state_changes, head, outside_only, reconcile_baseline, shown)
 from agentflow.governor_lane import GovernorLane
 from agentflow.guards import Violation, changed_paths, check_step, path_matches, snapshot
 from agentflow.hitl import ResultError, StepResult, clean_fact, notify_run, raise_hitl, read_result
@@ -726,6 +727,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
     def worktree(self) -> Path:
         return Path(self.run.state.get("worktree") or self.ctx.repo)
 
+    def _fenced(self, step: Step, key: str) -> bool:
+        """Whether the step may change only its `output` (`_outside_output`, `commit_artifact`): a reconcile step, and
+        a step with an `output` in the phase the runner walks while the approval before it waits (`speculating`)."""
+        return step.reconciles or (bool(step.output) and self.speculating == key.split("/")[0])
+
     # -- the lifecycle
 
     def run_agent_step(
@@ -767,7 +773,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
             return "skipped"
         if status in ("done", "unchanged"):
             return "done"
-        if state["waiting"] is not None or halted(state["status"]):
+        if self.current_wait() is not None or halted(state["status"]):
             return "stopped"
 
         agent_name = phase.agent or self.cfg.defaults.agent
@@ -859,7 +865,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
         # A reconcile step starts only on a tree that holds nothing but its artifact: a stray file left from an earlier
         # stop would otherwise ride along (and the step must not take it for its own work). Checked before the
         # snapshots below, which run `git add`; a resumed step is checked once its earlier agents are gone.
-        if step.reconciles and not (resuming and started is not None):
+        if self._fenced(step, key) and not (resuming and started is not None):
             outside = self._reconcile_start(sr, fresh=True)
             if outside:
                 return self._fail(sr, outside)
@@ -870,7 +876,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
                 self.run.emit("step_finished", key=key, status="done", summary=last.get("summary", ""), sha=last["sha"])
                 return "done"
             wait_for_agents(self.run, self.cfg, key, self._timeout_s())
-            if step.reconciles:  # after the wait: an agent left running could still change the tree until then
+            if self._fenced(step, key):  # after the wait: an agent left running could still change the tree until then
                 outside = self._reconcile_start(sr, fresh=False)
                 if outside:
                     return self._fail(sr, outside)
@@ -989,8 +995,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
                 return self._fail(sr, called.refused)
             violations = check_step(self.cfg, self.worktree, sr.start_head, sr.start_tree, called.after,
                                     outcome.tool_calls, sr.step.forbid, read_only=self._guard_read_only(sr))
-            if sr.step.reconciles:
-                violations = [*violations, *self._outside_output(sr)]
+            if self._fenced(sr.step, sr.key):
+                violations = [*violations, *self._outside_output(sr, missing_ok=True)]
             if violations:
                 return self._fail(sr, violations)
             if outcome.interruption is not None and outcome.interruption.kind == "cli_flags":
@@ -1217,7 +1223,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
                 tool=denial.get("tool_name") or denial.get("tool"),
                 input=denial.get("tool_input", denial.get("input")), **by_design,
             )
-        if sr.step.reconciles and sr.reconcile_base is not None:  # before the snapshot: it runs `git add`
+        if self._fenced(sr.step, sr.key) and sr.reconcile_base is not None:  # before the snapshot: it runs `git add`
             planted = git_state_changes(self.worktree, sr.reconcile_base)
             if planted:
                 return _Called(outcome, sr.start_tree, planted)
@@ -1384,7 +1390,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
         return [str(name) for name in (attempts[-1].get("gates") or [])] if attempts else []
 
     def _finish(self, sr: _StepRun, result: StepResult) -> Outcome:
-        if sr.step.reconciles:  # checked again after the gates, before any snapshot or commit
+        if self._fenced(sr.step, sr.key):  # checked again after the gates, before any snapshot or commit
             outside = self._outside_output(sr)
             if outside:
                 return self._fail(sr, outside)
@@ -1400,7 +1406,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
                 parts = [refine_subject(sr.step.id, subject), result.summary.strip(), refine_note_block(refine)]
             message = "\n\n".join(part for part in parts if part)
             try:
-                if sr.step.reconciles:  # its artifact alone, and the commit checked to hold exactly that
+                if self._fenced(sr.step, sr.key):  # its artifact alone, and the commit checked to hold exactly that
                     sha = commit_artifact(self.worktree, message, self.cfg, fmt(str(sr.step.output), self.ctx),
                                           expected_head=runner_head(self.run))
                 else:
@@ -1534,15 +1540,22 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
                 extra = "### Left to do\n\n" + "\n".join(lines)
         self._stop(sr, CAP_KINDS[cap], summary, extra=extra)
 
-    def _outside_output(self, sr: _StepRun) -> list[Violation]:
-        """For a `reconciles` step: what in the tree is more than an edit of its `output`, against the step's baseline
-        (`gitops.outside_only`). A step with no `output` has nothing it may edit, and one with no baseline has nothing
-        to be checked against: both are violations too."""
+    def _outside_output(self, sr: _StepRun, missing_ok: bool = False) -> list[Violation]:
+        """For a fenced step (`_fenced`): what in the tree is more than an edit of its `output`, against the step's
+        baseline (`gitops.outside_only`). A step with no `output` has nothing it may edit, and one with no baseline has
+        nothing to be checked against: both are violations too. With `missing_ok`, a step that is not a reconcile step
+        (it writes its `output`, as a speculated phase's step does) may not have written it yet: before it starts, and
+        after a call that stopped short of it. A reconcile step revises a file that is there, so it never may."""
         if not sr.step.output:
             return [Violation("outside_output", f"reconcile step {sr.step.id} has no output, so it may edit nothing")]
         if sr.reconcile_base is None:
             return [Violation("outside_output", f"reconcile step {sr.step.id} has no baseline to be checked against")]
-        return outside_only(self.worktree, fmt(str(sr.step.output), self.ctx), sr.reconcile_base)
+        rel = fmt(str(sr.step.output), self.ctx)
+        found = outside_only(self.worktree, rel, sr.reconcile_base)
+        if missing_ok and not sr.step.reconciles and not os.path.lexists(self.worktree / rel):
+            missing = f"{shown(rel)} was deleted or is not a regular file"
+            found = [v for v in found if v.detail != missing]
+        return found
 
     def _reconcile_start(self, sr: _StepRun, fresh: bool) -> list[Violation]:
         """The baseline a reconcile step is checked against, then the check itself.
@@ -1569,7 +1582,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
         branch = self.run.state.get("branch")
         if recorded is not None and not fresh:
             sr.reconcile_base = {**recorded, "git_state": original or recorded.get("git_state")}
-            return self._outside_output(sr)
+            return self._outside_output(sr, missing_ok=True)
         if original is not None:
             changed = git_state_changes(self.worktree, {"branch": branch, "git_state": original})
             if changed:
@@ -1582,7 +1595,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
             base["git_state"] = original
         sr.reconcile_base = base
         self.run.emit("reconcile_baseline", key=sr.key, baseline=base)
-        return self._outside_output(sr)
+        return self._outside_output(sr, missing_ok=True)
 
     def _fail(self, sr: _StepRun, violations: list[Violation]) -> Outcome:
         """A guard tripped: the step fails with no retry, and a human looks at the tree."""
