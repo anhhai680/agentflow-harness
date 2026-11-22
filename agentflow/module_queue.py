@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agentflow import finished, gitops, governor, pack, sources, work_source
+from agentflow import finished, gitops, governor, pack, slots, sources, work_source
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.gitops import uncommitted_paths
 from agentflow.guards import path_matches
@@ -719,6 +719,10 @@ def queue_tick(
         if entry["status"] != "backlog" or entry["run_id"] or entry["id"] in blocked or not set(entry["deps"]) <= done:
             continue
         if hold is not None or occupied >= max_parallel:
+            break
+        wait = slots.queue_hold(cfg, repo)  # per start: a start made this tick counts
+        if wait is not None:
+            _report(entry, wait, found.prior, say)
             break
         try:
             entry["run_id"] = start(entry["id"])

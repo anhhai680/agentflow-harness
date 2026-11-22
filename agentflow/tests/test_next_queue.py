@@ -29,6 +29,15 @@ MAP = """# Capability map
 | `crm` | crm | platform | SPEC-crm |
 | `settings` | settings | staff-auth | SPEC-settings |
 """
+MAP_FLAT = """# Capability map
+
+| Module id | Responsibility | Depends on | Spec |
+|---|---|---|---|
+| `platform` | base | — | SPEC-platform |
+| `staff-auth` | auth | — | SPEC-staff-auth |
+| `crm` | crm | — | SPEC-crm |
+| `settings` | settings | — | SPEC-settings |
+"""
 PLAN_OPEN = "# Plan\n\n### Task 1: One\n\n- [x] done\n\n### Task 2: Two\n\n- [ ] open\n"
 PLAN_DONE = "# Plan\n\n### Task 1: One\n\n- [x] done\n"
 PLAN_DEFERRED = (PLAN_DONE + "\n### Task 2: Later\n\n> **Deferred (SPEC-x C1, decided 2026-11-03).** "
@@ -309,6 +318,84 @@ def test_queue_a_deferred_task_does_not_hold_its_module_open(qrepo, monkeypatch)
     go = Starter(qrepo)
     assert queue_tick(qrepo.cfg, qrepo.root, 5, go) == ["staff-auth", "crm"]
     assert {m["id"]: m["status"] for m in QueueState.load(qrepo.root).modules}["platform"] == "done"
+
+
+class SlotStarter(Starter):
+    """A `Starter` whose runs hold a slot of `cfg`, as a real start does."""
+
+    def __init__(self, fr, cfg) -> None:
+        super().__init__(fr)
+        self.cfg = cfg
+
+    def __call__(self, module: str) -> str:
+        from agentflow import slots
+        from agentflow.state import Run
+
+        self.started.append(module)
+        run = Run.create(self.cfg, self.fr.root, "feature", {"module": module})
+        slots.acquire(self.cfg, run)
+        self.run_ids[module] = run.id
+        return run.id
+
+
+def _slot_cfg(qrepo, count: int, human_slot: int):
+    return qrepo.configure({"slots": {"count": count}, "queue": {"human_slot": human_slot}})
+
+
+def test_the_queue_leaves_the_human_slot_free(qrepo, monkeypatch):
+    cfg = _slot_cfg(qrepo, 3, 1)
+    go = SlotStarter(qrepo, cfg)
+    # four ready modules: platform alone is ready first, then its dependents; make them all roots
+    write(qrepo.root, "docs/specs/CAPABILITY-MAP.md", MAP_FLAT)
+    commit_all(qrepo.root)
+    messages: list[str] = []
+    assert queue_tick(cfg, qrepo.root, 5, go, log=messages.append) == ["platform", "staff-auth"]
+    entries = {m["id"]: m for m in QueueState.load(qrepo.root).modules}
+    assert entries["crm"]["blocked"].startswith("waiting for a free slot")
+    assert entries["crm"]["run_id"] is None
+    assert [m for m in messages if "waiting for a free slot" in m] == [
+        "queue: crm blocked \u2014 waiting for a free slot: 2 of 3 held, queue.human_slot keeps 1 free"]
+
+
+def test_the_slot_wait_is_said_once_until_it_changes(qrepo):
+    cfg = _slot_cfg(qrepo, 3, 1)
+    go = SlotStarter(qrepo, cfg)
+    write(qrepo.root, "docs/specs/CAPABILITY-MAP.md", MAP_FLAT)
+    commit_all(qrepo.root)
+    queue_tick(cfg, qrepo.root, 5, go)
+    again: list[str] = []
+    assert queue_tick(cfg, qrepo.root, 5, go, log=again.append) == []
+    assert not [m for m in again if "waiting for a free slot" in m]
+
+
+def test_a_freed_slot_lets_the_queue_start_again(qrepo):
+    cfg = _slot_cfg(qrepo, 3, 1)
+    go = SlotStarter(qrepo, cfg)
+    write(qrepo.root, "docs/specs/CAPABILITY-MAP.md", MAP_FLAT)
+    commit_all(qrepo.root)
+    assert queue_tick(cfg, qrepo.root, 5, go) == ["platform", "staff-auth"]
+    from agentflow.state import Run
+
+    Run.load(qrepo.root, go.run_ids["platform"]).emit("run_finished")
+    assert queue_tick(cfg, qrepo.root, 5, go) == ["crm"]
+    entries = {m["id"]: m for m in QueueState.load(qrepo.root).modules}
+    assert not entries["crm"].get("blocked")
+
+
+def test_max_parallel_still_caps_the_queue_with_slots_on(qrepo):
+    cfg = _slot_cfg(qrepo, 4, 0)
+    go = SlotStarter(qrepo, cfg)
+    write(qrepo.root, "docs/specs/CAPABILITY-MAP.md", MAP_FLAT)
+    commit_all(qrepo.root)
+    assert queue_tick(cfg, qrepo.root, 2, go) == ["platform", "staff-auth"]
+
+
+def test_slots_off_ignores_the_human_slot(qrepo):
+    cfg = _slot_cfg(qrepo, 1, 1)
+    go = SlotStarter(qrepo, cfg)
+    write(qrepo.root, "docs/specs/CAPABILITY-MAP.md", MAP_FLAT)
+    commit_all(qrepo.root)
+    assert queue_tick(cfg, qrepo.root, 3, go) == ["platform", "staff-auth", "crm"]
 
 
 def _feature_run(qrepo, module: str, events: list[tuple[str, dict]]):
