@@ -7,6 +7,8 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.2] - 2026-11-22
+
 ### Added
 
 - A board card shows a live run's slot number (a run that has ended shows none) and a badge for each parked step, with its summary as the badge title.
