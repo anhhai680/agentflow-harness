@@ -7,6 +7,9 @@ The rules are pure reads of the config, the run's state and its log; `pipeline._
   blocking finding (a spec a reviewer doubts is not worth planning on).
 - `basis` pins what the speculated phase is planned on: the bytes of each committed `output` of `after`.
   A revision is speculated once (`last_record`): the same basis after a finished speculation walks nothing again.
+- `planned_on` and `replan_due` say whether a phase that was walked (or re-planned) on one basis now follows another:
+  the runner then sends it back once, as a refine round of kind `replan` whose note (`replan_note`) names the changed
+  paths and the `git diff` to read.
 - `cut` reads what the person did at a step boundary: a rejection of `after` (`state["refine"]`) or an approval with
   `hold` (`state["ready"]`) ends the walk there. A plain approval lets it go on as a normal phase.
 
@@ -28,6 +31,8 @@ if TYPE_CHECKING:
     from agentflow.state import Run
 
 OUTCOMES = ("finished", "stopped", "approved", "rejected", "halted")
+REPLAN = "replan"  # `phase_rejected.kind` of the round the runner opens when the basis a phase was planned on changed
+UNSTARTED = (None, "pending", "skipped")  # a phase row that has nothing to re-plan
 
 
 def next_phase(cfg: Config, names: list[str], index: int, lane: str) -> str | None:
@@ -73,6 +78,39 @@ def last_record(events: list[dict], phase: str) -> tuple[dict | None, bool]:
         elif event["type"] == "speculation_ended" and record is not None:
             ended = True
     return record, ended
+
+
+def planned_on(events: list[dict], phase: str) -> tuple[dict[str, str], str] | None:
+    """`(basis, sha)` of the last `speculation_started` or `phase_rejected{kind: replan}` of `phase`: what its work was
+    last written on, and the commit a diff of that basis starts at. None when it was never walked behind an approval."""
+    found: tuple[dict[str, str], str] | None = None
+    for event in events:
+        if event.get("phase") != phase:
+            continue
+        if event["type"] == "speculation_started" or (event["type"] == "phase_rejected" and event.get("kind") == REPLAN):
+            sha = event.get("sha") if event["type"] == "speculation_started" else event.get("from_sha")
+            found = (dict(event.get("basis") or {}), str(sha or ""))
+    return found
+
+
+def replan_due(state: dict, events: list[dict], phase: str, basis: dict[str, str]) -> bool:
+    """Whether `phase` started, was planned on a basis (`planned_on`), and that basis is not `basis`."""
+    if (state["phases"].get(phase) or {}).get("status") in UNSTARTED:
+        return False
+    planned = planned_on(events, phase)
+    return planned is not None and planned[0] != basis
+
+
+def changed(old: dict[str, str], new: dict[str, str]) -> list[str]:
+    """The paths of `new` whose digest is not the one in `old` (a path in only one of them counts as changed)."""
+    return sorted(path for path in {*old, *new} if old.get(path) != new.get(path))
+
+
+def replan_note(paths: list[str], sha: str) -> str:
+    """The note of a `replan` round: which of the approval phase's files changed and the diff to read."""
+    names = ", ".join(f"`{path}`" for path in paths)
+    return (f"The {names} changed after this phase's work was written (at {sha[:12]}). Read the change with "
+            f"`git diff {sha[:12]} HEAD -- {names}`, then update what this phase wrote to match it; keep what still holds.")
 
 
 def cut(state: dict, after: str) -> str | None:

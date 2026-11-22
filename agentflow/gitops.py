@@ -1005,6 +1005,7 @@ def commit_at(repo: Path, ref: str) -> str | None:
 # (commit, every tree down the path, the blob) is hashed and compared with the id that named it, so a loose object an
 # agent rewrote is refused wherever it sits in the chain; `--no-replace-objects` (`HARDENED`) keeps a replace ref out.
 _READ_SHA = re.compile(r"[0-9a-f]{7,64}")
+_FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _HASHES: dict[str, Callable[[bytes], Any]] = {"sha1": hashlib.sha1, "sha256": hashlib.sha256}
 _META_MAX_BYTES = 16 * 1024 * 1024  # a commit or tree object larger than this is refused unread
 _LINK_MAX_BYTES = 4096  # a symlink's target is a path, never longer than this
@@ -1263,9 +1264,24 @@ def changed_between(worktree: Path, a: str, b: str) -> list[str]:
     return sorted({p for p in out.split("\0") if p})
 
 
-def diff_stat(worktree: Path, sha: str) -> str:
-    """`git diff --stat` of the work tree against `sha` (untracked files are not in it)."""
-    return _git_or_raise(Path(worktree), "diff", "--stat", sha).rstrip()
+def commit_paths(worktree: Path, shas: Sequence[str]) -> list[str]:
+    """The files the commits `shas` changed, each against its parent. A value that is not a full commit id is left
+    out, so nothing from an event log reaches git as an option."""
+    full = [sha for sha in shas if isinstance(sha, str) and _FULL_SHA.fullmatch(sha)]
+    if not full:
+        return []
+    out = _git_or_raise(Path(worktree), "show", "--no-renames", "--name-only", "--format=", "-z", *full)
+    return sorted({p.strip("\n") for p in out.split("\0") if p.strip("\n")})
+
+
+def excluding(paths: Sequence[str]) -> list[str]:
+    """The pathspec that leaves `paths` out (`-- . :(exclude,literal)<path>...`), or `[]` for none."""
+    return ["--", ".", *(f":(exclude,literal){path}" for path in paths)] if paths else []
+
+
+def diff_stat(worktree: Path, sha: str, exclude: Sequence[str] = ()) -> str:
+    """`git diff --stat` of the work tree against `sha` (untracked files are not in it), without the `exclude` paths."""
+    return _git_or_raise(Path(worktree), "diff", "--stat", sha, *excluding(exclude)).rstrip()
 
 
 def push(worktree: Path, branch: str, sha: str | None = None) -> None:

@@ -372,3 +372,173 @@ def test_the_spec_handoff_lists_only_the_spec(flow):
     text = (run.dir / "handoffs" / "define.md").read_text(encoding="utf-8")
     assert f"- `{SPEC}`" in text
     assert plan_path(flow) not in text
+
+
+# --------------------------------------------------------------------------- re-plan on a changed spec
+
+
+def replans(run: Run) -> list[dict]:
+    return [e for e in events(run, "phase_rejected") if e.get("kind") == speculation.REPLAN]
+
+
+def reject_after(run: Run, monkeypatch, key: str, times: int = 1) -> list[bool]:
+    """Reject `define` right after the walking runner's `key` returns, the first `times` times it runs: the person
+    acts while the runner is between that step and the next."""
+    real = Executor.run_step
+    done_: list[bool] = []
+
+    def run_step(self, phase, step, prefix):
+        outcome = real(self, phase, step, prefix)
+        if f"{prefix}/{step.id}" == key and len(done_) < times:
+            done_.append(True)
+            reject(run, "define", "me", "Thêm rollback")
+        return outcome
+
+    monkeypatch.setattr(Executor, "run_step", run_step)
+    return done_
+
+
+def test_planned_on_and_replan_due_read_the_last_basis():
+    log = [{"type": "speculation_started", "phase": "plan", "after": "define", "basis": {SPEC: "a"}, "sha": "1" * 40},
+           {"type": "phase_rejected", "phase": "plan", "kind": "reconcile", "basis": {SPEC: "x"}},
+           {"type": "phase_rejected", "phase": "plan", "kind": "replan", "basis": {SPEC: "b"}, "from_sha": "1" * 40},
+           {"type": "speculation_started", "phase": "build", "after": "plan", "basis": {"p": "c"}, "sha": "3" * 40}]
+    assert speculation.planned_on([], "plan") is None
+    assert speculation.planned_on(log[:1], "plan") == ({SPEC: "a"}, "1" * 40)
+    assert speculation.planned_on(log, "plan") == ({SPEC: "b"}, "1" * 40)  # a replan keeps the sha its diff starts at
+    state = {"phases": {"plan": {"status": "running"}}}
+    assert speculation.replan_due(state, log, "plan", {SPEC: "c"})
+    assert not speculation.replan_due(state, log, "plan", {SPEC: "b"})
+    assert not speculation.replan_due(state, log[:0], "plan", {SPEC: "c"})
+    for status in (None, "pending", "skipped"):
+        assert not speculation.replan_due({"phases": {"plan": {"status": status}}}, log, "plan", {SPEC: "c"})
+    assert not speculation.replan_due({"phases": {}}, log, "plan", {SPEC: "c"})
+
+
+def test_the_replan_note_names_the_paths_and_the_diff():
+    note = speculation.replan_note(["a.md", "b.md"], "0123456789abcdef")
+    assert note == ("The `a.md`, `b.md` changed after this phase's work was written (at 0123456789ab). Read the "
+                    "change with `git diff 0123456789ab HEAD -- `a.md`, `b.md``, then update what this phase wrote to "
+                    "match it; keep what still holds.")
+
+
+def test_rejecting_mid_speculation_refines_the_spec_then_replans(flow, monkeypatch):  # Review Focus 2
+    run = begin(flow, {**acts(flow), DRAFT: [DRAFTED, revised(1)]}, to=None)
+    rejected = reject_after(run, monkeypatch, PLAN)
+    assert go(flow, run) == "awaiting_approval"  # the same runner ran define's round and raised it again
+    assert rejected and called(flow, DRAFT) == [DRAFT, DRAFT]
+    assert events(run, "speculation_ended")[0]["outcome"] == "rejected"
+    (replan,) = replans(run)
+    assert "git diff" in replan["note"] and SPEC in replan["note"]
+    started = events(run, "speculation_started")
+    assert len(started) == 2 and run.state["waiting_queue"] == []
+    assert (replan["by"], replan["basis"], replan["from_sha"]) == ("runner", started[1]["basis"], started[0]["sha"])
+    assert started[0]["basis"] != started[1]["basis"]
+    raised = [e["seq"] for e in events(run, "phase_approval_raised") if e["phase"] == "define"]
+    assert len(raised) == 2 and raised[1] < replan["seq"] < started[1]["seq"]
+    assert called(flow, "plan/") == [PLAN, PLAN, PLAN_REVIEW]  # the yield came between plan's steps
+    second = [c for c in flow.calls() if c["step"] == PLAN][1]
+    assert replan["note"] in second["argv"][-1]  # the re-plan reads its note
+    assert run.state["waiting"]["key"] == "define_approved" and not called(flow, "build/")
+    assert (run.state["steps"][PLAN]["status"], run.state["steps"][PLAN_REVIEW]["status"]) == ("done", "done")
+
+
+def test_a_rejection_that_leaves_the_spec_as_it_was_keeps_the_plan(flow):
+    run = begin(flow, {**acts(flow), DRAFT: [DRAFTED, done("giữ nguyên")]}, to=None)
+    assert go(flow, run) == "awaiting_approval"
+    reject(run, "define", "me", "Xem lại")
+    assert go(flow, run) == "awaiting_approval"
+    assert called(flow, DRAFT) == [DRAFT, DRAFT] and not replans(run)
+    assert len(events(run, "speculation_started")) == 1
+    approve(run, "define", by="me")
+    assert go(flow, run) == "awaiting_approval"
+    assert run.state["waiting"]["key"] == "plan_approved" and not replans(run)
+    assert called(flow, "plan/") == [PLAN, PLAN_REVIEW]
+
+
+def test_a_spec_changed_without_a_new_speculation_is_replanned_after_approval(flow):
+    flow.configure({**SPECULATE, "autonomy": {"speculate": ["plan"], "finding_rounds": 2}}, autopilot=True,
+                   edit=with_doubt)
+    run = begin(flow, {REVIEW: [found(LOW), found(HIGH), found(HIGH), found(HIGH)], PLAN: [planned(flow)],
+                       DRAFT: [DRAFTED, revised(1)],
+                       RECONCILE: [revised(2, disp("R1-F1", "actionable")), revised(3, disp("R2-F1", "actionable"))]},
+                to=None)
+    assert go(flow, run) == "awaiting_approval"
+    assert len(events(run, "speculation_started")) == 1
+    reject(run, "define", "me", "Thêm rollback")
+    assert go(flow, run) == "awaiting_approval"
+    assert events(run, "reconcile_stopped")[-1]["reason"] == "bounded"  # a blocking finding is left: no speculation
+    assert len(events(run, "speculation_started")) == 1 and not replans(run)
+    assert called(flow, "plan/") == [PLAN, PLAN_REVIEW]
+    approve(run, "define", by="me")
+    assert go(flow, run) == "awaiting_approval"
+    (replan,) = replans(run)
+    assert seq(run, "phase_approved", phase="define") < replan["seq"]
+    assert replan["from_sha"] == events(run, "speculation_started")[0]["sha"] and SPEC in replan["note"]
+    assert called(flow, "plan/") == [PLAN, PLAN_REVIEW, PLAN, PLAN_REVIEW]
+    assert run.state["waiting"]["key"] == "plan_approved"
+    assert seq(run, "handoff_written", phase="define") < replan["seq"]
+    go(flow, run)
+    assert len(replans(run)) == 1  # once per revision
+
+
+def test_a_replan_is_not_counted_as_a_finding_round(flow, monkeypatch):
+    from agentflow.autonomy import finding_rounds
+
+    flow.configure({**SPECULATE, "autonomy": {"speculate": ["plan"], "finding_rounds": 1},
+                    "phases": {"plan": {"needs_approval": False}}}, autopilot=True, edit=with_doubt)
+    gap = {"severity": "high", "file": plan_path(flow), "line": 1, "text": "Thiếu bước rollback"}
+    run = begin(flow, {**acts(flow), DRAFT: [DRAFTED, revised(1)], PLAN_REVIEW: [found(gap)]}, to="build")
+    reject_after(run, monkeypatch, PLAN)
+    assert go(flow, run) == "awaiting_approval"
+    assert len(replans(run)) == 1
+    rounds = [e for e in events(run, "phase_rejected") if e["phase"] == "plan" and e.get("kind") is None]
+    assert len(rounds) == 1 and rounds[0]["seq"] > replans(run)[0]["seq"]  # the finding still got its round
+    assert finding_rounds(run, "plan") == 1
+    assert called(flow, "plan/") == [PLAN, PLAN, PLAN_REVIEW, PLAN, PLAN_REVIEW]
+
+
+def test_a_spec_rejected_again_during_its_replan_is_replanned_once_more(flow, monkeypatch):  # duty (b)
+    run = begin(flow, {**acts(flow), DRAFT: [DRAFTED, revised(1), revised(2)]}, to=None)
+    reject_after(run, monkeypatch, PLAN, times=2)  # the second lands inside the first re-plan's round
+    assert go(flow, run) == "awaiting_approval"
+    started = events(run, "speculation_started")
+    first, second = replans(run)
+    assert len(started) == 3 and len({str(s["basis"]) for s in started}) == 3
+    assert (first["basis"], second["basis"]) == (started[1]["basis"], started[2]["basis"])  # one per revision
+    assert second["from_sha"] == started[1]["sha"]
+    assert called(flow, "plan/") == [PLAN, PLAN, PLAN, PLAN_REVIEW]  # the cut round is planned again, whole
+    assert (run.state["steps"][PLAN]["status"], run.state["steps"][PLAN_REVIEW]["status"]) == ("done", "done")
+    assert (run.state["refine"]["phase"], run.state["refine"]["kind"]) == ("plan", speculation.REPLAN)
+    assert run.state["waiting"]["key"] == "define_approved" and run.state["waiting_queue"] == []
+    approve(run, "define", by="me")
+    assert go(flow, run) == "awaiting_approval"
+    assert run.state["waiting"]["key"] == "plan_approved" and len(replans(run)) == 2
+
+
+def test_the_re_raised_spec_page_leaves_out_the_speculated_plan(flow):  # duty (e)
+    run = begin(flow, {**acts(flow), DRAFT: [DRAFTED, revised(1)]}, to=None)
+    assert go(flow, run) == "awaiting_approval"
+    assert [e["key"] for e in events(run, "step_committed")].count(PLAN) == 1
+    reject(run, "define", "me", "Thêm rollback")
+    assert go(flow, run) == "awaiting_approval"
+    page = run.inbox_path("define_approved").read_text(encoding="utf-8")
+    assert "## Since the last approval request" in page and f"- `{SPEC}`" in page
+    assert plan_path(flow) not in page and "Plan demo" not in page
+    assert "SPEC-demo.md" in page.split("## Since the last approval request")[1].split("## ")[0]
+    approve(run, "define", by="me")
+    go(flow, run)
+    text = (run.dir / "handoffs" / "define.md").read_text(encoding="utf-8")
+    assert f"- `{SPEC}`" in text and plan_path(flow) not in text
+
+
+def test_a_spec_left_as_it_was_during_its_replan_finishes_that_round_after_approval(flow, monkeypatch):  # duty (b)
+    run = begin(flow, {**acts(flow), DRAFT: [DRAFTED, revised(1), done("giữ nguyên")]}, to=None)
+    reject_after(run, monkeypatch, PLAN, times=2)  # the second lands inside the re-plan, and leaves the spec as it was
+    assert go(flow, run) == "awaiting_approval"
+    assert len(replans(run)) == 1 and len(events(run, "speculation_started")) == 2  # no new revision: no new re-plan
+    assert called(flow, "plan/") == [PLAN, PLAN]
+    approve(run, "define", by="me")
+    assert go(flow, run) == "awaiting_approval"
+    assert run.state["waiting"]["key"] == "plan_approved" and len(replans(run)) == 1
+    assert called(flow, "plan/") == [PLAN, PLAN, PLAN_REVIEW]  # the round's step left goes on from its row

@@ -72,7 +72,9 @@ from agentflow.gitops import (
     changed_between,
     changed_since,
     commit,
+    commit_paths,
     diff_stat,
+    excluding,
     head,
 )
 from agentflow.guards import snapshot
@@ -431,8 +433,10 @@ class _Loop:
                 return self.speculate(names, index, self.executor())
             if self._speculating != name:
                 return "awaiting_approval"
-        row = state["phases"].get(name) or {}
         executor = self.executor()
+        if self._speculating != name and self.replan_after_approval(names, index, executor):
+            state = run.state
+        row = state["phases"].get(name) or {}
         if refining(state, name):
             if self.walk(phase, executor)[0] == "stopped":
                 return self.status()
@@ -557,6 +561,8 @@ class _Loop:
         if same and ended:
             return "awaiting_approval"
         if not same:
+            if speculation.replan_due(run.state, run.events.read(), nxt, basis):  # it was walked on an older revision
+                self.replan(names, names.index(nxt), basis)
             write_handoff(self.cfg, run, after)  # provisional, for the walked phase's `{handoff}`: no `handoff_written`
             run.emit("speculation_started", phase=nxt, after=after, basis=basis, sha=head(self.worktree))
         self._speculating = nxt
@@ -586,6 +592,36 @@ class _Loop:
         if cut == "ready":  # approved with `hold`: the run rests, and the walked phase goes on from its rows later
             return self.status()
         return outcome
+
+    def replan(self, names: list[str], index: int, basis: dict[str, str]) -> None:
+        """Send `names[index]`, last planned on another basis (`speculation.planned_on`), back once: a runner refine
+        round of kind `replan` whose note names the approval phase's changed paths and the `git diff` to read. It is
+        not a finding round (`finding_rounds`), and its `basis` is what the phase is planned on from here."""
+        name = names[index]
+        planned = speculation.planned_on(self.run.events.read(), name)
+        old, sha = planned if planned is not None else ({}, "")
+        note = speculation.replan_note(speculation.changed(old, basis), sha)
+        open_refine(self.run, name, AUTO_BY, note, extra={"kind": speculation.REPLAN, "basis": basis, "from_sha": sha})
+        self.run.refresh()
+
+    def replan_after_approval(self, names: list[str], index: int, executor: Executor) -> bool:
+        """Before `names[index]` walks, not behind an approval: re-plan it (`replan`) when it was walked behind the
+        approval of the phase its last `speculation_started` names, that phase is approved now, and its basis moved
+        since (a revision no speculation ran on, such as one a blocking finding was left in). True when it did. A phase
+        never walked behind an approval reads nothing more than the log, and an approved one is never sent back."""
+        name, run = names[index], self.run
+        if (run.state["phases"].get(name) or {}).get("status") == "approved":
+            return False
+        events = run.events.read()
+        record, _ = speculation.last_record(events, name)
+        after = (record or {}).get("after")
+        if after not in self.cfg.phases or (run.state["phases"].get(after) or {}).get("status") != "approved":
+            return False
+        basis = speculation.basis(self.cfg.phases[after], run.state["pipeline"], executor.ctx, self.worktree)
+        if not speculation.replan_due(run.state, events, name, basis):
+            return False
+        self.replan(names, index, basis)
+        return True
 
     def end_left_speculation(self) -> None:
         """End a speculation no runner walks any more (this one was stopped, or died, mid-walk) once the person decided
@@ -727,21 +763,45 @@ def _one_line(text: str) -> str:
     return " ".join(str(text).split())
 
 
+def _walked_paths(run: Run, phase: str) -> list[str]:
+    """The files the phases walked behind `phase`'s approval (`speculate`) committed, and no step of `phase` did: what
+    `phase`'s page and handoff leave out, so a person deciding on it (also after a rejection, when the walked phase's
+    commits sit among its own) sees its own work only. `[]` when no phase was walked behind it, as before."""
+    events = run.events.read()
+    walked = {e["phase"] for e in events if e["type"] == "speculation_started" and e.get("after") == phase}
+    worktree = run.state.get("worktree")
+    if not walked or not worktree:
+        return []
+
+    def shas(phases: set[str]) -> list[str]:
+        return [e.get("sha") for e in events
+                if e["type"] == "step_committed" and str(e.get("key") or "").split("/")[0] in phases]
+
+    try:
+        own = set(commit_paths(Path(worktree), shas({phase})))
+        return [path for path in commit_paths(Path(worktree), shas(walked)) if path not in own]
+    except GitError:
+        return []
+
+
 def _artifacts(run: Run, phase: str) -> list[str]:
-    """What the phase changed since it started. Once approved, a phase the runner walked another phase behind
-    (`speculate`) lists what changed up to the commit its approval was asked on, so the walked phase never shows in it."""
+    """What the phase changed since it started, without what a phase walked behind its approval committed
+    (`_walked_paths`). Once approved, such a phase lists what changed up to the commit its approval was asked on."""
     row = run.state["phases"].get(phase) or {}
     sha = row.get("start_sha")
     worktree = run.state.get("worktree")
     if not sha or not worktree:
         return []
+    hidden = _walked_paths(run, phase)
     walked = any(e["type"] == "speculation_started" and e.get("after") == phase for e in run.events.read())
     try:
         if walked and row.get("status") == "approved" and row.get("approval_sha"):
-            return changed_between(Path(worktree), sha, row["approval_sha"])
-        return changed_since(Path(worktree), sha)
+            paths = changed_between(Path(worktree), sha, row["approval_sha"])
+        else:
+            paths = changed_since(Path(worktree), sha)
     except GitError:
         return []
+    return [path for path in paths if path not in hidden]
 
 
 def _decisions(run: Run, phase: str) -> list[str]:
@@ -834,17 +894,18 @@ def write_handoff(cfg: Config, run: Run, phase: str) -> Path:
 
 
 def _diff_lines(run: Run, phase: str) -> list[str]:
-    return _diff_since(run, (run.state["phases"].get(phase) or {}).get("start_sha"))
+    return _diff_since(run, (run.state["phases"].get(phase) or {}).get("start_sha"), _walked_paths(run, phase))
 
 
-def _diff_since(run: Run, sha: str | None) -> list[str]:
+def _diff_since(run: Run, sha: str | None, exclude: list[str] | None = None) -> list[str]:
+    """The commits and the diff stat since `sha`, without the `exclude` paths (and the commits that touch only them)."""
     worktree = run.state.get("worktree")
     if not sha or not worktree:
         return []
     try:
-        stat = diff_stat(Path(worktree), sha)
-        log = subprocess.run(["git", "log", "--oneline", f"{sha}..HEAD"], cwd=worktree, capture_output=True,
-                             text=True, encoding="utf-8", check=False).stdout.strip()
+        stat = diff_stat(Path(worktree), sha, exclude or ())
+        log = subprocess.run(["git", "log", "--oneline", f"{sha}..HEAD", *excluding(exclude or ())], cwd=worktree,
+                             capture_output=True, text=True, encoding="utf-8", check=False).stdout.strip()
     except GitError:
         return []
     lines = [f"Since `{sha[:12]}`:"]
@@ -930,7 +991,7 @@ def approval_text(cfg: Config, run: Run, phase: str) -> str:
     previous = (run.state["phases"].get(phase) or {}).get("approval_sha")
     if round_ and previous:  # after a human's refine round: what changed since they last looked, step by step
         shown = [
-            _section("Since the last approval request", _diff_since(run, previous), "##"),
+            _section("Since the last approval request", _diff_since(run, previous, _walked_paths(run, phase)), "##"),
             _section(f"Steps in refine round {round_}", _round_lines(run, phase), "##"),
             *shown,
         ]
