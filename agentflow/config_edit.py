@@ -140,6 +140,11 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
          "End a read-only session that is quiet with no tool running after (min, 0 = as above)",
          {"kind": "number", "min": 0, "max": 1440}),
     ]),
+    ("Parallel build", "Plan tasks that can be built at the same time by one session's sub-agents.", [
+        (("parallel", "max_subagents"), "Plan tasks a wave builds at once (1 = off, at most 6)",
+         {"kind": "int", "min": 1, "max": 6}),
+        (("parallel", "serial_paths"), "Paths that never go in a wave", {"kind": "list"}),
+    ]),
     ("Usage window", "When runs stop starting new work because the plan's usage window is nearly spent; the soft mark "
                      "is your headroom.", [
         (("usage", "governor"), "Governor", {"kind": "enum", "options": ["on", "observe", "off"]}),

@@ -210,8 +210,22 @@ def test_compaction_and_subagents_on_the_row(run):
     run.emit("subagent_finished", parent_session="s-2", subagent_type="Explore", model="haiku", tool_use_id="t1")
     (sub,) = run.state["agents"]["s-2"]["subagents"]
     assert sub["subagent_type"] == "Explore" and sub["done"] is True
+    assert sub["description"] is None and sub["ok"] is None  # an older engine's events name neither
     run.emit("rolled_over", key="plan/x", session_id="s-2")
     assert run.state["steps"]["plan/x"]["rollovers"] == 1
+
+
+def test_a_subagent_row_keeps_its_description_and_outcome(run):
+    # the wave's dispatch check reads these rows (`waves.dispatch_violations`), also once the session has exited
+    run.emit("agent_started", agent="claude", pid=5, model="opus", effort="medium", step="build/x", sizing=False,
+             session_id="s-3")
+    run.emit("subagent_started", parent_session="s-3", subagent_type="general-purpose", model="inherit",
+             tool_use_id="t1", description="Task 2: a")
+    run.emit("subagent_finished", parent_session="s-3", subagent_type="general-purpose", model="inherit",
+             tool_use_id="t1", description="Task 2: a", cost_usd=0.1, ok=False)
+    run.emit("agent_exited", session_id="s-3", exit_code=0, cost=0.0)
+    (sub,) = run.state["exited"][-1]["subagents"]
+    assert (sub["description"], sub["done"], sub["ok"]) == ("Task 2: a", True, False)
 
 
 def test_context_window_is_cached_per_model(run):
@@ -768,6 +782,52 @@ def test_parking_a_stop_clears_its_wait_and_keeps_a_failed_row(run):
     run.emit("hitl_approved", key=K, kind="guard_violation", by="me", summary="x")
     assert run.state["parked"] == {} and run.state["steps"][K]["status"] == "failed"   # its restart checks the tree
     assert state_json(run) == replay(run.events.read())
+
+
+def test_wave_dissolved_clears_its_wait_only(run):
+    wave = "build/build/wave-1"
+    run.emit("hitl_raised", kind="blocked", key=f"{wave}/implement", phase="build", summary="x", questions=[])
+    run.emit("step_finished", key=f"{wave}/implement", status="failed", summary="x")
+    run.emit("wave_dissolved", key=wave, wave=1, tasks=[1, 2], reason="a member stopped", shelf=None)
+    assert run.state["waiting"] is None and run.state["status"] == "running"
+    row = run.state["steps"][f"{wave}/implement"]
+    assert row["status"] == "skipped" and row["skip_reason"] == "wave dissolved: a member stopped"
+    alone = "build/build/task-2/implement"
+    run.emit("hitl_raised", kind="blocked", key=alone, phase="build", summary="y", questions=[])
+    run.emit("wave_dissolved", key=wave, wave=1, tasks=[1, 2], reason="again", shelf=None)
+    assert run.state["waiting"]["key"] == alone  # a task's wait stays
+    assert state_json(run) == replay(run.events.read())
+
+
+def test_review_wave_dropped_clears_its_wait_only(run):
+    wave = "build/build/wave-1"
+    run.emit("hitl_raised", kind="turn_cap", key=f"{wave}/review", phase="build", summary="x", questions=[])
+    run.emit("review_wave_dropped", key=wave, wave=1, reason="a reviewer stopped")
+    assert run.state["waiting"] is None
+    row = run.state["steps"][f"{wave}/review"]
+    assert row["status"] == "skipped" and "a reviewer stopped" in row["skip_reason"]
+    run.emit("hitl_raised", kind="blocked", key=f"{wave}/implement", phase="build", summary="y", questions=[])
+    run.emit("review_wave_dropped", key=wave, wave=1, reason="again")
+    assert run.state["waiting"]["key"] == f"{wave}/implement"  # the implementer's wait stays
+    assert state_json(run) == replay(run.events.read())
+
+
+def test_a_wave_dissolved_never_clears_a_phase_approval(run):
+    run.emit("phase_approval_raised", phase="build", summary="ok?")
+    before = copy.deepcopy(run.state["waiting"])
+    run.emit("wave_dissolved", key="build_approved", wave=1, tasks=[1], reason="r", shelf=None)  # even under the approval's key
+    assert run.state["waiting"] == before and run.state["status"] == "awaiting_approval"
+
+
+@pytest.mark.parametrize("etype, fields", [
+    ("wave_started", {"key": "build/build/wave-1"}), ("wave_started", {"wave": 1}),
+    ("scope_violation", {"key": "build/build/task-1/implement"}), ("wave_dissolved", {"key": "build/build/wave-1"}),
+    ("wave_attributed", {}), ("wave_finished", {}), ("parallel_demoted", {}), ("parallel_candidates", {}),
+    ("review_wave_dropped", {}),
+])
+def test_a_wave_event_without_its_required_fields_is_refused(run, etype, fields):
+    with pytest.raises(EventError):
+        run.emit(etype, **fields)
 
 
 def test_a_notified_wait_stays_notified_and_another_keys_notice_changes_nothing(run):

@@ -1151,6 +1151,36 @@ def test_route_profiles_are_protected(shipped):
             config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)
 
 
+def test_the_form_sets_the_parallel_keys(shipped):
+    fields = {tuple(f["key"]): f for s in config_edit.form_fields(shipped)["sections"] for f in s["fields"]}
+    assert fields[("parallel", "max_subagents")]["kind"] == "int" and fields[("parallel", "max_subagents")]["min"] == 1
+    assert fields[("parallel", "max_subagents")]["max"] == 6
+    assert fields[("parallel", "serial_paths")]["kind"] == "list"
+    proposal = form(shipped, (["parallel", "max_subagents"], 3), (["parallel", "serial_paths"], ["**/migrations/**", "uv.lock"]))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    cfg = load_config(shipped)
+    assert cfg.parallel.max_subagents == 3 and cfg.parallel.serial_paths == ["**/migrations/**", "uv.lock"]
+    for bad in (0, 7, True, "3"):
+        with pytest.raises(EditError):
+            form(shipped, (["parallel", "max_subagents"], bad))
+    with pytest.raises(EditError):
+        form(shipped, (["parallel", "serial_paths"], "uv.lock"))
+
+
+def test_the_wave_skill_and_review_keys_are_protected(shipped):
+    assert "skills" in config_edit.PROTECTED and "route.profiles" in config_edit.PROTECTED
+    for key, value in ((["skills", "map", "build_wave"], "agentflow-build"),
+                       (["route", "profiles", "L", "wave_review"], False)):
+        with pytest.raises(Refused):  # the form has no field for either
+            form(shipped, (key, value))
+    _, sha = config_edit.read(shipped)
+    for added in ("skills: {map: {build_wave: agentflow-build}}\n",
+                  "route: {profiles: {L: {wave_review: false}}}\n"):
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)
+
+
 def test_the_form_sets_the_claude_cache_keys(shipped):
     for key, value in ((["agents", "claude", "cache_ttl"], "1h"), (["agents", "claude", "lean"], False),
                        (["agents", "claude", "user_settings"], True)):

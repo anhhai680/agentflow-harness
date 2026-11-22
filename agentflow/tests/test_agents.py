@@ -20,6 +20,7 @@ from agentflow.agents import (
     REVIEW_TOOLS,
     AgentCall,
     RUNNER_ONLY_DENY,
+    SUBAGENT_TOOLS,
     TTL_VARS,
     ClaudeAgent,
     CodexAgent,
@@ -263,6 +264,37 @@ def test_a_read_only_role_call_cannot_edit_or_test(cfg, call, tmp_path):
     assert "--disable-slash-commands" not in claude.argv(dataclasses.replace(call, read_only_role=True))
     resumed = claude.argv(dataclasses.replace(call, read_only_role=True, resume_session="abc"))
     assert ("--permission-mode", "dontAsk") in pairs(resumed) and ("--resume", "abc") in pairs(resumed)
+
+
+def _without_tools_and_settings(argv: list[str]) -> list[str]:
+    """`argv` with the values of `--tools` and `--settings` blanked, so the rest can be compared."""
+    return ["" if i and argv[i - 1] in ("--tools", "--settings") else a for i, a in enumerate(argv)]
+
+
+def test_a_wave_review_call_gets_the_subagent_tools_and_stays_read_only(cfg, call, tmp_path):
+    # a review wave (`Step.wave_size`) dispatches one reviewer per member: its read-only call needs `Agent`/`Task`
+    ws = tmp_path / "ws"
+    claude = ClaudeAgent(dataclasses.replace(cfg.agents["claude"], permission_mode="bypassPermissions"), cfg.context)
+    plain = claude.argv(dataclasses.replace(call, read_only_role=True, add_dirs=[ws]))
+    wave = claude.argv(dataclasses.replace(call, read_only_role=True, add_dirs=[ws], dispatches=True))
+    assert SUBAGENT_TOOLS == ("Agent", "Task")
+    assert ("--tools", "Read,Grep,Glob,Bash,Write,Agent,Task") in pairs(wave)
+    assert ("--tools", "Read,Grep,Glob,Bash,Write") in pairs(plain)  # every other review call: unchanged
+    wave_perms = json.loads(wave[wave.index("--settings") + 1])["permissions"]
+    plain_perms = json.loads(plain[plain.index("--settings") + 1])["permissions"]
+    assert plain_perms["allow"] == read_only_allow([ws])
+    # `dontAsk` runs only what is allowed, and only a `general-purpose` sub-agent: a custom type would run in the
+    # permission mode its own definition sets, so it is refused (and its call comes back an error, `ok: false`)
+    assert wave_perms["allow"] == [*read_only_allow([ws]), "Agent(general-purpose)", "Task(general-purpose)"]
+    assert "Agent" not in wave_perms["allow"] and "Task" not in wave_perms["allow"]
+    assert wave_perms["deny"] == plain_perms["deny"]  # the denies bind the session and its sub-agents alike
+    assert ("--permission-mode", "dontAsk") in pairs(wave) and "bypassPermissions" not in wave
+    assert "Edit" not in wave[wave.index("--tools") + 1].split(",")  # still no editing tool for anyone
+    assert _without_tools_and_settings(wave) == _without_tools_and_settings(plain)
+    # the flag means nothing to a call that is not a read-only role: a build wave keeps its argv
+    assert claude.argv(dataclasses.replace(call, dispatches=True)) == claude.argv(call)
+    assert (claude.argv(dataclasses.replace(call, read_only=True, dispatches=True))
+            == claude.argv(dataclasses.replace(call, read_only=True)))
 
 
 def test_the_read_only_allow_list_names_only_reads_and_the_workspace_out_folder(tmp_path):
@@ -590,6 +622,8 @@ def test_parse_fixture():
         "subagent_type": "Explore",
         "model": "inherit",
         "tool_use_id": "toolu_02",
+        "description": "Check layout",
+        "background": False,
     }
 
 
@@ -1507,3 +1541,106 @@ def test_ignored_settings_is_quiet_when_the_cli_did_what_was_asked(cfg):
 def test_ignored_settings_gives_both_when_both_apply(cfg):
     usage = {"tokens": {"cache_write_1h": 10}, "auto_memory": True}
     assert ignored_settings(_spec(cfg, cache_ttl="5m", lean=True), usage) == ["cache_ttl", "auto_memory"]
+
+
+# ------------------------------------------------------------------ sub-agent descriptions, cost and concurrency
+
+
+def _parallel_events(fake, fake_claude, call, subs):
+    fake.script({STEP: [{"model_id": SONNET, "parallel_subagents": subs}]})
+    events, on_event = collect()
+    fake_claude.run(call, on_event)
+    return events
+
+
+def test_two_task_calls_in_one_message_start_before_either_finishes(fake, fake_claude, call, wt):
+    events = _parallel_events(fake, fake_claude, call, [
+        {"description": "Task 2: a", "write": {"src/a.py": "a = 1\n"}, "output_tokens": 1000},
+        {"description": "Task 3: b", "write": {"src/b.py": "b = 1\n"}, "output_tokens": 5000}])
+    names = [n for n, _ in events if n.startswith("subagent_")]
+    assert names == ["subagent_started", "subagent_started", "subagent_finished", "subagent_finished"]
+    assert [p["description"] for n, p in events if n == "subagent_started"] == ["Task 2: a", "Task 3: b"]
+    assert [p["description"] for n, p in events if n == "subagent_finished"] == ["Task 2: a", "Task 3: b"]
+    assert (wt / "src" / "a.py").read_text() == "a = 1\n" and (wt / "src" / "b.py").read_text() == "b = 1\n"
+
+
+def test_a_subagents_cost_comes_from_its_own_usage_lines(fake, fake_claude, call):
+    events = _parallel_events(fake, fake_claude, call, [
+        {"description": "Task 2: a", "output_tokens": 1000}, {"description": "Task 3: b", "output_tokens": 5000}])
+    finished = [p for n, p in events if n == "subagent_finished"]
+    assert finished[0]["cost_usd"] > 0 and finished[0]["cost_usd"] != finished[1]["cost_usd"]
+    assert finished[1]["cost_usd"] > finished[0]["cost_usd"]
+
+
+def _call_line(*calls, parent=None):
+    return json.dumps({"type": "assistant", "parent_tool_use_id": parent, "message": {"content": [
+        {"type": "tool_use", "id": i, "name": "Agent", "input": d} for i, d in calls]}})
+
+
+def _sub_line(parent, msg_id, output_tokens=1000):
+    return json.dumps({"type": "assistant", "parent_tool_use_id": parent, "message": {
+        "id": msg_id, "model": SONNET, "content": [], "usage": {"input_tokens": 10, "output_tokens": output_tokens}}})
+
+
+def _finish_line(*ids):
+    return json.dumps({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+        {"type": "tool_result", "tool_use_id": i, "content": "ok"} for i in ids]}})
+
+
+def test_a_subagent_that_errored_is_not_ok(cfg):
+    # a `Task` call the CLI refused (an unknown agent type, a denied tool) comes back as an error result
+    acc = _acc(cfg)
+    parse_claude_line(_call_line(("t1", {"description": "Task 2: a"}), ("t2", {"description": "Task 3: b"})), acc)
+    line = json.dumps({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+        {"type": "tool_result", "tool_use_id": "t2", "content": "Agent type 'x' not found", "is_error": True}]}})
+    done = [p for n, p in parse_claude_line(line, acc) if n == "subagent_finished"]
+    assert [(p["description"], p["ok"]) for p in done] == [("Task 2: a", True), ("Task 3: b", False)]
+
+
+@pytest.mark.parametrize("extra, background", [({}, False), ({"run_in_background": False}, False),
+                                               ({"run_in_background": True}, True),
+                                               ({"run_in_background": "yes"}, True)])  # fail closed: any truthy value
+def test_a_subagent_started_in_the_background_is_marked_on_both_events(cfg, extra, background):
+    acc = _acc(cfg)
+    started = [p for n, p in parse_claude_line(_call_line(("t1", {"description": "Task 2: a", **extra})), acc)
+               if n == "subagent_started"]
+    done = [p for n, p in parse_claude_line(_finish_line("t1"), acc) if n == "subagent_finished"]
+    assert [p["background"] for p in started] == [background] and [p["background"] for p in done] == [background]
+
+
+def test_a_subagent_description_is_cut_and_a_missing_or_odd_one_is_empty(cfg):
+    acc = _acc(cfg)
+    events = parse_claude_line(_call_line(("t1", {"description": "x" * 500}), ("t2", {}), ("t3", {"description": 7})), acc)
+    assert [p["description"] for _, p in events if _ == "subagent_started"] == ["x" * 200, "", ""]
+
+
+def test_untrusted_stream_lines_never_raise_nor_inflate_a_subagents_cost(cfg):
+    acc = _acc(cfg)
+    parse_claude_line(_call_line(("t1", {"description": "one"}), ("t2", {"description": "two"})), acc)
+    for line in ("{not json", "[]", '{"type": "assistant", "message": "text"}', '{"type": "assistant", "message": []}',
+                 '{"type": "user", "message": {"content": "x"}}', _call_line(("t9", "not a dict")),
+                 json.dumps({"type": "assistant", "parent_tool_use_id": ["t1"], "message": {"usage": {"output_tokens": 9}}}),
+                 json.dumps({"type": "assistant", "parent_tool_use_id": "unknown", "message": {
+                     "id": "u", "model": SONNET, "usage": {"output_tokens": 999999}}})):
+        parse_claude_line(line, acc)
+    assert set(acc.subagent_usage) == {"t1", "t2", "t9"}  # only calls that started; "unknown" is not tracked
+    parse_claude_line(_sub_line("t1", "m1"), acc)
+    done = parse_claude_line(_finish_line("t1", "t2"), acc)
+    costs = [p["cost_usd"] for n, p in done if n == "subagent_finished"]
+    assert costs[0] > 0 and costs[1] == 0
+    assert acc.subagent_usage == {"t9": {}}  # a finished call is forgotten: a late line naming it is ignored
+    parse_claude_line(_sub_line("t1", "late"), acc)
+    assert acc.subagent_usage == {"t9": {}}
+
+
+def test_a_subagents_lines_stay_out_of_the_main_threads_numbers(cfg):
+    plain = _acc(cfg)
+    parse_claude_line(_assistant("m1", {"input_tokens": 10, "output_tokens": 20}, SONNET), plain)
+    acc = _acc(cfg)
+    parse_claude_line(_call_line(("t1", {"description": "one"})), acc)
+    parse_claude_line(_sub_line("t1", "s1", 5000), acc)
+    parse_claude_line(_assistant("m1", {"input_tokens": 10, "output_tokens": 20}, SONNET), acc)
+    assert acc.main_calls == plain.main_calls == 1 and acc.line_type == plain.line_type == "assistant"
+    assert acc.context_pct == plain.context_pct
+    assert acc.usage_payload()["turns"] == plain.usage_payload()["turns"] == 1

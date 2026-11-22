@@ -63,6 +63,15 @@ twice, with parking on or off), `forbidden_reverted` (a guard park's forbidden e
 A person's `approve --constraint` is `constraint_approved` (`constraint.py`) and the `constraint` field of
 `hitl_approved`.
 
+Waves. With `parallel.max_subagents` above 1 and the build phase on `claude` (`WaveLane.waves_on`: never in a refine
+round or a small plan's session), the walk asks `wave_lane.WaveLane.wave_at` before it builds a task. When the task has
+a `**Parallel group:**` and other open tasks of that group pass `waves.form_wave`'s checks, they are built together in
+one session that fans them out to sub-agents (`<step>/wave-<n>/implement`), the build gates run once on the combined
+tree, and each kept member is then reviewed and committed alone, in plan order, through `_run_task`. A member set aside
+by the wave's attribution, and a task the checks turn away (`parallel_demoted`), is built alone as above. A grouped task
+joins no batch. `_held_paths` holds the other uncommitted members' files, so a member's commit, park and shelf take
+only its own.
+
 `record_decisions` runs before an answered step resumes: an answer to a `spec_gap` question (or one
 given with `--record`) runs `record_step` and commits its `message` (default `Decide <question> in the
 <module> spec`) with only the files that step changed. `ambiguity`/`review_dispute`/`boundary` answers go in the task's
@@ -82,6 +91,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import shlex
 import subprocess
 from collections import Counter
 from collections.abc import Callable
@@ -89,7 +99,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import carry, constraint, overlays, park, route, sizing, sources, verification
+from agentflow import carry, constraint, overlays, park, route, sizing, sources, verification, waves
 from agentflow.autonomy import AUTO_BY, FORBIDDEN, GUARD_KIND, Resolver, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
@@ -138,6 +148,9 @@ TASK_N = re.compile(r"/task-(\d+)/")
 UNSHELVE = "unshelve"  # `<task>/unshelve`: the stop for a shelf that no longer applies on top of `HEAD`
 SHOWN_PATHS = 10
 DONE_STATUSES = ("done", "unchanged")
+# What settles a stop of a task (a person's answer, approval or retry, its shelf applied back): a wave member's fix is
+# checked against the tree from then on (`FeatureLane._fix_base`), never against changes made before it.
+FIX_SETTLED = ("hitl_approved", "hitl_answered", "step_retry", "unit_unparked")
 SUMMARY_MAX = 60
 FINAL_FIX = "final_fix"  # `finish`'s session that fixes what the full verify run on the final tree found
 FINAL_FIX_MESSAGE = "Fix what the full verify run found"
@@ -232,6 +245,7 @@ class FeatureLane:
         if small is None:
             return "stopped"
         self._batch_of = self._batches(phase, step, plan, prefix, small)
+        self._note_candidates(plan, prefix)
         if self.size_plan(phase, step, plan, prefix, small) == "stopped":
             return "stopped"
         if self.route_record() is not None:  # the plan sizer's answers can raise the route before the first task
@@ -250,6 +264,16 @@ class FeatureLane:
                 raise_hitl(self.cfg, self.run, "blocked", prefix,
                            f"Tasks {sorted(held)} of {prefix} are held back, but no parked stop explains it.")
                 return "stopped"
+
+    def _note_candidates(self, plan: Path, prefix: str) -> None:
+        """With waves on, once per run: record the pairs of open ungrouped tasks that could share a parallel group.
+        A resume or a refine pass finds the event already there and records nothing."""
+        if self.cfg.parallel.max_subagents <= 1:
+            return
+        if any(e["type"] == "parallel_candidates" for e in self.run.events.read()):
+            return
+        pairs = waves.candidates(sources.parse_plan(plan), self.cfg.parallel.serial_paths)
+        self.run.emit("parallel_candidates", key=prefix, pairs=[list(pair) for pair in pairs])
 
     def _scale_budget(self, plan: Path) -> None:
         """Once per run, raise the soft budget to fit the plan: `task_budget_usd` per unticked task on top of
@@ -353,6 +377,21 @@ class FeatureLane:
                 previous, previous_n = impl_key, task.n
                 carry_prev = None  # committed by an earlier walk: never a carry source
                 continue
+            if self.waves_on(phase, step, small):
+                waved = self.wave_at(phase, step, plan, rel, prefix, task, tasks, held, small)
+                if waved == "stopped":
+                    return True, held, True
+                if waved == "ran":
+                    attempted = True
+                    self.run.refresh()
+                    carry_prev = None  # a wave's session is never a carry source
+                    if self._committed(tkey):
+                        previous, previous_n = impl_key, task.n
+                        continue
+                    if self._parked(tkey):
+                        held.add(task.n)
+                        continue
+                    # set aside by the wave's attribution: built alone below
             batch = (self._batch_of or {}).get(task.n) if not refine else None
             if self._parked(tkey) or park.waits_on(task, held, texts):
                 held.add(task.n)
@@ -396,15 +435,18 @@ class FeatureLane:
     def _batches(self, phase: Phase, step: Step, plan: Path, prefix: str, small: dict) -> dict[int, list[int]]:
         """Task number -> its batch (`step.batch`), decided once per run and kept in a `plan_batched` event, so a
         resume sees the same batches after their tasks were ticked. None in a small plan or a refine round. The last
-        `plan_batched` counts, so a member split out of its batch (`_split_out`) stays out; a batch of one is none."""
+        `plan_batched` counts, so a member split out of its batch (`_split_out`) stays out; a batch of one is none.
+        With waves on (`parallel.max_subagents` above 1), a task with a `**Parallel group:**` joins no batch."""
         if not step.batch or small.get("active") or self._refine_round(phase):
             return {}
         recorded = [e for e in self.run.events.read() if e["type"] == "plan_batched" and e.get("key") == prefix]
         if recorded:
             batches = [list(b) for b in recorded[-1].get("batches") or []]
         else:
-            batches = sources.plan_batches(sources.parse_plan(plan), int(step.batch.get("max_tasks", 3)),
-                                           int(step.batch.get("max_files", 3)))
+            tasks = sources.parse_plan(plan)
+            grouped = {t.n for t in tasks if t.group is not None} if self.cfg.parallel.max_subagents > 1 else set()
+            batches = sources.plan_batches(tasks, int(step.batch.get("max_tasks", 3)),
+                                           int(step.batch.get("max_files", 3)), skip=grouped)
             self.run.emit("plan_batched", key=prefix, batches=batches)
         return {n: batch for batch in batches if len(batch) > 1 for n in batch}
 
@@ -830,11 +872,7 @@ class FeatureLane:
         review = step.review if not small.get("active") or small.get("review") else None
         last = not batch or task.n == batch[-1].n
         if review is not None and last and (dropped := self._route_drops_review(tkey, batch, prefix)):
-            review_key = f"{tkey}/review"
-            reason = f"route profile {dropped}"
-            if not any(e["type"] == "review_skipped" and e.get("key") == review_key and e.get("reason") == reason
-                       for e in self.run.events.read()):
-                self.run.emit("review_skipped", key=review_key, reason=reason, round=round_)
+            self._skip_review(tkey, dropped, round_)
             review = None  # the task commits as a small plan's does with `review: false`
         if round_ and self._changed_nothing(tkey):  # nothing to review or gate: the tree passed before
             review_key = f"{tkey}/review"
@@ -875,6 +913,14 @@ class FeatureLane:
             return None
         return str(record["profile"])
 
+    def _skip_review(self, tkey: str, profile: str, round_: int = 0) -> None:
+        """Record once that the run's route profile `profile` drops task `tkey`'s review."""
+        review_key = f"{tkey}/review"
+        reason = f"route profile {profile}"
+        if not any(e["type"] == "review_skipped" and e.get("key") == review_key and e.get("reason") == reason
+                   for e in self.run.events.read()):
+            self.run.emit("review_skipped", key=review_key, reason=reason, round=round_)
+
     def _sized_answers(self, keys: set[str]) -> dict[str, dict[str, str] | None]:
         """Each step key's answers from its latest `effort_decided` (`sizing.parse_answers`), None when it has none."""
         raw: dict[str, object] = dict.fromkeys(keys)
@@ -904,16 +950,23 @@ class FeatureLane:
                      review_extra: dict[str, str] | None = None,
                      start_sha: str | None = None) -> tuple[Outcome, list[dict]]:
         """`("done", open findings)` once the task may be committed; ("stopped", []) when a human is needed.
-        A batch's review passes the range's start (its first member's) and the batch's title and texts."""
+        A batch's review passes the range's start (its first member's) and the batch's title and texts.
+
+        A wave member's range holds only its own files (`_review_range`), and its fix may change only those: any other
+        path it changed goes back to how it was before the fix (`WaveLane.wave_revert_strays`, against `_fix_base`)."""
         impl_key, review_key = f"{tkey}/implement", f"{tkey}/review"
-        sha = start_sha or self._task_start(phase, impl_key)
-        rextra = {**(review_extra or extra), "task_start_sha": sha, "diff_range": f"{sha}..worktree"}
+        owned = self._wave_scope(phase, tkey)
+        rextra = {**(review_extra or extra), **self._review_range(phase, tkey, start_sha, owned)}
         first = self._review_round(phase, review, review_key, rextra, 1)
         if first is None:
             return "stopped", []
         if not first:
             return "done", []
-        if self._fix_round(phase, impl_step, impl_key, extra, first) != "done":
+        base = self._fix_base(phase, tkey) if owned is not None else None
+        fixed = self._fix_round(phase, impl_step, impl_key, extra, first, base=base)
+        if owned is not None and base is not None:  # a fix that stopped too: a park or another commit must not take it
+            self.wave_revert_strays(tkey, owned, base)
+        if fixed != "done":
             return "stopped", []
         second = self._review_round(phase, review, review_key, rextra, 2)
         if second is None:
@@ -938,6 +991,43 @@ class FeatureLane:
             raise_hitl(self.cfg, self.run, "review_unresolved", review_key,
                        f"{len(findings)} blocking review finding(s) are still open after the fix rounds in {tkey}.",
                        extra=f"### Open findings\n\n{lines}")
+
+    def _wave_scope(self, phase: Phase, tkey: str) -> list[str] | None:
+        """The files a wave member's review and fix are held to (`WaveLane.wave_owned`), on the first pass only; None
+        for a task in no wave, and in a refine round, where the task's range starts at its own refine session."""
+        return None if self._refine_round(phase) else self.wave_owned(tkey)
+
+    def _review_range(self, phase: Phase, tkey: str, start_sha: str | None = None,
+                      owned: list[str] | None = None) -> dict[str, str]:
+        """The review's `task_start_sha` and `diff_range`: from where the task started (`start_sha`, else
+        `_task_start`), and for a wave member (`owned`, its files) cut to those files, so the wave's other members'
+        work, committed or not, is not in it. Each file is a `:(literal)` pathspec, so git's pathspec magic in a path
+        a plan names cannot widen the range."""
+        sha = start_sha or self._task_start(phase, f"{tkey}/implement")
+        if not owned:
+            return {"task_start_sha": sha, "diff_range": f"{sha}..worktree"}
+        return {"task_start_sha": f"{sha} -- {' '.join(shlex.quote(f':(literal){p}') for p in owned)}",
+                "diff_range": f"{sha}..worktree, limited to {', '.join(owned)}"}
+
+    def _fix_base(self, phase: Phase, tkey: str) -> dict[str, str]:
+        """The tree and `HEAD` a wave member's fix is checked against: before its review reopen, the tree now (the
+        reopen records it); then the last one recorded, unless a stop of the task was settled since (a person's answer,
+        approval or retry, or its shelf applied back, after other tasks committed): the tree then holds what is not the
+        fix's, so it is taken again and recorded (`fix_rebased`)."""
+        impl_key = f"{tkey}/implement"
+        events = self._round_events(phase)
+        base = None
+        for event in events:
+            if event.get("key") == impl_key and (event["type"] == "fix_rebased" or (
+                    event["type"] == "step_reopened" and event.get("reason") == "review")):
+                base = event
+        if base is not None and not any(e["type"] in FIX_SETTLED and e["seq"] > base["seq"]
+                                        and under(str(e.get("key") or ""), tkey) for e in events):
+            return {"tree": str(base.get("tree") or ""), "head": str(base.get("head") or "")}
+        now = {"tree": snapshot(self.worktree), "head": head(self.worktree)}
+        if base is not None:
+            self.run.emit("fix_rebased", key=impl_key, **now)
+        return now
 
     def _task_start(self, phase: Phase, impl_key: str) -> str:
         """Where the task's diff starts: `HEAD` when its implementer started (in a refine round: started
@@ -1042,8 +1132,9 @@ class FeatureLane:
         return earlier_review(blocking_of(self.cfg, findings), note)
 
     def _fix_round(self, phase: Phase, impl_step: Step, impl_key: str, extra: dict[str, str],
-                   blocking: list[dict]) -> Outcome:
-        """The one round in which the implementer's session gets the blocking findings back."""
+                   blocking: list[dict], base: dict[str, str] | None = None) -> Outcome:
+        """The one round in which the implementer's session gets the blocking findings back. `base` (a wave member's:
+        the tree and `HEAD` before the fix) is kept on the reopen, so a later walk checks the fix against it."""
         reopened = any(e["type"] == "step_reopened" and e.get("key") == impl_key and e.get("reason") == "review"
                        for e in self._round_events(phase))
         self.run.refresh()
@@ -1060,7 +1151,7 @@ class FeatureLane:
                      f"fits), say in your summary why any does not, then run the gates.")
             if skill is not None:
                 note += f"\n\n{skill}"
-            self.run.emit("step_reopened", key=impl_key, reason="review", round=1, note=note)
+            self.run.emit("step_reopened", key=impl_key, reason="review", round=1, note=note, **(base or {}))
         return self._task_agent(phase, impl_step, impl_key, extra)
 
     def _unresolved_approver(self, phase: Phase, review_key: str) -> str | None:
@@ -1112,11 +1203,13 @@ class FeatureLane:
     def _gates_hold(self, tkey: str, commit_key: str, gates: str | list[str]) -> bool:
         """The implementer's gates hold for the tree about to be committed. They run again unless the tree
         is the one they last passed on: a human may edit before approving a stop, and a reviewer could
-        edit too. A failure is a `gate_failed` stop on `<task>/commit`; approving it runs them again."""
+        edit too. A wave member's projected row also holds for a tree that differs from the wave's only by the boxes
+        the runner ticked and committed for the members before it (`WaveLane.wave_gated`). A failure is a
+        `gate_failed` stop on `<task>/commit`; approving it runs them again."""
         tree = snapshot(self.worktree)
         finished = [e for e in self.run.events.read()
                     if e["type"] == "step_finished" and e.get("key") == f"{tkey}/implement" and e.get("status") == "done"]
-        if finished and finished[-1].get("tree") == tree:
+        if finished and (finished[-1].get("tree") == tree or self.wave_gated(finished[-1], tree)):
             return True
         results = run_gates_reusing(self.cfg, self.run, commit_key, gates, self.worktree,
                                     self.run.gate_log_dir(commit_key), tree)
@@ -1130,8 +1223,9 @@ class FeatureLane:
         return False
 
     def _held_paths(self, tkey: str) -> set[str]:
-        """Files other parked tasks changed before they parked: theirs to commit, never this task's. A park
-        stops holding once its task commits after it (a task committed earlier can park in a refine round)."""
+        """Files other parked tasks changed before they parked, and the files the other uncommitted members of the
+        task's wave own (`WaveLane.wave_held`): theirs to commit, never this task's. A park stops holding once its task
+        commits after it (a task committed earlier can park in a refine round)."""
         events = self.run.events.read()
         last_commit = {e.get("key"): e["seq"] for e in events if e["type"] == "task_committed"}
         held: set[str] = set()
@@ -1141,7 +1235,7 @@ class FeatureLane:
             task = str(event.get("key", "")).rsplit("/", 1)[0]
             if task != tkey and last_commit.get(task, 0) < event["seq"]:
                 held.update(event.get("paths") or [])
-        return held
+        return held | self.wave_held(tkey)
 
     def _task_message(self, subject: str, tkey: str, open_findings: list[dict], refine: dict | None = None) -> str:
         parts = [subject]

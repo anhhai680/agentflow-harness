@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 from agentflow.conditions import CondResult, Ctx, evaluate, explain, fmt, make_ctx, plan_warnings
-from agentflow.config import resolve_model
+from agentflow.config import Parallel, resolve_model
 from agentflow.gitops import GhError, gh_json
 from conftest import PYTHON_PACK
 
@@ -673,6 +673,65 @@ def test_explain_applies_cli_model_overrides(cfg, tmp_path):
     by_key = lines_by_key(explain(cfg, "feature", ctx, {"plan": "fable"}))
     assert by_key["plan/plan"].model == "fable"
     assert by_key["review/branch_review"].model == "sonnet"
+
+
+def waves_ctx(cfg, tmp_path, size: int = 2, groups=None, files=None):
+    """`cfg` with waves of up to `size` tasks, and a repo whose plan puts tasks 2 and 3 in one group."""
+    from test_feature_lane import plan_text
+
+    plans = tmp_path / "docs" / "plans"
+    plans.mkdir(parents=True)
+    named = files or {n: [f"src/t{n}.py"] for n in (1, 2, 3)}
+    (plans / "2026-10-29-demo.md").write_text(
+        plan_text({n: "none" for n in (1, 2, 3)}, count=3, groups={2: "A", 3: "A"} if groups is None else groups,
+                  files=named), encoding="utf-8")
+    cfg = dataclasses.replace(cfg, parallel=Parallel(max_subagents=size))
+    return cfg, make_ctx(cfg, tmp_path, "feature", {"module": "demo"})
+
+
+def wave_lines(lines):
+    return [(line.key, line.verdict, line.reason, line.model) for line in lines if "/wave-" in line.key]
+
+
+def test_explain_shows_a_wave(cfg, tmp_path):
+    cfg, ctx = waves_ctx(cfg, tmp_path)
+    lines = explain(cfg, "feature", ctx)
+    assert wave_lines(lines) == [("build/build/wave-1", "run", "wave-1: tasks 2, 3", "sonnet")]
+    keys = [line.key for line in lines]
+    assert keys.index("build/build/wave-1") == keys.index("build/build/review") + 1  # after the step's own lines
+
+
+def test_explain_names_the_tasks_a_wave_holds_back(cfg, tmp_path):
+    cfg, ctx = waves_ctx(cfg, tmp_path, files={1: ["src/t1.py"], 2: ["src/t2.py"], 3: ["src/t2.py"]})
+    assert wave_lines(explain(cfg, "feature", ctx)) == []  # tasks 2 and 3 share a file: no wave of two
+
+
+def test_explain_leaves_a_security_task_out_of_a_wave(cfg, tmp_path):
+    cfg, ctx = waves_ctx(cfg, tmp_path, files={1: ["src/t1.py"], 2: ["src/t2.py"], 3: ["src/auth/login.py"]})
+    assert wave_lines(explain(cfg, "feature", ctx)) == [("build/build/wave-1", "run", "wave-1: tasks 2, 3", "sonnet")]
+    secured = dataclasses.replace(cfg, overlays={**cfg.overlays, "security": {
+        **cfg.overlays.get("security", {}), "when_paths": ["src/auth/**"]}})
+    assert wave_lines(explain(secured, "feature", ctx)) == []
+
+
+def test_explain_is_unchanged_with_waves_off_or_codex(cfg, tmp_path):
+    off_cfg, off_ctx = waves_ctx(cfg, tmp_path, size=1)
+    assert wave_lines(explain(off_cfg, "feature", off_ctx)) == []
+    on_cfg, on_ctx = waves_ctx(cfg, tmp_path / "again", size=3)
+    assert wave_lines(explain(on_cfg, "feature", on_ctx)) != []
+    codex = dataclasses.replace(on_cfg, phases={
+        name: dataclasses.replace(phase, agent="codex") if name == "build" else phase
+        for name, phase in on_cfg.phases.items()})
+    codex_lines = explain(codex, "feature", on_ctx)
+    assert wave_lines(codex_lines) == []
+    keys = [line.key for line in codex_lines]
+    assert keys == [line.key for line in explain(dataclasses.replace(codex, parallel=Parallel()), "feature", on_ctx)]
+
+
+def test_explain_shows_no_wave_without_a_plan(cfg, tmp_path):
+    cfg = dataclasses.replace(cfg, parallel=Parallel(max_subagents=2))
+    ctx = make_ctx(cfg, tmp_path, "feature", {"module": "demo"})
+    assert wave_lines(explain(cfg, "feature", ctx)) == []
 
 
 def test_explain_skipped_phase_lists_no_steps(cfg):

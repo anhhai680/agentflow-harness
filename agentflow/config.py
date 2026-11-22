@@ -179,6 +179,11 @@ PROMPT_PLACEHOLDERS = frozenset(
         "task_cards",
         # the triage prompt (`route_lane.py`)
         "route_card",
+        # a wave of plan tasks built by one session (`parallel`); the build prompts and the plan sizer fill them
+        "wave_title",
+        "wave_cards",
+        "allowed_files",
+        "parallel_candidates",
     }
 )
 # What a run's brief can fill in `_preamble.md` and `_result.md`: values that hold for a whole run. A pack copy of
@@ -212,6 +217,8 @@ NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition"
                   CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed", "environment")
 PREFLIGHT_KEYS = ("enabled",)
 WATCHDOG_KEYS = ("no_progress_min", "read_only_idle_min")
+PARALLEL_KEYS = ("max_subagents", "serial_paths")
+PARALLEL_MAX = 6  # `parallel.max_subagents` above this is a typo, not a plan: a wave's members are one session's sub-agents
 CONSTRAINT_KEYS = ("trailer", "gates")  # `guardrails.constraint_override`
 TRAILER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")  # a git trailer's token: no space, no colon, one line
 WATCHDOG_MAX_MIN = 1440  # `watchdog.no_progress_min` above a day is a typo, not a plan
@@ -250,7 +257,7 @@ REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea
 # `capability_map`: a Markdown table with `Module id` and `Depends on` columns (`sources.capability_map`);
 # `specs`: one module per spec file in `project.docs.specs`, its dependencies from the header (`sources.spec_deps`)
 WORK_SOURCE_KINDS = ("capability_map", "specs")
-SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "verify", "ship",
+SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "build_wave", "verify", "ship",
                    "review", "debug", "review_feedback", "doubt")  # review_feedback: the skill sent with blocking findings
 
 
@@ -338,6 +345,12 @@ class Preflight:
 class Watchdog:
     no_progress_min: float = 0  # end a session whose stream is quiet this long (`agents.idle_limit`); 0 = off
     read_only_idle_min: float = 5  # a read-only session with no tool call open ends after this long quiet; 0 = no shorter limit
+
+
+@dataclass
+class Parallel:
+    max_subagents: int = 1  # plan tasks one build session may build at once as sub-agents (a wave); 1 = off
+    serial_paths: list[str] = field(default_factory=list)  # globs of paths a task of a wave may never touch
 
 
 @dataclass
@@ -433,7 +446,7 @@ class Policy:
 
 ROUTE_PROFILES = ("XS", "S", "M", "L")  # smallest first
 ROUTE_MODES = ("off", "observe", "on")
-ROUTE_PROFILE_KEYS = ("skip", "doubt_rounds", "per_task_review")
+ROUTE_PROFILE_KEYS = ("skip", "doubt_rounds", "per_task_review", "wave_review")
 
 
 @dataclass(frozen=True)
@@ -442,6 +455,7 @@ class RouteProfile:
     skip: tuple[str, ...] = ()
     doubt_rounds: Mapping[str, int] = field(default_factory=dict)  # a phase: the most doubt rounds it gets
     per_task_review: bool = True
+    wave_review: bool = True  # one fresh review of a whole wave; false: each member keeps its own review session
 
 
 @dataclass
@@ -612,6 +626,7 @@ class Step:
     task_briefs: dict[str, str] = field(default_factory=dict)
     task_brief: list[str] = field(default_factory=list)  # run time only, never configured: the `task_briefs` a plan task matched
     continuation: bool = False  # run time only: a later batch member or shared small_plan task; its session has the skill
+    wave_size: int = 0  # run time only, never configured: the member count of a wave step (0: not a wave step)
     name: str | None = None
     blocks_on_findings: bool = False  # its `findings` hold the phase back (`autonomy.phase_findings`)
     reconciles: bool = False  # in a `needs_approval: true` phase: the step that revises the artifact after a review's findings
@@ -662,6 +677,7 @@ class Config:
     recovery: Recovery = field(default_factory=Recovery)
     preflight: Preflight = field(default_factory=Preflight)
     watchdog: Watchdog = field(default_factory=Watchdog)
+    parallel: Parallel = field(default_factory=Parallel)
     usage: Usage = field(default_factory=Usage)
     autonomy: dict = field(default_factory=dict)
     resolve_step: Step | None = None
@@ -1443,17 +1459,31 @@ def _build_route(raw: Any) -> Route:
         skip = entry.get("skip")
         rounds = entry.get("doubt_rounds")
         review = entry.get("per_task_review", True)
+        wave_review = entry.get("wave_review", True)
         profiles[str(name)] = RouteProfile(
             skip=tuple(item for item in skip if isinstance(item, str)) if isinstance(skip, list) else (),
             doubt_rounds={str(k): v for k, v in rounds.items() if isinstance(v, int) and not isinstance(v, bool)}
             if isinstance(rounds, dict) else {},
             per_task_review=review if isinstance(review, bool) else True,
+            wave_review=wave_review if isinstance(wave_review, bool) else True,
         )
     # a mode outside the list runs as `off`, today's route: YAML reads a bare `off` as false, and `validate` names it
     mode = raw.get("mode", "off")
     return Route(mode=mode if mode in ("observe", "on") else "off",
                  lanes=_string_list(raw.get("lanes", ["feature"]), "route.lanes"),
                  profiles=profiles)
+
+
+def _build_parallel(raw: dict) -> Parallel:
+    """The `parallel` block as data. A value of the wrong type loads as today's (off, no paths) and `validate` names
+    it from the text, so a typo never turns waves on."""
+    block = _optional(raw, "parallel", "", dict, {})
+    subagents = block.get("max_subagents", 1)
+    paths = block.get("serial_paths", [])
+    return Parallel(
+        max_subagents=subagents if isinstance(subagents, int) and not isinstance(subagents, bool) else 1,
+        serial_paths=[item for item in paths if isinstance(item, str) and item] if isinstance(paths, list) else [],
+    )
 
 
 def _build_policy(policy: dict, disabled: tuple[str, ...]) -> Policy:
@@ -1590,6 +1620,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
         preflight=Preflight(enabled=_optional(preflight, "enabled", "preflight", bool, False)),
         watchdog=Watchdog(no_progress_min=_float(watchdog, "no_progress_min", "watchdog", 0),
                           read_only_idle_min=_float(watchdog, "read_only_idle_min", "watchdog", 5)),
+        parallel=_build_parallel(raw),
         usage=Usage(governor=_governor(usage.get("governor")),
                     five_hour_soft=_float(usage, "five_hour_soft", "usage", 0.75),
                     five_hour_hard=_float(usage, "five_hour_hard", "usage", 0.92),
@@ -2623,6 +2654,39 @@ class _Validator:
             if key not in WATCHDOG_KEYS:
                 self.error(f"watchdog.{key}", "unknown watchdog key")
 
+    def parallel(self) -> None:
+        """`parallel`: `max_subagents` is a whole number from 1 (off) to `PARALLEL_MAX`, and `serial_paths` a list of
+        non-empty globs; any other key is a typo. Read from the text, so a value the dataclass smoothed over is still
+        named. Waves are on only above 1, and then two things that make them a no-op or a wrong fit are warned."""
+        raw = self.cfg.raw.get("parallel")
+        block = raw if isinstance(raw, dict) else {}
+        count = block.get("max_subagents", 1)
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= PARALLEL_MAX:
+            self.error("parallel.max_subagents", f"max_subagents must be a whole number from 1 (off) to at most "
+                       f"{PARALLEL_MAX}")
+        paths = block.get("serial_paths", [])
+        if not isinstance(paths, list) or not all(isinstance(item, str) and item.strip() for item in paths):
+            self.error("parallel.serial_paths", "serial_paths must be a list of non-empty path globs")
+        for key in block:
+            if key not in PARALLEL_KEYS:
+                self.error(f"parallel.{key}", f"unknown parallel key; known: {', '.join(PARALLEL_KEYS)}")
+        if self.cfg.parallel.max_subagents <= 1:
+            return
+        build = self.cfg.phases.get("build")
+        agent = (build.agent if build is not None else None) or self.cfg.defaults.agent
+        if agent != "claude":
+            self.add("warning", "parallel.max_subagents", f"waves need the claude agent, and the build phase runs on "
+                     f"'{agent}': its tasks are built one at a time")
+        own = self.cfg.path.parent / "prompts" / "plan.md"
+        if own.is_file():
+            try:
+                text = own.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                return  # `templates` already says it is not UTF-8 text
+            if "Parallel group" not in text:
+                self.add("warning", "prompts/plan.md", "plans written with this prompt never form a wave: it does not "
+                         "ask for a `Parallel group` line on a task (see the engine's plan.md)")
+
     def usage(self) -> None:
         """`usage.governor`: `on`, `observe` or `off` (a bare `off` loads as `off` and warns, since YAML turns it into
         a bool); the marks are fractions of a window, finite, and the soft mark of the 5-hour window sits below its
@@ -2798,6 +2862,8 @@ class _Validator:
                         self.error(at, "rounds must be a whole number, 1 or more: the engine floor keeps at least one round")
             if "per_task_review" in entry and not isinstance(entry["per_task_review"], bool):
                 self.error(_join(where, "per_task_review"), "per_task_review must be true or false")
+            if "wave_review" in entry and not isinstance(entry["wave_review"], bool):
+                self.error(_join(where, "wave_review"), "wave_review must be true or false")
 
     def _route_skip(self, where: str, skip: Any, route_lanes: list[str], needed_steps: dict[str, str],
                     needed_phases: dict[str, str]) -> None:
@@ -3146,6 +3212,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.issue_policy()
     v.preflight()
     v.watchdog()
+    v.parallel()
     v.guardrails()
     v.usage()
     v.policy()

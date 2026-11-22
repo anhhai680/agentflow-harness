@@ -12,6 +12,7 @@ The runner reads the plan file itself, so the format below is exact. A task is t
 Each task is a level-3 heading `### Task N: <title>` with N counting from 1. Under it, in this order:
 
 - A line `**Depends on:** Task k, Task m` or `**Depends on:** none`. Give every task one: without it, the runner assumes the task depends on the one before.
+- Optionally, a line `**Parallel group:** <letter>` under it. Tasks that can be built at the same time share one letter: they depend on none of each other, share no file, change no contract the others use, and each one names its files. The runner checks the files and dependencies itself and may still build them one at a time. Leave the line out for a task that is not part of a group.
 - A `**Files:**` list, one line per file, each starting `- Create:`, `- Modify:` or `- Test:` and naming the path in backticks.
 - An `**Interfaces:**` list:
   - `Uses:` each piece of existing code the task calls, as `path:line` and its signature, for example `` `app/names.py:12` `normalise(name: str) -> str` ``. You read this code while planning, so writing it down saves every later session from searching for it.
@@ -25,6 +26,7 @@ Each task is a level-3 heading `### Task N: <title>` with N counting from 1. Und
 ### Task 2: Reject an empty name
 
 **Depends on:** Task 1
+**Parallel group:** A
 
 **Files:**
 - Modify: `app/names.py`

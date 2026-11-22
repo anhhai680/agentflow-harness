@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 
+from datetime import UTC, datetime
+
+from agentflow.metrics import run_metrics
 from agentflow.signals import COUNT_FAMILIES, FAMILIES, aggregate_signals, parse_target, run_signals
 
 EMPTY_METRICS = {"cost_usd": 0.0, "rework_cost_usd": 0.0, "phases": []}
 VERIFY = ("lint", "unit")
+NO_WAVES = {"waves": 0, "parallel_demoted": 0, "scope_violations": 0, "waves_dissolved": 0, "parallel_candidates": 0}
 
 
 def _ev(etype: str, **fields) -> dict:
@@ -82,7 +86,7 @@ def test_stops_and_plain_counters():
 def test_a_run_with_nothing_to_report_has_only_the_always_present_counts():
     assert run_signals([], EMPTY_METRICS) == {"ci_rounds": 0, "rollovers": 0, "progress_not_updated": 0, "rework_pct": 0,
                                               "gate_reruns": 0, "compactions": 0, "usage_holds": 0,
-                                              "parked_units": 0, "park_resume_rework": 0}
+                                              "parked_units": 0, "park_resume_rework": 0, **NO_WAVES}
 
 
 def test_a_run_with_a_gate_failure_but_no_ci_rounds_reports_zero_ci_rounds():
@@ -101,8 +105,8 @@ def test_a_phase_that_ran_reports_zero_fixes_and_rejections():
 def test_open_parameter_counts_stay_absent_and_count_families_are_lower_is_better():
     out = run_signals([], EMPTY_METRICS)
     assert not [k for k in out if k.split(":")[0] in ("guard_trips", "permission_denied", "stop")]
-    assert COUNT_FAMILIES <= set(FAMILIES) and all(FAMILIES[f][0] == "lower" for f in COUNT_FAMILIES)
-    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 21
+    assert COUNT_FAMILIES <= set(FAMILIES) and all(FAMILIES[f][0] == "lower" for f in COUNT_FAMILIES - {"waves"})
+    assert isinstance(COUNT_FAMILIES, frozenset) and len(COUNT_FAMILIES) == 26
 
 
 def test_cost_per_task_divides_by_the_steps_that_called_an_agent():
@@ -133,7 +137,7 @@ def test_signals_survive_events_without_the_new_fields():
            _ev("phase_rejected", by="human")]
     assert run_signals(evs, EMPTY_METRICS) == {"ci_rounds": 0, "rollovers": 0, "progress_not_updated": 0, "rework_pct": 0,
                                            "review_blocking:build": 0, "gate_reruns": 0, "compactions": 0,
-                                           "usage_holds": 0, "parked_units": 0, "park_resume_rework": 0}
+                                           "usage_holds": 0, "parked_units": 0, "park_resume_rework": 0, **NO_WAVES}
 
 
 def test_parse_target_accepts_only_the_vocabulary():
@@ -146,7 +150,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 41
+    assert len(FAMILIES) == 47
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -525,3 +529,75 @@ def test_the_same_task_parked_twice_counts_two_parks_and_one_task_of_rework():
     evs = [_park(f"{T2}/implement"), _park(f"{T2}/review"), _ev("step_retry", by="human", key=f"{T2}/review")]
     out = run_signals(evs, EMPTY_METRICS)
     assert (out["parked_units"], out["park_resume_rework"]) == (2, 1)
+
+
+def _at(sec: int, etype: str, **fields) -> dict:
+    """An event `sec` seconds after 09:00:00 (so a build of 100 s spans 09:00:00 to 09:01:40)."""
+    ts = f"2026-11-03T09:{sec // 60:02d}:{sec % 60:02d}.000+00:00"
+    return {"seq": 1, "ts": ts, "type": etype, "by": "runner", **fields}
+
+
+def _build_with_main(*extra: dict, end: int = 100) -> list[dict]:
+    return [_at(0, "run_started"), _at(0, "phase_started", phase="build"),
+            _at(0, "agent_started", key="build/build/task-1/implement", session_id="s1", pid=1, role="implement"),
+            *extra,
+            _at(end, "agent_exited", key="build/build/task-1/implement", session_id="s1", pid=1, exit_code=0),
+            _at(end, "phase_started", phase="verify")]
+
+
+def _signals(events: list[dict]) -> dict:
+    return run_signals(events, run_metrics(events, datetime(2026, 11, 3, 10, 0, tzinfo=UTC)))
+
+
+def test_two_overlapping_subagents_give_parallelism_above_one():
+    evs = _build_with_main(
+        _at(10, "subagent_started", tool_use_id="a", description="one"), _at(90, "subagent_finished", tool_use_id="a"),
+        _at(10, "subagent_started", tool_use_id="b", description="two"), _at(90, "subagent_finished", tool_use_id="b"))
+    assert _signals(evs)["agent_parallelism"] == 2.6
+
+
+def test_parallelism_is_clipped_to_the_build_window_and_leaves_out_an_unfinished_subagent():
+    evs = [_at(0, "phase_started", phase="define"),
+           _at(0, "agent_started", key="define/spec", session_id="d", pid=1, role="spec"),
+           _at(50, "agent_exited", key="define/spec", session_id="d", pid=1, exit_code=0),
+           _at(50, "phase_started", phase="build"),
+           _at(50, "agent_started", key="build/build/task-1/implement", session_id="s1", pid=2, role="implement"),
+           _at(60, "subagent_started", tool_use_id="a"), _at(70, "subagent_started", tool_use_id="never"),
+           _at(200, "subagent_finished", tool_use_id="a"),
+           _at(150, "agent_exited", key="build/build/task-1/implement", session_id="s1", pid=2, exit_code=0),
+           _at(150, "phase_started", phase="verify")]
+    # window 50..150: the main session 100 s, the sub-agent 60..150 = 90 s
+    assert _signals(evs)["agent_parallelism"] == 1.9
+
+
+def test_a_serial_build_has_parallelism_one_and_a_run_with_no_build_agent_time_has_none():
+    assert _signals(_build_with_main())["agent_parallelism"] == 1.0
+    idle = [_at(0, "phase_started", phase="build"), _at(100, "phase_started", phase="verify")]
+    assert "agent_parallelism" not in _signals(idle)
+    assert "agent_parallelism" not in run_signals([], EMPTY_METRICS)
+
+
+def test_wave_counts():
+    evs = [_ev("wave_started", key="build/build/wave-1", wave=1, tasks=[1, 2]),
+           _ev("wave_started", key="build/build/wave-2", wave=2, tasks=[3, 4]),
+           _ev("parallel_demoted", key="build/build/task-5", task=5, reason="shared_files", wave=1),
+           _ev("parallel_demoted", key="build/build/task-5", task=5, reason="shared_files", wave=1),
+           _ev("parallel_demoted", key="build/build/task-5", task=5, reason="blocked", wave=1),
+           _ev("parallel_demoted", key="build/build/task-6", task=6, reason="dissolved", wave=2),
+           _ev("scope_violation", key="build/build/task-1", task=1, path="a.py", wave=1),
+           _ev("scope_violation", key="build/build/task-2", task=2, path="b.py", wave=1),
+           _ev("wave_dissolved", key="build/build/wave-2", wave=2, tasks=[3, 4], reason="stopped", shelf="r"),
+           _ev("parallel_candidates", key="build/build", pairs=[[1, 2], [1, 3], [2, 3]]),
+           _ev("parallel_candidates", key="build/build", pairs=[[1, 2]])]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert (out["waves"], out["parallel_demoted"], out["scope_violations"], out["waves_dissolved"],
+            out["parallel_candidates"]) == (2, 2, 2, 1, 1)
+
+
+def test_a_run_with_no_wave_has_zero_counts_and_no_parallelism_key_without_build():
+    out = run_signals([_ev("run_started")], EMPTY_METRICS)
+    names = ("waves", "parallel_demoted", "scope_violations", "waves_dissolved", "parallel_candidates")
+    assert [out[n] for n in names] == [0] * 5 and "agent_parallelism" not in out
+    assert set(names) <= COUNT_FAMILIES and FAMILIES["waves"] == FAMILIES["agent_parallelism"] == ("higher", False)
+    assert all(FAMILIES[n] == ("lower", False) for n in names[1:])
+    assert parse_target("agent_parallelism") == ("agent_parallelism", None) and "agent_parallelism" not in COUNT_FAMILIES

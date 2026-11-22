@@ -32,7 +32,7 @@ from typing import Literal, TextIO
 
 from agentflow import brief as brief_mod
 from agentflow import lessons as lessons_mod
-from agentflow import doubt, gitops, overlays, pack, run_env, safeio, sizing, verification, workspace
+from agentflow import doubt, gitops, overlays, pack, run_env, safeio, sizing, sources, verification, waves, workspace
 from agentflow.agents import (CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption,
                               ignored_settings, read_only_allow)
 from agentflow.autonomy import AUTO_BY
@@ -63,6 +63,7 @@ from agentflow.route_lane import RouteLane
 from agentflow.run_control import wait_for_agents
 from agentflow.sizing_lane import SizingLane
 from agentflow.sync_lane import SyncLane
+from agentflow.wave_lane import WaveLane
 from agentflow.state import TERMINAL, Run, workspaces_root
 
 Outcome = Literal["done", "skipped", "stopped"]
@@ -105,6 +106,7 @@ RESUMABLE = ("running", "waiting_human")
 # (`role: review`) gets none: a capped review stops at once, so a truncated review is never taken as complete.
 WRAP_UP_TURNS = 3
 WRAP_UP_BUDGET_USD = 2.5  # never more than the role's own spend cap; none when the role has none
+WAVE_TIMEOUT_MARGIN_MIN = 15  # a wave session does its members' work: this much longer than `defaults.step_timeout_min`
 WRAP_UP_PROMPT = ("You have used this session's {cap} budget, so the runner stopped it. Write your result now with what "
                   "you have, and do not start new work: `done` if the step is finished, else `blocked`, with what is "
                   "left in `signals.todo` as a list of one-line strings.")
@@ -180,8 +182,24 @@ def _values(cfg: Config, step: Step, ctx: Ctx, extra: dict) -> dict[str, str]:
     values["code_map"] = _code_map(run)
     worktree = Path(run.state.get("worktree") or ctx.repo) if run is not None else ctx.repo
     values["self_checks"] = _self_checks(cfg, step, worktree)
+    values["parallel_candidates"] = _parallel_candidates(cfg, ctx, worktree)
     values.update({name: str(value) for name, value in extra.items()})
     return values
+
+
+def _parallel_candidates(cfg: Config, ctx: Ctx, worktree: Path) -> str:
+    """The note on ungrouped plan tasks that could share a `**Parallel group:**`, for the plan's doubt review. `""`
+    with waves off (`parallel.max_subagents` of 1), when the run has no plan file yet or the file can't be read."""
+    if cfg.parallel.max_subagents <= 1:
+        return ""
+    rel = ctx.values.get("plan") or ctx.values.get("plan_target") or ""
+    if not rel:
+        return ""
+    try:
+        tasks = sources.parse_plan(worktree / rel)
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return waves.candidates_text(waves.candidates(tasks, cfg.parallel.serial_paths))
 
 
 def _run_facts(run: Run | None) -> str:
@@ -305,7 +323,7 @@ def _brief_pointer(skill: str | None, files: bool) -> str:
 
 
 def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode: Mode,
-                 brief: dict | None = None, self_contained: bool = False) -> str:
+                 brief: dict | None = None, self_contained: bool = False, card: bool = False) -> str:
     """`_preamble.md` + `_step_head.md` + the step's template (after the refine template in a refine round) +
     `_result.md`.
 
@@ -320,6 +338,9 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
     With `self_contained` (a call with no skills listing: `Executor._self_contained`), a line that tells the agent to
     use a skill by name points at its file instead, as `skill_loading: read_file` does: the step template's and the
     overlay's lines, before placeholders are filled. The step's own carried skill keeps its line.
+
+    With `card` (a wave member's card: its parent session reports the result for it), `_result.md` is left out and the
+    rest is built as for a fresh session with no brief pin.
     """
     values = _values(cfg, step, ctx, {})
     preamble = EFFORT_BLOCK.sub("", _template(cfg, PREAMBLE))
@@ -386,7 +407,12 @@ def build_prompt(cfg: Config, step: Step, ctx: Ctx, rec: dict, extra: dict, mode
         values.update(_refine_values(ctx, rec))
     values["in_brief"] = ""  # reserved (`config.PROMPT_PLACEHOLDERS`): always empty for now
     values.update({name: str(value) for name, value in extra.items()})
-    parts = (step_head, body) if brief else (preamble, step_head, body, _template(cfg, RESULT))
+    if brief:
+        parts: tuple[str, ...] = (step_head, body)
+    elif card:
+        parts = (preamble, step_head, body)
+    else:
+        parts = (preamble, step_head, body, _template(cfg, RESULT))
     text = "\n\n".join(part.strip() for part in parts)
     agent = cfg.agents.get(rec.get("agent") or cfg.defaults.agent)
     if self_contained or (agent is not None and agent.skill_loading == "read_file"):
@@ -667,7 +693,7 @@ def _violation_text(violations: list[Violation]) -> str:
 # --------------------------------------------------------------------------- executor
 
 
-class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLane, RouteLane, GovernorLane):
+class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane, SizingLane, RouteLane, GovernorLane):
     """Runs a run's steps: `run_steps`/`run_step` (control flow, in `flow_control`), plan tasks and
     `finish` (in `feature_lane`), test expectations and fix-looping gate steps (in `bug_eval`) and the
     agent step lifecycle here. `dry_run` prints each agent's command line and calls nothing."""
@@ -811,6 +837,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             self._load_pin(sr, shared, sr.session)
             self._load_read_only(sr, shared, sr.session)
             turn = _Turn(self._prompt(sr, resume=sr.session), sr.session)
+        elif resuming and reopened is not None and reopened["type"] == "step_reopened":
+            # A step sent back that has no session (a wave member: its work was done in the wave's session) starts
+            # fresh, led by the note it was reopened with.
+            turn = _Turn(f"{self._continue_prompt(sr, {}, reopened, result=False)}\n\n{self._prompt(sr)}", None)
         else:
             turn = _Turn(self._prompt(sr), None)
         fixing = bool(fix_first) and not resuming
@@ -919,6 +949,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             return
         sr.max_turns = turn_cap if turn_cap is not None else resolve_turn_cap(self.cfg, sr.agent_name, sr.step, sr.role)
         sr.budget_usd = session_budget(self.cfg, sr.agent_name, sr.role)
+        if sr.budget_usd and sr.step.wave_size:  # a wave session does its members' work: their caps together
+            sr.budget_usd *= sr.step.wave_size
 
     def _under_budget(self) -> bool:
         """The run's spend is under its hard budget (the check `_loop` stops on)."""
@@ -1063,8 +1095,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
 
     # -- one call
 
-    def _timeout_s(self) -> int:
-        return max(1, round(self.cfg.defaults.step_timeout_min * 60))
+    def _timeout_s(self, wave: bool = False) -> int:
+        """The step's wall-clock limit: `defaults.step_timeout_min`, and for a wave session (`wave`) its margin more."""
+        minutes = self.cfg.defaults.step_timeout_min + (WAVE_TIMEOUT_MARGIN_MIN if wave else 0)
+        return max(1, round(minutes * 60))
 
     def _idle_s(self, read_only: bool = False) -> tuple[float | None, float | None]:
         """The watchdog's two limits (`agents.idle_limit`): `watchdog.no_progress_min`, and while a tool call is open
@@ -1097,7 +1131,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             # folder of every add-dir (`agents.read_only_allow`), so nothing else may ever join this list.
             add_dirs=[self.run.agent_dir],
             runs_root=self.run.dir.parent,  # denied to the agent's edits, wherever the pack puts the state dir
-            timeout_s=self._timeout_s(),
+            timeout_s=self._timeout_s(wave=sr.step.wave_size > 0),
             resume_session=turn.resume,
             agent_profile=sr.agent_profile,
             context_window=self.context_window_for(sr.key, sr.model),
@@ -1112,6 +1146,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
             carries_rules=bool(sr.brief is not None and sr.brief.get("rules") is True),
             # Every call of a session keeps the setting the session started with (`_decide_read_only`).
             read_only_role=sr.read_only,
+            dispatches=sr.step.wave_size > 0,
             self_contained=self._self_contained(sr),
             max_turns=max_turns,
             budget_usd=budget_usd,
@@ -1274,6 +1309,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         wrap-up turn's rollover as the cap's kind before this: 3 turns can't do the step in a fresh session.)"""
         self.run.emit("rolled_over", key=sr.key, session_id=outcome.session_id, context_pct=outcome.context_pct)
         sr.rollovers += 1
+        if sr.step.wave_size:  # its members run alone from the stop on (the wave is dissolved)
+            self._stop(sr, "max_rollovers", "A wave session never rolls over: its members run alone.")
+            return None
         limit = self.cfg.context.max_rollovers
         if sr.rollovers > limit:
             self._stop(sr, "max_rollovers",
@@ -1802,7 +1840,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
         text = "\n\n".join(parts) + "\n"
         return f"{sr.lead}\n\n{text}" if sr.lead else text
 
-    def _continue_prompt(self, sr: _StepRun, answers: dict[str, str], approved: dict | None = None) -> str:
+    def _continue_prompt(self, sr: _StepRun, answers: dict[str, str], approved: dict | None = None,
+                         result: bool = True) -> str:
         if answers:
             lines = "\n".join(f"{qid}: {text}" for qid, text in answers.items())
             who = "The runner took the option you recommended for each question" if self._answered_by_runner(sr.key) \
@@ -1826,7 +1865,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, SyncLane, CILane, SizingLa
                 "The runner stopped while this step was running. Carry on where you left off: "
                 f"check the work tree and `{progress}`, then finish the step."
             )
-        return f"{lead}\n\n{self._result_partial(sr)}"
+        return f"{lead}\n\n{self._result_partial(sr)}" if result else lead
 
     def _answered_by_runner(self, key: str) -> bool:
         answered = [e for e in self.run.events.read() if e["type"] == "hitl_answered" and e.get("key") == key]

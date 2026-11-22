@@ -463,7 +463,8 @@ def _on_subagent_started(state: dict, ev: dict) -> None:
     if row is not None:
         row["subagents"].append({
             "tool_use_id": ev.get("tool_use_id"), "subagent_type": ev.get("subagent_type"),
-            "model": ev.get("model"), "done": False,
+            "model": ev.get("model"), "description": ev.get("description"), "done": False, "ok": None,
+            "background": ev.get("background"),  # True: started with `run_in_background` (None: an older engine's event)
         })
 
 
@@ -473,6 +474,7 @@ def _on_subagent_finished(state: dict, ev: dict) -> None:
         for sub in row["subagents"]:
             if sub["tool_use_id"] == ev.get("tool_use_id"):
                 sub["done"] = True
+                sub["ok"] = ev.get("ok")  # False: the call came back as an error (None: an older engine's event)
 
 
 def _on_context_window(state: dict, ev: dict) -> None:
@@ -574,6 +576,36 @@ def _on_step_parked(state: dict, ev: dict) -> None:
 def _on_step_reopened(state: dict, ev: dict) -> None:
     """A finished step goes back to its session (an implementer given review findings): resumable, not done."""
     _step_row(state, ev["key"])["status"] = "running"
+
+
+def _clear_waits_under(state: dict, key: str) -> None:
+    """Drop the waits on `key` or under it (current and queued), unless a phase approval is the current wait."""
+    def under(wait: dict) -> bool:
+        return wait.get("key") == key or str(wait.get("key") or "").startswith(f"{key}/")
+
+    state["waiting_queue"] = [w for w in state["waiting_queue"] if not under(w)]
+    waiting = state["waiting"]
+    if waiting is not None and not _approval_pending(state) and under(waiting):
+        _clear_wait(state)
+
+
+def _on_wave_dissolved(state: dict, ev: dict) -> None:
+    """A wave of parallel tasks is given up: its tasks run alone. A wait under the wave's key (its stopped
+    implementer) is cleared, and the wave's implement row is skipped, not failed."""
+    _clear_waits_under(state, ev["key"])
+    row = _step_row(state, f"{ev['key']}/implement")
+    row["status"] = "skipped"
+    row["skip_reason"] = f"wave dissolved: {ev.get('reason')}"
+
+
+def _on_review_wave_dropped(state: dict, ev: dict) -> None:
+    """A wave's review is given up (its tasks are reviewed alone): the same as `_on_wave_dissolved`, for the
+    wave's review row."""
+    key = f"{ev['key']}/review"
+    _clear_waits_under(state, key)
+    row = _step_row(state, key)
+    row["status"] = "skipped"
+    row["skip_reason"] = f"wave review dropped: {ev.get('reason')}"
 
 
 def _on_resolve_started(state: dict, ev: dict) -> None:
@@ -888,6 +920,8 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "usage_governed": _on_usage_governed,
     "step_parked": _on_step_parked,
     "step_reopened": _on_step_reopened,
+    "wave_dissolved": _on_wave_dissolved,
+    "review_wave_dropped": _on_review_wave_dropped,
     "resolve_started": _on_resolve_started,
     "resolve_finished": _on_resolve_finished,
     "run_fact": _on_run_fact,
@@ -944,6 +978,15 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "hitl_notified": ("key",),
     "constraint_approved": ("key", "sha"),
     "step_reopened": ("key",),
+    "wave_started": ("key", "wave"),
+    "parallel_demoted": ("key",),
+    "wave_attributed": ("key",),
+    "scope_violation": ("key", "path"),
+    "wave_dissolved": ("key", "wave"),
+    "review_wave_dropped": ("key",),
+    "fix_rebased": ("key", "tree"),
+    "wave_finished": ("key",),
+    "parallel_candidates": ("key",),
     "resolve_started": ("key",),
     "resolve_finished": ("key",),
     "run_fact": ("text", "key"),
