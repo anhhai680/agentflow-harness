@@ -83,10 +83,13 @@ def plan_path(flow) -> str:
     return make_ctx(flow.cfg, flow.root, "feature", params).values["plan_target"]
 
 
+def planned(flow) -> dict:
+    return {"write": {plan_path(flow): PLAN_TEXT}, **done("planned")}
+
+
 def acts(flow, *plan_acts: dict) -> dict:
     """`define` reaches its approval clean, and `plan/plan` writes the plan (or does `plan_acts`)."""
-    planned = {"write": {plan_path(flow): PLAN_TEXT}, **done("planned")}
-    return {REVIEW: [found(LOW)], PLAN: list(plan_acts) or [planned]}
+    return {REVIEW: [found(LOW)], PLAN: list(plan_acts) or [planned(flow)]}
 
 
 def seq(run: Run, etype: str, **match) -> int:
@@ -176,6 +179,41 @@ def test_approving_with_hold_mid_speculation_rests_the_run(flow, monkeypatch):
     assert go(flow, run) == "awaiting_approval"  # a person goes on: plan resumes from its rows
     assert called(flow, "plan/") == [PLAN, PLAN_REVIEW] and run.state["waiting"]["key"] == "plan_approved"
     assert seq(run, "handoff_written", phase="define") < seq(run, "phase_approval_raised", phase="plan")
+
+
+def test_approving_mid_speculation_goes_on_into_build_when_plan_needs_no_approval(flow, monkeypatch):
+    flow.configure({**SPECULATE, "phases": {"plan": {"needs_approval": False}}}, autopilot=True, edit=with_doubt)
+    run = begin(flow, acts(flow), to="build")
+    real = Executor.run_step
+
+    def run_step(self, phase, step, prefix):
+        outcome = real(self, phase, step, prefix)
+        if f"{prefix}/{step.id}" == PLAN and run.refresh()["status"] == "awaiting_approval":
+            approve(run, "define", by="me")
+        return outcome
+
+    monkeypatch.setattr(Executor, "run_step", run_step)
+    go(flow, run)
+    assert called(flow, "plan/") == [PLAN, PLAN_REVIEW]
+    assert events(run, "speculation_ended")[-1]["outcome"] == "approved"
+    handoff = seq(run, "handoff_written", phase="define")
+    assert handoff < seq(run, "phase_approved", phase="plan", by="runner") < seq(run, "handoff_written", phase="plan")
+    built = [e["seq"] for e in events(run, "step_started") if e["key"].startswith("build/")]
+    assert built and min(built) > seq(run, "handoff_written", phase="plan")  # build started in the same advance
+    assert [e["phase"] for e in events(run, "phase_approval_raised")] == ["define"]
+
+
+def test_a_speculative_stop_the_runner_settles_is_not_told(flow, notices):
+    asks = {"result": {"status": "needs_human", "summary": "cần quyết định", "questions": [{**BOUNDARY, "kind": "spec_gap"}]}}
+    run = begin(flow, acts(flow, asks, planned(flow)), to=None)
+    assert go(flow, run) == "awaiting_approval"
+    assert [w["key"] for w in run.state["waiting_queue"]] == [PLAN]
+    assert not events(run, "hitl_answered")  # nothing is answered behind the approval
+    approve(run, "define", by="me")
+    assert go(flow, run) == "awaiting_approval"
+    assert run.state["waiting"]["key"] == "plan_approved"
+    assert [(e["key"], e["by"]) for e in events(run, "hitl_answered")] == [(PLAN, "runner")]
+    assert [n for n in notices if "cần quyết định" in n] == [] and not events(run, "hitl_notified")
 
 
 def test_a_speculative_stop_waits_quietly_behind_the_spec(flow, notices):
@@ -283,6 +321,17 @@ def test_no_speculation_with_the_default_config(flow_repo):
     assert not [e for e in run.events.read() if e["type"].startswith("speculation_")]
     assert "speculation" not in run.state
     assert "the runner drafts" not in approval_text(flow_repo.cfg, run, "define")
+
+
+def test_a_handoff_with_speculation_off_still_lists_uncommitted_files(flow_repo):
+    flow_repo.configure(PIPE, autopilot=True, edit=with_doubt)
+    run = begin(flow_repo, acts(flow_repo), to="define")
+    assert go(flow_repo, run) == "awaiting_approval"
+    (Path(run.state["worktree"]) / "notes.txt").write_text("chưa commit\n", encoding="utf-8")
+    approve(run, "define", by="me")
+    go(flow_repo, run)
+    text = (run.dir / "handoffs" / "define.md").read_text(encoding="utf-8")
+    assert f"- `{SPEC}`" in text and "- `notes.txt`" in text  # `changed_since`, as before
 
 
 def test_no_speculation_when_the_run_ends_at_the_spec(flow):

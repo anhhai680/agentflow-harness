@@ -54,6 +54,7 @@ from agentflow.autonomy import (
     findings_note,
     phase_findings,
     round_limit,
+    runner_settles,
 )
 from agentflow import constraint, doubt, governor, pack, preflight, route_lane, run_env, slots, speculation, work_source
 from agentflow.commit_checks import runner_head
@@ -75,7 +76,7 @@ from agentflow.gitops import (
     head,
 )
 from agentflow.guards import snapshot
-from agentflow.hitl import notify_run, open_refine, raise_hitl
+from agentflow.hitl import notify_run, open_refine, parks_first, raise_hitl
 from agentflow.intake import gather, save
 from agentflow.issue_status import mark, release
 from agentflow.lanes import Executor, Outcome, footer_next
@@ -609,10 +610,15 @@ class _Loop:
 
     def tell_speculative(self) -> None:
         """Tell a person, once, of the run's wait when it is a stop the walked phase queued quietly behind an approval
-        that has since been given (`_tell_once` keeps `hitl_notified` on it)."""
+        that has since been given (`_tell_once` keeps `hitl_notified` on it), where its raise would have told one: not
+        a stop the runner settles or parks first (`raise_hitl`'s own rule), which the resolver tells of if it cannot."""
         wait = self.run.refresh()["waiting"]
-        if wait is not None and wait.get("speculative"):
-            self.executor()._tell_once(wait)
+        if wait is None or not wait.get("speculative"):
+            return
+        kind, key = str(wait.get("kind")), str(wait.get("key"))
+        if runner_settles(self.cfg, self.run, kind, key, wait.get("questions") or []) or parks_first(self.cfg, kind, key):
+            return
+        self.executor()._tell_once(wait)
 
     def settle_doubt(self, names: list[str], index: int, executor: Executor, lane: str) -> tuple[bool, str | None]:
         """A `needs_approval: true` phase with a reconcile step: open a reconcile round on its review's blocking
@@ -722,15 +728,16 @@ def _one_line(text: str) -> str:
 
 
 def _artifacts(run: Run, phase: str) -> list[str]:
-    """What the phase changed: since it started, or, once approved, up to the commit its approval was asked on, so a
-    phase the runner walked behind that approval (`speculate`) never shows in it."""
+    """What the phase changed since it started. Once approved, a phase the runner walked another phase behind
+    (`speculate`) lists what changed up to the commit its approval was asked on, so the walked phase never shows in it."""
     row = run.state["phases"].get(phase) or {}
     sha = row.get("start_sha")
     worktree = run.state.get("worktree")
     if not sha or not worktree:
         return []
+    walked = any(e["type"] == "speculation_started" and e.get("after") == phase for e in run.events.read())
     try:
-        if row.get("status") == "approved" and row.get("approval_sha"):
+        if walked and row.get("status") == "approved" and row.get("approval_sha"):
             return changed_between(Path(worktree), sha, row["approval_sha"])
         return changed_since(Path(worktree), sha)
     except GitError:
