@@ -7,6 +7,11 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.5] - 2026-11-23
+
+### Fixed
+- The dashboard header no longer breaks when the usage window carries a note: the note gets its own full-width line under the header's controls, so the run summary stays one readable block instead of a narrow column and the tab buttons stay on the first row.
+
 ## [3.4] - 2026-11-23
 
 ### Added

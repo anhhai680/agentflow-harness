@@ -25,7 +25,9 @@
 body { margin: 0; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
 header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
 header h1 { font-size: 16px; margin: 0 8px 0 0; }
-#summary { flex: 1; color: var(--muted); }
+#summary { flex: 1 1 260px; min-width: 0; color: var(--muted); }
+/* A usage note is a sentence: give it its own full-width line under the header's controls, not a share of the first row */
+#usage-note { order: 1; flex: 1 1 100%; border-radius: 6px; }
 button, select { font: inherit; color: inherit; background: var(--chip); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
 button[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: var(--accent); }
 button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
