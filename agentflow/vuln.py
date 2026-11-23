@@ -14,7 +14,7 @@ scanner that dies must never read as a clean scan, so `judge` answers "failed" u
 
 `config.py` imports this module's constants at module level, so this module imports nothing from `agentflow` at
 module level (`config`, `gates` and `state` would be a cycle): `gather_alert` imports `gitops`, `intake` and `state`
-when it runs.
+when it runs, and `run_probe` imports `config`, `gates` and `guards`.
 """
 
 from __future__ import annotations
@@ -29,7 +29,9 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from agentflow.config import VulnPolicy
+    from agentflow.config import Config, VulnPolicy
+    from agentflow.gates import GateResult
+    from agentflow.state import Run
 
 SEVERITIES = ("low", "medium", "high", "critical")
 # The ecosystems GitHub documents for Dependabot alerts.
@@ -190,6 +192,61 @@ def judge(exit_code: int | None, output: str, ids: Sequence[str], ok_exit: Seque
         return "failed", []
     matched = [i for i in ids if re.search(rf"(?<![\w-]){re.escape(i)}(?![\w-])", output)]
     return ("present", matched) if matched else ("absent", [])
+
+
+def forbidden(cfg: Config, lane: str) -> list[str]:
+    """The paths a run of `lane` may never change, on top of `guardrails.forbidden_paths` and a step's `forbid`: in a
+    vuln run, `ENGINE_FORBID` and then the pack's `vuln.forbid` (it adds, never replaces); in any other lane none."""
+    return [*ENGINE_FORBID, *cfg.vuln.forbid] if lane == "vuln" else []
+
+
+def _probe_output(result: GateResult, command: str) -> str:
+    """The probe's own output, from its gate log without the runner's `$ <command>` line ("" when there is no log, or
+    the log does not start with that line: no output is never a clean scan)."""
+    if result.log_path is None:
+        return ""
+    try:
+        text = Path(result.log_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    head = f"$ {command}\n"
+    return text[len(head):] if text.startswith(head) else ""
+
+
+def run_probe(cfg: Config, run: Run, worktree: Path, key: str, expect: str) -> tuple[str, list[str], GateResult]:
+    """Run the pack's probe gate (`vuln.probe`) in `worktree` for the step `key` and judge its output against the run's
+    advisory ids (`alert.json`): `(verdict, matched ids, the gate's result)`. Emits `expectation_checked` with `ok`
+    (`present` for `advisory_present`, `absent` for `advisory_cleared`) and the `tree` the probe ran on.
+
+    The verdict is "failed", and nothing is run, when the run's ids cannot be read or `vuln.probe` names no gate: a
+    probe that cannot run is never a clean scan."""
+    from agentflow.config import ADVISORY_CLEARED, ADVISORY_PRESENT
+    from agentflow.gates import GateResult, run_gates
+    from agentflow.guards import snapshot
+
+    if expect not in (ADVISORY_PRESENT, ADVISORY_CLEARED):
+        raise ValueError(f"not a probe expectation: {expect!r}")
+    name = cfg.vuln.probe
+    tree = snapshot(worktree)
+    why = ""
+    try:
+        ids = [str(i) for i in read_alert(run.dir)["ids"]]
+    except AlertError as exc:
+        ids, why = [], str(exc)
+    if not why and name not in cfg.gates:
+        why = f"vuln.probe {name!r} is not a gate of the pack"
+    if why:
+        result = GateResult(name or "probe", False, False, why, None, f"The probe did not run: {why}.")
+        run.emit("expectation_checked", key=key, expect=expect, gate=name, ok=False, verdict="failed", matched=[],
+                 exit_code=None, log=None, tree=tree, error=why)
+        return "failed", [], result
+    gate = cfg.gates[name]
+    [result] = run_gates(cfg, [name], worktree, run.gate_log_dir(key))
+    verdict, matched = judge(result.exit_code, _probe_output(result, gate.run), ids, gate.ok_exit, gate.found_exit)
+    ok = verdict == ("present" if expect == ADVISORY_PRESENT else "absent")
+    run.emit("expectation_checked", key=key, expect=expect, gate=name, ok=ok, verdict=verdict, matched=matched,
+             exit_code=result.exit_code, log=str(result.log_path) if result.log_path else None, tree=tree)
+    return verdict, matched, result
 
 
 # --------------------------------------------------------------------------- intake: `--alert N`

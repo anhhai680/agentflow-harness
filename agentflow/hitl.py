@@ -619,6 +619,16 @@ def _way_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config, tim
     if kind == "red_test_passes":
         return (f"`agentflow approve {run.id} {key}` resumes the step's session to make the test fail for the bug's reason, "
                 f"and the runner checks it again; {reject}")
+    if kind == "advisory_not_reproduced":
+        return (f"The probe ran cleanly but does not name the alert's advisory: the alert may be stale (already fixed, or "
+                f"for another branch), or the scanner may not see it. Fix the probe gate (`vuln.probe`) if it is the "
+                f"scanner, then `agentflow retry {run.id} {key}` runs it again; or `agentflow cancel {run.id}` ends the "
+                f"run (dismiss a stale alert in GitHub).")
+    if kind == "probe_failed":
+        return (f"The probe gate did not run cleanly (a missing tool, a crash, a timeout, or a 'found' exit that names no "
+                f"advisory), so it is never read as a clean scan. Fix the probe gate (`vuln.probe` and its "
+                f"`ok_exit`/`found_exit`), then `agentflow retry {run.id} {key}` runs the step again; or "
+                f"`agentflow cancel {run.id}` ends the run.")
     if kind == "review_unresolved":
         return (f"Fix the code yourself if you want, then `agentflow approve {run.id} {key}` gives the reviewer one last "
                 f"look, runs the gates again and commits the task, with any finding still open listed in the commit body; "

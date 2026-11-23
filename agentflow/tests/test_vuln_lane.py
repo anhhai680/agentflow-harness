@@ -1,15 +1,18 @@
-"""The `vuln` lane in the engine defaults: its steps, its prompts and its bundled skill (the runner's behaviour for
-its two expectation steps is in later tests)."""
+"""The `vuln` lane in the engine defaults: its steps, its prompts and its bundled skill, and the runner's probe
+(`expect: advisory_present` before the patch, `advisory_cleared` after it) and the lane's forbidden ignore files."""
 
 from __future__ import annotations
 
+import json
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
-from conftest import SPARSE_PACK, add_vuln_lane, deep_merge, vuln_steps
+from conftest import SPARSE_PACK, add_vuln_lane, deep_merge, run_git, vuln_steps
 
-from agentflow import conditions, pack, pipeline, workspace
+from agentflow import conditions, hitl, pack, pipeline, vuln, workspace
 from agentflow.config import load_config, validate
 from agentflow.state import Run
 
@@ -173,3 +176,176 @@ def test_only_a_package_and_a_version_may_reach_a_command():
                  (SKILLS / "agentflow-patch" / "SKILL.md").read_text(encoding="utf-8")):
         assert "never put" in text.lower() or "never go into a command" in text
         assert "matched them against the manifest and the lockfile" in text
+
+
+# --------------------------------------------------------------------------- the probe: advisory_present | cleared
+
+GHSA = "GHSA-cfgh-2345-vwxj"
+RED_KEY, PATCH = "build/advisory_red", "build/patch"
+# The pack's own scanner: it names the advisory while requirements.txt pins requests below 2.32.0, and exits 1 then.
+AUDIT = (
+    "import re, sys\n"
+    "text = open('requirements.txt', encoding='utf-8').read()\n"
+    "found = re.search(r'requests==(\\d+)\\.(\\d+)\\.(\\d+)', text)\n"
+    "if found and tuple(map(int, found.groups())) < (2, 32, 0):\n"
+    f"    print('requests 2.31.0 {GHSA} Requests leaks credentials on redirect')\n"
+    "    sys.exit(1)\n"
+    "print('No known vulnerabilities found')\n"
+)
+PROBE = f"{shlex.quote(sys.executable)} audit.py"
+VULN_PATCH = {"vuln": {"probe": "audit"}, "gates": {"audit": {"run": PROBE}},
+              "gate_sets": {"build": ["ok"], "verify": ["ok"]}}
+FIXED = "requests==2.32.0\n"
+
+
+def _done(summary: str = "ok") -> dict:
+    return {"result": {"status": "done", "summary": summary}}
+
+
+def _vuln_run(flow_repo, audit: str = AUDIT, requirements: str = "requests==2.31.0\n", patch: dict | None = None):
+    """A vuln run started from alert 42 (`gh_alerts`), with `audit.py` and `requirements.txt` on the fork commit."""
+    for name, text in (("audit.py", audit), ("requirements.txt", requirements)):
+        (flow_repo.root / name).write_text(text, encoding="utf-8")
+    run_git(flow_repo.root, "add", "audit.py", "requirements.txt")
+    run_git(flow_repo.root, "commit", "-q", "-m", "audit")
+    flow_repo.configure(patch=deep_merge(VULN_PATCH, patch or {}), edit=add_vuln_lane)
+    return pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", {"alert": "42"}, pipeline.RunOptions())
+
+
+def _build(flow_repo, run):
+    """`advisory_red` then `patch`, as a run reaches them (the setup step's gates are not this test's)."""
+    phase = flow_repo.cfg.phases["build"]
+    steps = [s for s in phase.steps if s.id in ("advisory_red", "patch")]
+    return flow_repo.executor(run).run_steps(phase, steps, "build")[0]
+
+
+def _patch_calls(flow_repo) -> list[dict]:
+    return [c for c in flow_repo.calls() if c["step"] == PATCH]
+
+
+def _stop(flow_repo, run) -> dict:
+    return flow_repo.events(run, "hitl_raised")[-1]
+
+
+def _deny(argv: list[str]) -> list[str]:
+    return json.loads(argv[argv.index("--settings") + 1])["permissions"]["deny"]
+
+
+def test_happy_path_red_patch_cleared(flow_repo, gh_alerts):
+    run = _vuln_run(flow_repo)
+    flow_repo.script({PATCH: [{"write": {"requirements.txt": FIXED}, **_done("bumped requests")}]})
+    assert _build(flow_repo, run) == "done"
+    present, cleared = flow_repo.events(run, "expectation_checked")
+    assert (present["key"], present["expect"], present["ok"]) == (RED_KEY, "advisory_present", True)
+    assert present["matched"] == [GHSA] and present["exit_code"] == 1
+    assert (cleared["key"], cleared["expect"], cleared["ok"]) == (PATCH, "advisory_cleared", True)
+    assert cleared["matched"] == [] and cleared["exit_code"] == 0
+    [started] = [e for e in flow_repo.events(run, "step_started") if e["key"] == PATCH]
+    assert present["seq"] < started["seq"]  # proven present before any agent call of the patch
+    assert Path(present["log"]).read_text(encoding="utf-8").startswith(f"$ {PROBE}\n")
+    assert present["tree"] and cleared["tree"] != present["tree"]
+    assert len(_patch_calls(flow_repo)) == 1
+    [committed] = [e for e in flow_repo.events(run, "step_committed") if e["key"] == PATCH]
+    subject = run_git(Path(run.state["worktree"]), "log", "-1", "--format=%s", committed["sha"]).strip()
+    assert subject == "Patch requests-ghsa-cfgh-2345-vwxj"
+    assert run.state["steps"][RED_KEY]["status"] == "done" and run.state["steps"][PATCH]["status"] == "done"
+
+
+def test_not_reproduced_stops_before_patch(flow_repo, gh_alerts):
+    run = _vuln_run(flow_repo, requirements=FIXED)
+    assert _build(flow_repo, run) == "stopped"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("advisory_not_reproduced", RED_KEY)
+    assert _patch_calls(flow_repo) == []
+    [checked] = flow_repo.events(run, "expectation_checked")
+    assert checked["ok"] is False and checked["matched"] == [] and checked["exit_code"] == 0
+    way_on = hitl._way_on(run, "advisory_not_reproduced", RED_KEY, False, flow_repo.cfg)
+    assert "stale" in way_on and f"agentflow retry {run.id} {RED_KEY}" in way_on
+
+
+@pytest.mark.parametrize("when", ["present", "cleared"])
+@pytest.mark.parametrize("script", ["import sys; sys.exit(127)", "import sys; print('Traceback boom'); sys.exit(1)",
+                                    "pass", "import time; time.sleep(999)"])
+def test_probe_failed_never_green(flow_repo, gh_alerts, script, when):
+    quick = {"defaults": {"gate_timeout_min": 0.02}}  # the sleeping probe is killed after a second or so
+    if when == "present":  # the check before the patch
+        run = _vuln_run(flow_repo, audit=script + "\n", patch=quick)
+        key, expected = RED_KEY, [("advisory_present", False)]
+    else:  # the check after it: the patch "fixes" the probe into one that dies
+        run = _vuln_run(flow_repo, patch=quick)
+        flow_repo.script({PATCH: [{"write": {"requirements.txt": FIXED, "audit.py": script + "\n"}, **_done()}]})
+        key, expected = PATCH, [("advisory_present", True), ("advisory_cleared", False)]
+    assert _build(flow_repo, run) == "stopped"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("probe_failed", key)
+    checks = flow_repo.events(run, "expectation_checked")
+    assert [(c["expect"], c["ok"]) for c in checks] == expected and checks[-1]["verdict"] == "failed"
+    assert len(_patch_calls(flow_repo)) == (0 if when == "present" else 1)
+    assert not [e for e in flow_repo.events(run, "fix_attempt")]  # a dead scanner is never a gate to fix
+    assert (run.state["steps"].get(PATCH) or {}).get("status") != "done"
+    assert not [e for e in flow_repo.events(run, "step_committed") if e["key"] == PATCH]
+    assert "probe" in hitl._way_on(run, "probe_failed", key, False, flow_repo.cfg)
+
+
+def test_wrong_package_exhausts_the_fix_loop(flow_repo, gh_alerts):
+    run = _vuln_run(flow_repo)
+    attempts = flow_repo.cfg.defaults.fix_attempts
+    flow_repo.script({PATCH: [{"write": {"other.txt": f"try {i}\n"}, **_done()} for i in range(attempts + 1)]})
+    assert _build(flow_repo, run) == "stopped"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("fix_attempts_exhausted", PATCH)
+    assert "advisory_cleared" in stop["summary"]
+    assert len(_patch_calls(flow_repo)) == attempts + 1
+    fixes = [e for e in flow_repo.events(run, "fix_attempt") if e["key"] == PATCH]
+    assert len(fixes) == attempts and all(f["gates"] == ["advisory_cleared"] for f in fixes)
+    cleared = [e for e in flow_repo.events(run, "expectation_checked") if e["expect"] == "advisory_cleared"]
+    assert len(cleared) == attempts + 1 and not any(c["ok"] for c in cleared)
+    assert all(c["matched"] == [GHSA] for c in cleared)
+    assert "advisory still reported" in _patch_calls(flow_repo)[1]["argv"][-1]
+
+
+@pytest.mark.parametrize("path", [".nsprc", "web/.nsprc", "sub/osv-scanner.toml", ".github/workflows/ci.yml"])
+def test_ignore_file_edit_is_a_guard_violation(flow_repo, gh_alerts, path):
+    run = _vuln_run(flow_repo)
+    flow_repo.script({PATCH: [{"write": {"requirements.txt": FIXED, path: "ignore\n"}, **_done()}]})
+    assert _build(flow_repo, run) == "stopped"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("guard_violation", PATCH)
+    [tripped] = flow_repo.events(run, "guard_tripped")
+    assert {"kind": "forbidden_path", "detail": path} in tripped["violations"]
+    deny = _deny(_patch_calls(flow_repo)[0]["argv"])
+    assert all(f"Edit(./{glob})" in deny for glob in vuln.ENGINE_FORBID)
+    assert not [e for e in flow_repo.events(run, "step_committed") if e["key"] == PATCH]
+
+    hitl.approve(run, PATCH, by="me")  # approved with the ignore file still in the tree: the restart refuses it
+    assert _build(flow_repo, run) == "stopped"
+    assert (_stop(flow_repo, run)["kind"], len(_patch_calls(flow_repo))) == ("guard_violation", 1)
+    assert {"kind": "forbidden_path", "detail": path} in flow_repo.events(run, "guard_tripped")[-1]["violations"]
+    assert not [e for e in flow_repo.events(run, "step_committed") if e["key"] == PATCH]
+
+
+def test_probe_that_writes_an_ignore_file_is_a_guard_violation(flow_repo, gh_alerts):
+    run = _vuln_run(flow_repo, audit="open('.nsprc', 'w').write('{}')\n" + AUDIT)
+    assert _build(flow_repo, run) == "stopped"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("guard_violation", RED_KEY)
+    assert ".nsprc" in stop["summary"] and "probe" in stop["summary"]
+    assert _patch_calls(flow_repo) == []
+
+
+def test_pack_forbid_adds_to_the_engine_list(flow_repo, gh_alerts):
+    _vuln_run(flow_repo, patch={"vuln": {"forbid": ["audit.py"]}})
+    assert vuln.forbidden(flow_repo.cfg, "vuln") == [*vuln.ENGINE_FORBID, "audit.py"]
+
+
+def test_feature_lane_forbid_unchanged(flow_repo):
+    flow_repo.configure(patch={"vuln": {"forbid": ["audit.py"]}}, edit=add_vuln_lane)
+    assert vuln.forbidden(flow_repo.cfg, "feature") == [] and vuln.forbidden(flow_repo.cfg, "bug") == []
+    run = flow_repo.new_run()
+    phase = flow_repo.cfg.phases["define"]
+    step = next(s for s in phase.steps if s.id == "debug")  # any agent step: the lane is what counts
+    flow_repo.executor(run).run_agent_step(phase, step, "define/debug")
+    [call] = flow_repo.calls()
+    deny = _deny(call["argv"])
+    assert "Edit(./.claude/**)" in deny  # the pack's own forbidden paths still reach it
+    assert not [rule for rule in deny if ".nsprc" in rule or "audit.py" in rule]
