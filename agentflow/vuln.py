@@ -539,8 +539,11 @@ def pr_lines(run: Run) -> list[str]:
     target = clean_fact(str(facts.get("target_version") or "") if isinstance(facts, dict) else "")[:TARGET_MAX]
     lines.append(f"Target: {_code(target)}" if target.replace("`", "").strip() else "Target: unknown")
     for advisory in advisories:
-        url = _url(str(advisory.get("url") or ""))
-        lines.append(f"Alert: {url}" if url else f"Alert: #{advisory.get('number')}")
+        url, number = _url(str(advisory.get("url") or "")), advisory.get("number")
+        if url:
+            lines.append(f"Alert: {url}")
+        elif isinstance(number, int) and not isinstance(number, bool) and number > 0:
+            lines.append(f"Alert: #{number}")
     lines += [f"Supersedes #{n} (Dependabot)" for n in alert.get("dependabot_prs") or []
               if isinstance(n, int) and not isinstance(n, bool) and n > 0]
     lines.append(_probe_line(events))

@@ -401,10 +401,12 @@ def _vuln_signals(events: list[dict]) -> dict[str, float]:
     """A vuln run's signals (one with a `vuln_alert_read`): `advisory_reproduced`, `vuln_code_change` (only once a
     `vuln_scope` is recorded; the last one counts) and `hours_to_pr:<severity>` (the alert's severity, from the first
     `run_started` to the first `pr_opened`, an early draft included; only for a run with both)."""
+    from agentflow.config import ADVISORY_PRESENT
+
     alert = next((e for e in events if e.get("type") == "vuln_alert_read"), None)
     if alert is None:
         return {}
-    present = any(e.get("type") == "expectation_checked" and e.get("expect") == "advisory_present"
+    present = any(e.get("type") == "expectation_checked" and e.get("expect") == ADVISORY_PRESENT
                   and e.get("ok") is True for e in events)
     out: dict[str, float] = {"advisory_reproduced": 1.0 if present else 0.0}
     scopes = [e for e in events if e.get("type") == "vuln_scope"]

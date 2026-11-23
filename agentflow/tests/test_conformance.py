@@ -324,26 +324,36 @@ def test_advisory_cleared_needs_present_then_cleared(cfg):
     assert evaluate(cfg, red_green, [ADVISORY], "t")[0].status == "missing"  # another lane's checks are not this
 
 
-def test_advisory_cleared_goes_stale_after_a_code_change(cfg):
-    present = probe(3, "build/advisory_red", ADVISORY_PRESENT, verdict="present")
-    cleared = probe(4, "build/patch", ADVISORY_CLEARED)
+def test_advisory_cleared_counts_only_on_the_final_tree(cfg):
+    """Ruling 21: a cleared check is evidence only on exactly the tree to be pushed, like a gate result; any later
+    change of the tree (a commit, a fix that ran the verify set, a merge of the base, clean or conflicted, even
+    under the check's own key) leaves it missing, and the audit probes the final tree again."""
+    present = probe(3, "build/advisory_red", ADVISORY_PRESENT, verdict="present", tree="base")
+    cleared = probe(4, "build/patch", ADVISORY_CLEARED, tree="patched")
+    assert evaluate(cfg, [present, cleared], [ADVISORY], "patched")[0].status == "satisfied"
     later = ev(9, "step_committed", key="review/fix_findings", sha="f")
-    stale = evaluate(cfg, [present, cleared, later], [ADVISORY], "t")[0]
-    assert stale.status == "missing" and "last code change" in stale.note
-    again = probe(12, "ship/finish", ADVISORY_CLEARED)  # the audit's re-probe on the tree to be pushed
-    finding = evaluate(cfg, [present, cleared, later, again], [ADVISORY], "t")[0]
+    moved = evaluate(cfg, [present, cleared, later], [ADVISORY], "fixed")[0]
+    assert moved.status == "missing" and "final tree" in moved.note
+    covered = verify_gates(6, cfg, "review/fix_findings")  # a fix that ran the whole verify set: still only the probe
+    assert evaluate(cfg, [present, cleared, *covered, later], [ADVISORY], "fixed")[0].status == "missing"
+    again = probe(12, "ship/finish", ADVISORY_CLEARED, tree="fixed")  # the audit's re-probe on the tree to be pushed
+    finding = evaluate(cfg, [present, cleared, later, again], [ADVISORY], "fixed")[0]
     assert finding.status == "satisfied" and finding.evidence == [3, 12]
-    covered = verify_gates(6, cfg, "review/fix_findings")  # a fix that ran the whole verify set still stales it:
-    stale = evaluate(cfg, [present, cleared, *covered, later], [ADVISORY], "t")[0]  # only the probe proves it gone
-    assert stale.status == "missing" and "last code change" in stale.note
-    rtg = ob("red_then_green", "expect:red_then_green")  # red_then_green keeps the verify-coverage exemption
+    # the reviewer's reproduction: finish cleared, then a later sync under the same key merged with conflicts
+    reprobed = probe(12, "ship/finish", ADVISORY_CLEARED, tree="before-sync")
+    conflicted = ev(20, "base_synced", key="ship/finish", conflicts=["requirements.txt"])
+    assert evaluate(cfg, [present, reprobed, conflicted], [ADVISORY], "merged")[0].status == "missing"
+    clean_merge = ev(20, "base_synced", key="ship/finish", conflicts=[])  # the base's code is unprobed too
+    assert evaluate(cfg, [present, reprobed, clean_merge], [ADVISORY], "merged")[0].status == "missing"
+    no_tree = {**again}
+    del no_tree["tree"]  # an event with no tree is no evidence
+    assert evaluate(cfg, [present, no_tree], [ADVISORY], "fixed")[0].status == "missing"
+    assert evaluate(cfg, [present, again], [ADVISORY], "")[0].status == "missing"  # nor is an unknown final tree
+    rtg = ob("red_then_green", "expect:red_then_green")  # red_then_green keeps its change-list staling
     red_green = [ev(3, "expectation_checked", key="build/regression_test", expect="red", ok=True),
                  ev(4, "expectation_checked", key="build/fix", expect="green", ok=True)]
-    assert evaluate(cfg, [*red_green, *covered, later], [rtg], "t")[0].status == "satisfied"
-    conflicted = ev(9, "base_synced", key="ship/finish", conflicts=["requirements.txt"])
-    assert evaluate(cfg, [present, cleared, conflicted], [ADVISORY], "t")[0].status == "missing"
-    clean_merge = ev(9, "base_synced", key="ship/finish", conflicts=[])  # not the run's own change
-    assert evaluate(cfg, [present, cleared, clean_merge], [ADVISORY], "t")[0].status == "satisfied"
+    assert evaluate(cfg, [*red_green, *covered, later], [rtg], "fixed")[0].status == "satisfied"
+    assert evaluate(cfg, [*red_green, later], [rtg], "fixed")[0].status == "missing"
 
 
 def test_marked_done_never_waives_advisory_cleared(tmp_cfg):

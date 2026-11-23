@@ -514,15 +514,37 @@ def test_a_fix_that_ran_the_verify_set_still_triggers_the_reprobe(flow_repo, gh_
     assert not _pushed(flow_repo, run) and _created(gh_alerts) == []
 
 
+def test_a_clean_base_merge_after_the_clearance_is_probed_again(flow_repo, gh_alerts, monkeypatch):
+    """`origin/<fork_from>` moved on after the patch: finish merges it in cleanly, so the tree to be pushed holds code
+    no probe saw, and the audit probes it again."""
+    run = _at_ship(flow_repo)
+    fork = flow_repo.cfg.project.fork_from
+    run_git(flow_repo.root, "checkout", "-q", fork)
+    (flow_repo.root / "upstream.txt").write_text("from the base\n", encoding="utf-8")
+    run_git(flow_repo.root, "add", "upstream.txt")
+    run_git(flow_repo.root, "commit", "-q", "-m", "upstream")
+    run_git(flow_repo.root, "push", "-q", "origin", fork)
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
+    assert flow_repo.events(run, "base_synced")
+    checks = [e for e in flow_repo.events(run, "expectation_checked") if e["expect"] == "advisory_cleared"]
+    assert [c["key"] for c in checks] == [PATCH, FINISH] and checks[-1]["ok"] is True
+    assert checks[-1]["tree"] == flow_repo.events(run, "conformance_checked")[-1]["tree"]
+    assert _audit(flow_repo, run)["advisory_cleared"] == "satisfied" and _pushed(flow_repo, run)
+
+
 def test_a_fresh_clearance_is_not_probed_again(flow_repo, gh_alerts):
+    """The patch's check ran on the tree its commit then recorded, which is the tree finish pushes: no re-probe."""
     run = _at_ship(flow_repo)
     assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
     assert [e["key"] for e in flow_repo.events(run, "expectation_checked")] == [RED_KEY, PATCH]
+    cleared = flow_repo.events(run, "expectation_checked")[-1]
+    assert cleared["tree"] == flow_repo.events(run, "conformance_checked")[-1]["tree"]
+    assert not (run.gate_log_dir(FINISH) / "probe").exists()
     assert _audit(flow_repo, run)["advisory_cleared"] == "satisfied"
 
 
 @pytest.mark.parametrize("enforce", ["block", "report"])
-def test_block_mode_stops_when_still_present(flow_repo, gh_alerts, enforce):
+def test_finish_stops_when_still_present(flow_repo, gh_alerts, enforce):
     """A review fix put the vulnerable version back: the re-probe at finish names the advisory, and the run stops
     with `gate_failed` (as a gate failing at the audit does, not `conformance_failed`) before anything is pushed.
     `advisory_cleared` is the vuln lane's floor, so report mode stops the same way."""
@@ -602,6 +624,30 @@ def test_the_security_section_shows_what_is_missing_and_keeps_model_text_on_one_
     assert lines[-1] == "Code changed outside dependency files: `ab.py`, `src/app.py`"
     assert all("\n" not in line and line == hitl.clean_fact(line) for line in lines)
     assert vuln.pr_lines(flow_repo.new_run()) == []  # a run with no alert.json has no section
+    facts = json.loads((run.dir / vuln.ALERT_JSON).read_text(encoding="utf-8"))
+    facts["advisories"] = [{**facts["advisories"][0], "url": "", "number": 43},
+                           {**facts["advisories"][0], "url": "javascript:alert(1)", "number": None}]
+    (run.dir / vuln.ALERT_JSON).write_text(json.dumps(facts), encoding="utf-8")
+    alerts = [line for line in vuln.pr_lines(run) if line.startswith("Alert:")]
+    assert alerts == ["Alert: #43"]  # no URL and no number: no line, never `Alert: #None`
+
+
+def test_a_git_error_in_the_finish_probe_guard_is_a_blocked_stop(flow_repo, gh_alerts, monkeypatch):
+    from agentflow import conformance
+    from agentflow.gitops import GitError
+
+    run = _at_ship(flow_repo)
+    _review_fix(run, {"notes.md": "a review fix\n"})
+
+    def broken(_worktree):
+        raise GitError("git is gone")
+
+    monkeypatch.setattr(conformance, "head", broken)
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("blocked", FINISH) and "git is gone" in stop["summary"]
+    assert not [e for e in flow_repo.events(run, "expectation_checked") if e["key"] == FINISH]
+    assert not _pushed(flow_repo, run) and _created(gh_alerts) == []
 
 
 def test_vuln_scope_flags_code_changes(flow_repo, gh_alerts):

@@ -2,9 +2,8 @@
 
 `evaluate` is pure: nothing in it reads a file or the clock. It takes the run's events, the obligations that apply
 and the tree that will be pushed, and returns one finding per obligation. Evidence counts only when it comes after
-the last code change that makes it stale (steps, expectations; see `_staling`; `advisory_cleared` goes stale on any
-code change of the run) or was made on exactly the final
-tree (gates), or by a gate whose `input_hash` there equals the one on the result (the files it declares as `inputs`
+the last code change that makes it stale (steps, expectations; see `_staling`) or was made on exactly the final
+tree (gates, and the vuln lane's `advisory_cleared`), or by a gate whose `input_hash` there equals the one on the result (the files it declares as `inputs`
 are the same). An affected-tier result (`tier: "affected"`, passed or skipped) is never gate evidence: it checked
 only the files a fix changed. Events from older runs
 carry no `tree`, so every reader uses `.get` and a missing tree is no evidence.
@@ -18,6 +17,7 @@ trees only: no step summary or finding text, which are model text, ever reaches 
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -236,21 +236,20 @@ def _probe_ok(event: dict, expect: str) -> bool:
             and not event.get("forbidden"))
 
 
-def _advisory_cleared(events: list[dict]) -> _Item:
-    """The vuln lane's floor evidence: the latest `advisory_cleared` check that passed and is not stale, with an
-    `advisory_present` check that passed before it (the probe named the advisory, then no longer did).
+def _advisory_cleared(events: list[dict], final_tree: str) -> _Item:
+    """The vuln lane's floor evidence: the latest `advisory_cleared` check that passed on exactly `final_tree`, the
+    tree to be pushed (as a gate result counts), with an `advisory_present` check that passed before it.
 
-    Unlike `_red_then_green`, any later code change of the run stales it (`_is_code_change`, with no exemption for a
-    fix that ran the verify gates: a review fix can change dependencies, and only the probe proves the advisory
-    gone), and the item has no phase, so a mark-done never waives it, as it never waives the gates floor."""
-    changes = [e for e in events if _is_code_change(e)]
-    for cleared in sorted((e for e in events if _probe_ok(e, ADVISORY_CLEARED) and not _stale_by(changes, e)),
-                          key=lambda e: e["seq"], reverse=True):
+    The tree binding is its only staleness rule, and the strictest: any change of the tree since the check (a commit,
+    a fix that ran the verify gates, a merge of the base, clean or conflicted, even one under the check's own key)
+    leaves it missing, and the audit probes the final tree again (`_reprobe`). The item has no phase, so a mark-done
+    never waives it, as it never waives the gates floor."""
+    for cleared in sorted((e for e in events if _probe_ok(e, ADVISORY_CLEARED) and final_tree
+                           and e.get("tree") == final_tree), key=lambda e: e["seq"], reverse=True):
         present = _last([e for e in events if _probe_ok(e, ADVISORY_PRESENT) and e["seq"] < cleared["seq"]])
         if present is not None:
             return _Item(True, [present["seq"], cleared["seq"]])
-    return _Item(False, note=f"no {ADVISORY_PRESENT} check followed by an {ADVISORY_CLEARED} one after the last code "
-                 "change")
+    return _Item(False, note=f"no {ADVISORY_CLEARED} check on the final tree after a passing {ADVISORY_PRESENT} one")
 
 
 def _item(cfg: Config, events: list[dict], evidence: Evidence, final_tree: str, changes: list[dict],
@@ -264,7 +263,7 @@ def _item(cfg: Config, events: list[dict], evidence: Evidence, final_tree: str, 
     if evidence.kind == "expect" and evidence.arg == "red_then_green":
         return _red_then_green(cfg, events, changes)
     if evidence.kind == "expect" and evidence.arg == ADVISORY_CLEARED:
-        return _advisory_cleared(events)
+        return _advisory_cleared(events, final_tree)
     return _Item(False, note="unrecognised evidence item")  # `config.UNRECOGNISED`, or a kind this engine lacks
 
 
@@ -395,7 +394,7 @@ def audit(cfg: Config, run: Run, worktree: Path, ctx: Ctx, key: str) -> bool:
 
 def _needs_probe(cfg: Config, events: list[dict], findings: list[Finding]) -> bool:
     """Whether the audit runs the vuln probe on the tree to be pushed: an `expect:advisory_cleared` item is missing
-    (stale, say, after a review fix), the pack names a probe, and an `advisory_present` check passed, so a clean scan
+    (no passing check on that tree: a review fix or a merge of the base changed it, say), the pack names a probe, and an `advisory_present` check passed, so a clean scan
     now completes the evidence. With no such check, no scan can: the finding stays missing."""
     wanted = f"expect:{ADVISORY_CLEARED}"
     return (bool(cfg.vuln.probe) and any(f.status == "missing" and wanted in f.require for f in findings)
@@ -424,13 +423,18 @@ def _probe_guard(cfg: Config, run: Run, worktree: Path, found: list[str]) -> Cal
 
 def _reprobe(cfg: Config, run: Run, worktree: Path, key: str) -> bool:
     """Run the vuln probe on the tree `finish` would push and record it on `key` (`vuln.run_probe`, guard-checked);
-    True when it ran cleanly and names none of the run's advisory ids, else a stop on `key`: `guard_violation` when it
-    left or found a forbidden path, `probe_failed` when it did not run cleanly, `gate_failed` when the advisory is
+    True when it ran cleanly and names none of the run's advisory ids, else a stop on `key`: `blocked` when git could
+    not say what the probe changed (the guard raised before any event), `guard_violation` when it left or found a
+    forbidden path, `probe_failed` when it did not run cleanly, `gate_failed` when the advisory is
     still there. These stop in either `policy.enforce` mode, as a failing gate does: `advisory_cleared` is the vuln
     lane's floor. Approving the stop runs the audit, and so the probe, again."""
     found: list[str] = []
-    verdict, matched, result = vuln.run_probe(cfg, run, worktree, key, ADVISORY_CLEARED,
-                                              guard=_probe_guard(cfg, run, worktree, found))
+    try:
+        verdict, matched, result = vuln.run_probe(cfg, run, worktree, key, ADVISORY_CLEARED,
+                                                  guard=_probe_guard(cfg, run, worktree, found))
+    except (GitError, subprocess.CalledProcessError) as exc:  # the guard could not read the tree: no evidence
+        raise_hitl(cfg, run, "blocked", key, f"Could not check the tree the probe ran on in {worktree}: {exc}")
+        return False
     if found:
         run.emit("guard_tripped", key=key, violations=[{"kind": "forbidden_path", "detail": d} for d in found])
         raise_hitl(cfg, run, "guard_violation", key,
