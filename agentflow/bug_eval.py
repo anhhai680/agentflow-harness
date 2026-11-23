@@ -55,7 +55,6 @@ import signal
 import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
 from agentflow import safeio, vuln
@@ -75,6 +74,14 @@ RED, GREEN = "red", "green"
 RESUMABLE = ("running", "waiting_human")
 SHELL_SYNTAX = re.compile(r"[;|&$()<>`\n\r]")
 KILL_WAIT_S = 5
+
+
+@dataclass(frozen=True)
+class GateStepRef:
+    """What `_fail` and `_stop` read of a step run (`lanes._StepRun`), for a gate step that has no session."""
+
+    key: str
+    step: Step
 
 
 def exhausted_kind(step: Step) -> str:
@@ -143,7 +150,8 @@ def run_test_command(argv: list[str], cwd: Path, log_path: Path, timeout_s: int,
 
 class BugEvalLane:
     """`check_expect` (for `lanes.Executor._loop`) and the fix-looping `_run_gate_step`; relies on the
-    executor's `cfg`, `run`, `worktree`, `run_agent_step`, `current_wait`, `_stop`, `_fail`, and `_gate_report`."""
+    executor's `cfg`, `run`, `worktree`, `run_agent_step`, `current_wait`, `_stop`, `_fail`, `_uncommitted_forbidden`
+    and `_gate_report`."""
 
     cfg: Config
     run: Run
@@ -225,20 +233,26 @@ class BugEvalLane:
     # ------------------------------------------------------------------ expect: advisory_present | advisory_cleared
 
     def _probe(self, key: str, expect: str) -> tuple[str, list[str], GateResult, list[Violation]]:
-        """Run the vuln probe for `key` (`vuln.run_probe`), and the guard check of what it did to the tree: a probe that
-        writes a forbidden path (an ignore file) is a `forbidden_path` violation, as an agent's edit would be."""
-        before = snapshot(self.worktree)
-        verdict, matched, result = vuln.run_probe(self.cfg, self.run, self.worktree, key, expect)
+        """Run the vuln probe for `key` (`vuln.run_probe`) with the guard check of the tree it ran on: a forbidden path
+        left uncommitted in it (an ignore file a stop was approved past) or written by the probe is a `forbidden_path`
+        violation, as an agent's edit would be, and the probe's `expectation_checked` is never `ok` with one."""
+        found: list[Violation] = []
         name = self.cfg.vuln.probe
-        touched = [Violation("forbidden_path", f"{path} (changed by the probe gate `{name}`)")
-                   for path in self._forbidden_changes(before)]
-        return verdict, matched, result, touched
+
+        def guard(before: str) -> list[str]:
+            changed = self._forbidden_changes(before)
+            found.extend(Violation("forbidden_path", f"{path} (changed by the probe gate `{name}`)") for path in changed)
+            found.extend(Violation("forbidden_path", f"{path} (uncommitted in the tree the probe ran on)")
+                         for path in self._uncommitted_forbidden(before) if path not in changed)
+            return [v.detail for v in found]
+
+        verdict, matched, result = vuln.run_probe(self.cfg, self.run, self.worktree, key, expect, guard=guard)
+        return verdict, matched, result, found
 
     def _probe_failed(self, sr: Any, result: GateResult) -> Literal["stopped"]:
-        report = self._gate_report([replace(result, reason=result.reason or "no advisory id in its output")])
-        return self._stop(sr, "probe_failed", f"The probe gate `{result.name}` did not run cleanly (a missing tool, a "
-                          "crash, a timeout, empty output, or a 'found' exit that names no advisory), so it shows "
-                          "nothing about the advisory and is never read as a clean scan.", extra=report)
+        return self._stop(sr, "probe_failed", f"The probe gate `{result.name}` did not run cleanly ({result.reason}), so "
+                          "it shows nothing about the advisory and is never read as a clean scan.",
+                          extra=self._gate_report([result]))
 
     def _check_cleared(self, sr: Any) -> list[GateResult] | Literal["stopped"]:
         """`expect: advisory_cleared` (the patch): the probe must run cleanly and name none of the run's advisory ids.
@@ -258,7 +272,7 @@ class BugEvalLane:
         one of the run's advisory ids before any agent patches anything."""
         if self.current_wait() is not None:
             return "stopped"
-        sr = SimpleNamespace(key=key, step=step)  # what `_fail` and `_stop` read of a step run
+        sr = GateStepRef(key, step)
         verdict, matched, result, touched = self._probe(key, ADVISORY_PRESENT)
         if touched:
             return self._fail(sr, touched)

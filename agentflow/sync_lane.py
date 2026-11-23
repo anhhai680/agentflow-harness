@@ -28,6 +28,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from agentflow import vuln
 from agentflow.config import Config, Phase, Step
 from agentflow.gates import GateResult, gates_ok, record_results, run_gates, run_gates_reusing
 from agentflow.gitops import (
@@ -98,7 +99,7 @@ class SyncLane:
         if notes:
             message += "\n\n" + "\n".join(notes)
         try:
-            sha = commit_sync(wt, message, self.cfg, pulled.target_sha)
+            sha = commit_sync(wt, message, self.cfg, pulled.target_sha, forbid=vuln.run_forbidden(self.cfg, self.run))
         except CommitRejected as exc:
             raise_hitl(self.cfg, self.run, "guard_violation", key, f"Guard violation in {key}: {exc.kind}: {exc}")
             return "stopped"

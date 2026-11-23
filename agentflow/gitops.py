@@ -185,12 +185,13 @@ def head(worktree: Path) -> str:
 
 
 def commit(worktree: Path, message: str, cfg: Config, paths: list[str] | None = None,
-           expected_head: str | None = None) -> str:
+           expected_head: str | None = None, forbid: Sequence[str] = ()) -> str:
     """Stage everything and commit it with `project.commit_trailer` appended; return the new sha.
 
     The message is checked against `guardrails.reject_trailers` before anything is staged, so a
     rejected trailer raises `CommitRejected` and leaves the index alone. A staged path matching
-    `guardrails.forbidden_paths` also raises `CommitRejected` (kind `forbidden_path`), after the
+    `guardrails.forbidden_paths`, or one of the caller's `forbid` globs (a step's own `forbid`, the vuln lane's
+    scanner ignore files), also raises `CommitRejected` (kind `forbidden_path`), after the
     index is reset to `HEAD` (the working tree is untouched): the runner never commits those files,
     whoever changed them. An empty change raises
     `NothingToCommit`. The runner never amends, so this always makes a new commit.
@@ -225,7 +226,8 @@ def commit(worktree: Path, message: str, cfg: Config, paths: list[str] | None = 
     _git(worktree, *git, "add", "-A", *only)
     staged = [p for p in _git(worktree, *git, "diff", "--cached", "--name-only", "--no-renames", "-z", *only).split("\0")
               if p]
-    forbidden = [p for p in staged if any(path_matches(p, g) for g in cfg.guardrails.forbidden_paths)]
+    patterns = [*cfg.guardrails.forbidden_paths, *forbid]
+    forbidden = [p for p in staged if any(path_matches(p, g) for g in patterns)]
     if forbidden:
         _git(worktree, *git, "reset", "-q")
         raise CommitRejected("commit would include forbidden path(s): " + ", ".join(forbidden), kind="forbidden_path")
@@ -713,12 +715,14 @@ def conflict_markers(worktree: Path, paths: Sequence[str]) -> list[str]:
     return left
 
 
-def commit_sync(worktree: Path, message: str, cfg: Config, target_sha: str, expected_head: str | None = None) -> str:
+def commit_sync(worktree: Path, message: str, cfg: Config, target_sha: str, expected_head: str | None = None,
+                forbid: Sequence[str] = ()) -> str:
     """Conclude the merge in progress with a commit (the trailer appended) and return its sha.
 
     Like `commit`, with these differences: everything is staged, and the forbidden-path check applies to what the
     merge itself decided, that is the paths whose content equals neither the branch's (`HEAD`) nor the target's
-    (`target_sha`). A forbidden file that only came in from the target, or that only the branch changed, passes.
+    (`target_sha`), against `guardrails.forbidden_paths` and the caller's `forbid`. A forbidden file that only came
+    in from the target, or that only the branch changed, passes.
     A rejected commit leaves the merge in progress."""
     worktree = Path(worktree)
     before = head(worktree)
@@ -744,7 +748,8 @@ def commit_sync(worktree: Path, message: str, cfg: Config, target_sha: str, expe
         return {p for p in out.split("\0") if p}
 
     decided = differing(before) & differing(target_sha)
-    forbidden = sorted(p for p in decided if any(path_matches(p, g) for g in cfg.guardrails.forbidden_paths))
+    patterns = [*cfg.guardrails.forbidden_paths, *forbid]
+    forbidden = sorted(p for p in decided if any(path_matches(p, g) for g in patterns))
     if forbidden:
         raise CommitRejected("the merge resolution would change forbidden path(s): " + ", ".join(forbidden),
                              kind="forbidden_path")

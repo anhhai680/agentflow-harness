@@ -99,7 +99,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import carry, constraint, overlays, park, route, sizing, sources, verification, waves
+from agentflow import carry, constraint, overlays, park, route, sizing, sources, verification, vuln, waves
 from agentflow.autonomy import AUTO_BY, FORBIDDEN, GUARD_KIND, Resolver, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
@@ -1187,7 +1187,8 @@ class FeatureLane:
             paths = [p for p in changed if p not in held]
         try:
             message = self._task_message(subject, tkey, open_findings, refine)
-            sha = commit(self.worktree, message, self.cfg, paths=paths, expected_head=runner_head(self.run))
+            sha = commit(self.worktree, message, self.cfg, paths=paths, expected_head=runner_head(self.run),
+                         forbid=vuln.run_forbidden(self.cfg, self.run))
         except CommitRejected as exc:
             raise_hitl(self.cfg, self.run, "guard_violation", commit_key, f"Guard violation in {commit_key}: {exc.kind}: {exc}")
             return "stopped"
@@ -1317,7 +1318,8 @@ class FeatureLane:
         subject = fmt(rstep.message or "Decide {topic} in the {module} spec", {**self.ctx.values, **extra})
         message = f"{subject}\n\nQuestion: {extra['question']}\nAnswer: {text}"
         try:
-            sha = commit(self.worktree, message, self.cfg, paths=paths, expected_head=runner_head(self.run))
+            sha = commit(self.worktree, message, self.cfg, paths=paths, expected_head=runner_head(self.run),
+                         forbid=vuln.run_forbidden(self.cfg, self.run))
         except CommitRejected as exc:
             raise_hitl(self.cfg, self.run, "guard_violation", rkey, f"Guard violation in {rkey}: {exc.kind}: {exc}")
             return "stopped"

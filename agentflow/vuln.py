@@ -23,8 +23,8 @@ import json
 import posixpath
 import re
 import urllib.parse
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -200,6 +200,24 @@ def forbidden(cfg: Config, lane: str) -> list[str]:
     return [*ENGINE_FORBID, *cfg.vuln.forbid] if lane == "vuln" else []
 
 
+def run_forbidden(cfg: Config, run: Run) -> list[str]:
+    """`forbidden` for the lane `run` walks."""
+    return forbidden(cfg, str(run.state.get("pipeline") or ""))
+
+
+def failure_reason(exit_code: int | None, output: str, ok_exit: Sequence[int], found_exit: Sequence[int]) -> str:
+    """Why `judge` said "failed" for these inputs ("" when it would not): what the stop and the event tell a human."""
+    if exit_code is None:
+        return "it timed out or did not start"
+    if not output.strip():
+        return f"it printed nothing (exit {exit_code})"
+    if exit_code in found_exit and not ANY_ADVISORY.search(output):
+        return f"exit {exit_code} says it found something, but its output names no advisory id"
+    if exit_code not in ok_exit and exit_code not in found_exit:
+        return f"exit {exit_code} is in neither ok_exit {list(ok_exit)} nor found_exit {list(found_exit)}"
+    return ""
+
+
 def _probe_output(result: GateResult, command: str) -> str:
     """The probe's own output, from its gate log without the runner's `$ <command>` line ("" when there is no log, or
     the log does not start with that line: no output is never a clean scan)."""
@@ -213,10 +231,19 @@ def _probe_output(result: GateResult, command: str) -> str:
     return text[len(head):] if text.startswith(head) else ""
 
 
-def run_probe(cfg: Config, run: Run, worktree: Path, key: str, expect: str) -> tuple[str, list[str], GateResult]:
+PROBE_LOG_DIR = "probe"  # under the step's gate log dir, so the probe's log never overwrites a gate's of the same name
+
+
+def run_probe(cfg: Config, run: Run, worktree: Path, key: str, expect: str, *,
+              guard: Callable[[str], list[str]] | None = None) -> tuple[str, list[str], GateResult]:
     """Run the pack's probe gate (`vuln.probe`) in `worktree` for the step `key` and judge its output against the run's
-    advisory ids (`alert.json`): `(verdict, matched ids, the gate's result)`. Emits `expectation_checked` with `ok`
-    (`present` for `advisory_present`, `absent` for `advisory_cleared`) and the `tree` the probe ran on.
+    advisory ids (`alert.json`): `(verdict, matched ids, the gate's result)`. Its log is `<gate log dir>/probe/`.
+
+    Emits `expectation_checked` with `ok` (`present` for `advisory_present`, `absent` for `advisory_cleared`), the
+    `verdict`, the `tree` the probe ran on, and for a "failed" verdict the `reason` (also the result's `reason`).
+    `guard`, called with that tree once the probe has run and before the event is written, returns the forbidden
+    paths it finds (left in the tree, or written by the probe): any makes `ok` false and goes in `forbidden`, so no
+    evidence is ever recorded for a tree the guards refuse. The caller acts on them; the verdict stays the probe's.
 
     The verdict is "failed", and nothing is run, when the run's ids cannot be read or `vuln.probe` names no gate: a
     probe that cannot run is never a clean scan."""
@@ -238,14 +265,23 @@ def run_probe(cfg: Config, run: Run, worktree: Path, key: str, expect: str) -> t
     if why:
         result = GateResult(name or "probe", False, False, why, None, f"The probe did not run: {why}.")
         run.emit("expectation_checked", key=key, expect=expect, gate=name, ok=False, verdict="failed", matched=[],
-                 exit_code=None, log=None, tree=tree, error=why)
+                 exit_code=None, log=None, tree=tree, reason=why, forbidden=[])
         return "failed", [], result
     gate = cfg.gates[name]
-    [result] = run_gates(cfg, [name], worktree, run.gate_log_dir(key))
-    verdict, matched = judge(result.exit_code, _probe_output(result, gate.run), ids, gate.ok_exit, gate.found_exit)
-    ok = verdict == ("present" if expect == ADVISORY_PRESENT else "absent")
+    [result] = run_gates(cfg, [name], worktree, run.gate_log_dir(key) / PROBE_LOG_DIR)
+    output = _probe_output(result, gate.run)
+    verdict, matched = judge(result.exit_code, output, ids, gate.ok_exit, gate.found_exit)
+    reason = ""
+    if verdict == "failed":
+        reason = failure_reason(result.exit_code, output, gate.ok_exit, gate.found_exit)
+        if result.reason and result.exit_code is None:  # the gate runner's own word: "timed out after …", a skip
+            reason = f"{reason}: {result.reason}"
+        result = replace(result, reason=reason)
+    found = guard(tree) if guard is not None else []
+    ok = verdict == ("present" if expect == ADVISORY_PRESENT else "absent") and not found
     run.emit("expectation_checked", key=key, expect=expect, gate=name, ok=ok, verdict=verdict, matched=matched,
-             exit_code=result.exit_code, log=str(result.log_path) if result.log_path else None, tree=tree)
+             exit_code=result.exit_code, log=str(result.log_path) if result.log_path else None, tree=tree,
+             reason=reason, forbidden=found)
     return verdict, matched, result
 
 

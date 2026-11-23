@@ -1500,3 +1500,18 @@ def test_restore_paths_reads_each_name_as_a_path_never_a_glob(tmp_path):
     assert gitops.uncommitted_paths(repo) == ["a.py", "b.py"]  # only the two named files went
     assert (repo / "a.py").read_text() == "one\nTWO\nthree\n" and (repo / "b.py").read_text() == "new\n"
     assert run_git(repo, "ls-files", "a.py").strip() == "a.py"
+
+
+def test_commit_refuses_a_staged_path_the_caller_forbids(tmp_git, cfg):
+    """`forbid` adds to `guardrails.forbidden_paths` (a step's own list, the vuln lane's ignore files)."""
+    before = _head(tmp_git)
+    (tmp_git / "web").mkdir()
+    (tmp_git / "web" / ".nsprc").write_text("{}\n", encoding="utf-8")
+    (tmp_git / "fine.txt").write_text("fine\n", encoding="utf-8")
+    with pytest.raises(CommitRejected, match=r"web/\.nsprc") as caught:
+        gitops.commit(tmp_git, "Sneak", cfg, forbid=["**/.nsprc"])
+    assert caught.value.kind == "forbidden_path"
+    assert _head(tmp_git) == before and _staged(tmp_git) == []
+    assert (tmp_git / "web" / ".nsprc").is_file()  # the working tree is untouched
+    sha = gitops.commit(tmp_git, "Fine", cfg, paths=["fine.txt"], forbid=["**/.nsprc"])
+    assert run_git(tmp_git, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).split() == ["fine.txt"]

@@ -1419,7 +1419,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
                     sha = commit_artifact(self.worktree, message, self.cfg, fmt(str(sr.step.output), self.ctx),
                                           expected_head=runner_head(self.run))
                 else:
-                    sha = commit(self.worktree, message, self.cfg, expected_head=runner_head(self.run))
+                    sha = commit(self.worktree, message, self.cfg, expected_head=runner_head(self.run),
+                                 forbid=self._forbid(sr))
             except CommitRejected as exc:
                 return self._fail(sr, [Violation(exc.kind, str(exc))])
             except NothingToCommit:

@@ -32,7 +32,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, TextIO
 
-from agentflow import doubt, route, safeio, sources
+from agentflow import doubt, route, safeio, sources, vuln
 from agentflow.conditions import Ctx, evaluate, fmt, paths_read
 from agentflow.commit_checks import runner_head
 from agentflow.config import RECONCILE_CHANGED, Config, Phase, Step, for_lane, resolve_turn_cap
@@ -760,7 +760,8 @@ class StepControl:
         if refine is not None:  # a refine round commits on top, with the note
             message = f"{refine_subject(step.id, message)}\n\n{refine_note_block(refine)}"
         try:
-            sha = commit(self.worktree, message, self.cfg, expected_head=runner_head(self.run))
+            sha = commit(self.worktree, message, self.cfg, expected_head=runner_head(self.run),
+                         forbid=[*step.forbid, *vuln.run_forbidden(self.cfg, self.run)])
         except CommitRejected as exc:
             summary = f"Guard violation in {key}: {exc.kind}: {exc}"
             raise_hitl(self.cfg, self.run, "guard_violation", key, summary)

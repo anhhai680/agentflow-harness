@@ -243,6 +243,7 @@ def test_happy_path_red_patch_cleared(flow_repo, gh_alerts):
     [started] = [e for e in flow_repo.events(run, "step_started") if e["key"] == PATCH]
     assert present["seq"] < started["seq"]  # proven present before any agent call of the patch
     assert Path(present["log"]).read_text(encoding="utf-8").startswith(f"$ {PROBE}\n")
+    assert Path(present["log"]).parent == run.gate_log_dir(RED_KEY) / "probe"
     assert present["tree"] and cleared["tree"] != present["tree"]
     assert len(_patch_calls(flow_repo)) == 1
     [committed] = [e for e in flow_repo.events(run, "step_committed") if e["key"] == PATCH]
@@ -263,9 +264,17 @@ def test_not_reproduced_stops_before_patch(flow_repo, gh_alerts):
     assert "stale" in way_on and f"agentflow retry {run.id} {RED_KEY}" in way_on
 
 
+FAILED_PROBES = {  # a probe script, and what the stop says made it fail
+    "import sys; sys.exit(127)": "printed nothing",
+    "import sys; print('Traceback boom'); sys.exit(1)": "names no advisory id",
+    "pass": "printed nothing",
+    "import time; time.sleep(999)": "timed out",
+    "print('scanner config error'); raise SystemExit(3)": "neither ok_exit",
+}
+
+
 @pytest.mark.parametrize("when", ["present", "cleared"])
-@pytest.mark.parametrize("script", ["import sys; sys.exit(127)", "import sys; print('Traceback boom'); sys.exit(1)",
-                                    "pass", "import time; time.sleep(999)"])
+@pytest.mark.parametrize("script", list(FAILED_PROBES))
 def test_probe_failed_never_green(flow_repo, gh_alerts, script, when):
     quick = {"defaults": {"gate_timeout_min": 0.02}}  # the sleeping probe is killed after a second or so
     if when == "present":  # the check before the patch
@@ -280,6 +289,7 @@ def test_probe_failed_never_green(flow_repo, gh_alerts, script, when):
     assert (stop["kind"], stop["key"]) == ("probe_failed", key)
     checks = flow_repo.events(run, "expectation_checked")
     assert [(c["expect"], c["ok"]) for c in checks] == expected and checks[-1]["verdict"] == "failed"
+    assert FAILED_PROBES[script] in checks[-1]["reason"] and FAILED_PROBES[script] in stop["extra"]
     assert len(_patch_calls(flow_repo)) == (0 if when == "present" else 1)
     assert not [e for e in flow_repo.events(run, "fix_attempt")]  # a dead scanner is never a gate to fix
     assert (run.state["steps"].get(PATCH) or {}).get("status") != "done"
@@ -331,6 +341,70 @@ def test_probe_that_writes_an_ignore_file_is_a_guard_violation(flow_repo, gh_ale
     assert (stop["kind"], stop["key"]) == ("guard_violation", RED_KEY)
     assert ".nsprc" in stop["summary"] and "probe" in stop["summary"]
     assert _patch_calls(flow_repo) == []
+    [checked] = flow_repo.events(run, "expectation_checked")  # it read "present", but the guard decides
+    assert checked["verdict"] == "present" and checked["ok"] is False
+    assert any(".nsprc" in f for f in checked["forbidden"])
+
+
+def test_approving_past_a_probe_guard_stop_with_the_file_left_stops_again(flow_repo, gh_alerts):
+    """The guard stop's way on says the runner checks the tree again first: an ignore file left in the tree is
+    refused again at the probe, and no commit of the run ever holds it."""
+    run = _vuln_run(flow_repo, audit="open('.nsprc', 'w').write('{}')\n" + AUDIT)
+    assert _build(flow_repo, run) == "stopped"
+    hitl.approve(run, RED_KEY, by="me")  # `.nsprc` is still in the tree
+    flow_repo.script({PATCH: [{"write": {"requirements.txt": FIXED}, **_done()}]})
+    assert _build(flow_repo, run) == "stopped"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("guard_violation", RED_KEY) and ".nsprc" in stop["summary"]
+    assert _patch_calls(flow_repo) == []
+    assert not [e for e in flow_repo.events(run, "expectation_checked") if e["ok"]]
+    worktree = Path(run.state["worktree"])
+    assert ".nsprc" not in run_git(worktree, "log", "--name-only", "--format=", f"{run.state['base_sha']}..HEAD")
+
+
+def test_a_commit_never_takes_an_ignore_file_left_in_the_tree(flow_repo, gh_alerts):
+    """The commit backstop: a step with no probe whose session starts on a tree that already holds an ignore file
+    (so the guards see no change) still cannot commit it."""
+    run = _vuln_run(flow_repo)
+    worktree = Path(run.state["worktree"])
+    (worktree / "web").mkdir()
+    (worktree / "web" / ".nsprc").write_text("{}\n", encoding="utf-8")
+    base = run_git(worktree, "rev-parse", "HEAD").strip()
+    phase = flow_repo.cfg.phases["verify"]
+    step = next(s for s in phase.steps if s.id == "verify")
+    flow_repo.script({"verify/verify": [{"write": {"notes.txt": "checked\n"}, **_done()}]})
+    assert flow_repo.executor(run).run_steps(phase, [step], "verify")[0] == "stopped"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("guard_violation", "verify/verify") and "web/.nsprc" in stop["summary"]
+    assert run_git(worktree, "rev-parse", "HEAD").strip() == base
+
+
+def test_probe_log_does_not_overwrite_the_gate_log(flow_repo, gh_alerts):
+    run = _vuln_run(flow_repo, patch={"gate_sets": {"build": ["ok", "audit"]}})
+    flow_repo.script({PATCH: [{"write": {"requirements.txt": FIXED}, **_done()}]})
+    assert _build(flow_repo, run) == "done"
+    logs = run.gate_log_dir(PATCH)
+    assert (logs / "audit.log").is_file() and (logs / "probe" / "audit.log").is_file()
+    [gate] = [e for e in flow_repo.events(run, "gate_result") if e["key"] == PATCH and e["gate"] == "audit"]
+    [cleared] = [e for e in flow_repo.events(run, "expectation_checked") if e["key"] == PATCH]
+    assert gate["log"] != cleared["log"]
+
+
+def test_ci_fix_session_of_a_vuln_run_forbids_ignore_files(flow_repo, gh_alerts):
+    run = _vuln_run(flow_repo, patch={"gate_sets": {"setup": []}})
+    flow_repo.configure(patch=deep_merge(VULN_PATCH, {"gate_sets": {"setup": []}}), autopilot=True,
+                        edit=add_vuln_lane)
+    phase = flow_repo.cfg.phases["ship"]
+    ci = next(s for s in phase.steps if s.type == "ci")
+    key = "ship/ci/fix-1"
+    flow_repo.script({key: [{"write": {".nsprc": "{}\n"}, **_done("silenced it")}]})
+    failed = [{"name": "audit", "state": "FAILURE", "bucket": "fail", "link": ""}]
+    assert flow_repo.executor(run)._fix(phase, ci, "ship/ci", 1, failed) == "stopped"
+    [call] = [c for c in flow_repo.calls() if c["step"] == key]
+    deny = _deny(call["argv"])
+    assert all(f"Edit(./{glob})" in deny for glob in vuln.ENGINE_FORBID)
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("guard_violation", key) and ".nsprc" in stop["summary"]
 
 
 def test_pack_forbid_adds_to_the_engine_list(flow_repo, gh_alerts):
