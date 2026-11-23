@@ -14,7 +14,14 @@ from conftest import with_doubt
 from test_feature_lane import SMALL, begin_finish, created, gh_calls, review
 
 from agentflow.conditions import Ctx
-from agentflow.config import FLOOR_ID, Evidence, Obligation
+from agentflow.config import (
+    ADVISORY_CLEARED,
+    ADVISORY_FLOOR_ID,
+    ADVISORY_PRESENT,
+    FLOOR_ID,
+    Evidence,
+    Obligation,
+)
 from agentflow.conformance import evaluate, last_code_change, missing_gates
 from agentflow.flow import main
 from agentflow.hitl import approve
@@ -290,6 +297,44 @@ def test_red_then_green(cfg):
     assert evaluate(cfg, [red, fix, failed_green], [rtg], "t")[0].status == "missing"
     green_before_red = {**green, "seq": 2}
     assert evaluate(cfg, [green_before_red, red], [rtg], "t")[0].status == "missing"
+
+
+ADVISORY = ob(ADVISORY_FLOOR_ID, f"expect:{ADVISORY_CLEARED}")
+
+
+def probe(seq: int, key: str, expect: str, ok: bool = True, **over) -> dict:
+    fields = {"verdict": "absent", "matched": [], "tree": "t", "forbidden": [], **over}
+    return ev(seq, "expectation_checked", key=key, expect=expect, ok=ok, **fields)
+
+
+def test_advisory_cleared_needs_present_then_cleared(cfg):
+    present = probe(3, "build/advisory_red", ADVISORY_PRESENT, verdict="present", matched=["GHSA-cfgh-2345-vwxj"])
+    patch = ev(5, "step_committed", key="build/patch", sha="p")  # the patch's own commit after its check
+    cleared = probe(4, "build/patch", ADVISORY_CLEARED)
+    finding = evaluate(cfg, [present, cleared, patch], [ADVISORY], "t")[0]
+    assert finding.status == "satisfied" and finding.evidence == [3, 4]
+    only_cleared = evaluate(cfg, [cleared, patch], [ADVISORY], "t")[0]
+    assert only_cleared.status == "missing" and "advisory_present" in only_cleared.note
+    assert evaluate(cfg, [{**present, "seq": 6}, cleared], [ADVISORY], "t")[0].status == "missing"  # wrong order
+    for bad in ({"ok": False}, {"ok": False, "forbidden": [".nsprc"]}, {"forbidden": [".nsprc"]}):
+        assert evaluate(cfg, [{**present, **bad}, cleared], [ADVISORY], "t")[0].status == "missing"
+        assert evaluate(cfg, [present, {**cleared, **bad}], [ADVISORY], "t")[0].status == "missing"
+    red_green = [ev(3, "expectation_checked", key="build/regression_test", expect="red", ok=True),
+                 ev(4, "expectation_checked", key="build/fix", expect="green", ok=True)]
+    assert evaluate(cfg, red_green, [ADVISORY], "t")[0].status == "missing"  # another lane's checks are not this
+
+
+def test_advisory_cleared_goes_stale_after_a_code_change(cfg):
+    present = probe(3, "build/advisory_red", ADVISORY_PRESENT, verdict="present")
+    cleared = probe(4, "build/patch", ADVISORY_CLEARED)
+    later = ev(9, "step_committed", key="review/fix_findings", sha="f")
+    stale = evaluate(cfg, [present, cleared, later], [ADVISORY], "t")[0]
+    assert stale.status == "missing" and "last code change" in stale.note
+    again = probe(12, "ship/finish", ADVISORY_CLEARED)  # the audit's re-probe on the tree to be pushed
+    finding = evaluate(cfg, [present, cleared, later, again], [ADVISORY], "t")[0]
+    assert finding.status == "satisfied" and finding.evidence == [3, 12]
+    covered = verify_gates(6, cfg, "review/fix_findings")  # a fix that ran the verify set: stale as red_then_green
+    assert evaluate(cfg, [present, cleared, *covered, later], [ADVISORY], "t")[0].status == "satisfied"
 
 
 def test_a_steps_own_commit_never_makes_its_evidence_stale(cfg):

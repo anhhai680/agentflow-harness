@@ -1372,6 +1372,8 @@ class FeatureLane:
             return "stopped"
         if not self._unmoved(key, sha) or not clean_tree(self.cfg, self.run, self.worktree, key):
             return "stopped"
+        if not self._vuln_scope(key, sha):
+            return "stopped"
         body = self.write_pr_body()
         if early:  # the draft opened early: push the audited tree and bring its description up to date
             url = str(early[-1]["url"])
@@ -1474,6 +1476,23 @@ class FeatureLane:
         """`<key>/final_fix` started and is not finished (a stop, an approval or a retry left it open)."""
         rec = self.run.state["steps"].get(f"{key}/{FINAL_FIX}")
         return rec is not None and rec.get("status") not in (*DONE_STATUSES, "skipped")
+
+    def _vuln_scope(self, key: str, sha: str) -> bool:
+        """In a vuln run, record which paths of the pull request's diff are outside `vuln.dependency_files`
+        (`vuln_scope`, which the PR's Security advisory section names): the diff from the last target-branch tip
+        merged in (`base_synced`), else the fork commit, to `sha`. Other lanes record nothing. False = stopped."""
+        if self.run.state.get("pipeline") != "vuln":
+            return True
+        events = self.run.events.read()
+        synced = [str(e["target"]) for e in events if e["type"] == "base_synced" and e.get("target")]
+        start = synced[-1] if synced else str(self.run.state.get("base_sha") or "")
+        try:
+            changed = changed_paths(self.worktree, f"{start}^{{tree}}", f"{sha}^{{tree}}")
+        except (GitError, subprocess.CalledProcessError) as exc:
+            raise_hitl(self.cfg, self.run, "blocked", key, f"Could not list the paths {key} would push: {exc}")
+            return False
+        self.run.emit("vuln_scope", key=key, sha=sha, code_paths=vuln.code_change_paths(self.cfg, changed))
+        return True
 
     def _unmoved(self, key: str, sha: str) -> bool:
         """HEAD is still `sha`, the commit the audit checked (a gate it ran could have committed); False = stopped."""
@@ -1621,6 +1640,12 @@ def _conformance(run: Run, events: list[dict]) -> str | None:
     return _section("Conformance", lines) if lines else None
 
 
+def _security_advisory(run: Run) -> str | None:
+    """The Security advisory section of a vuln run (`vuln.pr_lines`); None for a run with no alert."""
+    lines = vuln.pr_lines(run)
+    return _section("Security advisory", lines) if lines else None
+
+
 def issue_line(params: dict) -> str | None:
     """`Refs #N` for an epic, `Closes #N` for any other issue, else None. It depends on `params` alone."""
     if not params.get("issue"):
@@ -1658,6 +1683,7 @@ def render_pr_body(run: Run, plan: str | None = None, *, early: bool = False) ->
         EARLY_LINE if early else None,
         f"Opened by agentflow run `{run.id}` ({state.get('pipeline')}) from branch `{branch}`.",
         issue_line(state.get("params") or {}),
+        _security_advisory(run),
         f"Marked done after `{marked['phase']}` by {marked['by']}: the phases under Skipped steps did not run."
         if marked else None,
         f"Plan: `{plan}`" if plan else "Plan: none",

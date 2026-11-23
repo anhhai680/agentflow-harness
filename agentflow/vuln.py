@@ -471,3 +471,82 @@ def read_alert(run_dir: Path) -> dict:
             or not all(isinstance(i, str) and (GHSA_ID.fullmatch(i) or CVE_ID.fullmatch(i)) for i in ids)):
         raise AlertError(f"{path} names no advisory id")
     return data
+
+
+# --------------------------------------------------------------------------- the pull request: `finish`
+
+TARGET_MAX = 64  # characters of the triage's target version the pull request shows
+SCOPE_SHOWN = 10  # paths the code-change line names before `and <n> more`
+
+
+def code_change_paths(cfg: Config, changed: Sequence[str]) -> list[str]:
+    """The paths of `changed` that match none of `vuln.dependency_files`: code the upgrade needed changed, which the
+    pull request names (`vuln_scope`)."""
+    from agentflow.guards import path_matches
+
+    return [p for p in changed if not any(path_matches(p, glob) for glob in cfg.vuln.dependency_files)]
+
+
+def _code(text: object) -> str:
+    """`text` as inline code, with no backtick of its own that could close the span early."""
+    return "`" + str(text).replace("`", "") + "`"
+
+
+def _last_ok(events: list[dict], expect: str, before: int | None = None) -> dict | None:
+    found = [e for e in events if e.get("type") == "expectation_checked" and e.get("expect") == expect
+             and e.get("ok") is True and not e.get("forbidden") and (before is None or e["seq"] < before)]
+    return found[-1] if found else None
+
+
+def _probe_line(events: list[dict]) -> str:
+    """`Probe: present (<ids>) → cleared` from the last passing cleared check and the last passing present check
+    before it, else `Probe: not cleared`. Only an id of the advisory patterns is shown."""
+    from agentflow.config import ADVISORY_CLEARED, ADVISORY_PRESENT
+
+    cleared = _last_ok(events, ADVISORY_CLEARED)
+    present = _last_ok(events, ADVISORY_PRESENT, cleared["seq"]) if cleared else None
+    if present is None:
+        return "Probe: not cleared"
+    ids = [str(i) for i in present.get("matched") or [] if GHSA_ID.fullmatch(str(i)) or CVE_ID.fullmatch(str(i))]
+    return f"Probe: present ({', '.join(ids)}) → cleared"
+
+
+def pr_lines(run: Run) -> list[str]:
+    """The lines of the pull request's `Security advisory` section; [] for a run with no readable `alert.json`.
+
+    They come from the facts intake validated (`alert.json`), the probe's `expectation_checked` events, the triage's
+    cleaned facts (`triage_rendered`, the target version as inline code, cut to `TARGET_MAX`) and the last
+    `vuln_scope`. The advisory's summary and description never go in, and each line passes `hitl.clean_fact`, so no
+    text from outside the run or from a model can start a heading, a list item or a line of its own."""
+    from agentflow.hitl import clean_fact
+
+    try:
+        alert = read_alert(run.dir)
+    except AlertError:
+        return []
+    events = run.events.read()
+    advisories = [a for a in alert.get("advisories") or [] if isinstance(a, dict)]
+    lines = [f"Advisories: {', '.join(i for i in alert['ids'])}"]
+    severity = str(alert.get("severity") or "")
+    lines.append(f"Severity: {severity if severity in SEVERITIES else 'unknown'}")
+    ecosystem = str(alert.get("ecosystem") or "")
+    lines.append(f"Package: {_code(alert.get('package') or '')} ({ecosystem if ecosystem in ECOSYSTEMS else 'unknown'}) in "
+                 f"{_code(alert.get('manifest') or '')}")
+    ranges = dict.fromkeys((str(a.get("vulnerable_range") or "?"), str(a.get("patched") or "?")) for a in advisories)
+    lines += [f"Vulnerable: {vulnerable} · patched in {patched}" for vulnerable, patched in ranges]
+    triage = [e for e in events if e.get("type") == "triage_rendered"]
+    facts = (triage[-1].get("facts") if triage else None) or {}
+    target = clean_fact(str(facts.get("target_version") or "") if isinstance(facts, dict) else "")[:TARGET_MAX]
+    lines.append(f"Target: {_code(target)}" if target.replace("`", "").strip() else "Target: unknown")
+    for advisory in advisories:
+        url = _url(str(advisory.get("url") or ""))
+        lines.append(f"Alert: {url}" if url else f"Alert: #{advisory.get('number')}")
+    lines += [f"Supersedes #{n} (Dependabot)" for n in alert.get("dependabot_prs") or []
+              if isinstance(n, int) and not isinstance(n, bool) and n > 0]
+    lines.append(_probe_line(events))
+    scopes = [e for e in events if e.get("type") == "vuln_scope"]
+    paths = [str(p) for p in (scopes[-1].get("code_paths") or [] if scopes else [])]
+    if paths:
+        more = f" and {len(paths) - SCOPE_SHOWN} more" if len(paths) > SCOPE_SHOWN else ""
+        lines.append(f"Code changed outside dependency files: {', '.join(_code(p) for p in paths[:SCOPE_SHOWN])}{more}")
+    return [clean_fact(line) for line in lines]

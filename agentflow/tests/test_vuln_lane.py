@@ -423,3 +423,188 @@ def test_feature_lane_forbid_unchanged(flow_repo):
     deny = _deny(call["argv"])
     assert "Edit(./.claude/**)" in deny  # the pack's own forbidden paths still reach it
     assert not [rule for rule in deny if ".nsprc" in rule or "audit.py" in rule]
+
+
+# --------------------------------------------------------------------------- finish: conformance and the pull request
+
+FINISH = "ship/finish"
+FIX_FINDINGS = "review/fix_findings"
+TRIAGE_FACTS = {"relationship": "direct", "target_version": "2.32.0", "bump": "minor", "method": "bump",
+                "release_date": "2024-05-20", "notes": ""}
+DEPENDABOT_PR = [{"number": 7, "title": "Bump requests from 2.31.0 to 2.32.0", "url": "https://github.com/a/b/pull/7"}]
+
+
+def _at_ship(flow_repo, write: dict[str, str] | None = None, patch: dict | None = None, audit: str = AUDIT):
+    """A vuln run started at `ship` whose `advisory_red` and `patch` ran (the patch writes `write`), with the evidence
+    a walked run shows for its verify and review steps: what `finish` audits next."""
+    for name, text in (("audit.py", audit), ("requirements.txt", "requests==2.31.0\n")):
+        (flow_repo.root / name).write_text(text, encoding="utf-8")
+    run_git(flow_repo.root, "add", "audit.py", "requirements.txt")
+    run_git(flow_repo.root, "commit", "-q", "-m", "audit")
+    flow_repo.configure(patch=deep_merge(VULN_PATCH, patch or {}), edit=add_vuln_lane)
+    run = pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", {"alert": "42"},
+                         pipeline.RunOptions(from_phase="ship"))
+    flow_repo.script({PATCH: [{"write": {"requirements.txt": FIXED, **(write or {})}, **_done("bumped requests")}]})
+    assert _build(flow_repo, run) == "done"
+    _verified_and_reviewed(run)
+    return run
+
+
+def _verified_and_reviewed(run) -> None:
+    run.emit("step_finished", key="verify/verify", status="done", summary="")
+    run.emit("step_finished", key="review/vuln_review", status="done", summary="")
+
+
+def _review_fix(run, files: dict[str, str]) -> None:
+    """A review fix the runner committed after the patch (`review/fix_findings`), with no gates run on it, then the
+    verify and review steps again: of the run's evidence, only the patch's clearance is stale."""
+    worktree = Path(run.state["worktree"])
+    for name, text in files.items():
+        (worktree / name).write_text(text, encoding="utf-8")
+    run_git(worktree, "add", *files)
+    run_git(worktree, "commit", "-q", "-m", "Fix review findings")
+    run.emit("step_committed", key=FIX_FINDINGS, sha=run_git(worktree, "rev-parse", "HEAD").strip(), summary="fix")
+    _verified_and_reviewed(run)
+
+
+def _pushed(flow_repo, run) -> bool:
+    return run.state["branch"] in run_git(flow_repo.origin, "branch", "--list")
+
+
+def _created(gh_alerts) -> list[list[str]]:
+    lines = gh_alerts.log.read_text(encoding="utf-8").splitlines() if gh_alerts.log.exists() else []
+    return [argv for argv in map(json.loads, lines) if argv[:2] == ["pr", "create"]]
+
+
+def _audit(flow_repo, run) -> dict[str, str]:
+    checked = flow_repo.events(run, "conformance_checked")[-1]
+    return {o["id"]: o["status"] for o in checked["obligations"]}
+
+
+def test_finish_reprobes_a_stale_clearance(flow_repo, gh_alerts):
+    run = _at_ship(flow_repo, patch={"policy": {"enforce": "block"}})
+    _review_fix(run, {"notes.md": "a review fix\n"})  # after the patch's clearance: it is stale now
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
+    checks = [e for e in flow_repo.events(run, "expectation_checked") if e["expect"] == "advisory_cleared"]
+    assert [c["key"] for c in checks] == [PATCH, FINISH]
+    again = checks[-1]
+    assert again["ok"] is True and again["verdict"] == "absent" and again["forbidden"] == []
+    worktree = Path(run.state["worktree"])
+    assert again["tree"] == run_git(worktree, "rev-parse", "HEAD^{tree}").strip()
+    assert Path(again["log"]).parent == run.gate_log_dir(FINISH) / "probe"
+    statuses = _audit(flow_repo, run)
+    assert statuses["advisory_cleared"] == "satisfied" and flow_repo.events(run, "conformance_checked")[-1]["passed"]
+    [finding] = [o for o in flow_repo.events(run, "conformance_checked")[-1]["obligations"]
+                 if o["id"] == "advisory_cleared"]
+    assert again["seq"] in finding["evidence"]
+    assert _pushed(flow_repo, run) and len(_created(gh_alerts)) == 1
+
+
+def test_a_fresh_clearance_is_not_probed_again(flow_repo, gh_alerts):
+    run = _at_ship(flow_repo)
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
+    assert [e["key"] for e in flow_repo.events(run, "expectation_checked")] == [RED_KEY, PATCH]
+    assert _audit(flow_repo, run)["advisory_cleared"] == "satisfied"
+
+
+@pytest.mark.parametrize("enforce", ["block", "report"])
+def test_block_mode_stops_when_still_present(flow_repo, gh_alerts, enforce):
+    """A review fix put the vulnerable version back: the re-probe at finish names the advisory, and the run stops
+    before anything is pushed. `advisory_cleared` is the vuln lane's floor, so report mode stops too."""
+    run = _at_ship(flow_repo, patch={"policy": {"enforce": enforce}})
+    _review_fix(run, {"requirements.txt": "requests==2.31.0\n"})
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("gate_failed", FINISH)
+    assert GHSA in stop["summary"] and "advisory" in stop["summary"]
+    again = flow_repo.events(run, "expectation_checked")[-1]
+    assert (again["key"], again["ok"], again["verdict"], again["matched"]) == (FINISH, False, "present", [GHSA])
+    assert flow_repo.events(run, "conformance_checked") == []
+    assert not _pushed(flow_repo, run) and _created(gh_alerts) == []
+
+
+def test_a_probe_that_fails_at_finish_stops_with_probe_failed(flow_repo, gh_alerts):
+    run = _at_ship(flow_repo)
+    _review_fix(run, {"audit.py": "import sys; sys.exit(127)\n"})
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("probe_failed", FINISH) and "printed nothing" in stop["extra"]
+    assert not _pushed(flow_repo, run) and _created(gh_alerts) == []
+
+
+def test_a_probe_that_writes_an_ignore_file_at_finish_is_a_guard_violation(flow_repo, gh_alerts):
+    """The re-probe is guard-checked like the build's probe: its `ok` can never vouch for a tree holding an ignore
+    file, and the run stops before the push."""
+    run = _at_ship(flow_repo, audit="import os\nif os.path.exists('trigger'):\n    open('.nsprc', 'w').write('{}')\n"
+                   + AUDIT)
+    _review_fix(run, {"trigger": "1\n"})
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("guard_violation", FINISH) and ".nsprc" in stop["summary"]
+    again = flow_repo.events(run, "expectation_checked")[-1]
+    assert again["key"] == FINISH and again["verdict"] == "absent" and again["ok"] is False
+    assert any(".nsprc" in f for f in again["forbidden"])
+    [tripped] = [e for e in flow_repo.events(run, "guard_tripped") if e["key"] == FINISH]
+    assert any(".nsprc" in v["detail"] for v in tripped["violations"])
+    assert not _pushed(flow_repo, run) and _created(gh_alerts) == []
+
+
+def _section(body: str) -> list[str]:
+    return body.split("## Security advisory\n\n", 1)[1].split("\n\n", 1)[0].splitlines()
+
+
+def test_pr_body_security_section(flow_repo, gh_alerts, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_PR_LIST", json.dumps(DEPENDABOT_PR))
+    run = _at_ship(flow_repo)
+    run.emit("triage_rendered", key="define/triage", path=str(run.dir / "triage.md"), facts=TRIAGE_FACTS)
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
+    body = (run.dir / "pr.md").read_text(encoding="utf-8")
+    assert _section(body) == [
+        f"Advisories: {GHSA}, CVE-2024-1234",
+        "Severity: high",
+        "Package: `requests` (pip) in `requirements.txt`",
+        "Vulnerable: < 2.32.0 · patched in 2.32.0",
+        "Target: `2.32.0`",
+        "Alert: https://github.com/acme/app/security/dependabot/42",
+        "Supersedes #7 (Dependabot)",
+        f"Probe: present ({GHSA}) → cleared",
+    ]
+    assert body.index("Opened by agentflow run") < body.index("## Security advisory") < body.index("Plan: ")
+    for text in ("crafted redirect", "Authorization header", "leaks credentials"):  # the advisory's own words
+        assert text not in body
+
+
+def test_the_security_section_shows_what_is_missing_and_keeps_model_text_on_one_line(flow_repo, gh_alerts):
+    run = _vuln_run(flow_repo)
+    assert vuln.pr_lines(run)[4:] == ["Target: unknown", "Alert: https://github.com/acme/app/security/dependabot/42",
+                                      "Probe: not cleared"]
+    forged = {**TRIAGE_FACTS, "target_version": "2.32.0 `x` ## Gates [click](https://evil.example) " + "9" * 80}
+    run.emit("triage_rendered", key="define/triage", path=str(run.dir / "triage.md"), facts=forged)
+    run.emit("vuln_scope", key=FINISH, code_paths=["a`b.py", "src/app.py"])
+    lines = vuln.pr_lines(run)
+    [target] = [line for line in lines if line.startswith("Target: ")]
+    assert target.count("`") == 2 and len(target) <= len("Target: ``") + 64
+    assert lines[-1] == "Code changed outside dependency files: `ab.py`, `src/app.py`"
+    assert all("\n" not in line and line == hitl.clean_fact(line) for line in lines)
+    assert vuln.pr_lines(flow_repo.new_run()) == []  # a run with no alert.json has no section
+
+
+def test_vuln_scope_flags_code_changes(flow_repo, gh_alerts):
+    run = _at_ship(flow_repo, write={"app.py": "import requests\n"})
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
+    [scope] = flow_repo.events(run, "vuln_scope")
+    assert scope["key"] == FINISH and scope["code_paths"] == ["app.py"]
+    [opened] = flow_repo.events(run, "pr_opened")
+    assert scope["seq"] < opened["seq"]
+    body = (run.dir / "pr.md").read_text(encoding="utf-8")
+    assert "Code changed outside dependency files: `app.py`" in _section(body)
+    assert vuln.code_change_paths(flow_repo.cfg, ["requirements.txt", "web/package.json", "app.py", "go.sum"]) == [
+        "app.py"]
+
+
+def test_a_dependency_only_patch_has_no_code_change_line(flow_repo, gh_alerts):
+    run = _at_ship(flow_repo)
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
+    [scope] = flow_repo.events(run, "vuln_scope")
+    assert scope["code_paths"] == []
+    assert not [line for line in _section((run.dir / "pr.md").read_text(encoding="utf-8")) if "Code changed" in line]
