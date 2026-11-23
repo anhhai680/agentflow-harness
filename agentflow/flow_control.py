@@ -32,7 +32,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, TextIO
 
-from agentflow import doubt, route, sources
+from agentflow import doubt, route, safeio, sources
 from agentflow.conditions import Ctx, evaluate, fmt, paths_read
 from agentflow.commit_checks import runner_head
 from agentflow.config import RECONCILE_CHANGED, Config, Phase, Step, for_lane, resolve_turn_cap
@@ -79,6 +79,10 @@ CONDITION_QID = "answer"
 YES = ("y", "yes", "true", "approve", "approved")
 NO = ("n", "no", "false")
 QUESTIONS_SUFFIX = "questions.md"
+TRIAGE_SUFFIX = "triage.md"
+TRIAGE_FIELDS = (("relationship", "Relationship"), ("target_version", "Target version"), ("bump", "Bump"),
+                 ("method", "Method"), ("release_date", "Release date"), ("notes", "Notes"))
+TRIAGE_FIELD_CAP = 300  # characters of one rendered value
 NOTHING_RAN = "all steps skipped"
 _STOPPED = "stopped"
 
@@ -135,6 +139,11 @@ def refine_note_block(refine: dict) -> str:
 
 def writes_questions(step: Step) -> bool:
     return bool(step.output) and str(step.output).endswith(QUESTIONS_SUFFIX)
+
+
+def writes_triage(step: Step) -> bool:
+    """A triage step (the vuln lane's): its `output` names `triage.md`, which the runner renders from the result."""
+    return bool(step.output) and str(step.output).endswith(TRIAGE_SUFFIX)
 
 
 class StepControl:
@@ -457,6 +466,8 @@ class StepControl:
         outcome = self.run_agent_step(phase, step, key, extra=extra, mode=mode, fix_first=fix_first, turn_cap=turn_cap)
         if outcome == "done" and rec.get("status") not in DONE_STATUSES and writes_questions(step):
             self._render_questions(key, mode == "refine")
+        if outcome == "done" and rec.get("status") not in DONE_STATUSES and writes_triage(step):
+            self._render_triage(key, mode == "refine")
         return outcome
 
     # ------------------------------------------------------------------ reconcile rounds
@@ -601,6 +612,27 @@ class StepControl:
         path = self.run.questions_path()
         render_inbox(path, f"{self.run.id}: questions from {key}", result.summary, result.questions)
         self.run.emit("questions_rendered", key=key, path=str(path), questions=[asdict(q) for q in result.questions])
+
+    def _render_triage(self, key: str, refine: bool) -> None:
+        """The facts a triage step put in `signals.triage` become `runs/<run>/triage.md`, which the phase's approval
+        page links and the later steps read (`workspace.INPUT_FILES`). The runner writes the file, one line per fact,
+        so the text a human approves is not the agent's own file and holds no markup the agent chose."""
+        try:
+            result = read_result(self.run.result_path(key), refine=refine)
+        except ResultError:
+            return
+        facts = result.signals.get("triage") if isinstance(result.signals, dict) else None
+        facts = facts if isinstance(facts, dict) else {}
+        lines = [f"# {self.run.id}: triage from {key}", result.summary.strip()]
+        rows = []
+        for field, label in TRIAGE_FIELDS:
+            value = " ".join(str(facts.get(field, "")).split())[:TRIAGE_FIELD_CAP]
+            if value or field != "notes":
+                rows.append(f"{label}: {value or '(not given)'}")
+        lines.append("\n".join(rows))
+        path = self.run.dir / TRIAGE_SUFFIX
+        safeio.replace_file(path, ("\n\n".join(part for part in lines if part) + "\n").encode("utf-8"))
+        self.run.emit("triage_rendered", key=key, path=str(path), facts={f: facts.get(f) for f, _ in TRIAGE_FIELDS})
 
     # ------------------------------------------------------------------ groups
 

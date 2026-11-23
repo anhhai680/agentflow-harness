@@ -7,7 +7,7 @@ may write, so nothing an agent writes can change a run's state.
 
 Before every agent call, `prepare` refreshes the workspace's read-only-by-convention copies of the run's
 inputs from the run directory, which stays the source of truth: `issue.md`, `bug.log`, `task.md`,
-`questions.md`, `handoff.md`, `handoffs/*.md`, `results/*.json` (the checked results of earlier
+`alert.md`, `questions.md`, `triage.md`, `handoff.md`, `handoffs/*.md`, `results/*.json` (the checked results of earlier
 steps) and, for a retro run, `retro/digest.md` as `digest.md` (`RETRO_DIGEST`). Whatever the agent left at those names (an edit, a symlink, a folder) is replaced, never written
 through. The agent writes its result to `out/<step>.json` (`AGENTFLOW_RESULT`) and its notes to
 `progress.md`; the runner reads only those two, and `take_result` copies a result into the run
@@ -23,7 +23,7 @@ from pathlib import Path
 from agentflow import safeio
 from agentflow.state import Run, workspaces_root
 
-INPUT_FILES = ("issue.md", "bug.log", "task.md", "questions.md", "handoff.md")
+INPUT_FILES = ("issue.md", "bug.log", "task.md", "alert.md", "questions.md", "triage.md", "handoff.md")
 INPUT_DIRS = {"handoffs": "*.md", "results": "*.json"}
 OUT_DIR = "out"
 RESULT_LIMIT = 1_000_000  # bytes; a result file is a few lines of JSON

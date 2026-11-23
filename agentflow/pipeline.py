@@ -56,7 +56,9 @@ from agentflow.autonomy import (
     round_limit,
     runner_settles,
 )
-from agentflow import constraint, doubt, governor, pack, preflight, route_lane, run_env, slots, speculation, work_source
+from agentflow import (
+    constraint, doubt, governor, pack, preflight, route_lane, run_env, safeio, slots, speculation, work_source,
+)
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
@@ -64,7 +66,7 @@ from agentflow.config import (
     RETRO_PIPELINE, Config, ConfigError, Phase, Step, check_lane, for_lane, layer_files, load_config, validate,
     worktrees_root,
 )
-from agentflow.flow_control import condition_label, halted, read_json
+from agentflow.flow_control import condition_label, halted, read_json, writes_triage
 from agentflow.gitops import (
     GitError,
     add_worktree,
@@ -85,6 +87,7 @@ from agentflow.issue_status import mark, release
 from agentflow.lanes import Executor, Outcome, footer_next
 from agentflow.state import MARKED_DONE_SKIP, TERMINAL, Run, speculating
 
+TRIAGE_PAGE_LIMIT = 20_000  # bytes of `triage.md` the approval page carries
 DEFAULT_SHOW = ["handoff", "diff", "step_results", "skipped_steps", "gates", "review_findings"]
 DONE_STEPS = ("done", "unchanged")
 
@@ -1013,6 +1016,21 @@ def _review_findings(cfg: Config, run: Run, phase: str) -> list[str]:
     return [*lead, *(f"- {line}" for line in lines)]
 
 
+def _triage_section(cfg: Config, run: Run, phase: str) -> str:
+    """The runner's `triage.md` (`flow_control._render_triage`) when the phase has a triage step that ran: the text
+    of the file, so the approval page of `define` shows the upgrade path itself."""
+    spec = cfg.phases.get(phase)
+    if spec is None or not any(writes_triage(step) for step in spec.steps):
+        return ""
+    try:
+        text = safeio.read_bytes(run.dir / "triage.md", TRIAGE_PAGE_LIMIT)
+    except (OSError, ValueError):
+        return ""
+    if not text:
+        return ""
+    return _section("Triage", [line for line in text.decode("utf-8", errors="replace").splitlines()[1:] if line.strip()], "##")
+
+
 def approval_text(cfg: Config, run: Run, phase: str) -> str:
     """The inbox page for `<phase>_approved`, built from `phase_approval.show`."""
     round_ = (run.state["phases"].get(phase) or {}).get("round", 0)
@@ -1035,6 +1053,9 @@ def approval_text(cfg: Config, run: Run, phase: str) -> str:
         "review_findings": lambda: _section("Review findings", _review_findings(cfg, run, phase), "##"),
     }
     shown = [builders[item]() for item in cfg.phase_approval.get("show", DEFAULT_SHOW) if item in builders]
+    triage = _triage_section(cfg, run, phase)
+    if triage:
+        shown.insert(0, triage)  # what a human is approving first: the upgrade path, with its bump size
     lead += _approval_note(cfg, run, phase)
     names = list(cfg.phases)
     nxt = (speculation.due(cfg, run, names, names.index(phase), (run.state.get("options") or {}).get("to_phase"))

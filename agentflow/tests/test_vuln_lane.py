@@ -10,8 +10,9 @@ import pytest
 import yaml
 from conftest import SPARSE_PACK, deep_merge
 
-from agentflow import conditions, layers, pack, pipeline
+from agentflow import conditions, layers, pack, pipeline, workspace
 from agentflow.config import load_config, validate
+from agentflow.state import Run
 
 PROMPTS = Path(__file__).resolve().parents[1] / "prompts"
 SKILLS = Path(__file__).resolve().parents[1] / "skills"
@@ -124,3 +125,66 @@ def test_the_patch_skill_is_bundled_and_the_lane_steps_use_it():
 def test_review_blocks_on_high_for_a_fresh_target_version():
     text = (PROMPTS / "vuln_review.md").read_text(encoding="utf-8")
     assert "7 days" in text and "release_date" in text and "release-age" in text
+
+
+TRIAGE_RESULT = {"status": "done", "summary": "requests is direct; 2.32.0 is the smallest fix.",
+                 "signals": {"triage": {"relationship": "direct", "target_version": "2.32.0", "bump": "major",
+                                        "method": "bump", "release_date": "2024-05-20",
+                                        "notes": "drops Python 3.7\n# not a heading"}}}
+
+
+def _triage_phase(flow_repo):
+    flow_repo.configure(edit=add_vuln_lane)
+    run = Run.create(flow_repo.cfg, flow_repo.root, "vuln", {"module": "crm"})
+    phase = flow_repo.cfg.phases["define"]
+    step = next(s for s in phase.steps if s.id == "triage")
+    return run, phase, step
+
+
+def test_a_triage_result_reaches_the_run_dir_and_the_approval_page(flow_repo):
+    from agentflow import pipeline
+
+    run, phase, step = _triage_phase(flow_repo)
+    flow_repo.script({"define/triage": [{"result": TRIAGE_RESULT}]})
+    assert flow_repo.executor(run).run_steps(phase, [step], "define")[0] == "done"
+    text = (run.dir / "triage.md").read_text(encoding="utf-8")
+    for line in ("Relationship: direct", "Target version: 2.32.0", "Bump: major", "Method: bump",
+                 "Release date: 2024-05-20", "Notes: drops Python 3.7 # not a heading"):
+        assert line in text
+    assert "\n# not a heading" not in text  # one line per fact: the agent's text opens no heading
+    page = pipeline.approval_text(flow_repo.cfg, run, "define")
+    assert "## Triage" in page and "Bump: major" in page and page.index("## Triage") < page.index("## Step results")
+    workspace.prepare(run)  # the later sessions read the mirrored copy
+    assert (run.agent_dir / "triage.md").read_text(encoding="utf-8") == text
+
+
+def test_a_triage_result_with_no_facts_still_shows_what_is_missing(flow_repo):
+    run, phase, step = _triage_phase(flow_repo)
+    flow_repo.script({"define/triage": [{"result": {"status": "done", "summary": "no facts"}}]})
+    assert flow_repo.executor(run).run_steps(phase, [step], "define")[0] == "done"
+    text = (run.dir / "triage.md").read_text(encoding="utf-8")
+    assert "Target version: (not given)" in text and "Notes:" not in text
+
+
+def test_the_triage_file_is_a_run_file_the_dashboard_lists(flow_repo):
+    from agentflow import run_files
+
+    run, phase, step = _triage_phase(flow_repo)
+    flow_repo.script({"define/triage": [{"result": TRIAGE_RESULT}]})
+    flow_repo.executor(run).run_steps(phase, [step], "define")
+    assert "triage.md" in [f["name"] for f in run_files.list_files(run)]
+
+
+def test_triage_and_patch_leave_a_major_bump_to_the_approval():
+    triage = (PROMPTS / "vuln_triage.md").read_text(encoding="utf-8")
+    skill = (SKILLS / "agentflow-patch" / "SKILL.md").read_text(encoding="utf-8")
+    assert "A major bump is not a stop" in triage and "allow for" not in triage
+    assert "approval of the bump" in skill
+    assert "A major bump in it is approved" in (PROMPTS / "vuln_patch.md").read_text(encoding="utf-8")
+
+
+def test_only_a_package_and_a_version_may_reach_a_command():
+    for text in ((PROMPTS / "vuln_patch.md").read_text(encoding="utf-8"),
+                 (SKILLS / "agentflow-patch" / "SKILL.md").read_text(encoding="utf-8")):
+        assert "never put" in text.lower() or "never go into a command" in text
+        assert "matched them against the manifest and the lockfile" in text
