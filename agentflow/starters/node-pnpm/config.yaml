@@ -1,9 +1,13 @@
 # Starter: a Node project built with pnpm. A config layer under the pack: the pack overrides it key by key.
-# It sets only the gates and which gate runs when; the workflow, the lanes and every other setting are the engine's.
+# It sets only the gates, which gate runs when, and the vuln probe; the workflow, the lanes and every other setting are the engine's.
 gates:
   install: {run: pnpm install --frozen-lockfile}
   test: {run: pnpm test}
+  audit: {run: pnpm audit, ok_exit: [0], found_exit: [1]}
 gate_sets:
   setup: [install]
   build: [test]
   verify: [test]
+# audit is in no gate set, so it slows no other lane; the vuln lane runs it before and after a patch
+vuln:
+  probe: audit

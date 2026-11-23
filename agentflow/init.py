@@ -179,6 +179,8 @@ def pack_data(d: Detected, *, base: dict, red: frozenset[str] = frozenset()) -> 
         data["gate_sets"] = _red_sets(sets, base, red)
     elif sets:
         data["gate_sets"] = sets
+    if d.probe and d.probe in gates:  # the probe gate survived `_checked`
+        data["vuln"] = {"probe": d.probe}
     return data
 
 
@@ -201,6 +203,9 @@ def render_pack(d: Detected, *, base: dict, red: frozenset[str] = frozenset()) -
     if "gate_sets" in data:
         blocks.append("# which gates run when; a set not written here is the starter's\n"
                       + _dump({"gate_sets": data["gate_sets"]}))
+    if "vuln" in data:
+        blocks.append("# the audit probe: the `vuln` lane runs this gate before and after a patch and needs the advisory "
+                      "in its output first\n" + _dump({"vuln": data["vuln"]}))
     return "\n".join(blocks)
 
 

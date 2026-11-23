@@ -1,7 +1,8 @@
 """`agentflow doctor`: whether this machine can run the pack, checked before a run spends money.
 
-It looks at the agent CLIs and their logins, `gh`, the `origin` remote, Docker (when a gate runs it), the state dir
-and the programs each gate runs. Every external command is bounded by `TIMEOUT_S`. It changes nothing except
+It looks at the agent CLIs and their logins, `gh`, Dependabot alert access (when `vuln.source` is `dependabot`, one
+read-only `gh api` call), the `origin` remote, Docker (when a gate runs it), the state dir and the programs each gate
+and the vuln probe run. Every external command is bounded by `TIMEOUT_S`. It changes nothing except
 creating the state dir and a probe file there that it removes at once.
 """
 
@@ -210,6 +211,21 @@ def _gh_fields_check(repo: Path) -> Check:
                  "update gh: the Backlog cannot read issue dependencies")
 
 
+def _dependabot_check(repo: Path) -> Check:
+    """Whether the token reads Dependabot alerts: one read-only `GET` of one alert. `{owner}` and `{repo}` are filled
+    in by `gh` from the repository's remote."""
+    code, output = run_bounded(["gh", "api", "repos/{owner}/{repo}/dependabot/alerts?per_page=1"], repo)
+    if code == 0:
+        return Check("dependabot alerts", "ok", "Dependabot alerts readable")
+    if "HTTP 403" in output:
+        return Check("dependabot alerts", "fail", _last_line(output) or "HTTP 403", "grant the token Dependabot alerts: read")
+    if "HTTP 404" in output:
+        return Check("dependabot alerts", "warn", "Dependabot alerts are off for this repository, or the token cannot see them",
+                     "turn on Dependabot alerts in the repository's security settings, or set `vuln.source: \"\"`")
+    detail = "timed out" if code is None and output == "timed out" else (_last_line(output) or f"exit {code}")
+    return Check("dependabot alerts", "warn", f"could not read the alerts: {detail}", "check `gh auth status` and the network")
+
+
 def _remote_check(repo: Path) -> Check:
     code, output = run_bounded(["git", "remote", "get-url", "origin"], repo)
     if code == 0 and output:
@@ -321,41 +337,50 @@ def _gate_names(cfg: Config) -> list[str]:
     return names
 
 
+def _program_check(label: str, command: str, path: str, has_setup: bool, *, soft: bool = False) -> tuple[Check, list[str]]:
+    """The check for one command's programs and the programs. `soft` makes a missing program a warning, never a
+    failure (the vuln probe, which no gate set runs)."""
+    try:
+        programs = gate_programs(command)
+    except ValueError as exc:
+        return Check(label, "warn", f"cannot read the command: {exc}"), []
+    problems: list[Check] = []
+    for program in programs:
+        if found(program, path):
+            continue
+        if "/" in program and not os.path.isabs(program):
+            problems.append(Check(label, "warn", f"`{program}` is relative: it may be created by setup"))
+        elif has_setup:
+            problems.append(Check(label, "warn", f"`{program}` is not on PATH: it may be installed by `gate_sets.setup`"))
+        else:
+            problems.append(Check(label, "warn" if soft else "fail", f"`{program}` is not on PATH", f"install `{program}`"))
+    if not problems:
+        return Check(label, "ok", ", ".join(f"`{p}`" for p in programs) + " found" if programs else "no program to find"), programs
+    worst = next((p for p in problems if p.status == "fail"), problems[0])
+    return Check(label, worst.status, "; ".join(p.detail for p in problems), worst.fix), programs
+
+
 def _gate_checks(cfg: Config) -> tuple[list[Check], bool]:
-    """The `gate:<name>` checks, and whether any gate runs `docker`."""
+    """The `gate:<name>` checks (then `probe:<name>` for the vuln probe, when no gate set holds it), and whether any
+    gate runs `docker`."""
     path = gate_path(cfg)
     has_setup = bool(cfg.gate_sets.get("setup"))
     checks: list[Check] = []
     uses_docker = False
-    for name in _gate_names(cfg):
-        label = f"gate:{name}"
-        try:
-            programs = gate_programs(cfg.gates[name].run)
-        except ValueError as exc:
-            checks.append(Check(label, "warn", f"cannot read the command: {exc}"))
-            continue
+    names = _gate_names(cfg)
+    for name in names:
+        check, programs = _program_check(f"gate:{name}", cfg.gates[name].run, path, has_setup)
         uses_docker = uses_docker or "docker" in programs
-        problems: list[Check] = []
-        for program in programs:
-            if found(program, path):
-                continue
-            if "/" in program and not os.path.isabs(program):
-                problems.append(Check(label, "warn", f"`{program}` is relative: it may be created by setup"))
-            elif has_setup:
-                problems.append(Check(label, "warn", f"`{program}` is not on PATH: it may be installed by `gate_sets.setup`"))
-            else:
-                problems.append(Check(label, "fail", f"`{program}` is not on PATH", f"install `{program}`"))
-        if not problems:
-            checks.append(Check(label, "ok", ", ".join(f"`{p}`" for p in programs) + " found" if programs else "no program to find"))
-        else:
-            worst = next((p for p in problems if p.status == "fail"), problems[0])
-            checks.append(Check(label, worst.status, "; ".join(p.detail for p in problems), worst.fix))
+        checks.append(check)
+    probe = cfg.vuln.probe
+    if probe and probe in cfg.gates and probe not in names:
+        checks.append(_program_check(f"probe:{probe}", cfg.gates[probe].run, path, has_setup, soft=True)[0])
     return checks, uses_docker
 
 
 def run_checks(cfg: Config, repo: Path) -> list[Check]:
-    """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), the remote, Docker (when a gate runs it), the state dir, keeping the
-    machine awake, the inherited environment, the gates."""
+    """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), Dependabot alerts (with `vuln.source: dependabot`), the remote, Docker (when a gate runs it), the state dir, keeping the
+    machine awake, the inherited environment, the gates and the vuln probe."""
     gate_checks, uses_docker = _gate_checks(cfg)
     checks = [*_agent_checks(cfg, repo)]
     if (settings := _user_settings_check(cfg)) is not None:
@@ -363,6 +388,8 @@ def run_checks(cfg: Config, repo: Path) -> list[Check]:
     checks.append(_gh_check(repo))
     if cfg.issues.sync_label and shutil.which("gh"):
         checks.append(_gh_fields_check(repo))
+    if cfg.vuln.source == "dependabot" and shutil.which("gh"):
+        checks.append(_dependabot_check(repo))
     checks.append(_remote_check(repo))
     if uses_docker:
         checks.append(docker_check(repo))

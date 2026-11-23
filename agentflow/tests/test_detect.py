@@ -576,3 +576,86 @@ def test_notes_are_capped_with_a_count_of_the_rest(make):
     found = detect.detect(make({".github/workflows/many.yml": f"on: push\njobs:\n{jobs}\n"}))
     assert len(found.notes) == detect.MAX_NOTES + 1
     assert found.notes[-1] == f"\u2026and {300 - detect.MAX_NOTES} more notes"
+
+
+# --- audit steps ----------------------------------------------------------------------------------------------------
+
+def test_detect_proposes_audit_outside_gate_sets(make):
+    repo = make(ci("""
+        - run: pip install pip-audit
+        - name: Tests
+          run: pytest -q
+        - name: Audit
+          run: pip-audit --strict
+    """))
+    found = detect.detect(repo)
+    assert found.probe == "audit"
+    assert found.gates["audit"] == {"run": "pip-audit --strict"}
+    assert gate_runs(found)["audit"] == "pip-audit --strict"
+    assert all("audit" not in members for members in found.gate_sets.values())
+    assert found.gate_sets["verify"]  # the test gate still stands in verify
+    assert found.gate_source == "ci"
+
+
+@pytest.mark.parametrize("run", ["npm audit --audit-level=high", "pnpm audit", "yarn audit", "osv-scanner -r .",
+                                 "govulncheck ./...", "cargo audit", "bundle audit check", "bundler-audit check",
+                                 "trivy fs ."])
+def test_detect_recognises_every_audit_scanner(make, run):
+    found = detect.detect(make(ci(f"- name: Scan\n  run: {run}")))
+    assert found.probe == "audit"
+    assert found.gates["audit"]["run"] == run
+
+
+def test_an_audit_only_workflow_leaves_the_starter_gates_and_script_detection_alone(make):
+    repo = make({**ci("- name: Scan\n  run: pip-audit"), "pyproject.toml": "[tool.ruff]\n[tool.pytest.ini_options]\n"})
+    found = detect.detect(repo)
+    assert found.probe == "audit"
+    assert found.gate_source == "scripts"  # the project's own scripts still gave the test gates
+    assert "ruff" in found.gates and found.gate_sets["verify"]
+    assert all("audit" not in members for members in found.gate_sets.values())
+
+
+def test_an_audit_step_that_installs_keeps_only_the_scan(make):
+    found = detect.detect(make(ci("- name: Scan\n  run: pip install pip-audit && pip-audit --strict")))
+    assert found.gates["audit"] == {"run": "pip-audit --strict"}
+
+
+@pytest.mark.parametrize("run", ["npm audit fix", "pip-audit --fix", "yarn audit fix"])
+def test_an_audit_step_that_rewrites_files_is_skipped(make, run):
+    found = detect.detect(make(ci(f"- name: Scan\n  run: {run}")))
+    assert found.probe is None and "audit" not in found.gates
+    assert "ci.yml/test/Scan" in notes_text(found)
+
+
+def test_no_audit_step_means_no_probe(make):
+    found = detect.detect(make(ci("- name: Tests\n  run: pytest -q")))
+    assert found.probe is None and "audit" not in found.gates
+
+
+def test_a_step_named_audit_that_is_no_scan_does_not_take_the_audit_name(make):
+    found = detect.detect(make(ci("- name: Audit\n  run: pytest -q")))
+    assert found.probe is None
+    assert gate_runs(found) == {"audit_2": "pytest -q"}
+
+
+def test_only_the_first_audit_step_becomes_the_audit_gate(make):
+    found = detect.detect(make(ci("""
+        - name: Python audit
+          run: pip-audit
+        - name: Node audit
+          run: npm audit
+    """)))
+    assert found.gates["audit"]["run"] == "pip-audit"
+    assert len([n for n in found.gates if n.startswith("audit")]) == 1
+    assert "more than one audit step" in notes_text(found)
+
+
+def test_a_pip_audit_step_without_aliases_keeps_its_command_and_gets_a_note(make):
+    found = detect.detect(make(ci("- name: Scan\n  run: pip-audit --strict")))
+    assert found.gates["audit"] == {"run": "pip-audit --strict"}  # never rewritten
+    assert "--aliases on" in notes_text(found) and "GHSA" in notes_text(found)
+
+
+@pytest.mark.parametrize("run", ["pip-audit --aliases on", "pip-audit -r req.txt --aliases=on", "npm audit"])
+def test_no_aliases_note_when_the_scan_names_them_or_is_no_pip_audit(make, run):
+    assert "--aliases" not in notes_text(detect.detect(make(ci(f"- name: Scan\n  run: {run}"))))

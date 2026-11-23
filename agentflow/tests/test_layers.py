@@ -484,3 +484,38 @@ def test_the_user_file_may_set_claude_user_settings_only():
             check_user(nested(key), lower, USER_FILE)
         assert err.value.path == f"{USER_FILE}: {key}"
         assert err.value.message == "not a personal setting; set it in the pack"
+
+
+def _starter(name: str) -> dict:
+    return layers.merge(layers.base_layers(name))[0]
+
+
+def test_starter_python_uv_sets_the_probe():
+    merged = _starter("python-uv")
+    assert merged["vuln"]["probe"] == "audit"
+    assert merged["gates"]["audit"] == {
+        "run": "uv run --frozen --with pip-audit==2.9.0 pip-audit --progress-spinner off --aliases on",
+        "ok_exit": [0], "found_exit": [1]}
+    assert all("audit" not in members for members in merged["gate_sets"].values())  # in no gate set: no other lane slows
+
+
+def test_starter_node_pnpm_sets_the_probe():
+    merged = _starter("node-pnpm")
+    assert merged["vuln"]["probe"] == "audit"
+    assert merged["gates"]["audit"] == {"run": "pnpm audit", "ok_exit": [0], "found_exit": [1]}
+    assert all("audit" not in members for members in merged["gate_sets"].values())
+
+
+def test_starter_go_audit_exits_zero_either_way():
+    merged = _starter("go")
+    assert merged["vuln"]["probe"] == "audit"
+    assert merged["gates"]["audit"] == {
+        "run": "go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 -format json ./...", "ok_exit": [0], "found_exit": []}
+    assert all("audit" not in members for members in merged["gate_sets"].values())
+
+
+def test_starter_docs_only_has_no_alert_source_and_no_probe():
+    merged = _starter("docs-only")
+    assert merged["vuln"]["source"] == ""
+    assert merged["vuln"]["probe"] == ""
+    assert "audit" not in merged["gates"]
