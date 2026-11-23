@@ -455,10 +455,12 @@ def _verified_and_reviewed(run) -> None:
     run.emit("step_finished", key="review/vuln_review", status="done", summary="")
 
 
-def _review_fix(run, files: dict[str, str]) -> None:
-    """A review fix the runner committed after the patch (`review/fix_findings`), with no gates run on it, then the
-    verify and review steps again: of the run's evidence, only the patch's clearance is stale."""
+def _review_fix(run, files: dict[str, str], gates: list[str] = ()) -> None:
+    """A review fix the runner committed after the patch (`review/fix_findings`), with `gates` passed on it (none by
+    default), then the verify and review steps again: of the run's evidence, only the patch's clearance is stale."""
     worktree = Path(run.state["worktree"])
+    for gate in gates:
+        run.emit("gate_result", key=FIX_FINDINGS, gate=gate, passed=True, skipped=False, reason="", tree="x")
     for name, text in files.items():
         (worktree / name).write_text(text, encoding="utf-8")
     run_git(worktree, "add", *files)
@@ -500,6 +502,18 @@ def test_finish_reprobes_a_stale_clearance(flow_repo, gh_alerts):
     assert _pushed(flow_repo, run) and len(_created(gh_alerts)) == 1
 
 
+def test_a_fix_that_ran_the_verify_set_still_triggers_the_reprobe(flow_repo, gh_alerts):
+    """A review fix can change dependencies: even one that ran every verify gate makes the clearance stale, and only
+    the probe on the tree to be pushed proves the advisory gone."""
+    run = _at_ship(flow_repo, patch={"policy": {"enforce": "block"}})
+    _review_fix(run, {"requirements.txt": "requests==2.31.0\n"}, gates=list(flow_repo.cfg.gate_sets["verify"]))
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("gate_failed", FINISH) and GHSA in stop["summary"]
+    assert flow_repo.events(run, "expectation_checked")[-1]["key"] == FINISH
+    assert not _pushed(flow_repo, run) and _created(gh_alerts) == []
+
+
 def test_a_fresh_clearance_is_not_probed_again(flow_repo, gh_alerts):
     run = _at_ship(flow_repo)
     assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
@@ -510,7 +524,8 @@ def test_a_fresh_clearance_is_not_probed_again(flow_repo, gh_alerts):
 @pytest.mark.parametrize("enforce", ["block", "report"])
 def test_block_mode_stops_when_still_present(flow_repo, gh_alerts, enforce):
     """A review fix put the vulnerable version back: the re-probe at finish names the advisory, and the run stops
-    before anything is pushed. `advisory_cleared` is the vuln lane's floor, so report mode stops too."""
+    with `gate_failed` (as a gate failing at the audit does, not `conformance_failed`) before anything is pushed.
+    `advisory_cleared` is the vuln lane's floor, so report mode stops the same way."""
     run = _at_ship(flow_repo, patch={"policy": {"enforce": enforce}})
     _review_fix(run, {"requirements.txt": "requests==2.31.0\n"})
     assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"

@@ -377,7 +377,8 @@ def test_vuln_signals():
     assert not [k for k in plain if k.split(":")[0] in ("advisory_reproduced", "vuln_code_change", "hours_to_pr")]
     odd = run_signals([start, {**alert, "severity": "huge"}, final], EMPTY_METRICS)
     assert not [k for k in odd if k.startswith("hours_to_pr")]  # only a known severity is a parameter
-    assert FAMILIES["advisory_reproduced"] == ("lower", False) and FAMILIES["vuln_code_change"] == ("lower", False)
+    assert FAMILIES["advisory_reproduced"] == ("higher", False)  # 1.0: the probe saw the advisory, the healthy case
+    assert FAMILIES["vuln_code_change"] == ("lower", False)
     assert FAMILIES["hours_to_pr"] == ("lower", True)
     assert parse_target("hours_to_pr:critical") == ("hours_to_pr", "critical") and parse_target("hours_to_pr") is None
     assert parse_target("advisory_reproduced") == ("advisory_reproduced", None)

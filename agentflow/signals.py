@@ -71,7 +71,7 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   `auto_approvals` counts the `phase_approved` events that carry `ramp`, and is present only for a run with a
   `would_auto_approve`. A run without these events carries none of the three keys.
   A vuln run (one with a `vuln_alert_read`) carries `advisory_reproduced` (1.0 when an `advisory_present` check
-  passed), `vuln_code_change` (1.0 when the last `vuln_scope` names paths; present once one is recorded) and
+  passed; higher is better), `vuln_code_change` (1.0 when the last `vuln_scope` names paths; present once one is recorded) and
   `hours_to_pr:<severity>` (hours from `run_started` to the first `pr_opened`, keyed by the alert's severity;
   present only for a run with both). A run of another lane carries none of them.
 - `human_agreement(events, phase)`: the rule `ramp_agreement:<p>` is, for the approval ramp.
@@ -147,7 +147,7 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "replans": ("lower", False),              # phases planned on a spec that then changed, planned again
     "ramp_agreement": ("higher", True),       # a phase: 1.0 when a person's decision agreed with a true verdict
     "auto_approvals": ("higher", False),      # phase approvals the runner gave itself under the approval ramp
-    "advisory_reproduced": ("lower", False),  # vuln: 1.0 when the probe named the advisory before the patch
+    "advisory_reproduced": ("higher", False),  # vuln: 1.0 when the probe named the advisory before the patch
     "vuln_code_change": ("lower", False),     # vuln: 1.0 when the pull request changed code outside dependency files
     "hours_to_pr": ("lower", True),           # a severity: hours from a vuln run's start to its first pull request
 }

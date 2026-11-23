@@ -2,7 +2,8 @@
 
 `evaluate` is pure: nothing in it reads a file or the clock. It takes the run's events, the obligations that apply
 and the tree that will be pushed, and returns one finding per obligation. Evidence counts only when it comes after
-the last code change that makes it stale (steps, expectations; see `_staling`) or was made on exactly the final
+the last code change that makes it stale (steps, expectations; see `_staling`; `advisory_cleared` goes stale on any
+code change of the run) or was made on exactly the final
 tree (gates), or by a gate whose `input_hash` there equals the one on the result (the files it declares as `inputs`
 are the same). An affected-tier result (`tier: "affected"`, passed or skipped) is never gate evidence: it checked
 only the files a fix changed. Events from older runs
@@ -235,17 +236,21 @@ def _probe_ok(event: dict, expect: str) -> bool:
             and not event.get("forbidden"))
 
 
-def _advisory_cleared(cfg: Config, events: list[dict], changes: list[dict]) -> _Item:
-    """The vuln lane's evidence, as `_red_then_green`: the latest `advisory_cleared` check that passed and is not stale,
-    with an `advisory_present` check that passed before it (the probe named the advisory, then no longer did)."""
-    phase = phase_where(cfg, lambda step: step.expect == ADVISORY_CLEARED)
+def _advisory_cleared(events: list[dict]) -> _Item:
+    """The vuln lane's floor evidence: the latest `advisory_cleared` check that passed and is not stale, with an
+    `advisory_present` check that passed before it (the probe named the advisory, then no longer did).
+
+    Unlike `_red_then_green`, any later code change of the run stales it (`_is_code_change`, with no exemption for a
+    fix that ran the verify gates: a review fix can change dependencies, and only the probe proves the advisory
+    gone), and the item has no phase, so a mark-done never waives it, as it never waives the gates floor."""
+    changes = [e for e in events if _is_code_change(e)]
     for cleared in sorted((e for e in events if _probe_ok(e, ADVISORY_CLEARED) and not _stale_by(changes, e)),
                           key=lambda e: e["seq"], reverse=True):
         present = _last([e for e in events if _probe_ok(e, ADVISORY_PRESENT) and e["seq"] < cleared["seq"]])
         if present is not None:
             return _Item(True, [present["seq"], cleared["seq"]])
     return _Item(False, note=f"no {ADVISORY_PRESENT} check followed by an {ADVISORY_CLEARED} one after the last code "
-                 "change", phase=phase)
+                 "change")
 
 
 def _item(cfg: Config, events: list[dict], evidence: Evidence, final_tree: str, changes: list[dict],
@@ -259,7 +264,7 @@ def _item(cfg: Config, events: list[dict], evidence: Evidence, final_tree: str, 
     if evidence.kind == "expect" and evidence.arg == "red_then_green":
         return _red_then_green(cfg, events, changes)
     if evidence.kind == "expect" and evidence.arg == ADVISORY_CLEARED:
-        return _advisory_cleared(cfg, events, changes)
+        return _advisory_cleared(events)
     return _Item(False, note="unrecognised evidence item")  # `config.UNRECOGNISED`, or a kind this engine lacks
 
 

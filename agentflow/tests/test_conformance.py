@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 import test_feature_lane
-from conftest import with_doubt
+from conftest import add_vuln_lane, with_doubt
 from test_feature_lane import SMALL, begin_finish, created, gh_calls, review
 
 from agentflow.conditions import Ctx
@@ -333,8 +333,33 @@ def test_advisory_cleared_goes_stale_after_a_code_change(cfg):
     again = probe(12, "ship/finish", ADVISORY_CLEARED)  # the audit's re-probe on the tree to be pushed
     finding = evaluate(cfg, [present, cleared, later, again], [ADVISORY], "t")[0]
     assert finding.status == "satisfied" and finding.evidence == [3, 12]
-    covered = verify_gates(6, cfg, "review/fix_findings")  # a fix that ran the verify set: stale as red_then_green
-    assert evaluate(cfg, [present, cleared, *covered, later], [ADVISORY], "t")[0].status == "satisfied"
+    covered = verify_gates(6, cfg, "review/fix_findings")  # a fix that ran the whole verify set still stales it:
+    stale = evaluate(cfg, [present, cleared, *covered, later], [ADVISORY], "t")[0]  # only the probe proves it gone
+    assert stale.status == "missing" and "last code change" in stale.note
+    rtg = ob("red_then_green", "expect:red_then_green")  # red_then_green keeps the verify-coverage exemption
+    red_green = [ev(3, "expectation_checked", key="build/regression_test", expect="red", ok=True),
+                 ev(4, "expectation_checked", key="build/fix", expect="green", ok=True)]
+    assert evaluate(cfg, [*red_green, *covered, later], [rtg], "t")[0].status == "satisfied"
+    conflicted = ev(9, "base_synced", key="ship/finish", conflicts=["requirements.txt"])
+    assert evaluate(cfg, [present, cleared, conflicted], [ADVISORY], "t")[0].status == "missing"
+    clean_merge = ev(9, "base_synced", key="ship/finish", conflicts=[])  # not the run's own change
+    assert evaluate(cfg, [present, cleared, clean_merge], [ADVISORY], "t")[0].status == "satisfied"
+
+
+def test_marked_done_never_waives_advisory_cleared(tmp_cfg):
+    """`advisory_cleared` is the vuln lane's floor: a mark-done that skipped the build waives `verified`, never it."""
+    from agentflow.config import load_config
+
+    path = tmp_cfg(add_vuln_lane)
+    vuln_cfg = load_config(path)
+    obligations = [ob("verified", "step:verify"), ADVISORY]
+    for after, skipped in (("define", ("build", "verify", "review")), ("build", ("verify", "review"))):
+        events = [ev(4, "run_marked_done", by="me", phase=after),
+                  *(ev(5 + i, "phase_skipped", phase=p, reason=f"marked done after {after}")
+                    for i, p in enumerate(skipped))]
+        findings = evaluate(vuln_cfg, events, obligations, "t")
+        assert only(findings, "verified").status == "waived"
+        assert only(findings, ADVISORY_FLOOR_ID).status == "missing"
 
 
 def test_a_steps_own_commit_never_makes_its_evidence_stale(cfg):
