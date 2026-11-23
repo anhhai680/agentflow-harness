@@ -625,3 +625,27 @@ def session_with_transcript(flow_repo, lines=0, width=0, raw=None, tail=b""):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(body)
     return run, "s2"
+
+
+# A Dependabot alert as GitHub's REST API returns it (`GET /repos/{owner}/{repo}/dependabot/alerts/{n}`), cut to the
+# fields the vuln lane reads. Tests copy it with `copy.deepcopy` before they change a field.
+VULN_ALERT: dict[str, Any] = {
+    "number": 42,
+    "state": "open",
+    "html_url": "https://github.com/acme/app/security/dependabot/42",
+    "dependency": {"package": {"ecosystem": "pip", "name": "requests"}, "manifest_path": "requirements.txt"},
+    "security_advisory": {
+        "ghsa_id": "GHSA-cfgh-2345-vwxj",
+        "cve_id": "CVE-2024-1234",
+        "summary": "Requests leaks credentials on redirect",
+        "description": "A crafted redirect makes requests resend the Authorization header to another host.",
+        "severity": "high",
+        "identifiers": [{"type": "GHSA", "value": "GHSA-cfgh-2345-vwxj"}, {"type": "CVE", "value": "CVE-2024-1234"}],
+        "references": [{"url": "https://github.com/advisories/GHSA-cfgh-2345-vwxj"}],
+    },
+    "security_vulnerability": {
+        "vulnerable_version_range": "< 2.32.0",
+        "first_patched_version": {"identifier": "2.32.0"},
+        "severity": "high",
+    },
+}

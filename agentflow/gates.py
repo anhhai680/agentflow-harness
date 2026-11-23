@@ -95,6 +95,7 @@ class GateResult:
     input_hash: str | None = None  # `hash_inputs` of the gate's `inputs` on the tree it ran on; None for a gate with none
     tier: str = "full"  # "affected": its `affected` command ran (or it skipped for no affected path); never evidence
     waited_s: float = 0.0  # seconds the gate waited for its `resource` lock (not in `duration_s`); 0 when it was free
+    exit_code: int | None = None  # the command's exit code; None for a skip, a gate that didn't start, or a timeout
 
 
 def _resolve(cfg: Config, names: str | list[str]) -> list[Gate]:
@@ -355,7 +356,7 @@ def _run_gate(gate: Gate, cwd: Path, log_dir: Path, tail_lines: int, timeout_min
     if code is None:
         return GateResult(gate.name, False, False, f"timed out after {_minutes(timeout_min)}", log_path, tail)
     passed = code == 0
-    return GateResult(gate.name, passed, False, "" if passed else f"exit {code}", log_path, tail)
+    return GateResult(gate.name, passed, False, "" if passed else f"exit {code}", log_path, tail, exit_code=code)
 
 
 class _Left(Exception):
