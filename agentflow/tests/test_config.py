@@ -2988,3 +2988,104 @@ def test_this_repositorys_pack_has_no_warnings_with_waves_off(repo_root):
     cfg = load_config(repo_root / ".agentflow" / "config.yaml")
     assert cfg.parallel.max_subagents == 1
     assert [i for i in validate(cfg, repo_root) if "parallel" in i.path or "plan.md" in i.path] == []
+
+
+# --------------------------------------------------------------------------- speculation and the approval ramp
+
+
+def ramp_errors(tmp_cfg, autonomy: dict, edit=None) -> list[Issue]:
+    """The `error` issues under `autonomy` for the `python` pack (with the doubt review, so `plan` has three steps)."""
+    def patch(data: dict) -> None:
+        with_doubt(data)
+        if edit:
+            edit(data)
+        data.setdefault("autonomy", {}).update(autonomy)
+    return [i for i in issues_for(tmp_cfg, patch) if i.level == "error" and i.path.startswith("autonomy")]
+
+
+def test_the_autonomy_ramp_keys_default_off(sparse_repo):
+    cfg = load_config(pack.pack_config(sparse_repo))
+    assert cfg.autonomy["speculate"] == [] and cfg.autonomy["approvals"] == {} and cfg.autonomy["ramp_samples"] == 5
+    assert not [i for i in validate(cfg, sparse_repo) if i.path.startswith("autonomy")]
+
+
+def test_speculate_names_a_phase_after_an_approval(tmp_cfg):
+    assert ramp_errors(tmp_cfg, {"speculate": ["plan"]}) == []
+    first = ramp_errors(tmp_cfg, {"speculate": ["define"]})
+    assert [i.path for i in first] == ["autonomy.speculate"] and "first phase" in first[0].message
+    nope = ramp_errors(tmp_cfg, {"speculate": ["nope"]})
+    assert [i.path for i in nope] == ["autonomy.speculate"] and "not a phase" in nope[0].message
+    bad = ramp_errors(tmp_cfg, {"speculate": "plan"})
+    assert [i.path for i in bad] == ["autonomy.speculate"]
+
+    def no_approval(data: dict) -> None:
+        data["phases"]["define"]["needs_approval"] = False
+    unapproved = ramp_errors(tmp_cfg, {"speculate": ["plan"]}, no_approval)
+    assert [i.path for i in unapproved] == ["autonomy.speculate"] and "define" in unapproved[0].message
+
+
+def test_a_speculated_phase_holds_only_artifact_steps(tmp_cfg):
+    found = ramp_errors(tmp_cfg, {"speculate": ["build"]}, lambda data: data["phases"]["plan"].update(needs_approval=True))
+    assert [i.path for i in found] == ["autonomy.speculate"] and "setup is not an artifact step" in found[0].message
+
+    def no_output(data: dict) -> None:
+        del phase_step(data, "plan", "plan")["output"]
+    found = ramp_errors(tmp_cfg, {"speculate": ["plan"]}, no_output)
+    assert [i.path for i in found] == ["autonomy.speculate"] and "step plan is not an artifact step" in found[0].message
+
+    def commits_review(data: dict) -> None:
+        phase_step(data, "plan", "plan_review")["commit"] = True
+    found = ramp_errors(tmp_cfg, {"speculate": ["plan"]}, commits_review)
+    assert [i.path for i in found] == ["autonomy.speculate"] and "step plan_review is not an artifact step" in found[0].message
+
+
+def test_a_speculated_review_must_run_read_only(tmp_cfg):  # Ruling AA (a)
+    def not_read_only(data: dict) -> None:
+        data["agents"]["claude"]["read_only_roles"] = []
+    found = ramp_errors(tmp_cfg, {"speculate": ["plan"]}, not_read_only)
+    assert [i.path for i in found] == ["autonomy.speculate"]
+    assert "plan: step plan_review is a `role: review` step agent claude does not run read-only" in found[0].message
+    assert "agents.claude.read_only_roles" in found[0].message
+    assert ramp_errors(tmp_cfg, {}, not_read_only) == []  # only a speculated phase needs it
+
+    def on_codex(data: dict) -> None:
+        data["agents"]["codex"].update(enabled=True, read_only_roles=["review"])
+        data["phases"]["plan"]["agent"] = "codex"
+    found = ramp_errors(tmp_cfg, {"speculate": ["plan"]}, on_codex)
+    assert [i.path for i in found] == ["autonomy.speculate"]
+    assert "agent codex does not run read-only" in found[0].message and "has no read-only mode" in found[0].message
+
+
+def test_approvals_map_an_approval_phase_to_a_mode(tmp_cfg):
+    from agentflow.config import APPROVAL_MODES
+
+    assert APPROVAL_MODES == ("off", "observe", "auto")
+    found = ramp_errors(tmp_cfg, {"approvals": {"build": "observe"}})
+    assert [i.path for i in found] == ["autonomy.approvals.build"] and "needs_approval" in found[0].message
+    found = ramp_errors(tmp_cfg, {"approvals": {"define": "sometimes"}})
+    assert [i.path for i in found] == ["autonomy.approvals.define"] and "off, observe, auto" in found[0].message
+    found = ramp_errors(tmp_cfg, {"approvals": {"nope": "observe"}})
+    assert [i.path for i in found] == ["autonomy.approvals.nope"]
+    found = ramp_errors(tmp_cfg, {"approvals": ["define"]})
+    assert [i.path for i in found] == ["autonomy.approvals"]
+    assert ramp_errors(tmp_cfg, {"approvals": {"define": "auto", "plan": "off"}}) == []
+
+
+def test_goal_is_never_auto(tmp_cfg):
+    def goal(data: dict) -> None:
+        data["phases"]["goal"] = {"needs_approval": True, "steps": [
+            {"id": "goal_step", "skill": "writing-plans", "role": "plan", "prompt": "plan.md", "output": "docs/goal.md"}]}
+    found = ramp_errors(tmp_cfg, {"approvals": {"goal": "auto"}}, goal)
+    assert [i.path for i in found] == ["autonomy.approvals.goal"] and "never auto" in found[0].message
+    assert ramp_errors(tmp_cfg, {"approvals": {"goal": "observe"}}, goal) == []
+
+
+@pytest.mark.parametrize("n", [2, 51, True, "5"])
+def test_ramp_samples_is_a_whole_number_from_3_to_50(tmp_cfg, n):
+    found = ramp_errors(tmp_cfg, {"ramp_samples": n})
+    assert [i.path for i in found] == ["autonomy.ramp_samples"] and "3 to 50" in found[0].message
+
+
+@pytest.mark.parametrize("n", [3, 5, 50])
+def test_ramp_samples_accepts_its_bounds(tmp_cfg, n):
+    assert ramp_errors(tmp_cfg, {"ramp_samples": n}) == []

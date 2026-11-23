@@ -347,6 +347,29 @@ def test_retro_step_is_protected(shipped):
             config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)
 
 
+def test_the_approval_ramp_is_protected(shipped):
+    assert "autonomy.approvals" in config_edit.PROTECTED and "autonomy.ramp_samples" in config_edit.PROTECTED
+    for key, value in ((["autonomy", "approvals"], {"define": "auto"}), (["autonomy", "ramp_samples"], 3)):
+        with pytest.raises(Refused):  # the form has no field for it
+            form(shipped, (key, value))
+    _, sha = config_edit.read(shipped)
+    for key, value in (("approvals", {"define": "observe"}), ("ramp_samples", 7)):
+        data = yaml.safe_load(SHIPPED)
+        data.setdefault("autonomy", {})[key] = value  # a page cannot move the ramp's promotion bar
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=yaml.safe_dump(data, sort_keys=False), repo=REPO)
+
+
+def test_speculate_is_a_form_field(shipped):
+    assert _fields(shipped)[("autonomy", "speculate")]["kind"] == "list"
+    proposal = form(shipped, (["autonomy", "speculate"], ["plan"]))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    assert load_config(shipped).autonomy["speculate"] == ["plan"]
+    assert _fields(shipped)[("autonomy", "speculate")]["value"] == ["plan"]
+    assert "autonomy.speculate" in [i.path for i in form(shipped, (["autonomy", "speculate"], ["define"])).errors]
+
+
 def test_policy_is_protected(shipped):
     assert "policy" in config_edit.PROTECTED
     for key in (["policy", "enforce"], ["policy", "obligations", "reviewed"]):

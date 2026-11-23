@@ -1044,3 +1044,10 @@ def test_round_limit_is_at_least_one(tmp_cfg, rounds, expected):
             data["autonomy"]["finding_rounds"] = rounds
 
     assert round_limit(load_config(tmp_cfg(patch))) == expected
+
+
+def test_a_replan_round_is_not_a_finding_round(run):
+    run.emit("phase_rejected", phase="plan", round=1, note="the spec changed", by=autonomy.AUTO_BY, kind="replan")
+    assert autonomy.finding_rounds(run, "plan") == 0
+    run.emit("phase_rejected", phase="plan", round=2, note="a finding", by=autonomy.AUTO_BY)
+    assert autonomy.finding_rounds(run, "plan") == 1

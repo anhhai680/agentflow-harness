@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from agentflow.metrics import run_metrics
-from agentflow.signals import COUNT_FAMILIES, FAMILIES, aggregate_signals, parse_target, run_signals
+from agentflow.signals import COUNT_FAMILIES, FAMILIES, RUNNER, aggregate_signals, parse_target, run_signals
 
 EMPTY_METRICS = {"cost_usd": 0.0, "rework_cost_usd": 0.0, "phases": []}
 VERIFY = ("lint", "unit")
@@ -150,7 +150,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 47
+    assert len(FAMILIES) == 50
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -601,3 +601,70 @@ def test_a_run_with_no_wave_has_zero_counts_and_no_parallelism_key_without_build
     assert set(names) <= COUNT_FAMILIES and FAMILIES["waves"] == FAMILIES["agent_parallelism"] == ("higher", False)
     assert all(FAMILIES[n] == ("lower", False) for n in names[1:])
     assert parse_target("agent_parallelism") == ("agent_parallelism", None) and "agent_parallelism" not in COUNT_FAMILIES
+
+
+# --------------------------------------------------------------------------- slice T7: replans and the ramp
+
+
+def _would(phase: str, verdict: bool = True, **extra) -> dict:
+    return _ev("would_auto_approve", phase=phase, mode="observe", verdict=verdict, held=[], missing=[], **extra)
+
+
+def test_replans_and_auto_approvals_are_counted():
+    evs = [_ev("speculation_started", phase="plan", after="define", basis={}, sha="a"),
+           _ev("phase_rejected", phase="plan", by="runner", kind="replan"),
+           _ev("phase_rejected", phase="plan", by="runner", kind="replan"),
+           _ev("phase_rejected", phase="plan", by="runner", kind="refine"),
+           _would("define"),
+           _ev("phase_approved", phase="define", by="runner", ramp={"samples": 5, "profile": "S"}),
+           _ev("phase_approved", phase="plan", by="me")]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert out["replans"] == 2 and out["auto_approvals"] == 1
+    assert FAMILIES["replans"] == ("lower", False) and FAMILIES["auto_approvals"] == ("higher", False)
+    assert parse_target("replans") == ("replans", None) and parse_target("auto_approvals") == ("auto_approvals", None)
+    assert "replans" not in run_signals([_would("define")], EMPTY_METRICS)
+    assert run_signals([_would("define")], EMPTY_METRICS)["auto_approvals"] == 0
+    assert run_signals([_ev("speculation_started", phase="plan", after="define", basis={}, sha="a")],
+                       EMPTY_METRICS)["replans"] == 0
+
+
+def test_ramp_agreement_is_one_per_agreeing_decision():
+    evs = [_would("define"), _ev("phase_approved", phase="define", by="me"),
+           _would("plan"), _ev("phase_rejected", phase="plan", by="me"),
+           _would("review"), _ev("phase_rejected", phase="review", by="runner", kind="refine"),
+           _ev("phase_approved", phase="review", by="me"),
+           _would("verify"), _ev("phase_approved", phase="verify", by="runner", ramp={"samples": 5, "profile": "S"}),
+           _would("ship", verdict=False), _ev("phase_approved", phase="ship", by="me"),
+           _would("goal")]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert out["ramp_agreement:define"] == 1.0 and out["ramp_agreement:plan"] == 0.0
+    assert out["ramp_agreement:review"] == 1.0
+    assert not [k for k in out if k in ("ramp_agreement:verify", "ramp_agreement:ship", "ramp_agreement:goal")]
+    assert FAMILIES["ramp_agreement"] == ("higher", True) and parse_target("ramp_agreement:define")
+
+
+def test_a_replan_is_no_refine_round():
+    phases = [{"phase": "plan", "cost_usd": 0.0, "steps": []}]
+    evs = [_ev("phase_rejected", phase="plan", by="runner", kind="replan"),
+           _ev("phase_rejected", phase="plan", by="runner")]
+    out = run_signals(evs, _metrics(phases))
+    assert out["refine_rounds:plan"] == 1 and out["human_rejections:plan"] == 0
+    assert run_signals(evs[:1], _metrics(phases))["refine_rounds:plan"] == 0
+
+
+def test_signals_of_a_run_without_t7_events_are_unchanged():
+    evs = [_ev("phase_rejected", phase="plan", by="runner"), _ev("phase_approved", phase="plan", by="me"),
+           _ev("phase_rejected", phase="plan", by="me")]
+    out = run_signals(evs, EMPTY_METRICS)
+    assert not [k for k in out if k.startswith(("replans", "ramp_agreement", "auto_approvals"))]
+
+
+def test_the_human_decision_rule_is_shared_with_the_ramp():
+    from agentflow import autonomy
+    from agentflow.signals import human_agreement
+
+    assert RUNNER == autonomy.AUTO_BY
+    assert human_agreement([_would("define"), _ev("phase_approved", phase="define", by="me")], "define") is True
+    assert human_agreement([_would("define"), _ev("phase_rejected", phase="define", by="me")], "define") is False
+    assert human_agreement([_would("define")], "define") is None
+    assert human_agreement([_ev("phase_approved", phase="define", by="me")], "define") is None

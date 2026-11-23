@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from agentflow import overlays
 from agentflow.autonomy import AUTO_BY, blocking_of
 from agentflow.conditions import Ctx
 from agentflow.config import CONFORMANCE_FAILED, Config, Evidence, Obligation
@@ -35,6 +36,7 @@ Status = Literal["satisfied", "waived", "missing", "not_applicable"]
 
 HUMAN_OVERRIDE = "human override"
 ON_BASE = "on base"
+RAMP_APPROVAL = "approval ramp"
 GREEN, RED = "green", "red"
 
 
@@ -161,11 +163,45 @@ def _step(cfg: Config, events: list[dict], step_id: str, changes: list[dict]) ->
                  phase=phase)
 
 
-def _approval(events: list[dict], phase: str) -> _Item:
+def _ramped(event: dict) -> bool:
+    """Whether `event` is a `phase_approved` the runner gave on the approval ramp (`approval_ramp`): `by` the runner,
+    with a `ramp` record whose `samples` is a whole number. Anything else that claims the ramp fails closed."""
+    ramp = event.get("ramp")
+    samples = ramp.get("samples") if isinstance(ramp, dict) else None
+    return (event.get("type") == "phase_approved" and event.get("by") == AUTO_BY
+            and isinstance(samples, int) and not isinstance(samples, bool))
+
+
+def ramp_refused_note(phase: str) -> str:
+    """The note of an `approval:<phase>` item the ramp approved where the security overlay holds (`ramp_refused`)."""
+    return f"the approval ramp approved {phase}, but the security overlay holds: a person must approve it"
+
+
+def ramp_refused(event: dict | None) -> list[str]:
+    """The phases whose `approval:` evidence a `conformance_checked` event found missing because only the approval
+    ramp gave it while the security overlay holds (`ramp_refused_note`), each once, in order: no retry of a missing
+    step brings that evidence, only a person's approval of the phase."""
+    phases: list[str] = []
+    for finding in (event or {}).get("obligations") or []:
+        if not isinstance(finding, dict) or finding.get("status") != "missing":
+            continue
+        for item in finding.get("require") or []:
+            kind, _, phase = str(item).partition(":")
+            if kind == "approval" and phase not in phases and ramp_refused_note(phase) in str(finding.get("note") or ""):
+                phases.append(phase)
+    return phases
+
+
+def _approval(events: list[dict], phase: str, security: bool = False) -> _Item:
     approved = _last([e for e in events if e.get("type") == "phase_approved" and e.get("phase") == phase
                       and e.get("by") != AUTO_BY])
     if approved is not None:
         return _Item(True, [approved["seq"]])
+    ramped = _last([e for e in events if e.get("phase") == phase and _ramped(e)])
+    if ramped is not None and security:  # the ramp may have approved it before the run touched a security path
+        return _Item(False, [ramped["seq"]], ramp_refused_note(phase))
+    if ramped is not None:
+        return _Item(True, [ramped["seq"]], RAMP_APPROVAL)
     skipped = _last([e for e in events if e.get("type") == "phase_skipped" and e.get("phase") == phase
                      and e.get("via") == "skip_if"  # not mark-done, not "all steps skipped"; older logs have no `via`
                      and e.get("decided_by") != "agent"])  # a model's guess is no proof the artifact is on base
@@ -186,13 +222,13 @@ def _red_then_green(cfg: Config, events: list[dict], changes: list[dict]) -> _It
 
 
 def _item(cfg: Config, events: list[dict], evidence: Evidence, final_tree: str, changes: list[dict],
-          hashes: Mapping[str, str] | None = None) -> _Item:
+          hashes: Mapping[str, str] | None = None, security: bool = False) -> _Item:
     if evidence.kind == "gates":
         return _gates(cfg, events, evidence.arg, final_tree, hashes)
     if evidence.kind == "step":
         return _step(cfg, events, evidence.arg, changes)
     if evidence.kind == "approval":
-        return _approval(events, evidence.arg)
+        return _approval(events, evidence.arg, security)
     if evidence.kind == "expect" and evidence.arg == "red_then_green":
         return _red_then_green(cfg, events, changes)
     return _Item(False, note="unrecognised evidence item")  # `config.UNRECOGNISED`, or a kind this engine lacks
@@ -212,7 +248,8 @@ def _waiver(events: list[dict], unmet: list[_Item]) -> Finding | None:
 
 
 def evaluate(cfg: Config, events: list[dict], obligations: list[Obligation], final_tree: str,
-             not_applicable: list[Obligation] = (), *, input_hashes: Mapping[str, str] | None = None) -> list[Finding]:
+             not_applicable: list[Obligation] = (), *, input_hashes: Mapping[str, str] | None = None,
+             security: bool = False) -> list[Finding]:
     """One finding per obligation (those that apply first, then `not_applicable` ones, in order), from `events` alone.
 
     An obligation is satisfied when every `require` item is. One that is not is `waived` when a human marked the
@@ -221,7 +258,10 @@ def evaluate(cfg: Config, events: list[dict], obligations: list[Obligation], fin
     items is `missing`: it fails closed, never vacuously met.
 
     A gate's result counts when its `tree` is `final_tree`, or when it carries an `input_hash` equal to
-    `input_hashes[gate]`, the gate's hash on the final tree (only a gate with `inputs` has one)."""
+    `input_hashes[gate]`, the gate's hash on the final tree (only a gate with `inputs` has one).
+
+    With `security` (the security overlay holds on the tree to be pushed), an approval the runner gave on the approval
+    ramp is no evidence: only a person approves such a run's phases."""
     changes = _staling(cfg, events)
     findings: list[Finding] = []
     for obligation in obligations:
@@ -229,7 +269,8 @@ def evaluate(cfg: Config, events: list[dict], obligations: list[Obligation], fin
         if not obligation.require:
             findings.append(Finding(obligation.id, require, "missing", [], "no evidence items"))
             continue
-        items = [_item(cfg, events, evidence, final_tree, changes, input_hashes) for evidence in obligation.require]
+        items = [_item(cfg, events, evidence, final_tree, changes, input_hashes, security)
+                 for evidence in obligation.require]
         unmet = [item for item in items if not item.ok]
         evidence = sorted({seq for item in items for seq in item.evidence})
         if not unmet:
@@ -289,7 +330,8 @@ def audit(cfg: Config, run: Run, worktree: Path, ctx: Ctx, key: str) -> bool:
     ids = {obligation.id for obligation in applying}
     others = [obligation for obligation in cfg.policy.obligations.values() if obligation.id not in ids]
     hashes = input_hashes(cfg, list(cfg.gates.values()), worktree, tree)
-    findings = evaluate(cfg, run.events.read(), applying, tree, others, input_hashes=hashes)
+    security = overlays.security_path(cfg, ctx)  # read on the tree about to be pushed: a ramp approval is no evidence then
+    findings = evaluate(cfg, run.events.read(), applying, tree, others, input_hashes=hashes, security=security)
     names = missing_gates(cfg, findings)
     if names:
         results = run_gates(cfg, names, worktree, run.gate_log_dir(key))
@@ -300,7 +342,7 @@ def audit(cfg: Config, run: Run, worktree: Path, ctx: Ctx, key: str) -> bool:
                        f"Gates failed on the tree {key} would push: {', '.join(r.name for r in failed)}.",
                        extra=failure_report(failed))
             return False
-        findings = evaluate(cfg, run.events.read(), applying, tree, others, input_hashes=hashes)
+        findings = evaluate(cfg, run.events.read(), applying, tree, others, input_hashes=hashes, security=security)
     missing = [f.id for f in findings if f.status == "missing"]
     enforce = "report" if cfg.policy.enforce == "report" else "block"  # an unknown mode fails closed
     run.emit("conformance_checked", key=key, tree=tree, enforce=enforce, passed=not missing,

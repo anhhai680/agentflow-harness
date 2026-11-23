@@ -59,7 +59,11 @@ REMOVED_DEFAULTS = {  # keys that were read but never acted on: a value here wou
     "pr": "`finish` always opens a draft pull request, and the `ci` step marks it ready",
 }
 AUTONOMY_KEYS = ("non_blocking_severities", "finding_rounds", "resolve_kinds", "answer_recommended", "revert_forbidden",
-                 "human_question_kinds")
+                 "human_question_kinds", "speculate", "approvals", "ramp_samples")
+# `autonomy.approvals`: how far the runner goes with a phase's approval. `observe` only records what it would have done.
+APPROVAL_MODES = ("off", "observe", "auto")
+NEVER_AUTO = ("goal",)  # phases whose approval is always a person's
+RAMP_SAMPLES_MIN, RAMP_SAMPLES_MAX = 3, 50
 # The `kind` of a `needs_human` question. `boundary`: the repository's docs reserve the decision for a human.
 QUESTION_KINDS = ("spec_gap", "ambiguity", "conflict", "review_dispute", "boundary", "other")
 CI_KEYS = ("poll_s", "appear_min", "timeout_min", "fix_rounds", "rerun_rounds", "sync_rounds", "watch_max_h",
@@ -712,6 +716,36 @@ class Config:
 def _holds_finish(steps: list[Step]) -> bool:
     """Whether a `type: finish` step is among `steps` or inside one of their groups."""
     return any(step.type == "finish" or _holds_finish(step.steps) for step in steps)
+
+
+def speculation_shape(phase: Phase) -> str | None:
+    """Why `phase` can't run while the approval before it waits, or None. A speculated phase holds only artifact steps:
+    top-level agent steps that write an `output`, or `role: review` steps that don't commit. Every lane's steps count."""
+    for step in phase.steps:
+        artifact = (step.type == "agent" and not step.steps and not step.foreach
+                    and (step.output or step.role == "review") and not (step.role == "review" and step.commit))
+        if not artifact:
+            return f"step {step.id} is not an artifact step"
+    return None
+
+
+def speculation_writes(cfg: Config, phase: Phase) -> str | None:
+    """Why a `role: review` step of `phase` could write while the approval before it waits, or None. The fence holds
+    only a step with an `output`; a review step has none, so it must run read-only: its role is in its agent's
+    `read_only_roles`, and the agent has a read-only mode (`agents.ADAPTERS`, as the runner reads it)."""
+    from agentflow.agents import ADAPTERS  # it imports this module
+
+    name = phase.agent or cfg.defaults.agent
+    agent = cfg.agents.get(name)
+    for step in phase.steps:
+        if step.role != "review":
+            continue
+        if not getattr(ADAPTERS.get(name), "takes_read_only_role", False):
+            return f"step {step.id} is a `role: review` step agent {name} does not run read-only: {name} has no read-only mode"
+        if agent is None or step.role not in agent.read_only_roles:
+            return (f"step {step.id} is a `role: review` step agent {name} does not run read-only: add `review` to "
+                    f"`agents.{name}.read_only_roles`")
+    return None
 
 
 def for_lane(steps: list[Step], lane: str) -> list[Step]:
@@ -3028,6 +3062,7 @@ class _Validator:
             if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 1:
                 self.error("autonomy.finding_rounds", "finding_rounds must be a whole number, 1 or more: "
                            "automatic refinement of blocking findings is an engine floor and cannot be switched off")
+        self.ramp()
         kinds = cfg.autonomy.get("resolve_kinds", {})
         if not isinstance(kinds, dict):
             self.error("autonomy.resolve_kinds", "resolve_kinds maps a stop kind to its attempts per step")
@@ -3053,6 +3088,50 @@ class _Validator:
             if key not in CI_KEYS:
                 self.error(f"ci.{key}", "unknown ci key")
         self.early_pr_after()
+
+    def ramp(self) -> None:
+        """`autonomy.speculate`, `autonomy.approvals` and `autonomy.ramp_samples`: one error per key path."""
+        cfg = self.cfg
+        names = list(cfg.phases)
+        listed = cfg.autonomy.get("speculate", [])
+        if not isinstance(listed, list) or any(not isinstance(name, str) for name in listed):
+            self.error("autonomy.speculate", "speculate must be a list of phase names")
+            listed = []
+        for name in listed:
+            if name not in cfg.phases:
+                self.error("autonomy.speculate", f"{name}: not a phase ({', '.join(names)})")
+                continue
+            at = names.index(name)
+            if at == 0:
+                self.error("autonomy.speculate", f"{name}: the first phase has no approval before it to wait for")
+                continue
+            before = names[at - 1]
+            if not cfg.phases[before].needs_approval:
+                self.error("autonomy.speculate", f"{name}: the phase before it, {before}, does not need an approval")
+                continue
+            reason = speculation_shape(cfg.phases[name]) or speculation_writes(cfg, cfg.phases[name])
+            if reason:
+                self.error("autonomy.speculate", f"{name}: {reason}")
+        modes = cfg.autonomy.get("approvals", {})
+        if not isinstance(modes, dict):
+            self.error("autonomy.approvals", f"approvals maps a phase to a mode: {', '.join(APPROVAL_MODES)}")
+            modes = {}
+        for name, mode in modes.items():
+            where = f"autonomy.approvals.{name}"
+            if name not in cfg.phases:
+                self.error(where, f"not a phase ({', '.join(names)})")
+            elif not cfg.phases[name].needs_approval:
+                self.error(where, "only a phase with needs_approval: true has an approval to ramp")
+            elif mode not in APPROVAL_MODES:
+                self.error(where, f"a mode is one of {', '.join(APPROVAL_MODES)}")
+            elif mode == "auto" and name in NEVER_AUTO:
+                self.error(where, f"the approval of {name} is never auto: it is always a person's")
+        if "ramp_samples" in cfg.autonomy:
+            samples = cfg.autonomy["ramp_samples"]
+            if (not isinstance(samples, int) or isinstance(samples, bool)
+                    or not RAMP_SAMPLES_MIN <= samples <= RAMP_SAMPLES_MAX):
+                self.error("autonomy.ramp_samples", "ramp_samples must be a whole number, "
+                           f"{RAMP_SAMPLES_MIN} to {RAMP_SAMPLES_MAX}")
 
     def hitl(self) -> None:
         """`hitl.park_independent` and `hitl.digest` (bools) and `hitl.park_kinds` (stops a plan task may park, none of

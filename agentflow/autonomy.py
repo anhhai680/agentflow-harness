@@ -141,9 +141,11 @@ def findings_note(findings: list[dict]) -> str:
 
 
 def finding_rounds(run: Run, phase: str) -> int:
-    """How many refine rounds the runner has opened on `phase`."""
+    """How many refine rounds the runner has opened on `phase` for findings (a `replan` round is not one: it follows a
+    change to the spec the phase was planned on, not a finding)."""
     return sum(1 for e in run.events.read()
-               if e["type"] == "phase_rejected" and e.get("phase") == phase and e.get("by") == AUTO_BY)
+               if e["type"] == "phase_rejected" and e.get("phase") == phase and e.get("by") == AUTO_BY
+               and e.get("kind") != "replan")
 
 
 # --------------------------------------------------------------------------- inner stops

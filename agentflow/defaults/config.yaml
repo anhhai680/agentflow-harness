@@ -210,6 +210,9 @@ autonomy:
     review_unresolved: 1
     turn_cap: 1                 # a step that stopped at its turn cap
     budget_cap: 1               # a step that stopped at its spend cap
+  speculate: []      # phases that run while the approval of the phase right before them waits (e.g. [plan]); [] = off
+  approvals: {}      # phase -> off | observe | auto: the approval ramp; auto also needs ramp_samples agreeing runs and a green scorecard
+  ramp_samples: 5    # human decisions in a row that agreed with the runner before `auto` approves by itself; 3 to 50
 
 route:                         # size a run at its start; a profile drops ceremony, never an obligation
   mode: "off"                  # off | observe (decide and record a profile, run the full route) | on (apply it)

@@ -162,19 +162,38 @@ def _find_agent(state: dict, event: dict) -> tuple[str | None, dict | None]:
 
 
 def _clear_wait(state: dict) -> None:
-    """Drop the current wait and promote the next queued one, if any."""
+    """Drop the current wait and promote the next queued one, if any. The last one cleared leaves the run `ready` when
+    a person held an approval while it waited (`_on_phase_ready`, speculation only), else `running`."""
     state["waiting"] = None
     if state["waiting_queue"]:
         state["waiting"] = state["waiting_queue"].pop(0)
         if state["status"] not in TERMINAL:
             state["status"] = "waiting_human"
     elif state["status"] in ("waiting_human", "awaiting_approval"):
-        state["status"] = "running"
+        state["status"] = "ready" if (state.get("ready") or {}).get("speculative") else "running"
 
 
 def _approval_pending(state: dict) -> bool:
     """A phase approval is the current wait: only `phase_approved` and `phase_rejected` may end it."""
     return state["waiting"] is not None and state["waiting"].get("kind") == "phase_approval"
+
+
+def speculating(state: dict) -> dict | None:
+    """The speculation record while the approval of the phase it follows (`after`) is still the run's wait, else None:
+    the runner is looking ahead at `phase` while a human decides on `after`."""
+    record = state.get("speculation")
+    if record and _approval_pending(state) and state["waiting"].get("phase") == record.get("after"):
+        return record
+    return None
+
+
+def _on_speculation_started(state: dict, ev: dict) -> None:
+    state["speculation"] = {"phase": ev["phase"], "after": ev["after"], "basis": copy.deepcopy(ev["basis"]),
+                            "sha": ev.get("sha"), "since": ev.get("ts")}
+
+
+def _on_speculation_ended(state: dict, ev: dict) -> None:
+    state["speculation"] = None
 
 
 def _on_run_started(state: dict, ev: dict) -> None:
@@ -535,7 +554,7 @@ def _on_hitl_raised(state: dict, ev: dict) -> None:
     }
     if "times" in ev:  # a `blocked_repeat` stop that came back after a human's approval
         wait["times"] = ev["times"]
-    for mark in ("promoted", "notified"):  # a parked item made the wait once no task could run; a person was told
+    for mark in ("promoted", "notified", "speculative"):  # a parked item made the wait once no task could run; a person was told; a stop of a speculated phase
         if mark in ev:
             wait[mark] = ev[mark]
     if state["status"] in TERMINAL:  # a stop raised after a cancel is logged, never a wait to act on
@@ -731,6 +750,11 @@ def _on_phase_approval_raised(state: dict, ev: dict) -> None:
         "since": ev.get("ts"),
     }
     state["refine"] = None
+    stash = state.get("refine_stash")  # only ever set under speculation (`_on_phase_rejected`)
+    if stash and stash.get("after") == phase:
+        state.pop("refine_stash")
+        if _refining_row(state, stash["refine"].get("phase")):
+            state["refine"] = stash["refine"]  # the round a rejection of this phase cut in the phase walked behind it
     state["phase"] = phase
     state["status"] = "awaiting_approval"
 
@@ -748,13 +772,32 @@ def _on_phase_approved(state: dict, ev: dict) -> None:
     waiting = state["waiting"]
     if waiting is not None and waiting.get("kind") == "phase_approval" and waiting.get("phase") == phase:
         _clear_wait(state)
+        if state["status"] == "running" and state.get("refine"):  # another phase's round, run while this one waited
+            state["status"] = "refining"
+
+
+def _behind_speculation(state: dict, phase: str) -> bool:
+    """Whether a phase was walked behind `phase`'s approval and is not done with it: the speculation record names
+    `phase`, or a stop the walk queued quietly is still the wait or queued."""
+    if (state.get("speculation") or {}).get("after") == phase:
+        return True
+    return any(w.get("speculative") and w.get("phase") != phase for w in [state["waiting"] or {}, *state["waiting_queue"]])
 
 
 def _on_phase_ready(state: dict, ev: dict) -> None:
-    """An approved phase rests until a human continues the run or marks it done. A queued wait comes first."""
+    """An approved phase rests until a human continues the run or marks it done. A queued wait comes first.
+
+    Under speculation, a hold on the approval a phase was walked behind is never dropped: it is recorded whatever the
+    status (the walked phase's round made it `refining`, or the walk's queued stop became the wait), so the walk
+    yields to it (`speculation.cut`) and the run never goes on past the held phase. The status is `ready` at once when
+    nothing waits, else once the last wait clears (`_clear_wait`)."""
     if state["status"] in ("running", "paused") and state["waiting"] is None:
         state["ready"] = {"phase": ev["phase"], "since": ev.get("ts")}
         state["status"] = "ready"
+    elif state["status"] not in TERMINAL and _behind_speculation(state, ev["phase"]):
+        state["ready"] = {"phase": ev["phase"], "since": ev.get("ts"), "speculative": True}
+        if state["waiting"] is None:
+            state["status"] = "ready"
 
 
 def _on_run_marked_done(state: dict, ev: dict) -> None:
@@ -780,8 +823,18 @@ def _in_scope(key: str, scope: str | None, keys: list[str] | None = None) -> boo
 RECONCILE_KIND = "reconcile"  # `doubt.RECONCILE`: a round the runner opens on a doubt review's findings, not a human's
 
 
+def _refining_row(state: dict, phase: object) -> bool:
+    return isinstance(phase, str) and (state["phases"].get(phase) or {}).get("status") == "refining"
+
+
 def _on_phase_rejected(state: dict, ev: dict) -> None:
     phase, round_ = ev["phase"], ev.get("round", 1)
+    prior = state.get("refine") or {}
+    if (_approval_pending(state) and state["waiting"].get("phase") == phase and prior.get("phase") != phase
+            and _refining_row(state, prior.get("phase"))):
+        # The waiting phase is sent back while the phase walked behind it (speculation) is in a round of its own: keep
+        # that round, so the waiting phase's next raise gives it back (`_on_phase_approval_raised`) and it goes on as one.
+        state["refine_stash"] = {"after": phase, "refine": copy.deepcopy(prior)}
     scope = ev.get("scope") or None
     keys = ev.get("keys") if isinstance(ev.get("keys"), list) else None
     row = _phase_row(state, phase)
@@ -804,6 +857,15 @@ def _on_phase_rejected(state: dict, ev: dict) -> None:
     parked = state.setdefault("parked", {})
     for key in [k for k, item in parked.items() if item.get("phase") == phase and _in_scope(k, scope, keys)]:
         parked.pop(key)  # its step runs again in the refine round
+    if _approval_pending(state) and state["waiting"].get("phase") != phase:
+        return  # another phase's round (speculation): the pending approval, its queue and its status stay
+    # the waiting phase itself is sent back: the stops queued from its speculated phase no longer apply
+    for wait in [w for w in state["waiting_queue"] if w.get("speculative")]:
+        step = state["steps"].get(wait.get("key"))
+        if step is not None and step["status"] == "waiting_human":  # it starts afresh, not as a session resumed on a question nobody answered
+            step["status"] = "pending"
+            step["session_id"] = None
+    state["waiting_queue"] = [w for w in state["waiting_queue"] if not w.get("speculative")]
     state["waiting"] = None
     if state["status"] not in TERMINAL:
         state["status"] = "refining"
@@ -890,6 +952,8 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "phase_approved": _on_phase_approved,
     "phase_ready": _on_phase_ready,
     "phase_rejected": _on_phase_rejected,
+    "speculation_started": _on_speculation_started,
+    "speculation_ended": _on_speculation_ended,
     "step_started": _on_step_started,
     "step_finished": _on_step_finished,
     "step_skipped": _on_step_skipped,
@@ -955,6 +1019,9 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "phase_ready": ("phase",),
     "run_marked_done": ("phase",),
     "phase_rejected": ("phase",),
+    "speculation_started": ("phase", "after", "basis"),
+    "speculation_ended": ("phase", "outcome"),
+    "would_auto_approve": ("phase", "verdict"),
     "step_started": ("key",),
     "step_finished": ("key",),
     "step_skipped": (("key", "step"),),

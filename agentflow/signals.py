@@ -63,6 +63,14 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   are clipped to the window. 1.0 is one agent at a time, above it sub-agents ran together. It is present only when
   build had agent time (wall time and a main session in the window), and it counts seconds, never cost: a session's
   cost already holds its sub-agents'.
+  `replans` counts the `phase_rejected` events of kind `replan` (a phase planned on a spec that then changed), and
+  `refine_rounds:<p>` leaves them out as it leaves out `reconcile`; it is present only for a run with a
+  `speculation_started`. `ramp_agreement:<p>` is 1.0 when the first decision on phase `<p>` after its first
+  `would_auto_approve` with a true verdict was a person's approval, and 0.0 when it was a person's rejection
+  (`human_agreement`, which the approval ramp's samples share); it is present only for a phase with such a decision.
+  `auto_approvals` counts the `phase_approved` events that carry `ramp`, and is present only for a run with a
+  `would_auto_approve`. A run without these events carries none of the three keys.
+- `human_agreement(events, phase)`: the rule `ramp_agreement:<p>` is, for the approval ramp.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
 
@@ -131,6 +139,9 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "waves_dissolved": ("lower", False),      # waves undone because they stopped, dispatched wrongly or were cut off
     "parallel_candidates": ("lower", False),  # independent ungrouped task pairs the plan left on the table
     "agent_parallelism": ("higher", False),   # agent seconds of the build window over its wall seconds
+    "replans": ("lower", False),              # phases planned on a spec that then changed, planned again
+    "ramp_agreement": ("higher", True),       # a phase: 1.0 when a person's decision agreed with a true verdict
+    "auto_approvals": ("higher", False),      # phase approvals the runner gave itself under the approval ramp
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
@@ -145,11 +156,13 @@ COUNT_FAMILIES = frozenset({"fix_attempts", "guard_trips", "permission_denied", 
 DOUBT_FIELDS = (("doubt_blocking", "first_blocking"), ("doubt_rounds", "rounds"), ("doubt_noise", "noise"),
                 ("doubt_misread", "misread"), ("doubt_open", "open"), ("doubt_actionable", "actionable"))
 RECONCILE = "reconcile"  # `phase_rejected.kind` of a round the runner opens on a doubt review's findings
+REPLAN = "replan"  # `phase_rejected.kind` of a round that plans a speculated phase again on a changed spec
 USAGE_HOLD = "usage limit"  # `run_held.reason` of a run waiting for its plan's usage limit to reset
 TASK_PREFIX = re.compile(r"^(.*?/task-\d+)(?:/|$)")  # a plan task's key: `<phase>/<step>/task-<n>`
 DISSOLVED = "dissolved"  # `parallel_demoted.reason` of a task a dissolved wave handed back: counted by the dissolve
 BUILD = "build"  # the phase whose window `agent_parallelism` measures
 RUNNER = "runner"  # `phase_rejected.by` for what the runner settles itself; a person's name is never this
+WOULD = "would_auto_approve"  # the event the approval ramp records just before a phase raises its approval
 
 
 def parse_target(text: str) -> tuple[str, str | None] | None:
@@ -168,6 +181,32 @@ def parse_target(text: str) -> tuple[str, str | None] | None:
 
 def _phase_of(key: object) -> str | None:
     return str(key).split("/", 1)[0] if key else None
+
+
+def ramp_decision(events: list[dict], phase: str) -> tuple[dict, dict] | None:
+    """`(would, decision)` for a run's `phase`: its first `would_auto_approve` with a true verdict, and the first
+    decision on the phase after it. That decision is a `phase_approved` or `phase_rejected` of a person (`by` is not
+    the runner's), or the runner's own `phase_approved` carrying `ramp`. A runner refine round (`phase_rejected` by
+    the runner) and a runner approval with no `ramp` are no decision. None for a run with no such pair."""
+    first = next((i for i, e in enumerate(events) if e.get("type") == WOULD and e.get("phase") == phase
+                  and e.get("verdict") is True), None)
+    if first is None:
+        return None
+    for event in events[first + 1:]:
+        if event.get("phase") != phase or event.get("type") not in ("phase_approved", "phase_rejected"):
+            continue
+        if event.get("by") != RUNNER or (event["type"] == "phase_approved" and event.get("ramp")):
+            return events[first], event
+    return None
+
+
+def human_agreement(events: list[dict], phase: str) -> bool | None:
+    """Whether a person's first decision on `phase` agreed with the runner's true verdict: True for an approval,
+    False for a rejection, None for a run with no such decision (none at all, or the ramp approved it itself)."""
+    found = ramp_decision(events, phase)
+    if found is None or found[1].get("by") == RUNNER:
+        return None
+    return found[1]["type"] == "phase_approved"
 
 
 def _park_signals(events: list[dict]) -> dict[str, int]:
@@ -424,7 +463,8 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
     decided: dict[str, tuple[Any, Any]] = {}
     plain: Counter[str] = Counter()
     audit: dict | None = None
-    routed = False
+    routed = speculated = ramped = False
+    voted: set[str] = set()  # phases with a true `would_auto_approve`
     settled: dict[str, dict] = {}
     approvals: dict[str, list[bool]] = {}
     for ev in events:
@@ -447,8 +487,10 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
         elif etype == "phase_rejected":
             if ev.get("phase") and ev.get("by") != RUNNER:
                 counts["human_rejections"][str(ev["phase"])] += 1
-            elif ev.get("phase") and ev.get("kind") != RECONCILE:
+            elif ev.get("phase") and ev.get("kind") not in (RECONCILE, REPLAN):
                 counts["refine_rounds"][str(ev["phase"])] += 1
+            if ev.get("kind") == REPLAN:
+                plain["replans"] += 1
         elif etype == "doubt_settled":
             if ev.get("phase"):
                 settled[str(ev["phase"])] = ev   # the last one per phase: a crash can settle a phase twice
@@ -467,6 +509,13 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
         elif etype == "phase_approved":
             if (phase := ev.get("phase")) and ev.get("by") != RUNNER and ev.get("produced") != []:
                 approvals.setdefault(str(phase), []).append(_informed(ev))
+            plain["auto_approvals"] += int(bool(ev.get("ramp")))
+        elif etype == WOULD:
+            ramped = True
+            if ev.get("phase") and ev.get("verdict") is True:
+                voted.add(str(ev["phase"]))
+        elif etype == "speculation_started":
+            speculated = True
         elif etype == "conformance_checked":
             audit = ev
         elif etype == "route_profile":
@@ -485,6 +534,13 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
                                                "usage_holds")})
     if routed:  # only a run that was triaged has a route to upgrade
         out["route_upgrades"] = plain["route_upgrades"]
+    if speculated:  # only a run that planned ahead has a plan to redo
+        out["replans"] = plain["replans"]
+    if ramped:  # only a run the ramp looked at
+        out["auto_approvals"] = plain["auto_approvals"]
+    for phase in sorted(voted):
+        if (agreed := human_agreement(events, phase)) is not None:
+            out[f"ramp_agreement:{phase}"] = float(agreed)
     for phase in metrics.get("phases") or []:
         for family in ("fix_attempts", "human_rejections", "refine_rounds"):
             out.setdefault(f"{family}:{phase['phase']}", 0)

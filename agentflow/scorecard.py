@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from agentflow import safeio
+from agentflow.config import Config
 from agentflow.events import parse_iso
 from agentflow.metrics import run_metrics
 from agentflow.pack import ENGINE_VERSION
@@ -36,6 +37,9 @@ NO_BASELINE = "No baseline yet: run `agentflow scorecard --freeze` first."
 # the signals `run_row` adds to a run's own, with the direction that is better (like `signals.FAMILIES`)
 EFFICIENCY: dict[str, tuple[str, bool]] = {"cost_usd": ("lower", False), "wall_h": ("lower", False),
                                            "human_wait_h": ("lower", False)}
+
+
+RAMP_COLUMNS = ("lane", "phase", "profile", "mode", "human", "agreeing", "auto", "regressions", "eligible")
 
 
 def baseline_path(repo: Path) -> Path:
@@ -137,9 +141,11 @@ def _compare(base: dict, current: dict) -> list[dict]:
 
 
 def scorecard_view(repo: Path, lane: str | None, date_from: date | None, date_to: date | None,
-                   now: datetime, *, full_suite: Collection[str] = ()) -> dict:
+                   now: datetime, *, full_suite: Collection[str] = (), cfg: Config | None = None) -> dict:
     """`{"baseline": bool, "lanes": {lane: [row, ...]}}`. With no dates, a lane's current runs are those that ended
-    after its baseline's `to`; with a date, the runs that ended in that range (the baseline's own runs included)."""
+    after its baseline's `to`; with a date, the runs that ended in that range (the baseline's own runs included).
+    With `cfg`, a `"ramp"` key holds `approval_ramp.ramp_view` (the approval ramp's rows, imported here because
+    `approval_ramp` itself imports this module)."""
     base = load_baseline(repo)
     if base is None:
         return {"baseline": False, "lanes": {}}
@@ -160,7 +166,12 @@ def scorecard_view(repo: Path, lane: str | None, date_from: date | None, date_to
             extra.setdefault(name, []).append(run_row(run, now, full_suite=full_suite))
     for name, rows in sorted(extra.items()):
         lanes[name] = _compare({}, aggregate_signals(rows))
-    return {"baseline": True, "lanes": lanes}
+    view: dict = {"baseline": True, "lanes": lanes}
+    if cfg is not None:
+        from agentflow import approval_ramp
+
+        view["ramp"] = approval_ramp.ramp_view(repo, cfg, now)
+    return view
 
 
 def _num(value: float | None) -> str:
@@ -182,4 +193,15 @@ def scorecard_table(view: dict) -> str:
             mark = "  SLO BREACH" if r["slo"] else ""
             out.append(f"  {r['signal'].ljust(width)}  {_num(r['baseline']) + f' ({r['baseline_n']})':>9}"
                        f"  {_num(r['current']) + f' ({r['current_n']})':>9}  {_num(r['delta']):>9}  {r['verdict']}{mark}")
+    if view.get("ramp"):
+        table = [list(RAMP_COLUMNS)] + [[str(c) for c in (r["lane"], r["phase"], r["profile"], r["mode"], r["human"],
+                                                          r["agreeing"], r["auto"], r["regressions"],
+                                                          "yes" if r["eligible"] else "no")] for r in view["ramp"]]
+        widths = [max(len(row[i]) for row in table) for i in range(len(RAMP_COLUMNS))]
+        out.append("Approval ramp")
+        out.append("  " + "  ".join(c.ljust(w) for c, w in zip(table[0], widths)).rstrip())
+        for r, cells in zip(view["ramp"], table[1:]):
+            out.append("  " + "  ".join(c.ljust(w) for c, w in zip(cells, widths)).rstrip())
+            if not r["eligible"]:
+                out.append(f"    why: {r['why']}")
     return "\n".join(out) if out else "The baseline holds no lanes."

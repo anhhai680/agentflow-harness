@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import test_feature_lane
+from conftest import with_doubt
 from test_feature_lane import SMALL, begin_finish, created, gh_calls, review
 
 from agentflow.conditions import Ctx
@@ -178,6 +179,47 @@ def test_runner_approval_is_not_approval(cfg):
     assert evaluate(cfg, [ev(2, "phase_approved", phase="plan", by="runner")], [planned], "t")[0].status == "missing"
     finding = evaluate(cfg, [ev(2, "phase_approved", phase="plan", by="me")], [planned], "t")[0]
     assert finding.status == "satisfied" and finding.evidence == [2]
+
+
+def test_a_ramp_approval_is_evidence_for_approval(cfg):
+    planned = ob("plan_approved", "approval:plan")
+    ramped = [ev(2, "phase_approved", phase="plan", by="runner", ramp={"samples": 5, "profile": "S"})]
+    finding = evaluate(cfg, ramped, [planned], "t")[0]
+    assert finding.status == "satisfied" and finding.evidence == [2] and finding.note == "approval ramp"
+    # a person's approval is still the evidence when there is one
+    both = [*ramped, ev(3, "phase_approved", phase="plan", by="me")]
+    finding = evaluate(cfg, both, [planned], "t")[0]
+    assert finding.status == "satisfied" and finding.evidence == [3] and finding.note == ""
+    # the ramp never overrides a step's blocking findings: that stays a person's
+    reviewed = ob("reviewed", "step:plan")
+    flagged = [finished(1, "plan/plan"),
+               ev(2, "step_findings", key="plan/plan", findings=[{"severity": "high", "text": "x"}]),
+               ev(3, "phase_approved", phase="plan", by="runner", ramp={"samples": 5, "profile": "S"})]
+    assert evaluate(cfg, flagged, [reviewed], "t")[0].status == "missing"
+
+
+def test_a_plain_runner_approval_is_not(cfg):
+    planned = ob("plan_approved", "approval:plan")
+    for event in (ev(2, "phase_approved", phase="plan", by="runner"),
+                  ev(2, "phase_approved", phase="plan", by="runner", ramp=None),
+                  ev(2, "phase_approved", phase="other", by="runner", ramp={"samples": 5, "profile": "S"})):
+        assert evaluate(cfg, [event], [planned], "t")[0].status == "missing"
+
+
+def test_a_ramp_approval_needs_whole_samples(cfg):
+    planned = ob("plan_approved", "approval:plan")
+    for ramp in ("yes", [5], {"profile": "S"}, {"samples": "5", "profile": "S"}, {"samples": True, "profile": "S"}):
+        event = ev(2, "phase_approved", phase="plan", by="runner", ramp=ramp)
+        assert evaluate(cfg, [event], [planned], "t")[0].status == "missing", ramp
+
+
+def test_a_ramp_approval_is_not_evidence_where_the_security_overlay_holds(cfg):
+    planned = ob("plan_approved", "approval:plan")
+    ramped = [ev(2, "phase_approved", phase="plan", by="runner", ramp={"samples": 5, "profile": "S"})]
+    finding = evaluate(cfg, ramped, [planned], "t", security=True)[0]
+    assert finding.status == "missing" and "security overlay" in finding.note
+    human = [*ramped, ev(3, "phase_approved", phase="plan", by="me")]  # a person's approval stands either way
+    assert evaluate(cfg, human, [planned], "t", security=True)[0].status == "satisfied"
 
 
 def test_skip_if_skip_is_on_base(cfg):
@@ -480,6 +522,49 @@ def test_finish_audits_and_reports_in_report_mode(flow_repo, gh, git):
     assert "Conformance: " in body and "`reviewed` missing" in body
     assert body.index("## Gates") < body.index("## Conformance") < body.index("## Skipped steps")
     assert pushed(git, flow_repo, run) and len(created(gh)) == 1
+
+
+@pytest.mark.parametrize("overlay", [False, True])
+def test_the_audit_refuses_a_ramp_approval_once_the_overlay_holds(flow_repo, gh, git, overlay):
+    """Ruling T: `define` or `plan` may be approved on the ramp before the run touches a security path; the audit at
+    `finish` reads the overlay on the tree it is about to push."""
+    run = begin_finish(flow_repo)
+    if overlay:
+        flow_repo.configure({**SMALL, "conditions": {"security_path": {"any": None, "check": "file_exists",
+                                                                         "path": "README.md"}}})
+    run.emit("step_finished", key="verify/verify", status="done", summary="")
+    run.emit("phase_approved", phase="plan", by="runner", ramp={"samples": 5, "profile": "S"})
+    assert advance(run, flow_repo.cfg, RunOptions()) == "done"
+    [plan] = [o for o in last(flow_repo, run, "conformance_checked")["obligations"] if o["id"] == "plan_approved"]
+    if overlay:
+        assert plan["status"] == "missing" and "security overlay" in plan["note"]
+    else:
+        assert plan["status"] == "satisfied" and plan["note"] == "approval ramp"
+
+
+@pytest.mark.parametrize("reviewed", [True, False])
+def test_a_ramp_approval_refused_under_the_overlay_names_the_retry_that_asks_a_person(flow_repo, gh, git, reviewed):
+    """Ruling Z: the stop names `agentflow retry <run> <phase>/<step>`, the phase's `role: review` step when it ran in
+    this run (else its first step), which walks the phase again and raises its approval for a person."""
+    run = begin_finish(flow_repo)
+    flow_repo.configure({**SMALL, "policy": {"enforce": "block"},
+                         "conditions": {"security_path": {"any": None, "check": "file_exists", "path": "README.md"}}},
+                        edit=with_doubt)  # `plan` has its review
+    run.emit("step_finished", key="verify/verify", status="done", summary="")
+    run.emit("step_finished", key="plan/plan", status="done", summary="")
+    if reviewed:
+        run.emit("step_finished", key="plan/plan_review", status="done", summary="")
+    else:  # an XS route skips the plan's review
+        run.emit("step_skipped", key="plan/plan_review", phase="plan", reason="route XS")
+    run.emit("phase_approved", phase="plan", by="runner", ramp={"samples": 5, "profile": "S"})
+    assert advance(run, flow_repo.cfg, RunOptions()) == "waiting_human"
+    raised = last(flow_repo, run, "hitl_raised")
+    assert raised["kind"] == "conformance_failed" and not pushed(git, flow_repo, run)
+    inbox = " ".join(Path(raised["inbox"]).read_text(encoding="utf-8").split())
+    step = "plan/plan_review" if reviewed else "plan/plan"
+    assert (f"The approval ramp approved `plan`, but the security overlay holds, so a person must approve it: "
+            f"`agentflow retry {run.id} {step}` runs `{step}` again and raises `plan`'s approval; once you approve "
+            f"it, `{FINISH}` audits again.") in inbox
 
 
 def test_block_mode_stops_before_the_push(flow_repo, gh, git):

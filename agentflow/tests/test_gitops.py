@@ -1464,3 +1464,39 @@ def test_commit_still_refuses_the_human_only_trailer(tmp_git, cfg):
     (tmp_git / "README.md").write_text("changed\n", encoding="utf-8")
     with pytest.raises(CommitRejected, match="Constraints-Approved-By"):
         gitops.commit(tmp_git, OVERRIDE_MESSAGE, cfg)
+
+
+def test_commit_paths_lists_what_the_commits_changed_and_drops_what_is_not_a_commit_id(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "a.md", "a\n")
+    _commit(repo)
+    _write(repo, "spec.md", "s\n")
+    _commit(repo)
+    spec = run_git(repo, "rev-parse", "HEAD").strip()
+    _write(repo, "plan dir/plan.md", "p\n")
+    _write(repo, "a.md", "a2\n")
+    _commit(repo)
+    plan = run_git(repo, "rev-parse", "HEAD").strip()
+    assert gitops.commit_paths(repo, [plan, spec]) == ["a.md", "plan dir/plan.md", "spec.md"]
+    assert gitops.commit_paths(repo, ["--all", "HEAD", None, plan[:12]]) == []  # never an option, a ref or a short id
+    assert gitops.diff_stat(repo, spec, ["plan dir/plan.md", "a.md"]) == ""
+    assert "spec.md" not in gitops.diff_stat(repo, spec) and "plan dir/plan.md" in gitops.diff_stat(repo, spec)
+    assert gitops.excluding([]) == []
+
+
+def test_uncommitted_paths_lists_each_file_of_a_new_folder(tmp_path):
+    repo = _repo(tmp_path)
+    _write(repo, "a.md", "a\n")
+    _commit(repo)
+    _write(repo, "docs/plans/p.md", "p\n")  # a folder git has never seen: listed file by file, never as `docs/`
+    assert gitops.uncommitted_paths(repo) == ["docs/plans/p.md"]
+
+
+def test_restore_paths_reads_each_name_as_a_path_never_a_glob(tmp_path):
+    repo = _shelf_repo(tmp_path)  # `a.py` is changed, `b.py` is new
+    _write(repo, "*.py", "stray\n")
+    _write(repo, "[ab].py", "stray\n")
+    gitops.restore_paths(repo, ["*.py", "[ab].py"], "HEAD")
+    assert gitops.uncommitted_paths(repo) == ["a.py", "b.py"]  # only the two named files went
+    assert (repo / "a.py").read_text() == "one\nTWO\nthree\n" and (repo / "b.py").read_text() == "new\n"
+    assert run_git(repo, "ls-files", "a.py").strip() == "a.py"

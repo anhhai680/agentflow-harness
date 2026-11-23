@@ -30,7 +30,7 @@ import shlex
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TextIO
+from typing import TYPE_CHECKING, Any, Callable, Literal, TextIO
 
 from agentflow import doubt, route, sources
 from agentflow.conditions import Ctx, evaluate, fmt, paths_read
@@ -51,7 +51,7 @@ from agentflow.hitl import (
     write_answers,
 )
 from agentflow.policy import applicable
-from agentflow.state import TERMINAL
+from agentflow.state import TERMINAL, speculating
 
 if TYPE_CHECKING:
     from agentflow.state import Run
@@ -148,6 +148,19 @@ class StepControl:
     dry_run: bool
     out: TextIO
     last_decided_by: str = "runner"  # who settled the last `decide`: runner, agent or human
+    # While a phase's approval waits and the runner walks the phase after it (`pipeline._Loop.speculate`): that
+    # phase's name, and what ends the walk at the next step boundary (`speculation.cut` on the approval phase).
+    speculating: str | None = None
+    yield_if: Callable[[dict], str | None] | None = None
+
+    def current_wait(self) -> dict | None:
+        """The wait that stops this executor's steps: the run's wait, except that a walk of the phase speculated behind
+        a pending approval is stopped by that phase's own queued stop (`speculative`), never by the approval."""
+        state = self.run.state
+        record = speculating(state) if self.speculating is not None else None
+        if record is None or record["phase"] != self.speculating:
+            return state["waiting"]
+        return next((w for w in state["waiting_queue"] if w.get("speculative")), None)
 
     # ------------------------------------------------------------------ walking steps
 
@@ -188,6 +201,8 @@ class StepControl:
         self.run.refresh()
         state = self.run.state
         if halted(state["status"]):  # `pause`/`cancel` take effect here, between steps
+            return "stopped", False
+        if self.yield_if is not None and self.yield_if(state):  # the person rejected or held the approval it walks behind
             return "stopped", False
         rec = state["steps"].get(key) or {}
         if rec.get("status") in DONE_STATUSES:
@@ -256,11 +271,11 @@ class StepControl:
         self.run.emit("step_skipped", key=key, phase=phase.name, condition=cond, reason=reason)
 
     def _waiting_elsewhere(self, key: str) -> bool:
-        waiting = self.run.state["waiting"]
+        waiting = self.current_wait()
         return waiting is not None and waiting.get("key") != key
 
     def _waiting_on(self, key: str) -> bool:
-        waiting = self.run.state["waiting"]
+        waiting = self.current_wait()
         return waiting is not None and waiting.get("key") == key
 
     # ------------------------------------------------------------------ conditions
@@ -435,7 +450,7 @@ class StepControl:
         mode = "refine" if rerun and not review else "first"
         fix_first = None
         if step.gates_first and not self.dry_run and rec.get("status") not in PRERUN_SKIP:
-            if self.run.state["waiting"] is not None:
+            if self.current_wait() is not None:
                 return "stopped"
             evidence, fix_first = self._prerun_gates(step, key)
             extra = {**(extra or {}), "gate_evidence": evidence}
@@ -691,7 +706,7 @@ class StepControl:
 
     def _run_gate_step(self, phase: Phase, step: Step, key: str) -> Outcome:
         """Run the step's gates; a failure stops for a human, and approving runs them again."""
-        if self.run.state["waiting"] is not None:
+        if self.current_wait() is not None:
             return "stopped"
         tree = snapshot(self.worktree)
         results = run_gates_reusing(self.cfg, self.run, key, step.gates or [], self.worktree,
@@ -706,7 +721,7 @@ class StepControl:
         return "stopped"
 
     def _run_commit_step(self, phase: Phase, step: Step, key: str) -> Outcome:
-        if self.run.state["waiting"] is not None:
+        if self.current_wait() is not None:
             return "stopped"
         message = fmt(step.message or f"Step {key}", self.ctx)
         refine = current_refine(self.run, phase.name)

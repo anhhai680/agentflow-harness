@@ -182,3 +182,45 @@ def test_informed_approval_reaches_the_scorecard_row(flow_repo):
     run.emit("phase_approved", phase="define", by="dashboard", produced=[spec], viewed=[spec])
     run.emit("run_finished")
     assert scorecard.run_row(run, datetime.now(UTC))["informed_approval:define"] == 1.0
+
+
+def test_the_scorecard_prints_the_approval_ramp(tmp_git, fake_runs, monkeypatch):
+    from agentflow import approval_ramp
+
+    _baseline_runs(fake_runs)
+    scorecard.freeze(tmp_git, None, None, None, False, NOW)
+    rows = [{"lane": "feature", "phase": "define", "profile": "S", "mode": "auto", "human": 4, "agreeing": 3,
+             "auto": 1, "regressions": 0, "eligible": False, "why": "3 of 5 agreeing human decisions"},
+            {"lane": "feature", "phase": "plan", "profile": "XS", "mode": "observe", "human": 5, "agreeing": 5,
+             "auto": 0, "regressions": 0, "eligible": True, "why": "5 of 5 agreeing human decisions"}]
+    seen = []
+
+    def ramp_view(repo, cfg, now):
+        seen.append(cfg)
+        return rows
+
+    monkeypatch.setattr(approval_ramp, "ramp_view", ramp_view)
+    cfg = object()
+    view = scorecard.scorecard_view(tmp_git, None, None, None, NOW, cfg=cfg)
+    assert view["ramp"] == rows and seen == [cfg]
+    text = scorecard.scorecard_table(view)
+    assert "Approval ramp" in text and text.index("Approval ramp") > text.index("gate_first_pass:lint")
+    lines = text.splitlines()
+    head = next(i for i, line in enumerate(lines) if "Approval ramp" in line)
+    assert lines[head + 1].split() == ["lane", "phase", "profile", "mode", "human", "agreeing", "auto",
+                                       "regressions", "eligible"]
+    assert lines[head + 2].split() == ["feature", "define", "S", "auto", "4", "3", "1", "0", "no"]
+    assert "3 of 5 agreeing human decisions" in lines[head + 3] and lines[head + 3].startswith(" ")
+    assert lines[head + 4].split() == ["feature", "plan", "XS", "observe", "5", "5", "0", "0", "yes"]
+    assert len(lines) == head + 5  # an eligible row has no `why` line
+
+
+def test_the_scorecard_has_no_ramp_without_a_cfg_or_rows(tmp_git, fake_runs, monkeypatch):
+    from agentflow import approval_ramp
+
+    _baseline_runs(fake_runs)
+    scorecard.freeze(tmp_git, None, None, None, False, NOW)
+    assert "ramp" not in scorecard.scorecard_view(tmp_git, None, None, None, NOW)
+    monkeypatch.setattr(approval_ramp, "ramp_view", lambda repo, cfg, now: [])
+    view = scorecard.scorecard_view(tmp_git, None, None, None, NOW, cfg=object())
+    assert "Approval ramp" not in scorecard.scorecard_table(view)

@@ -101,7 +101,7 @@ from agentflow.run_control import ControlError, cancel, mark_done, pause, resume
 from agentflow.run_files import list_files, read_file
 from agentflow.scorecard import scorecard_view
 from agentflow.sessions import run_sessions
-from agentflow.state import Run, runs_root
+from agentflow.state import Run, runs_root, speculating
 from agentflow.transcripts import transcript_page
 from agentflow.views import agents_view, board, lessons_view, metrics_view, run_detail, workflow_view
 
@@ -187,6 +187,9 @@ def _rests(run: Run, cfg: Config) -> bool:
     lane = run.state.get("pipeline")
     following = [cfg.phases[name] for name in names[names.index(waiting["phase"]) + 1 :]
                  if for_lane(cfg.phases[name].steps, lane)]
+    record = speculating(run.state)
+    if following and record is not None and record["phase"] == following[0].name:
+        return False  # the runner is already walking that phase behind this approval: it goes on with it
     return not following or following[0].needs_approval
 
 

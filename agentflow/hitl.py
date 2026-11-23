@@ -23,10 +23,10 @@ from pathlib import Path
 from typing import Any
 
 from . import pack, safeio
-from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RECONCILE_CHANGED, RETRO_PIPELINE, Config
+from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RECONCILE_CHANGED, RETRO_PIPELINE, Config, for_lane
 from .events import nfc, parse_iso
 from .park import radius_line
-from .state import TERMINAL, Run, list_runs
+from .state import TERMINAL, Run, list_runs, speculating
 
 RESULT_STATUSES = ("done", "blocked", "needs_human", "effort_change", "unchanged")
 # What a resolver may name as a stop's cause (`StepResult.stop_class`). Advisory: the runner acts on `flaky` and
@@ -452,21 +452,26 @@ def raise_hitl(cfg: Config, run: Run, kind: str, key: str, summary: str, questio
 
     `notify`: None is the usual rule (quiet while the runner settles the stop itself, while a plan task's stop may
     still park, or for a wave's stop, which dissolves the wave: the runner tells a human if it cannot settle, park or
-    dissolve it); True always tells a human, False never does (a stop a human was already told of)."""
+    dissolve it); True always tells a human, False never does (a stop a human was already told of). A stop under the
+    phase the runner is speculating on is raised quietly and marked `speculative`, whatever `notify` says: it is queued
+    behind the approval it waits for, and a person is told once it becomes the run's wait."""
     questions = list(questions)
     counted = {"times": _times_back(run, key)} if kind == "blocked_repeat" else {}
     how = [f"Run `{run.id}` is waiting on `{key}` ({kind}).",
            _how_to_go_on(run, kind, key, bool(questions), cfg, **counted)]
     path = run.inbox_path(key)
     render_inbox(path, f"{run.id}: {key}", summary, questions, extra="\n\n".join(["\n".join(how), extra]))
-    if notify is None:
+    speculative = (record := speculating(run.state)) is not None and key.split("/")[0] == record["phase"]
+    if speculative:
+        notify = False
+    elif notify is None:
         from agentflow.autonomy import runner_settles  # the runner tries this stop first; it notifies if it cannot settle it
 
         notify = (not runner_settles(cfg, run, kind, key, [asdict(q) for q in questions]) and not parks_first(cfg, kind, key)
                   and WAVE_STOP.search(key) is None)
     run.emit("hitl_raised", kind=kind, key=key, phase=key.split("/")[0], summary=summary,
              questions=[asdict(q) for q in questions], inbox=str(path), extra=extra[-EVENT_EXTRA_MAX:],
-             notified=bool(notify), **counted)
+             notified=bool(notify), **({"speculative": True} if speculative else {}), **counted)
     if notify:
         notify_run(cfg, run, notice_text({"key": key, "summary": summary, **counted}) or f"{key} needs a decision")
     return path
@@ -637,19 +642,39 @@ def _way_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config, tim
 
 def _conformance_way_on(run: Run, key: str, cfg: Config) -> str:
     """For a `conformance_failed` stop: the `agentflow retry` that runs each missing step the run walked again (it
-    clears this stop, so `key` audits again); for a step this run never walked, that no retry can bring it; and
-    the retry of `key` itself, which audits again."""
-    from agentflow.conformance import missing_steps  # it imports this module
+    clears this stop, so `key` audits again); for a phase the approval ramp approved where the security overlay holds,
+    the retry of one of its steps (`_settling_step`), which walks it again and raises its approval for a person; for a
+    step this run never walked, that no retry can bring it; and the retry of `key` itself, which audits again."""
+    from agentflow.conformance import missing_steps, ramp_refused  # it imports this module
 
     checks = [e for e in run.events.read() if e["type"] == "conformance_checked" and e.get("key") == key]
     walked, never = missing_steps(run.state.get("steps") or {}, checks[-1] if checks else None)
     lines = ["Nothing was pushed."]
     lines += [f"`agentflow retry {run.id} {step}` runs `{step}` again, then `{key}` audits again." for step in walked]
+    for phase in ramp_refused(checks[-1] if checks else None):
+        step = _settling_step(cfg, run, phase)
+        if step is not None:
+            lines.append(f"The approval ramp approved `{phase}`, but the security overlay holds, so a person must approve "
+                         f"it: `agentflow retry {run.id} {step}` runs `{step}` again and raises `{phase}`'s approval; once "
+                         f"you approve it, `{key}` audits again.")
     lines += [f"This run's lane never ran `{step}`, so no retry can bring its evidence: change the pack's `policy` "
               f"(or the lane's steps), then `agentflow retry {run.id} {key}` audits again." for step in never]
     lines.append(f"Once the evidence is there some other way, `agentflow retry {run.id} {key}` audits again. "
                  "An approval does not waive an obligation: the audit runs again and stops again.")
     return "\n".join(lines)
+
+
+def _settling_step(cfg: Config, run: Run, phase: str) -> str | None:
+    """The step key whose retry walks the approved `phase` again, so it settles and raises its approval
+    (`pipeline.retried`): its first top-level `role: review` step for the run's lane that ran in this run (a review is
+    the cheapest session to repeat), else its first such step of any role; None when no step of it ran."""
+    if phase not in cfg.phases:
+        return None
+    steps = run.state.get("steps") or {}
+    ran = [step for step in for_lane(cfg.phases[phase].steps, str(run.state.get("pipeline") or ""))
+           if (steps.get(f"{phase}/{step.id}") or {}).get("status") not in (None, "skipped")]
+    chosen = next((step for step in ran if step.role == "review"), ran[0] if ran else None)
+    return f"{phase}/{chosen.id}" if chosen is not None else None
 
 
 def _not_waiting(run: Run, target: str) -> NotWaiting:

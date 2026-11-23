@@ -215,7 +215,7 @@ class SizingLane:
             steps = self.run.state["steps"]
             todo = [t for t in tasks
                     if t.open and not (steps.get(f"{prefix}/task-{t.n}/implement") or {}).get("session_id")]
-            if todo and (self.run.state["waiting"] is not None or halted(self.run.state["status"])):
+            if todo and (self.current_wait() is not None or halted(self.run.state["status"])):
                 return "stopped" if halted(self.run.state["status"]) else "done"  # a stop is the lane's to handle
 
             role = step.role or "build"

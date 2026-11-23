@@ -439,7 +439,7 @@ Slices are ordered by **hours saved per unit of risk**. Each slice is one PR on 
 | **T4 Park and continue** | `park_independent` on by default and widened to every task stop, with the runner deciding independence; batch members park alone; a blast radius on each item (A.1); the human override for guards (A.6); batched approvals and a digest (A.5, A.7) | medium | most of the remaining human-wait hours | not started |
 | **T5 Parallel build** | Human pre-flight with a real `claude -p` (decision 1); `**Parallel group:**` in the plan; the runner's check of the mark; wave sessions that fan out sub-agents; attribution, build gates once per wave, a review wave, commits per task (D) | high (concurrency); `max_subagents: 1` until the scorecard is green on 5 runs | build 2–2.5× faster | not started |
 | **T6 Slots and multi-run** | `slots` and `{slot}`; the human slot; resource locks across runs (F) | medium | 3 features in flight | not started |
-| **T7 Speculative planning and the approval ramp** | Plan while the spec awaits approval; `observe → auto` per approval kind, from the scorecard (A.5) | medium | overlaps the last human wait | not started |
+| **T7 Speculative planning and the approval ramp** | Plan while the spec awaits approval; `observe → auto` per approval kind, from the scorecard (A.5) | medium | overlaps the last human wait | shipped 2026-11-22; autonomy.speculate and autonomy.approvals default off |
 
 T1 and T2 change nothing about how agents work, and they recover the most hours for the least risk. They go first. T5 depends on T4, because parking is how a failed member gets out of a wave. It doesn't need T6: sub-agents don't run integration tests or Docker, and the runner's gates still run one at a time per run.
 
