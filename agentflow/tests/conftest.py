@@ -649,3 +649,76 @@ VULN_ALERT: dict[str, Any] = {
         "severity": "high",
     },
 }
+
+
+def vuln_steps() -> dict[str, list[dict]]:
+    """Per phase, the engine defaults' steps whose `lanes` include `vuln`, in their order."""
+    from agentflow import layers
+
+    defaults = yaml.safe_load(layers.ENGINE_DEFAULTS.read_text(encoding="utf-8"))
+    out: dict[str, list[dict]] = {}
+    for name, phase in defaults["phases"].items():
+        steps = [copy.deepcopy(s) for s in phase["steps"] if "vuln" in (s.get("lanes") or [])]
+        if steps:
+            out[name] = steps
+    return out
+
+
+def add_vuln_lane(data: dict) -> None:
+    """A `FlowRepo.configure(edit=...)` callback: add `vuln` to a pack that writes its own `phases:`. A step the pack
+    already has (`setup`, `verify`, `plan_fixes`, `fix_findings`) gains `vuln` in its `lanes`; a new one goes in
+    right after the vuln step before it in its phase (the first one at the start), so `advisory_red` and `patch`
+    follow `setup` and `vuln_review` follows `fix_findings`."""
+    if "vuln" not in data["lanes"]:
+        data["lanes"].append("vuln")
+    skills = data.setdefault("skills", {}).setdefault("map", {})
+    for key, name in (("patch", "agentflow-patch"), ("review", "agentflow-review")):
+        skills.setdefault(key, name)
+    for phase, wanted in vuln_steps().items():
+        steps = data["phases"][phase]["steps"]
+        anchor = -1
+        for step in wanted:
+            have = next((i for i, s in enumerate(steps) if s.get("id") == step["id"]), None)
+            if have is None:
+                steps.insert(anchor + 1, copy.deepcopy(step))
+                have = anchor + 1
+            elif steps[have].get("lanes") and "vuln" not in steps[have]["lanes"]:
+                steps[have]["lanes"].append("vuln")
+            anchor = have
+
+
+GH_BIN = ENGINE / "tests" / "bin"  # the fake `gh` (`tests/bin/gh`)
+
+
+class GhAlerts:
+    """The Dependabot alerts the fake `gh` serves (`$FAKE_GH_ALERTS`) and the argv of every `gh` call (`log`)."""
+
+    def __init__(self, path: Path, log: Path) -> None:
+        self.path = path
+        self.log = log
+
+    def write(self, alerts: list[dict]) -> None:
+        self.path.write_text(json.dumps(alerts, ensure_ascii=False), encoding="utf-8")
+
+    def calls(self) -> list[list[str]]:
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.fixture
+def gh_alerts(flow_repo: FlowRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> GhAlerts:
+    """`flow_repo` with the `vuln` lane added and `vuln.probe: ok`, `requirements.txt` (the alert's manifest)
+    committed on `fork_from` and pushed, and the fake `gh` first on PATH serving `[VULN_ALERT]`. `write` replaces the
+    list; `$FAKE_GH_PR_LIST` (default `[]`) is what `gh pr list --author app/dependabot` prints."""
+    (flow_repo.root / "requirements.txt").write_text("requests==2.31.0\n", encoding="utf-8")
+    run_git(flow_repo.root, "add", "requirements.txt")
+    run_git(flow_repo.root, "commit", "-q", "-m", "requirements")
+    run_git(flow_repo.root, "push", "-q", "origin", flow_repo.cfg.project.fork_from)
+    flow_repo.configure(patch={"vuln": {"probe": "ok"}}, edit=add_vuln_lane)
+    handle = GhAlerts(tmp_path / "alerts.json", tmp_path / "gh.jsonl")
+    handle.write([copy.deepcopy(VULN_ALERT)])
+    monkeypatch.setenv("PATH", f"{GH_BIN}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(handle.log))
+    monkeypatch.setenv("FAKE_GH_ALERTS", str(handle.path))
+    return handle

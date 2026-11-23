@@ -1,4 +1,7 @@
-"""The vuln lane's alert model, its validation and the probe verdict: pure functions, no I/O, no process.
+"""The vuln lane's alert model, its validation, its intake from GitHub and the probe verdict.
+
+Everything but `gather_alert` and `read_alert` is a pure function. `gather_alert` reads a Dependabot alert through `gh`
+(an argv list, never a shell) before any run exists, and `read_alert` reads back the facts it kept (`alert.json`).
 
 Trust model. A Dependabot alert is data from outside the run: GitHub's reply carries text that other people wrote
 (package names, advisory summaries, version ranges). `parse_alert` is the one place that turns it into `Alert`, and it
@@ -9,16 +12,24 @@ doesn't match its pattern. A refusal is an `AlertError`, never a repair. The fre
 `judge` is the verdict of the probe, the pack's own scanner command, on whether the alert's advisory is still there. A
 scanner that dies must never read as a clean scan, so `judge` answers "failed" unless the probe ran cleanly.
 
-`config.py` imports this module's constants at module level, so this module imports nothing from `agentflow` at run
-time (`config`, `gates` and `state` would be a cycle).
+`config.py` imports this module's constants at module level, so this module imports nothing from `agentflow` at
+module level (`config`, `gates` and `state` would be a cycle): `gather_alert` imports `gitops`, `intake` and `state`
+when it runs.
 """
 
 from __future__ import annotations
 
+import json
+import posixpath
 import re
+import urllib.parse
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agentflow.config import VulnPolicy
 
 SEVERITIES = ("low", "medium", "high", "critical")
 # The ecosystems GitHub documents for Dependabot alerts.
@@ -78,16 +89,16 @@ def _text(data: dict, key: str, what: str) -> str:
 
 
 def _package(name: str) -> str:
-    if not _PACKAGE.fullmatch(name) or not name.isprintable():
-        raise AlertError("the package name is empty, too long, or has whitespace or shell characters")
+    if not _PACKAGE.fullmatch(name) or not name.isprintable() or name.startswith("-"):
+        raise AlertError("the package name is empty, too long, starts with '-', or has whitespace or shell characters")
     return name
 
 
 def _manifest(path: str) -> str:
     pure = PurePosixPath(path)
     if (not path or "\x00" in path or "\\" in path or pure.is_absolute() or ".." in pure.parts
-            or not path.isprintable()):
-        raise AlertError("the manifest path must be relative, with no '..', and printable")
+            or not path.isprintable() or not pure.parts or posixpath.normpath(path) == "."):
+        raise AlertError("the manifest path must name a file: relative, with no '..', and printable")
     return path
 
 
@@ -179,3 +190,191 @@ def judge(exit_code: int | None, output: str, ids: Sequence[str], ok_exit: Seque
         return "failed", []
     matched = [i for i in ids if re.search(rf"(?<![\w-]){re.escape(i)}(?![\w-])", output)]
     return ("present", matched) if matched else ("absent", [])
+
+
+# --------------------------------------------------------------------------- intake: `--alert N`
+
+ALERT_FILE = "alert.md"  # the advisory's text, for the agent (mirrored into its workspace)
+ALERT_JSON = "alert.json"  # the validated facts, for the runner only
+ALERTS_API = "repos/{owner}/{repo}/dependabot/alerts"  # `gh api` fills in `{owner}` and `{repo}` itself
+MANIFEST_MAX = 64 << 20  # bytes of the manifest `gather_alert` reads to prove it is a file at the fork commit
+PR_SEARCH_LIMIT = 20
+PERMISSION_HINT = ("The alert must exist, and gh's token must be allowed to read it: a fine-grained token needs the "
+                   "repository permission \"Dependabot alerts: read\", a classic token the `security_events` scope "
+                   "(`gh auth refresh -s security_events`).")
+_URL = re.compile(r"^https://[A-Za-z0-9.-]{1,253}(:\d{1,5})?/[A-Za-z0-9._~/%-]{0,400}$")
+_CLOSED_STATES = ("dismissed", "fixed", "auto_dismissed")
+
+
+def alert_number(ref: object) -> str:
+    """`42` from `42` or `#42`; anything else is refused (it would reach `gh` as part of an argument)."""
+    from agentflow.intake import ISSUE_REF
+
+    match = ISSUE_REF.match(str(ref).strip())
+    if not match:
+        raise ValueError(f"--alert takes a Dependabot alert number such as 42, not {str(ref)[:80]!r}")
+    return match.group(1)
+
+
+def _api(path: str, repo: Path, number: str) -> object:
+    """`gh api <path>`'s JSON; a 403 or a 404 becomes a `GhError` that says which permission the token needs."""
+    from agentflow.gitops import GhError, gh_json
+
+    try:
+        return gh_json(["api", path], cwd=repo)
+    except GhError as exc:
+        text = str(exc)
+        if "HTTP 403" in text or "HTTP 404" in text:
+            raise GhError(f"gh could not read Dependabot alert #{number} ({text[:300]}). {PERMISSION_HINT}") from exc
+        raise
+
+
+def _label(entry: object) -> str:
+    number = entry.get("number") if isinstance(entry, dict) else None
+    return f"#{number}" if isinstance(number, int) and not isinstance(number, bool) else "with no number"
+
+
+def _url(text: str) -> str:
+    """`text` when it is a plain https URL (no space, quote, bracket or markup), else ""."""
+    return text if _URL.fullmatch(text) else ""
+
+
+def _dependabot_prs(package: str, repo: Path) -> list[int]:
+    """The open Dependabot PRs whose title names `package` as a whole token; [] when `gh` fails or prints junk."""
+    from agentflow.gitops import GhError, gh_json
+
+    try:
+        data = gh_json(["pr", "list", "--author", "app/dependabot", "--state", "open", "--search", package,
+                        "--json", "number,title,url", "--limit", str(PR_SEARCH_LIMIT)], cwd=repo)
+    except GhError:
+        return []
+    token = re.compile(rf"(?<![\w.-]){re.escape(package)}(?![\w.-])", re.IGNORECASE)
+    found: list[int] = []
+    for pr in data if isinstance(data, list) else []:
+        number, title = (pr.get("number"), pr.get("title")) if isinstance(pr, dict) else (None, None)
+        if (isinstance(number, int) and not isinstance(number, bool) and number > 0 and isinstance(title, str)
+                and token.search(title) and number not in found):
+            found.append(number)
+    return found
+
+
+def _group(primary: Alert, listing: object, number: str) -> tuple[list[Alert], list[str]]:
+    """`primary` and its open siblings in the same manifest that have a patched version, and a warning for each
+    sibling left out because it has none (no upgrade can clear it)."""
+    from agentflow.gitops import GhError
+
+    if not isinstance(listing, list):
+        raise GhError(f"gh api {ALERTS_API} printed no list of alerts")
+    others = []
+    for entry in listing:
+        dependency = entry.get("dependency") if isinstance(entry, dict) else None
+        if not isinstance(dependency, dict) or dependency.get("manifest_path") != primary.manifest:
+            continue  # another manifest's alert is never used, so its fields are never checked
+        try:
+            others.append(parse_alert(entry))
+        except AlertError as exc:
+            raise AlertError(f"Dependabot alert {_label(entry)}, open for the same package as #{number}: {exc}") from exc
+    group, warnings, seen = [], [], set()
+    for alert in siblings(primary, others):
+        if alert.number in seen:
+            continue
+        seen.add(alert.number)
+        if alert.patched is None:
+            warnings.append(f"Dependabot alert #{alert.number} for {alert.package} has no patched version yet; "
+                            "this run leaves it open")
+            continue
+        group.append(alert)
+    return group, warnings
+
+
+def _alert_text(group: list[Alert], ids: list[str], severity: str) -> str:
+    from agentflow.intake import DATA_NOTE
+
+    primary = group[0]
+    lines = [DATA_NOTE, "",
+             f"# Dependabot alert #{primary.number}: {primary.package} ({primary.ecosystem}) in {primary.manifest}", "",
+             f"- Alerts: {', '.join(f'#{a.number}' for a in group)}",
+             f"- Advisories: {', '.join(ids)}",
+             f"- Severity: {severity}",
+             f"- Package: {primary.package} ({primary.ecosystem})",
+             f"- Manifest: {primary.manifest}"]
+    for alert in group:
+        lines += ["", f"## Alert #{alert.number} ({alert.severity}): {', '.join(alert.ids)}", "",
+                  f"- Vulnerable: {alert.vulnerable_range}", f"- Patched in: {alert.patched}",
+                  f"- URL: {_url(alert.url) or '(none)'}", "", "### Summary", "", alert.summary or "(none)", "",
+                  "### Description", "", alert.description or "(none)"]
+        if alert.references:
+            lines += ["", "### References", "", *(f"- {ref}" for ref in alert.references)]
+    return "\n".join(lines) + "\n"
+
+
+def gather_alert(policy: VulnPolicy, ref: object, repo: Path, *, fork: str) -> tuple[dict, dict[str, bytes], list[str]]:
+    """`(params_update, files, warnings)` for `--alert <ref>`, read through `gh` before any run exists.
+
+    `params_update` holds `alert` (the number), `slug` (`<package>-<first GHSA id>`) and `advisory_ids` (the union of
+    the group's ids); `files` are `alert.json` (the validated facts) and `alert.md` (the advisory text, as data);
+    `warnings` are lines for the CLI. A refusal raises `ValueError` (an `AlertError` for a bad field) or `GhError`.
+    """
+    from agentflow import gitops
+    from agentflow.state import slugify
+
+    if policy.source != "dependabot":
+        raise ValueError('vuln.source is off ("" in the pack), so --alert can\'t start a run: set vuln.source: '
+                         'dependabot, or fix the dependency by hand or with `agentflow run bug --task ...`')
+    number = alert_number(ref)
+    repo = Path(repo)
+    data = _api(f"{ALERTS_API}/{number}", repo, number)
+    try:
+        primary = parse_alert(data)
+    except AlertError as exc:
+        raise AlertError(f"Dependabot alert #{number}: {exc}") from exc
+    if primary.number != int(number):
+        raise AlertError(f"gh printed alert #{primary.number} when asked for Dependabot alert #{number}")
+    if primary.state != "open":
+        state = primary.state if primary.state in _CLOSED_STATES else repr(primary.state[:40])
+        raise ValueError(f"Dependabot alert #{number} is {state}: only an open alert starts a vuln run")
+    if primary.patched is None:
+        raise ValueError(f"Dependabot alert #{number} ({primary.package}) has no patched version yet, so no upgrade "
+                         "can fix it. A human can wait for a patched release, replace the package, or dismiss the "
+                         "alert in GitHub.")
+    if not severity_at_least(primary.severity, policy.min_severity):
+        raise ValueError(f"Dependabot alert #{number} is {primary.severity}, below vuln.min_severity "
+                         f"({policy.min_severity})")
+    sha = gitops.commit_at(repo, f"refs/heads/{fork}") if fork else None
+    if sha is None or gitops.read_blob(repo, sha, primary.manifest, MANIFEST_MAX) is None:
+        raise ValueError(f"the alert's manifest {primary.manifest} is not a file at project.fork_from ({fork}): the "
+                         "alert is for another branch, or the manifest moved")
+    query = urllib.parse.urlencode({"state": "open", "package": primary.package, "ecosystem": primary.ecosystem,
+                                    "per_page": 100}, quote_via=urllib.parse.quote, safe="")
+    group, warnings = _group(primary, _api(f"{ALERTS_API}?{query}", repo, number), number)
+    ids = list(dict.fromkeys(i for alert in group for i in alert.ids))
+    severity = max((a.severity for a in group), key=SEVERITIES.index)
+    prs = _dependabot_prs(primary.package, repo)
+    warnings += [f"Dependabot PR #{n} is open for {primary.package}; this run's PR will supersede it" for n in prs]
+    facts = {
+        "alert": primary.number, "alerts": [a.number for a in group], "ecosystem": primary.ecosystem,
+        "package": primary.package, "manifest": primary.manifest, "severity": severity, "ids": ids,
+        "advisories": [{"number": a.number, "severity": a.severity, "ids": list(a.ids),
+                        "vulnerable_range": a.vulnerable_range, "patched": a.patched, "url": _url(a.url)}
+                       for a in group],
+        "dependabot_prs": prs,
+    }
+    files = {ALERT_JSON: (json.dumps(facts, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+             ALERT_FILE: _alert_text(group, ids, severity).encode("utf-8")}
+    params = {"alert": number, "slug": slugify(f"{primary.package}-{primary.ids[0]}"), "advisory_ids": ids}
+    return params, files, warnings
+
+
+def read_alert(run_dir: Path) -> dict:
+    """The facts `gather_alert` kept in `<run_dir>/alert.json`. `AlertError` when the file is missing, unreadable, or
+    names no advisory id: a vuln step must never read "no ids" as "nothing found"."""
+    path = Path(run_dir) / ALERT_JSON
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise AlertError(f"{path} could not be read: {exc}") from exc
+    ids = data.get("ids") if isinstance(data, dict) else None
+    if (not isinstance(ids, list) or not ids
+            or not all(isinstance(i, str) and (GHSA_ID.fullmatch(i) or CVE_ID.fullmatch(i)) for i in ids)):
+        raise AlertError(f"{path} names no advisory id")
+    return data

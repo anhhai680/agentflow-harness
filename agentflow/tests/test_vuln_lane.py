@@ -3,56 +3,18 @@ its two expectation steps is in later tests)."""
 
 from __future__ import annotations
 
-import copy
 from pathlib import Path
 
 import pytest
 import yaml
-from conftest import SPARSE_PACK, deep_merge
+from conftest import SPARSE_PACK, add_vuln_lane, deep_merge, vuln_steps
 
-from agentflow import conditions, layers, pack, pipeline, workspace
+from agentflow import conditions, pack, pipeline, workspace
 from agentflow.config import load_config, validate
 from agentflow.state import Run
 
 PROMPTS = Path(__file__).resolve().parents[1] / "prompts"
 SKILLS = Path(__file__).resolve().parents[1] / "skills"
-
-
-def _defaults() -> dict:
-    return yaml.safe_load(layers.ENGINE_DEFAULTS.read_text(encoding="utf-8"))
-
-
-def vuln_steps() -> dict[str, list[dict]]:
-    """Per phase, the engine defaults' steps whose `lanes` include `vuln`, in their order."""
-    out: dict[str, list[dict]] = {}
-    for name, phase in _defaults()["phases"].items():
-        steps = [copy.deepcopy(s) for s in phase["steps"] if "vuln" in (s.get("lanes") or [])]
-        if steps:
-            out[name] = steps
-    return out
-
-
-def add_vuln_lane(data: dict) -> None:
-    """A `FlowRepo.configure(edit=...)` callback: add `vuln` to a pack that writes its own `phases:`. A step the pack
-    already has (`setup`, `verify`, `plan_fixes`, `fix_findings`) gains `vuln` in its `lanes`; a new one goes in
-    right after the vuln step before it in its phase (the first one at the start), so `advisory_red` and `patch`
-    follow `setup` and `vuln_review` follows `fix_findings`."""
-    if "vuln" not in data["lanes"]:
-        data["lanes"].append("vuln")
-    skills = data.setdefault("skills", {}).setdefault("map", {})
-    for key, name in (("patch", "agentflow-patch"), ("review", "agentflow-review")):
-        skills.setdefault(key, name)
-    for phase, wanted in vuln_steps().items():
-        steps = data["phases"][phase]["steps"]
-        anchor = -1
-        for step in wanted:
-            have = next((i for i, s in enumerate(steps) if s.get("id") == step["id"]), None)
-            if have is None:
-                steps.insert(anchor + 1, copy.deepcopy(step))
-                have = anchor + 1
-            elif steps[have].get("lanes") and "vuln" not in steps[have]["lanes"]:
-                steps[have]["lanes"].append("vuln")
-            anchor = have
 
 
 def _sparse_with_probe(sparse_repo: Path, probe: str | None = "unit"):

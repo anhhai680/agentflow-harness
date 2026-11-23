@@ -1,9 +1,10 @@
-"""What a bug or eval run starts from: `--issue N`, `--log PATH` or `--task TEXT`, kept under `runs/<run>/`.
+"""What a run starts from: `--issue N`, `--log PATH`, `--task TEXT` or `--alert N`, kept under `runs/<run>/`.
 
 `gather` runs before the run exists, so a bad reference or an unreachable GitHub leaves no run
 behind: `--issue N` reads `gh issue view N --json title,body,url,labels` (and names the run and branch
 `issue-<N>-<title>`, D14), `--log PATH` reads the file, `--task` takes the text. `save` writes them
-as `issue.md`, `bug.log` (byte for byte) and `task.md` once the run directory exists.
+as `issue.md`, `bug.log` (byte for byte) and `task.md` once the run directory exists. `--alert N` (the vuln
+lane) reads a Dependabot alert and its open siblings (`vuln.gather_alert`) into `alert.json` and `alert.md`.
 
 The text comes from people outside the run (an issue tracker, a log, the CLI): the files say it is data,
 the prompts only point at the files, and nothing here ever puts it in a shell command (`gh` gets an
@@ -12,16 +13,19 @@ argv list, and the issue reference must be a number).
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from agentflow import vuln
 from agentflow.events import nfc
 from agentflow.gitops import GhError, gh_json
 from agentflow.state import slugify
 
 if TYPE_CHECKING:
+    from agentflow.config import VulnPolicy
     from agentflow.state import Run
 
 ISSUE_FILE = "issue.md"
@@ -61,11 +65,21 @@ def is_epic(data: dict, epic_labels: Iterable[str]) -> bool:
                and nfc(label["name"]).casefold() in wanted for label in labels)
 
 
-def gather(params: dict, repo: Path, epic_labels: Iterable[str] = ()) -> tuple[dict, dict[str, bytes]]:
-    """`(params, files)`: the run's parameters (an issue adds `slug`, and `issue_epic` when one of its labels
-    is in `epic_labels`) and the input files to save."""
+def gather(params: dict, repo: Path, epic_labels: Iterable[str] = (), vuln_policy: VulnPolicy | None = None,
+           fork_from: str = "") -> tuple[dict, dict[str, bytes], list[str]]:
+    """`(params, files, warnings)`: the run's parameters (an issue adds `slug`, and `issue_epic` when one of its
+    labels is in `epic_labels`; an alert adds `slug` and `advisory_ids`), the input files to save, and lines for the
+    CLI to show. An alert is checked against `vuln_policy`, its manifest at the branch `fork_from`."""
     params = dict(params)
     files: dict[str, bytes] = {}
+    warnings: list[str] = []
+    if params.get("alert") not in (None, ""):
+        if vuln_policy is None:
+            raise ValueError("--alert needs the pack's vuln settings")
+        update, found, notes = vuln.gather_alert(vuln_policy, params["alert"], Path(repo), fork=fork_from)
+        params.update(update)
+        files.update(found)
+        warnings += notes
     if params.get("issue") not in (None, ""):
         number = issue_number(params["issue"])
         data = gh_json(["issue", "view", number, "--json", ISSUE_FIELDS], cwd=Path(repo))
@@ -85,12 +99,20 @@ def gather(params: dict, repo: Path, epic_labels: Iterable[str] = ()) -> tuple[d
     if params.get("task") not in (None, ""):
         text = nfc(str(params["task"])).strip()
         files[TASK_FILE] = f"# Task\n\n{DATA_NOTE}\n\n{text}\n".encode()
-    return params, files
+    return params, files, warnings
 
 
-def save(run: Run, files: dict[str, bytes]) -> None:
-    """Write the input files into the run directory and record each one (`intake_saved`)."""
+def save(run: Run, files: dict[str, bytes], warnings: Iterable[str] = ()) -> None:
+    """Write the input files into the run directory and record each one (`intake_saved`), an alert's facts
+    (`vuln_alert_read`) and each warning (`intake_warning`, which the CLI prints)."""
     for name, content in files.items():
         path = run.dir / name
         path.write_bytes(content)
         run.emit("intake_saved", file=name, path=str(path), bytes=len(content))
+    if vuln.ALERT_JSON in files:
+        facts = json.loads(files[vuln.ALERT_JSON])
+        run.emit("vuln_alert_read", alerts=facts["alerts"], ids=facts["ids"], package=facts["package"],
+                 ecosystem=facts["ecosystem"], manifest=facts["manifest"], severity=facts["severity"],
+                 dependabot_prs=facts["dependabot_prs"])
+    for text in warnings:
+        run.emit("intake_warning", text=text)

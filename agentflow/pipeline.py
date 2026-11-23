@@ -151,8 +151,9 @@ def _free_branch(repo: Path, name: str) -> str:
 def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions) -> Run:
     """Create the run and the checkout it works in (D7), recording the options for `resume`.
 
-    The run's inputs (`--issue`, `--log`, `--task`; `intake`) are read before anything is created, so a
-    bad one leaves no run, and saved in the run directory once it exists.
+    The run's inputs (`--issue`, `--log`, `--task`, `--alert`; `intake`) are read before anything is created, so a
+    bad one leaves no run, and saved in the run directory once it exists. Intake's warnings (an open Dependabot PR)
+    are recorded as `intake_warning` events, which the CLI prints.
     """
     _check_range(cfg, pipeline, opts)
     _check_new_module(cfg, params, opts.new_module)
@@ -164,8 +165,13 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     if pipeline == "vuln" and not cfg.vuln.probe:
         raise ValueError("the vuln lane needs `vuln.probe`, the audit gate that must name the advisory before the patch "
                          "and not after: set it in the pack's config (the starters set `audit`)")
+    has_alert = params.get("alert") not in (None, "")
+    if pipeline == "vuln" and not has_alert:
+        raise ValueError("the vuln lane starts from a Dependabot alert: agentflow run vuln --alert N")
+    if has_alert and pipeline != "vuln":
+        raise ValueError(f"--alert starts a vuln run, not a {pipeline} run: agentflow run vuln --alert N")
     slots.check_free(cfg, repo)  # the common refusal, before the inputs are read
-    params, inputs = gather(params, repo, cfg.issues.epic_labels)
+    params, inputs, warnings = gather(params, repo, cfg.issues.epic_labels, cfg.vuln, fork)
     # `{date}` (in `plan_target`) is the day the run started, every day it runs: a step resumed tomorrow still names
     # the file the plan step wrote today, and a reconcile step may edit only that file.
     if params.get("date") in (None, ""):
@@ -177,7 +183,7 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
         with slots.starting(cfg, repo) as take:
             run = Run.create(cfg, repo, pipeline, params)
             take(run)
-        _set_up(cfg, repo, run, pipeline, params, inputs, opts)
+        _set_up(cfg, repo, run, pipeline, params, inputs, opts, warnings)
     except Exception as exc:  # once the run exists it must never be left `running` with nothing behind it
         if run is not None:
             run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}")
@@ -186,8 +192,9 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     return run
 
 
-def _set_up(cfg: Config, repo: Path, run: Run, pipeline: str, params: dict, inputs: dict, opts: RunOptions) -> None:
-    save(run, inputs)
+def _set_up(cfg: Config, repo: Path, run: Run, pipeline: str, params: dict, inputs: dict, opts: RunOptions,
+            warnings: list[str]) -> None:
+    save(run, inputs, warnings)
     run.emit("run_options", from_phase=opts.from_phase, to_phase=opts.to_phase,
              model_overrides=dict(opts.model_overrides), **start_options(cfg.path, layer_files(cfg)))
     slug = make_ctx(cfg, repo, pipeline, params).values["slug"]
