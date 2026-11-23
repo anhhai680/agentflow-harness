@@ -192,6 +192,32 @@ def test_the_written_pack_loads_back_to_the_rendered_data(toy_repo):
     assert cfg.gates["tests"].run == multi and cfg.gate_sets["setup"] == ["sync"]
 
 
+def test_init_writes_vuln_probe_when_detected(toy_repo):
+    set_ci(toy_repo, [{"name": "Tests", "run": "pytest -q"}, {"name": "Audit", "run": "pip-audit --strict"}])
+    code, out = run_init(toy_repo)
+    assert code == 0, out
+    data = written(toy_repo)
+    assert data["vuln"] == {"probe": "audit"}
+    assert data["gates"]["audit"] == {"run": "pip-audit --strict"}
+    assert "audit" not in data["gate_sets"]["verify"] and "audit" not in data["gate_sets"].get("build", [])
+    text = pack_file(toy_repo).read_text(encoding="utf-8")
+    assert "# the audit probe" in text
+    cfg = load_config(pack_file(toy_repo), user=False)
+    assert cfg.vuln.probe == "audit" and cfg.gates["audit"].run == "pip-audit --strict"
+
+
+def test_init_writes_no_vuln_block_without_an_audit_step(toy_repo):
+    code, out = run_init(toy_repo)
+    assert code == 0, out
+    assert "vuln" not in written(toy_repo)
+
+
+def test_a_dropped_audit_gate_leaves_no_probe():
+    found = detect.Detected(base_branch="main", base_ref=None, starter="python-uv",
+                            gates={"audit": {"run": "@x pip-audit"}}, probe="audit")
+    assert "vuln" not in init.pack_data(found, base=init.base_of(found.starter))
+
+
 SPECS_COMMENT = ("# the Backlog: one module per spec file in project.docs.specs; a new feature card writes a new "
                  "spec\n")
 

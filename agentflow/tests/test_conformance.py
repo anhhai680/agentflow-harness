@@ -10,11 +10,18 @@ from pathlib import Path
 
 import pytest
 import test_feature_lane
-from conftest import with_doubt
+from conftest import add_vuln_lane, with_doubt
 from test_feature_lane import SMALL, begin_finish, created, gh_calls, review
 
 from agentflow.conditions import Ctx
-from agentflow.config import FLOOR_ID, Evidence, Obligation
+from agentflow.config import (
+    ADVISORY_CLEARED,
+    ADVISORY_FLOOR_ID,
+    ADVISORY_PRESENT,
+    FLOOR_ID,
+    Evidence,
+    Obligation,
+)
 from agentflow.conformance import evaluate, last_code_change, missing_gates
 from agentflow.flow import main
 from agentflow.hitl import approve
@@ -290,6 +297,79 @@ def test_red_then_green(cfg):
     assert evaluate(cfg, [red, fix, failed_green], [rtg], "t")[0].status == "missing"
     green_before_red = {**green, "seq": 2}
     assert evaluate(cfg, [green_before_red, red], [rtg], "t")[0].status == "missing"
+
+
+ADVISORY = ob(ADVISORY_FLOOR_ID, f"expect:{ADVISORY_CLEARED}")
+
+
+def probe(seq: int, key: str, expect: str, ok: bool = True, **over) -> dict:
+    fields = {"verdict": "absent", "matched": [], "tree": "t", "forbidden": [], **over}
+    return ev(seq, "expectation_checked", key=key, expect=expect, ok=ok, **fields)
+
+
+def test_advisory_cleared_needs_present_then_cleared(cfg):
+    present = probe(3, "build/advisory_red", ADVISORY_PRESENT, verdict="present", matched=["GHSA-cfgh-2345-vwxj"])
+    patch = ev(5, "step_committed", key="build/patch", sha="p")  # the patch's own commit after its check
+    cleared = probe(4, "build/patch", ADVISORY_CLEARED)
+    finding = evaluate(cfg, [present, cleared, patch], [ADVISORY], "t")[0]
+    assert finding.status == "satisfied" and finding.evidence == [3, 4]
+    only_cleared = evaluate(cfg, [cleared, patch], [ADVISORY], "t")[0]
+    assert only_cleared.status == "missing" and "advisory_present" in only_cleared.note
+    assert evaluate(cfg, [{**present, "seq": 6}, cleared], [ADVISORY], "t")[0].status == "missing"  # wrong order
+    for bad in ({"ok": False}, {"ok": False, "forbidden": [".nsprc"]}, {"forbidden": [".nsprc"]}):
+        assert evaluate(cfg, [{**present, **bad}, cleared], [ADVISORY], "t")[0].status == "missing"
+        assert evaluate(cfg, [present, {**cleared, **bad}], [ADVISORY], "t")[0].status == "missing"
+    red_green = [ev(3, "expectation_checked", key="build/regression_test", expect="red", ok=True),
+                 ev(4, "expectation_checked", key="build/fix", expect="green", ok=True)]
+    assert evaluate(cfg, red_green, [ADVISORY], "t")[0].status == "missing"  # another lane's checks are not this
+
+
+def test_advisory_cleared_counts_only_on_the_final_tree(cfg):
+    """Ruling 21: a cleared check is evidence only on exactly the tree to be pushed, like a gate result; any later
+    change of the tree (a commit, a fix that ran the verify set, a merge of the base, clean or conflicted, even
+    under the check's own key) leaves it missing, and the audit probes the final tree again."""
+    present = probe(3, "build/advisory_red", ADVISORY_PRESENT, verdict="present", tree="base")
+    cleared = probe(4, "build/patch", ADVISORY_CLEARED, tree="patched")
+    assert evaluate(cfg, [present, cleared], [ADVISORY], "patched")[0].status == "satisfied"
+    later = ev(9, "step_committed", key="review/fix_findings", sha="f")
+    moved = evaluate(cfg, [present, cleared, later], [ADVISORY], "fixed")[0]
+    assert moved.status == "missing" and "final tree" in moved.note
+    covered = verify_gates(6, cfg, "review/fix_findings")  # a fix that ran the whole verify set: still only the probe
+    assert evaluate(cfg, [present, cleared, *covered, later], [ADVISORY], "fixed")[0].status == "missing"
+    again = probe(12, "ship/finish", ADVISORY_CLEARED, tree="fixed")  # the audit's re-probe on the tree to be pushed
+    finding = evaluate(cfg, [present, cleared, later, again], [ADVISORY], "fixed")[0]
+    assert finding.status == "satisfied" and finding.evidence == [3, 12]
+    # the reviewer's reproduction: finish cleared, then a later sync under the same key merged with conflicts
+    reprobed = probe(12, "ship/finish", ADVISORY_CLEARED, tree="before-sync")
+    conflicted = ev(20, "base_synced", key="ship/finish", conflicts=["requirements.txt"])
+    assert evaluate(cfg, [present, reprobed, conflicted], [ADVISORY], "merged")[0].status == "missing"
+    clean_merge = ev(20, "base_synced", key="ship/finish", conflicts=[])  # the base's code is unprobed too
+    assert evaluate(cfg, [present, reprobed, clean_merge], [ADVISORY], "merged")[0].status == "missing"
+    no_tree = {**again}
+    del no_tree["tree"]  # an event with no tree is no evidence
+    assert evaluate(cfg, [present, no_tree], [ADVISORY], "fixed")[0].status == "missing"
+    assert evaluate(cfg, [present, again], [ADVISORY], "")[0].status == "missing"  # nor is an unknown final tree
+    rtg = ob("red_then_green", "expect:red_then_green")  # red_then_green keeps its change-list staling
+    red_green = [ev(3, "expectation_checked", key="build/regression_test", expect="red", ok=True),
+                 ev(4, "expectation_checked", key="build/fix", expect="green", ok=True)]
+    assert evaluate(cfg, [*red_green, *covered, later], [rtg], "fixed")[0].status == "satisfied"
+    assert evaluate(cfg, [*red_green, later], [rtg], "fixed")[0].status == "missing"
+
+
+def test_marked_done_never_waives_advisory_cleared(tmp_cfg):
+    """`advisory_cleared` is the vuln lane's floor: a mark-done that skipped the build waives `verified`, never it."""
+    from agentflow.config import load_config
+
+    path = tmp_cfg(add_vuln_lane)
+    vuln_cfg = load_config(path)
+    obligations = [ob("verified", "step:verify"), ADVISORY]
+    for after, skipped in (("define", ("build", "verify", "review")), ("build", ("verify", "review"))):
+        events = [ev(4, "run_marked_done", by="me", phase=after),
+                  *(ev(5 + i, "phase_skipped", phase=p, reason=f"marked done after {after}")
+                    for i, p in enumerate(skipped))]
+        findings = evaluate(vuln_cfg, events, obligations, "t")
+        assert only(findings, "verified").status == "waived"
+        assert only(findings, ADVISORY_FLOOR_ID).status == "missing"
 
 
 def test_a_steps_own_commit_never_makes_its_evidence_stale(cfg):

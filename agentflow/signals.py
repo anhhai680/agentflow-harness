@@ -70,6 +70,10 @@ vocabulary (`parse_target`), and the same keys are averaged over many runs (`agg
   (`human_agreement`, which the approval ramp's samples share); it is present only for a phase with such a decision.
   `auto_approvals` counts the `phase_approved` events that carry `ramp`, and is present only for a run with a
   `would_auto_approve`. A run without these events carries none of the three keys.
+  A vuln run (one with a `vuln_alert_read`) carries `advisory_reproduced` (1.0 when an `advisory_present` check
+  passed; higher is better), `vuln_code_change` (1.0 when the last `vuln_scope` names paths; present once one is recorded) and
+  `hours_to_pr:<severity>` (hours from `run_started` to the first `pr_opened`, keyed by the alert's severity;
+  present only for a run with both). A run of another lane carries none of them.
 - `human_agreement(events, phase)`: the rule `ramp_agreement:<p>` is, for the approval ramp.
 - `parse_target(text)`: `(family, parameter)` for a key in the vocabulary, else None.
 - `aggregate_signals(per_run)`: `{key: {"runs": n, "mean": m}}` over the runs that have each key.
@@ -89,6 +93,7 @@ from typing import Any
 
 from agentflow.events import parse_iso
 from agentflow.metrics import _p90
+from agentflow.vuln import SEVERITIES
 
 # family -> (the direction that is better, whether the key takes a parameter after `:`)
 FAMILIES: dict[str, tuple[str, bool]] = {
@@ -142,6 +147,9 @@ FAMILIES: dict[str, tuple[str, bool]] = {
     "replans": ("lower", False),              # phases planned on a spec that then changed, planned again
     "ramp_agreement": ("higher", True),       # a phase: 1.0 when a person's decision agreed with a true verdict
     "auto_approvals": ("higher", False),      # phase approvals the runner gave itself under the approval ramp
+    "advisory_reproduced": ("higher", False),  # vuln: 1.0 when the probe named the advisory before the patch
+    "vuln_code_change": ("lower", False),     # vuln: 1.0 when the pull request changed code outside dependency files
+    "hours_to_pr": ("lower", True),           # a severity: hours from a vuln run's start to its first pull request
 }
 # Families that count events: a run with none has a true 0, so a key absent from a run's signals reads as 0 here.
 # The plain ones (`ci_rounds`, `rollovers`, `progress_not_updated`) are always present, and `fix_attempts` and
@@ -389,6 +397,29 @@ def _lead_time(events: list[dict]) -> dict[str, float]:
     return {"lead_time_h": round((ready - started).total_seconds() / 3600, 3)}
 
 
+def _vuln_signals(events: list[dict]) -> dict[str, float]:
+    """A vuln run's signals (one with a `vuln_alert_read`): `advisory_reproduced`, `vuln_code_change` (only once a
+    `vuln_scope` is recorded; the last one counts) and `hours_to_pr:<severity>` (the alert's severity, from the first
+    `run_started` to the first `pr_opened`, an early draft included; only for a run with both)."""
+    from agentflow.config import ADVISORY_PRESENT
+
+    alert = next((e for e in events if e.get("type") == "vuln_alert_read"), None)
+    if alert is None:
+        return {}
+    present = any(e.get("type") == "expectation_checked" and e.get("expect") == ADVISORY_PRESENT
+                  and e.get("ok") is True for e in events)
+    out: dict[str, float] = {"advisory_reproduced": 1.0 if present else 0.0}
+    scopes = [e for e in events if e.get("type") == "vuln_scope"]
+    if scopes:
+        out["vuln_code_change"] = 1.0 if scopes[-1].get("code_paths") else 0.0
+    started = next((parse_iso(e.get("ts")) for e in events if e.get("type") == "run_started"), None)
+    opened = next((parse_iso(e.get("ts")) for e in events if e.get("type") == "pr_opened"), None)
+    severity = alert.get("severity")
+    if started is not None and opened is not None and severity in SEVERITIES:
+        out[f"hours_to_pr:{severity}"] = round((opened - started).total_seconds() / 3600, 3)
+    return out
+
+
 def _full_suite_runs(events: list[dict], full_suite: Collection[str]) -> int:
     """How many batches ran every gate of `full_suite`. A batch is a maximal run of consecutive `gate_result` events
     with the same `key`; passed, failed and skipped results all count, since every gate runs even after a failure.
@@ -562,6 +593,7 @@ def run_signals(events: list[dict], metrics: dict, *, full_suite: Collection[str
     cost = float(metrics.get("cost_usd") or 0.0)
     out["rework_pct"] = round(100 * float(metrics.get("rework_cost_usd") or 0.0) / cost, 2) if cost else 0
     out.update(_lead_time(events))
+    out.update(_vuln_signals(events))
     wall = float(metrics.get("wall_s") or 0.0)
     if wall > 0:
         out["human_blocked_share"] = round(float((metrics.get("buckets") or {}).get("human") or 0.0) / wall, 4)

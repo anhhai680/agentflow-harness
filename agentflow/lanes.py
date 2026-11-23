@@ -33,8 +33,8 @@ from typing import Literal, TextIO
 
 from agentflow import brief as brief_mod
 from agentflow import lessons as lessons_mod
-from agentflow import (doubt, gitops, overlays, pack, run_env, safeio, sizing, sources, speculation, verification, waves,
-                       workspace)
+from agentflow import (doubt, gitops, overlays, pack, run_env, safeio, sizing, sources, speculation, verification, vuln,
+                       waves, workspace)
 from agentflow.agents import (CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption,
                               ignored_settings, read_only_allow)
 from agentflow.autonomy import AUTO_BY
@@ -998,7 +998,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
             if called.refused:  # the git state changed: nothing that reads the tree has run, and nothing may
                 return self._fail(sr, called.refused)
             violations = check_step(self.cfg, self.worktree, sr.start_head, sr.start_tree, called.after,
-                                    outcome.tool_calls, sr.step.forbid, read_only=self._guard_read_only(sr))
+                                    outcome.tool_calls, self._forbid(sr), read_only=self._guard_read_only(sr))
             if self._fenced(sr.step, sr.key):
                 violations = [*violations, *self._outside_output(sr, missing_ok=True)]
             if violations:
@@ -1147,7 +1147,7 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
             context_window=self.context_window_for(sr.key, sr.model),
             env=self.cfg.defaults.env,
             env_base=run_env.base(self.cfg),
-            forbidden_paths=[*self.cfg.guardrails.forbidden_paths, *sr.step.forbid],
+            forbidden_paths=[*self.cfg.guardrails.forbidden_paths, *self._forbid(sr)],
             idle_s=idle_s,
             tool_idle_s=tool_idle_s,
             usage_windows=dict(self.run.state.get("usage_window") or {}),
@@ -1162,6 +1162,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
             budget_usd=budget_usd,
             on_reading=self._on_reading,
         )
+
+    def _forbid(self, sr: _StepRun) -> list[str]:
+        """What this step may not change on top of `guardrails.forbidden_paths`: its own `forbid`, plus the lane's
+        (`vuln.forbidden`: the scanner ignore files in a vuln run, for every agent step, `ci`'s fix session too)."""
+        return [*sr.step.forbid, *vuln.forbidden(self.cfg, str(self.run.state.get("pipeline") or ""))]
 
     @staticmethod
     def _call_caps(sr: _StepRun, wrap_up: bool) -> tuple[int | None, float | None]:
@@ -1414,7 +1419,8 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
                     sha = commit_artifact(self.worktree, message, self.cfg, fmt(str(sr.step.output), self.ctx),
                                           expected_head=runner_head(self.run))
                 else:
-                    sha = commit(self.worktree, message, self.cfg, expected_head=runner_head(self.run))
+                    sha = commit(self.worktree, message, self.cfg, expected_head=runner_head(self.run),
+                                 forbid=self._forbid(sr))
             except CommitRejected as exc:
                 return self._fail(sr, [Violation(exc.kind, str(exc))])
             except NothingToCommit:
@@ -1950,9 +1956,11 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
         return f"{self._fix_lead(sr, failed, sr.fixes, excerpt=True)}\n\n{self._result_partial(sr)}"
 
     def _uncommitted_forbidden(self, tree: str) -> list[str]:
-        """Forbidden paths that differ between `HEAD` and `tree` (changes nobody has committed)."""
+        """Forbidden paths that differ between `HEAD` and `tree` (changes nobody has committed): `guardrails.forbidden_paths`
+        and the lane's (`vuln.forbidden`), so a restart or a rebase never adopts an ignore file a vuln run left behind."""
         base = head(self.worktree) + "^{tree}"
-        patterns = self.cfg.guardrails.forbidden_paths
+        lane = str(self.run.state.get("pipeline") or "")
+        patterns = [*self.cfg.guardrails.forbidden_paths, *vuln.forbidden(self.cfg, lane)]
         return [p for p in changed_paths(self.worktree, base, tree) if any(path_matches(p, g) for g in patterns)]
 
     # -- event log

@@ -7,6 +7,16 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.6] - 2026-11-23
+
+### Added
+- A `vuln` lane that patches a Dependabot alert's package, proving the advisory present before and gone after with the pack's audit probe (`--alert N`, `vuln:` config, `advisory_cleared` floor obligation). A triage session proposes the upgrade path and the `define` approval decides a major bump; scanner ignore files, scanner config, `dependabot.yml` and CI workflows are forbidden in the lane; `finish` binds the `advisory_cleared` clearance to the tree it pushes, and a later push (a CI fix round's commit, or the merge made when GitHub calls the pull request conflicting) is probed before it goes out. The PR gets a Security advisory section with the package's old and new version (`Target: <from> → <to>`, from the triage's `current_version` and `target_version`) and a `Probe:` line that says `cleared` only for a clearance of the head it shows. `vuln.dependency_files` names the files counted as dependency files: changes outside them are shown in the PR, never refused. A vuln run can't start `--from` a phase past `define`, which would skip the triage approval. `gates.<name>.ok_exit` and `found_exit` set a scanner's exit codes, `skills.map.patch` maps the patch skill, and a run's signals gain `advisory_reproduced`, `vuln_code_change` and `hours_to_pr:<severity>`.
+- The starters (`python-uv`, `node-pnpm`, `go`) ship a pinned `audit` probe gate, `detect` and `init` turn an audit scanner step of the CI workflow into `gates.audit` and `vuln.probe`.
+- `doctor` checks Dependabot alert access (one read-only `gh api` call) for a pack that can run the `vuln` lane; a `403` is a warning, since intake refuses such a token itself.
+
+### Changed
+- A step's `forbid` globs are now enforced at the runner's commit as well as at the step's guard check.
+
 ## [3.5] - 2026-11-23
 
 ### Fixed

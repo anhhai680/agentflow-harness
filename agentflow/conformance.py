@@ -3,31 +3,40 @@
 `evaluate` is pure: nothing in it reads a file or the clock. It takes the run's events, the obligations that apply
 and the tree that will be pushed, and returns one finding per obligation. Evidence counts only when it comes after
 the last code change that makes it stale (steps, expectations; see `_staling`) or was made on exactly the final
-tree (gates), or by a gate whose `input_hash` there equals the one on the result (the files it declares as `inputs`
+tree (gates, and the vuln lane's `advisory_cleared`), or by a gate whose `input_hash` there equals the one on the result (the files it declares as `inputs`
 are the same). An affected-tier result (`tier: "affected"`, passed or skipped) is never gate evidence: it checked
 only the files a fix changed. Events from older runs
 carry no `tree`, so every reader uses `.get` and a missing tree is no evidence.
 
 `audit` is the one impure entry point: `finish` calls it before the push. It snapshots the final tree, runs the
-gates that have no evidence on it, writes `conformance_checked`, and in `block` mode stops on a missing obligation.
+gates that have no evidence on it and, in a vuln run whose `advisory_cleared` went stale, the probe (`_reprobe`),
+writes `conformance_checked`, and in `block` mode stops on a missing obligation.
 `render_section` turns that event into the pull request's Conformance section, from config ids, statuses, seqs and
 trees only: no step summary or finding text, which are model text, ever reaches it.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+import subprocess
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
-from agentflow import overlays
+from agentflow import overlays, vuln
 from agentflow.autonomy import AUTO_BY, blocking_of
 from agentflow.conditions import Ctx
-from agentflow.config import CONFORMANCE_FAILED, Config, Evidence, Obligation
+from agentflow.config import (
+    ADVISORY_CLEARED,
+    ADVISORY_PRESENT,
+    CONFORMANCE_FAILED,
+    Config,
+    Evidence,
+    Obligation,
+)
 from agentflow.gates import failure_report, gates_ok, input_hashes, record_results, run_gates
-from agentflow.gitops import GitError, dirty_paths, merge_in_progress
-from agentflow.guards import snapshot
+from agentflow.gitops import GitError, dirty_paths, head, merge_in_progress
+from agentflow.guards import changed_paths, path_matches, snapshot
 from agentflow.hitl import clean_fact, raise_hitl
 from agentflow.policy import applicable, phase_where, step_phase
 from agentflow.state import MARKED_DONE_SKIP, Run
@@ -221,6 +230,28 @@ def _red_then_green(cfg: Config, events: list[dict], changes: list[dict]) -> _It
     return _Item(False, note="no red check followed by a green one after the last code change", phase=phase)
 
 
+def _probe_ok(event: dict, expect: str) -> bool:
+    """A probe check (`vuln.run_probe`) for `expect` that passed with no forbidden path in its tree."""
+    return (event.get("type") == "expectation_checked" and event.get("expect") == expect and event.get("ok") is True
+            and not event.get("forbidden"))
+
+
+def _advisory_cleared(events: list[dict], final_tree: str) -> _Item:
+    """The vuln lane's floor evidence: the latest `advisory_cleared` check that passed on exactly `final_tree`, the
+    tree to be pushed (as a gate result counts), with an `advisory_present` check that passed before it.
+
+    The tree binding is its only staleness rule, and the strictest: any change of the tree since the check (a commit,
+    a fix that ran the verify gates, a merge of the base, clean or conflicted, even one under the check's own key)
+    leaves it missing, and the audit probes the final tree again (`_reprobe`). The item has no phase, so a mark-done
+    never waives it, as it never waives the gates floor."""
+    for cleared in sorted((e for e in events if _probe_ok(e, ADVISORY_CLEARED) and final_tree
+                           and e.get("tree") == final_tree), key=lambda e: e["seq"], reverse=True):
+        present = _last([e for e in events if _probe_ok(e, ADVISORY_PRESENT) and e["seq"] < cleared["seq"]])
+        if present is not None:
+            return _Item(True, [present["seq"], cleared["seq"]])
+    return _Item(False, note=f"no {ADVISORY_CLEARED} check on the final tree after a passing {ADVISORY_PRESENT} one")
+
+
 def _item(cfg: Config, events: list[dict], evidence: Evidence, final_tree: str, changes: list[dict],
           hashes: Mapping[str, str] | None = None, security: bool = False) -> _Item:
     if evidence.kind == "gates":
@@ -231,6 +262,8 @@ def _item(cfg: Config, events: list[dict], evidence: Evidence, final_tree: str, 
         return _approval(events, evidence.arg, security)
     if evidence.kind == "expect" and evidence.arg == "red_then_green":
         return _red_then_green(cfg, events, changes)
+    if evidence.kind == "expect" and evidence.arg == ADVISORY_CLEARED:
+        return _advisory_cleared(events, final_tree)
     return _Item(False, note="unrecognised evidence item")  # `config.UNRECOGNISED`, or a kind this engine lacks
 
 
@@ -319,7 +352,8 @@ def audit(cfg: Config, run: Run, worktree: Path, ctx: Ctx, key: str) -> bool:
     It first checks again that the worktree holds nothing uncommitted (the sync and its gates ran since `finish`
     last looked), so the snapshot it audits is what the push sends; anything left over is a `dirty_tree` stop.
     Gates with no passing result on that snapshot run now, once, and are recorded on `key`; a failure is the usual
-    `gate_failed` stop there, and approving it runs the audit again. Then `conformance_checked` is written. In
+    `gate_failed` stop there, and approving it runs the audit again. A missing `advisory_cleared` with an earlier
+    passing `advisory_present` runs the vuln probe the same way (`_reprobe`). Then `conformance_checked` is written. In
     `block` mode a missing obligation stops the run with `conformance_failed` before anything is pushed; in
     `report` mode the run goes on and the pull request shows the gap."""
     if not clean_tree(cfg, run, worktree, key):
@@ -343,6 +377,10 @@ def audit(cfg: Config, run: Run, worktree: Path, ctx: Ctx, key: str) -> bool:
                        extra=failure_report(failed))
             return False
         findings = evaluate(cfg, run.events.read(), applying, tree, others, input_hashes=hashes, security=security)
+    if _needs_probe(cfg, run.events.read(), findings):
+        if not _reprobe(cfg, run, worktree, key):
+            return False
+        findings = evaluate(cfg, run.events.read(), applying, tree, others, input_hashes=hashes, security=security)
     missing = [f.id for f in findings if f.status == "missing"]
     enforce = "report" if cfg.policy.enforce == "report" else "block"  # an unknown mode fails closed
     run.emit("conformance_checked", key=key, tree=tree, enforce=enforce, passed=not missing,
@@ -352,6 +390,81 @@ def audit(cfg: Config, run: Run, worktree: Path, ctx: Ctx, key: str) -> bool:
                    f"{len(missing)} obligation(s) have no evidence on the tree to be pushed: {', '.join(missing)}.")
         return False
     return True
+
+
+def _needs_probe(cfg: Config, events: list[dict], findings: list[Finding]) -> bool:
+    """Whether the audit runs the vuln probe on the tree to be pushed: an `expect:advisory_cleared` item is missing
+    (no passing check on that tree: a review fix or a merge of the base changed it, say), the pack names a probe, and an `advisory_present` check passed, so a clean scan
+    now completes the evidence. With no such check, no scan can: the finding stays missing."""
+    wanted = f"expect:{ADVISORY_CLEARED}"
+    return (bool(cfg.vuln.probe) and any(f.status == "missing" and wanted in f.require for f in findings)
+            and any(_probe_ok(e, ADVISORY_PRESENT) for e in events))
+
+
+def _probe_guard(cfg: Config, run: Run, worktree: Path, found: list[str]) -> Callable[[str], list[str]]:
+    """The guard `vuln.run_probe` calls with the tree it ran on, as the build's probe has (`bug_eval._probe`): the
+    forbidden paths (`guardrails.forbidden_paths`, and the lane's scanner ignore files) the probe changed, then those
+    left uncommitted in that tree against `HEAD`. Each goes in `found` too, for the stop."""
+    patterns = [*cfg.guardrails.forbidden_paths, *vuln.run_forbidden(cfg, run)]
+    name = cfg.vuln.probe
+
+    def hits(paths: list[str]) -> list[str]:
+        return [p for p in paths if any(path_matches(p, g) for g in patterns)]
+
+    def guard(before: str) -> list[str]:
+        changed = hits(changed_paths(worktree, before, snapshot(worktree)))
+        left = [p for p in hits(changed_paths(worktree, head(worktree) + "^{tree}", before)) if p not in changed]
+        found.extend(f"{path} (changed by the probe gate `{name}`)" for path in changed)
+        found.extend(f"{path} (uncommitted in the tree the probe ran on)" for path in left)
+        return list(found)
+
+    return guard
+
+
+def _reprobe(cfg: Config, run: Run, worktree: Path, key: str) -> bool:
+    """Run the vuln probe on the tree `key` would push and record it on `key` (`vuln.run_probe`, guard-checked);
+    True when it ran cleanly and names none of the run's advisory ids, else a stop on `key`: `blocked` when git could
+    not say what the probe changed (the guard raised before any event), `guard_violation` when it left or found a
+    forbidden path, `probe_failed` when it did not run cleanly, `gate_failed` when the advisory is
+    still there. These stop in either `policy.enforce` mode, as a failing gate does: `advisory_cleared` is the vuln
+    lane's floor. Approving the stop runs the audit, and so the probe, again."""
+    found: list[str] = []
+    try:
+        verdict, matched, result = vuln.run_probe(cfg, run, worktree, key, ADVISORY_CLEARED,
+                                                  guard=_probe_guard(cfg, run, worktree, found))
+    except (GitError, subprocess.CalledProcessError) as exc:  # the guard could not read the tree: no evidence
+        raise_hitl(cfg, run, "blocked", key, f"Could not check the tree the probe ran on in {worktree}: {exc}")
+        return False
+    if found:
+        run.emit("guard_tripped", key=key, violations=[{"kind": "forbidden_path", "detail": d} for d in found])
+        raise_hitl(cfg, run, "guard_violation", key,
+                   f"Guard violation in {key}: " + "; ".join(f"forbidden_path: {d}" for d in found))
+        return False
+    if verdict == "failed":
+        raise_hitl(cfg, run, "probe_failed", key,
+                   f"The probe gate `{result.name}` did not run cleanly on the tree {key} would push ({result.reason}), "
+                   "so it shows nothing about the advisory and is never read as a clean scan.",
+                   extra=failure_report([result]))
+        return False
+    if verdict == "present":
+        ids = ", ".join(matched)
+        raise_hitl(cfg, run, "gate_failed", key,
+                   f"The probe gate `{result.name}` still names the advisory on the tree {key} would push: {ids}.",
+                   extra=failure_report([replace(result, reason=f"advisory still reported: {ids}")]))
+        return False
+    return True
+
+
+def probe_before_push(cfg: Config, run: Run, worktree: Path, key: str) -> bool:
+    """In a vuln run, the probe on the commit a push after `finish` sends: a CI fix round's (`ci_lane`), or the merge
+    `confirm_mergeable` makes when GitHub calls the pull request conflicting. No audit runs after `finish`, so without
+    this a fix that pins the package back, or a merge that takes the target's vulnerable lockfile, would be pushed
+    under a body that says "cleared". The tree must hold nothing uncommitted (`clean_tree`), so the probe scans exactly
+    the commit pushed; then `_reprobe` runs it, guard-checked, with the same stops as the audit's re-probe, on `key`.
+    True, with nothing run, for a run of any other lane."""
+    if run.state.get("pipeline") != "vuln":
+        return True
+    return clean_tree(cfg, run, worktree, key) and _reprobe(cfg, run, worktree, key)
 
 
 def missing_steps(steps: dict, event: dict | None) -> tuple[list[str], list[str]]:

@@ -40,6 +40,7 @@ from agentflow.config import (
     CACHE_TTLS, KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ROUTE_MODES, ConfigError, Issue, load_config, validate,
 )
 from agentflow.layers import PHASE_FREE_KEYS
+from agentflow.vuln import SEVERITIES as VULN_SEVERITIES
 
 __all__ = ["Conflict", "EditError", "Proposal", "Refused", "form_fields", "propose", "read", "save"]
 
@@ -52,6 +53,7 @@ _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and p
     "phase_approval", "record_step", "resolve_step", "retro_step", "paths", "defaults.env", "defaults.env_inherit", "context.autocompact_env", "context.progress_file",
     "hitl.notify", "dashboard.host", "work_source", "skills", "starter", "policy",
     "route.lanes", "route.profiles", "autonomy.approvals", "autonomy.ramp_samples",
+    "vuln.source", "vuln.probe", "vuln.forbid",
 )
 PROTECTED = (
     *_PROTECTED_KEYS,
@@ -191,6 +193,12 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
          {"kind": "text", "allow_empty": True}),
         (("issues", "sync_lane"), "Lane for a synced issue no lane label matches", {"kind": "enum", "options": "@lanes"}),
         (("issues", "lane_labels"), "Lane by issue label (first match wins)", {"kind": "map", "value_kind": "text"}),
+    ]),
+    ("Vulnerabilities", "How the vuln lane takes alerts and which files count as dependency files.", [
+        (("vuln", "min_severity"), "Lowest severity taken (lower alerts are refused)",
+         {"kind": "enum", "options": list(VULN_SEVERITIES)}),
+        (("vuln", "sync"), "Open alerts become Backlog cards", {"kind": "bool"}),
+        (("vuln", "dependency_files"), "Dependency files (globs; changes outside them are named in the PR)", {"kind": "list"}),
     ]),
     ("Autonomy", "What the runner settles by itself before a human hears of it.", [
         (("autonomy", "non_blocking_severities"), "Non-blocking severities", {"kind": "list"}),

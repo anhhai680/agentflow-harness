@@ -26,6 +26,12 @@ Two modes for the issue-dependency fields: with `$FAKE_GH_OLD` set (an old `gh`)
 whose `--json` value contains `blockedBy` writes `Unknown JSON field: "blockedBy"` to stderr and exits 1, after it is
 logged. `issue list --json` as the last argument prints `$FAKE_GH_JSON_FIELDS` (default: the field list of gh 2.103,
 one field per line under "Specify one or more comma-separated fields for `--json`:") and exits 0.
+Dependabot alerts come from `$FAKE_GH_ALERTS`, a file holding a JSON list of alerts (none when unset).
+`api repos/{owner}/{repo}/dependabot/alerts/N` prints the one whose `number` is N, or writes `gh: Not Found (HTTP 404)`
+to stderr and exits 1. `api repos/{owner}/{repo}/dependabot/alerts?<query>` (the query URL-decoded) prints the alerts
+that match its `state`, `package` (`dependency.package.name`) and `ecosystem` (`dependency.package.ecosystem`).
+`$FAKE_GH_ALERTS_STATUS=403` makes both forms write `gh: Resource not accessible by integration (HTTP 403)` to stderr
+and exit 1. `pr list --author app/dependabot ...` prints `$FAKE_GH_PR_LIST` (default `[]`).
 """
 
 import json
@@ -72,6 +78,36 @@ if os.environ.get("FAKE_GH_NO_LABEL") and args[:2] == ["issue", "edit"] and "--a
         label = args[args.index("--add-label") + 1]
         sys.stderr.write(f"could not add label: '{label}' not found\n")
         sys.exit(1)
+ALERTS_API = "repos/{owner}/{repo}/dependabot/alerts"
+if args[:1] == ["api"] and len(args) > 1 and args[1].startswith(ALERTS_API):
+    from urllib.parse import parse_qs, urlsplit
+
+    if os.environ.get("FAKE_GH_ALERTS_STATUS") == "403":
+        sys.stderr.write("gh: Resource not accessible by integration (HTTP 403)\n")
+        sys.exit(1)
+    source = os.environ.get("FAKE_GH_ALERTS")
+    alerts = json.load(open(source, encoding="utf-8")) if source else []
+    parts = urlsplit(args[1])
+    if parts.path.startswith(ALERTS_API + "/"):
+        number = parts.path[len(ALERTS_API) + 1:]
+        match = [a for a in alerts if str(a.get("number")) == number]
+        if not match:
+            sys.stderr.write("gh: Not Found (HTTP 404)\n")
+            sys.exit(1)
+        print(json.dumps(match[0]))
+    else:
+        query = {key: values[0] for key, values in parse_qs(parts.query).items()}
+
+        def matches(alert: dict) -> bool:
+            package = alert.get("dependency", {}).get("package", {})
+            found = {"state": alert.get("state"), "package": package.get("name"), "ecosystem": package.get("ecosystem")}
+            return all(key not in query or found[key] == query[key] for key in found)
+
+        print(json.dumps([a for a in alerts if matches(a)]))
+    sys.exit(0)
+if args[:2] == ["pr", "list"] and args[2:4] == ["--author", "app/dependabot"]:
+    print(os.environ.get("FAKE_GH_PR_LIST", "[]"))
+    sys.exit(0)
 if args[:2] == ["pr", "create"]:
     print(os.environ.get("FAKE_GH_URL", "https://github.com/example/repo/pull/1"))
 elif args[:2] == ["pr", "view"] and "--json" in args and args[args.index("--json") + 1:][:1] == ["headRefOid"]:

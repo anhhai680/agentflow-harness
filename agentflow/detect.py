@@ -41,6 +41,11 @@ _PIPED_INTO_SHELL = re.compile(r"\|\s*(sudo\s+)?(ba)?sh\b")
 _GATE_WORDS = re.compile(r"\b(test|tests|pytest|unittest|jest|vitest|tox|lint|ruff|eslint|flake8|mypy|pyright|tsc"
                          r"|typecheck|check|vet|clippy)\b", re.IGNORECASE)
 _FAST_WORDS = re.compile(r"\b(lint|ruff|eslint|flake8|mypy|pyright|tsc|typecheck|vet|clippy)\b", re.IGNORECASE)
+_AUDIT_WORDS = re.compile(r"\b(pip-audit|npm\s+audit|pnpm\s+audit|yarn\s+audit|osv-scanner|govulncheck|cargo\s+audit"
+                          r"|bundle(r)?[\s-]+audit|trivy\s+fs)\b", re.IGNORECASE)
+_AUDIT_REWRITES = re.compile(r"\b(audit|osv-scanner)\s+fix\b", re.IGNORECASE)  # `npm audit fix` edits the lockfile
+_ALIASES_ON = re.compile(r"--aliases(\s+|=)on\b")
+AUDIT = "audit"  # the gate a CI audit step becomes: in no gate set, and the vuln lane's `vuln.probe`
 _GITHUB_REFERENCE = re.compile(r"\$\{\{|\$\{?GITHUB_")
 _REWRITES = re.compile(r"(?<![\w-])--(write|fix)\b")
 _SHELL_SYNTAX = re.compile(r"[|$><`(;&]")
@@ -68,6 +73,7 @@ class Detected:
     skills: list[str] = field(default_factory=list)
     agent_docs: list[str] = field(default_factory=list)  # printed only
     notes: list[str] = field(default_factory=list)
+    probe: str | None = None  # `AUDIT` when a CI audit step was found: the pack then writes `vuln.probe`
 
 
 # --- reading the repository -----------------------------------------------------------------------------------------
@@ -271,13 +277,21 @@ class _Gates:
 
     def __init__(self, reserved: set[str]) -> None:
         self.items: dict[str, dict] = {}
+        self.audit: dict | None = None  # the first CI audit step; it is no gate of any set
+        self.audit_more = 0  # audit steps after the first: not proposed
         self._seen: set[tuple[str, str | None]] = set()
-        self._taken = set(reserved)
+        self._taken = {*reserved, AUDIT}
 
     def add(self, name: str, run: str, cwd: str | None) -> None:
         if (run, cwd) in self._seen:
             return
         self._seen.add((run, cwd))
+        if name == AUDIT and _AUDIT_WORDS.search(run):
+            if self.audit is None:
+                self.audit = {"run": run, **({"cwd": cwd} if cwd else {})}
+            else:
+                self.audit_more += 1
+            return
         unique, n = name, 1
         while unique in self._taken:
             n += 1
@@ -451,6 +465,10 @@ def _step_gate(label: str, step: dict, env: dict[str, str], shell: str | None, w
     remaining = _without_installs(run)
     if remaining is None:
         raise _Skip("mixes install and test commands: add it by hand")
+    if _AUDIT_WORDS.search(remaining):
+        if _AUDIT_REWRITES.search(remaining):
+            raise _Skip("its `run` rewrites files (an audit `fix`)")
+        return AUDIT, _command(remaining, shell, env), cwd
     if not _GATE_WORDS.search(remaining):
         return None
     name = _slug(str(step.get("name") or "")) or _slug(" ".join(remaining.split()[:2])) or "gate"
@@ -656,12 +674,29 @@ def detect(repo: Path, starter: str | None = None) -> Detected:
         _script_gates(src, notes, propose)
         source = "scripts" if found.items else "starter"
     gates = {**overrides, **found.items}
+    probe = None
+    if found.audit is not None:
+        gates[AUDIT], probe = found.audit, AUDIT
+        notes.extend(_audit_notes(found))
     gate_sets = _gate_sets([*standing, *found.items], {**_starter_gates(picked), **gates}, notes) if found.items else {}
     return Detected(
         base_branch=branch, base_ref=ref, starter=picked, gates=gates, gate_sets=gate_sets, gate_source=source,
         docs=_docs(src, notes),
         skills=[n for n in src.ls(".claude/skills") if src.exists(f".claude/skills/{n}/SKILL.md")],
-        agent_docs=[n for n in ("CLAUDE.md", "AGENTS.md") if src.exists(n)], notes=_capped(notes))
+        agent_docs=[n for n in ("CLAUDE.md", "AGENTS.md") if src.exists(n)], notes=_capped(notes), probe=probe)
+
+
+def _audit_notes(found: _Gates) -> list[str]:
+    run = found.audit["run"] if found.audit else ""
+    notes = ["the CI audit step became `gates.audit` and `vuln.probe: audit`; it replaces the starter's `audit` gate "
+             "and is in no gate set: it expects exit 0 for a clean scan and 1 for findings (set `ok_exit` and "
+             "`found_exit` on it if your scanner differs)"]
+    if re.search(r"\bpip-audit\b", run) and not _ALIASES_ON.search(run):
+        notes.append("`gates.audit` runs `pip-audit` without `--aliases on`: add it, so the probe names the GHSA and "
+                     "CVE ids a Dependabot alert carries (the default output lists only `PYSEC-` ids)")
+    if found.audit_more:
+        notes.append(f"more than one audit step in CI: only the first became `gates.audit` ({found.audit_more} not proposed)")
+    return notes
 
 
 def _capped(notes: list[str]) -> list[str]:

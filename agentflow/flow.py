@@ -530,7 +530,7 @@ def cmd_reject(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- running
 
 
-PARAM_FLAGS = ("module", "topic", "issue", "log", "task", "slice")
+PARAM_FLAGS = ("module", "topic", "issue", "log", "task", "slice", "alert")
 
 
 def _run_cfg(run, args: argparse.Namespace):
@@ -664,7 +664,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         new_module = _parse_new_module(args.new_module)
         if not params:
-            raise ValueError("run needs one of --module, --topic, --issue, --log or --task")
+            raise ValueError("run needs one of --module, --topic, --issue, --log, --task or --alert")
         cfg = _load_cfg(args)
         opts = RunOptions(from_phase=args.from_phase, to_phase=args.to_phase,
                           model_overrides=_parse_models(args.model, cfg.phases), dry_run=args.dry_run,
@@ -679,6 +679,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 1
         _print_usage_note(cfg, args.from_phase)
         run = start(cfg, repo, args.lane, params, opts)
+        for event in run.events.read():
+            if event["type"] == "intake_warning":
+                print(f"warning: {event['text']}")
         print(f"Started {run.id} in {run.state['worktree']} on {run.state['branch']}.")
         if args.detach:
             _spawn_resume(run, args)
@@ -738,10 +741,11 @@ def _explain_row(line, indent: str) -> str:
 def cmd_explain(args: argparse.Namespace) -> int:
     from agentflow.conditions import explain, make_ctx, plan_warnings
 
-    params = {k: v for k, v in (("module", args.module), ("topic", args.topic), ("issue", args.issue)) if v}
+    params = {k: v for k, v in (("module", args.module), ("topic", args.topic), ("issue", args.issue),
+                                ("alert", args.alert)) if v}  # an alert is only named: explain calls no `gh`
     try:
         if not params:
-            raise ValueError("explain needs --module <id>, --topic <text> or --issue <ref>")
+            raise ValueError("explain needs --module <id>, --topic <text>, --issue <ref> or --alert <n>")
         cfg = _load_cfg(args)
         overrides = _parse_models(args.model, cfg.phases)
         ctx = make_ctx(cfg, _find_repo(), args.lane, params)
@@ -1169,7 +1173,7 @@ def build_parser() -> argparse.ArgumentParser:
     rej.set_defaults(func=cmd_reject)
 
     run = sub.add_parser("run", help="start the workflow for a lane; it stops for a human after each phase with needs_approval: true")
-    run.add_argument("lane", help="the kind of work, which selects the workflow's steps: feature, bug, eval or design")
+    run.add_argument("lane", help="the kind of work, which selects the workflow's steps: feature, bug, vuln, eval or design")
     for flag in PARAM_FLAGS:
         run.add_argument(f"--{flag}", help=f"the run's {flag}")
     run.add_argument("--from", dest="from_phase", help="start at this phase instead of the first")
@@ -1196,6 +1200,7 @@ def build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--module", help="a capability-map module id")
     exp.add_argument("--topic", help="a design topic")
     exp.add_argument("--issue", help="a bug or issue reference")
+    exp.add_argument("--alert", help="a Dependabot alert number (the vuln lane); explain does not read it")
     exp.add_argument("--model", action="append", default=[], metavar="PHASE=MODEL", help="override one phase's model")
     exp.add_argument("--profile", choices=ROUTE_PROFILES,
                      help="show the steps this route profile skips (one of the pack's route.profiles)")

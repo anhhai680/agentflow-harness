@@ -22,13 +22,16 @@ merges the pull request.
 
 from __future__ import annotations
 
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from agentflow import vuln
 from agentflow.config import Config, Phase, Step
+from agentflow.conformance import probe_before_push
 from agentflow.gates import GateResult, gates_ok, record_results, run_gates, run_gates_reusing
 from agentflow.gitops import (
     CommitRejected,
@@ -38,6 +41,7 @@ from agentflow.gitops import (
     _git_or_raise,
     commit_sync,
     conflict_markers,
+    head,
     merge_in_progress,
     merge_target,
     pr_mergeable,
@@ -98,7 +102,7 @@ class SyncLane:
         if notes:
             message += "\n\n" + "\n".join(notes)
         try:
-            sha = commit_sync(wt, message, self.cfg, pulled.target_sha)
+            sha = commit_sync(wt, message, self.cfg, pulled.target_sha, forbid=vuln.run_forbidden(self.cfg, self.run))
         except CommitRejected as exc:
             raise_hitl(self.cfg, self.run, "guard_violation", key, f"Guard violation in {key}: {exc.kind}: {exc}")
             return "stopped"
@@ -255,7 +259,8 @@ class SyncLane:
         """GitHub's verdict on the new pull request. Main may have moved since the fetch: on `CONFLICTING`, bring the
         target in again and push, up to `ci.sync_rounds` times, then a human. "UNKNOWN" and a failed read are not a
         verdict: the `ci` step is the backstop. Such a merge is pushed with no audit after it, so the `sync` step's
-        gates check it at the full tier, whatever its `gate_tier`."""
+        gates check it at the full tier, whatever its `gate_tier`, and in a vuln run the probe checks it before the
+        push (`conformance.probe_before_push`): a resolution that took the target's vulnerable lockfile stops there."""
         rounds = int(self.cfg.ci.get("sync_rounds", DEFAULT_ROUNDS))
         full = replace(step, sync=replace(step.sync, gate_tier="full")) if step.sync is not None else step
         branch = str(self.run.state.get("branch") or "")
@@ -269,7 +274,14 @@ class SyncLane:
             if not self.runner_commits_only(key):
                 return "stopped"
             try:
-                push(self.worktree, branch)
+                sha = head(self.worktree)
+            except (GitError, subprocess.CalledProcessError) as exc:
+                raise_hitl(self.cfg, self.run, "blocked", key, f"Could not read HEAD of {self.worktree}: {exc}")
+                return "stopped"
+            if not probe_before_push(self.cfg, self.run, self.worktree, key):
+                return "stopped"
+            try:
+                push(self.worktree, branch, sha=sha)
             except GitError as exc:
                 raise_hitl(self.cfg, self.run, "blocked", key, f"Could not push {branch} after syncing it: {exc}")
                 return "stopped"

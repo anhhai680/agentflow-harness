@@ -7,7 +7,9 @@ import pytest
 import yaml
 
 from agentflow import pack
-from agentflow.config import CACHE_TTLS, ConfigError, Evidence, Issue, Usage, load_config, parse_evidence, validate, validate_usage
+from agentflow.config import (
+    CACHE_TTLS, ConfigError, Evidence, Issue, Usage, VulnPolicy, load_config, parse_evidence, validate, validate_usage,
+)
 from agentflow.flow import main, repo_root
 from conftest import PYTHON_CONFIG, with_doubt
 
@@ -804,13 +806,13 @@ REQUIRED = {("defaults", "agent"), ("effort", "default"), ("effort", "allowed"),
             ("context", "rollover_pct"), ("context", "max_rollovers"), ("context", "progress_file"),
             ("context", "gate_output_lines")}
 STEP_SKILLS = {  # each default step, by its id path, and the `skills.map` key its skill comes from
-    "define/debug": "debug", "define/draft": "define", "define/grill_open_questions/grill": "decide",
+    "define/debug": "debug", "define/triage": "patch", "define/draft": "define", "define/grill_open_questions/grill": "decide",
     "define/grill_open_questions/apply": "design_doc", "define/spec_reconcile": "design_doc",
     "define/spec_review": "doubt", "plan/plan": "plan", "plan/plan_reconcile": "plan", "plan/plan_review": "doubt",
     "build/build": "build",
     "build/build/review": "review", "build/build/small_plan": "build_small", "build/regression_test": "build",
-    "build/fix": "build", "verify/verify": "verify", "review/plan_fixes": "review_feedback", "review/fix_findings": "review_feedback",
-    "review/branch_review": "review", "ship/finish/sync": "debug", "ship/ci/fix": "debug",
+    "build/fix": "build", "build/patch": "patch", "verify/verify": "verify", "review/plan_fixes": "review_feedback", "review/fix_findings": "review_feedback",
+    "review/branch_review": "review", "review/vuln_review": "review", "ship/finish/sync": "debug", "ship/ci/fix": "debug",
     "record_step": "design_doc", "resolve_step": "debug",
 }
 _WHOLE = (("record_step",), ("resolve_step",))
@@ -883,7 +885,7 @@ def _user_file(text: str) -> Path:
 def test_a_sparse_pack_loads_on_the_engine_defaults(sparse_repo):
     cfg = _sparse_config(sparse_repo)
     assert list(cfg.phases) == ["define", "plan", "build", "verify", "review", "ship"]
-    assert cfg.lanes == ["feature", "bug"]
+    assert cfg.lanes == ["feature", "bug", "vuln"]
     assert cfg.agents["claude"].permission_mode == "bypassPermissions" and not cfg.agents["codex"].enabled
     assert cfg.project.worktrees_dir is None
     assert [i for i in validate(cfg, sparse_repo) if i.level == "error"] == []
@@ -925,7 +927,7 @@ def test_every_default_step_has_an_explicit_id_and_a_mapped_skill():
 def test_engine_default_verify_has_no_refine_round_step():
     ids = {name: [step["id"] for step in DEFAULTS["phases"][name]["steps"]] for name in ("verify", "review")}
     assert ids["verify"] == ["setup", "verify"]
-    assert ids["review"] == ["setup", "plan_fixes", "fix_findings", "branch_review"]
+    assert ids["review"] == ["setup", "plan_fixes", "fix_findings", "branch_review", "vuln_review"]
 
 
 def test_a_sparse_pack_maps_a_default_step_to_its_own_skill(sparse_repo):
@@ -946,7 +948,7 @@ def test_every_skills_map_reference_in_the_defaults_resolves(tmp_path):
     assert skills == {"decide": "agentflow-define", "define": "agentflow-define", "design_doc": "agentflow-define",
                       "plan": "agentflow-plan", "build": "agentflow-build", "build_small": "agentflow-build",
                       "build_wave": "agentflow-build", "debug": "agentflow-debug", "verify": "agentflow-verify", "review": "agentflow-review",
-                      "review_feedback": "agentflow-respond", "doubt": "agentflow-doubt"}
+                      "review_feedback": "agentflow-respond", "doubt": "agentflow-doubt", "patch": "agentflow-patch"}
     for name in skills.values():
         found = pack.skill_file(tmp_path, ".claude/skills", name)
         assert found is not None and pack.is_bundled(found), name
@@ -1477,9 +1479,9 @@ def test_policy_defaults_and_floor():
     assert cfg.policy.enforce == "report"
     assert list(cfg.policy.obligations)[-1] == "engine_floor"
     assert cfg.policy.obligations["engine_floor"].require == (Evidence("gates", "verify"),)
-    assert set(cfg.policy.obligations) >= {"verified", "reviewed", "plan_approved", "red_then_green"}
+    assert set(cfg.policy.obligations) >= {"verified", "reviewed", "plan_approved", "red_then_green", "vuln_reviewed"}
     verified = cfg.policy.obligations["verified"]
-    assert verified.lanes == ("feature", "bug") and verified.require == (Evidence("step", "verify"),)
+    assert verified.lanes == ("feature", "bug", "vuln") and verified.require == (Evidence("step", "verify"),)
     assert str(Evidence("step", "verify")) == "step:verify"
 
 
@@ -1678,8 +1680,8 @@ def test_a_null_policy_or_obligations_reports_every_default_it_switches_off(tmp_
 
     path = tmp_cfg(apply)
     cfg = load_config(path)
-    assert list(cfg.policy.obligations) == ["engine_floor"]
-    assert cfg.policy.disabled == ("verified", "reviewed", "plan_approved", "red_then_green")
+    assert list(cfg.policy.obligations) == ["advisory_cleared", "engine_floor"]  # the two floors, whatever the layers say
+    assert cfg.policy.disabled == ("verified", "reviewed", "plan_approved", "red_then_green", "vuln_reviewed")
     found = {i.path: i for i in validate(cfg, path.parent.parent) if i.level == "warning"}
     for key in cfg.policy.disabled:
         assert key in found[f"policy.obligations.{key}"].message
@@ -3089,3 +3091,60 @@ def test_ramp_samples_is_a_whole_number_from_3_to_50(tmp_cfg, n):
 @pytest.mark.parametrize("n", [3, 5, 50])
 def test_ramp_samples_accepts_its_bounds(tmp_cfg, n):
     assert ramp_errors(tmp_cfg, {"ramp_samples": n}) == []
+
+
+# ---- the vuln block, probe exit codes and the advisory floor
+
+
+def test_vuln_defaults(cfg):
+    assert cfg.vuln == VulnPolicy()  # probe "" by default: `run vuln` refuses to start until a pack names one
+    assert cfg.vuln.probe == "" and cfg.vuln.source == "dependabot" and cfg.vuln.min_severity == "low"
+    assert cfg.vuln.sync is False and cfg.vuln.forbid == ()
+    assert "**/pyproject.toml" in cfg.vuln.dependency_files and "**/Cargo.lock" in cfg.vuln.dependency_files
+
+
+def test_vuln_block_loads(tmp_cfg):
+    cfg = load_config(tmp_cfg({"vuln": {"probe": "eval", "min_severity": "high", "sync": True, "forbid": ["a/**"]}}))
+    assert (cfg.vuln.probe, cfg.vuln.min_severity, cfg.vuln.sync, cfg.vuln.forbid) == ("eval", "high", True, ("a/**",))
+
+
+def test_advisory_floor_is_added_for_the_vuln_lane(cfg):
+    ob = cfg.policy.obligations["advisory_cleared"]
+    assert ob.require == (Evidence("expect", "advisory_cleared"),) and ob.lanes == ("vuln",)
+    assert list(cfg.policy.obligations)[-2:] == ["advisory_cleared", "engine_floor"]
+
+
+def test_advisory_cleared_is_evidence_and_advisory_present_is_an_expectation():
+    assert parse_evidence("expect:advisory_cleared") == Evidence("expect", "advisory_cleared")
+    assert parse_evidence("expect:advisory_present") is None
+
+
+def test_advisory_floor_cannot_be_nulled(tmp_cfg):
+    path = tmp_cfg(_policy({"obligations": {"advisory_cleared": None}}))  # a literal null: a patch dict would delete the key
+    cfg = load_config(path)
+    assert cfg.policy.obligations["advisory_cleared"].lanes == ("vuln",)
+    found = [i for i in validate(cfg, path.parent.parent) if i.path == "policy.obligations.advisory_cleared"]
+    assert found and all(i.level == "warning" for i in found)
+    assert any("cannot be removed" in i.message for i in found)
+
+
+def test_advisory_floor_cannot_be_replaced(tmp_cfg):
+    path = tmp_cfg({"policy": {"obligations": {"advisory_cleared": {"lanes": ["feature"], "require": ["step:verify"]}}}})
+    cfg = load_config(path)
+    ob = cfg.policy.obligations["advisory_cleared"]
+    assert ob.require == (Evidence("expect", "advisory_cleared"),) and ob.lanes == ("vuln",)
+    found = [i for i in validate(cfg, path.parent.parent) if i.path == "policy.obligations.advisory_cleared"]
+    assert [i.level for i in found] == ["warning"] and "cannot be removed or changed" in found[0].message
+
+
+def test_gate_exit_codes_parse(tmp_cfg):
+    cfg = load_config(tmp_cfg({"gates": {"scan": {"run": "x", "ok_exit": [0], "found_exit": []},
+                                         "plain": {"run": "x"}}}))
+    assert (cfg.gates["scan"].ok_exit, cfg.gates["scan"].found_exit) == ((0,), ())
+    assert (cfg.gates["plain"].ok_exit, cfg.gates["plain"].found_exit) == ((0,), (1,))
+
+
+@pytest.mark.parametrize("value", ["0", 0, [True], ["0"], [1.5]])
+def test_gate_exit_codes_must_be_lists_of_ints(tmp_cfg, value):
+    with pytest.raises(ConfigError, match="ok_exit"):
+        load_config(tmp_cfg({"gates": {"scan": {"run": "x", "ok_exit": value}}}))

@@ -186,7 +186,7 @@ def test_every_workspace_path_a_prompt_names_exists_after_prepare(flow_repo):
 def test_debug_step_reads_its_task_from_the_workspace(flow_repo):
     from agentflow.intake import gather, save
 
-    params, files = gather({"task": "Lỗi đăng nhập"}, flow_repo.root)
+    params, files, _warnings = gather({"task": "Lỗi đăng nhập"}, flow_repo.root)
     run = Run.create(flow_repo.cfg, flow_repo.root, "bug", params)
     save(run, files)
     step = Step(id="debug", type="agent", skill="systematic-debugging", role="debug", prompt="debug.md")

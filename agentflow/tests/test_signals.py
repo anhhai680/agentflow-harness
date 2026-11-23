@@ -150,7 +150,7 @@ def test_parse_target_accepts_only_the_vocabulary():
 def test_every_family_has_a_direction_and_a_parameter_flag():
     assert all(d in ("lower", "higher") and isinstance(p, bool) for d, p in FAMILIES.values())
     assert FAMILIES["gate_first_pass"] == ("higher", True) and FAMILIES["rework_pct"] == ("lower", False)
-    assert len(FAMILIES) == 50
+    assert len(FAMILIES) == 53
 
 
 def test_aggregate_means_over_runs_that_have_the_key():
@@ -354,6 +354,35 @@ def test_the_throughput_families_are_plain_lower_signals():
     for family in ("lead_time_h", "human_blocked_share", "full_suite_runs"):
         assert FAMILIES[family] == ("lower", False) and parse_target(family) == (family, None)
     assert "full_suite_runs" in COUNT_FAMILIES and "lead_time_h" not in COUNT_FAMILIES
+
+
+def test_vuln_signals():
+    alert = _ev("vuln_alert_read", alerts=[42], ids=["GHSA-cfgh-2345-vwxj"], package="requests", ecosystem="pip",
+                manifest="requirements.txt", severity="high", dependabot_prs=[])
+    start = _ev("run_started") | {"ts": "2026-11-03T09:00:00+00:00"}
+    present = _ev("expectation_checked", key="build/advisory_red", expect="advisory_present", ok=True)
+    early = _ev("pr_opened", key="review/early_pr", early=True) | {"ts": "2026-11-03T10:30:00+00:00"}
+    final = _ev("pr_opened", key="ship/finish") | {"ts": "2026-11-03T12:00:00+00:00"}
+    scope = _ev("vuln_scope", key="ship/finish", code_paths=["app.py"])
+    out = run_signals([start, alert, present, scope, early, final], EMPTY_METRICS)
+    assert out["advisory_reproduced"] == 1.0 and out["vuln_code_change"] == 1.0
+    assert out["hours_to_pr:high"] == 1.5 and not [k for k in out if k.startswith("hours_to_pr:") and k != "hours_to_pr:high"]
+    later = _ev("vuln_scope", key="ship/finish", code_paths=[])  # the last scope counts
+    not_reproduced = {**present, "ok": False}
+    out = run_signals([start, alert, not_reproduced, scope, later], EMPTY_METRICS)
+    assert out["advisory_reproduced"] == 0.0 and out["vuln_code_change"] == 0.0
+    assert not [k for k in out if k.startswith("hours_to_pr")]  # no pull request yet
+    assert "vuln_code_change" not in run_signals([start, alert], EMPTY_METRICS)  # no scope recorded
+    plain = run_signals([start, final], EMPTY_METRICS)  # a run of another lane carries none of them
+    assert not [k for k in plain if k.split(":")[0] in ("advisory_reproduced", "vuln_code_change", "hours_to_pr")]
+    odd = run_signals([start, {**alert, "severity": "huge"}, final], EMPTY_METRICS)
+    assert not [k for k in odd if k.startswith("hours_to_pr")]  # only a known severity is a parameter
+    assert FAMILIES["advisory_reproduced"] == ("higher", False)  # 1.0: the probe saw the advisory, the healthy case
+    assert FAMILIES["vuln_code_change"] == ("lower", False)
+    assert FAMILIES["hours_to_pr"] == ("lower", True)
+    assert parse_target("hours_to_pr:critical") == ("hours_to_pr", "critical") and parse_target("hours_to_pr") is None
+    assert parse_target("advisory_reproduced") == ("advisory_reproduced", None)
+    assert not {"advisory_reproduced", "vuln_code_change", "hours_to_pr"} & COUNT_FAMILIES
 
 
 def test_gate_cache_hit_rate():

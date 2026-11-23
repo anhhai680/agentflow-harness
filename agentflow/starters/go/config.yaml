@@ -1,9 +1,13 @@
 # Starter: a Go module. A config layer under the pack: the pack overrides it key by key.
-# It sets only the gates and which gate runs when; the workflow, the lanes and every other setting are the engine's.
+# It sets only the gates, which gate runs when, and the vuln probe; the workflow, the lanes and every other setting are the engine's.
 gates:
   vet: {run: go vet ./...}
   test: {run: go test ./...}
+  audit: {run: 'go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 -format json ./...', ok_exit: [0], found_exit: []}
 gate_sets:
   setup: []
   build: [vet]
   verify: [vet, test]
+# audit is in no gate set, so it slows no other lane; the vuln lane runs it before and after a patch
+vuln:
+  probe: audit

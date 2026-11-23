@@ -72,9 +72,99 @@ def test_doctor_is_all_ok_with_every_tool_present_and_logged_in(tmp_cfg, repo, m
     monkeypatch.setattr(keepawake, "describe", lambda platform=None: "caffeinate")
     checks = _checks(tmp_cfg, repo)
     assert {n: c.status for n, c in checks.items()} == {
-        "agent:claude": "ok", "gh": "ok", "claude user settings": "ok", "remote": "ok", "state dir": "ok",
-        "keep awake": "ok", "inherited environment": "ok", "gate:build": "ok"}
+        "agent:claude": "ok", "gh": "ok", "claude user settings": "ok", "remote": "ok",
+        "state dir": "ok", "keep awake": "ok", "inherited environment": "ok", "gate:build": "ok"}
     assert "network" in checks["gh"].detail
+
+
+def _vuln_patch(**overrides):
+    """`_patch` for a pack that can run the vuln lane: `vuln` in `lanes`, the Dependabot source and a probe gate."""
+    base = {"lanes": ["feature", "bug", "vuln"], "vuln": {"source": "dependabot", "probe": "audit"},
+            "gates": {"build": {"run": "buildtool --x"}, "audit": {"run": "buildtool --scan"}}}
+    return _patch(**{**base, **overrides})
+
+
+# A 403 is a warning, never a failure: a read-only token is common, doctor must not exit 1 for a lane the user may never
+# run, and `run vuln --alert` refuses the same token cleanly with the permission it needs.
+@pytest.mark.parametrize("reply,status", [("[]", "ok"), ("gh: Resource not accessible by integration (HTTP 403)", "warn"),
+                                          ("gh: Not Found (HTTP 404)", "warn"), ("gh: connection refused", "warn")])
+def test_doctor_dependabot_check(tmp_cfg, repo, bindir, reply, status):
+    (bindir / "gh").unlink()
+    calls = bindir / "gh-calls"
+    answer = 'echo "[]"; exit 0' if reply == "[]" else f'echo "{reply}" >&2; exit 1'
+    _script(bindir / "gh", f'echo "$*" >> {calls}\nif [ "$1" = auth ]; then exit 0; fi\n{answer}\n')
+    check = _checks(tmp_cfg, repo, _vuln_patch())["dependabot alerts"]
+    assert check.status == status
+    assert "api repos/{owner}/{repo}/dependabot/alerts?per_page=1" in calls.read_text(encoding="utf-8")
+    if status == "ok":
+        assert check.detail == "Dependabot alerts readable"
+    elif "403" in reply:
+        assert "HTTP 403" in check.detail
+        assert '"Dependabot alerts: read"' in check.fix and "rate limit" in check.fix and "SSO" in check.fix
+        assert '`vuln.source: ""` turns this check off' in check.fix
+    elif "404" in reply:
+        assert check.detail == "Dependabot alerts are off for this repository, or the token cannot see them"
+
+
+def test_doctor_dependabot_check_that_times_out_is_a_warning(tmp_cfg, repo, monkeypatch):
+    real = doctor.run_bounded
+    monkeypatch.setattr(doctor, "run_bounded", lambda argv, cwd, env=None: (
+        (None, "timed out") if argv[:2] == ["gh", "api"] else real(argv, cwd, env)))
+    check = _checks(tmp_cfg, repo, _vuln_patch())["dependabot alerts"]
+    assert check.status == "warn" and check.detail == "could not read the alerts: timed out"
+
+
+def test_doctor_dependabot_check_runs_only_for_a_pack_that_can_run_the_vuln_lane(tmp_cfg, repo):
+    assert "dependabot alerts" in _checks(tmp_cfg, repo, _vuln_patch())
+    assert "dependabot alerts" not in _checks(tmp_cfg, repo)  # no vuln lane, no probe
+    no_probe = _patch(lanes=["feature", "bug", "vuln"], vuln={"source": "dependabot", "probe": ""})
+    assert "dependabot alerts" not in _checks(tmp_cfg, repo, no_probe)
+    no_lane = _patch(vuln={"source": "dependabot", "probe": "audit"},
+                     gates={"build": {"run": "buildtool --x"}, "audit": {"run": "buildtool --scan"}})
+    assert "dependabot alerts" not in _checks(tmp_cfg, repo, no_lane)
+
+
+def test_doctor_skips_dependabot_check_when_source_off(tmp_cfg, repo):
+    assert "dependabot alerts" not in _checks(tmp_cfg, repo, _vuln_patch(vuln={"source": "", "probe": "audit"}))
+
+
+def test_doctor_skips_dependabot_check_without_gh(tmp_cfg, repo, monkeypatch):
+    real = doctor.shutil.which
+    monkeypatch.setattr(doctor.shutil, "which", lambda name, *a, **k: None if name == "gh" else real(name, *a, **k))
+    checks = _checks(tmp_cfg, repo, _vuln_patch())
+    assert checks["gh"].status == "fail" and "dependabot alerts" not in checks
+
+
+def test_doctor_warns_on_missing_probe_program(tmp_cfg, repo):
+    patch = _patch(vuln={"probe": "audit"}, gates={"build": {"run": "buildtool --x"}, "audit": {"run": "nosuchscanner --json"}})
+    checks = _checks(tmp_cfg, repo, patch)
+    check = checks["probe:audit"]
+    assert check.status == "warn"
+    assert "`nosuchscanner` is not on PATH" in check.detail and check.fix == "install `nosuchscanner`"
+    assert "gate:audit" not in checks  # the probe is in no gate set
+
+
+def test_doctor_probe_program_found_is_ok_and_a_setup_set_changes_nothing(tmp_cfg, repo):
+    ok = _checks(tmp_cfg, repo, _patch(vuln={"probe": "audit"}, gates={"build": {"run": "buildtool --x"},
+                                                                        "audit": {"run": "buildtool --scan"}}))
+    assert ok["probe:audit"].status == "ok"
+    with_setup = _patch(vuln={"probe": "audit"}, gates={"build": {"run": "buildtool --x"}, "audit": {"run": "nosuch --scan"}},
+                        gate_sets={"setup": ["build"], "verify": ["build"], "build": ["build"]})
+    check = _checks(tmp_cfg, repo, with_setup)["probe:audit"]
+    assert check.status == "warn" and "may be installed by `gate_sets.setup`" in check.detail
+    assert check.fix == ""  # a setup set may install it: nothing to fix by hand
+    no_setup = _checks(tmp_cfg, repo, _patch(vuln={"probe": "audit"}, gates={"build": {"run": "buildtool --x"},
+                                                                              "audit": {"run": "nosuch --scan"}}))
+    assert "may be installed" not in no_setup["probe:audit"].detail and no_setup["probe:audit"].fix == "install `nosuch`"
+
+
+def test_a_probe_that_is_also_a_gate_is_checked_once(tmp_cfg, repo):
+    checks = _checks(tmp_cfg, repo, _patch(vuln={"probe": "build"}))
+    assert "probe:build" not in checks and checks["gate:build"].status == "ok"
+
+
+def test_an_empty_probe_adds_no_check(tmp_cfg, repo):
+    assert not [name for name in _checks(tmp_cfg, repo) if name.startswith("probe:")]
 
 
 def test_no_sleep_inhibitor_is_a_warning(tmp_cfg, repo, monkeypatch):

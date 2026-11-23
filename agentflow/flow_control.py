@@ -32,7 +32,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, TextIO
 
-from agentflow import doubt, route, sources
+from agentflow import doubt, route, safeio, sources, vuln
 from agentflow.conditions import Ctx, evaluate, fmt, paths_read
 from agentflow.commit_checks import runner_head
 from agentflow.config import RECONCILE_CHANGED, Config, Phase, Step, for_lane, resolve_turn_cap
@@ -43,6 +43,7 @@ from agentflow.hitl import (
     Option,
     Question,
     ResultError,
+    clean_fact,
     parse_answers,
     question_objects,
     raise_hitl,
@@ -79,6 +80,10 @@ CONDITION_QID = "answer"
 YES = ("y", "yes", "true", "approve", "approved")
 NO = ("n", "no", "false")
 QUESTIONS_SUFFIX = "questions.md"
+TRIAGE_SUFFIX = "triage.md"
+TRIAGE_FIELDS = (("relationship", "Relationship"), ("current_version", "Current version"),
+                 ("target_version", "Target version"), ("bump", "Bump"), ("method", "Method"),
+                 ("release_date", "Release date"), ("notes", "Notes"))
 NOTHING_RAN = "all steps skipped"
 _STOPPED = "stopped"
 
@@ -135,6 +140,11 @@ def refine_note_block(refine: dict) -> str:
 
 def writes_questions(step: Step) -> bool:
     return bool(step.output) and str(step.output).endswith(QUESTIONS_SUFFIX)
+
+
+def writes_triage(step: Step) -> bool:
+    """A triage step (the vuln lane's): its `output` names `triage.md`, which the runner renders from the result."""
+    return bool(step.output) and str(step.output).endswith(TRIAGE_SUFFIX)
 
 
 class StepControl:
@@ -457,6 +467,8 @@ class StepControl:
         outcome = self.run_agent_step(phase, step, key, extra=extra, mode=mode, fix_first=fix_first, turn_cap=turn_cap)
         if outcome == "done" and rec.get("status") not in DONE_STATUSES and writes_questions(step):
             self._render_questions(key, mode == "refine")
+        if outcome == "done" and rec.get("status") not in DONE_STATUSES and writes_triage(step):
+            self._render_triage(key, mode == "refine")
         return outcome
 
     # ------------------------------------------------------------------ reconcile rounds
@@ -602,6 +614,27 @@ class StepControl:
         render_inbox(path, f"{self.run.id}: questions from {key}", result.summary, result.questions)
         self.run.emit("questions_rendered", key=key, path=str(path), questions=[asdict(q) for q in result.questions])
 
+    def _render_triage(self, key: str, refine: bool) -> None:
+        """The facts a triage step put in `signals.triage` become `runs/<run>/triage.md`, which the phase's approval
+        page shows and the later steps read (`workspace.INPUT_FILES`). The runner writes the file, and every value
+        in it, the summary included, is model text passed through `hitl.clean_fact` onto one labelled line: no
+        heading, no list item and no `Label:` row of its own can start in it, so the agent cannot forge the page."""
+        try:
+            result = read_result(self.run.result_path(key), refine=refine)
+        except ResultError:
+            return
+        facts = result.signals.get("triage") if isinstance(result.signals, dict) else None
+        facts = facts if isinstance(facts, dict) else {}
+        cleaned = {field: clean_fact(str(facts.get(field) or "")) for field, _ in TRIAGE_FIELDS}
+        rows = [f"Summary: {clean_fact(result.summary) or '(none)'}"]
+        for field, label in TRIAGE_FIELDS:
+            if cleaned[field] or field != "notes":
+                rows.append(f"{label}: {cleaned[field] or '(not given)'}")
+        path = self.run.dir / TRIAGE_SUFFIX
+        text = f"# {self.run.id}: triage from {key}\n\n" + "\n".join(rows) + "\n"
+        safeio.replace_file(path, text.encode("utf-8"))
+        self.run.emit("triage_rendered", key=key, path=str(path), facts=cleaned)
+
     # ------------------------------------------------------------------ groups
 
     def _run_group(self, phase: Phase, step: Step, key: str) -> tuple[Outcome, bool]:
@@ -728,7 +761,8 @@ class StepControl:
         if refine is not None:  # a refine round commits on top, with the note
             message = f"{refine_subject(step.id, message)}\n\n{refine_note_block(refine)}"
         try:
-            sha = commit(self.worktree, message, self.cfg, expected_head=runner_head(self.run))
+            sha = commit(self.worktree, message, self.cfg, expected_head=runner_head(self.run),
+                         forbid=[*step.forbid, *vuln.run_forbidden(self.cfg, self.run)])
         except CommitRejected as exc:
             summary = f"Guard violation in {key}: {exc.kind}: {exc}"
             raise_hitl(self.cfg, self.run, "guard_violation", key, summary)

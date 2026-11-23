@@ -56,7 +56,9 @@ from agentflow.autonomy import (
     round_limit,
     runner_settles,
 )
-from agentflow import constraint, doubt, governor, pack, preflight, route_lane, run_env, slots, speculation, work_source
+from agentflow import (
+    constraint, doubt, governor, pack, preflight, route_lane, run_env, safeio, slots, speculation, work_source,
+)
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
 from agentflow.config_trust import layers_sha256, start_options
@@ -64,7 +66,7 @@ from agentflow.config import (
     RETRO_PIPELINE, Config, ConfigError, Phase, Step, check_lane, for_lane, layer_files, load_config, validate,
     worktrees_root,
 )
-from agentflow.flow_control import condition_label, halted, read_json
+from agentflow.flow_control import condition_label, halted, read_json, writes_triage
 from agentflow.gitops import (
     GitError,
     add_worktree,
@@ -85,6 +87,7 @@ from agentflow.issue_status import mark, release
 from agentflow.lanes import Executor, Outcome, footer_next
 from agentflow.state import MARKED_DONE_SKIP, TERMINAL, Run, speculating
 
+TRIAGE_PAGE_LIMIT = 20_000  # bytes of `triage.md` the approval page carries
 DEFAULT_SHOW = ["handoff", "diff", "step_results", "skipped_steps", "gates", "review_findings"]
 DONE_STEPS = ("done", "unchanged")
 
@@ -137,6 +140,14 @@ def _check_range(cfg: Config, lane: str, opts: RunOptions) -> list[str]:
     return names
 
 
+def _past_triage(cfg: Config, phase: str) -> bool:
+    """Whether `phase` comes after `define`, the phase of the vuln lane's triage and its approval (a pack with no
+    `define` phase: after the first)."""
+    names = list(cfg.phases)
+    gate = names.index("define") if "define" in names else 0
+    return phase in names and names.index(phase) > gate
+
+
 def _free_branch(repo: Path, name: str) -> str:
     branch, n = name, 1
     while branch_exists(repo, branch):
@@ -148,8 +159,9 @@ def _free_branch(repo: Path, name: str) -> str:
 def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions) -> Run:
     """Create the run and the checkout it works in (D7), recording the options for `resume`.
 
-    The run's inputs (`--issue`, `--log`, `--task`; `intake`) are read before anything is created, so a
-    bad one leaves no run, and saved in the run directory once it exists.
+    The run's inputs (`--issue`, `--log`, `--task`, `--alert`; `intake`) are read before anything is created, so a
+    bad one leaves no run, and saved in the run directory once it exists. Intake's warnings (an open Dependabot PR)
+    are recorded as `intake_warning` events, which the CLI prints.
     """
     _check_range(cfg, pipeline, opts)
     _check_new_module(cfg, params, opts.new_module)
@@ -158,8 +170,20 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     if not branch_exists(repo, fork):
         raise GitError(f"project.fork_from {fork!r} is not a local branch of {repo}")
 
+    if pipeline == "vuln" and opts.from_phase and _past_triage(cfg, opts.from_phase):
+        raise ValueError(f"a vuln run can't start --from {opts.from_phase}: it would skip the triage and its approval in "
+                         "`define`, where a human approves the upgrade path (a major bump among them). Start it from "
+                         "the first phase")
+    if pipeline == "vuln" and not cfg.vuln.probe:
+        raise ValueError("the vuln lane needs `vuln.probe`, the audit gate that must name the advisory before the patch "
+                         "and not after: set it in the pack's config (the starters set `audit`)")
+    has_alert = params.get("alert") not in (None, "")
+    if pipeline == "vuln" and not has_alert:
+        raise ValueError("the vuln lane starts from a Dependabot alert: agentflow run vuln --alert N")
+    if has_alert and pipeline != "vuln":
+        raise ValueError(f"--alert starts a vuln run, not a {pipeline} run: agentflow run vuln --alert N")
     slots.check_free(cfg, repo)  # the common refusal, before the inputs are read
-    params, inputs = gather(params, repo, cfg.issues.epic_labels)
+    params, inputs, warnings = gather(params, repo, cfg.issues.epic_labels, cfg.vuln, fork)
     # `{date}` (in `plan_target`) is the day the run started, every day it runs: a step resumed tomorrow still names
     # the file the plan step wrote today, and a reconcile step may edit only that file.
     if params.get("date") in (None, ""):
@@ -171,7 +195,7 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
         with slots.starting(cfg, repo) as take:
             run = Run.create(cfg, repo, pipeline, params)
             take(run)
-        _set_up(cfg, repo, run, pipeline, params, inputs, opts)
+        _set_up(cfg, repo, run, pipeline, params, inputs, opts, warnings)
     except Exception as exc:  # once the run exists it must never be left `running` with nothing behind it
         if run is not None:
             run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}")
@@ -180,8 +204,9 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     return run
 
 
-def _set_up(cfg: Config, repo: Path, run: Run, pipeline: str, params: dict, inputs: dict, opts: RunOptions) -> None:
-    save(run, inputs)
+def _set_up(cfg: Config, repo: Path, run: Run, pipeline: str, params: dict, inputs: dict, opts: RunOptions,
+            warnings: list[str]) -> None:
+    save(run, inputs, warnings)
     run.emit("run_options", from_phase=opts.from_phase, to_phase=opts.to_phase,
              model_overrides=dict(opts.model_overrides), **start_options(cfg.path, layer_files(cfg)))
     slug = make_ctx(cfg, repo, pipeline, params).values["slug"]
@@ -1010,6 +1035,21 @@ def _review_findings(cfg: Config, run: Run, phase: str) -> list[str]:
     return [*lead, *(f"- {line}" for line in lines)]
 
 
+def _triage_section(cfg: Config, run: Run, phase: str) -> str:
+    """The runner's `triage.md` (`flow_control._render_triage`) when the phase has a triage step that ran: the text
+    of the file, so the approval page of `define` shows the upgrade path itself."""
+    spec = cfg.phases.get(phase)
+    if spec is None or not any(writes_triage(step) for step in spec.steps):
+        return ""
+    try:
+        text = safeio.read_bytes(run.dir / "triage.md", TRIAGE_PAGE_LIMIT)
+    except (OSError, ValueError):
+        return ""
+    if not text:
+        return ""
+    return _section("Triage", [line for line in text.decode("utf-8", errors="replace").splitlines()[1:] if line.strip()], "##")
+
+
 def approval_text(cfg: Config, run: Run, phase: str) -> str:
     """The inbox page for `<phase>_approved`, built from `phase_approval.show`."""
     round_ = (run.state["phases"].get(phase) or {}).get("round", 0)
@@ -1032,6 +1072,9 @@ def approval_text(cfg: Config, run: Run, phase: str) -> str:
         "review_findings": lambda: _section("Review findings", _review_findings(cfg, run, phase), "##"),
     }
     shown = [builders[item]() for item in cfg.phase_approval.get("show", DEFAULT_SHOW) if item in builders]
+    triage = _triage_section(cfg, run, phase)
+    if triage:
+        shown.insert(0, triage)  # what a human is approving first: the upgrade path, with its bump size
     lead += _approval_note(cfg, run, phase)
     names = list(cfg.phases)
     nxt = (speculation.due(cfg, run, names, names.index(phase), (run.state.get("options") or {}).get("to_phase"))

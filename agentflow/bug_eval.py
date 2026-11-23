@@ -8,6 +8,13 @@
   result with no command stops it (`blocked`).
 - `expect: green` (the fix): the same command (the last one a red check accepted) must pass, in
   addition to the step's gates; a failure is one more failing "gate" (`test_command`) for the fix loop.
+- `expect: advisory_present` (the vuln lane's `advisory_red` gate step) and `expect: advisory_cleared` (its
+  `patch`): the runner runs the pack's probe gate (`vuln.run_probe`) and judges its output against the run's
+  advisory ids. Before the patch an id must be named, or the run stops (`advisory_not_reproduced`); after it none
+  may be, or that is one more failing "gate" (`advisory_cleared`) for the fix loop. A probe that did not run
+  cleanly stops the run either way (`probe_failed`) and is never a clean scan. The probe's effect on the tree is
+  guard-checked like the test command's, and in a vuln run the scanner ignore files are forbidden
+  (`vuln.forbidden`).
 - A gate step with `fix_loop` (the eval gate) runs its gates first; when they fail, an agent session is
   started with the gate output and resumed with it up to `defaults.fix_attempts` times (the agent step
   lifecycle's own fix loop). With `on_fail: block` the stop after the last attempt is `eval_regression`.
@@ -50,7 +57,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from agentflow import safeio
+from agentflow import safeio, vuln
+from agentflow.config import ADVISORY_CLEARED, ADVISORY_PRESENT
 from agentflow.gates import GateResult, gates_ok, record_results, run_gates, summarize
 from agentflow.guards import Violation, changed_paths, command_allowed, path_matches, snapshot
 from agentflow.hitl import StepResult, raise_hitl
@@ -66,6 +74,14 @@ RED, GREEN = "red", "green"
 RESUMABLE = ("running", "waiting_human")
 SHELL_SYNTAX = re.compile(r"[;|&$()<>`\n\r]")
 KILL_WAIT_S = 5
+
+
+@dataclass(frozen=True)
+class GateStepRef:
+    """What `_fail` and `_stop` read of a step run (`lanes._StepRun`), for a gate step that has no session."""
+
+    key: str
+    step: Step
 
 
 def exhausted_kind(step: Step) -> str:
@@ -134,7 +150,8 @@ def run_test_command(argv: list[str], cwd: Path, log_path: Path, timeout_s: int,
 
 class BugEvalLane:
     """`check_expect` (for `lanes.Executor._loop`) and the fix-looping `_run_gate_step`; relies on the
-    executor's `cfg`, `run`, `worktree`, `run_agent_step`, `_stop`, `_fail`, and `_gate_report`."""
+    executor's `cfg`, `run`, `worktree`, `run_agent_step`, `current_wait`, `_stop`, `_fail`, `_uncommitted_forbidden`
+    and `_gate_report`."""
 
     cfg: Config
     run: Run
@@ -145,6 +162,8 @@ class BugEvalLane:
         """After a `done` result: `[]` when the step's expectation holds (or it has none), the failed
         test as a gate result for the fix loop (`green`), or "stopped" when a human is needed."""
         expect = sr.step.expect
+        if expect == ADVISORY_CLEARED:
+            return self._check_cleared(sr)
         if expect not in (RED, GREEN) or (expect == RED and gates_failed):
             return []
         command = self._test_command(expect, result)
@@ -187,8 +206,10 @@ class BugEvalLane:
                           "bug's reason.", extra=report)
 
     def _forbidden_changes(self, before: str) -> list[str]:
-        """Forbidden paths the tree changed in since the `before` snapshot."""
-        patterns = self.cfg.guardrails.forbidden_paths
+        """Forbidden paths the tree changed in since the `before` snapshot: `guardrails.forbidden_paths`, plus the
+        scanner ignore files in a vuln run (`vuln.forbidden`)."""
+        lane = str(self.run.state.get("pipeline") or "")
+        patterns = [*self.cfg.guardrails.forbidden_paths, *vuln.forbidden(self.cfg, lane)]
         paths = changed_paths(self.worktree, before, snapshot(self.worktree))
         return [p for p in paths if any(path_matches(p, g) for g in patterns)]
 
@@ -209,10 +230,69 @@ class BugEvalLane:
     def _command_report(self, ran: CommandRun) -> str:
         return self._gate_report([GateResult(TEST_GATE, False, False, self._reason(ran), ran.log_path, ran.tail)])
 
+    # ------------------------------------------------------------------ expect: advisory_present | advisory_cleared
+
+    def _probe(self, key: str, expect: str) -> tuple[str, list[str], GateResult, list[Violation]]:
+        """Run the vuln probe for `key` (`vuln.run_probe`) with the guard check of the tree it ran on: a forbidden path
+        left uncommitted in it (an ignore file a stop was approved past) or written by the probe is a `forbidden_path`
+        violation, as an agent's edit would be, and the probe's `expectation_checked` is never `ok` with one."""
+        found: list[Violation] = []
+        name = self.cfg.vuln.probe
+
+        def guard(before: str) -> list[str]:
+            changed = self._forbidden_changes(before)
+            found.extend(Violation("forbidden_path", f"{path} (changed by the probe gate `{name}`)") for path in changed)
+            found.extend(Violation("forbidden_path", f"{path} (uncommitted in the tree the probe ran on)")
+                         for path in self._uncommitted_forbidden(before) if path not in changed)
+            return [v.detail for v in found]
+
+        verdict, matched, result = vuln.run_probe(self.cfg, self.run, self.worktree, key, expect, guard=guard)
+        return verdict, matched, result, found
+
+    def _probe_failed(self, sr: Any, result: GateResult) -> Literal["stopped"]:
+        return self._stop(sr, "probe_failed", f"The probe gate `{result.name}` did not run cleanly ({result.reason}), so "
+                          "it shows nothing about the advisory and is never read as a clean scan.",
+                          extra=self._gate_report([result]))
+
+    def _check_cleared(self, sr: Any) -> list[GateResult] | Literal["stopped"]:
+        """`expect: advisory_cleared` (the patch): the probe must run cleanly and name none of the run's advisory ids.
+        Still named, it is a failing "gate" for the fix loop; a probe that did not run cleanly stops the run."""
+        verdict, matched, result, touched = self._probe(sr.key, ADVISORY_CLEARED)
+        if touched:
+            return self._fail(sr, touched)
+        if verdict == "failed":
+            return self._probe_failed(sr, result)
+        if verdict == "absent":
+            return []
+        return [GateResult(ADVISORY_CLEARED, False, False, f"advisory still reported: {', '.join(matched)}",
+                           result.log_path, result.tail)]
+
+    def _run_probe_step(self, step: Step, key: str) -> str:
+        """A gate step with `expect: advisory_present` (`advisory_red`): the probe must run cleanly and name at least
+        one of the run's advisory ids before any agent patches anything."""
+        if self.current_wait() is not None:
+            return "stopped"
+        sr = GateStepRef(key, step)
+        verdict, matched, result, touched = self._probe(key, ADVISORY_PRESENT)
+        if touched:
+            return self._fail(sr, touched)
+        if verdict == "failed":
+            return self._probe_failed(sr, result)
+        if verdict == "absent":
+            report = self._gate_report([replace(result, reason="no advisory id of the alert in its output")])
+            return self._stop(sr, "advisory_not_reproduced", f"The probe gate `{result.name}` ran cleanly but does "
+                              "not name the alert's advisory, so the run cannot show the patch fixes it: the alert may "
+                              "be stale, or the scanner may not see it.", extra=report)
+        self.run.emit("step_finished", key=key, status="done", summary=f"advisory reported: {', '.join(matched)}")
+        return "done"
+
     # ------------------------------------------------------------------ gate steps with a fix loop
 
     def _run_gate_step(self, phase: Phase, step: Step, key: str) -> str:
-        """A gate step: its gates, then (with `fix_loop`) an agent fix session, and the `on_fail` stop."""
+        """A gate step: its gates, then (with `fix_loop`) an agent fix session, and the `on_fail` stop. A step with
+        `expect: advisory_present` runs the vuln probe instead (`_run_probe_step`)."""
+        if step.expect == ADVISORY_PRESENT:
+            return self._run_probe_step(step, key)
         if not step.fix_loop and step.on_fail != BLOCK:
             return super()._run_gate_step(phase, step, key)  # the plain gate step of `flow_control`
         if self.run.state["waiting"] is not None:

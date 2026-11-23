@@ -278,6 +278,8 @@ def test_a_pull_request_github_calls_conflicting_is_synced_again(flow_repo, gh, 
     own_work(flow_repo, run, {"mine.txt": "mine\n"})
     assert go(flow_repo, run) == "done"
     assert len(verbs(gh, "view")) == 2 and len(verbs(gh, "create")) == 1
+    assert not [e for e in flow_repo.events(run, "expectation_checked")  # a feature run's re-sync runs no probe
+                if str(e.get("expect")).startswith("advisory")]
 
 
 def test_a_pull_request_that_stays_conflicting_is_a_humans(flow_repo, gh, git, monkeypatch):

@@ -428,7 +428,7 @@ def test_the_form_refuses_the_paths_the_runner_reads(shipped, key, value):
         form(shipped, (key, value))
 
 
-@pytest.mark.parametrize("key", ["review", "debug", "review_feedback"])
+@pytest.mark.parametrize("key", ["review", "debug", "review_feedback", "patch"])
 def test_new_skills_map_keys_are_refused_by_the_page(shipped, key):
     with pytest.raises(Refused):
         form(shipped, (["skills", "map", key], "agentflow-review"))
@@ -659,7 +659,7 @@ def test_form_offers_agents_and_lanes_on_a_sparse_pack(sparse_repo):
     assert "Agent: claude" in titles and "Agent: codex" in titles and "Phases" in titles
     fields = _fields(path)
     assert fields[("defaults", "agent")]["options"] == ["claude", "codex"]
-    assert fields[("dashboard", "backlog", "module_lane")]["options"] == ["feature", "bug"]
+    assert fields[("dashboard", "backlog", "module_lane")]["options"] == ["feature", "bug", "vuln"]
     proposal = _sparse_form(path, (["dashboard", "backlog", "module_lane"], "bug"), (["defaults", "agent"], "codex"),
                             (["agents", "codex", "enabled"], True))
     assert not proposal.errors, proposal.errors
@@ -1345,3 +1345,50 @@ def test_the_settings_form_has_the_digest_key(shipped):
     config_edit.save(shipped, proposal)
     assert load_config(shipped).hitl["digest"] is True
     assert _fields(shipped)[("hitl", "digest")]["value"] is True
+
+
+# --------------------------------------------------------------------------- the vuln block
+
+
+def test_the_vuln_fields_round_trip(sparse_repo):
+    path = _sparse(sparse_repo)
+    fields = _fields(path)
+    for key in ("min_severity", "sync", "dependency_files"):
+        assert fields[("vuln", key)]["source"] == "engine"
+    assert fields[("vuln", "min_severity")]["value"] == "low" and fields[("vuln", "sync")]["value"] is False
+    proposal = _sparse_form(path, (["vuln", "min_severity"], "high"), (["vuln", "sync"], True),
+                            (["vuln", "dependency_files"], ["**/go.mod", "**/go.sum"]))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    cfg = load_config(path)
+    assert (cfg.vuln.min_severity, cfg.vuln.sync, cfg.vuln.dependency_files) == ("high", True, ("**/go.mod", "**/go.sum"))
+    assert _fields(path)[("vuln", "min_severity")]["source"] == "project"
+    again = _sparse_form(path, (["vuln", "min_severity"], "critical"))
+    assert not again.errors, again.errors
+    config_edit.save(path, again)
+    assert load_config(path).vuln.min_severity == "critical"
+
+
+@pytest.mark.parametrize("key, value", [
+    (["vuln", "min_severity"], "urgent"), (["vuln", "sync"], "yes"), (["vuln", "dependency_files"], "**/go.mod"),
+    (["vuln", "dependency_files"], [""]),
+])
+def test_the_vuln_fields_refuse_bad_values(sparse_repo, key, value):
+    path = _sparse(sparse_repo)
+    try:
+        proposal = _sparse_form(path, (key, value))
+    except EditError:
+        return
+    assert proposal.errors
+
+
+def test_vuln_source_probe_and_forbid_are_protected(shipped):
+    for key in ("vuln.source", "vuln.probe", "vuln.forbid"):
+        assert key in config_edit.PROTECTED and key in config_edit.form_fields(shipped)["protected"]
+    _, sha = config_edit.read(shipped)
+    for key, value in ((["vuln", "source"], ""), (["vuln", "probe"], "floor"), (["vuln", "forbid"], ["x"])):
+        with pytest.raises(Refused):  # the form has no field for it
+            form(shipped, (key, value))
+    for added in ("vuln: {source: ''}\n", "vuln: {probe: floor}\n", "vuln: {forbid: [x]}\n"):
+        with pytest.raises(Refused, match="protected"):
+            config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)

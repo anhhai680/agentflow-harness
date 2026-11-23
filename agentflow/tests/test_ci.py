@@ -121,6 +121,16 @@ def test_a_failure_is_fixed_committed_pushed_and_checked_again(flow_repo, gh, gi
     assert gh.did("pr", "ready", URL)
 
 
+def test_a_fix_round_outside_the_vuln_lane_runs_no_probe(flow_repo, gh):
+    """Only a vuln run probes a CI fix before its push: a bug run with a probe gate configured pushes as before."""
+    gh.play(FAIL, PASS)
+    run = to_ship(flow_repo, {**PIPE, "vuln": {"probe": "ok"}}, acts={FIX: [change()]})
+    assert go(flow_repo, run) == "done"
+    assert flow_repo.events(run, "ci_round")[0]["action"] == "fix"
+    assert not [e for e in flow_repo.events(run, "expectation_checked") if str(e.get("expect")).startswith("advisory")]
+    assert not (run.gate_log_dir("ship/ci") / "probe").exists()
+
+
 def test_ci_fix_round_names_the_failed_checks(flow_repo, gh):
     two = {"checks": [{"name": "unit", "state": "FAILURE", "bucket": "fail", "link": LINK},
                       {"name": "lint", "state": "FAILURE", "bucket": "fail", "link": LINK}]}

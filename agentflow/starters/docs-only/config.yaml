@@ -1,5 +1,5 @@
 # Starter: a documentation repository. A config layer under the pack: the pack overrides it key by key.
-# It sets only the gates and which gate runs when; the workflow, the lanes and every other setting are the engine's.
+# It sets only the gates, which gate runs when, and the vuln probe; the workflow, the lanes and every other setting are the engine's.
 # `whitespace` checks every tracked file against the empty tree, so it works on a committed tree and on an unborn
 # HEAD. It turns off `blank-at-eol`, so a Markdown line break (two trailing spaces) is not flagged. It does not see
 # untracked files: a docs repository should add a real gate, such as a Markdown linter.
@@ -9,3 +9,6 @@ gate_sets:
   setup: []
   build: [whitespace]
   verify: [whitespace]
+# a documentation repository has no dependencies to audit
+vuln:
+  source: ""
