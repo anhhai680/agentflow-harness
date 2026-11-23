@@ -74,7 +74,7 @@ itself is data: new steps tagged `lanes: [vuln]` in `defaults/config.yaml`.
   - `GateResult.exit_code: int | None = None`.
 
 - [ ] **Step 1: Write the failing tests** in `agentflow/tests/test_vuln.py`.
-  - `ALERT` is a dict shaped like GitHub's REST reply. It holds `number`, `state`, `html_url`,
+  - `ALERT` lives in `agentflow/tests/conftest.py` as `VULN_ALERT`, a plain dict that tests import, because Tasks 4–6 use it from other test files. It is a dict shaped like GitHub's REST reply. It holds `number`, `state`, `html_url`,
     `dependency.package.{ecosystem,name}`, `dependency.manifest_path`, `security_advisory.{ghsa_id,cve_id,summary,description,severity,identifiers,references}`
     and `security_vulnerability.{vulnerable_version_range,first_patched_version.identifier,severity}`. Use
     `GHSA-abcd-2345-wxyz` and `CVE-2024-1234`.
@@ -109,7 +109,7 @@ def test_siblings_same_package_and_manifest_open_only():
     (127, "pip-audit: not found", ("failed", [])), (None, "GHSA-abcd-2345-wxyz", ("failed", [])),
     (0, "", ("failed", [])), (2, "GHSA-abcd-2345-wxyz", ("failed", [])),
     (1, "see CVE-2024-12345", ("absent", [])),                        # not CVE-2024-1234
-    (1, "https://x/GHSA-abcd-2345-wxyz-extra and CVE-2024-9", ("absent", []))])
+    (1, "https://x/GHSA-abcd-2345-wxyz-extra and CVE-2024-9", ("failed", []))])  # no whole-token id at all: a found-exit naming nothing
 def test_judge(code, out, expected):
     assert vuln.judge(code, out, ["GHSA-abcd-2345-wxyz", "CVE-2024-1234"], [0], [1]) == expected
 
@@ -253,7 +253,8 @@ def test_validate_accepts_advisory_expectations(tmp_cfg): ...  # a step with exp
 
 ```python
 def test_explain_vuln_on_engine_defaults(sparse_repo, monkeypatch):
-    # write vuln: {probe: unit} into the sparse pack; `agentflow explain vuln --alert 42` lists, in order:
+    # write vuln: {probe: unit} into the sparse pack; conditions.explain(cfg, "vuln", make_ctx(cfg, repo, "vuln", {"alert": "42"}))
+    # (called directly: the CLI's --alert flag arrives in Task 4, which adds a CLI test) lists, in order:
     # define/triage, build/setup, build/advisory_red, build/patch, verify/setup, verify/verify,
     # review/vuln_review, ship/finish, ship/ci, and no branch_review, debug, regression_test or fix
 def test_sparse_pack_validates_with_vuln_lane_and_no_probe(sparse_repo): ...  # 0 warnings
@@ -339,8 +340,8 @@ def test_dependabot_pr_warning(flow_repo, gh_alerts, prs, warned): ...
 def test_pr_list_failure_drops_only_the_warning(flow_repo, gh_alerts): ...  # FAKE_GH_FAIL_ON="pr list"
 ```
 
-  `gh_alerts` is a fixture in the test file. It writes the `ALERT`-shaped list, and sets `FAKE_GH_ALERTS` and
-  `vuln.probe: unit` through `flow_repo.configure`.
+  `gh_alerts` is a fixture in `agentflow/tests/conftest.py`, because Tasks 5–6 use it from `test_vuln_lane.py`. It writes a list built from `VULN_ALERT`, and sets `FAKE_GH_ALERTS` and
+  `vuln.probe: unit` through `flow_repo.configure`. It returns a small handle with the alerts file path, so a test can rewrite the list.
 
 - [ ] **Step 2: Run them and see them fail.** Run `pytest agentflow/tests/test_vuln.py -k "alert or dependabot" -q`.
   Expected: FAIL.
