@@ -158,6 +158,9 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     if not branch_exists(repo, fork):
         raise GitError(f"project.fork_from {fork!r} is not a local branch of {repo}")
 
+    if pipeline == "vuln" and not cfg.vuln.probe:
+        raise ValueError("the vuln lane needs `vuln.probe`, the audit gate that must name the advisory before the patch "
+                         "and not after: set it in the pack's config (the starters set `audit`)")
     slots.check_free(cfg, repo)  # the common refusal, before the inputs are read
     params, inputs = gather(params, repo, cfg.issues.epic_labels)
     # `{date}` (in `plan_target`) is the day the run started, every day it runs: a step resumed tomorrow still names

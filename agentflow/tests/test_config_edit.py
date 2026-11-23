@@ -428,7 +428,7 @@ def test_the_form_refuses_the_paths_the_runner_reads(shipped, key, value):
         form(shipped, (key, value))
 
 
-@pytest.mark.parametrize("key", ["review", "debug", "review_feedback"])
+@pytest.mark.parametrize("key", ["review", "debug", "review_feedback", "patch"])
 def test_new_skills_map_keys_are_refused_by_the_page(shipped, key):
     with pytest.raises(Refused):
         form(shipped, (["skills", "map", key], "agentflow-review"))
@@ -659,7 +659,7 @@ def test_form_offers_agents_and_lanes_on_a_sparse_pack(sparse_repo):
     assert "Agent: claude" in titles and "Agent: codex" in titles and "Phases" in titles
     fields = _fields(path)
     assert fields[("defaults", "agent")]["options"] == ["claude", "codex"]
-    assert fields[("dashboard", "backlog", "module_lane")]["options"] == ["feature", "bug"]
+    assert fields[("dashboard", "backlog", "module_lane")]["options"] == ["feature", "bug", "vuln"]
     proposal = _sparse_form(path, (["dashboard", "backlog", "module_lane"], "bug"), (["defaults", "agent"], "codex"),
                             (["agents", "codex", "enabled"], True))
     assert not proposal.errors, proposal.errors

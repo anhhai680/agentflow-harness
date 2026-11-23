@@ -1169,7 +1169,7 @@ def build_parser() -> argparse.ArgumentParser:
     rej.set_defaults(func=cmd_reject)
 
     run = sub.add_parser("run", help="start the workflow for a lane; it stops for a human after each phase with needs_approval: true")
-    run.add_argument("lane", help="the kind of work, which selects the workflow's steps: feature, bug, eval or design")
+    run.add_argument("lane", help="the kind of work, which selects the workflow's steps: feature, bug, vuln, eval or design")
     for flag in PARAM_FLAGS:
         run.add_argument(f"--{flag}", help=f"the run's {flag}")
     run.add_argument("--from", dest="from_phase", help="start at this phase instead of the first")

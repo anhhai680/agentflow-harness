@@ -270,7 +270,7 @@ REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea
 # `specs`: one module per spec file in `project.docs.specs`, its dependencies from the header (`sources.spec_deps`)
 WORK_SOURCE_KINDS = ("capability_map", "specs")
 SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "build_wave", "verify", "ship",
-                   "review", "debug", "review_feedback", "doubt")  # review_feedback: the skill sent with blocking findings
+                   "review", "debug", "review_feedback", "doubt", "patch")  # review_feedback: the skill sent with blocking findings
 
 
 @dataclass
@@ -2528,6 +2528,25 @@ class _Validator:
         self.add("warning", "lanes", "the bug lane's red/green check runs the regression test only when a Bash allow "
                  f"rule in .claude/settings.json covers it: add a narrow rule such as `Bash({program} *)`")
 
+    def vuln_lane(self) -> None:
+        """A pack with the `vuln` lane must hold the steps its two expectations run on: one that says
+        `expect: advisory_present` (the probe before the patch) and one that says `expect: advisory_cleared` (after)."""
+        if "vuln" not in self.cfg.lanes:
+            return
+        found: set[str | None] = set()
+
+        def walk(steps: list[Step]) -> None:
+            for step in steps:
+                if not step.lanes or "vuln" in step.lanes:
+                    found.add(step.expect)
+                walk(step.steps)
+
+        for phase in self.cfg.phases.values():
+            walk(phase.steps)
+        if not {ADVISORY_PRESENT, ADVISORY_CLEARED} <= found:
+            self.error("lanes", "the vuln lane needs its advisory_red and patch steps (steps for the vuln lane with "
+                       f"`expect: {ADVISORY_PRESENT}` and `expect: {ADVISORY_CLEARED}`); see playbook §14")
+
     def phases(self) -> None:
         cfg = self.cfg
         for name, phase in cfg.phases.items():
@@ -3429,6 +3448,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.agents()
     v.gate_definitions()
     v.bug_lane()
+    v.vuln_lane()
     v.lanes()
     v.conditions()
     v.phases()

@@ -130,10 +130,11 @@ vuln:                          # the vuln lane (patching Dependabot alerts): whe
 policy:                        # what a finished run must show before it counts as conformant; a pack's own entries merge by id
   enforce: report              # report | block (`block` stops `finish` with `conformance_failed` when an obligation is missing)
   obligations:                 # `null` switches an entry off (the engine floor, `gates:verify`, cannot be switched off)
-    verified:       {lanes: [feature, bug], require: ["step:verify"]}
+    verified:       {lanes: [feature, bug, vuln], require: ["step:verify"]}
     reviewed:       {lanes: [feature, bug], require: ["step:branch_review"]}
     plan_approved:  {lanes: [feature], require: ["approval:plan"]}
     red_then_green: {lanes: [bug], require: ["expect:red_then_green"]}
+    vuln_reviewed:  {lanes: [vuln], require: ["step:vuln_review"]}
 
 hitl:
   park_independent: true       # park a stopped plan task and go on with the tasks that don't depend on it
@@ -161,6 +162,7 @@ skills:
     build_small: agentflow-build
     build_wave: agentflow-build   # the skill of a session that builds a wave of plan tasks with sub-agents
     debug: agentflow-debug
+    patch: agentflow-patch     # the vuln lane's triage and patch sessions
     verify: agentflow-verify
     review: agentflow-review
     review_feedback: agentflow-respond
@@ -192,7 +194,7 @@ conditions:                    # evaluated by the runner from files and git, nev
       - {not: plan_exists_unchecked}
   build_done:             {all: [{check: lane, is: feature}, plan_done]}
 
-lanes: [feature, bug]
+lanes: [feature, bug, vuln]   # `vuln` patches a Dependabot alert
 
 record_step:                   # a spec gap settled during a run: it files the answer in the spec
   {id: record_decision, skill: "@skills.map.design_doc", role: build, prompt: record_decision.md, commit: true,
@@ -249,6 +251,8 @@ phases:
     model: {default: sonnet, build: sonnet}
     steps:
       - {id: debug, lanes: [bug], skill: "@skills.map.debug", role: debug, prompt: debug.md}
+      - {id: triage, lanes: [vuln], skill: "@skills.map.patch", role: plan, prompt: vuln_triage.md,
+         output: "runs/{run}/triage.md"}
       - {id: draft, lanes: [feature], skill: "@skills.map.define", role: plan, prompt: spec.md,
          output: "{spec}", unless: spec_exists, commit: true, message: "Draft the {module} spec"}
       - id: grill_open_questions
@@ -284,7 +288,7 @@ phases:
     skip_if: build_done
     steps:
       - &setup
-        {id: setup, lanes: [feature, bug], type: gate, gates: setup}
+        {id: setup, lanes: [feature, bug, vuln], type: gate, gates: setup}
       - id: build
         lanes: [feature]
         foreach: plan_task
@@ -302,13 +306,16 @@ phases:
          expect: red}
       - {id: fix, lanes: [bug], skill: "@skills.map.build", role: build, prompt: fix.md,
          gates: verify, expect: green, fix_loop: true, commit: true, message: "Fix {slug}"}
+      - {id: advisory_red, lanes: [vuln], type: gate, gates: [], expect: advisory_present}  # the runner runs `vuln.probe`; no agent
+      - {id: patch, lanes: [vuln], skill: "@skills.map.patch", role: build, prompt: vuln_patch.md,
+         gates: build, expect: advisory_cleared, fix_loop: true, commit: true, message: "Patch {slug}"}
   verify:
     needs_approval: false
     resolve: true
     model: sonnet
     steps:
       - *setup
-      - {id: verify, lanes: [feature, bug], skill: "@skills.map.verify", role: build, prompt: verify.md,
+      - {id: verify, lanes: [feature, bug, vuln], skill: "@skills.map.verify", role: build, prompt: verify.md,
          blocks_on_findings: true, gates_first: true, gates: verify, fix_loop: true, commit: true,
          message: "Fix failures found in verification"}
   review:
@@ -316,16 +323,18 @@ phases:
     resolve: true
     model: {default: sonnet, build: sonnet}
     steps:
-      - {<<: *setup, lanes: [feature, bug], when: refine_round}
+      - {<<: *setup, lanes: [feature, bug, vuln], when: refine_round}
       - &plan_fixes
-        {id: plan_fixes, lanes: [feature, bug], skill: "@skills.map.review_feedback", role: plan, model: opus,
+        {id: plan_fixes, lanes: [feature, bug, vuln], skill: "@skills.map.review_feedback", role: plan, model: opus,
          prompt: plan_fixes.md, when: refine_round}
       - &fix_findings
-        {id: fix_findings, lanes: [feature, bug], skill: "@skills.map.review_feedback", role: build,
+        {id: fix_findings, lanes: [feature, bug, vuln], skill: "@skills.map.review_feedback", role: build,
          prompt: fix_findings.md, when: refine_round, gates: verify, gate_tier: affected, fix_loop: true,
          commit: true, message: "Fix findings"}
       - {id: branch_review, lanes: [feature, bug], skill: "@skills.map.review", role: review,
          prompt: branch_review.md, blocks_on_findings: true}
+      - {id: vuln_review, lanes: [vuln], skill: "@skills.map.review", role: review, prompt: vuln_review.md,
+         blocks_on_findings: true}
   ship:
     needs_approval: false
     steps:
