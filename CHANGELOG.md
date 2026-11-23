@@ -7,6 +7,16 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.6] - 2026-11-23
+
+### Added
+- A `vuln` lane that patches a Dependabot alert's package, proving the advisory present before and gone after with the pack's audit probe (`--alert N`, `vuln:` config, `advisory_cleared` floor obligation). A triage session proposes the upgrade path and the `define` approval decides a major bump; scanner ignore files, scanner config, `dependabot.yml` and CI workflows are forbidden in the lane; `finish` binds the `advisory_cleared` clearance to the tree it pushes and the PR gets a Security advisory section. `gates.<name>.ok_exit` and `found_exit` set a scanner's exit codes, `skills.map.patch` maps the patch skill, and a run's signals gain `advisory_reproduced`, `vuln_code_change` and `hours_to_pr:<severity>`.
+- The starters (`python-uv`, `node-pnpm`, `go`) ship a pinned `audit` probe gate, `detect` and `init` turn an audit scanner step of the CI workflow into `gates.audit` and `vuln.probe`, and `doctor` checks Dependabot alert access.
+
+### Changed
+- `doctor` checks Dependabot alert access only for a pack that can run the `vuln` lane.
+- A step's `forbid` globs are now enforced at the runner's commit as well as at the step's guard check.
+
 ## [3.5] - 2026-11-23
 
 ### Fixed
