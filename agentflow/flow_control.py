@@ -43,6 +43,7 @@ from agentflow.hitl import (
     Option,
     Question,
     ResultError,
+    clean_fact,
     parse_answers,
     question_objects,
     raise_hitl,
@@ -82,7 +83,6 @@ QUESTIONS_SUFFIX = "questions.md"
 TRIAGE_SUFFIX = "triage.md"
 TRIAGE_FIELDS = (("relationship", "Relationship"), ("target_version", "Target version"), ("bump", "Bump"),
                  ("method", "Method"), ("release_date", "Release date"), ("notes", "Notes"))
-TRIAGE_FIELD_CAP = 300  # characters of one rendered value
 NOTHING_RAN = "all steps skipped"
 _STOPPED = "stopped"
 
@@ -615,24 +615,24 @@ class StepControl:
 
     def _render_triage(self, key: str, refine: bool) -> None:
         """The facts a triage step put in `signals.triage` become `runs/<run>/triage.md`, which the phase's approval
-        page links and the later steps read (`workspace.INPUT_FILES`). The runner writes the file, one line per fact,
-        so the text a human approves is not the agent's own file and holds no markup the agent chose."""
+        page shows and the later steps read (`workspace.INPUT_FILES`). The runner writes the file, and every value
+        in it, the summary included, is model text passed through `hitl.clean_fact` onto one labelled line: no
+        heading, no list item and no `Label:` row of its own can start in it, so the agent cannot forge the page."""
         try:
             result = read_result(self.run.result_path(key), refine=refine)
         except ResultError:
             return
         facts = result.signals.get("triage") if isinstance(result.signals, dict) else None
         facts = facts if isinstance(facts, dict) else {}
-        lines = [f"# {self.run.id}: triage from {key}", result.summary.strip()]
-        rows = []
+        cleaned = {field: clean_fact(str(facts.get(field) or "")) for field, _ in TRIAGE_FIELDS}
+        rows = [f"Summary: {clean_fact(result.summary) or '(none)'}"]
         for field, label in TRIAGE_FIELDS:
-            value = " ".join(str(facts.get(field, "")).split())[:TRIAGE_FIELD_CAP]
-            if value or field != "notes":
-                rows.append(f"{label}: {value or '(not given)'}")
-        lines.append("\n".join(rows))
+            if cleaned[field] or field != "notes":
+                rows.append(f"{label}: {cleaned[field] or '(not given)'}")
         path = self.run.dir / TRIAGE_SUFFIX
-        safeio.replace_file(path, ("\n\n".join(part for part in lines if part) + "\n").encode("utf-8"))
-        self.run.emit("triage_rendered", key=key, path=str(path), facts={f: facts.get(f) for f, _ in TRIAGE_FIELDS})
+        text = f"# {self.run.id}: triage from {key}\n\n" + "\n".join(rows) + "\n"
+        safeio.replace_file(path, text.encode("utf-8"))
+        self.run.emit("triage_rendered", key=key, path=str(path), facts=cleaned)
 
     # ------------------------------------------------------------------ groups
 
