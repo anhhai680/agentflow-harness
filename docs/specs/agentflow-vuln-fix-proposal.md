@@ -163,6 +163,8 @@ from the alert.
 
 The go starter's probe uses `govulncheck -format json`, whose OSV entries carry GHSA and CVE aliases. Its text
 output names only `GO-` ids.
+`pip-audit` likewise needs `--aliases on` to print GHSA and CVE ids next to its `PYSEC-` ids. `detect` adds a note
+when it proposes a `pip-audit` step from CI that lacks it.
 
 ### 4. Guards: an ignore list is a moved baseline
 
@@ -214,8 +216,9 @@ The section also shows the probe's before and after checks (`Probe: present (<id
 
 - **Starters** add a pinned `audit` gate and `vuln.probe: audit`. It is in no gate set, so it never slows another
   lane:
-  - `python-uv`: `uv run --frozen --with pip-audit==2.9.0 pip-audit --progress-spinner off`, with `ok_exit: [0]` and
-    `found_exit: [1]`;
+  - `python-uv`: `uv run --frozen --with pip-audit==2.9.0 pip-audit --progress-spinner off --aliases on`, with
+    `ok_exit: [0]` and `found_exit: [1]`. Without `--aliases on`, `pip-audit` prints only `PYSEC-` ids, never the
+    alert's GHSA or CVE id, so the probe could never reproduce the advisory (checked against `requests==2.31.0`);
   - `node-pnpm`: `pnpm audit`, with `ok_exit: [0]` and `found_exit: [1]`;
   - `go`: `go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 -format json ./...`, with `ok_exit: [0]` and
     `found_exit: []`, since its JSON mode exits 0 either way;
