@@ -437,7 +437,7 @@ class VulnPolicy:
     min_severity: str = "low"  # alerts below it are refused at intake and not synced
     probe: str = ""  # the gate whose output must name the advisory before the patch and not after; "" refuses the lane
     sync: bool = False  # true: open alerts become Backlog cards
-    dependency_files: tuple[str, ...] = DEPENDENCY_FILES  # globs of the files a patch may change
+    dependency_files: tuple[str, ...] = DEPENDENCY_FILES  # globs counted as dependency files; the PR names changes outside them
     forbid: tuple[str, ...] = ()  # added to `vuln.ENGINE_FORBID`, never in place of it
 
 
@@ -2880,7 +2880,7 @@ class _Validator:
 
     def vuln(self) -> None:
         """`vuln`: where the vuln lane's alerts come from, how severe, which gate probes for the advisory and which
-        files a patch may change; and each gate's `ok_exit` and `found_exit`, which only a probe reads."""
+        files count as dependency files (the PR names changes outside them); and each gate's `ok_exit` and `found_exit`, which only a probe reads."""
         pol = self.cfg.vuln
         if pol.source not in VULN_SOURCES:
             self.error("vuln.source", "must be `dependabot`, or `\"\"` for no alert intake")

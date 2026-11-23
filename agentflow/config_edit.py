@@ -194,11 +194,11 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("issues", "sync_lane"), "Lane for a synced issue no lane label matches", {"kind": "enum", "options": "@lanes"}),
         (("issues", "lane_labels"), "Lane by issue label (first match wins)", {"kind": "map", "value_kind": "text"}),
     ]),
-    ("Vulnerabilities", "How the vuln lane takes alerts and which files a patch may change.", [
+    ("Vulnerabilities", "How the vuln lane takes alerts and which files count as dependency files.", [
         (("vuln", "min_severity"), "Lowest severity taken (lower alerts are refused)",
          {"kind": "enum", "options": list(VULN_SEVERITIES)}),
         (("vuln", "sync"), "Open alerts become Backlog cards", {"kind": "bool"}),
-        (("vuln", "dependency_files"), "Files a patch may change (globs)", {"kind": "list"}),
+        (("vuln", "dependency_files"), "Dependency files (globs; changes outside them are named in the PR)", {"kind": "list"}),
     ]),
     ("Autonomy", "What the runner settles by itself before a human hears of it.", [
         (("autonomy", "non_blocking_severities"), "Non-blocking severities", {"kind": "list"}),

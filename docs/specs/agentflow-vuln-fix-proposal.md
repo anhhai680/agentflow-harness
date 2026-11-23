@@ -227,7 +227,7 @@ The section also shows the probe's before and after checks (`Probe: present (<id
   `cargo audit`, `bundle audit` and `trivy fs` in CI steps and proposes them as the `audit` gate.
 - **doctor**: when `vuln.source: dependabot`, it calls `gh api repos/{owner}/{repo}/dependabot/alerts?per_page=1`
   (`GET`, read-only). A `403` or `404` reports the missing permission ("Dependabot alerts: read") or that alerts are
-  off. When the probe gate's program is missing from `PATH`, it says so. This widens doctor's "only command it runs"
+  off, as a warning (intake refuses such a token itself, naming the permission). When the probe gate's program is missing from `PATH`, it says so. This widens doctor's "only command it runs"
   rule by one read-only `gh` call, and the playbook says so.
 
 ### 8. Backlog sync (slice V2)

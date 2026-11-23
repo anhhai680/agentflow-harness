@@ -117,14 +117,14 @@ issues:
   sync_lane: feature                           # the lane of a synced issue that no lane_labels entry matches
   lane_labels: {bug: bug}                      # issue label: lane, for a synced issue; the first match wins
 
-vuln:                          # the vuln lane (patching Dependabot alerts): where alerts come from and what a patch may touch
+vuln:                          # the vuln lane (patching Dependabot alerts): where alerts come from and what a patch may not touch
   source: dependabot           # dependabot | "" (no alert intake: the lane refuses --alert)
   min_severity: low            # low | medium | high | critical: lower alerts are refused at intake and not synced
   probe: ""                    # the gate whose output must name the advisory before the patch and not after; "" makes `run vuln` refuse to start (the starters set `audit`)
   sync: false                  # true: open alerts become Backlog cards
   dependency_files: ["**/pyproject.toml", "**/uv.lock", "**/requirements*.txt", "**/package.json",
                      "**/pnpm-lock.yaml", "**/package-lock.json", "**/yarn.lock", "**/go.mod", "**/go.sum",
-                     "**/Cargo.toml", "**/Cargo.lock", "**/Gemfile", "**/Gemfile.lock"]   # the files a patch may change
+                     "**/Cargo.toml", "**/Cargo.lock", "**/Gemfile", "**/Gemfile.lock"]   # files counted as dependency files; changes outside them are named in the PR (not a boundary)
   forbid: []                   # globs a patch may not touch, added to the engine's fixed list (scanner configs, workflows), never in place of it
 
 policy:                        # what a finished run must show before it counts as conformant; a pack's own entries merge by id
