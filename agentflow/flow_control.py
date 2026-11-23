@@ -81,8 +81,9 @@ YES = ("y", "yes", "true", "approve", "approved")
 NO = ("n", "no", "false")
 QUESTIONS_SUFFIX = "questions.md"
 TRIAGE_SUFFIX = "triage.md"
-TRIAGE_FIELDS = (("relationship", "Relationship"), ("target_version", "Target version"), ("bump", "Bump"),
-                 ("method", "Method"), ("release_date", "Release date"), ("notes", "Notes"))
+TRIAGE_FIELDS = (("relationship", "Relationship"), ("current_version", "Current version"),
+                 ("target_version", "Target version"), ("bump", "Bump"), ("method", "Method"),
+                 ("release_date", "Release date"), ("notes", "Notes"))
 NOTHING_RAN = "all steps skipped"
 _STOPPED = "stopped"
 

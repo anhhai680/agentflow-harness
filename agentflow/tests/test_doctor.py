@@ -84,7 +84,9 @@ def _vuln_patch(**overrides):
     return _patch(**{**base, **overrides})
 
 
-@pytest.mark.parametrize("reply,status", [("[]", "ok"), ("gh: Resource not accessible by integration (HTTP 403)", "fail"),
+# A 403 is a warning, never a failure: a read-only token is common, doctor must not exit 1 for a lane the user may never
+# run, and `run vuln --alert` refuses the same token cleanly with the permission it needs.
+@pytest.mark.parametrize("reply,status", [("[]", "ok"), ("gh: Resource not accessible by integration (HTTP 403)", "warn"),
                                           ("gh: Not Found (HTTP 404)", "warn"), ("gh: connection refused", "warn")])
 def test_doctor_dependabot_check(tmp_cfg, repo, bindir, reply, status):
     (bindir / "gh").unlink()

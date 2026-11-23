@@ -18,14 +18,16 @@ GitHub's head for it (`headRefOid`) is the sha the runner pushed last (`pr_updat
 for a conflicting PR, or a fix round's `ci_round`): until then they count as none yet, under the same `appear_min` and
 watch limits, so the early push's checks never pass it.
 3. A failure: run the step's `gates` (the environment), then its `fix` session with the failed jobs' logs. The
-   session's own gates hold before the runner commits. A commit is pushed; no commit means the session found
-   nothing in the code to change, so the failed jobs run again, at most `ci.rerun_rounds` times.
+   session's own gates hold before the runner commits. A commit is pushed (in a vuln run only once the probe on it
+   passed, `conformance.probe_before_push`, so a fix that pins the package back stops there); no commit means the
+   session found nothing in the code to change, so the failed jobs run again, at most `ci.rerun_rounds` times.
 4. After `ci.fix_rounds` fixes, a `ci_failed` stop. A human's approval earns fresh rounds.
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +35,7 @@ from typing import TYPE_CHECKING, Literal
 
 from agentflow.autonomy import AUTO_BY
 from agentflow.config import Config, Phase, Step
+from agentflow.conformance import probe_before_push
 from agentflow.flow_control import halted
 from agentflow.gates import gates_ok, run_gates
 from agentflow.gitops import (
@@ -287,15 +290,24 @@ class CILane:
                                    extra={"ci_report": self._ci_report}, role=fix.role)
 
     def _push(self, key: str, round_: int, checks: list[dict]) -> bool:
+        """Push the fix commit; in a vuln run only once the probe on it passed (`probe_before_push`): the commit
+        probed is the commit pushed."""
         if not self.runner_commits_only(key):
             return False
         branch = str(self.run.state.get("branch") or "")
         try:
-            push(self.worktree, branch)
+            sha = head(self.worktree)
+        except (GitError, subprocess.CalledProcessError) as exc:
+            self._ci_raise("blocked", key, f"Could not read HEAD of {self.worktree}: {exc}")
+            return False
+        if not probe_before_push(self.cfg, self.run, self.worktree, key):
+            return False
+        try:
+            push(self.worktree, branch, sha=sha)
         except GitError as exc:
             self._ci_raise("blocked", key, f"Could not push the CI fix to {branch}: {exc}")
             return False
-        self.run.emit("ci_round", key=key, action="fix", round=round_, sha=head(self.worktree), note="fixed and pushed",
+        self.run.emit("ci_round", key=key, action="fix", round=round_, sha=sha, note="fixed and pushed",
                       failed=_failed_names(checks), tail=self._ci_report[-EVENT_EXTRA_MAX:])
         return True
 

@@ -184,6 +184,11 @@ def head(worktree: Path) -> str:
     return _git(Path(worktree), "rev-parse", "HEAD").strip()
 
 
+def head_tree(worktree: Path) -> str:
+    """The tree hash of the commit `HEAD` points at."""
+    return _git(Path(worktree), "rev-parse", "HEAD^{tree}").strip()
+
+
 def commit(worktree: Path, message: str, cfg: Config, paths: list[str] | None = None,
            expected_head: str | None = None, forbid: Sequence[str] = ()) -> str:
     """Stage everything and commit it with `project.commit_trailer` appended; return the new sha.

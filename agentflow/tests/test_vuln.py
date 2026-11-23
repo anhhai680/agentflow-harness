@@ -48,6 +48,24 @@ def test_parse_alert_refuses_bad_fields(path, value):
         vuln.parse_alert(_set(ALERT, path, value))
 
 
+@pytest.mark.parametrize("value", ["2.32.0 ", "2.32 0", ">2.32.0", ">=2.32.0", "2.32.0,<3", "^2.32.0", "2.*", "!2"])
+def test_a_patched_version_takes_only_the_version_alphabet(value):
+    """A first patched version is one version: the range characters (space, `<>=!,^*`) are refused there."""
+    with pytest.raises(vuln.AlertError, match="first patched version"):
+        vuln.parse_alert(_set(ALERT, ("security_vulnerability", "first_patched_version", "identifier"), value))
+
+
+@pytest.mark.parametrize("value", ["2.32.0", "1.0.0-rc.1", "1.0+local_2", "1.0~beta", "v1.2.3"])
+def test_a_patched_version_in_the_version_alphabet_parses(value):
+    data = _set(ALERT, ("security_vulnerability", "first_patched_version", "identifier"), value)
+    assert vuln.parse_alert(data).patched == value
+
+
+def test_the_vulnerable_range_keeps_the_range_alphabet():
+    data = _set(ALERT, ("security_vulnerability", "vulnerable_version_range"), ">= 2.0, < 2.32.0")
+    assert vuln.parse_alert(data).vulnerable_range == ">= 2.0, < 2.32.0"
+
+
 def test_parse_alert_refuses_a_non_object_and_missing_parts():
     for bad in (None, [], "x", {}, _set(ALERT, ("dependency",), None)):
         with pytest.raises(vuln.AlertError):

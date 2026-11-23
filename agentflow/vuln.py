@@ -51,7 +51,8 @@ ENGINE_FORBID: tuple[str, ...] = (
     "**/osv-scanner.toml", "**/.trivyignore", "**/.grype.yaml", "**/pip-audit*.toml", "**/.cargo/audit.toml")
 
 _PACKAGE = re.compile(r"^[^\s;|&$()<>`'\"\\]{1,214}$")
-_VERSION = re.compile(r"^[0-9A-Za-z.+~_\- <>=!,^*]{1,64}$")
+_VERSION = re.compile(r"^[0-9A-Za-z.+~_-]{1,64}$")  # one version: a first patched version
+_RANGE = re.compile(r"^[0-9A-Za-z.+~_\- <>=!,^*]{1,64}$")  # a vulnerable range: versions, comparators and commas
 MAX_TEXT = 64 * 1024  # characters kept of an advisory's summary and of its description
 MAX_REFERENCES = 20
 
@@ -104,9 +105,9 @@ def _manifest(path: str) -> str:
     return path
 
 
-def _version(value: str, what: str) -> str:
-    if not _VERSION.fullmatch(value):
-        raise AlertError(f"{what} is not a version")
+def _version(value: str, what: str, pattern: re.Pattern[str] = _VERSION) -> str:
+    if not pattern.fullmatch(value):
+        raise AlertError(f"{what} is not a version" if pattern is _VERSION else f"{what} is not a version range")
     return value
 
 
@@ -158,7 +159,7 @@ def parse_alert(data: object) -> Alert:
         manifest=_manifest(_text(dependency, "manifest_path", "the manifest path")),
         severity=severity, ids=_ids(advisory),
         vulnerable_range=_version(_text(vulnerability, "vulnerable_version_range", "the vulnerable range"),
-                                  "the vulnerable range"),
+                                  "the vulnerable range", _RANGE),
         patched=patched, url=str(root.get("html_url") or ""),
         summary=str(advisory.get("summary") or "")[:MAX_TEXT],
         description=str(advisory.get("description") or "")[:MAX_TEXT],
@@ -475,7 +476,7 @@ def read_alert(run_dir: Path) -> dict:
 
 # --------------------------------------------------------------------------- the pull request: `finish`
 
-TARGET_MAX = 64  # characters of the triage's target version the pull request shows
+TARGET_MAX = 64  # characters of each of the triage's versions (current, target) the pull request shows
 SCOPE_SHOWN = 10  # paths the code-change line names before `and <n> more`
 
 
@@ -498,25 +499,49 @@ def _last_ok(events: list[dict], expect: str, before: int | None = None) -> dict
     return found[-1] if found else None
 
 
-def _probe_line(events: list[dict]) -> str:
-    """`Probe: present (<ids>) → cleared` from the last passing cleared check and the last passing present check
-    before it, else `Probe: not cleared`. Only an id of the advisory patterns is shown."""
+def _probe_line(events: list[dict], pushed_tree: str) -> str:
+    """`Probe: present (<ids>) → cleared` from the last passing cleared check on `pushed_tree` (the tree of the head
+    the pull request shows) and the last passing present check before it. A passing pair on another tree only (a CI
+    fix or a re-sync changed the head since) is `Probe: not re-checked on the pushed head`; no passing pair at all is
+    `Probe: not cleared`. Only an id of the advisory patterns is shown."""
     from agentflow.config import ADVISORY_CLEARED, ADVISORY_PRESENT
 
-    cleared = _last_ok(events, ADVISORY_CLEARED)
-    present = _last_ok(events, ADVISORY_PRESENT, cleared["seq"]) if cleared else None
-    if present is None:
-        return "Probe: not cleared"
-    ids = [str(i) for i in present.get("matched") or [] if GHSA_ID.fullmatch(str(i)) or CVE_ID.fullmatch(str(i))]
+    def pair(tree: str | None) -> tuple[dict, dict] | None:
+        for cleared in reversed([e for e in events if e.get("type") == "expectation_checked"
+                                 and e.get("expect") == ADVISORY_CLEARED and e.get("ok") is True
+                                 and not e.get("forbidden") and (tree is None or e.get("tree") == tree)]):
+            present = _last_ok(events, ADVISORY_PRESENT, cleared["seq"])
+            if present is not None:
+                return present, cleared
+        return None
+
+    found = pair(pushed_tree) if pushed_tree else None
+    if found is None:
+        return "Probe: not re-checked on the pushed head" if pair(None) else "Probe: not cleared"
+    ids = [str(i) for i in found[0].get("matched") or [] if GHSA_ID.fullmatch(str(i)) or CVE_ID.fullmatch(str(i))]
     return f"Probe: present ({', '.join(ids)}) → cleared"
 
 
-def pr_lines(run: Run) -> list[str]:
+def _versions(facts: object) -> str:
+    """`Target: <from> → <to>` from the triage's cleaned facts, each as inline code cut to `TARGET_MAX`, or `unknown`;
+    `Target: unknown` when neither is known."""
+    from agentflow.hitl import clean_fact
+
+    def one(field: str) -> str:
+        text = clean_fact(str(facts.get(field) or "") if isinstance(facts, dict) else "")[:TARGET_MAX]
+        return _code(text) if text.replace("`", "").strip() else "unknown"
+
+    old, new = one("current_version"), one("target_version")
+    return "Target: unknown" if old == new == "unknown" else f"Target: {old} → {new}"
+
+
+def pr_lines(run: Run, pushed_tree: str = "") -> list[str]:
     """The lines of the pull request's `Security advisory` section; [] for a run with no readable `alert.json`.
 
-    They come from the facts intake validated (`alert.json`), the probe's `expectation_checked` events, the triage's
-    cleaned facts (`triage_rendered`, the target version as inline code, cut to `TARGET_MAX`) and the last
-    `vuln_scope`. The advisory's summary and description never go in, and each line passes `hitl.clean_fact`, so no
+    They come from the facts intake validated (`alert.json`), the probe's `expectation_checked` events (`cleared`
+    only for a check on `pushed_tree`, the tree of the head the body goes out with; "" never shows it), the triage's
+    cleaned facts (`triage_rendered`, the current and target versions as inline code, each cut to `TARGET_MAX`) and
+    the last `vuln_scope`. The advisory's summary and description never go in, and each line passes `hitl.clean_fact`, so no
     text from outside the run or from a model can start a heading, a list item or a line of its own."""
     from agentflow.hitl import clean_fact
 
@@ -535,9 +560,7 @@ def pr_lines(run: Run) -> list[str]:
     ranges = dict.fromkeys((str(a.get("vulnerable_range") or "?"), str(a.get("patched") or "?")) for a in advisories)
     lines += [f"Vulnerable: {vulnerable} · patched in {patched}" for vulnerable, patched in ranges]
     triage = [e for e in events if e.get("type") == "triage_rendered"]
-    facts = (triage[-1].get("facts") if triage else None) or {}
-    target = clean_fact(str(facts.get("target_version") or "") if isinstance(facts, dict) else "")[:TARGET_MAX]
-    lines.append(f"Target: {_code(target)}" if target.replace("`", "").strip() else "Target: unknown")
+    lines.append(_versions((triage[-1].get("facts") if triage else None) or {}))
     for advisory in advisories:
         url, number = _url(str(advisory.get("url") or "")), advisory.get("number")
         if url:
@@ -546,7 +569,7 @@ def pr_lines(run: Run) -> list[str]:
             lines.append(f"Alert: #{number}")
     lines += [f"Supersedes #{n} (Dependabot)" for n in alert.get("dependabot_prs") or []
               if isinstance(n, int) and not isinstance(n, bool) and n > 0]
-    lines.append(_probe_line(events))
+    lines.append(_probe_line(events, pushed_tree))
     scopes = [e for e in events if e.get("type") == "vuln_scope"]
     paths = [str(p) for p in (scopes[-1].get("code_paths") or [] if scopes else [])]
     if paths:

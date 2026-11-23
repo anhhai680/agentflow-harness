@@ -217,8 +217,8 @@ def _dependabot_check(repo: Path) -> Check:
     code, output = run_bounded(["gh", "api", "repos/{owner}/{repo}/dependabot/alerts?per_page=1"], repo)
     if code == 0:
         return Check("dependabot alerts", "ok", "Dependabot alerts readable")
-    if "HTTP 403" in output:
-        return Check("dependabot alerts", "fail", _last_line(output) or "HTTP 403", "the token needs \"Dependabot alerts: read\", or this may be a rate limit or SSO enforcement (see the detail); "
+    if "HTTP 403" in output:  # a warning: `run vuln --alert` refuses this token itself, naming the permission
+        return Check("dependabot alerts", "warn", _last_line(output) or "HTTP 403", "the token needs \"Dependabot alerts: read\", or this may be a rate limit or SSO enforcement (see the detail); "
                      "`vuln.source: \"\"` turns this check off")
     if "HTTP 404" in output:
         return Check("dependabot alerts", "warn", "Dependabot alerts are off for this repository, or the token cannot see them",

@@ -140,6 +140,14 @@ def _check_range(cfg: Config, lane: str, opts: RunOptions) -> list[str]:
     return names
 
 
+def _past_triage(cfg: Config, phase: str) -> bool:
+    """Whether `phase` comes after `define`, the phase of the vuln lane's triage and its approval (a pack with no
+    `define` phase: after the first)."""
+    names = list(cfg.phases)
+    gate = names.index("define") if "define" in names else 0
+    return phase in names and names.index(phase) > gate
+
+
 def _free_branch(repo: Path, name: str) -> str:
     branch, n = name, 1
     while branch_exists(repo, branch):
@@ -162,6 +170,10 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     if not branch_exists(repo, fork):
         raise GitError(f"project.fork_from {fork!r} is not a local branch of {repo}")
 
+    if pipeline == "vuln" and opts.from_phase and _past_triage(cfg, opts.from_phase):
+        raise ValueError(f"a vuln run can't start --from {opts.from_phase}: it would skip the triage and its approval in "
+                         "`define`, where a human approves the upgrade path (a major bump among them). Start it from "
+                         "the first phase")
     if pipeline == "vuln" and not cfg.vuln.probe:
         raise ValueError("the vuln lane needs `vuln.probe`, the audit gate that must name the advisory before the patch "
                          "and not after: set it in the pack's config (the starters set `audit`)")

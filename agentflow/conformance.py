@@ -422,7 +422,7 @@ def _probe_guard(cfg: Config, run: Run, worktree: Path, found: list[str]) -> Cal
 
 
 def _reprobe(cfg: Config, run: Run, worktree: Path, key: str) -> bool:
-    """Run the vuln probe on the tree `finish` would push and record it on `key` (`vuln.run_probe`, guard-checked);
+    """Run the vuln probe on the tree `key` would push and record it on `key` (`vuln.run_probe`, guard-checked);
     True when it ran cleanly and names none of the run's advisory ids, else a stop on `key`: `blocked` when git could
     not say what the probe changed (the guard raised before any event), `guard_violation` when it left or found a
     forbidden path, `probe_failed` when it did not run cleanly, `gate_failed` when the advisory is
@@ -453,6 +453,18 @@ def _reprobe(cfg: Config, run: Run, worktree: Path, key: str) -> bool:
                    extra=failure_report([replace(result, reason=f"advisory still reported: {ids}")]))
         return False
     return True
+
+
+def probe_before_push(cfg: Config, run: Run, worktree: Path, key: str) -> bool:
+    """In a vuln run, the probe on the commit a push after `finish` sends: a CI fix round's (`ci_lane`), or the merge
+    `confirm_mergeable` makes when GitHub calls the pull request conflicting. No audit runs after `finish`, so without
+    this a fix that pins the package back, or a merge that takes the target's vulnerable lockfile, would be pushed
+    under a body that says "cleared". The tree must hold nothing uncommitted (`clean_tree`), so the probe scans exactly
+    the commit pushed; then `_reprobe` runs it, guard-checked, with the same stops as the audit's re-probe, on `key`.
+    True, with nothing run, for a run of any other lane."""
+    if run.state.get("pipeline") != "vuln":
+        return True
+    return clean_tree(cfg, run, worktree, key) and _reprobe(cfg, run, worktree, key)
 
 
 def missing_steps(steps: dict, event: dict | None) -> tuple[list[str], list[str]]:

@@ -118,6 +118,7 @@ from agentflow.gitops import (
     dirty_paths,
     drop_shelf,
     head,
+    head_tree,
     push,
     restore_paths,
     shelf_ref,
@@ -1641,8 +1642,17 @@ def _conformance(run: Run, events: list[dict]) -> str | None:
 
 
 def _security_advisory(run: Run) -> str | None:
-    """The Security advisory section of a vuln run (`vuln.pr_lines`); None for a run with no alert."""
-    lines = vuln.pr_lines(run)
+    """The Security advisory section of a vuln run (`vuln.pr_lines`); None for a run with no alert. The probe line
+    is read against the tree of the worktree's `HEAD`, the commit every caller of the body has just pushed or is
+    about to push ("" when it cannot be read, which never shows "cleared")."""
+    if not (run.dir / vuln.ALERT_JSON).is_file():
+        return None
+    worktree = str(run.state.get("worktree") or "")
+    try:
+        tree = head_tree(Path(worktree)) if worktree and Path(worktree).is_dir() else ""
+    except (GitError, subprocess.CalledProcessError, OSError):
+        tree = ""
+    lines = vuln.pr_lines(run, tree)
     return _section("Security advisory", lines) if lines else None
 
 

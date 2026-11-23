@@ -75,6 +75,11 @@ def test_prompts_point_at_the_alert_file():
         assert "{run_dir}/alert.md" in (PROMPTS / name).read_text(encoding="utf-8")
 
 
+def test_the_triage_prompt_asks_for_the_current_version():
+    text = (PROMPTS / "vuln_triage.md").read_text(encoding="utf-8")
+    assert '"current_version":' in text and '"target_version":' in text
+
+
 def test_the_patch_skill_is_bundled_and_the_lane_steps_use_it():
     found = pack.skill_file(Path("/nonexistent"), ".claude/skills", "agentflow-patch")
     assert found is not None and pack.is_bundled(found)
@@ -93,7 +98,8 @@ def test_review_blocks_on_high_for_a_fresh_target_version():
 
 
 TRIAGE_RESULT = {"status": "done", "summary": "requests is direct; 2.32.0 is the smallest fix.",
-                 "signals": {"triage": {"relationship": "direct", "target_version": "2.32.0", "bump": "major",
+                 "signals": {"triage": {"relationship": "direct", "current_version": "2.31.0",
+                                        "target_version": "2.32.0", "bump": "major",
                                         "method": "bump", "release_date": "2024-05-20",
                                         "notes": "drops Python 3.7\n# not a heading"}}}
 
@@ -113,7 +119,8 @@ def test_a_triage_result_reaches_the_run_dir_and_the_approval_page(flow_repo):
     flow_repo.script({"define/triage": [{"result": TRIAGE_RESULT}]})
     assert flow_repo.executor(run).run_steps(phase, [step], "define")[0] == "done"
     text = (run.dir / "triage.md").read_text(encoding="utf-8")
-    for line in ("Relationship: direct", "Target version: 2.32.0", "Bump: major", "Method: bump",
+    for line in ("Relationship: direct", "Current version: 2.31.0", "Target version: 2.32.0", "Bump: major",
+                 "Method: bump",
                  "Release date: 2024-05-20", "Notes: drops Python 3.7 # not a heading"):
         assert line in text
     assert "\n# not a heading" not in text  # one line per fact: the agent's text opens no heading
@@ -134,7 +141,7 @@ def test_a_triage_result_cannot_forge_the_approval_page(flow_repo):
     flow_repo.script({"define/triage": [{"result": forged}]})
     assert flow_repo.executor(run).run_steps(phase, [step], "define")[0] == "done"
     text = (run.dir / "triage.md").read_text(encoding="utf-8")
-    assert "\n## " not in text and len(text.splitlines()) == 1 + 1 + 7  # header, blank, Summary and six facts
+    assert "\n## " not in text and len(text.splitlines()) == 1 + 1 + 8  # header, blank, Summary and seven facts
     assert text.count("\nBump:") == 1 and "Bump: major" in text and "\nBump: patch" not in text
     assert "Target version: 2.32.0evil" in text and not {"\u202e", "\u200b"} & set(text)
     page = pipeline.approval_text(flow_repo.cfg, run, "define")
@@ -151,7 +158,7 @@ def test_a_triage_result_with_no_facts_still_shows_what_is_missing(flow_repo):
     flow_repo.script({"define/triage": [{"result": {"status": "done", "summary": "no facts"}}]})
     assert flow_repo.executor(run).run_steps(phase, [step], "define")[0] == "done"
     text = (run.dir / "triage.md").read_text(encoding="utf-8")
-    assert "Target version: (not given)" in text and "Notes:" not in text
+    assert "Target version: (not given)" in text and "Current version: (not given)" in text and "Notes:" not in text
 
 
 def test_the_triage_file_is_a_run_file_the_dashboard_lists(flow_repo):
@@ -429,21 +436,26 @@ def test_feature_lane_forbid_unchanged(flow_repo):
 
 FINISH = "ship/finish"
 FIX_FINDINGS = "review/fix_findings"
-TRIAGE_FACTS = {"relationship": "direct", "target_version": "2.32.0", "bump": "minor", "method": "bump",
+TRIAGE_FACTS = {"relationship": "direct", "current_version": "2.31.0", "target_version": "2.32.0", "bump": "minor",
+                "method": "bump",
                 "release_date": "2024-05-20", "notes": ""}
 DEPENDABOT_PR = [{"number": 7, "title": "Bump requests from 2.31.0 to 2.32.0", "url": "https://github.com/a/b/pull/7"}]
 
 
-def _at_ship(flow_repo, write: dict[str, str] | None = None, patch: dict | None = None, audit: str = AUDIT):
+def _at_ship(flow_repo, write: dict[str, str] | None = None, patch: dict | None = None, audit: str = AUDIT,
+             autopilot: bool = False):
     """A vuln run started at `ship` whose `advisory_red` and `patch` ran (the patch writes `write`), with the evidence
-    a walked run shows for its verify and review steps: what `finish` audits next."""
+    a walked run shows for its verify and review steps: what `finish` audits next (and, with `autopilot`, the `ci`
+    step after it)."""
     for name, text in (("audit.py", audit), ("requirements.txt", "requests==2.31.0\n")):
         (flow_repo.root / name).write_text(text, encoding="utf-8")
     run_git(flow_repo.root, "add", "audit.py", "requirements.txt")
     run_git(flow_repo.root, "commit", "-q", "-m", "audit")
-    flow_repo.configure(patch=deep_merge(VULN_PATCH, patch or {}), edit=add_vuln_lane)
-    run = pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", {"alert": "42"},
-                         pipeline.RunOptions(from_phase="ship"))
+    flow_repo.configure(patch=deep_merge(VULN_PATCH, patch or {}), autopilot=autopilot, edit=add_vuln_lane)
+    run = pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", {"alert": "42"}, pipeline.RunOptions())
+    # `--from` past `define` is refused for a vuln run; this setup stands for the phases before `ship`, so the run
+    # goes on from there
+    run.emit("run_options", **{**(run.refresh().get("options") or {}), "from_phase": "ship"})
     flow_repo.script({PATCH: [{"write": {"requirements.txt": FIXED, **(write or {})}, **_done("bumped requests")}]})
     assert _build(flow_repo, run) == "done"
     _verified_and_reviewed(run)
@@ -601,7 +613,7 @@ def test_pr_body_security_section(flow_repo, gh_alerts, monkeypatch):
         "Severity: high",
         "Package: `requests` (pip) in `requirements.txt`",
         "Vulnerable: < 2.32.0 · patched in 2.32.0",
-        "Target: `2.32.0`",
+        "Target: `2.31.0` → `2.32.0`",
         "Alert: https://github.com/acme/app/security/dependabot/42",
         "Supersedes #7 (Dependabot)",
         f"Probe: present ({GHSA}) → cleared",
@@ -615,12 +627,16 @@ def test_the_security_section_shows_what_is_missing_and_keeps_model_text_on_one_
     run = _vuln_run(flow_repo)
     assert vuln.pr_lines(run)[4:] == ["Target: unknown", "Alert: https://github.com/acme/app/security/dependabot/42",
                                       "Probe: not cleared"]
-    forged = {**TRIAGE_FACTS, "target_version": "2.32.0 `x` ## Gates [click](https://evil.example) " + "9" * 80}
+    only_target = {**TRIAGE_FACTS, "current_version": ""}
+    run.emit("triage_rendered", key="define/triage", path=str(run.dir / "triage.md"), facts=only_target)
+    assert "Target: unknown → `2.32.0`" in vuln.pr_lines(run)
+    forged = {**TRIAGE_FACTS, "target_version": "2.32.0 `x` ## Gates [click](https://evil.example) " + "9" * 80,
+              "current_version": "2.31.0\n## Gates " + "8" * 80}
     run.emit("triage_rendered", key="define/triage", path=str(run.dir / "triage.md"), facts=forged)
     run.emit("vuln_scope", key=FINISH, code_paths=["a`b.py", "src/app.py"])
     lines = vuln.pr_lines(run)
     [target] = [line for line in lines if line.startswith("Target: ")]
-    assert target.count("`") == 2 and len(target) <= len("Target: ``") + 64
+    assert target.count("`") == 4 and len(target) <= len("Target: `` → ``") + 2 * 64
     assert lines[-1] == "Code changed outside dependency files: `ab.py`, `src/app.py`"
     assert all("\n" not in line and line == hitl.clean_fact(line) for line in lines)
     assert vuln.pr_lines(flow_repo.new_run()) == []  # a run with no alert.json has no section
@@ -669,3 +685,143 @@ def test_a_dependency_only_patch_has_no_code_change_line(flow_repo, gh_alerts):
     [scope] = flow_repo.events(run, "vuln_scope")
     assert scope["code_paths"] == []
     assert not [line for line in _section((run.dir / "pr.md").read_text(encoding="utf-8")) if "Code changed" in line]
+
+
+def test_the_probe_line_names_cleared_only_on_the_pushed_head(flow_repo, gh_alerts):
+    """`Probe: … → cleared` holds only for a passing cleared check on the tree of the head the pull request shows: a
+    clearance of another tree (an earlier commit, before a CI fix or a re-sync) says so instead."""
+    run = _vuln_run(flow_repo)
+    assert vuln.pr_lines(run, "a" * 40)[-1] == "Probe: not cleared"
+    run.emit("expectation_checked", key=RED_KEY, expect="advisory_present", ok=True, verdict="present",
+             matched=[GHSA], tree="t0", forbidden=[])
+    run.emit("expectation_checked", key=PATCH, expect="advisory_cleared", ok=True, verdict="absent", matched=[],
+             tree="t1", forbidden=[])
+    assert vuln.pr_lines(run, "t1")[-1] == f"Probe: present ({GHSA}) → cleared"
+    assert vuln.pr_lines(run, "t2")[-1] == "Probe: not re-checked on the pushed head"
+    assert vuln.pr_lines(run)[-1] == "Probe: not re-checked on the pushed head"  # no head known: never "cleared"
+    run.emit("expectation_checked", key="ship/ci", expect="advisory_cleared", ok=False, verdict="present",
+             matched=[GHSA], tree="t2", forbidden=[])
+    assert vuln.pr_lines(run, "t2")[-1] == "Probe: not re-checked on the pushed head"
+    run.emit("expectation_checked", key="ship/ci", expect="advisory_cleared", ok=True, verdict="absent", matched=[],
+             tree="t3", forbidden=[".nsprc"])
+    assert vuln.pr_lines(run, "t3")[-1] == "Probe: not re-checked on the pushed head"  # a guarded tree never counts
+    run.emit("expectation_checked", key="ship/ci", expect="advisory_cleared", ok=True, verdict="absent", matched=[],
+             tree="t2", forbidden=[])
+    assert vuln.pr_lines(run, "t2")[-1] == f"Probe: present ({GHSA}) → cleared"
+
+
+@pytest.mark.parametrize("phase", ["plan", "build", "verify", "review", "ship"])
+def test_a_vuln_run_cannot_start_past_the_triage_approval(flow_repo, gh_alerts, phase):
+    """`--from` past `define` would skip the triage and its approval (where a human decides a major bump): refused
+    before any run exists. `--from define` is the lane's own start."""
+    flow_repo.configure(patch=VULN_PATCH, edit=add_vuln_lane)
+    assert phase in flow_repo.cfg.phases
+    with pytest.raises(ValueError, match="triage"):
+        pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", {"alert": "42"}, pipeline.RunOptions(from_phase=phase))
+    runs = pack.state_dir(flow_repo.root) / "runs"
+    assert not runs.exists() or not list(runs.iterdir())
+    run = pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", {"alert": "42"},
+                         pipeline.RunOptions(from_phase="define"))
+    assert run.state["options"]["from_phase"] == "define"
+
+
+# --------------------------------------------------------------------------- pushes after finish: CI fixes, re-syncs
+
+CI_FIX = "ship/ci/fix-1"
+CI_LINK = "https://github.com/acme/repo/actions/runs/111/job/222"
+CI_FAIL = {"checks": [{"name": "backend", "state": "FAILURE", "bucket": "fail", "link": CI_LINK}]}
+CI_PASS = {"checks": [{"name": "backend", "state": "SUCCESS", "bucket": "pass", "link": CI_LINK}]}
+CI_PATCH = {"gate_sets": {"setup": []}, "ci": {"poll_s": 0, "appear_min": 0, "timeout_min": 0}}
+
+
+def _ci_checks(monkeypatch, tmp_path, *entries: dict) -> None:
+    checks = tmp_path / "checks.json"
+    checks.write_text(json.dumps(list(entries)), encoding="utf-8")
+    monkeypatch.setenv("FAKE_GH_CHECKS", str(checks))
+    monkeypatch.setenv("FAKE_GH_URL", "https://github.com/acme/repo/pull/42")
+
+
+def _gh_calls(gh_alerts) -> list[list[str]]:
+    return [json.loads(line) for line in gh_alerts.log.read_text(encoding="utf-8").splitlines()]
+
+
+def _origin_head(flow_repo, run) -> str:
+    return run_git(flow_repo.origin, "rev-parse", run.state["branch"]).strip()
+
+
+def test_a_ci_fix_that_pins_the_package_back_is_never_pushed(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    """CI fails on the upgrade; the fix session takes the easy way to green and pins the vulnerable version back.
+    The runner probes the fix commit before it pushes: the advisory is there, so the run stops with nothing pushed
+    and the pull request is never marked ready."""
+    _ci_checks(monkeypatch, tmp_path, CI_FAIL, CI_PASS)
+    run = _at_ship(flow_repo, patch=CI_PATCH, autopilot=True)
+    flow_repo.script({CI_FIX: [{"write": {"requirements.txt": "requests==2.31.0\n"}, **_done("pinned it back")}]})
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("gate_failed", "ship/ci") and GHSA in stop["summary"]
+    again = flow_repo.events(run, "expectation_checked")[-1]
+    assert (again["key"], again["verdict"], again["ok"]) == ("ship/ci", "present", False)
+    worktree = Path(run.state["worktree"])
+    assert again["tree"] == run_git(worktree, "rev-parse", "HEAD^{tree}").strip()
+    assert _origin_head(flow_repo, run) != run_git(worktree, "rev-parse", "HEAD").strip()  # the fix stayed local
+    assert run_git(flow_repo.origin, "show", f"{run.state['branch']}:requirements.txt") == FIXED
+    assert not [e for e in flow_repo.events(run, "ci_round") if e.get("action") == "fix"]
+    assert not flow_repo.events(run, "pr_marked_ready")
+    assert not [c for c in _gh_calls(gh_alerts) if c[:2] == ["pr", "ready"]]
+
+
+def test_a_ci_fix_that_keeps_the_upgrade_is_probed_pushed_and_shown_cleared(flow_repo, gh_alerts, monkeypatch,
+                                                                             tmp_path):
+    _ci_checks(monkeypatch, tmp_path, CI_FAIL, CI_PASS)
+    run = _at_ship(flow_repo, patch=CI_PATCH, autopilot=True)
+    flow_repo.script({CI_FIX: [{"write": {"app.py": "x = 1\n"}, **_done("fixed the build")}]})
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
+    worktree = Path(run.state["worktree"])
+    [probe] = [e for e in flow_repo.events(run, "expectation_checked") if e["key"] == "ship/ci"]
+    assert probe["ok"] is True and probe["tree"] == run_git(worktree, "rev-parse", "HEAD^{tree}").strip()
+    [fixed] = [e for e in flow_repo.events(run, "ci_round") if e.get("action") == "fix"]
+    assert probe["seq"] < fixed["seq"] and _origin_head(flow_repo, run) == fixed["sha"]
+    assert flow_repo.events(run, "pr_marked_ready")
+    body = (run.dir / "pr.md").read_text(encoding="utf-8")
+    assert f"Probe: present ({GHSA}) → cleared" in _section(body)
+
+
+def _target_moves(flow_repo, files: dict[str, str]) -> None:
+    fork = flow_repo.cfg.project.fork_from
+    on = run_git(flow_repo.root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    run_git(flow_repo.root, "checkout", "-q", fork)
+    for name, text in files.items():
+        (flow_repo.root / name).write_text(text, encoding="utf-8")
+    run_git(flow_repo.root, "add", *files)
+    run_git(flow_repo.root, "commit", "-q", "-m", "upstream")
+    run_git(flow_repo.root, "push", "-q", "origin", fork)
+    run_git(flow_repo.root, "checkout", "-q", on)
+
+
+def test_a_re_sync_that_takes_the_vulnerable_lockfile_is_never_pushed(flow_repo, gh_alerts, monkeypatch):
+    """GitHub calls the new pull request conflicting: the target changed the lockfile too. The sync session resolves
+    the conflict by taking the target's (vulnerable) side; the runner probes the merge before it pushes it, and
+    stops on `finish` with nothing pushed."""
+    from agentflow.sync_lane import SyncLane
+
+    run = _at_ship(flow_repo)
+    verdicts = iter(["CONFLICTING", "MERGEABLE"])
+
+    def mergeable(self, url):
+        verdict = next(verdicts)
+        if verdict == "CONFLICTING":
+            _target_moves(flow_repo, {"requirements.txt": "requests==2.31.0  # pinned upstream\n"})
+        return verdict
+
+    monkeypatch.setattr(SyncLane, "_mergeable", mergeable)
+    flow_repo.script({"ship/finish/sync-1": [{"write": {"requirements.txt": "requests==2.31.0  # pinned upstream\n"},
+                                              **_done("took the target's pin")}]})
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("gate_failed", FINISH) and GHSA in stop["summary"]
+    [synced] = flow_repo.events(run, "base_synced")
+    assert synced["conflicts"] == ["requirements.txt"]
+    again = flow_repo.events(run, "expectation_checked")[-1]
+    assert (again["key"], again["verdict"], again["seq"] > synced["seq"]) == (FINISH, "present", True)
+    assert _origin_head(flow_repo, run) != synced["sha"]  # the merge stayed local
+    assert run_git(flow_repo.origin, "show", f"{run.state['branch']}:requirements.txt") == FIXED
