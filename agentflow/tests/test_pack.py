@@ -459,3 +459,55 @@ def test_lessons_paths_read_the_main_checkout_not_a_worktree(tmp_git, git):
     assert engine == pack.ENGINE_LESSONS and engine.is_file()
     assert pack_file == (tmp_git / pack.LESSONS_FILE).resolve()
     assert pack.lessons_paths(wt / "src") == (engine, pack_file)
+
+
+# ---- the vuln block and a probe gate's exit codes
+
+
+@pytest.mark.parametrize("patch,where", [
+    ({"vuln": {"probe": "nope"}}, "vuln.probe"),
+    ({"vuln": {"min_severity": "urgent"}}, "vuln.min_severity"),
+    ({"vuln": {"source": "snyk"}}, "vuln.source"),
+    ({"vuln": {"dependency_files": [""]}}, "vuln.dependency_files"),
+    ({"vuln": {"forbid": ["ok", " "]}}, "vuln.forbid"),
+    ({"gates": {"unit": {"run": "true", "ok_exit": []}}}, "gates.unit.ok_exit"),
+    ({"gates": {"unit": {"run": "true", "ok_exit": [0], "found_exit": [0]}}}, "gates.unit.found_exit"),
+    ({"gates": {"unit": {"run": "true", "found_exit": [127]}}}, "gates.unit.found_exit"),
+    ({"gates": {"unit": {"run": "true", "ok_exit": [126]}}}, "gates.unit.ok_exit"),
+    ({"gates": {"unit": {"run": "true", "ok_exit": [256]}}}, "gates.unit.ok_exit"),
+    ({"gates": {"unit": {"run": "true", "found_exit": [-1]}}}, "gates.unit.found_exit"),
+])
+def test_validate_refuses_bad_vuln_config(tmp_cfg, repo_root, patch, where):
+    path = tmp_cfg(patch)
+    issues = validate(load_config(path), path.parent.parent)
+    assert any(i.level == "error" and i.path == where for i in issues), [(i.level, i.path) for i in issues]
+
+
+def test_validate_accepts_a_vuln_probe_and_exit_codes(tmp_cfg):
+    path = tmp_cfg({"vuln": {"probe": "audit", "min_severity": "medium", "source": "", "forbid": ["x/**"]},
+                    "gates": {"audit": {"run": "true", "ok_exit": [0, 3], "found_exit": [1, 2]}}})
+    issues = validate(load_config(path), path.parent.parent)
+    assert not [i for i in issues if i.level == "error"]
+
+
+def test_validate_accepts_advisory_expectations(tmp_cfg):
+    def patch(data: dict) -> None:
+        data["phases"]["build"]["steps"].append(
+            {"id": "advisory_red", "lanes": ["bug"], "type": "gate", "gates": "verify", "expect": "advisory_present"})
+        data["phases"]["build"]["steps"].append(
+            {"id": "advisory_green", "lanes": ["bug"], "type": "gate", "gates": "verify", "expect": "advisory_cleared"})
+        data["policy"]["obligations"]["cleared"] = {"lanes": ["bug"], "require": ["expect:advisory_cleared"]}
+
+    path = tmp_cfg(patch)
+    issues = validate(load_config(path), path.parent.parent)
+    assert not [i for i in issues if i.level == "error"], [(i.path, i.message) for i in issues if i.level == "error"]
+
+
+def test_validate_refuses_an_unknown_expectation(tmp_cfg):
+    def patch(data: dict) -> None:
+        data["phases"]["build"]["steps"].append(
+            {"id": "x", "lanes": ["bug"], "type": "gate", "gates": "verify", "expect": "advisory_gone"})
+
+    path = tmp_cfg(patch)
+    issues = validate(load_config(path), path.parent.parent)
+    assert any(i.level == "error" and i.path.endswith(".expect") for i in issues)

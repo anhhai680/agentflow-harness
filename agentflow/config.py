@@ -23,6 +23,7 @@ from typing import Any, Literal
 import yaml
 
 from agentflow import layers, pack
+from agentflow.vuln import SEVERITIES as VULN_SEVERITIES
 
 KNOWN_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 SIZER_STEP_ID = re.compile(r"size(?:-\d+)?")  # the last part of a sizer's key (`sizing.is_sizer_key`): no step's id
@@ -213,7 +214,9 @@ RUNNER_FLAGS = {
 # could widen it.
 READ_ONLY_FLAGS = ("--tools", "--settings", "--agents", "--agent", "--plugin-dir")
 PERMISSION_MODES = ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions")
-EXPECT_VALUES = ("red", "green")
+ADVISORY_PRESENT = "advisory_present"  # a vuln step's expectation: the probe's output still names the alert's advisory
+ADVISORY_CLEARED = "advisory_cleared"  # ...and no longer does
+EXPECT_VALUES = ("red", "green", ADVISORY_PRESENT, ADVISORY_CLEARED)
 ON_FAIL_VALUES = ("block",)
 CONFORMANCE_FAILED = "conformance_failed"  # the audit at `finish` found an obligation with no evidence (`block` mode)
 RECONCILE_CHANGED = "reconcile_changed_conditions"  # a reconcile edit changed which steps of its phase run
@@ -420,23 +423,43 @@ class IssuePolicy:
     lane_labels: dict[str, str] = field(default_factory=lambda: {"bug": "bug"})  # issue label: lane, first match wins
 
 
+VULN_SOURCES = ("dependabot", "")
+SHELL_FAILURE_EXITS = (126, 127)  # the shell's "found but cannot run" and "not found": never a scanner's own answer
+DEPENDENCY_FILES = (
+    "**/pyproject.toml", "**/uv.lock", "**/requirements*.txt", "**/package.json", "**/pnpm-lock.yaml",
+    "**/package-lock.json", "**/yarn.lock", "**/go.mod", "**/go.sum", "**/Cargo.toml", "**/Cargo.lock", "**/Gemfile",
+    "**/Gemfile.lock")
+
+
+@dataclass
+class VulnPolicy:
+    source: str = "dependabot"  # `dependabot`, or "" (no alert intake: the lane refuses `--alert`)
+    min_severity: str = "low"  # alerts below it are refused at intake and not synced
+    probe: str = ""  # the gate whose output must name the advisory before the patch and not after; "" refuses the lane
+    sync: bool = False  # true: open alerts become Backlog cards
+    dependency_files: tuple[str, ...] = DEPENDENCY_FILES  # globs of the files a patch may change
+    forbid: tuple[str, ...] = ()  # added to `vuln.ENGINE_FORBID`, never in place of it
+
+
 FLOOR_ID = "engine_floor"  # the obligation code adds after the layers merge: no layer can remove or replace it
+ADVISORY_FLOOR_ID = "advisory_cleared"  # the vuln lane's floor, added the same way, just before FLOOR_ID
+FLOOR_IDS = (ADVISORY_FLOOR_ID, FLOOR_ID)
 EVIDENCE_KINDS = ("gates", "step", "approval", "expect")
 ENFORCE_MODES = ("report", "block")
-EXPECT_EVIDENCE = ("red_then_green",)
+EXPECT_EVIDENCE = ("red_then_green", ADVISORY_CLEARED)
 
 
 @dataclass(frozen=True)
 class Evidence:
     kind: str  # one of EVIDENCE_KINDS
-    arg: str  # a gate set, a step id, a phase name, or `red_then_green`
+    arg: str  # a gate set, a step id, a phase name, or an `EXPECT_EVIDENCE` value
 
     def __str__(self) -> str:
         return f"{self.kind}:{self.arg}"
 
 
 def parse_evidence(text: str) -> Evidence | None:
-    """`kind:arg` as an `Evidence`; None for an unknown kind, an empty arg, or an `expect:` other than `red_then_green`."""
+    """`kind:arg` as an `Evidence`; None for an unknown kind, an empty arg, or an `expect:` that is not in `EXPECT_EVIDENCE`."""
     kind, sep, arg = text.partition(":")
     if not sep or kind not in EVIDENCE_KINDS or not arg.strip() or arg != arg.strip():
         return None
@@ -598,6 +621,8 @@ class Gate:
     resource: str | None = None  # gates that share a resource never run at the same time, in a run or across runs
     inputs: list[str] = field(default_factory=list)  # globs of the files the gate reads: its pass holds while none of them changes
     affected: Affected | None = None  # the command a `gate_tier: affected` step runs instead, on the files it changed
+    ok_exit: tuple[int, ...] = (0,)  # a probe gate: the exit codes of a clean scan that found nothing
+    found_exit: tuple[int, ...] = (1,)  # a probe gate: the exit codes of a clean scan that found something
 
 
 @dataclass
@@ -709,6 +734,7 @@ class Config:
     merged: dict = field(default_factory=dict)  # the layers merged, before `@` resolution (`raw` is after it)
     layer_origins: dict[tuple[str, ...], str] = field(default_factory=dict)  # each leaf of `merged`: its layer's name
     issues: IssuePolicy = field(default_factory=IssuePolicy)  # what a run started from an issue does on GitHub
+    vuln: VulnPolicy = field(default_factory=VulnPolicy)  # the vuln lane: where its alerts come from and what it may touch
     policy: Policy = field(default_factory=Policy)  # the obligations a finished run must show evidence for
     route: Route = field(default_factory=Route)  # how much ceremony a run's route gets (`route.py` reads it)
 
@@ -1216,6 +1242,16 @@ def _gate_affected(value: Any, path: str, inputs: list[str]) -> Affected | None:
     return Affected(run=_require(value, "run", here, str), paths=list(paths) if paths is not None else list(inputs or ["**"]))
 
 
+def _exit_codes(raw: dict, key: str, path: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    """A probe gate's `ok_exit` or `found_exit`: a list of ints. Which ints are allowed is for `validate` to say."""
+    value = raw.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, list) or not all(isinstance(v, int) and not isinstance(v, bool) for v in value):
+        raise ConfigError(_join(path, key), "expected a list of whole numbers")
+    return tuple(value)
+
+
 def _build_gates(data: dict) -> dict[str, Gate]:
     out: dict[str, Gate] = {}
     for name, raw in data.items():
@@ -1234,6 +1270,8 @@ def _build_gates(data: dict) -> dict[str, Gate]:
             resource=_optional(raw, "resource", path, str, None),
             inputs=inputs,
             affected=_gate_affected(raw.get("affected"), path, inputs),
+            ok_exit=_exit_codes(raw, "ok_exit", path, (0,)),
+            found_exit=_exit_codes(raw, "found_exit", path, (1,)),
         )
     return out
 
@@ -1486,9 +1524,8 @@ def _switched_off(project: dict, merged: dict) -> tuple[str, ...]:
         return found if isinstance(found, dict) else {}
 
     engine, kept = entries(layers.base_layers(project.get("starter"))[0].data), entries(merged)
-    ids = [key for key in engine if key != FLOOR_ID and key not in kept]
-    if FLOOR_ID in entries(project) and entries(project)[FLOOR_ID] is None:
-        ids.append(FLOOR_ID)
+    ids = [key for key in engine if key not in FLOOR_IDS and key not in kept]
+    ids.extend(floor for floor in FLOOR_IDS if floor in entries(project) and entries(project)[floor] is None)
     return tuple(ids)
 
 
@@ -1560,7 +1597,7 @@ def _build_policy(policy: dict, disabled: tuple[str, ...]) -> Policy:
         path = f"policy.obligations.{key}"
         if not isinstance(key, str):
             raise ConfigError("policy.obligations", f"an obligation id is text, got {key!r}")
-        if key == FLOOR_ID:
+        if key in FLOOR_IDS:
             continue
         if not isinstance(entry, dict):
             raise ConfigError(path, "expected a mapping with `require` (and optionally `when` and `lanes`)")
@@ -1571,6 +1608,8 @@ def _build_policy(policy: dict, disabled: tuple[str, ...]) -> Policy:
             when=_optional(entry, "when", path, str, None),
             lanes=tuple(_string_list(entry.get("lanes", []), f"{path}.lanes")),
         )
+    out[ADVISORY_FLOOR_ID] = Obligation(ADVISORY_FLOOR_ID, (Evidence("expect", ADVISORY_CLEARED),),
+                                        lanes=("vuln",))
     out[FLOOR_ID] = Obligation(FLOOR_ID, (Evidence("gates", "verify"),))
     return Policy(enforce=_optional(policy, "enforce", "policy", str, "report"), obligations=out, disabled=disabled)
 
@@ -1585,6 +1624,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
     context = _require(raw, "context", "", dict)
     memory = _optional(raw, "memory", "", dict, {})
     issues = _optional(raw, "issues", "", dict, {})
+    vuln = _optional(raw, "vuln", "", dict, {})
     policy = _optional(raw, "policy", "", dict, {})
     guardrails = _require(raw, "guardrails", "", dict)
     override = _optional(guardrails, "constraint_override", "guardrails", dict, {})
@@ -1653,6 +1693,14 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             sync_label=_optional(issues, "sync_label", "issues", str, ""),
             sync_lane=_optional(issues, "sync_lane", "issues", str, "feature"),
             lane_labels=_string_map(issues.get("lane_labels", {"bug": "bug"}), "issues.lane_labels"),
+        ),
+        vuln=VulnPolicy(
+            source=_optional(vuln, "source", "vuln", str, "dependabot"),
+            min_severity=_optional(vuln, "min_severity", "vuln", str, "low"),
+            probe=_optional(vuln, "probe", "vuln", str, ""),
+            sync=_optional(vuln, "sync", "vuln", bool, False),
+            dependency_files=tuple(_string_list(vuln.get("dependency_files", list(DEPENDENCY_FILES)), "vuln.dependency_files")),
+            forbid=tuple(_string_list(vuln.get("forbid", []), "vuln.forbid")),
         ),
         gates=_build_gates(_require(raw, "gates", "", dict)),
         gate_sets={name: _string_list(members, f"gate_sets.{name}") for name, members in gate_sets.items()},
@@ -2811,6 +2859,34 @@ class _Validator:
             if key not in USAGE_KEYS:
                 self.error(f"usage.{key}", "unknown usage key")
 
+    def vuln(self) -> None:
+        """`vuln`: where the vuln lane's alerts come from, how severe, which gate probes for the advisory and which
+        files a patch may change; and each gate's `ok_exit` and `found_exit`, which only a probe reads."""
+        pol = self.cfg.vuln
+        if pol.source not in VULN_SOURCES:
+            self.error("vuln.source", "must be `dependabot`, or `\"\"` for no alert intake")
+        if pol.min_severity not in VULN_SEVERITIES:
+            self.error("vuln.min_severity", f"must be one of {', '.join(VULN_SEVERITIES)}")
+        if pol.probe and pol.probe not in self.cfg.gates:
+            self.error("vuln.probe", f"{pol.probe!r} is not a gate; known: {', '.join(self.cfg.gates) or 'none'}")
+        for key in ("dependency_files", "forbid"):
+            for i, glob in enumerate(getattr(pol, key)):
+                if not glob.strip():
+                    self.error(f"vuln.{key}", f"entry {i} is empty: each is a glob of repository paths")
+        for name, gate in self.cfg.gates.items():
+            path = f"gates.{name}"
+            if not gate.ok_exit:
+                self.error(_join(path, "ok_exit"), "needs at least one exit code: a clean scan that found nothing")
+            for key in ("ok_exit", "found_exit"):
+                for code in getattr(gate, key):
+                    if not 0 <= code <= 255 or code in SHELL_FAILURE_EXITS:
+                        self.error(_join(path, key), f"{code} is not an exit code a scanner can report: use 0 to 255, "
+                                   "not 126 or 127 (the shell's 'cannot run' and 'not found')")
+            shared = sorted(set(gate.ok_exit) & set(gate.found_exit))
+            if shared:
+                self.error(_join(path, "found_exit"), f"{', '.join(map(str, shared))} is also in ok_exit: a code means "
+                           "either 'found nothing' or 'found something'")
+
     def issue_sync(self, pol: IssuePolicy) -> None:
         """`issues.sync_label`, `sync_lane`, `lane_labels`: which open issues the Backlog shows and their lanes."""
         if _label_problem(pol.sync_label):
@@ -2859,16 +2935,20 @@ class _Validator:
             where = f"policy.obligations.{key}"
             if key == FLOOR_ID:
                 self.add("warning", where, f"{FLOOR_ID} cannot be removed: it is the obligation `gates:verify`, and it stays")
+            elif key == ADVISORY_FLOOR_ID:
+                self.add("warning", where, f"{ADVISORY_FLOOR_ID} cannot be removed: it is the vuln lane's obligation "
+                         "`expect:advisory_cleared`, and it stays")
             else:
                 self.add("warning", where, f"the obligation '{key}' is switched off (`null`), so no run shows evidence for it")
-        if FLOOR_ID in entries:
-            self.add("warning", f"policy.obligations.{FLOOR_ID}",
-                     f"{FLOOR_ID} cannot be removed or changed: this entry is ignored")
+        for floor in FLOOR_IDS:
+            if floor in entries:
+                self.add("warning", f"policy.obligations.{floor}",
+                         f"{floor} cannot be removed or changed: this entry is ignored")
         lane_steps: dict[str, set[str]] = {}
         for lane in cfg.lanes:
             lane_steps[lane] = _lane_step_ids([s for phase in cfg.phases.values() for s in phase.steps], lane)
         for key, ob in pol.obligations.items():
-            if key == FLOOR_ID:
+            if key in FLOOR_IDS:
                 continue
             where = f"policy.obligations.{key}"
             entry = entries.get(key)
@@ -2894,7 +2974,7 @@ class _Validator:
                 at = f"{where}.require[{i}]"
                 evidence = parse_evidence(text) if isinstance(text, str) else None
                 if evidence is None:
-                    self.error(at, f"'{text}' is not evidence: use gates:<set>, step:<id>, approval:<phase> or expect:red_then_green")
+                    self.error(at, f"'{text}' is not evidence: use gates:<set>, step:<id>, approval:<phase>, expect:red_then_green or expect:advisory_cleared")
                 elif evidence.kind == "gates" and evidence.arg not in cfg.gate_sets:
                     self.error(at, f"'{evidence.arg}' is not a gate set{off}")
                 elif evidence.kind == "step" and applicable and not any(evidence.arg in lane_steps[lane] for lane in applicable):
@@ -3356,6 +3436,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.context()
     v.memory()
     v.issue_policy()
+    v.vuln()
     v.preflight()
     v.watchdog()
     v.parallel()

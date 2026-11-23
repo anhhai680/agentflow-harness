@@ -7,7 +7,9 @@ import pytest
 import yaml
 
 from agentflow import pack
-from agentflow.config import CACHE_TTLS, ConfigError, Evidence, Issue, Usage, load_config, parse_evidence, validate, validate_usage
+from agentflow.config import (
+    CACHE_TTLS, ConfigError, Evidence, Issue, Usage, VulnPolicy, load_config, parse_evidence, validate, validate_usage,
+)
 from agentflow.flow import main, repo_root
 from conftest import PYTHON_CONFIG, with_doubt
 
@@ -1678,7 +1680,7 @@ def test_a_null_policy_or_obligations_reports_every_default_it_switches_off(tmp_
 
     path = tmp_cfg(apply)
     cfg = load_config(path)
-    assert list(cfg.policy.obligations) == ["engine_floor"]
+    assert list(cfg.policy.obligations) == ["advisory_cleared", "engine_floor"]  # the two floors, whatever the layers say
     assert cfg.policy.disabled == ("verified", "reviewed", "plan_approved", "red_then_green")
     found = {i.path: i for i in validate(cfg, path.parent.parent) if i.level == "warning"}
     for key in cfg.policy.disabled:
@@ -3089,3 +3091,60 @@ def test_ramp_samples_is_a_whole_number_from_3_to_50(tmp_cfg, n):
 @pytest.mark.parametrize("n", [3, 5, 50])
 def test_ramp_samples_accepts_its_bounds(tmp_cfg, n):
     assert ramp_errors(tmp_cfg, {"ramp_samples": n}) == []
+
+
+# ---- the vuln block, probe exit codes and the advisory floor
+
+
+def test_vuln_defaults(cfg):
+    assert cfg.vuln == VulnPolicy()  # probe "" by default: `run vuln` refuses to start until a pack names one
+    assert cfg.vuln.probe == "" and cfg.vuln.source == "dependabot" and cfg.vuln.min_severity == "low"
+    assert cfg.vuln.sync is False and cfg.vuln.forbid == ()
+    assert "**/pyproject.toml" in cfg.vuln.dependency_files and "**/Cargo.lock" in cfg.vuln.dependency_files
+
+
+def test_vuln_block_loads(tmp_cfg):
+    cfg = load_config(tmp_cfg({"vuln": {"probe": "eval", "min_severity": "high", "sync": True, "forbid": ["a/**"]}}))
+    assert (cfg.vuln.probe, cfg.vuln.min_severity, cfg.vuln.sync, cfg.vuln.forbid) == ("eval", "high", True, ("a/**",))
+
+
+def test_advisory_floor_is_added_for_the_vuln_lane(cfg):
+    ob = cfg.policy.obligations["advisory_cleared"]
+    assert ob.require == (Evidence("expect", "advisory_cleared"),) and ob.lanes == ("vuln",)
+    assert list(cfg.policy.obligations)[-2:] == ["advisory_cleared", "engine_floor"]
+
+
+def test_advisory_cleared_is_evidence_and_advisory_present_is_an_expectation():
+    assert parse_evidence("expect:advisory_cleared") == Evidence("expect", "advisory_cleared")
+    assert parse_evidence("expect:advisory_present") is None
+
+
+def test_advisory_floor_cannot_be_nulled(tmp_cfg):
+    path = tmp_cfg(_policy({"obligations": {"advisory_cleared": None}}))  # a literal null: a patch dict would delete the key
+    cfg = load_config(path)
+    assert cfg.policy.obligations["advisory_cleared"].lanes == ("vuln",)
+    found = [i for i in validate(cfg, path.parent.parent) if i.path == "policy.obligations.advisory_cleared"]
+    assert found and all(i.level == "warning" for i in found)
+    assert any("cannot be removed" in i.message for i in found)
+
+
+def test_advisory_floor_cannot_be_replaced(tmp_cfg):
+    path = tmp_cfg({"policy": {"obligations": {"advisory_cleared": {"lanes": ["feature"], "require": ["step:verify"]}}}})
+    cfg = load_config(path)
+    ob = cfg.policy.obligations["advisory_cleared"]
+    assert ob.require == (Evidence("expect", "advisory_cleared"),) and ob.lanes == ("vuln",)
+    found = [i for i in validate(cfg, path.parent.parent) if i.path == "policy.obligations.advisory_cleared"]
+    assert [i.level for i in found] == ["warning"] and "cannot be removed or changed" in found[0].message
+
+
+def test_gate_exit_codes_parse(tmp_cfg):
+    cfg = load_config(tmp_cfg({"gates": {"scan": {"run": "x", "ok_exit": [0], "found_exit": []},
+                                         "plain": {"run": "x"}}}))
+    assert (cfg.gates["scan"].ok_exit, cfg.gates["scan"].found_exit) == ((0,), ())
+    assert (cfg.gates["plain"].ok_exit, cfg.gates["plain"].found_exit) == ((0,), (1,))
+
+
+@pytest.mark.parametrize("value", ["0", 0, [True], ["0"], [1.5]])
+def test_gate_exit_codes_must_be_lists_of_ints(tmp_cfg, value):
+    with pytest.raises(ConfigError, match="ok_exit"):
+        load_config(tmp_cfg({"gates": {"scan": {"run": "x", "ok_exit": value}}}))
