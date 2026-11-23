@@ -1,7 +1,7 @@
 """`agentflow doctor`: whether this machine can run the pack, checked before a run spends money.
 
-It looks at the agent CLIs and their logins, `gh`, Dependabot alert access (when `vuln.source` is `dependabot`, one
-read-only `gh api` call), the `origin` remote, Docker (when a gate runs it), the state dir and the programs each gate
+It looks at the agent CLIs and their logins, `gh`, Dependabot alert access (when the pack can run the `vuln` lane: `vuln` in
+`lanes`, `vuln.source` `dependabot` and a `vuln.probe`; one read-only `gh api` call), the `origin` remote, Docker (when a gate runs it), the state dir and the programs each gate
 and the vuln probe run. Every external command is bounded by `TIMEOUT_S`. It changes nothing except
 creating the state dir and a probe file there that it removes at once.
 """
@@ -218,7 +218,8 @@ def _dependabot_check(repo: Path) -> Check:
     if code == 0:
         return Check("dependabot alerts", "ok", "Dependabot alerts readable")
     if "HTTP 403" in output:
-        return Check("dependabot alerts", "fail", _last_line(output) or "HTTP 403", "grant the token Dependabot alerts: read")
+        return Check("dependabot alerts", "fail", _last_line(output) or "HTTP 403", "the token needs \"Dependabot alerts: read\", or this may be a rate limit or SSO enforcement (see the detail); "
+                     "`vuln.source: \"\"` turns this check off")
     if "HTTP 404" in output:
         return Check("dependabot alerts", "warn", "Dependabot alerts are off for this repository, or the token cannot see them",
                      "turn on Dependabot alerts in the repository's security settings, or set `vuln.source: \"\"`")
@@ -379,7 +380,7 @@ def _gate_checks(cfg: Config) -> tuple[list[Check], bool]:
 
 
 def run_checks(cfg: Config, repo: Path) -> list[Check]:
-    """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), Dependabot alerts (with `vuln.source: dependabot`), the remote, Docker (when a gate runs it), the state dir, keeping the
+    """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), Dependabot alerts (when the pack can run the vuln lane), the remote, Docker (when a gate runs it), the state dir, keeping the
     machine awake, the inherited environment, the gates and the vuln probe."""
     gate_checks, uses_docker = _gate_checks(cfg)
     checks = [*_agent_checks(cfg, repo)]
@@ -388,7 +389,7 @@ def run_checks(cfg: Config, repo: Path) -> list[Check]:
     checks.append(_gh_check(repo))
     if cfg.issues.sync_label and shutil.which("gh"):
         checks.append(_gh_fields_check(repo))
-    if cfg.vuln.source == "dependabot" and shutil.which("gh"):
+    if "vuln" in cfg.lanes and cfg.vuln.source == "dependabot" and cfg.vuln.probe and shutil.which("gh"):
         checks.append(_dependabot_check(repo))
     checks.append(_remote_check(repo))
     if uses_docker:
