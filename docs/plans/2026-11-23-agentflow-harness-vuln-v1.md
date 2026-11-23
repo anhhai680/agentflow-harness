@@ -77,13 +77,13 @@ itself is data: new steps tagged `lanes: [vuln]` in `defaults/config.yaml`.
   - `ALERT` lives in `agentflow/tests/conftest.py` as `VULN_ALERT`, a plain dict that tests import, because Tasks 4–6 use it from other test files. It is a dict shaped like GitHub's REST reply. It holds `number`, `state`, `html_url`,
     `dependency.package.{ecosystem,name}`, `dependency.manifest_path`, `security_advisory.{ghsa_id,cve_id,summary,description,severity,identifiers,references}`
     and `security_vulnerability.{vulnerable_version_range,first_patched_version.identifier,severity}`. Use
-    `GHSA-abcd-2345-wxyz` and `CVE-2024-1234`.
+    `GHSA-cfgh-2345-vwxj` and `CVE-2024-1234`.
 
 ```python
 def test_parse_alert_keeps_validated_facts():
     a = vuln.parse_alert(ALERT)
     assert (a.number, a.ecosystem, a.package, a.manifest) == (42, "pip", "requests", "requirements.txt")
-    assert a.ids == ("GHSA-abcd-2345-wxyz", "CVE-2024-1234") and a.patched == "2.32.0" and a.severity == "high"
+    assert a.ids == ("GHSA-cfgh-2345-vwxj", "CVE-2024-1234") and a.patched == "2.32.0" and a.severity == "high"
 
 @pytest.mark.parametrize("path,value", [
     (("dependency", "package", "name"), "x; rm -rf ~"), (("dependency", "package", "name"), "a b"),
@@ -102,16 +102,16 @@ def test_siblings_same_package_and_manifest_open_only():
     # same eco/package/manifest + open → kept; other manifest, other package, dismissed → dropped; primary first
 
 @pytest.mark.parametrize("code,out,expected", [
-    (1, "Found GHSA-abcd-2345-wxyz in requests", ("present", ["GHSA-abcd-2345-wxyz"])),
+    (1, "Found GHSA-cfgh-2345-vwxj in requests", ("present", ["GHSA-cfgh-2345-vwxj"])),
     (0, "No known vulnerabilities found", ("absent", [])),
     (1, "Found CVE-2024-9999 in urllib3", ("absent", [])),          # found something else: clean scan
     (1, "Traceback (most recent call last): boom", ("failed", [])),  # found-exit but no id: a crash
-    (127, "pip-audit: not found", ("failed", [])), (None, "GHSA-abcd-2345-wxyz", ("failed", [])),
-    (0, "", ("failed", [])), (2, "GHSA-abcd-2345-wxyz", ("failed", [])),
+    (127, "pip-audit: not found", ("failed", [])), (None, "GHSA-cfgh-2345-vwxj", ("failed", [])),
+    (0, "", ("failed", [])), (2, "GHSA-cfgh-2345-vwxj", ("failed", [])),
     (1, "see CVE-2024-12345", ("absent", [])),                        # not CVE-2024-1234
-    (1, "https://x/GHSA-abcd-2345-wxyz-extra and CVE-2024-9", ("failed", []))])  # no whole-token id at all: a found-exit naming nothing
+    (1, "https://x/GHSA-cfgh-2345-vwxj-extra and CVE-2024-9", ("failed", []))])  # no whole-token id at all: a found-exit naming nothing
 def test_judge(code, out, expected):
-    assert vuln.judge(code, out, ["GHSA-abcd-2345-wxyz", "CVE-2024-1234"], [0], [1]) == expected
+    assert vuln.judge(code, out, ["GHSA-cfgh-2345-vwxj", "CVE-2024-1234"], [0], [1]) == expected
 
 def test_gate_result_carries_exit_code(tmp_path):  # run_gates on a `exit 3` gate → result.exit_code == 3; timeout → None
 ```
@@ -324,7 +324,7 @@ def test_prompts_point_at_the_alert_file():
 ```python
 def test_alert_intake_writes_data_files_and_groups_siblings(flow_repo, gh_alerts): ...
     # alert.json ids = union of 42 and sibling 43 (same manifest), 44 (other manifest) excluded;
-    # alert.md starts with intake.DATA_NOTE; slug == "requests-ghsa-abcd-2345-wxyz"
+    # alert.md starts with intake.DATA_NOTE; slug == "requests-ghsa-cfgh-2345-vwxj"
 @pytest.mark.parametrize("change,message", [
     ({"state": "dismissed"}, "is dismissed"), ({"first_patched_version": None}, "no patched version"),
     ({"severity": "low"}, "below vuln.min_severity")])
@@ -397,14 +397,14 @@ def test_pr_list_failure_drops_only_the_warning(flow_repo, gh_alerts): ...  # FA
 
 - [ ] **Step 1: Write the failing tests.**
   - The tests use `flow_repo.configure(patch=VULN_PATCH, edit=add_vuln_lane)` and commit `deps.txt`
-    (`requests==2.31.0`) and `audit.py`. `audit.py` prints `GHSA-abcd-2345-wxyz` and exits 1 while `deps.txt` is
+    (`requests==2.31.0`) and `audit.py`. `audit.py` prints `GHSA-cfgh-2345-vwxj` and exits 1 while `deps.txt` is
     below 2.32.0, and prints `No known vulnerabilities found` and exits 0 otherwise.
   - The fake agent's `patch` act writes `deps.txt` with 2.32.0.
 
 ```python
 def test_happy_path_red_patch_cleared(flow_repo, gh_alerts): ...
     # events: expectation_checked advisory_present ok (matched GHSA) before any agent call of build/patch,
-    # then advisory_cleared ok; build/patch committed "Patch requests-ghsa-abcd-2345-wxyz"
+    # then advisory_cleared ok; build/patch committed "Patch requests-ghsa-cfgh-2345-vwxj"
 def test_not_reproduced_stops_before_patch(flow_repo, gh_alerts): ...  # deps already 2.32.0 → stop kind, no build/patch call
 @pytest.mark.parametrize("script", ["import sys; sys.exit(127)", "import sys; print('Traceback boom'); sys.exit(1)",
                                     "pass", "import time; time.sleep(999)"])
