@@ -1783,12 +1783,77 @@ def test_a_cli_run_for_the_package_holds_the_card_and_a_cancel_frees_it(abk, mon
     assert abk.cards()["alert:42"]["status"] == "ready"
 
 
-def test_a_run_without_readable_alert_facts_holds_nothing(abk, monkeypatch):
+def test_a_failed_run_frees_the_card(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)
+    assert abk.cards()["alert:42"]["status"] == "in_progress"
+    run.emit("run_failed", reason="the fix did not build")
+    assert abk.cards()["alert:42"]["status"] == "ready"
+
+
+def test_a_done_run_holds_a_group_only_while_one_of_its_alerts_is_still_open(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)
+    run.emit("run_finished")  # its pull request is open: alert 42 is still open, so the fix has not landed
+    card = abk.cards()["alert:42"]
+    assert card["status"] == "in_progress" and run.id in card["note"]
+    with pytest.raises(Refused, match="holds requests"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:42")
+    # the fix merged and a later advisory for the same package and manifest opened: the done run is history
+    abk.alerts.write([_alert(50)])
+    abk.refresh()
+    assert abk.cards()["alert:50"]["status"] == "ready"
+    assert backlog.begin_start(abk.cfg, abk.root, "alert:50").params == {"alert": "50"}
+
+
+def test_a_live_run_holds_the_package_in_the_manifest_whatever_its_alerts(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)
+    abk.alerts.write([_alert(50)])  # 42 is gone from the listing, but the run is still working on requests
+    abk.refresh()
+    card = abk.cards()["alert:50"]
+    assert card["status"] == "in_progress" and run.id in card["note"]
+
+
+def test_the_note_names_a_live_run_before_a_finished_one_and_the_newest_of_each(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    old = test_vuln._start(abk.fr)
+    old.emit("run_finished")
+    assert run_id_in_note(abk) == old.id
+    live = test_vuln._start(abk.fr)  # a second run for the same group, live
+    assert run_id_in_note(abk) == live.id
+    live.emit("run_finished")  # both finished: the newest holds the name
+    assert run_id_in_note(abk) == live.id
+
+
+def run_id_in_note(board) -> str:
+    return board.cards()["alert:42"]["note"].split()[1]
+
+
+def test_each_vuln_runs_alert_json_is_read_once_per_snapshot(abk, monkeypatch):
+    abk.alerts.write([_alert(42), OTHER_MANIFEST, _alert(60, **{"dependency.package.name": "flask"}),
+                      _alert(61, **{"dependency.package.name": "django"})])
+    abk.refresh()
+    test_vuln._start(abk.fr)
+    reads = []
+    real = backlog.vuln.read_alert
+    monkeypatch.setattr(backlog.vuln, "read_alert", lambda run_dir: reads.append(run_dir) or real(run_dir))
+    assert len(abk.cards()) >= 4
+    assert len(reads) == 1  # four groups, one vuln run
+
+
+def test_a_run_without_readable_alert_facts_holds_by_its_started_alert_only_while_live(abk, monkeypatch):
     abk.alerts.write([_alert(42)])
     abk.refresh()
     run = test_vuln._start(abk.fr)
     (run.dir / "alert.json").write_text("{not json", encoding="utf-8")
-    assert abk.cards()["alert:42"]["status"] == "ready"
+    assert abk.cards()["alert:42"]["status"] == "in_progress"  # live, and started for alert 42
+    run.emit("run_finished")
+    assert abk.cards()["alert:42"]["status"] == "ready"  # done, and its facts say nothing: it holds nothing
 
 
 def test_an_alert_start_spawns_the_vuln_lane_and_a_started_card_is_held_by_its_run(abk, monkeypatch):
@@ -1796,9 +1861,10 @@ def test_an_alert_start_spawns_the_vuln_lane_and_a_started_card_is_held_by_its_r
     abk.refresh()
     assert abk.start("alert:42")
     assert abk.spawn.calls[0]["lane"] == "vuln" and abk.spawn.calls[0]["params"] == {"alert": "42"}
-    assert abk.cards()["alert:42"]["status"] == "ready"  # the spawner's run has no alert.json, so it holds no group
-    with pytest.raises(Refused, match="already has a live run"):
-        abk.start("alert:42")  # but a live run of alert 42 still clashes
+    # the spawner's run has no alert.json, but it is live and its alert is in the group: the card says so, as the 409 does
+    assert abk.cards()["alert:42"]["status"] == "in_progress"
+    with pytest.raises(Refused, match="holds requests|already has a live run"):
+        abk.start("alert:42")
 
 
 def test_an_alert_start_that_fails_keeps_its_reason(abk, monkeypatch):

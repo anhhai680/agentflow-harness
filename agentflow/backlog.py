@@ -682,20 +682,44 @@ def _synced_alerts(cfg: Config, state: dict) -> list[dict]:
     return [g for g in groups if g and vuln.severity_at_least(g["severity"], cfg.vuln.min_severity)]
 
 
-def _alert_holder(group: dict, runs: list[Run]) -> Run | None:
-    """The vuln run that holds `group`: one that `module_queue.issue_run_holds` says still holds its work, whose
-    `alert.json` names the group's ecosystem, package and manifest. A run whose facts can't be read holds nothing."""
-    want = (group["ecosystem"], group["package"], group["manifest"])
+def _vuln_runs(runs: list[Run]) -> list[tuple[Run, dict | None]]:
+    """Each vuln run here that may hold an alert group, with its `alert.json` facts read once (None when they can't
+    be: a run whose facts are unreadable holds a group only by the alert number it was started with)."""
+    found: list[tuple[Run, dict | None]] = []
     for run in runs:
         if run.state.get("pipeline") != "vuln" or not module_queue.issue_run_holds(run):
             continue
         try:
-            facts = vuln.read_alert(run.dir)
+            found.append((run, vuln.read_alert(run.dir)))
         except vuln.AlertError:
-            continue
-        if (facts.get("ecosystem"), facts.get("package"), facts.get("manifest")) == want:
-            return run
-    return None
+            found.append((run, None))
+    return found
+
+
+def _numbers(value: Any) -> set[int]:
+    return {n for n in value if isinstance(n, int) and not isinstance(n, bool)} if isinstance(value, list) else set()
+
+
+def _alert_holder(group: dict, vuln_runs: list[tuple[Run, dict | None]]) -> Run | None:
+    """The vuln run that holds `group`, preferring a live one and then the newest (`vuln_runs` is oldest first).
+    A live run holds it when its `alert.json` names the group's ecosystem, package and manifest, or when the alert it
+    was started with (`params.alert`) is in the group, even before `alert.json` exists. A run that is not live but
+    still holds its work (done with its pull request open, or stopped on an error) holds it only while one of its
+    alerts is still in the group: once none is open, its fix landed and the run is history."""
+    want = (group["ecosystem"], group["package"], group["manifest"])
+    alerts = set(group["alerts"])
+    live: list[Run] = []
+    finished_: list[Run] = []
+    for run, facts in vuln_runs:
+        named = facts is not None and (facts.get("ecosystem"), facts.get("package"), facts.get("manifest")) == want
+        if run.state["status"] not in TERMINAL:
+            started = str((run.state.get("params") or {}).get("alert") or "")
+            if named or (started.isascii() and started.isdigit() and int(started) in alerts):
+                live.append(run)
+        elif named and facts is not None and _numbers(facts.get("alerts")) & alerts:
+            finished_.append(run)
+    held = live or finished_
+    return held[-1] if held else None
 
 
 def _issue_blocker(number: str, pic: dict) -> str | None:
@@ -814,8 +838,9 @@ def _picture(cfg: Config, repo: Path) -> dict:
            "issues": _synced(cfg, state)}
     pic["alerts"] = _synced_alerts(cfg, state)
     pic["alert_runs"] = {}  # the lowest alert number of each held group -> the run that holds it
+    vuln_runs = _vuln_runs(runs) if pic["alerts"] else []
     for group in pic["alerts"]:
-        holder = _alert_holder(group, runs)
+        holder = _alert_holder(group, vuln_runs)
         if holder is not None:
             pic["alert_runs"][group["alerts"][0]] = holder
     issues = []
