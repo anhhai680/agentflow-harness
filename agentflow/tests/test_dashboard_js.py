@@ -523,9 +523,12 @@ IDEA = {**ALERT, "kind": "module", "key": "module:i", "id": "i", "label": "An id
         "planning": "backlog", "startable": True, "severity": None, "alerts": [], "dependabot_prs": [], "url": ""}
 
 
+def _chips(item: dict) -> list:
+    return [k["p"].get("text") for k in js(["board.js"], FAKE_EL + "backlogNode(args)", item)["c"]]
+
+
 def test_an_idea_card_has_an_idea_chip_and_a_ready_one_does_not():
-    chips = lambda item: [k["p"].get("text") for k in js(["board.js"], FAKE_EL + "backlogNode(args)", item)["c"]]  # noqa: E731
-    assert "idea" in chips(IDEA) and "idea" not in chips({**IDEA, "planning": "ready"})
+    assert "idea" in _chips(IDEA) and "idea" not in _chips({**IDEA, "planning": "ready"})
     assert "Start" in [b["p"].get("text") for k in js(["board.js"], FAKE_EL + "backlogNode(args)", IDEA)["c"]
                        for b in k["c"] if k["p"].get("class") == "moves"]
 
