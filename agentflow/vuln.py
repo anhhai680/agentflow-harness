@@ -837,18 +837,20 @@ HITS_SHOWN = 10  # advisories a `new_advisory` summary names before `and <n> mor
 
 def _accepted_by(events: list[dict], review: dict) -> str | None:
     """The person who accepted the failing `review`: the first approval on its key after it, when that approves a
-    dependency-review stop and is not the runner's own (`AUTO_BY`). A `step_retry` on the key first means no one
-    accepted it. None when no one did."""
+    dependency-review stop, is not the runner's own (`AUTO_BY`) and is not a retry's. `run_control.retry` clears the
+    stop it retries with a `hitl_approved` and then, under the same lock, a `step_retry` on the key, so an approval
+    the key's next event retries asked GitHub again rather than accepted the head; a `step_retry` before any approval
+    means the same. None when no one accepted it."""
     from agentflow.autonomy import AUTO_BY  # it imports `config`, which imports this module
 
-    for event in events:
-        if event.get("seq", -1) <= review.get("seq", -1) or event.get("key") != review.get("key"):
-            continue
+    after = [e for e in events if e.get("seq", -1) > review.get("seq", -1) and e.get("key") == review.get("key")]
+    for index, event in enumerate(after):
         if event["type"] == "step_retry":
             return None
         if event["type"] == "hitl_approved":
+            retried = index + 1 < len(after) and after[index + 1]["type"] == "step_retry"
             by = str(event.get("by") or "")
-            return by if event.get("kind") in REVIEW_STOPS and by and by != AUTO_BY else None
+            return by if event.get("kind") in REVIEW_STOPS and by and by != AUTO_BY and not retried else None
     return None
 
 

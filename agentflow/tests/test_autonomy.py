@@ -121,6 +121,13 @@ def test_a_human_only_stop_cannot_be_listed(tmp_cfg, kind):
     assert any(kind in i.path for i in validate(cfg, REPO))
 
 
+@pytest.mark.parametrize("kind", ["new_advisory", "dependency_review_failed"])
+def test_a_dependency_review_stop_is_always_a_humans(tmp_cfg, kind):
+    assert kind in NEVER_RESOLVED  # only a person accepts a head the dependency review stopped
+    cfg = load_config(tmp_cfg(lambda data: data["autonomy"]["resolve_kinds"].update({kind: 1})))
+    assert [i.level for i in validate(cfg, REPO) if i.path == f"autonomy.resolve_kinds.{kind}"] == ["error"]
+
+
 # --------------------------------------------------------------------------- findings
 
 

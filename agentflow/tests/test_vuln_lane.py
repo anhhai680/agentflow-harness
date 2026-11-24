@@ -951,7 +951,10 @@ def test_dependency_review_hit_stops_with_new_advisory(flow_repo, gh_alerts, mon
                                      "manifest": "requirements.txt"}]
     assert not flow_repo.events(run, "pr_marked_ready")
     assert not [c for c in _gh_calls(gh_alerts) if c[:2] == ["pr", "ready"]]
-    assert "agentflow approve" in run.inbox_path(CI_KEY).read_text(encoding="utf-8")
+    inbox = run.inbox_path(CI_KEY).read_text(encoding="utf-8")
+    assert f"`agentflow approve {run.id} {CI_KEY}` accepts this head and marks the PR ready" in inbox
+    assert f"`agentflow retry {run.id} {CI_KEY}` asks GitHub again about the same head" in inbox
+    assert "Fix it on the branch" not in inbox
 
 
 def test_dependency_review_empty_compare_fails_closed(flow_repo, gh_alerts, monkeypatch, tmp_path):
@@ -1007,6 +1010,27 @@ def test_approving_new_advisory_accepts_that_sha_only(flow_repo, gh_alerts, monk
     lines = vuln.pr_lines(run, pushed_sha=moved)
     assert f"Dependency review: accepted by alice ({IDNA_GHSA})" not in lines
     assert "Dependency review: not checked on the pushed head" in vuln.pr_lines(run, pushed_sha="c" * 40)
+
+
+@pytest.mark.parametrize("compare,kind", [(IDNA_COMPARE, "new_advisory"), ([], "dependency_review_failed")])
+def test_a_retry_asks_again_and_never_accepts_the_head(flow_repo, gh_alerts, monkeypatch, tmp_path, compare, kind):
+    """`run_control.retry` clears the stop with an approval by the person who retried: that asks GitHub again about
+    the same head and is never read as accepting it."""
+    from agentflow import run_control
+
+    run, outcome = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, compare)
+    assert outcome == "waiting_human" and _stop(flow_repo, run)["kind"] == kind
+    calls = len(_compare_calls(gh_alerts))
+    run_control.retry(run, CI_KEY, by="alice")
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"
+    assert len(_compare_calls(gh_alerts)) == calls + 1
+    assert _stop(flow_repo, run)["kind"] == kind and len(flow_repo.events(run, "dependency_reviewed")) == 2
+    assert not flow_repo.events(run, "pr_marked_ready")
+    assert not [line for line in vuln.pr_lines(run, pushed_sha=_origin_head(flow_repo, run)) if "accepted" in line]
+    hitl.approve(run, CI_KEY, by="bob")  # a plain approval after the retry still accepts it
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
+    assert len(_compare_calls(gh_alerts)) == calls + 1 and flow_repo.events(run, "pr_marked_ready")
+    assert "Dependency review: accepted by bob" in (run.dir / "pr.md").read_text(encoding="utf-8")
 
 
 def test_an_approval_by_the_runner_never_accepts_a_new_advisory(flow_repo, gh_alerts, monkeypatch, tmp_path):
