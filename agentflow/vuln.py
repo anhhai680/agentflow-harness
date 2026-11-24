@@ -905,7 +905,12 @@ def review_dependencies(cfg: Config, run: Run, worktree: Path, key: str, head: s
     hits = [{field: clean_fact(str(hit[field])) for field in ("ghsa", "severity", "package", "version", "manifest")}
             for hit in hits]
     short = head[:12] if _FULL_SHA1.fullmatch(head or "") else "the pushed head"
-    if error:
+    if error and not _FULL_SHA1.fullmatch(head or ""):  # no head to pin an approval to: approving only stops again
+        verdict = "dependency_review_failed"
+        summary = (f"The pushed head is unknown (the run recorded no full commit id for its last push), so GitHub's "
+                   f"dependency review cannot be asked and `agentflow approve` cannot accept it: `agentflow cancel "
+                   f"{run.id}`, or set `vuln.dependency_review: false`.")
+    elif error:
         verdict = "dependency_review_failed"
         summary = f"GitHub's dependency review of {short} could not be read: {error}"
     elif hits:

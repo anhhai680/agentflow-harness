@@ -1044,6 +1044,26 @@ def test_an_approval_by_the_runner_never_accepts_a_new_advisory(flow_repo, gh_al
     assert verdict == "new_advisory" and len(_compare_calls(gh_alerts)) == calls + 1
 
 
+def test_an_unknown_pushed_head_says_approve_cannot_accept_it(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    """A run whose events name no pushed sha (its `pr_opened` predates the `sha` field) has no head to pin an approval
+    to: the stop says so, and an approval only stops again, never marking the pull request ready."""
+    from agentflow.ci_lane import CILane
+
+    monkeypatch.setattr(CILane, "_pushed_sha", lambda self: "")
+    run, outcome = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, CLEAN_COMPARE)
+    assert outcome == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("dependency_review_failed", CI_KEY)
+    assert "The pushed head is unknown" in stop["summary"] and "`agentflow approve` cannot accept it" in stop["summary"]
+    assert f"`agentflow cancel {run.id}`" in stop["summary"] and "`vuln.dependency_review: false`" in stop["summary"]
+    assert _compare_calls(gh_alerts) == []
+    hitl.approve(run, CI_KEY, by="alice")
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"
+    again = _stop(flow_repo, run)
+    assert again["kind"] == "dependency_review_failed" and again["seq"] > stop["seq"]
+    assert not flow_repo.events(run, "pr_marked_ready") and _compare_calls(gh_alerts) == []
+
+
 def test_dependency_review_refuses_a_head_that_is_not_a_full_sha(flow_repo, gh_alerts, monkeypatch, tmp_path):
     run, _ = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, CLEAN_COMPARE)
     calls = len(_compare_calls(gh_alerts))
