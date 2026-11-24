@@ -339,5 +339,5 @@ dashboard:
       feature: Feature
       bug: Bug fix
     new_task:                       # lane: its form fields; a lane left out can't be added from the page
-      feature: [new_module, issue, after]  # a feature card writes an item in backlog.yml (and its spec), or works on issue-<N>
+      feature: [new_module, issue, after]  # a feature card starts a run that writes a new spec (then `agentflow backlog add --spec` lists it), or works on issue-<N>
       bug: [issue, task, after]
