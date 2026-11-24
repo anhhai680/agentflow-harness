@@ -868,6 +868,12 @@ def cmd_backlog(args: argparse.Namespace) -> int:
             if work_source.kind(cfg) != "backlog":
                 raise backlog.Invalid(backlog.NEEDS_BACKLOG.format(noun=work_source.noun(cfg)))
             lines = [json.dumps(shown)] if args.json else [f"{v['id']}  {v['state']}  {v['title']}" for v in shown]
+        elif verb == "import":
+            from agentflow import backlog_import
+
+            lines, notes = backlog_import.run(cfg, repo, args.dry_run)
+            for note in notes:
+                print(note, file=sys.stderr)
         elif verb == "add":
             lines = backlog.add_item(
                 cfg, repo, args.id, spec=args.spec, title=args.title, lane=args.lane or "", status=args.status,
@@ -877,7 +883,7 @@ def cmd_backlog(args: argparse.Namespace) -> int:
         for line in lines:
             print(line)
         return 0
-    except (backlog.Refused, EditRefused, *_human_errors()) as exc:
+    except (backlog.Refused, EditRefused, OSError, *_human_errors()) as exc:
         print(f"error: {exc}")
         return 1
 
@@ -1267,6 +1273,10 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--spec", help="a spec file inside the repository")
     add.add_argument("--notes")
     _config_arg(add)
+    imp = blg_sub.add_parser("import", help="write backlog.yml from the capability map or spec files, the form cards and "
+                                            "the done marks (nothing is committed; the config is not edited)")
+    imp.add_argument("--dry-run", action="store_true", help="print the file (stdout) and the notes (stderr); write nothing")
+    _config_arg(imp)
     st = blg_sub.add_parser("set", help="edit an item of the backlog file: set <id> key=value... (nothing is committed)")
     st.add_argument("id")
     st.add_argument("pairs", nargs="*", metavar="key=value",

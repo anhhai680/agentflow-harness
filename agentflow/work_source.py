@@ -255,6 +255,12 @@ def _unlisted_specs(cfg: Config, repo: Path, named: set[str]) -> list[str]:
     return sorted(found)
 
 
+def unlisted_specs(cfg: Config, repo: Path, named: set[str]) -> list[str]:
+    """`_unlisted_specs`, for `backlog import`: the Markdown files under `project.docs.specs` (any work source kind)
+    that are not in `named` (repo-relative POSIX paths), `backlog.ignore_specs` and `project.docs.plans` left out."""
+    return _unlisted_specs(cfg, repo, named)
+
+
 def skipped(cfg: Config, repo: Path) -> list[str]:
     """For `specs`, the sorted names that fit `spec_file` but are not modules: an id that is not a module id, a
     symlink or anything but a regular file, `<name> (unreadable)`, and one line for the entries past
