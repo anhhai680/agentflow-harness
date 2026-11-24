@@ -404,10 +404,10 @@ Notifications: a terminal bell and a macOS notification fire when a run needs yo
 ```bash
 agentflow queue --max-parallel 2          # loop, every --interval seconds (30): start modules from the work source as dependencies merge
 agentflow queue --once                    # one tick, for cron
-agentflow queue --include-specs           # required with work_source specs (this repository's): queue every spec file's module
+agentflow queue --include-specs           # required with work_source specs: queue every spec file's module (ignored, with a note, by a backlog pack)
 ```
 
-The queue reads the pack's `work_source`: a capability map's rows (`kind: capability_map`, the default), or one module per spec file in `project.docs.specs` that fits `project.docs.spec_file` (`kind: specs`). With `specs` it refuses to start without `--include-specs`, because every spec file is a module, finished or not, and starting them all must be asked for.
+The queue reads the pack's `work_source`: a capability map's rows (`kind: capability_map`, the default), or one module per spec file in `project.docs.specs` that fits `project.docs.spec_file` (`kind: specs`). With `specs` it refuses to start without `--include-specs`, because every spec file is a module, finished or not, and starting them all must be asked for. With `kind: backlog` (this repository's) the queue starts only the items of `backlog.yml` whose `status` is `ready`, in the file's order, and ignores `--include-specs` with a note; an idea (`backlog`) waits until `agentflow backlog set <id> status=ready`.
 
 A module is done when its plan is fully checked and its PR is merged. A module `issue-<N>` (an issue-backed run's) is also done, as `issue closed`, once issue #N is closed on GitHub and no run of it is live; `agentflow backlog undone` overrides that, as it does origin evidence. The queue starts ready modules in the work source's order, never above `--max-parallel`. A run that is waiting for you, paused or held keeps its slot but does not block the others. The one exception is a run held on `ci_pending` (watching CI checks still pending, `ci.watch_max_h`): it frees its slot while it waits. The queue prints `queue: <module> blocked — <reason>` once per change: an unauthenticated `gh`, a failed, cancelled or crashed run, a start that failed, an unknown dependency, a dependency cycle. Failed and crashed runs are never restarted automatically. Only one `agentflow queue` runs at a time, and its start output goes to `<state dir>/runs/queue.log`.
 
@@ -462,9 +462,17 @@ agentflow resume <run> --mark-done                  # a ready run: skip to ship,
 agentflow dashboard                                 # token is in the URL fragment; keep it private
 agentflow queue --max-parallel 2
 agentflow queue --include-specs                     # a pack with work_source specs: queue every spec file's module
+                                                    #   (a backlog pack ignores it and queues the ready items)
 agentflow backlog done <module> [--by NAME]         # mark a module finished by hand (refused while it has a live run)
 agentflow backlog undone <module> [--by NAME]       # remove that hand mark; with none, ignore the origin evidence or
                                                     #   closed issue that says it is done (a merged module stays done)
+                                                    #   (with work_source backlog, done and undone edit `status` in backlog.yml instead)
+agentflow backlog list [--all] [--json]             # the items of backlog.yml with status and title (--all: dropped too)
+agentflow backlog add <id> --title "…" [--lane L] [--status S] [--depends-on a,b] [--issue N] [--spec PATH] [--notes "…"]
+                                                    # append an item to backlog.yml (with --spec the id comes from the file name)
+agentflow backlog set <id> status=ready [key=value …]   # edit an item: title, lane, status, spec, plan, depends_on, issue, notes;
+                                                    #   an empty value clears the key
+agentflow backlog import [--dry-run]                # write the first backlog.yml from the current work source (section 14)
 agentflow retro [--since YYYY-MM-DD]                # lessons from the runs ended since the last finished retro, as a
                                                     #   draft PR that changes only .agentflow/lessons.md (section 15)
 agentflow retro --dry-run                           # print the digest and the session's prompt; creates nothing
