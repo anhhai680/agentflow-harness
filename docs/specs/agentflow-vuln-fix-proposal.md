@@ -245,7 +245,7 @@ target them, and the scorecard shows them in the Metrics tab.
 
 ### 10. V3: beyond Dependabot
 
-Status of this section: proposed (2026-11-24). It adds two CLI inputs and one config key that §1 to §9 don't have.
+Status of this section: approved (2026-11-24). It adds two CLI inputs and one config key that §1 to §9 don't have.
 V3 builds the two committed items of §Rollout V3. The two candidates (`--pr N`, an engine release cooldown) stay
 unplanned.
 
