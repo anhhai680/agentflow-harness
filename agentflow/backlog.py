@@ -36,7 +36,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from agentflow import backlog_file, finished, intake, module_queue, sources, vuln, work_source
@@ -1119,6 +1119,171 @@ def mark_not_done(cfg: Config, repo: Path, module: str, by: str) -> list[str]:
         finished.veto(repo, module, by)
         message = f"{module} marked not done by hand: origin evidence and a closed issue are ignored"
     return [message, *_reassess(cfg, repo)]
+
+
+# --------------------------------------------------------------------------- the backlog file from the command line
+
+NEEDS_BACKLOG = "this needs work_source kind backlog (it is {noun} here)"
+SET_KEYS = tuple(k for k in backlog_file.KEYS if k != "id")
+
+
+def backlog_view(cfg: Config, repo: Path) -> list[dict]:
+    """One dict per item of the backlog file, in file order, for `agentflow backlog list`: `id`, `title`, `lane`,
+    `status` (the file's), `state` and `detail`. `state` is the first that holds: `dropped`, `done` (`detail` is
+    the reason), the phase of the item's local run (`detail` is the run id), `blocked` (`detail` names the items
+    it waits for), else the file's `ready` or `backlog`. A claim on `origin` is not read here."""
+    repo = Path(repo)
+    if work_source.kind(cfg) != "backlog":
+        return []
+    pic = _picture(cfg, repo)
+    by_entry = {e["id"]: e for e in pic["entries"]}
+    runs = {r.id: r for r in pic["runs"]}
+    out = []
+    for item in pic["file_items"].values():
+        entry = by_entry.get(item.id)
+        state, detail = item.status, ""
+        if item.status == "dropped":
+            state = "dropped"
+        elif entry is not None and entry["status"] == "done":
+            state, detail = "done", entry.get("done_reason") or finished.MERGED
+        elif item.status == "done":
+            state, detail = "done", finished.FILE_SAYS
+        elif entry is not None and entry.get("run_id") in runs:
+            state, detail = str(runs[entry["run_id"]].state.get("phase") or "running"), entry["run_id"]
+        else:
+            waiting = [b["key"].partition(":")[2] for b in pic["view"].get(f"module:{item.id}", {}).get("blocked_by", [])]
+            if waiting:
+                state, detail = "blocked", ", ".join(waiting)
+        out.append({"id": item.id, "title": item.title, "lane": item.lane, "status": item.status,
+                    "state": state, "detail": detail})
+    return out
+
+
+def _backlog_path(cfg: Config, repo: Path) -> Path:
+    path = work_source.file(cfg, repo) if work_source.kind(cfg) == "backlog" else None
+    if path is None:
+        raise Invalid(NEEDS_BACKLOG.format(noun=work_source.noun(cfg)))
+    return path
+
+
+def _comma_list(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _positive(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise Invalid(f"issue must be a positive whole number, not {value!r}") from None
+    if number < 1:
+        raise Invalid(f"issue must be a positive whole number, not {value!r}")
+    return number
+
+
+def set_item(cfg: Config, repo: Path, item_id: str, pairs: list[str]) -> list[str]:
+    """`set <id> key=value...`: edit the item in the backlog file, in the working tree (nothing is committed).
+    Every pair is read before the file is touched. `Invalid` for a pair that cannot be read or a file that is not
+    a backlog; `backlog_file.EditRefused` when the file cannot take the edit."""
+    path = _backlog_path(cfg, repo)
+    fields: dict[str, object] = {}
+    for pair in pairs:
+        key, equals, value = pair.partition("=")
+        if not equals:
+            raise Invalid(f"{pair!r} is not key=value")
+        if key not in SET_KEYS:
+            raise Invalid(f"set takes the keys {', '.join(SET_KEYS)}, not {key!r}")
+        if key in fields:
+            raise Invalid(f"{key} is given twice")
+        if key == "status" and not value:
+            raise Invalid("status cannot be empty: it is one of " + ", ".join(backlog_file.STATUSES))
+        if key == "depends_on":
+            fields[key] = _comma_list(value)
+        elif key == "issue":
+            fields[key] = _positive(value) if value else None
+        else:
+            fields[key] = value
+    if not fields:
+        raise Invalid("nothing to set: give key=value pairs")
+    backlog_file.set_fields(path, item_id, fields)
+    return [f"{item_id}: set {', '.join(fields)} in {path.name} (not committed)"]
+
+
+def set_status(cfg: Config, repo: Path, item_id: str, status: str) -> list[str]:
+    """`done` and `undone` on a backlog pack: `set <id> status=<status>`. `done` is refused while the item has a
+    live run, as for the other work sources; it never touches `runs/done_marks.json`."""
+    repo = Path(repo)
+    path = _backlog_path(cfg, repo)
+    if status == "done":
+        run = module_queue.feature_runs(cfg, repo).get(item_id)
+        if run is not None and run.state["status"] in module_queue._LIVE:
+            raise Refused(f"{item_id} has a live run, {run.id} ({run.state['status']}); cancel it first or let it finish")
+    backlog_file.set_fields(path, item_id, {"status": status})
+    return [f"{item_id}: status set to {status} in {path.name} (not committed)"]
+
+
+def _spec_file(repo: Path, spec: str) -> str:
+    """`spec` (a path inside `repo`, as the command line gave it) when it is a regular file reached through no
+    symlink; the heading text is read from it by the caller. `Invalid` otherwise."""
+    pure = PurePosixPath(spec)
+    if not spec or spec != str(pure) or pure.is_absolute() or ".." in pure.parts or "." in pure.parts or "\\" in spec:
+        raise Invalid(f"--spec must be a path inside the repository, not {spec!r}")
+    at = Path(repo)
+    for part in pure.parts:
+        at = at / part
+        if at.is_symlink():
+            raise Invalid(f"--spec {spec} goes through a symlink")
+    if not at.is_file():
+        raise Invalid(f"--spec {spec} is not a file")
+    return str(pure)
+
+
+def _spec_id(cfg: Config, spec: str) -> str:
+    """The module id a spec file stands for: the `{module}` of `project.docs.spec_file` when the file name fits it,
+    else the file's lowercased slug stem. `Invalid` when that is not a module id."""
+    name = PurePosixPath(spec).name
+    pattern = re.escape(cfg.project.spec_file).replace(re.escape("{module}"), "(?P<module>.+)")
+    found = re.fullmatch(pattern, name)
+    if found:
+        derived = found.group("module")
+    else:
+        derived = re.sub(r"[^a-z0-9_-]+", "-", PurePosixPath(name).stem.lower()).strip("-")
+    if sources.MODULE_ID.fullmatch(derived) is None or len(derived) > backlog_file.ID_MAX:
+        raise Invalid(f"cannot make an item id from {name}: give one (a lowercase slug, at most "
+                      f"{backlog_file.ID_MAX} characters)")
+    return derived
+
+
+def _spec_title(repo: Path, spec: str) -> str:
+    try:
+        header = sources.read_header(Path(repo) / spec)
+    except OSError as exc:
+        raise Invalid(f"cannot read {spec}: {exc}") from None
+    for line, _ in sources.spec_header(header):
+        if line.startswith("# "):
+            return line[2:].strip()[: backlog_file.TITLE_MAX].rstrip()
+    return ""
+
+
+def add_item(cfg: Config, repo: Path, item_id: str | None, *, spec: str | None = None, title: str | None = None,
+             lane: str = "", status: str = "backlog", depends_on: str = "", issue: str | None = None,
+             notes: str = "") -> list[str]:
+    """`add [<id>] [--spec PATH] ...`: append an item to the backlog file, in the working tree (nothing is committed).
+    With `--spec` the id and the title come from the spec file unless given. `Invalid` for a bad argument;
+    `backlog_file.EditRefused` when the file cannot take the item."""
+    repo = Path(repo)
+    path = _backlog_path(cfg, repo)
+    if spec is not None:
+        spec = _spec_file(repo, spec)
+        item_id = item_id or _spec_id(cfg, spec)
+        title = title if title is not None else _spec_title(repo, spec)
+    if not item_id:
+        raise Invalid("give an item id, or --spec")
+    if not title:
+        raise Invalid("give --title (the spec has no '# ' heading)" if spec else "give --title")
+    item = BacklogItem(id=item_id, deps=_comma_list(depends_on), title=title, lane=lane, status=status,
+                       spec=spec or "", issue=_positive(issue) if issue else None, notes=notes)
+    backlog_file.append_item(path, item)
+    return [f"{item_id}: added to {path.name} as {status} (not committed)"]
 
 
 # --------------------------------------------------------------------------- starting
