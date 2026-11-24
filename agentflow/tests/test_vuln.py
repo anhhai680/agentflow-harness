@@ -12,7 +12,7 @@ from agentflow.config import Gate, load_config
 from agentflow.gates import run_gates
 from agentflow.gitops import GhError
 from agentflow.pipeline import RunOptions, start
-from conftest import PYTHON_CONFIG, VULN_ALERT, add_vuln_lane
+from conftest import GLOBAL_ADVISORY, PYTHON_CONFIG, VULN_ALERT, add_vuln_lane
 
 ALERT = VULN_ALERT
 
@@ -403,3 +403,135 @@ def test_prs_naming_matches_whole_tokens_only():
            {"number": 8, "title": "Bump requests-toolbelt from 1.0 to 1.1"}, {"number": True, "title": "requests"}]
     assert vuln.prs_naming("requests", prs) == [7]
     assert vuln.prs_naming("requests", "junk") == []
+
+
+# --- global advisories and the dependency-graph compare (V3) ---
+
+GOOD_VULN = {"package": {"ecosystem": "pip", "name": "requests"}, "vulnerable_version_range": "< 2.32.0",
+             "first_patched_version": "2.32.0"}
+
+
+def _advisory(**changes):
+    return vuln.parse_advisory({**copy.deepcopy(GLOBAL_ADVISORY), **changes})
+
+
+def test_parse_advisory_keeps_validated_fields():
+    a = vuln.parse_advisory(GLOBAL_ADVISORY)
+    assert a.ghsa == "GHSA-cfgh-2345-vwxj" and a.cve == "CVE-2024-1234" and a.severity == "high"
+    assert a.withdrawn is False and a.url == "https://github.com/advisories/GHSA-cfgh-2345-vwxj"
+    assert a.references == ("https://github.com/advisories/GHSA-cfgh-2345-vwxj",)
+    assert a.vulnerabilities[0] == vuln.Vulnerability("pip", "requests", "< 2.32.0", "2.32.0")
+
+
+def test_parse_advisory_drops_bad_vulnerabilities_not_the_advisory():
+    bad = [
+        {**GOOD_VULN, "package": {"ecosystem": "erlang", "name": "requests"}},
+        {**GOOD_VULN, "package": {"ecosystem": "pip", "name": "x; rm -rf ~"}},
+        {**GOOD_VULN, "vulnerable_version_range": "`id`"},
+        {**GOOD_VULN, "first_patched_version": "1;2"},
+        {**GOOD_VULN, "first_patched_version": {"identifier": "2.32.0"}},
+        "not a dict",
+    ]
+    a = _advisory(vulnerabilities=[bad[0], copy.deepcopy(GOOD_VULN), *bad[1:]])
+    assert a.vulnerabilities == (vuln.Vulnerability("pip", "requests", "< 2.32.0", "2.32.0"),)
+
+
+def test_parse_advisory_allows_no_patch_and_marks_withdrawn():
+    a = _advisory(withdrawn_at="2024-02-01T00:00:00Z", cve_id=None,
+                  vulnerabilities=[{**GOOD_VULN, "first_patched_version": None}])
+    assert a.withdrawn is True and a.cve is None and a.vulnerabilities[0].patched is None
+
+
+def test_parse_advisory_blanks_a_bad_url_and_caps_text():
+    a = _advisory(html_url="https://x/a b", summary="s" * (vuln.MAX_TEXT + 5))
+    assert a.url == "" and len(a.summary) == vuln.MAX_TEXT
+
+
+@pytest.mark.parametrize("changes", [
+    {"ghsa_id": "GHSA-0000-0000-0000"}, {"cve_id": "CVE-1"}, {"severity": "severe"}, {"ghsa_id": None},
+    {"vulnerabilities": "x"}])
+def test_parse_advisory_refuses_bad_ids_and_severity(changes):
+    with pytest.raises(vuln.AlertError):
+        _advisory(**changes)
+
+
+def test_parse_advisory_refuses_a_non_object():
+    with pytest.raises(vuln.AlertError):
+        vuln.parse_advisory([])
+
+
+def test_advisory_id():
+    assert vuln.advisory_id(" GHSA-cfgh-2345-vwxj ") == "GHSA-cfgh-2345-vwxj"
+    assert vuln.advisory_id("CVE-2024-1234") == "CVE-2024-1234"
+    for bad in ("42", "GHSA-x; ls"):
+        with pytest.raises(ValueError, match="--advisory"):
+            vuln.advisory_id(bad)
+
+
+@pytest.mark.parametrize("ecosystem,a,b,same", [
+    ("pip", "PyYAML", "pyyaml", True), ("pip", "Foo_Bar", "foo-bar", True),
+    ("nuget", "Newtonsoft.Json", "newtonsoft.json", True),
+    ("npm", "Lodash", "lodash", False), ("pip", "requests", "requests-oauth", False)])
+def test_same_package(ecosystem, a, b, same):
+    assert vuln.same_package(ecosystem, a, b) is same
+
+
+def test_match_package_unions_live_matches():
+    a = _advisory()
+    withdrawn = _advisory(ghsa_id="GHSA-2222-3333-4444", withdrawn_at="2024-02-01T00:00:00Z")
+    other = _advisory(ghsa_id="GHSA-5555-6666-7777",
+                      vulnerabilities=[{**GOOD_VULN, "package": {"ecosystem": "pip", "name": "urllib3"}}])
+    advisories, vulnerabilities = vuln.match_package([a, withdrawn, other], "requests")
+    assert advisories == [a] and vulnerabilities == [a.vulnerabilities[0]]
+
+
+def test_normalize_severity():
+    assert vuln.normalize_severity("moderate") == "medium" and vuln.normalize_severity("high") == "high"
+    assert vuln.normalize_severity("severe") is None and vuln.normalize_severity(None) is None
+
+
+def _change(kind, name, version, *found):
+    return {"change_type": kind, "name": name, "version": version, "ecosystem": "pip", "manifest": "requirements.txt",
+            "vulnerabilities": [{"severity": s, "advisory_ghsa_id": g, "advisory_summary": "x",
+                                 "advisory_url": "https://github.com/advisories/" + g} for g, s in found]}
+
+
+COMPARE = [
+    _change("removed", "requests", "2.31.0", ("GHSA-cfgh-2345-vwxj", "high")),
+    _change("added", "requests", "2.32.0"),
+    _change("added", "idna", "3.0", ("GHSA-2222-3333-4444", "moderate")),
+]
+
+
+def test_review_changes_counts_added_at_or_above_floor():
+    hits = vuln.review_changes(COMPARE, "medium", "requests", "pip")
+    assert hits == [{"ghsa": "GHSA-2222-3333-4444", "severity": "medium", "package": "idna", "version": "3.0",
+                     "manifest": "requirements.txt"}]
+    assert vuln.review_changes(COMPARE, "high", "requests", "pip") == []
+
+
+def test_review_changes_unknown_severity_is_a_hit():
+    reply = [_change("added", "requests", "2.32.0", ("GHSA-cfgh-2345-vwxj", "weird"))]
+    hits = vuln.review_changes(reply, "critical", "requests", "pip")
+    assert [h["severity"] for h in hits] == ["unknown"]
+
+
+@pytest.mark.parametrize("reply", [[], [_change("added", "idna", "3.0")]])
+def test_review_changes_without_the_package_is_unreadable(reply):
+    with pytest.raises(vuln.AlertError, match="no change to requests"):
+        vuln.review_changes(reply, "medium", "requests", "pip")
+
+
+def _with(index, **changes):
+    reply = copy.deepcopy(COMPARE)
+    reply[index].update(changes)
+    return reply
+
+
+@pytest.mark.parametrize("reply", [
+    {"a": 1}, [*COMPARE, "oops"], _with(1, vulnerabilities="x"),
+    _with(0, vulnerabilities=[{"severity": "high", "advisory_ghsa_id": "GHSA-bad"}]),
+    _with(2, name="evil\n## owned"), _with(2, version="1;2"), _with(2, manifest="../x")])
+def test_review_changes_refuses_a_hostile_reply(reply):
+    with pytest.raises(vuln.AlertError):
+        vuln.review_changes(reply, "medium", "requests", "pip")

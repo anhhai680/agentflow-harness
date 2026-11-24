@@ -166,6 +166,99 @@ def parse_alert(data: object) -> Alert:
         references=_references(advisory))
 
 
+@dataclass(frozen=True)
+class Vulnerability:
+    """One package a global advisory names: the ecosystem, the package, the vulnerable range and the first patch."""
+    ecosystem: str
+    package: str
+    vulnerable_range: str
+    patched: str | None
+
+
+@dataclass(frozen=True)
+class Advisory:
+    ghsa: str
+    cve: str | None
+    severity: str  # one of SEVERITIES, or "unknown"
+    withdrawn: bool
+    url: str  # "" unless it is a plain https URL
+    summary: str
+    description: str
+    references: tuple[str, ...]
+    vulnerabilities: tuple[Vulnerability, ...]
+
+
+def advisory_id(ref: object) -> str:
+    """The GHSA or CVE id in `ref`, stripped; anything else is refused (it would reach `gh` as part of a path)."""
+    text = str(ref).strip()
+    if not (GHSA_ID.fullmatch(text) or CVE_ID.fullmatch(text)):
+        raise ValueError(f"--advisory takes a GHSA or CVE id such as GHSA-cfgh-2345-vwxj, not {str(ref)[:80]!r}")
+    return text
+
+
+def _vulnerability(entry: object) -> Vulnerability | None:
+    """One `vulnerabilities[]` entry of a global advisory, or None when any used field fails its check: GitHub lists
+    packages this lane has no use for, and one bad entry must not hide the good ones."""
+    try:
+        root = _obj(entry, "the vulnerability")
+        package = _obj(root.get("package"), "the vulnerability's package")
+        ecosystem = _text(package, "ecosystem", "the ecosystem")
+        if ecosystem not in ECOSYSTEMS:
+            return None
+        fixed = root.get("first_patched_version")
+        patched = None if fixed is None else _version(_text(root, "first_patched_version", "the first patched version"),
+                                                      "the first patched version")
+        return Vulnerability(
+            ecosystem, _package(_text(package, "name", "the package name")),
+            _version(_text(root, "vulnerable_version_range", "the vulnerable range"), "the vulnerable range", _RANGE),
+            patched)
+    except AlertError:
+        return None
+
+
+def parse_advisory(data: object) -> Advisory:
+    """The validated facts of one global advisory (GitHub's REST shape); `AlertError` when an id or the severity is
+    bad. An entry of `vulnerabilities` that fails its checks is dropped, never repaired."""
+    root = _obj(data, "the advisory")
+    ids = _ids(root)
+    severity = _text(root, "severity", "the severity")
+    if severity not in (*SEVERITIES, "unknown"):
+        raise AlertError(f"the severity {severity!r} is not one of {', '.join((*SEVERITIES, 'unknown'))}")
+    entries = root.get("vulnerabilities")
+    if not isinstance(entries, list):
+        raise AlertError("the advisory's vulnerabilities are missing or not a list")
+    found = (_vulnerability(entry) for entry in entries)
+    return Advisory(
+        ghsa=ids[0], cve=ids[1] if root.get("cve_id") is not None else None, severity=severity,
+        withdrawn=root.get("withdrawn_at") is not None, url=_url(str(root.get("html_url") or "")),
+        summary=str(root.get("summary") or "")[:MAX_TEXT], description=str(root.get("description") or "")[:MAX_TEXT],
+        references=_references(root), vulnerabilities=tuple(v for v in found if v is not None))
+
+
+def same_package(ecosystem: str, a: str, b: str) -> bool:
+    """True when `a` and `b` name one package in `ecosystem`: pip folds `-`, `_` and `.` and the case (PEP 503), NuGet
+    and Composer fold the case, and every other registry compares the names exactly."""
+    if ecosystem == "pip":
+        return re.sub(r"[-_.]+", "-", a).lower() == re.sub(r"[-_.]+", "-", b).lower()
+    if ecosystem in ("nuget", "composer"):
+        return a.casefold() == b.casefold()
+    return a == b
+
+
+def match_package(advisories: Sequence[Advisory], package: str) -> tuple[list[Advisory], list[Vulnerability]]:
+    """The advisories that aren't withdrawn and name `package`, and those vulnerabilities, in input order."""
+    live: list[Advisory] = []
+    named: list[Vulnerability] = []
+    for advisory in advisories:
+        if advisory.withdrawn:
+            continue
+        hits = [v for v in advisory.vulnerabilities if same_package(v.ecosystem, v.package, package)]
+        if hits:
+            live.append(advisory)
+            named.extend(hits)
+    return live, named
+
+
 def siblings(primary: Alert, others: Iterable[Alert]) -> tuple[Alert, ...]:
     """`primary` first, then the other open alerts for the same package in the same manifest."""
     key = (primary.ecosystem, primary.package, primary.manifest)
@@ -193,6 +286,53 @@ def judge(exit_code: int | None, output: str, ids: Sequence[str], ok_exit: Seque
         return "failed", []
     matched = [i for i in ids if re.search(rf"(?<![\w-]){re.escape(i)}(?![\w-])", output)]
     return ("present", matched) if matched else ("absent", [])
+
+
+def normalize_severity(value: object) -> str | None:
+    """`medium` for the dependency graph's `moderate`, a member of `SEVERITIES` as it is, and None for anything else."""
+    if value == "moderate":
+        return "medium"
+    return value if isinstance(value, str) and value in SEVERITIES else None
+
+
+def review_changes(changes: object, floor: str, package: str, ecosystem: str) -> list[dict]:
+    """The new vulnerabilities a dependency-graph compare reports, at or above `floor`: one dict per vulnerability of
+    an `added` entry, `{"ghsa", "severity", "package", "version", "manifest"}`. A severity that isn't one this module
+    knows counts as a hit and shows as "unknown". A reply that isn't the documented shape, or that names no change to
+    `package` (the graph hasn't caught up with the push yet), is an `AlertError`, never a clean compare."""
+    if not isinstance(changes, list):
+        raise AlertError("the dependency graph's reply is not a list")
+    seen = False
+    for item in changes:
+        root = _obj(item, "a dependency change")
+        found = root.get("vulnerabilities")
+        if not isinstance(found, list):
+            raise AlertError("a dependency change's vulnerabilities are missing or not a list")
+        for entry in found:
+            ghsa = _obj(entry, "a dependency change's vulnerability").get("advisory_ghsa_id")
+            if not isinstance(ghsa, str) or not GHSA_ID.fullmatch(ghsa):
+                raise AlertError("a dependency change's advisory_ghsa_id is not a GHSA id")
+        name = root.get("name")
+        seen = seen or (isinstance(name, str) and same_package(ecosystem, name, package))
+    if not seen:
+        raise AlertError(f"the dependency graph shows no change to {package} yet")
+    hits: list[dict] = []
+    for item in changes:
+        if item.get("change_type") != "added":
+            continue
+        counted = []
+        for entry in item["vulnerabilities"]:
+            severity = normalize_severity(entry.get("severity"))
+            if severity is None or severity_at_least(severity, floor):
+                counted.append((entry["advisory_ghsa_id"], severity or "unknown"))
+        if not counted:
+            continue
+        name = _package(_text(item, "name", "a dependency change's name"))
+        version = _version(_text(item, "version", "a dependency change's version"), "a dependency change's version")
+        manifest = _manifest(_text(item, "manifest", "a dependency change's manifest"))
+        hits.extend({"ghsa": ghsa, "severity": severity, "package": name, "version": version, "manifest": manifest}
+                    for ghsa, severity in counted)
+    return hits
 
 
 def forbidden(cfg: Config, lane: str) -> list[str]:

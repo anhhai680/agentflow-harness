@@ -651,6 +651,25 @@ VULN_ALERT: dict[str, Any] = {
 }
 
 
+# A global security advisory as GitHub's REST API returns it (`GET /advisories/{ghsa_id}`), cut to the fields the vuln
+# lane reads. `first_patched_version` is a plain string here, unlike a Dependabot alert's `{identifier}`. Tests copy
+# it with `copy.deepcopy` before they change a field.
+GLOBAL_ADVISORY: dict[str, Any] = {
+    "ghsa_id": "GHSA-cfgh-2345-vwxj",
+    "cve_id": "CVE-2024-1234",
+    "html_url": "https://github.com/advisories/GHSA-cfgh-2345-vwxj",
+    "summary": "Requests leaks credentials on redirect",
+    "description": "A crafted redirect makes requests resend the Authorization header to another host.",
+    "severity": "high",
+    "withdrawn_at": None,
+    "references": [{"url": "https://github.com/advisories/GHSA-cfgh-2345-vwxj"}],
+    "vulnerabilities": [
+        {"package": {"ecosystem": "pip", "name": "requests"}, "vulnerable_version_range": "< 2.32.0",
+         "first_patched_version": "2.32.0"},
+    ],
+}
+
+
 def vuln_steps() -> dict[str, list[dict]]:
     """Per phase, the engine defaults' steps whose `lanes` include `vuln`, in their order."""
     from agentflow import layers
