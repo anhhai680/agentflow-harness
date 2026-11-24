@@ -1,4 +1,4 @@
-"""Parse and validate `backlog.yml`, the file that holds every backlog item (spec: agentflow-backlog-file-proposal).
+"""Parse, render and edit `backlog.yml`, the file that holds every backlog item (spec: agentflow-backlog-file-proposal).
 
 `parse` and `read` never raise. A file-level fault (not YAML, a wrong `version`, `items` not a list, too many items)
 gives no items and one error. An item-level error drops only that item, except a bad `spec` or `plan` path, which is
@@ -7,8 +7,10 @@ dependency is known is `validate`'s business, not the parser's."""
 
 from __future__ import annotations
 
+import json
 import posixpath
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -180,3 +182,275 @@ def read(path: Path) -> tuple[list[BacklogItem], list[Problem]]:
     except UnicodeDecodeError:
         return [], [Problem("error", FILE, "is not valid UTF-8")]
     return parse(text)
+
+
+# --- rendering and in-place edits -------------------------------------------------------------------------------
+
+HEADER = (
+    "# backlog.yml: every backlog item, highest priority first. `agentflow validate` checks it.\n"
+    "# status: backlog (an idea) | ready (may start) | done | dropped. A run's phase is never written here: the Board\n"
+    "# shows it from the run's claim (refs/agentflow/claims/<id>).\n"
+)
+_PLAIN = re.compile(r"[A-Za-z0-9_./][A-Za-z0-9_ ./,()'+=@-]*")
+_UNREADABLE = re.compile("[^\x09\x0a\x0d\x20-\x7e\xa0-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+_LINE = re.compile(r"[^\r\n]*(?:\r\n|\n|\r)|[^\r\n]+")
+_KEY_LINE = re.compile(r"( *)([A-Za-z_][A-Za-z0-9_]*)[ \t]*:(?:[ \t]+(.*?))?[ \t]*\r?\n?$")
+_DEFAULTS = {"lane": "", "spec": "", "plan": "", "depends_on": [], "issue": None, "notes": ""}
+_FIELD = {"depends_on": "deps"}
+
+
+class EditRefused(ValueError):
+    """An edit that could not be made safely. The file is untouched."""
+
+
+def _reads_back(text: str, as_value: str, expect: object) -> bool:
+    try:
+        return yaml.safe_load(text) == expect
+    except (yaml.YAMLError, RecursionError, ValueError):
+        return False
+
+
+def _scalar(value: str, flow: bool = False) -> str:
+    """`value` as YAML that reads back as exactly this string: plain when that is certain, else a JSON string."""
+    if _PLAIN.fullmatch(value) and value == value.strip():
+        probe = f"[{value}]" if flow else f"k: {value}"
+        if _reads_back(probe, value, [value] if flow else {"k": value}):
+            return value
+    quoted = json.dumps(value, ensure_ascii=False)
+    return _UNREADABLE.sub(lambda m: f"\\u{ord(m.group()):04x}", quoted)
+
+
+def _entry(key: str, value: object) -> str:
+    """The `key: value` text of one field. `EditRefused` for a value of the wrong type."""
+    if key == "depends_on":
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise EditRefused("depends_on must be a list of item ids")
+        return "depends_on: [" + ", ".join(_scalar(v, flow=True) for v in value) + "]"
+    if key == "issue":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise EditRefused("issue must be a positive integer")
+        return f"issue: {value}"
+    if not isinstance(value, str):
+        raise EditRefused(f"{key} must be a string")
+    return f"{key}: {_scalar(value)}"
+
+
+def _empty(key: str, value: object) -> bool:
+    return key in _DEFAULTS and (value is None or value == _DEFAULTS[key])
+
+
+def _block(item: BacklogItem, indent: int = 2) -> list[str]:
+    """The lines (without endings) of one item: `status` always, and the other keys when they hold something."""
+    values = {
+        "id": item.id, "title": item.title, "lane": item.lane, "status": item.status, "spec": item.spec,
+        "plan": item.plan, "depends_on": item.deps, "issue": item.issue, "notes": item.notes,
+    }  # fmt: skip
+    pad = " " * (indent + 2)
+    lines = [" " * indent + "- " + _entry("id", item.id)]
+    for key in KEYS[1:]:
+        if not _empty(key, values[key]):
+            lines.append(pad + _entry(key, values[key]))
+    return lines
+
+
+def render(items: list[BacklogItem]) -> str:
+    """The file's text for `items`: the header, `version: 1`, and each item with its keys in `KEYS` order."""
+    out = [HEADER, "version: 1\n"]
+    if not items:
+        out.append("items: []\n")
+    else:
+        out.append("items:\n")
+        out.extend(line + "\n" for item in items for line in _block(item))
+    return "".join(out)
+
+
+def _load(path: Path) -> str:
+    try:
+        data = safeio.read_bytes(path, FILE_MAX + 1)
+    except safeio.SymlinkRefused:
+        raise EditRefused(f"{path.name} is a symlink") from None
+    except (OSError, ValueError) as exc:
+        raise EditRefused(f"{path.name} cannot be read: {exc}") from None
+    if data is None:
+        raise EditRefused(f"{path.name} is missing: agentflow backlog import writes it")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise EditRefused(f"{path.name} is not valid UTF-8") from None
+
+
+def _store(path: Path, text: str) -> None:
+    if len(text.encode("utf-8")) > FILE_MAX:
+        raise EditRefused(f"the edit would make {path.name} larger than {FILE_MAX} bytes")
+    try:
+        safeio.write_text(path, text)
+    except (OSError, ValueError) as exc:
+        raise EditRefused(f"{path.name} cannot be written: {exc}") from None
+
+
+def _ending(line: str) -> str:
+    return line[len(line.rstrip("\r\n")) :]
+
+
+def _skippable(line: str) -> bool:
+    """A blank line or a comment: neither belongs to a block's structure."""
+    stripped = line.strip()
+    return not stripped or stripped.startswith("#")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _new_problems(before: list[Problem], after: list[Problem]) -> list[Problem]:
+    return [p for p in after if p not in before]
+
+
+def _find_block(lines: list[str], item_id: str) -> tuple[int, int, int]:
+    """(index of the `- id:` line, index after the item's last line, column of its keys). `EditRefused` otherwise."""
+    flow = re.compile(r"\s*-\s*\{.*\bid\s*:\s*[\"']?" + re.escape(item_id) + r"[\"']?\s*[,}]")
+    start = re.compile(r"( *)-( +)id:[ \t]*[\"']?" + re.escape(item_id) + r"[\"']?[ \t]*(?:#.*)?\r?\n?$")
+    for n, line in enumerate(lines):
+        if flow.match(line):
+            raise EditRefused(f"item {item_id} is written in flow style: edit it by hand")
+        found = start.match(line)
+        if not found:
+            continue
+        dash, key_col = len(found.group(1)), len(found.group(1)) + 1 + len(found.group(2))
+        end = n + 1
+        for j in range(n + 1, len(lines)):
+            if _skippable(lines[j]):
+                continue
+            if _indent(lines[j]) <= dash:
+                break
+            end = j + 1
+        return n, end, key_col
+    raise EditRefused(f"item {item_id} is not written as a block with `- id: {item_id}` on its first line")
+
+
+def _key_lines(lines: list[str], first: int, end: int, col: int, item_id: str) -> dict[str, tuple[int, int]]:
+    """Each key line of the block in `lines[first:end]` -> (line index, index after its value). Refuses a block that is
+    not one key per line at column `col`."""
+    keys: dict[str, tuple[int, int]] = {}
+    order: list[tuple[str, int]] = []
+    for j in range(first, end):
+        line = lines[j]
+        if _skippable(line):
+            continue
+        if _indent(line) == col:
+            found = _KEY_LINE.match(line)
+            if found is None:
+                raise EditRefused(f"item {item_id} is not written one key per line")
+            order.append((found.group(2), j))
+        elif _indent(line) < col or not order:
+            raise EditRefused(f"item {item_id} is not written one key per line")
+    for n, (key, j) in enumerate(order):
+        after = order[n + 1][1] if n + 1 < len(order) else end
+        keys.setdefault(key, (j, after))
+    return keys
+
+
+def set_fields(path: Path, item_id: str, fields: dict[str, object]) -> None:
+    """Set `fields` of the item `item_id` in the file at `path`, changing only those lines. A key's line is replaced,
+    or inserted after the `- id:` line; an empty value (`""`, `[]`, `None`) removes the key's line. The new text is parsed
+    first: the item must hold the new values and nothing else may change. `EditRefused`, with the file untouched, when
+    it cannot."""
+    text = _load(path)
+    for key in fields:
+        if key == "id":
+            raise EditRefused("an item's id is never renamed")
+        if key not in KEYS:
+            raise EditRefused(f"{key!r} is not a backlog key")
+    # an empty value removes the key's line (`None` here); `status` and `title` are required, so they are always written
+    entries = {k: None if _empty(k, v) else _entry(k, v) for k, v in fields.items()}
+    items, problems = parse(text)
+    index = next((n for n, item in enumerate(items) if item.id == item_id), None)
+    if index is None:
+        raise EditRefused(f"item {item_id} is not in {path.name}, or has an error")
+    lines = _LINE.findall(text)
+    first, end, col = _find_block(lines, item_id)
+    keys = _key_lines(lines, first + 1, end, col, item_id)
+    nl = _ending(lines[first]) or ("\r\n" if "\r\n" in text else "\n")
+    out = list(lines)
+    added: list[str] = []
+    for key in KEYS[1:]:
+        if key not in entries:
+            continue
+        entry = entries[key]
+        if key in keys:
+            at, after = keys[key]
+            found = _KEY_LINE.match(lines[at])
+            value = (found.group(3) if found else "") or ""
+            if value[:1] in ("|", ">") or any(not _skippable(lines[j]) for j in range(at + 1, after)):
+                raise EditRefused(f"{key} of item {item_id} spans several lines: edit it by hand")
+            out[at] = "" if entry is None else " " * col + entry + _ending(lines[at])
+        elif entry is not None:
+            added.append(" " * col + entry + nl)
+    if added:
+        if not _ending(out[first]):
+            out[first] += nl
+            added[-1] = added[-1][: -len(nl)]
+        out[first + 1 : first + 1] = added
+    new = "".join(out)
+    expected = replace(
+        items[index], **{_FIELD.get(k, k): (_DEFAULTS[k] if entries[k] is None else v) for k, v in fields.items()}
+    )
+    after_items, after_problems = parse(new)
+    if (
+        len(after_items) != len(items)
+        or after_items[index] != expected
+        or any(a != b for n, (a, b) in enumerate(zip(after_items, items, strict=True)) if n != index)
+        or _new_problems(problems, after_problems)
+    ):
+        raise EditRefused(f"the new values for item {item_id} are not valid: {_why(problems, after_problems, fields)}")
+    _store(path, new)
+
+
+def _why(before: list[Problem], after: list[Problem], fields: dict[str, object]) -> str:
+    fresh = _new_problems(before, after)
+    return "; ".join(f"{p.where} {p.message}" for p in fresh) or ", ".join(f"{k}={v!r}" for k, v in fields.items())
+
+
+def append_item(path: Path, item: BacklogItem) -> None:
+    """Add `item` after the last item of the file at `path`, leaving every other line as it is. `EditRefused`, with the
+    file untouched, for a missing file, a duplicate id, a list written in flow style, or an item that does not parse."""
+    text = _load(path)
+    items, problems = parse(text)
+    if any(other.id == item.id for other in items):
+        raise EditRefused(f"item {item.id} is already in {path.name}")
+    lines = _LINE.findall(text)
+    head = next((n for n, line in enumerate(lines) if re.match(r"items:", line)), None)
+    if head is None:
+        raise EditRefused(f"{path.name} has no `items:` list")
+    rest = re.sub(r"\s*(#.*)?$", "", lines[head][len("items:") :], flags=re.S)
+    nl = _ending(lines[head]) or ("\r\n" if "\r\n" in text else "\n")
+    out = list(lines)
+    if rest == "":
+        last = head
+        indent = 2
+        for j in range(head + 1, len(lines)):
+            if _skippable(lines[j]):
+                continue
+            if _indent(lines[j]) == 0 and not lines[j].startswith("- "):
+                break
+            if last == head:
+                found = re.match(r"( *)- ", lines[j])
+                if found is None:
+                    raise EditRefused(f"the items list of {path.name} is not written as a block")
+                indent = len(found.group(1))
+            last = j
+        at = last + 1
+        if last != head and not _ending(out[last]):
+            out[last] += nl
+    elif re.fullmatch(r"\[\s*\]", rest.strip()):
+        out[head] = "items:" + nl
+        at = head + 1
+    else:
+        raise EditRefused(f"the items list of {path.name} is written in flow style: edit it by hand")
+    block = [line + nl for line in _block(item, indent if rest == "" else 2)]
+    out[at:at] = block
+    new = "".join(out)
+    after_items, after_problems = parse(new)
+    if after_items != [*items, item] or _new_problems(problems, after_problems):
+        raise EditRefused(f"item {item.id} is not valid: {_why(problems, after_problems, {})}")
+    _store(path, new)

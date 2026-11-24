@@ -134,3 +134,162 @@ def test_read_a_file_that_is_not_utf8(tmp_path):
     path.write_bytes(b"version: 1\nitems: []\n# \xff\xfe\n")
     items, problems = backlog_file.read(path)
     assert items == [] and [p.level for p in problems] == ["error"]
+
+
+def test_render_round_trips():
+    items = [
+        BacklogItem("a", [], title="A: colon", status="ready", spec="docs/a.md"),
+        BacklogItem("b", ["a"], title="yes", issue=3, notes="multi\nline"),
+    ]
+    assert backlog_file.parse(backlog_file.render(items)) == (items, [])
+
+
+def test_render_leaves_out_empty_fields_and_orders_keys():
+    text = backlog_file.render([BacklogItem("a", ["x", "y"], title="Plain title, with comma", lane="bug", issue=4)])
+    assert text.startswith(backlog_file.HEADER) and "refs/agentflow/claims/<id>" in backlog_file.HEADER
+    assert text.endswith(
+        "version: 1\nitems:\n  - id: a\n    title: Plain title, with comma\n    lane: bug\n    status: backlog\n"
+        "    depends_on: [x, y]\n    issue: 4\n"
+    )
+    assert backlog_file.render([]).endswith("version: 1\nitems: []\n")
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["yes", "null", "1", "1.5", "2024-01-01", "A: colon", " lead", "trail ", "# hash", "a #b", "[x]", "{x}", "- x", "*a", "&a", "!t",
+     "'q'", '"q"', "%x", "@x", "`x", "|", ">", "?", "é ünï", "tab\there", "back\\slash", "x\u2028y", "x\x85y", "x\x7fy"],
+)
+def test_render_round_trips_awkward_strings(title):
+    items = [BacklogItem("a", ["b-c"], title=title, notes=title, lane=title)]
+    assert backlog_file.parse(backlog_file.render(items)) == (items, [])
+
+
+def test_set_fields_changes_only_the_named_lines(tmp_path):
+    path = tmp_path / "backlog.yml"
+    path.write_text("# keep me\r\n" + GOOD.replace("\n", "\r\n"), newline="")
+    backlog_file.set_fields(path, "a", {"status": "done", "plan": "docs/plans/p.md"})
+    text = path.read_text(newline="")
+    assert text.startswith("# keep me\r\n") and "\n" not in text.replace("\r\n", "")
+    items, _ = backlog_file.parse(text)
+    assert (items[0].status, items[0].plan) == ("done", "docs/plans/p.md") and items[1] == backlog_file.parse(GOOD)[0][1]
+
+
+def test_set_fields_leaves_every_other_line_byte_identical(tmp_path):
+    original = "\ufeff# top\nversion: 1\nitems:\n  # between\n  - id: a\n    title: A  # why\n    status: ready\n\n  - id: b\n    title: B\n"
+    path = tmp_path / "backlog.yml"
+    path.write_bytes(original.encode())
+    backlog_file.set_fields(path, "a", {"status": "done"})
+    assert path.read_bytes().decode() == original.replace("status: ready", "status: done")
+
+
+def test_set_fields_clears_a_field_by_removing_its_line(tmp_path):
+    path = tmp_path / "backlog.yml"
+    path.write_text(GOOD.replace("    status: ready\n", "    status: ready\n    spec: docs/a.md\n"))
+    backlog_file.set_fields(path, "a", {"spec": ""})
+    assert "spec" not in path.read_text() and backlog_file.read(path)[0][0].spec == ""
+
+
+def test_set_fields_inserts_a_missing_key_with_its_own_value_format(tmp_path):
+    path = tmp_path / "backlog.yml"
+    path.write_text(GOOD)
+    backlog_file.set_fields(path, "a", {"depends_on": ["x", "y"], "issue": 9, "notes": "a: b"})
+    item = backlog_file.read(path)[0][0]
+    assert (item.deps, item.issue, item.notes) == (["x", "y"], 9, "a: b")
+    assert "    depends_on: [x, y]\n" in path.read_text() and '    notes: "a: b"\n' in path.read_text()
+
+
+def test_set_fields_adds_a_line_ending_to_a_last_line_without_one(tmp_path):
+    path = tmp_path / "backlog.yml"
+    path.write_text("version: 1\nitems:\n  - id: a\n    title: A")
+    backlog_file.set_fields(path, "a", {"status": "done"})
+    assert backlog_file.read(path)[0][0].status == "done"
+
+
+FLOW = "version: 1\nitems:\n  - {id: f, title: F}\n"
+MULTI = "version: 1\nitems:\n  - id: m\n    title: M\n    notes: |\n      long\n      text\n"
+
+
+@pytest.mark.parametrize(
+    "text,item_id,fields",
+    [
+        (GOOD, "nope", {"status": "done"}),
+        (GOOD, "a", {"status": "wip"}),
+        (GOOD, "a", {"issue": 0}),
+        (GOOD, "a", {"title": "two\nlines"}),
+        (GOOD, "a", {"spec": "/etc/passwd"}),
+        (GOOD, "a", {"owner": "me"}),
+        (GOOD, "a", {"id": "z"}),
+        (GOOD, "a", {"status": 5}),
+        (GOOD, "a", {"depends_on": "x"}),
+        (FLOW, "f", {"status": "done"}),
+        (MULTI, "m", {"notes": "short"}),
+        (MULTI, "m", {"notes": ""}),
+    ],
+)
+def test_set_fields_refuses_and_leaves_the_file_untouched(tmp_path, text, item_id, fields):
+    path = tmp_path / "backlog.yml"
+    path.write_bytes(text.encode())
+    with pytest.raises(backlog_file.EditRefused):
+        backlog_file.set_fields(path, item_id, fields)
+    assert path.read_bytes() == text.encode()
+
+
+def test_set_fields_refuses_a_missing_file_a_symlink_and_an_oversize_file(tmp_path):
+    with pytest.raises(backlog_file.EditRefused):
+        backlog_file.set_fields(tmp_path / "backlog.yml", "a", {"status": "done"})
+    real = tmp_path / "real.yml"
+    real.write_text(GOOD)
+    link = tmp_path / "link.yml"
+    link.symlink_to(real)
+    with pytest.raises(backlog_file.EditRefused):
+        backlog_file.set_fields(link, "a", {"status": "done"})
+    assert real.read_text() == GOOD
+    big = tmp_path / "big.yml"
+    big.write_text(GOOD + "# " + "x" * backlog_file.FILE_MAX)
+    with pytest.raises(backlog_file.EditRefused):
+        backlog_file.set_fields(big, "a", {"status": "done"})
+
+
+def test_append_item_adds_after_the_last_item_and_refuses_a_duplicate(tmp_path):
+    path = tmp_path / "backlog.yml"
+    text = GOOD + "# trailing\nextra: 1\n"
+    path.write_text(text)
+    backlog_file.append_item(path, BacklogItem("c", ["a"], title="C", lane="bug"))
+    new = path.read_text()
+    assert new == GOOD + "  - id: c\n    title: C\n    lane: bug\n    status: backlog\n    depends_on: [a]\n# trailing\nextra: 1\n"
+    items, problems = backlog_file.parse(new)
+    assert [i.id for i in items] == ["a", "b", "c"] and problems == []
+    before = path.read_bytes()
+    with pytest.raises(backlog_file.EditRefused):
+        backlog_file.append_item(path, BacklogItem("a", [], title="again"))
+    with pytest.raises(backlog_file.EditRefused):
+        backlog_file.append_item(path, BacklogItem("d", [], title="two\nlines"))
+    with pytest.raises(backlog_file.EditRefused):
+        backlog_file.append_item(path, BacklogItem("e", [], title="E", status="wip"))
+    assert path.read_bytes() == before
+
+
+def test_append_item_keeps_crlf_and_the_list_indent(tmp_path):
+    path = tmp_path / "backlog.yml"
+    path.write_bytes(b"version: 1\r\nitems:\r\n- id: a\r\n  title: A\r\n")
+    backlog_file.append_item(path, BacklogItem("b", [], title="B"))
+    data = path.read_bytes()
+    assert data == b"version: 1\r\nitems:\r\n- id: a\r\n  title: A\r\n- id: b\r\n  title: B\r\n  status: backlog\r\n"
+
+
+def test_append_item_into_an_empty_list_and_a_flow_list(tmp_path):
+    path = tmp_path / "backlog.yml"
+    path.write_text("version: 1\nitems: []\n")
+    backlog_file.append_item(path, BacklogItem("a", [], title="A"))
+    assert path.read_text() == "version: 1\nitems:\n  - id: a\n    title: A\n    status: backlog\n"
+    flow = tmp_path / "flow.yml"
+    flow.write_text("version: 1\nitems: [{id: a, title: A}]\n")
+    with pytest.raises(backlog_file.EditRefused):
+        backlog_file.append_item(flow, BacklogItem("b", [], title="B"))
+    assert flow.read_text() == "version: 1\nitems: [{id: a, title: A}]\n"
+
+
+def test_append_item_refuses_a_missing_file_naming_import(tmp_path):
+    with pytest.raises(backlog_file.EditRefused, match="agentflow backlog import"):
+        backlog_file.append_item(tmp_path / "backlog.yml", BacklogItem("a", [], title="A"))
+    assert not (tmp_path / "backlog.yml").exists()
