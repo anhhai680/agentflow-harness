@@ -446,6 +446,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
         "done_note": pile["done_note"],
         "sync_note": pile["sync_note"],
         "issues_note": pile["issues_note"],
+        "alerts_note": pile["alerts_note"],
         "new_task": pile["new_task"],
         "lane_phases": pile["lane_phases"],
         "lane_labels": pile["lane_labels"],
@@ -964,6 +965,8 @@ def board_table(data: dict) -> str:
         lines.append(f"warning: {data['done_note']}")
     if data.get("issues_note"):
         lines.append(f"warning: {data['issues_note']}")
+    if data.get("alerts_note"):
+        lines.append(f"warning: {data['alerts_note']}")
     lines.append(f"Needs human ({len(data['needs_human'])}):")
     for item in data["needs_human"]:
         lines.append(f"  {item['run_id']} · {item['key']} · {item['kind']} · {_short(item['age_s'])} ago")

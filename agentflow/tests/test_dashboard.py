@@ -1618,7 +1618,7 @@ def test_the_page_wires_the_backlog_actions():
     for needle in ('"/api/backlog"', '"/api/backlog/start"', '"/api/backlog/remove"', "+ New task", "Stop after",
                    "Can run in parallel", "Runs after:", "Parallel with:", "Start", "Remove", "after_choices",
                    "new_task", "lane_phases", "sync_note", "first_phase", "issues_note", "Taken elsewhere",
-                   "issueNode"):
+                   "linkNode", "alerts_note", "alerts-note", "severityClass"):
         assert needle in source, needle
     allow = re.search(r"\^\(type\|value[^\n]*", source).group(0)
     for attribute in ("disabled", "maxlength", "multiple"):
@@ -2418,3 +2418,20 @@ def test_an_alert_group_with_no_fix_answers_409_on_start_and_a_bad_key_400(adash
 def test_an_alert_card_cannot_be_removed(adash):
     code, _, body = adash.post("/api/backlog/remove", {"item": "alert:42"})
     assert code == 409 and "Dependabot" in payload(body)["error"]
+
+
+def test_the_board_carries_alerts_note_with_the_cached_cards_when_gh_fails(adash, monkeypatch):
+    data = payload(adash.get("/api/board")[2])
+    assert data["alerts_note"] == ""
+    card = {c["key"]: c for c in data["backlog"]}["alert:42"]
+    assert card["severity"] in ("low", "medium", "high", "critical") and card["manifest"] and card["alerts"] == [42]
+    monkeypatch.setenv("FAKE_GH_ALERTS_STATUS", "403")
+    from agentflow.dashboard import refresh_once
+
+    refresh_once(adash.server)
+    data = payload(adash.get("/api/board")[2])
+    assert data["alerts_note"].startswith("Dependabot alerts not updated:")
+    assert {"alert:42", "alert:40"} <= {c["key"] for c in data["backlog"]}  # the last list stays on the board
+    from agentflow.views import board_table
+
+    assert f"warning: {data['alerts_note']}" in board_table(data)
