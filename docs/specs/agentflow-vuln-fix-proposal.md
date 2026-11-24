@@ -243,6 +243,56 @@ severity, and the count of alerts. Start runs `vuln --alert <lowest number in th
 `signals.py` gains `advisory_reproduced` (0/1), `vuln_code_change` (0/1) and `hours_to_pr:<severity>`. A lesson can
 target them, and the scorecard shows them in the Metrics tab.
 
+### 10. V3: beyond Dependabot
+
+Status of this section: proposed (2026-11-24). It adds two CLI inputs and one config key that §1 to §9 don't have.
+V3 builds the two committed items of §Rollout V3. The two candidates (`--pr N`, an engine release cooldown) stay
+unplanned.
+
+**`--advisory ID --package NAME --manifest PATH`.** This starts a vuln run in a repository without Dependabot alerts.
+- `ID` must match `GHSA_ID` or `CVE_ID`. The runner reads GitHub's global advisory database with one `GET`, as an argv
+  list: `gh api advisories/<GHSA>`, or `gh api advisories?cve_id=<CVE>&per_page=100` for a CVE. That endpoint needs no
+  token permission.
+- The run keeps the advisories that aren't withdrawn and whose `vulnerabilities[]` name `--package`. It compares
+  names by ecosystem: PEP 503 normalisation for `pip`, case-insensitive for `nuget` and `composer`, exact otherwise.
+  The run's ids are the union of those advisories' GHSA and CVE ids.
+- Each field the runner uses passes the same validators as an alert's. `--package` must pass the package check, and
+  `--manifest` the manifest check, as a file at the fork commit.
+- Intake refuses a run, and leaves none behind, when:
+  - no advisory names the package;
+  - the matches span more than one ecosystem;
+  - every match is withdrawn;
+  - no match has a `first_patched_version`;
+  - the highest severity is `unknown` or below `vuln.min_severity`.
+  A match with no patched version, alongside one that has one, is dropped with a warning.
+- `vuln.source` doesn't apply: it governs Dependabot intake only. `--alert` and `--advisory` exclude each other.
+  `--package` and `--manifest` are valid only with `--advisory`, and both are required with it.
+- `alert.json` keeps the shape `--alert` writes, with `"source": "advisory"`, `"alert": null` and `"alerts": []`.
+  Each advisory entry has `"number": null`, and its `url` is the advisory's `html_url`. So the probe, conformance,
+  signals and Backlog holds work unchanged. `alert.md` holds the advisory's text under `DATA_NOTE`. The PR's
+  Security advisory section says `Advisory: <url>` where an alert run says `Alert: <url>`.
+- The Dependabot PR lookup runs as for an alert. The Backlog never starts an `--advisory` run.
+
+**The dependency review check (`vuln.dependency_review: false`).**
+- When the check is on, in a vuln run, `ci` makes one call each time CI passes on a pushed sha, before it marks the PR
+  ready:
+  `gh api repos/{owner}/{repo}/dependency-graph/compare/<base sha>...<pushed sha>`. The base sha is
+  `refs/remotes/origin/<fork_from>`, and GitHub resolves the merge base.
+- It counts each `added` change whose vulnerabilities reach `vuln.min_severity`. The API's severity isn't a
+  documented enum: `moderate` reads as `medium`, and an unknown value counts as a hit, so the check fails closed.
+- A hit stops the run as `new_advisory`, which names the ids and packages.
+- These stop the run as `dependency_review_failed`: an API error (a `403` means a private repository without
+  GitHub Advanced Security, or a fork), a malformed reply, or a reply with no change to the run's package. The last
+  case means the dependency graph hasn't caught up, and an empty compare must never read as clean.
+- `approve` on either stop accepts that sha. The PR is marked ready, and its section says
+  `Dependency review: accepted by <who> (<ids>)`. A later push is checked again. A clean check shows
+  `Dependency review: no new advisory at or above <floor>`.
+- The check covers the vuln lane only.
+- `doctor`, when the key is on, makes one read-only call comparing `<fork_from>...<fork_from>`. It warns on a `403`
+  or a `404`.
+- The key is protected, because turning it off from the dashboard weakens a run. `validate` wants a bool, and with
+  `true` it wants `vuln` in `lanes`.
+
 ## Config (each key ships with its four obligations: Settings field or `_PROTECTED_KEYS`, `validate`, a `test_config_edit` case, a playbook §14 line)
 
 ```yaml
@@ -251,6 +301,7 @@ vuln:
   min_severity: low           # low | medium | high | critical: lower alerts are refused at intake and not synced
   probe: ""                   # the gate whose output must name the advisory before and not after; "" (the engine default) makes `run vuln` refuse to start; the starters set `audit`
   sync: false                 # true: open alerts become Backlog cards (V2)
+  dependency_review: false    # true: after CI passes, a new advisory at or above min_severity stops the run (V3, §10)
   dependency_files: ["**/pyproject.toml", "**/uv.lock", "**/requirements*.txt", "**/package.json",
                      "**/pnpm-lock.yaml", "**/package-lock.json", "**/yarn.lock", "**/go.mod", "**/go.sum",
                      "**/Cargo.toml", "**/Cargo.lock", "**/Gemfile", "**/Gemfile.lock"]
@@ -274,7 +325,7 @@ skills:
 - a pack that lists `vuln` in `lanes` but writes its own `phases:` has an `advisory_red` and a `patch` step tagged
   `vuln`.
 
-`vuln.source`, `vuln.forbid` and `vuln.probe` go in `_PROTECTED_KEYS`. The other keys get Settings fields.
+`vuln.source`, `vuln.forbid`, `vuln.probe` and `vuln.dependency_review` (V3) go in `_PROTECTED_KEYS`. The other keys get Settings fields.
 
 ## Boundaries
 
