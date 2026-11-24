@@ -13,7 +13,7 @@ from agentflow.config import PROMPT_PLACEHOLDERS, ConfigError, load_config, vali
 from agentflow.config_trust import ConfigUntrusted, trusted_config_path
 from agentflow.conditions import make_ctx
 from agentflow.state import Run, runs_root, workspaces_root
-from conftest import PYTHON_CONFIG, PYTHON_SKILLS, deep_merge, run_git
+from conftest import PYTHON_CONFIG, PYTHON_SKILLS, add_vuln_lane, deep_merge, run_git
 
 
 def write_pack(root: Path, patch: dict) -> Path:
@@ -481,6 +481,31 @@ def test_validate_refuses_bad_vuln_config(tmp_cfg, repo_root, patch, where):
     path = tmp_cfg(patch)
     issues = validate(load_config(path), path.parent.parent)
     assert any(i.level == "error" and i.path == where for i in issues), [(i.level, i.path) for i in issues]
+
+
+def _sync_patch(source="dependabot", probe="audit", lane=True):
+    def patch(data: dict) -> None:
+        data["gates"]["audit"] = {"run": "true"}
+        data["vuln"] = {"sync": True, "source": source, "probe": probe}
+        if lane:
+            add_vuln_lane(data)
+    return patch
+
+
+@pytest.mark.parametrize("kwargs,named", [
+    ({"source": ""}, "vuln.source"),
+    ({"lane": False}, "`vuln` in lanes"),
+    ({"probe": ""}, "vuln.probe"),
+])
+def test_validate_refuses_vuln_sync_without_what_a_start_needs(tmp_cfg, kwargs, named):
+    path = tmp_cfg(_sync_patch(**kwargs))
+    issues = [i for i in validate(load_config(path), path.parent.parent) if i.path == "vuln.sync"]
+    assert [i.level for i in issues] == ["error"] and named in issues[0].message
+
+
+def test_validate_accepts_vuln_sync_with_a_source_a_lane_and_a_probe(tmp_cfg):
+    path = tmp_cfg(_sync_patch())
+    assert not [i for i in validate(load_config(path), path.parent.parent) if i.level == "error"]
 
 
 def test_validate_accepts_a_vuln_probe_and_exit_codes(tmp_cfg):

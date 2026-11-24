@@ -468,3 +468,52 @@ def test_the_usage_pill_leaves_out_stale_windows_and_names_the_mode():
     assert label["text"] == "7d 30% (observe)" and label["title"].endswith(" · 1 run waits")
     assert js(["board.js"], "usageLabel(args).text", {**usage, "mode": "off"}) == "7d 30% (off)"
     assert js(["board.js"], "usageLabel(args).title", {**usage, "waiting": 0}).count("·") == 0
+
+
+def test_severity_class_knows_the_four_and_nothing_else():
+    got = js(["board.js"], "['low','medium','high','critical','urgent','<b>',null].map(severityClass)", {})
+    assert got == ["sev-low", "sev-medium", "sev-high", "sev-critical", None, None, None]
+
+
+def test_alert_lines_count_and_name_dependabot_prs():
+    item = {"alerts": [42, 43], "manifest": "requirements.txt", "dependabot_prs": [7]}
+    assert js(["board.js"], "alertLines(args)", item) == ["2 alerts · requirements.txt", "Dependabot PR #7 open"]
+    assert js(["board.js"], "alertLines(args)", {**item, "alerts": [42], "dependabot_prs": []}) == [
+        "1 alert · requirements.txt"]
+
+
+# `board.js` loads with no DOM, so these tests swap `el` for one that records its props and children as plain data.
+FAKE_EL = ("el = (tag, p, ...c) => ({tag, p: p || {}, c: c.flat().filter((x) => x), addEventListener() {}});"
+           "globalThis.Node = Object;")
+
+
+def test_backlog_mark_names_the_alert_statuses():
+    assert js(["board.js"], FAKE_EL + "backlogMark({status: 'no_fix'}).p", {}) == {"class": "badge lock", "text": "No fix yet"}
+    assert js(["board.js"], FAKE_EL + "backlogMark({status: 'in_progress'}).p", {}) == {"class": "badge", "text": "In progress"}
+
+
+ALERT = {"kind": "alert", "key": "alert:42", "label": "<b>requests</b> (pip)", "status": "ready", "severity": "high",
+         "manifest": "requirements.txt", "alerts": [42], "dependabot_prs": [7], "blocked_by": [], "blocks": [],
+         "parallel_with": [], "note": "", "failure": "", "removable": False,
+         "url": "https://github.com/acme/app/security/dependabot/42"}
+
+
+def test_an_alert_card_draws_its_pill_lines_and_link_as_text():
+    node = js(["board.js"], FAKE_EL + "backlogNode(args)", ALERT)
+    kids = node["c"]
+    assert kids[0]["p"] == {"class": "title", "text": "<b>requests</b> (pip)"}
+    assert kids[1]["p"] == {"class": "pill sev-high", "text": "high"}
+    assert [k["p"] for k in kids[3:5]] == [{"class": "sub", "text": "1 alert · requirements.txt"},
+                                           {"class": "sub", "text": "Dependabot PR #7 open"}]
+    link = kids[5]["c"][0]
+    assert link["p"]["text"] == "Alert ↗" and link["p"]["href"] == ALERT["url"]
+    assert all("innerHTML" not in k["p"] for k in kids)
+
+
+def test_an_alert_card_with_an_unknown_severity_draws_no_pill_and_an_issue_keeps_its_link_text():
+    node = js(["board.js"], FAKE_EL + "backlogNode(args)", {**ALERT, "severity": "<b>", "url": ""})
+    assert not [k for k in node["c"] if "pill" in (k["p"].get("class") or "")]
+    assert not [k for k in node["c"] if k["tag"] == "div" and k["c"] and k["c"][0]["tag"] == "a"]  # no url: no link
+    issue = {**ALERT, "kind": "issue", "key": "issue:1", "label": "#1 · x"}
+    link = js(["board.js"], FAKE_EL + "backlogNode(args)", issue)["c"][2]["c"][0]
+    assert link["p"]["text"] == "Issue ↗"

@@ -2888,6 +2888,12 @@ class _Validator:
             self.error("vuln.min_severity", f"must be one of {', '.join(VULN_SEVERITIES)}")
         if pol.probe and pol.probe not in self.cfg.gates:
             self.error("vuln.probe", f"{pol.probe!r} is not a gate; known: {', '.join(self.cfg.gates) or 'none'}")
+        if pol.sync:
+            missing = [what for what, absent in (("vuln.source `dependabot`", pol.source != "dependabot"),
+                                                 ("`vuln` in lanes", "vuln" not in self.cfg.lanes),
+                                                 ("a vuln.probe gate", not pol.probe)) if absent]
+            if missing:
+                self.error("vuln.sync", f"is on, but the Backlog cannot start an alert without {' and '.join(missing)}")
         for key in ("dependency_files", "forbid"):
             for i, glob in enumerate(getattr(pol, key)):
                 if not glob.strip():

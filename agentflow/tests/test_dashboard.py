@@ -23,7 +23,8 @@ from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
 from agentflow.views import _badge, _strip, lane_phases, step_title
-from conftest import PYTHON_CONFIG, L, awaiting, run_git, session_with_transcript
+from conftest import PYTHON_CONFIG, L, add_vuln_lane, awaiting, run_git, session_with_transcript
+from test_vuln import _alert
 
 TOKEN = "k3y-" + "x" * 40
 AGENTFLOW = Path(__file__).resolve().parents[1]
@@ -1535,6 +1536,19 @@ def test_a_pack_without_a_backlog_block_still_syncs_its_issues(idash, monkeypatc
     assert backlog._load_state(idash.flow.root)["issues"] == []
 
 
+def test_a_pack_without_a_backlog_block_still_syncs_its_alerts(idash, monkeypatch):
+    from agentflow import backlog
+    from agentflow.dashboard import refresh_once
+
+    seen = []
+    monkeypatch.setattr(backlog, "refresh", lambda cfg, repo: pytest.fail("no backlog block: no git refresh"))
+    monkeypatch.setattr(backlog, "sync_alerts", lambda cfg, repo: seen.append(repo) or "")
+    idash.flow.configure({"vuln": {"probe": "ok", "sync": True}, "dashboard": {"backlog": None}}, edit=add_vuln_lane)
+    idash.server.cfg = idash.flow.cfg
+    refresh_once(idash.server)
+    assert seen == [idash.flow.root]
+
+
 def test_the_page_names_no_lane_phase_or_path(bdash):
     """The page is framework code: lanes, phases and the form fields all come from the board data."""
     # the two tab lists and `PLAN_TAB` name the artifact tabs (`plan` is a tab id there, as `define`'s `spec` is); nothing else may
@@ -1604,7 +1618,7 @@ def test_the_page_wires_the_backlog_actions():
     for needle in ('"/api/backlog"', '"/api/backlog/start"', '"/api/backlog/remove"', "+ New task", "Stop after",
                    "Can run in parallel", "Runs after:", "Parallel with:", "Start", "Remove", "after_choices",
                    "new_task", "lane_phases", "sync_note", "first_phase", "issues_note", "Taken elsewhere",
-                   "issueNode"):
+                   "linkNode", "alerts_note", "alerts-note", "severityClass"):
         assert needle in source, needle
     allow = re.search(r"\^\(type\|value[^\n]*", source).group(0)
     for attribute in ("disabled", "maxlength", "multiple"):
@@ -2370,3 +2384,64 @@ def test_the_usage_header_is_set_without_innerhtml():
     board_js = (UI_DIR / "board.js").read_text(encoding="utf-8")
     assert "innerHTML" not in board_js and '$("usage").textContent = label.text' in board_js
     assert '$("usage-note").textContent = label.note' in board_js
+
+
+@pytest.fixture
+def adash(bdash, gh_alerts):
+    """`bdash` with the vuln lane, `vuln.sync: true` and two alert groups listed: 42 (fixable) and 40 (no fix)."""
+    bdash.flow.configure(patch={"vuln": {"probe": "ok", "sync": True}}, edit=add_vuln_lane)
+    bdash.server.cfg = bdash.flow.cfg
+    gh_alerts.write([_alert(42), _alert(40, **{"dependency.package.name": "flask",
+                                               "security_vulnerability.first_patched_version": None})])
+    from agentflow.dashboard import refresh_once
+
+    refresh_once(bdash.server)
+    return bdash
+
+
+def test_the_board_carries_alert_cards_and_a_fixable_one_starts(adash):
+    data = payload(adash.get("/api/board")[2])
+    cards = {c["key"]: c for c in data["backlog"]}
+    assert cards["alert:42"]["status"] == "ready" and cards["alert:40"]["status"] == "no_fix"
+    assert adash.post("/api/backlog/start", {"item": "alert:42"})[0] == 202
+    settle(adash)
+    assert adash.fake.calls[-1]["lane"] == "vuln" and adash.fake.calls[-1]["params"] == {"alert": "42"}
+
+
+def test_an_alert_group_with_no_fix_answers_409_on_start_and_a_bad_key_400(adash):
+    code, _, body = adash.post("/api/backlog/start", {"item": "alert:40"})
+    assert code == 409 and "no patched version yet" in payload(body)["error"]
+    assert adash.post("/api/backlog/start", {"item": "alert:x; rm"})[0] == 400
+    assert adash.fake.calls == []
+
+
+def test_an_alert_card_cannot_be_removed(adash):
+    code, _, body = adash.post("/api/backlog/remove", {"item": "alert:42"})
+    assert code == 409 and "Dependabot" in payload(body)["error"]
+
+
+def test_the_board_carries_alerts_note_with_the_cached_cards_when_gh_fails(adash, monkeypatch):
+    data = payload(adash.get("/api/board")[2])
+    assert data["alerts_note"] == ""
+    card = {c["key"]: c for c in data["backlog"]}["alert:42"]
+    assert card["severity"] in ("low", "medium", "high", "critical") and card["manifest"] and card["alerts"] == [42]
+    monkeypatch.setenv("FAKE_GH_ALERTS_STATUS", "403")
+    from agentflow.dashboard import refresh_once
+
+    refresh_once(adash.server)
+    data = payload(adash.get("/api/board")[2])
+    assert data["alerts_note"].startswith("Dependabot alerts not updated:")
+    assert {"alert:42", "alert:40"} <= {c["key"] for c in data["backlog"]}  # the last list stays on the board
+    from agentflow.views import board_table
+
+    assert f"warning: {data['alerts_note']}" in board_table(data)
+
+
+def test_the_cli_board_text_marks_a_no_fix_and_an_in_progress_alert_card(adash):
+    from agentflow.views import _backlog_text, board_table
+
+    data = payload(adash.get("/api/board")[2])
+    cards = {c["key"]: c for c in data["backlog"]}
+    assert _backlog_text(cards["alert:40"]).endswith(" (no fix yet)")
+    assert _backlog_text({**cards["alert:42"], "status": "in_progress"}).endswith(" (in progress)")
+    assert f"{cards['alert:40']['label']} (no fix yet)" in board_table(data)

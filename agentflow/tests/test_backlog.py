@@ -7,12 +7,15 @@ import os
 from pathlib import Path
 
 import pytest
-from agentflow import backlog, finished, module_queue
+from agentflow import backlog, finished, module_queue, run_control, vuln
 from agentflow.flow import main
 from agentflow.backlog import Invalid, Refused
 from agentflow.state import Run, runs_root
 
-from conftest import ENGINE, prime, release, run_git
+from conftest import ENGINE, add_vuln_lane, prime, release, run_git
+from agentflow.views import lane_first_phase
+import test_vuln
+from test_vuln import OTHER_MANIFEST, SIBLING, _alert
 
 GH_BIN = ENGINE / "tests" / "bin"
 # A is merged, B and C depend on A, D depends on B (the plan's example).
@@ -1600,3 +1603,307 @@ def test_the_backlog_starts_in_observe_and_when_the_governor_fails(bk, monkeypat
     assert bk.start("module:b")
     monkeypatch.setattr(governor, "account_of", lambda cfg: 1 / 0)
     assert bk.start("module:c")
+
+
+# --- synced Dependabot alerts
+
+
+def _vuln(board, **keys) -> None:
+    board.fr.configure(patch={"vuln": {"probe": "ok", "sync": True, **keys}}, edit=add_vuln_lane)
+
+
+@pytest.fixture
+def abk(bk, gh_alerts):
+    """`bk` with the vuln lane, `vuln.sync: true` and the fake `gh` serving `abk.alerts`."""
+    _vuln(bk)
+    bk.alerts = gh_alerts
+    return bk
+
+
+def _cached(board) -> list[dict]:
+    return backlog._synced_alerts(board.cfg, backlog._load_state(board.root))
+
+
+def test_alert_sync_is_off_by_default_and_calls_no_gh(bk, gh_alerts):
+    assert bk.refresh()["alerts_note"] == ""  # gh_alerts adds the lane, but vuln.sync stays false
+    assert not [c for c in _gh_calls(bk) if c[:1] == ["api"]]
+    assert _cached(bk) == []
+
+
+def test_a_refresh_makes_one_alerts_call_and_one_pr_call(abk, monkeypatch):
+    abk.alerts.write([_alert(42), SIBLING])
+    abk.refresh()
+    calls = _gh_calls(abk)
+    assert [c for c in calls if c[:1] == ["api"]] == [
+        ["api", "repos/{owner}/{repo}/dependabot/alerts?state=open&severity=low,medium,high,critical&per_page=100"]]
+    assert ["pr", "list", "--author", "app/dependabot", "--state", "open", "--json", "number,title",
+            "--limit", "100"] in calls
+
+
+def test_the_severity_floor_goes_to_gh_and_is_applied_again_on_read(abk, monkeypatch):
+    abk.alerts.write([_alert(42), SIBLING])  # 42 is high, SIBLING low: one group
+    abk.refresh()
+    assert [g["alerts"] for g in _cached(abk)] == [[42, 43]]
+    _vuln(abk, min_severity="critical")  # raised after the sync: no gh call needed
+    assert _cached(abk) == []
+
+
+def test_a_floor_above_low_is_sent_to_gh_and_filters_the_listing(abk, monkeypatch):
+    _vuln(abk, min_severity="high")
+    abk.alerts.write([_alert(42), SIBLING])
+    abk.refresh()
+    assert [c for c in _gh_calls(abk) if c[:1] == ["api"]] == [
+        ["api", "repos/{owner}/{repo}/dependabot/alerts?state=open&severity=high,critical&per_page=100"]]
+    assert [g["alerts"] for g in _cached(abk)] == [[42]]
+
+
+def test_a_failed_alerts_call_keeps_the_last_list_and_says_why(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    monkeypatch.setenv("FAKE_GH_ALERTS_STATUS", "403")
+    assert abk.refresh()["alerts_note"].startswith("Dependabot alerts not updated:")
+    assert [g["alerts"] for g in _cached(abk)] == [[42]]
+
+
+def test_a_failed_pr_list_drops_only_the_pr_lines(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    monkeypatch.setenv("FAKE_GH_FAIL_ON", "pr list")
+    assert "Dependabot pull requests not read" in abk.refresh()["alerts_note"]
+    assert _cached(abk)[0]["dependabot_prs"] == []
+
+
+def test_a_group_names_the_dependabot_prs_for_its_package(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    monkeypatch.setenv("FAKE_GH_PR_LIST", json.dumps([{"number": 7, "title": "Bump requests from 2.31.0 to 2.32.0"},
+                                                      {"number": 8, "title": "Bump flask from 2 to 3"}]))
+    assert abk.refresh()["alerts_note"] == ""
+    assert _cached(abk)[0]["dependabot_prs"] == [7]
+
+
+def test_an_unreadable_alert_is_counted_not_shown(abk, monkeypatch):
+    abk.alerts.write([_alert(41, **{"dependency.package.name": "x; rm -rf ~"}), _alert(42)])
+    assert "1 alert(s) could not be read" in abk.refresh()["alerts_note"]
+    assert [g["alerts"] for g in _cached(abk)] == [[42]]
+
+
+def test_a_full_page_says_only_the_first_alerts_are_shown(abk, monkeypatch):
+    abk.alerts.write([_alert(n) for n in range(1, 101)])
+    assert "only the first 100 open alerts are shown" in abk.refresh()["alerts_note"]
+
+
+def test_a_tampered_cache_group_is_dropped(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    state = backlog._load_state(abk.root)
+    backlog._save_state(abk.root, alerts=[{**state["alerts"][0], "package": "$(id)"}])
+    assert _cached(abk) == []
+
+
+def test_turning_sync_off_clears_the_cache(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    _vuln(abk, sync=False)
+    abk.refresh()
+    assert backlog._load_state(abk.root).get("alerts") == []
+
+
+def test_an_alert_card_shows_the_group(abk, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_PR_LIST", json.dumps([{"number": 7, "title": "Bump requests from 2.31.0 to 2.32.0"}]))
+    abk.alerts.write([_alert(42), SIBLING])
+    abk.refresh()
+    card = abk.cards()["alert:42"]
+    assert (card["kind"], card["lane"], card["status"], card["label"]) == ("alert", "vuln", "ready", "requests (pip)")
+    assert card["id"] == "42" and card["severity"] == "high" and card["manifest"] == "requirements.txt"
+    assert card["alerts"] == [42, 43] and card["dependabot_prs"] == [7] and card["removable"] is False
+    assert card["ids"] and card["url"].startswith("https://")
+    assert card["first_phase"] == lane_first_phase(abk.cfg, "vuln")
+
+
+def test_alert_cards_stay_out_of_the_after_choices(abk):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    snap = backlog.snapshot(abk.cfg, abk.root)
+    assert "alert:42" in {c["key"] for c in snap["cards"]}
+    assert not [c for c in snap["after_choices"] if c["key"].startswith("alert:")]
+
+
+def test_the_snapshot_says_nothing_about_alerts_when_sync_is_off(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    monkeypatch.setenv("FAKE_GH_ALERTS_STATUS", "403")
+    abk.refresh()
+    assert backlog.snapshot(abk.cfg, abk.root)["alerts_note"].startswith("Dependabot alerts not updated:")
+    _vuln(abk, sync=False)  # the stale note stays in backlog_state.json until a refresh clears it
+    assert backlog._load_state(abk.root)["alerts_note"]
+    snap = backlog.snapshot(abk.cfg, abk.root)
+    assert snap["alerts_note"] == "" and not [c for c in snap["cards"] if c["kind"] == "alert"]
+
+
+def test_start_passes_the_lowest_fixable_alert(abk, monkeypatch):
+    abk.alerts.write([_alert(40, **{"security_vulnerability.first_patched_version": None}), _alert(42)])
+    abk.refresh()
+    job = backlog.begin_start(abk.cfg, abk.root, "alert:40")
+    assert (job.lane, job.params) == ("vuln", {"alert": "42"})
+    assert abk.cards()["alert:40"]["status"] == "starting"
+    with pytest.raises(Refused, match="alert:40 is already starting"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:40")
+    item = backlog.Backlog.load(abk.root).alert_overlay("40")
+    assert (item.source, item.kind, item.params, item.label) == ("alert", "alert", {"alert": "40"}, "alert #40")
+    assert item.key == "alert:40"
+
+
+def test_a_group_with_no_fix_shows_and_refuses_start(abk, monkeypatch):
+    abk.alerts.write([_alert(40, **{"security_vulnerability.first_patched_version": None})])
+    abk.refresh()
+    card = abk.cards()["alert:40"]
+    assert card["status"] == "no_fix" and card["note"] == "no patched version yet"
+    with pytest.raises(Refused, match="alert #40: no patched version yet"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:40")
+
+
+def test_start_refuses_a_group_that_is_not_on_the_board(abk):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    with pytest.raises(Refused, match=r"alert #41 is not an open alert group at or above low as of the last refresh"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:41")
+    _vuln(abk, sync=False)
+    with pytest.raises(Refused, match="alert sync is off"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:42")
+
+
+def test_a_cli_run_for_the_package_holds_the_card_and_a_cancel_frees_it(abk, monkeypatch):
+    abk.alerts.write([_alert(42), OTHER_MANIFEST])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)  # a real `run vuln --alert 42` intake: it writes alert.json
+    cards = abk.cards()
+    assert cards["alert:42"]["status"] == "in_progress" and run.id in cards["alert:42"]["note"]
+    assert cards["alert:44"]["status"] == "ready"  # same package, other manifest
+    with pytest.raises(Refused, match=f"alert #42: run {run.id} holds requests in requirements.txt"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:42")
+    run_control.cancel(run, "test")
+    assert abk.cards()["alert:42"]["status"] == "ready"
+
+
+def test_a_failed_run_frees_the_card(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)
+    assert abk.cards()["alert:42"]["status"] == "in_progress"
+    run.emit("run_failed", reason="the fix did not build")
+    assert abk.cards()["alert:42"]["status"] == "ready"
+
+
+def test_a_done_run_holds_a_group_only_while_one_of_its_alerts_is_still_open(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)
+    run.emit("run_finished")  # its pull request is open: alert 42 is still open, so the fix has not landed
+    card = abk.cards()["alert:42"]
+    assert card["status"] == "in_progress" and run.id in card["note"]
+    with pytest.raises(Refused, match="holds requests"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:42")
+    # the fix merged and a later advisory for the same package and manifest opened: the done run is history
+    abk.alerts.write([_alert(50)])
+    abk.refresh()
+    assert abk.cards()["alert:50"]["status"] == "ready"
+    assert backlog.begin_start(abk.cfg, abk.root, "alert:50").params == {"alert": "50"}
+
+
+def test_a_run_stopped_on_an_error_holds_the_package_whatever_its_alerts(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)
+    run.emit("runner_error", error="disk full", exception="OSError")  # status "error": it can be resumed
+    assert run.state["status"] == "error"
+    abk.alerts.write([_alert(50)])  # 42 is gone and 50 is not among the run's alerts
+    abk.refresh()
+    card = abk.cards()["alert:50"]
+    assert card["status"] == "in_progress" and run.id in card["note"]
+
+
+def test_a_tampered_cache_with_two_groups_sharing_an_alert_number_keeps_the_first(abk, monkeypatch):
+    abk.alerts.write([_alert(42), OTHER_MANIFEST])
+    abk.refresh()
+    first, second = backlog._load_state(abk.root)["alerts"][:2]
+    assert first["alerts"] != second["alerts"]
+    tampered = {**second, "alerts": sorted({*second["alerts"], *first["alerts"]})}
+    assert vuln.check_group(tampered) is not None  # valid on its own: only the overlap with `first` drops it
+    backlog._save_state(abk.root, alerts=[first, tampered])
+    assert [g["alerts"] for g in _cached(abk)] == [first["alerts"]]
+
+
+def test_a_live_run_holds_the_package_in_the_manifest_whatever_its_alerts(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)
+    abk.alerts.write([_alert(50)])  # 42 is gone from the listing, but the run is still working on requests
+    abk.refresh()
+    card = abk.cards()["alert:50"]
+    assert card["status"] == "in_progress" and run.id in card["note"]
+
+
+def test_the_note_names_a_live_run_before_a_finished_one_and_the_newest_of_each(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    old = test_vuln._start(abk.fr)
+    old.emit("run_finished")
+    assert run_id_in_note(abk) == old.id
+    live = test_vuln._start(abk.fr)  # a second run for the same group, live
+    assert run_id_in_note(abk) == live.id
+    live.emit("run_finished")  # both finished: the newest holds the name
+    assert run_id_in_note(abk) == live.id
+
+
+def run_id_in_note(board) -> str:
+    return board.cards()["alert:42"]["note"].split()[1]
+
+
+def test_each_vuln_runs_alert_json_is_read_once_per_snapshot(abk, monkeypatch):
+    abk.alerts.write([_alert(42), OTHER_MANIFEST, _alert(60, **{"dependency.package.name": "flask"}),
+                      _alert(61, **{"dependency.package.name": "django"})])
+    abk.refresh()
+    test_vuln._start(abk.fr)
+    reads = []
+    real = backlog.vuln.read_alert
+    monkeypatch.setattr(backlog.vuln, "read_alert", lambda run_dir: reads.append(run_dir) or real(run_dir))
+    assert len(abk.cards()) >= 4
+    assert len(reads) == 1  # four groups, one vuln run
+
+
+def test_a_run_without_readable_alert_facts_holds_by_its_started_alert_only_while_live(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)
+    (run.dir / "alert.json").write_text("{not json", encoding="utf-8")
+    assert abk.cards()["alert:42"]["status"] == "in_progress"  # live, and started for alert 42
+    run.emit("run_finished")
+    assert abk.cards()["alert:42"]["status"] == "ready"  # done, and its facts say nothing: it holds nothing
+
+
+def test_an_alert_start_spawns_the_vuln_lane_and_a_started_card_is_held_by_its_run(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    assert abk.start("alert:42")
+    assert abk.spawn.calls[0]["lane"] == "vuln" and abk.spawn.calls[0]["params"] == {"alert": "42"}
+    # the spawner's run has no alert.json, but it is live and its alert is in the group: the card says so, as the 409 does
+    assert abk.cards()["alert:42"]["status"] == "in_progress"
+    with pytest.raises(Refused, match="holds requests|already has a live run"):
+        abk.start("alert:42")
+
+
+def test_an_alert_start_that_fails_keeps_its_reason(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    abk.spawn.fail = "Dependabot alert #42 is fixed: only an open alert starts a vuln run"
+    abk.start("alert:42")
+    card = abk.cards()["alert:42"]
+    assert card["status"] == "ready" and card["failure"].startswith("Dependabot alert #42 is fixed")
+
+
+@pytest.mark.parametrize("key", ["alert:x", "alert:-1", "alert:", "alert:4 2", "alert:--x"])
+def test_a_bad_alert_key_is_invalid(key):
+    with pytest.raises(Invalid):
+        backlog.parse_key(key)
+
+
+def test_a_good_alert_key_is_normalised():
+    assert backlog.parse_key("alert:#42") == ("alert", "42")

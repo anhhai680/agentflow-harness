@@ -857,6 +857,17 @@ def test_spawn_run_passes_the_stop_phase_and_the_new_module_row(qrepo, tmp_path)
     assert argv[-1] == "--detach"
 
 
+def test_spawn_run_passes_an_alert_number_as_one_flag_item(qrepo, tmp_path):
+    argv = _argv_of(tmp_path, qrepo.root, "vuln", {"alert": "42"})
+    assert argv == ["run", "vuln", "--alert=42", "--detach"]
+
+
+@pytest.mark.parametrize("alert", ["4 2", "--x", "42\n", "#42", "", "4\x002", "٤٢"])
+def test_spawn_run_refuses_an_alert_that_is_not_all_digits(qrepo, alert):
+    with pytest.raises(StartFailed):
+        module_queue.spawn_run(qrepo.root, "vuln", {"alert": alert}, command=["true"])
+
+
 @pytest.mark.parametrize("lane,params", [
     ("bad lane", {"task": "x"}), ("--x", {"task": "x"}), ("", {"task": "x"}),
     ("bug", {"log": "/etc/passwd"}),       # --log reads a local path, so it is never offered

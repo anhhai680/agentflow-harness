@@ -218,16 +218,30 @@ function backlogMark(item) {
   if (item.status === "blocked") return el("span", { class: "badge lock", text: "Blocked" });
   if (item.status === "starting") return el("span", { class: "badge", text: "Starting…" });
   if (item.status === "taken") return el("span", { class: "badge lock", text: "Taken elsewhere" });
+  if (item.status === "no_fix") return el("span", { class: "badge lock", text: "No fix yet" });
+  if (item.status === "in_progress") return el("span", { class: "badge", text: "In progress" });
   return el("span", { class: "badge ready-mark", text: "Ready" });
 }
 
-// A synced issue's link: the server keeps only an https URL of that issue, and the title stays text.
-function issueNode(url) {
+// A synced issue's or alert's link: the server keeps only an https URL, and the title stays text.
+function linkNode(url, text) {
   if (!/^https:\/\//.test(url)) return null;
-  const link = el("a", { href: url, target: "_blank", rel: "noopener noreferrer", text: "Issue ↗",
+  const link = el("a", { href: url, target: "_blank", rel: "noopener noreferrer", text: text,
     onclick: (ev) => ev.stopPropagation() });
   link.addEventListener("keydown", (ev) => ev.stopPropagation());
   return el("div", {}, link);
+}
+
+// Only the four severities Dependabot reports become a CSS class; anything else draws no pill.
+function severityClass(sev) {
+  return ["low", "medium", "high", "critical"].includes(sev) ? "sev-" + sev : null;
+}
+
+// The lines under an alert card's title: how many alerts it groups, where, and each open Dependabot PR.
+function alertLines(item) {
+  const n = item.alerts.length;
+  return [`${n} alert${n === 1 ? "" : "s"} · ${item.manifest}`,
+    ...item.dependabot_prs.map((k) => "Dependabot PR #" + k + " open")];
 }
 
 function backlogNode(item) {
@@ -236,10 +250,14 @@ function backlogNode(item) {
   const buttons = [];
   if (canStart) buttons.push(el("button", { type: "button", class: "primary", text: "Start", onclick: (ev) => { ev.stopPropagation(); startItem(item); } }));
   if (item.removable) buttons.push(el("button", { type: "button", class: "danger", text: "Remove", onclick: (ev) => { ev.stopPropagation(); removeItem(item); } }));
+  const isAlert = item.kind === "alert";
+  const sev = isAlert ? severityClass(item.severity) : null;
   const node = el("article", { class: "card backlog " + item.status + (item.failure ? " failed-start" : ""), draggable: canStart ? "true" : null },
     el("div", { class: "title", text: item.label }),
+    sev ? el("span", { class: "pill " + sev, text: item.severity }) : null,
     backlogMark(item),
-    item.url ? issueNode(item.url) : null,
+    isAlert ? alertLines(item).map((line) => el("div", { class: "sub", text: line })) : null,
+    item.url ? linkNode(item.url, isAlert ? "Alert ↗" : "Issue ↗") : null,
     item.blocked_by.length ? el("div", { class: "sub", text: "Runs after: " + item.blocked_by.map((b) => b.text).join(", ") }) : null,
     item.blocks && item.blocks.length ? el("div", { class: "sub", text: "Blocks: " + names(item.blocks) }) : null,
     item.parallel_with.length ? el("div", { class: "sub", text: "Parallel with: " + names(item.parallel_with) }) : null,
@@ -443,6 +461,8 @@ function renderBoard(data) {
   $("sync-note").textContent = data.sync_note ? "Base branch not updated: " + data.sync_note : "";
   $("issues-note").hidden = !data.issues_note;
   $("issues-note").textContent = data.issues_note || "";
+  $("alerts-note").hidden = !data.alerts_note;
+  $("alerts-note").textContent = data.alerts_note || "";
   $("retro-due").hidden = !data.retro_due;
   $("retro-due").replaceChildren(...(data.retro_due ? [document.createTextNode("Retro due: " + data.retro_due + " → run "), el("code", { text: "agentflow retro" })] : []));
   if (!ui.dragging) {  // a patch mid-drag would lose the drop highlights; dragend draws what arrived

@@ -1352,6 +1352,8 @@ def test_the_settings_form_has_the_digest_key(shipped):
 
 def test_the_vuln_fields_round_trip(sparse_repo):
     path = _sparse(sparse_repo)
+    with path.open("a", encoding="utf-8") as handle:  # `vuln.sync` needs a probe, and `vuln.probe` is protected
+        handle.write("vuln:\n  probe: unit\n")
     fields = _fields(path)
     for key in ("min_severity", "sync", "dependency_files"):
         assert fields[("vuln", key)]["source"] == "engine"
@@ -1367,6 +1369,12 @@ def test_the_vuln_fields_round_trip(sparse_repo):
     assert not again.errors, again.errors
     config_edit.save(path, again)
     assert load_config(path).vuln.min_severity == "critical"
+
+
+def test_turning_vuln_sync_on_without_a_probe_is_refused(sparse_repo):
+    proposal = _sparse_form(_sparse(sparse_repo), (["vuln", "sync"], True))
+    assert [(i.path, i.message) for i in proposal.errors] == [
+        ("vuln.sync", "is on, but the Backlog cannot start an alert without a vuln.probe gate")]
 
 
 @pytest.mark.parametrize("key, value", [

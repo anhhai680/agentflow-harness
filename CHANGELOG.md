@@ -7,6 +7,12 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.7] - 2026-11-24
+
+### Added
+- With `vuln.sync: true`, open Dependabot alerts at or above `vuln.min_severity` become dashboard Backlog cards, grouped by package and manifest (`alert:<lowest number>`). A card shows a severity pill, "N alerts · <manifest>", an open Dependabot PR line for each pull request naming the package, and an "Alert ↗" link; Start runs `vuln --alert N` with the lowest alert that has a patched version. A group with no patched version shows **No fix yet**, and one a vuln run holds shows **In progress** (a live run, or one stopped on an error, holds the package in the manifest; a done run with its PR open holds it only while one of its alerts is still open); both answer Start with 409. Alert cards can't be removed by hand, and a failed alerts call keeps the last list and shows an alerts note on the board and in the CLI board text (`alerts_note`), and a failed `gh pr list` call drops only the PR lines. Each refresh makes one alerts call and one `gh pr list` call.
+- `validate` refuses `vuln.sync: true` without `vuln.source: dependabot`, `vuln` in `lanes` and a `vuln.probe`.
+
 ## [3.6] - 2026-11-23
 
 ### Added

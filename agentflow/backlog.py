@@ -18,7 +18,14 @@ Open GitHub issues that carry `issues.sync_label` are a third kind: `refresh` re
 Nothing from an issue's text reaches an argv, a module id, a map row or a refusal: an issue-backed run in the
 module lane works on the derived module `issue-<N>`, and the issue is named only by its number.
 
-Item keys are typed so they cannot clash: `module:<id>`, `card:<id>`, `issue:<number>` and `run:<id>`.
+Open Dependabot alerts are a fourth kind, when `vuln.sync` is on: `refresh` reads them with one `gh api` call (and
+one `gh pr list`) into `backlog_state.json`, grouped by package and manifest. Only `vuln.py`'s validators let an
+alert's package, manifest or advisory ids into the cache; its titles and summaries never reach the board.
+
+A group's card is `alert:<N>` (N: its lowest alert number). Start runs the vuln lane on the lowest alert in the
+group that has a patched version, and the card reads "in progress" while a run of that package and manifest holds it.
+
+Item keys are typed so they cannot clash: `module:<id>`, `card:<id>`, `issue:<number>`, `alert:<number>` and `run:<id>`.
 """
 
 from __future__ import annotations
@@ -32,7 +39,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agentflow import finished, intake, module_queue, sources, work_source
+from agentflow import finished, intake, module_queue, sources, vuln, work_source
 from agentflow.conditions import first_phase_with_work, make_ctx
 from agentflow.config import check_lane
 from agentflow.events import EventLog, nfc
@@ -96,12 +103,12 @@ class Item:
 
     `source` is `form` for a card added on the page, `map` for the record a capability-map module gets when
     someone first presses Start on it (so a failed start has somewhere to keep its reason), and `issue` for the
-    same record of a synced GitHub issue.
+    same record of a synced GitHub issue, and `alert` for that of a Dependabot alert group.
     """
 
     id: str
     lane: str
-    kind: str  # "task" or "module"
+    kind: str  # "task", "module", "issue" or "alert"
     params: dict
     new_module: dict | None
     after: list[str]
@@ -118,6 +125,8 @@ class Item:
             return f"module:{self.params['module']}"
         if self.source == "issue":
             return f"issue:{self.params['issue']}"
+        if self.source == "alert":
+            return f"alert:{self.params['alert']}"
         return f"card:{self.id}"
 
     @property
@@ -171,6 +180,11 @@ class Backlog:
     def issue_overlay(self, number: str) -> Item | None:
         """The newest record of a start attempt for synced issue `number`."""
         found = [i for i in self.items.values() if i.source == "issue" and i.params.get("issue") == number]
+        return found[-1] if found else None
+
+    def alert_overlay(self, number: str) -> Item | None:
+        """The newest record of a start attempt for the alert group whose lowest alert is `number`."""
+        found = [i for i in self.items.values() if i.source == "alert" and i.params.get("alert") == number]
         return found[-1] if found else None
 
 
@@ -235,6 +249,8 @@ def _label_of_run(run: Run) -> str:
         return str(params["module"])
     if params.get("issue"):
         return f"issue #{params['issue']}"
+    if params.get("alert"):
+        return f"alert #{params['alert']}"
     return _one_line(str(params.get("task") or params.get("topic") or run.id), 40)
 
 
@@ -615,6 +631,109 @@ def _synced(cfg: Config, state: dict) -> list[dict]:
     return out
 
 
+# --------------------------------------------------------------------------- synced Dependabot alerts
+
+
+def _alerts_on(cfg: Config) -> bool:
+    return bool(cfg.vuln.sync and cfg.vuln.source == "dependabot" and "vuln" in cfg.lanes)
+
+
+def sync_alerts(cfg: Config, repo: Path) -> str:
+    """Read the open Dependabot alerts at or above `vuln.min_severity` into `backlog_state.json`, grouped by package
+    and manifest; returns the note the board shows ("" when all is well). It never raises: when `gh` fails, the last
+    list stays and the note says why. One call reads the alerts and one the open Dependabot PRs."""
+    repo = Path(repo)
+    if not _alerts_on(cfg):
+        if _load_state(repo).get("alerts"):
+            _save_state(repo, alerts=[], alerts_note="")
+        return ""
+    floor = cfg.vuln.min_severity
+    try:
+        listing = gh_json(["api", f"{vuln.ALERTS_API}?state=open&severity={vuln.severity_query(floor)}"
+                           f"&per_page={vuln.ALERTS_MAX}"], cwd=repo)
+        groups, skipped = vuln.group_alerts(listing, floor)
+    except (GhError, OSError, ValueError, TypeError, RecursionError) as exc:  # AlertError is a ValueError
+        note = f"Dependabot alerts not updated: {_reason(exc)}"
+        _save_state(repo, alerts_note=note)
+        return note
+    notes = []
+    try:
+        prs = gh_json(["pr", "list", "--author", "app/dependabot", "--state", "open", "--json", "number,title",
+                       "--limit", "100"], cwd=repo)
+    except (GhError, OSError, ValueError, TypeError, RecursionError):
+        prs = []
+        notes.append("Dependabot pull requests not read")
+    for group in groups:
+        group["dependabot_prs"] = vuln.prs_naming(group["package"], prs)
+    if skipped:
+        notes.append(f"{skipped} alert(s) could not be read and are not shown")
+    if len(listing) >= vuln.ALERTS_MAX:
+        notes.append(f"only the first {vuln.ALERTS_MAX} open alerts are shown")
+    note = "; ".join(notes)
+    _save_state(repo, alerts=groups, alerts_note=note, alerts_at=datetime.now(UTC).isoformat(timespec="seconds"))
+    return note
+
+
+def _synced_alerts(cfg: Config, state: dict) -> list[dict]:
+    """The cached alert groups that pass `vuln.check_group` and sit at or above the current `vuln.min_severity`."""
+    if not _alerts_on(cfg) or not isinstance(state.get("alerts"), list):
+        return []
+    # A group is filtered by its highest severity only, so after `vuln.min_severity` is raised a below-floor fixable
+    # member can stay as Start's target until the next refresh; intake then refuses it with a visible reason.
+    groups = (vuln.check_group(entry) for entry in state["alerts"])
+    kept: list[dict] = []
+    taken: set[int] = set()
+    for g in groups:
+        if not g or not vuln.severity_at_least(g["severity"], cfg.vuln.min_severity):
+            continue
+        if taken & set(g["alerts"]):  # a tampered cache: no two cards may share an `alert:N` key
+            continue
+        taken.update(g["alerts"])
+        kept.append(g)
+    return kept
+
+
+def _vuln_runs(runs: list[Run]) -> list[tuple[Run, dict | None]]:
+    """Each vuln run here that may hold an alert group, with its `alert.json` facts read once (None when they can't
+    be: a run whose facts are unreadable holds a group only by the alert number it was started with)."""
+    found: list[tuple[Run, dict | None]] = []
+    for run in runs:
+        if run.state.get("pipeline") != "vuln" or not module_queue.issue_run_holds(run):
+            continue
+        try:
+            found.append((run, vuln.read_alert(run.dir)))
+        except vuln.AlertError:
+            found.append((run, None))
+    return found
+
+
+def _int_set(value: Any) -> set[int]:
+    return {n for n in value if isinstance(n, int) and not isinstance(n, bool)} if isinstance(value, list) else set()
+
+
+def _alert_holder(group: dict, vuln_runs: list[tuple[Run, dict | None]]) -> Run | None:
+    """The vuln run that holds `group`, preferring a live one and then the newest (`vuln_runs` is oldest first).
+    A run that is not finished (live, or stopped on an error, since it can be resumed) holds the group's package in
+    its manifest whatever its alerts: its `alert.json` names the group's ecosystem, package and manifest, or the
+    alert it was started with (`params.alert`) is in the group, even before `alert.json` exists. A `done` run with
+    its pull request open holds it only while one of its alerts is still in the group: once none is open, its fix
+    landed and the run is history. A failed, cancelled or archived run does not hold it."""
+    want = (group["ecosystem"], group["package"], group["manifest"])
+    alerts = set(group["alerts"])
+    live: list[Run] = []
+    finished_: list[Run] = []
+    for run, facts in vuln_runs:
+        named = facts is not None and (facts.get("ecosystem"), facts.get("package"), facts.get("manifest")) == want
+        if run.state["status"] not in TERMINAL:
+            started = str((run.state.get("params") or {}).get("alert") or "")
+            if named or (started.isascii() and started.isdigit() and int(started) in alerts):
+                live.append(run)
+        elif named and facts is not None and _int_set(facts.get("alerts")) & alerts:
+            finished_.append(run)
+    held = live or finished_
+    return held[-1] if held else None
+
+
 def _issue_blocker(number: str, pic: dict) -> str | None:
     """Why synced issue `number` is not a Backlog card of its own: a run, a card or a module here has it."""
     for run in pic["runs"]:
@@ -729,6 +848,13 @@ def _picture(cfg: Config, repo: Path) -> dict:
     merged = {k: v for k, v in (state.get("merged") or {}).items() if isinstance(k, str)}
     pic = {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "state": state,
            "issues": _synced(cfg, state)}
+    pic["alerts"] = _synced_alerts(cfg, state)
+    pic["alert_runs"] = {}  # the lowest alert number of each held group -> the run that holds it
+    vuln_runs = _vuln_runs(runs) if pic["alerts"] else []
+    for group in pic["alerts"]:
+        holder = _alert_holder(group, vuln_runs)
+        if holder is not None:
+            pic["alert_runs"][group["alerts"][0]] = holder
     issues = []
     for entry in pic["issues"]:
         record = book.issue_overlay(entry["number"])
@@ -775,6 +901,8 @@ def _label_of(key: str, pic: dict) -> str:
         return _label_of_run(run) if run else name
     if kind == "issue":
         return f"issue #{name}"
+    if kind == "alert":
+        return f"alert #{name}"
     return name
 
 
@@ -854,6 +982,21 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         if number in taken and card["status"] != "starting":
             card["status"], card["note"] = "taken", TAKEN
         cards.append(card)
+    for group in pic["alerts"]:
+        lowest = group["alerts"][0]
+        number, holder = str(lowest), pic["alert_runs"].get(lowest)
+        card = make(f"alert:{number}", "alert", number, f"{group['package']} ({group['ecosystem']})", "vuln",
+                    book.alert_overlay(number), severity=group["severity"], manifest=group["manifest"],
+                    alerts=group["alerts"], ids=group["ids"], dependabot_prs=group["dependabot_prs"],
+                    url=group["url"])
+        if card["status"] != "starting":
+            if holder is not None:
+                card["status"], card["note"] = "in_progress", f"run {holder.id} holds it"
+            elif not group["fixable"]:
+                card["status"], card["note"] = "no_fix", "no patched version yet"
+            else:
+                card["status"] = "ready"
+        cards.append(card)
     done = [{"key": f"module:{n.id}", "id": n.id, "reason": by_entry[n.id].get("done_reason") or finished.MERGED}
             for n in pic["nodes"] if by_entry[n.id]["status"] == "done"]
     live_runs = [{"key": f"run:{r.id}", "label": _label_of_run(r), "kind": "run"} for r in _live_runs(pic["runs"])]
@@ -874,6 +1017,7 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         "skipped": work_source.skipped(cfg, repo),
         "sync_note": pic["state"].get("sync_note") or "",
         "issues_note": pic["state"].get("issues_note") or "" if cfg.issues.sync_label else "",
+        "alerts_note": pic["state"].get("alerts_note") or "" if _alerts_on(cfg) else "",
     }
 
 
@@ -953,11 +1097,12 @@ def _spec_task(new_module: dict) -> str:
 
 def parse_key(key: Any) -> tuple[str, str]:
     kind, _, name = str(key).partition(":")
-    if kind not in ("module", "card", "issue") or not name:
-        raise Invalid("name a card (card:<id>), a module (module:<id>) or an issue (issue:<number>)")
-    if kind == "issue":
+    if kind not in ("module", "card", "issue", "alert") or not name:
+        raise Invalid("name a card (card:<id>), a module (module:<id>), an issue (issue:<number>) "
+                      "or an alert group (alert:<number>)")
+    if kind in ("issue", "alert"):
         try:
-            name = str(int(intake.issue_number(name)))
+            name = str(int(intake.issue_number(name) if kind == "issue" else vuln.alert_number(name)))
         except ValueError as exc:
             raise Invalid(str(exc)) from exc
     return kind, name
@@ -1007,6 +1152,20 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
             item = book.issue_overlay(name)
             params, new_module = _issue_run_params(cfg, item_lane, name, pic)
             to_phase = None
+        elif kind == "alert":
+            if not _alerts_on(cfg):
+                raise Refused("alert sync is off")
+            group = next((g for g in pic["alerts"] if str(g["alerts"][0]) == name), None)
+            if group is None:
+                raise Refused(f"alert #{name} is not an open alert group at or above {cfg.vuln.min_severity} "
+                              "as of the last refresh")
+            if not group["fixable"]:
+                raise Refused(f"alert #{name}: no patched version yet")
+            holder = pic["alert_runs"].get(group["alerts"][0])
+            if holder is not None:
+                raise Refused(f"alert #{name}: run {holder.id} holds {group['package']} in {group['manifest']}")
+            item_lane, item = "vuln", book.alert_overlay(name)
+            params, new_module, to_phase = {"alert": str(group["fixable"][0])}, None, None
         else:
             item = book.items.get(name)
             if item is None or item.source != "form" or item.status == "removed":
@@ -1036,11 +1195,14 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
         clash = _live_clash(params, item_lane, pic["runs"])
         if clash:
             raise Refused(clash)
-        if item is None or (kind in ("module", "issue") and item.status == "started"):  # a card always has its item
+        if item is None or (kind in ("module", "issue", "alert") and item.status == "started"):  # a card always has its item
             ident = uuid.uuid4().hex[:8]
             if kind == "issue":
                 log.append("item_added", by=BY, id=ident, lane=item_lane, kind="issue", source="issue",
                            params={"issue": name}, new_module=None, after=[], to_phase=None, label=f"issue #{name}")
+            elif kind == "alert":
+                log.append("item_added", by=BY, id=ident, lane=item_lane, kind="alert", source="alert",
+                           params={"alert": name}, new_module=None, after=[], to_phase=None, label=f"alert #{name}")
             else:
                 log.append("item_added", by=BY, id=ident, lane=item_lane, kind="module", source="map",
                            params={"module": name}, new_module=None, after=[], to_phase=None, label=name)
@@ -1053,7 +1215,7 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
 def _live_clash(params: dict, lane: str, runs: list[Run]) -> str | None:
     for run in _live_runs(runs):
         have = run.state.get("params") or {}
-        for name in ("module", "issue"):
+        for name in ("module", "issue", "alert"):
             if name in params and str(have.get(name)) == str(params[name]) and (name != "module" or run.state.get("pipeline") == lane):
                 return f"{name} {params[name]} already has a live run ({run.id})"
     return None
@@ -1115,6 +1277,7 @@ def refresh(cfg: Config, repo: Path) -> dict:
     `agentflow queue` holds the queue lock."""
     repo = Path(repo)
     issues_note = sync_issues(cfg, repo)  # never raises, and touches no git
+    alerts_note = sync_alerts(cfg, repo)  # the same
     note = sync_branch(repo, cfg.project.fork_from) if module_queue.backlog_settings(cfg).get("sync_base", False) else ""
     # origin/<fork_from> is where a merged plan lands; fetching it never touches a local branch or the work tree
     fetch_remote_branch(repo, cfg.project.fork_from)
@@ -1130,7 +1293,7 @@ def refresh(cfg: Config, repo: Path) -> dict:
     if merged is not None:
         changes["merged"] = merged
     _save_state(repo, **changes)
-    return {"note": note, "skipped": skipped, "issues_note": issues_note}
+    return {"note": note, "skipped": skipped, "issues_note": issues_note, "alerts_note": alerts_note}
 
 
 def _blocker_runs(entry: dict, runs: dict[str, Run]) -> set[str]:
