@@ -1808,6 +1808,27 @@ def test_a_done_run_holds_a_group_only_while_one_of_its_alerts_is_still_open(abk
     assert backlog.begin_start(abk.cfg, abk.root, "alert:50").params == {"alert": "50"}
 
 
+def test_a_run_stopped_on_an_error_holds_the_package_whatever_its_alerts(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)
+    run.emit("runner_error", error="disk full", exception="OSError")  # status "error": it can be resumed
+    assert run.state["status"] == "error"
+    abk.alerts.write([_alert(50)])  # 42 is gone and 50 is not among the run's alerts
+    abk.refresh()
+    card = abk.cards()["alert:50"]
+    assert card["status"] == "in_progress" and run.id in card["note"]
+
+
+def test_a_tampered_cache_with_two_groups_sharing_an_alert_number_keeps_the_first(abk, monkeypatch):
+    abk.alerts.write([_alert(42), OTHER_MANIFEST])
+    abk.refresh()
+    first, second = backlog._load_state(abk.root)["alerts"][:2]
+    assert first["alerts"] != second["alerts"]
+    backlog._save_state(abk.root, alerts=[first, {**second, "alerts": [*second["alerts"], *first["alerts"]]}])
+    assert [g["alerts"] for g in _cached(abk)] == [first["alerts"]]
+
+
 def test_a_live_run_holds_the_package_in_the_manifest_whatever_its_alerts(abk, monkeypatch):
     abk.alerts.write([_alert(42)])
     abk.refresh()

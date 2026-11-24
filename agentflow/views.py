@@ -942,7 +942,8 @@ def _backlog_text(card: dict) -> str:
     """A Backlog card in the terminal: `name [P]` when it can run in parallel, or what it runs after."""
     if card["blocked_by"]:
         return f"{card['label']} (runs after {', '.join(b['text'] for b in card['blocked_by'])})"
-    status = {"starting": " (starting)", "taken": " (taken elsewhere)"}.get(card["status"], "")
+    status = {"starting": " (starting)", "taken": " (taken elsewhere)", "no_fix": " (no fix yet)",
+              "in_progress": " (in progress)"}.get(card["status"], "")
     return card["label"] + (" [P]" if card["parallel"] else "") + status
 
 

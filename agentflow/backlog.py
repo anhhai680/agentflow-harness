@@ -108,7 +108,7 @@ class Item:
 
     id: str
     lane: str
-    kind: str  # "task" or "module"
+    kind: str  # "task", "module", "issue" or "alert"
     params: dict
     new_module: dict | None
     after: list[str]
@@ -678,8 +678,19 @@ def _synced_alerts(cfg: Config, state: dict) -> list[dict]:
     """The cached alert groups that pass `vuln.check_group` and sit at or above the current `vuln.min_severity`."""
     if not _alerts_on(cfg) or not isinstance(state.get("alerts"), list):
         return []
+    # A group is filtered by its highest severity only, so after `vuln.min_severity` is raised a below-floor fixable
+    # member can stay as Start's target until the next refresh; intake then refuses it with a visible reason.
     groups = (vuln.check_group(entry) for entry in state["alerts"])
-    return [g for g in groups if g and vuln.severity_at_least(g["severity"], cfg.vuln.min_severity)]
+    kept: list[dict] = []
+    taken: set[int] = set()
+    for g in groups:
+        if not g or not vuln.severity_at_least(g["severity"], cfg.vuln.min_severity):
+            continue
+        if taken & set(g["alerts"]):  # a tampered cache: no two cards may share an `alert:N` key
+            continue
+        taken.update(g["alerts"])
+        kept.append(g)
+    return kept
 
 
 def _vuln_runs(runs: list[Run]) -> list[tuple[Run, dict | None]]:
@@ -696,16 +707,17 @@ def _vuln_runs(runs: list[Run]) -> list[tuple[Run, dict | None]]:
     return found
 
 
-def _numbers(value: Any) -> set[int]:
+def _int_set(value: Any) -> set[int]:
     return {n for n in value if isinstance(n, int) and not isinstance(n, bool)} if isinstance(value, list) else set()
 
 
 def _alert_holder(group: dict, vuln_runs: list[tuple[Run, dict | None]]) -> Run | None:
     """The vuln run that holds `group`, preferring a live one and then the newest (`vuln_runs` is oldest first).
-    A live run holds it when its `alert.json` names the group's ecosystem, package and manifest, or when the alert it
-    was started with (`params.alert`) is in the group, even before `alert.json` exists. A run that is not live but
-    still holds its work (done with its pull request open, or stopped on an error) holds it only while one of its
-    alerts is still in the group: once none is open, its fix landed and the run is history."""
+    A run that is not finished (live, or stopped on an error, since it can be resumed) holds the group's package in
+    its manifest whatever its alerts: its `alert.json` names the group's ecosystem, package and manifest, or the
+    alert it was started with (`params.alert`) is in the group, even before `alert.json` exists. A `done` run with
+    its pull request open holds it only while one of its alerts is still in the group: once none is open, its fix
+    landed and the run is history. A failed, cancelled or archived run does not hold it."""
     want = (group["ecosystem"], group["package"], group["manifest"])
     alerts = set(group["alerts"])
     live: list[Run] = []
@@ -716,7 +728,7 @@ def _alert_holder(group: dict, vuln_runs: list[tuple[Run, dict | None]]) -> Run 
             started = str((run.state.get("params") or {}).get("alert") or "")
             if named or (started.isascii() and started.isdigit() and int(started) in alerts):
                 live.append(run)
-        elif named and facts is not None and _numbers(facts.get("alerts")) & alerts:
+        elif named and facts is not None and _int_set(facts.get("alerts")) & alerts:
             finished_.append(run)
     held = live or finished_
     return held[-1] if held else None

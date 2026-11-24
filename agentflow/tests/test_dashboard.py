@@ -2435,3 +2435,13 @@ def test_the_board_carries_alerts_note_with_the_cached_cards_when_gh_fails(adash
     from agentflow.views import board_table
 
     assert f"warning: {data['alerts_note']}" in board_table(data)
+
+
+def test_the_cli_board_text_marks_a_no_fix_and_an_in_progress_alert_card(adash):
+    from agentflow.views import _backlog_text, board_table
+
+    data = payload(adash.get("/api/board")[2])
+    cards = {c["key"]: c for c in data["backlog"]}
+    assert _backlog_text(cards["alert:40"]).endswith(" (no fix yet)")
+    assert _backlog_text({**cards["alert:42"], "status": "in_progress"}).endswith(" (in progress)")
+    assert f"{cards['alert:40']['label']} (no fix yet)" in board_table(data)
