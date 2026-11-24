@@ -293,3 +293,23 @@ def test_append_item_refuses_a_missing_file_naming_import(tmp_path):
     with pytest.raises(backlog_file.EditRefused, match="agentflow backlog import"):
         backlog_file.append_item(tmp_path / "backlog.yml", BacklogItem("a", [], title="A"))
     assert not (tmp_path / "backlog.yml").exists()
+
+
+def test_set_fields_is_linear_on_a_long_run_of_blanks(tmp_path):
+    pad = " " * 200_000
+    for crlf in (False, True):
+        text = f"version: 1\nitems:\n  - id: a\n    title: A\n    owner: x{pad}y\n    notes: n{pad}\n  - id: b\n    title: B\n"
+        text = text.replace("\n", "\r\n") if crlf else text
+        path = tmp_path / "backlog.yml"
+        path.write_bytes(text.encode())
+        backlog_file.set_fields(path, "a", {"status": "done", "notes": "z"})
+        assert path.read_bytes() == text.replace("status: backlog", "").replace(f"    notes: n{pad}", "    notes: z").replace(
+            "  - id: a" + ("\r\n" if crlf else "\n"), "  - id: a" + ("\r\n" if crlf else "\n") + "    status: done" + ("\r\n" if crlf else "\n")
+        ).encode()
+    long_list = tmp_path / "list.yml"
+    long_list.write_text("version: 1\nitems:" + pad + "x\n")
+    with pytest.raises(backlog_file.EditRefused):
+        backlog_file.append_item(long_list, BacklogItem("c", [], title="C"))
+    long_list.write_text("version: 1\nitems:" + pad + "# note\n")
+    backlog_file.append_item(long_list, BacklogItem("c", [], title="C"))
+    assert [i.id for i in backlog_file.read(long_list)[0]] == ["c"]

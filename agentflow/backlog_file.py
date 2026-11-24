@@ -194,7 +194,8 @@ HEADER = (
 _PLAIN = re.compile(r"[A-Za-z0-9_./][A-Za-z0-9_ ./,()'+=@-]*")
 _UNREADABLE = re.compile("[^\x09\x0a\x0d\x20-\x7e\xa0-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
 _LINE = re.compile(r"[^\r\n]*(?:\r\n|\n|\r)|[^\r\n]+")
-_KEY_LINE = re.compile(r"( *)([A-Za-z_][A-Za-z0-9_]*)[ \t]*:(?:[ \t]+(.*?))?[ \t]*\r?\n?$")
+_KEY_LINE = re.compile(r"( *)([A-Za-z_][A-Za-z0-9_]*)[ \t]*:(?:[ \t]+(.*))?\r?\n?$")
+# group 3 is left untrimmed on purpose: a lazy group before trailing blanks backtracks quadratically on a long run
 _DEFAULTS = {"lane": "", "spec": "", "plan": "", "depends_on": [], "issue": None, "notes": ""}
 _FIELD = {"depends_on": "deps"}
 
@@ -422,7 +423,7 @@ def append_item(path: Path, item: BacklogItem) -> None:
     head = next((n for n, line in enumerate(lines) if re.match(r"items:", line)), None)
     if head is None:
         raise EditRefused(f"{path.name} has no `items:` list")
-    rest = re.sub(r"\s*(#.*)?$", "", lines[head][len("items:") :], flags=re.S)
+    rest = lines[head][len("items:") :].split("#", 1)[0].strip()  # no regex: the line may hold a long run of blanks
     nl = _ending(lines[head]) or ("\r\n" if "\r\n" in text else "\n")
     out = list(lines)
     if rest == "":
@@ -442,7 +443,7 @@ def append_item(path: Path, item: BacklogItem) -> None:
         at = last + 1
         if last != head and not _ending(out[last]):
             out[last] += nl
-    elif re.fullmatch(r"\[\s*\]", rest.strip()):
+    elif re.fullmatch(r"\[\s*\]", rest):
         out[head] = "items:" + nl
         at = head + 1
     else:
