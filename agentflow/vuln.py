@@ -1,7 +1,9 @@
 """The vuln lane's alert model, its validation, its intake from GitHub and the probe verdict.
 
-Everything but `gather_alert` and `read_alert` is a pure function. `gather_alert` reads a Dependabot alert through `gh`
-(an argv list, never a shell) before any run exists, and `read_alert` reads back the facts it kept (`alert.json`).
+Everything but `gather_alert`, `gather_advisory`, `read_alert` and `review_dependencies` is a pure function.
+`gather_alert` reads a Dependabot alert, and `gather_advisory` a global advisory, through `gh` (an argv list, never a
+shell) before any run exists, `read_alert` reads back the facts they kept (`alert.json`), and `review_dependencies`
+asks GitHub's dependency graph what the pushed head adds (`vuln.dependency_review`).
 
 Trust model. A Dependabot alert is data from outside the run: GitHub's reply carries text that other people wrote
 (package names, advisory summaries, version ranges). `parse_alert` is the one place that turns it into `Alert`, and it
@@ -13,8 +15,9 @@ doesn't match its pattern. A refusal is an `AlertError`, never a repair. The fre
 scanner that dies must never read as a clean scan, so `judge` answers "failed" unless the probe ran cleanly.
 
 `config.py` imports this module's constants at module level, so this module imports nothing from `agentflow` at
-module level (`config`, `gates` and `state` would be a cycle): `gather_alert` imports `gitops`, `intake` and `state`
-when it runs, and `run_probe` imports `config`, `gates` and `guards`.
+module level (`config`, `gates` and `state` would be a cycle): `gather_alert` and `gather_advisory` import `gitops`,
+`intake` and `state` when they run, `run_probe` imports `config`, `gates` and `guards`, and `review_dependencies`
+imports `gitops`, `hitl` and `autonomy`.
 """
 
 from __future__ import annotations
@@ -166,6 +169,107 @@ def parse_alert(data: object) -> Alert:
         references=_references(advisory))
 
 
+@dataclass(frozen=True)
+class Vulnerability:
+    """One package a global advisory names: the ecosystem, the package, the vulnerable range and the first patch."""
+    ecosystem: str
+    package: str
+    vulnerable_range: str
+    patched: str | None
+
+
+@dataclass(frozen=True)
+class Advisory:
+    ghsa: str
+    cve: str | None
+    severity: str  # one of SEVERITIES, or "unknown"
+    withdrawn: bool
+    url: str  # "" unless it is a plain https URL
+    summary: str
+    description: str
+    references: tuple[str, ...]
+    vulnerabilities: tuple[Vulnerability, ...]
+
+
+def advisory_id(ref: object) -> str:
+    """The GHSA or CVE id in `ref`, stripped; anything else is refused (it would reach `gh` as part of a path)."""
+    text = str(ref).strip()
+    if not (GHSA_ID.fullmatch(text) or CVE_ID.fullmatch(text)):
+        raise ValueError(f"--advisory takes a GHSA or CVE id such as GHSA-cfgh-2345-vwxj, not {str(ref)[:80]!r}")
+    return text
+
+
+def _vulnerability(entry: object) -> Vulnerability | None:
+    """One `vulnerabilities[]` entry of a global advisory, or None when any used field fails its check: GitHub lists
+    packages this lane has no use for, and one bad entry must not hide the good ones."""
+    try:
+        root = _obj(entry, "the vulnerability")
+        package = _obj(root.get("package"), "the vulnerability's package")
+        ecosystem = _text(package, "ecosystem", "the ecosystem")
+        if ecosystem not in ECOSYSTEMS:
+            return None
+        fixed = root.get("first_patched_version")
+        patched = None if fixed is None else _version(_text(root, "first_patched_version", "the first patched version"),
+                                                      "the first patched version")
+        return Vulnerability(
+            ecosystem, _package(_text(package, "name", "the package name")),
+            _version(_text(root, "vulnerable_version_range", "the vulnerable range"), "the vulnerable range", _RANGE),
+            patched)
+    except AlertError:
+        return None
+
+
+def _advisory_references(advisory: dict) -> tuple[str, ...]:
+    """A global advisory's `references` are plain URL strings (a Dependabot alert's are `{url}` objects)."""
+    refs = advisory.get("references")
+    return tuple(r for r in refs if isinstance(r, str))[:MAX_REFERENCES] if isinstance(refs, list) else ()
+
+
+def parse_advisory(data: object) -> Advisory:
+    """The validated facts of one global advisory (GitHub's REST shape); `AlertError` when an id or the severity is
+    bad. An entry of `vulnerabilities` that fails its checks is dropped, never repaired."""
+    root = _obj(data, "the advisory")
+    ids = _ids(root)
+    severity = _text(root, "severity", "the severity")
+    if severity not in (*SEVERITIES, "unknown"):
+        raise AlertError(f"the severity {severity!r} is not one of {', '.join((*SEVERITIES, 'unknown'))}")
+    entries = root.get("vulnerabilities")
+    if entries is None:  # GitHub documents it as "array of objects or null": an advisory that names no package
+        entries = []
+    if not isinstance(entries, list):
+        raise AlertError("the advisory's vulnerabilities are not a list")
+    found = (_vulnerability(entry) for entry in entries)
+    return Advisory(
+        ghsa=ids[0], cve=ids[1] if root.get("cve_id") is not None else None, severity=severity,
+        withdrawn=root.get("withdrawn_at") is not None, url=_url(str(root.get("html_url") or "")),
+        summary=str(root.get("summary") or "")[:MAX_TEXT], description=str(root.get("description") or "")[:MAX_TEXT],
+        references=_advisory_references(root), vulnerabilities=tuple(v for v in found if v is not None))
+
+
+def same_package(ecosystem: str, a: str, b: str) -> bool:
+    """True when `a` and `b` name one package in `ecosystem`: pip folds `-`, `_` and `.` and the case (PEP 503), NuGet
+    and Composer fold the case, and every other registry compares the names exactly."""
+    if ecosystem == "pip":
+        return re.sub(r"[-_.]+", "-", a).lower() == re.sub(r"[-_.]+", "-", b).lower()
+    if ecosystem in ("nuget", "composer"):
+        return a.casefold() == b.casefold()
+    return a == b
+
+
+def match_package(advisories: Sequence[Advisory], package: str) -> tuple[list[Advisory], list[Vulnerability]]:
+    """The advisories that aren't withdrawn and name `package`, and those vulnerabilities, in input order."""
+    live: list[Advisory] = []
+    named: list[Vulnerability] = []
+    for advisory in advisories:
+        if advisory.withdrawn:
+            continue
+        hits = [v for v in advisory.vulnerabilities if same_package(v.ecosystem, v.package, package)]
+        if hits:
+            live.append(advisory)
+            named.extend(hits)
+    return live, named
+
+
 def siblings(primary: Alert, others: Iterable[Alert]) -> tuple[Alert, ...]:
     """`primary` first, then the other open alerts for the same package in the same manifest."""
     key = (primary.ecosystem, primary.package, primary.manifest)
@@ -193,6 +297,53 @@ def judge(exit_code: int | None, output: str, ids: Sequence[str], ok_exit: Seque
         return "failed", []
     matched = [i for i in ids if re.search(rf"(?<![\w-]){re.escape(i)}(?![\w-])", output)]
     return ("present", matched) if matched else ("absent", [])
+
+
+def normalize_severity(value: object) -> str | None:
+    """`medium` for the dependency graph's `moderate`, a member of `SEVERITIES` as it is, and None for anything else."""
+    if value == "moderate":
+        return "medium"
+    return value if isinstance(value, str) and value in SEVERITIES else None
+
+
+def review_changes(changes: object, floor: str, package: str, ecosystem: str) -> list[dict]:
+    """The new vulnerabilities a dependency-graph compare reports, at or above `floor`: one dict per vulnerability of
+    an `added` entry, `{"ghsa", "severity", "package", "version", "manifest"}`. A severity that isn't one this module
+    knows counts as a hit and shows as "unknown". A reply that isn't the documented shape, or that names no change to
+    `package` (the graph hasn't caught up with the push yet), is an `AlertError`, never a clean compare."""
+    if not isinstance(changes, list):
+        raise AlertError("the dependency graph's reply is not a list")
+    seen = False
+    for item in changes:
+        root = _obj(item, "a dependency change")
+        found = root.get("vulnerabilities")
+        if not isinstance(found, list):
+            raise AlertError("a dependency change's vulnerabilities are missing or not a list")
+        for entry in found:
+            ghsa = _obj(entry, "a dependency change's vulnerability").get("advisory_ghsa_id")
+            if not isinstance(ghsa, str) or not GHSA_ID.fullmatch(ghsa):
+                raise AlertError("a dependency change's advisory_ghsa_id is not a GHSA id")
+        name = root.get("name")
+        seen = seen or (isinstance(name, str) and same_package(ecosystem, name, package))
+    if not seen:
+        raise AlertError(f"the dependency graph shows no change to {package} yet")
+    hits: list[dict] = []
+    for item in changes:
+        if item.get("change_type") != "added":
+            continue
+        counted = []
+        for entry in item["vulnerabilities"]:
+            severity = normalize_severity(entry.get("severity"))
+            if severity is None or severity_at_least(severity, floor):
+                counted.append((entry["advisory_ghsa_id"], severity or "unknown"))
+        if not counted:
+            continue
+        name = _package(_text(item, "name", "a dependency change's name"))
+        version = _version(_text(item, "version", "a dependency change's version"), "a dependency change's version")
+        manifest = _manifest(_text(item, "manifest", "a dependency change's manifest"))
+        hits.extend({"ghsa": ghsa, "severity": severity, "package": name, "version": version, "manifest": manifest}
+                    for ghsa, severity in counted)
+    return hits
 
 
 def forbidden(cfg: Config, lane: str) -> list[str]:
@@ -522,7 +673,8 @@ def gather_alert(policy: VulnPolicy, ref: object, repo: Path, *, fork: str) -> t
     prs = _dependabot_prs(primary.package, repo)
     warnings += [f"Dependabot PR #{n} is open for {primary.package}; this run's PR will supersede it" for n in prs]
     facts = {
-        "alert": primary.number, "alerts": [a.number for a in group], "ecosystem": primary.ecosystem,
+        "source": "dependabot", "alert": primary.number, "alerts": [a.number for a in group],
+        "ecosystem": primary.ecosystem,
         "package": primary.package, "manifest": primary.manifest, "severity": severity, "ids": ids,
         "advisories": [{"number": a.number, "severity": a.severity, "ids": list(a.ids),
                         "vulnerable_range": a.vulnerable_range, "patched": a.patched, "url": _url(a.url)}
@@ -532,6 +684,131 @@ def gather_alert(policy: VulnPolicy, ref: object, repo: Path, *, fork: str) -> t
     files = {ALERT_JSON: (json.dumps(facts, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
              ALERT_FILE: _alert_text(group, ids, severity).encode("utf-8")}
     params = {"alert": number, "slug": slugify(f"{primary.package}-{primary.ids[0]}"), "advisory_ids": ids}
+    return params, files, warnings
+
+
+# --------------------------------------------------------------------------- intake: `--advisory ID`
+
+ADVISORIES_API = "advisories"  # GitHub's global advisory database: public, so `gh` needs no token permission for it
+
+
+def _fetch_advisories(ghsa_or_cve: str, repo: Path) -> list[Advisory]:
+    """The global advisories for one id: a GHSA id is one `GET advisories/<id>`, a CVE id is one listing filtered by
+    `cve_id`. The id was checked by `advisory_id`, and the query is encoded like an alert listing's."""
+    from agentflow.gitops import GhError, gh_json
+
+    if CVE_ID.fullmatch(ghsa_or_cve):
+        query = urllib.parse.urlencode({"cve_id": ghsa_or_cve, "per_page": 100}, quote_via=urllib.parse.quote, safe="")
+        data = gh_json(["api", f"{ADVISORIES_API}?{query}"], cwd=repo)
+        if not isinstance(data, list):
+            raise GhError(f"gh api {ADVISORIES_API} printed no list of advisories")
+        found = [parse_advisory(entry) for entry in data]
+        found = [a for a in found if a.cve == ghsa_or_cve]
+    else:
+        try:
+            data = gh_json(["api", f"{ADVISORIES_API}/{ghsa_or_cve}"], cwd=repo)
+        except GhError as exc:
+            if "HTTP 404" in str(exc):
+                raise ValueError(f"no GitHub advisory {ghsa_or_cve}") from exc
+            raise
+        found = [parse_advisory(data)]
+        if found[0].ghsa != ghsa_or_cve:
+            raise AlertError(f"gh printed advisory {found[0].ghsa} when asked for {ghsa_or_cve}")
+    if not found:
+        raise ValueError(f"no GitHub advisory {ghsa_or_cve}")
+    return found
+
+
+def _advisory_text(kept: list[tuple[Advisory, list[Vulnerability]]], ids: list[str], severity: str, package: str,
+                   ecosystem: str, manifest: str) -> str:
+    from agentflow.intake import DATA_NOTE
+
+    lines = [DATA_NOTE, "", f"# Advisory {kept[0][0].ghsa}: {package} ({ecosystem}) in {manifest}", "",
+             f"- Advisories: {', '.join(ids)}",
+             f"- Severity: {severity}",
+             f"- Package: {package} ({ecosystem})",
+             f"- Manifest: {manifest}"]
+    for advisory, hits in kept:
+        lines += ["", f"## Advisory {advisory.ghsa} ({advisory.severity}): "
+                      f"{', '.join(i for i in (advisory.ghsa, advisory.cve) if i)}", ""]
+        lines += [f"- Vulnerable: {v.vulnerable_range}\n- Patched in: {v.patched}" for v in hits]
+        lines += [f"- URL: {advisory.url or '(none)'}", "", "### Summary", "", advisory.summary or "(none)", "",
+                  "### Description", "", advisory.description or "(none)"]
+        if advisory.references:
+            lines += ["", "### References", "", *(f"- {ref}" for ref in advisory.references)]
+    return "\n".join(lines) + "\n"
+
+
+def gather_advisory(policy: VulnPolicy, ref: object, package: object, manifest: object, repo: Path, *,
+                    fork: str) -> tuple[dict, dict[str, bytes], list[str]]:
+    """`(params_update, files, warnings)` for `--advisory <ref> --package <package> --manifest <manifest>`, read from
+    GitHub's global advisory database through `gh` before any run exists. It keeps `gather_alert`'s contract.
+
+    `params_update` holds `advisory` (the id), `slug` (`<package>-<first GHSA id>`) and `advisory_ids`; `files` are
+    `alert.json` (the validated facts, `source: "advisory"`, `alert: null`, `alerts: []`) and `alert.md` (the
+    advisories' text, as data). The advisory's text is never in the facts, the pull request or an argv. `vuln.source`
+    governs Dependabot intake only, so it isn't checked here. A refusal raises `ValueError` (an `AlertError` for a bad
+    field) or `GhError`.
+    """
+    from agentflow import gitops
+    from agentflow.state import slugify
+
+    wanted = advisory_id(ref)
+    if package in (None, "") or manifest in (None, ""):
+        raise ValueError("--advisory needs --package NAME and --manifest PATH")
+    name, path = _package(str(package)), _manifest(str(manifest))
+    repo = Path(repo)
+    sha = gitops.commit_at(repo, f"refs/heads/{fork}") if fork else None
+    if sha is None or gitops.read_blob(repo, sha, path, MANIFEST_MAX) is None:
+        raise ValueError(f"the manifest {path} is not a file at project.fork_from ({fork}): the manifest is on "
+                         "another branch, or it moved")
+    found = _fetch_advisories(wanted, repo)
+    live, _ = match_package(found, name)
+    if not live:
+        withdrawn = any(a.withdrawn and any(same_package(v.ecosystem, v.package, name) for v in a.vulnerabilities)
+                        for a in found)
+        if withdrawn:
+            raise ValueError(f"GitHub advisory {wanted} is withdrawn, so no run can start from it")
+        raise ValueError(f"GitHub advisory {wanted} does not name the package {name}")
+    matches = [(a, match_package([a], name)[1]) for a in live]
+    ecosystems = list(dict.fromkeys(v.ecosystem for _, hits in matches for v in hits))
+    if len(ecosystems) > 1:
+        raise ValueError(f"GitHub advisory {wanted} names {name} in more than one ecosystem "
+                         f"({', '.join(ecosystems)}): this run takes one")
+    warnings: list[str] = []
+    kept: list[tuple[Advisory, list[Vulnerability]]] = []
+    for advisory, hits in matches:
+        patched = [v for v in hits if v.patched is not None]
+        warnings += [f"GitHub advisory {advisory.ghsa} names {v.package} {v.vulnerable_range} with no patched "
+                     "version yet; this run leaves it open" for v in hits if v.patched is None]
+        if patched:
+            kept.append((advisory, patched))
+    if not kept:
+        raise ValueError(f"GitHub advisory {wanted} ({name}) has no patched version yet, so no upgrade can fix it. "
+                         "A human can wait for a patched release, replace the package, or fix it by hand.")
+    known = [a.severity for a, _ in kept if a.severity in SEVERITIES]
+    if not known:
+        raise ValueError(f"GitHub advisory {wanted} has severity unknown: it is not rated, so the run can't judge "
+                         f"it against vuln.min_severity ({policy.min_severity})")
+    severity = max(known, key=SEVERITIES.index)
+    if not severity_at_least(severity, policy.min_severity):
+        raise ValueError(f"GitHub advisory {wanted} is {severity}, below vuln.min_severity ({policy.min_severity})")
+    package_name, ecosystem = kept[0][1][0].package, kept[0][1][0].ecosystem
+    ghsas = list(dict.fromkeys(a.ghsa for a, _ in kept))
+    ids = ghsas + list(dict.fromkeys(a.cve for a, _ in kept if a.cve and a.cve not in ghsas))
+    prs = _dependabot_prs(package_name, repo)
+    warnings += [f"Dependabot PR #{n} is open for {package_name}; this run's PR will supersede it" for n in prs]
+    facts = {
+        "source": "advisory", "alert": None, "alerts": [], "ecosystem": ecosystem, "package": package_name,
+        "manifest": path, "severity": severity, "ids": ids,
+        "advisories": [{"number": None, "severity": a.severity, "ids": [i for i in (a.ghsa, a.cve) if i],
+                        "vulnerable_range": v.vulnerable_range, "patched": v.patched, "url": a.url}
+                       for a, hits in kept for v in hits],
+        "dependabot_prs": prs,
+    }
+    files = {ALERT_JSON: (json.dumps(facts, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+             ALERT_FILE: _advisory_text(kept, ids, severity, package_name, ecosystem, path).encode("utf-8")}
+    params = {"advisory": wanted, "slug": slugify(f"{package_name}-{ghsas[0]}"), "advisory_ids": ids}
     return params, files, warnings
 
 
@@ -548,6 +825,105 @@ def read_alert(run_dir: Path) -> dict:
             or not all(isinstance(i, str) and (GHSA_ID.fullmatch(i) or CVE_ID.fullmatch(i)) for i in ids)):
         raise AlertError(f"{path} names no advisory id")
     return data
+
+
+# --------------------------------------------------------------------------- the pushed head: `vuln.dependency_review`
+
+REVIEW_API = "repos/{owner}/{repo}/dependency-graph/compare"  # `gh api` fills in `{owner}` and `{repo}` itself
+REVIEW_STOPS = ("new_advisory", "dependency_review_failed")  # the stops `review_dependencies` names; a person's approval accepts the head
+_FULL_SHA1 = re.compile(r"^[0-9a-f]{40}$")
+HITS_SHOWN = 10  # advisories a `new_advisory` summary names before `and <n> more`
+
+
+def _accepted_by(events: list[dict], review: dict) -> str | None:
+    """The person who accepted the failing `review`: the first approval on its key after it, when that approves a
+    dependency-review stop, is not the runner's own (`AUTO_BY`) and is not a retry's. `run_control.retry` clears the
+    stop it retries with a `hitl_approved` and then, under the same lock, a `step_retry` on the key, so an approval
+    the key's next event retries asked GitHub again rather than accepted the head; a `step_retry` before any approval
+    means the same. None when no one accepted it."""
+    from agentflow.autonomy import AUTO_BY  # it imports `config`, which imports this module
+
+    after = [e for e in events if e.get("seq", -1) > review.get("seq", -1) and e.get("key") == review.get("key")]
+    for index, event in enumerate(after):
+        if event["type"] == "step_retry":
+            return None
+        if event["type"] == "hitl_approved":
+            retried = index + 1 < len(after) and after[index + 1]["type"] == "step_retry"
+            by = str(event.get("by") or "")
+            return by if event.get("kind") in REVIEW_STOPS and by and by != AUTO_BY and not retried else None
+    return None
+
+
+def _reviews(events: list[dict], head: str, key: str | None = None) -> list[dict]:
+    return [e for e in events if e.get("type") == "dependency_reviewed" and head and e.get("head") == head
+            and (key is None or e.get("key") == key)]
+
+
+def _hit_text(hit: dict) -> str:
+    return f"{hit['ghsa']} ({hit['severity']}) in {hit['package']} {hit['version']} ({hit['manifest']})"
+
+
+def review_dependencies(cfg: Config, run: Run, worktree: Path, key: str, head: str) -> tuple[str, str]:
+    """GitHub's dependency review of the pushed `head` against `origin/<fork_from>`: `(verdict, summary)`.
+
+    `off` when `vuln.dependency_review` is false or `run` is not a vuln run (nothing is asked or recorded); `accepted`
+    when a person approved the stop a failing review of this same `head` raised on `key` (nothing is asked again);
+    otherwise one `gh api <REVIEW_API>/<base>...<head>` (a GET: no fields; both full 40-hex shas, checked before `gh` sees them),
+    read by `review_changes` against the run's package (`alert.json`) and `vuln.min_severity`: `ok`, `new_advisory`
+    when the head adds an advisory at or above it, or `dependency_review_failed` for a `gh` error, a reply that is not
+    the documented shape or shows no change to the package yet, or a sha that cannot be read. The check fails closed:
+    nothing but `ok` and `accepted` lets the pull request be marked ready. Each verdict but `off` and `accepted` is a
+    `dependency_reviewed` event. Text from GitHub reaches the summary and the event only as `review_changes`' validated
+    fields or a `gh` error, and each passes `hitl.clean_fact`."""
+    from agentflow.gitops import GhError, commit_at, gh_json
+    from agentflow.hitl import clean_fact
+
+    if not cfg.vuln.dependency_review or run.state.get("pipeline") != "vuln":
+        return "off", ""
+    events = run.events.read()
+    mine = _reviews(events, head, key)
+    if mine and mine[-1].get("ok") is not True:
+        by = _accepted_by(events, mine[-1])
+        if by is not None:
+            return "accepted", clean_fact(f"{by} accepted the dependency review of {head[:12]}.")
+    floor = cfg.vuln.min_severity
+    fork = cfg.project.fork_from
+    base = commit_at(worktree, f"refs/remotes/origin/{fork}") or ""
+    hits: list[dict] = []
+    error = ""
+    if not _FULL_SHA1.fullmatch(head or ""):
+        error = "the pushed head is not a full 40-character commit id"
+    elif not _FULL_SHA1.fullmatch(base):
+        error = f"origin/{fork} is not a commit with a full 40-character id in the worktree"
+    else:
+        try:
+            alert = read_alert(run.dir)
+            reply = gh_json(["api", f"{REVIEW_API}/{base}...{head}"], cwd=worktree)
+            hits = review_changes(reply, floor, str(alert.get("package") or ""), str(alert.get("ecosystem") or ""))
+        except (GhError, AlertError) as exc:
+            error = clean_fact(str(exc))
+    hits = [{field: clean_fact(str(hit[field])) for field in ("ghsa", "severity", "package", "version", "manifest")}
+            for hit in hits]
+    short = head[:12] if _FULL_SHA1.fullmatch(head or "") else "the pushed head"
+    if error and not _FULL_SHA1.fullmatch(head or ""):  # no head to pin an approval to: approving only stops again
+        verdict = "dependency_review_failed"
+        summary = (f"The pushed head is unknown (the run recorded no full commit id for its last push), so GitHub's "
+                   f"dependency review cannot be asked and `agentflow approve` cannot accept it: `agentflow cancel "
+                   f"{run.id}`, or set `vuln.dependency_review: false`.")
+    elif error:
+        verdict = "dependency_review_failed"
+        summary = f"GitHub's dependency review of {short} could not be read: {error}"
+    elif hits:
+        verdict = "new_advisory"
+        more = f" and {len(hits) - HITS_SHOWN} more" if len(hits) > HITS_SHOWN else ""
+        summary = (f"The pushed head {short} adds {len(hits)} advisory(ies) at or above {floor}: "
+                   f"{'; '.join(_hit_text(h) for h in hits[:HITS_SHOWN])}{more}.")
+    else:
+        verdict = "ok"
+        summary = f"GitHub's dependency review of {short} names no new advisory at or above {floor}."
+    run.emit("dependency_reviewed", key=key, head=head if _FULL_SHA1.fullmatch(head or "") else "", base=base,
+             floor=floor, ok=verdict == "ok", verdict=verdict, advisories=hits, error=error)
+    return verdict, clean_fact(summary)
 
 
 # --------------------------------------------------------------------------- the pull request: `finish`
@@ -611,13 +987,41 @@ def _versions(facts: object) -> str:
     return "Target: unknown" if old == new == "unknown" else f"Target: {old} → {new}"
 
 
-def pr_lines(run: Run, pushed_tree: str = "") -> list[str]:
+def _review_line(events: list[dict], pushed_sha: str) -> str:
+    """The `Dependency review:` line, from the `dependency_reviewed` events alone ("" when there is none: the check is
+    off, or has not run yet). The last review of `pushed_sha` (the head the body goes out with) says `no new advisory
+    at or above <floor>`, or `accepted by <by> (<ids>)` when a person approved its stop; reviews of other heads only
+    say `not checked on the pushed head`. Only GHSA ids and a known severity name are shown."""
+    from agentflow.hitl import clean_fact
+
+    if not any(e.get("type") == "dependency_reviewed" for e in events):
+        return ""
+    mine = _reviews(events, pushed_sha)
+    if not mine:
+        return "Dependency review: not checked on the pushed head"
+    last = mine[-1]
+    if last.get("ok") is True:
+        floor = str(last.get("floor") or "")
+        return f"Dependency review: no new advisory at or above {floor if floor in SEVERITIES else 'unknown'}"
+    ids = list(dict.fromkeys(str(a.get("ghsa")) for a in last.get("advisories") or []
+                             if isinstance(a, dict) and GHSA_ID.fullmatch(str(a.get("ghsa")))))
+    named = ", ".join(ids) or "unchecked"
+    by = _accepted_by(events, last)
+    if by is not None:
+        return f"Dependency review: accepted by {clean_fact(by)[:100]} ({named})"
+    if last.get("verdict") == "new_advisory":
+        return f"Dependency review: new advisory on the pushed head ({named})"
+    return "Dependency review: could not be read on the pushed head"
+
+
+def pr_lines(run: Run, pushed_tree: str = "", pushed_sha: str = "") -> list[str]:
     """The lines of the pull request's `Security advisory` section; [] for a run with no readable `alert.json`.
 
     They come from the facts intake validated (`alert.json`), the probe's `expectation_checked` events (`cleared`
     only for a check on `pushed_tree`, the tree of the head the body goes out with; "" never shows it), the triage's
     cleaned facts (`triage_rendered`, the current and target versions as inline code, each cut to `TARGET_MAX`) and
-    the last `vuln_scope`. The advisory's summary and description never go in, and each line passes `hitl.clean_fact`, so no
+    the last `vuln_scope`, and the `dependency_reviewed` events (`_review_line`, for `pushed_sha`, the head's commit).
+    The advisory's summary and description never go in, and each line passes `hitl.clean_fact`, so no
     text from outside the run or from a model can start a heading, a list item or a line of its own."""
     from agentflow.hitl import clean_fact
 
@@ -637,15 +1041,25 @@ def pr_lines(run: Run, pushed_tree: str = "") -> list[str]:
     lines += [f"Vulnerable: {vulnerable} · patched in {patched}" for vulnerable, patched in ranges]
     triage = [e for e in events if e.get("type") == "triage_rendered"]
     lines.append(_versions((triage[-1].get("facts") if triage else None) or {}))
+    label = "Advisory" if alert.get("source") == "advisory" else "Alert"  # an advisory run has no alert number
+    shown: set[str] = set()
     for advisory in advisories:
         url, number = _url(str(advisory.get("url") or "")), advisory.get("number")
         if url:
-            lines.append(f"Alert: {url}")
+            text = f"{label}: {url}"
         elif isinstance(number, int) and not isinstance(number, bool) and number > 0:
-            lines.append(f"Alert: #{number}")
+            text = f"{label}: #{number}"
+        else:
+            continue
+        if text not in shown:  # one advisory can name the package twice
+            shown.add(text)
+            lines.append(text)
     lines += [f"Supersedes #{n} (Dependabot)" for n in alert.get("dependabot_prs") or []
               if isinstance(n, int) and not isinstance(n, bool) and n > 0]
     lines.append(_probe_line(events, pushed_tree))
+    review = _review_line(events, pushed_sha)
+    if review:
+        lines.append(review)
     scopes = [e for e in events if e.get("type") == "vuln_scope"]
     paths = [str(p) for p in (scopes[-1].get("code_paths") or [] if scopes else [])]
     if paths:

@@ -629,6 +629,17 @@ def _way_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config, tim
                 f"advisory), so it is never read as a clean scan. Fix the probe gate (`vuln.probe` and its "
                 f"`ok_exit`/`found_exit`), then `agentflow retry {run.id} {key}` runs the step again; or "
                 f"`agentflow cancel {run.id}` ends the run.")
+    if kind == "new_advisory":
+        return (f"The pushed head adds a dependency with an advisory at or above `vuln.min_severity`. "
+                f"`agentflow approve {run.id} {key}` accepts this head and marks the PR ready (its body names the "
+                f"advisories), `agentflow cancel {run.id}` ends the run so the dependency can be fixed by hand, or "
+                f"`agentflow retry {run.id} {key}` asks GitHub again about the same head.")
+    if kind == "dependency_review_failed":
+        return (f"GitHub's dependency review could not be read for the pushed head (a 403 is a private repository "
+                f"without GitHub Advanced Security, or a fork; an empty or partial compare means the dependency graph "
+                f"has not caught up). `agentflow retry {run.id} {key}` asks GitHub again about the same head, "
+                f"`agentflow approve {run.id} {key}` accepts this head unchecked and marks the PR ready, or set "
+                f"`vuln.dependency_review: false`.")
     if kind == "review_unresolved":
         return (f"Fix the code yourself if you want, then `agentflow approve {run.id} {key}` gives the reviewer one last "
                 f"look, runs the gates again and commits the task, with any finding still open listed in the commit body; "

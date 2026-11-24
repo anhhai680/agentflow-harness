@@ -1,7 +1,8 @@
 """`agentflow doctor`: whether this machine can run the pack, checked before a run spends money.
 
 It looks at the agent CLIs and their logins, `gh`, Dependabot alert access (when the pack can run the `vuln` lane: `vuln` in
-`lanes`, `vuln.source` `dependabot` and a `vuln.probe`; one read-only `gh api` call), the `origin` remote, Docker (when a gate runs it), the state dir and the programs each gate
+`lanes`, `vuln.source` `dependabot` and a `vuln.probe`; one read-only `gh api` call), the dependency review API (with
+`vuln.dependency_review`; one more read-only `gh api` call), the `origin` remote, Docker (when a gate runs it), the state dir and the programs each gate
 and the vuln probe run. Every external command is bounded by `TIMEOUT_S`. It changes nothing except
 creating the state dir and a probe file there that it removes at once.
 """
@@ -15,12 +16,14 @@ import shlex
 import shutil
 import signal
 import subprocess
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from agentflow import keepawake, layers, pack, run_env, safeio
 from agentflow.config import Config, ConfigError, load_config
+from agentflow.vuln import REVIEW_API
 
 TIMEOUT_S = 20  # each external command
 MAX_USER_SETTINGS_BYTES = 256 * 1024  # the most of the user's Claude settings file that is read
@@ -227,6 +230,23 @@ def _dependabot_check(repo: Path) -> Check:
     return Check("dependabot alerts", "warn", f"could not read the alerts: {detail}", "check `gh auth status` and the network")
 
 
+def _dependency_review_check(repo: Path, fork_from: str) -> Check:
+    """Whether the token reads the dependency review API: one read-only `GET` comparing the base branch with itself, so it
+    answers the same permission and dependency-graph questions as a real review."""
+    ref = urllib.parse.quote(fork_from, safe="")
+    code, output = run_bounded(["gh", "api", f"{REVIEW_API}/{ref}...{ref}"], repo)
+    if code == 0:
+        return Check("dependency review", "ok", "dependency review readable")
+    if "HTTP 403" in output:
+        return Check("dependency review", "warn", _last_line(output) or "HTTP 403",
+                     "a private repository needs GitHub Advanced Security; a fork can't be compared; or set `vuln.dependency_review: false`")
+    if "HTTP 404" in output:
+        return Check("dependency review", "warn", "the dependency review API is not available for this repository",
+                     "turn on the dependency graph in the repository's settings")
+    detail = "timed out" if code is None and output == "timed out" else (_last_line(output) or f"exit {code}")
+    return Check("dependency review", "warn", f"could not read the dependency review: {detail}", "check `gh auth status` and the network")
+
+
 def _remote_check(repo: Path) -> Check:
     code, output = run_bounded(["git", "remote", "get-url", "origin"], repo)
     if code == 0 and output:
@@ -380,7 +400,7 @@ def _gate_checks(cfg: Config) -> tuple[list[Check], bool]:
 
 
 def run_checks(cfg: Config, repo: Path) -> list[Check]:
-    """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), Dependabot alerts (when the pack can run the vuln lane), the remote, Docker (when a gate runs it), the state dir, keeping the
+    """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), Dependabot alerts (when the pack can run the vuln lane), the dependency review API (with `vuln.dependency_review`), the remote, Docker (when a gate runs it), the state dir, keeping the
     machine awake, the inherited environment, the gates and the vuln probe."""
     gate_checks, uses_docker = _gate_checks(cfg)
     checks = [*_agent_checks(cfg, repo)]
@@ -391,6 +411,8 @@ def run_checks(cfg: Config, repo: Path) -> list[Check]:
         checks.append(_gh_fields_check(repo))
     if "vuln" in cfg.lanes and cfg.vuln.source == "dependabot" and cfg.vuln.probe and shutil.which("gh"):
         checks.append(_dependabot_check(repo))
+    if cfg.vuln.dependency_review and "vuln" in cfg.lanes and shutil.which("gh"):
+        checks.append(_dependency_review_check(repo, cfg.project.fork_from))
     checks.append(_remote_check(repo))
     if uses_docker:
         checks.append(docker_check(repo))

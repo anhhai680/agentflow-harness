@@ -503,6 +503,20 @@ def test_validate_refuses_vuln_sync_without_what_a_start_needs(tmp_cfg, kwargs, 
     assert [i.level for i in issues] == ["error"] and named in issues[0].message
 
 
+def test_validate_dependency_review_needs_the_vuln_lane(tmp_cfg):
+    path = tmp_cfg({"vuln": {"dependency_review": True}})  # the python pack's lanes: feature and bug
+    issues = [i for i in validate(load_config(path), path.parent.parent) if i.path == "vuln.dependency_review"]
+    assert [i.level for i in issues] == ["error"] and "vuln" in issues[0].message
+    path = tmp_cfg(_sync_patch())  # the vuln lane is there: the key may be on
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["vuln"]["dependency_review"] = True
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    assert load_config(path).vuln.dependency_review is True
+    assert not [i for i in validate(load_config(path), path.parent.parent) if i.path == "vuln.dependency_review"]
+    with pytest.raises(ConfigError, match="vuln.dependency_review"):
+        load_config(tmp_cfg({"vuln": {"dependency_review": "yes"}}))
+
+
 def test_validate_accepts_vuln_sync_with_a_source_a_lane_and_a_probe(tmp_cfg):
     path = tmp_cfg(_sync_patch())
     assert not [i for i in validate(load_config(path), path.parent.parent) if i.level == "error"]

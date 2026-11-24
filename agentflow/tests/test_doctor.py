@@ -106,6 +106,55 @@ def test_doctor_dependabot_check(tmp_cfg, repo, bindir, reply, status):
         assert check.detail == "Dependabot alerts are off for this repository, or the token cannot see them"
 
 
+def _review_patch(**overrides):
+    """`_vuln_patch` with the dependency review on."""
+    return _vuln_patch(**{"vuln": {"source": "dependabot", "probe": "audit", "dependency_review": True}, **overrides})
+
+
+@pytest.mark.parametrize("reply,status", [("{}", "ok"), ("gh: Resource not accessible by integration (HTTP 403)", "warn"),
+                                          ("gh: Not Found (HTTP 404)", "warn"), ("gh: connection refused", "warn")])
+def test_doctor_dependency_review_check(tmp_cfg, repo, bindir, reply, status):
+    (bindir / "gh").unlink()
+    calls = bindir / "gh-calls"
+    answer = 'echo "{}"; exit 0' if reply == "{}" else f'echo "{reply}" >&2; exit 1'
+    _script(bindir / "gh", f'echo "$*" >> {calls}\nif [ "$1" = auth ]; then exit 0; fi\n{answer}\n')
+    check = _checks(tmp_cfg, repo, _review_patch())["dependency review"]
+    assert check.status == status
+    assert "api repos/{owner}/{repo}/dependency-graph/compare/main...main" in calls.read_text(encoding="utf-8")
+    if status == "ok":
+        assert check.detail == "dependency review readable"
+    elif "403" in reply:
+        assert "HTTP 403" in check.detail
+        assert "GitHub Advanced Security" in check.fix and "fork" in check.fix and "vuln.dependency_review: false" in check.fix
+    elif "404" in reply:
+        assert "dependency graph" in check.fix
+    else:
+        assert "connection refused" in check.detail
+
+
+def test_doctor_dependency_review_check_quotes_the_branch(tmp_cfg, repo, bindir):
+    (bindir / "gh").unlink()
+    calls = bindir / "gh-calls"
+    _script(bindir / "gh", f'echo "$*" >> {calls}\necho "{{}}"\n')
+
+    def patch(data: dict) -> None:
+        _review_patch()(data)
+        data["project"]["fork_from"] = "release/1.0"
+
+    _checks(tmp_cfg, repo, patch)
+    assert "dependency-graph/compare/release%2F1.0...release%2F1.0" in calls.read_text(encoding="utf-8")
+
+
+def test_doctor_dependency_review_check_runs_only_when_on(tmp_cfg, repo):
+    assert "dependency review" in _checks(tmp_cfg, repo, _review_patch())
+    assert "dependency review" not in _checks(tmp_cfg, repo, _vuln_patch())  # the key is off by default
+    off = _review_patch(vuln={"source": "dependabot", "probe": "audit", "dependency_review": False})
+    assert "dependency review" not in _checks(tmp_cfg, repo, off)
+    no_lane = _patch(vuln={"source": "dependabot", "probe": "audit", "dependency_review": True},
+                     gates={"build": {"run": "buildtool --x"}, "audit": {"run": "buildtool --scan"}})
+    assert "dependency review" not in _checks(tmp_cfg, repo, no_lane)
+
+
 def test_doctor_dependabot_check_that_times_out_is_a_warning(tmp_cfg, repo, monkeypatch):
     real = doctor.run_bounded
     monkeypatch.setattr(doctor, "run_bounded", lambda argv, cwd, env=None: (

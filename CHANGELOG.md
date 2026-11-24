@@ -7,6 +7,15 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.8] - 2026-11-24
+
+### Added
+- `agentflow run vuln --advisory GHSA-…|CVE-… --package NAME --manifest PATH` starts a vuln run from GitHub's global advisory database, for a repository without Dependabot. It needs no token permission and works whatever `vuln.source` says. It excludes `--alert`, and is refused when no advisory names the package, the matches span more than one ecosystem or are all withdrawn, there is no patched version, or the severity is `unknown` or below `vuln.min_severity`. The PR's Security advisory section says `Advisory: <url>`, and the Backlog never starts one.
+- `vuln.dependency_review` (default `false`, protected): once CI passes on the head a vuln run pushed, `ci` asks GitHub's dependency review API before it marks the PR ready. A new advisory at or above `vuln.min_severity` stops the run as `new_advisory`, and an API error, a malformed reply or a review that shows no change to the run's package stops it as `dependency_review_failed`. `agentflow approve` accepts that head (the PR says `Dependency review: accepted by <who> (<ids>)`), `retry` asks GitHub again and never accepts, and neither kind can be resolved by the runner itself. `validate` wants a bool, and with `true` wants `vuln` in `lanes`.
+
+### Changed
+- `doctor` makes one more read-only call, `gh api repos/{owner}/{repo}/dependency-graph/compare/<fork_from>...<fork_from>`, when `vuln.dependency_review` is on, `vuln` is in `lanes` and `gh` is on `PATH`; a `403` or `404` warns.
+
 ## [3.7] - 2026-11-24
 
 ### Added

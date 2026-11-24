@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 import yaml
 from conftest import SPARSE_PACK, add_vuln_lane, deep_merge, run_git, vuln_steps
 
-from agentflow import conditions, hitl, pack, pipeline, vuln, workspace
+from agentflow import conditions, flow, hitl, pack, pipeline, vuln, workspace
 from agentflow.config import load_config, validate
 from agentflow.state import Run
 
@@ -209,14 +210,16 @@ def _done(summary: str = "ok") -> dict:
     return {"result": {"status": "done", "summary": summary}}
 
 
-def _vuln_run(flow_repo, audit: str = AUDIT, requirements: str = "requests==2.31.0\n", patch: dict | None = None):
-    """A vuln run started from alert 42 (`gh_alerts`), with `audit.py` and `requirements.txt` on the fork commit."""
+def _vuln_run(flow_repo, audit: str = AUDIT, requirements: str = "requests==2.31.0\n", patch: dict | None = None,
+              params: dict | None = None):
+    """A vuln run started from alert 42 (`gh_alerts`), or from `params`, with `audit.py` and `requirements.txt` on the
+    fork commit."""
     for name, text in (("audit.py", audit), ("requirements.txt", requirements)):
         (flow_repo.root / name).write_text(text, encoding="utf-8")
     run_git(flow_repo.root, "add", "audit.py", "requirements.txt")
     run_git(flow_repo.root, "commit", "-q", "-m", "audit")
     flow_repo.configure(patch=deep_merge(VULN_PATCH, patch or {}), edit=add_vuln_lane)
-    return pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", {"alert": "42"}, pipeline.RunOptions())
+    return pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", params or {"alert": "42"}, pipeline.RunOptions())
 
 
 def _build(flow_repo, run):
@@ -257,6 +260,63 @@ def test_happy_path_red_patch_cleared(flow_repo, gh_alerts):
     subject = run_git(Path(run.state["worktree"]), "log", "-1", "--format=%s", committed["sha"]).strip()
     assert subject == "Patch requests-ghsa-cfgh-2345-vwxj"
     assert run.state["steps"][RED_KEY]["status"] == "done" and run.state["steps"][PATCH]["status"] == "done"
+
+
+ADVISORY_RUN = {"advisory": GHSA, "package": "requests", "manifest": "requirements.txt"}
+
+
+def test_happy_path_from_an_advisory(flow_repo, gh_advisories):
+    run = _vuln_run(flow_repo, params=ADVISORY_RUN)
+    flow_repo.script({PATCH: [{"write": {"requirements.txt": FIXED}, **_done("bumped requests")}]})
+    assert _build(flow_repo, run) == "done"
+    present, cleared = flow_repo.events(run, "expectation_checked")
+    assert (present["expect"], present["ok"], present["matched"]) == ("advisory_present", True, [GHSA])
+    assert (cleared["expect"], cleared["ok"], cleared["matched"]) == ("advisory_cleared", True, [])
+    [read] = flow_repo.events(run, "vuln_alert_read")
+    assert read["alerts"] == [] and read["ids"] == [GHSA, "CVE-2024-1234"]
+    assert run.state["params"]["advisory"] == GHSA and run.state["branch"] == "flow/vuln/requests-ghsa-cfgh-2345-vwxj"
+
+
+@pytest.mark.parametrize("pipeline_name,params", [
+    ("vuln", {"advisory": GHSA}),
+    ("vuln", {"advisory": GHSA, "package": "requests"}),
+    ("vuln", {"advisory": GHSA, "manifest": "requirements.txt"}),
+    ("vuln", {"alert": "42", **ADVISORY_RUN}),
+    ("vuln", {"package": "requests"}),
+    ("vuln", {"manifest": "requirements.txt"}),
+    ("vuln", {"task": "bump requests"}),
+    ("bug", ADVISORY_RUN),
+    ("bug", {"alert": "42"})])
+def test_run_refuses_bad_advisory_input_combinations(flow_repo, gh_advisories, pipeline_name, params):
+    with pytest.raises(ValueError):
+        pipeline.start(flow_repo.cfg, flow_repo.root, pipeline_name, params, pipeline.RunOptions())
+    runs = pack.state_dir(flow_repo.root) / "runs"
+    assert (not runs.exists() or not list(runs.iterdir())) and gh_advisories.calls() == []
+
+
+@pytest.mark.parametrize("params,message", [
+    ({"alert": "42", **ADVISORY_RUN}, "--alert and --advisory"),
+    ({"package": "requests"}, "--package and --manifest go with --advisory"),
+    ({"advisory": GHSA, "package": "requests"}, "--advisory needs --package NAME and --manifest PATH"),
+    ({"task": "x"}, "--advisory ID --package NAME --manifest PATH")])
+def test_run_names_what_is_wrong_with_the_inputs(flow_repo, gh_advisories, params, message):
+    with pytest.raises(ValueError) as caught:
+        pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", params, pipeline.RunOptions())
+    assert message in str(caught.value)
+
+
+def test_explain_vuln_with_an_advisory_calls_no_gh(sparse_repo, monkeypatch, tmp_path, capsys):
+    from conftest import GH_BIN
+
+    _sparse_with_probe(sparse_repo)
+    log = tmp_path / "gh.jsonl"
+    monkeypatch.setenv("PATH", f"{GH_BIN}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(log))
+    monkeypatch.chdir(sparse_repo)
+    assert flow.main(["explain", "vuln", "--advisory", GHSA]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith(f'explain vuln {{"advisory": "{GHSA}"}}') and "advisory_red" in out
+    assert not log.exists()
 
 
 def test_not_reproduced_stops_before_patch(flow_repo, gh_alerts):
@@ -825,3 +885,206 @@ def test_a_re_sync_that_takes_the_vulnerable_lockfile_is_never_pushed(flow_repo,
     assert (again["key"], again["verdict"], again["seq"] > synced["seq"]) == (FINISH, "present", True)
     assert _origin_head(flow_repo, run) != synced["sha"]  # the merge stayed local
     assert run_git(flow_repo.origin, "show", f"{run.state['branch']}:requirements.txt") == FIXED
+
+
+# --------------------------------------------------------------------------- vuln.dependency_review: the pushed head
+
+CI_KEY = "ship/ci"
+IDNA_GHSA = "GHSA-2222-3333-4444"
+
+
+def _change(kind: str, name: str, version: str, *found: tuple[str, str]) -> dict:
+    return {"change_type": kind, "name": name, "version": version, "ecosystem": "pip", "manifest": "requirements.txt",
+            "vulnerabilities": [{"severity": s, "advisory_ghsa_id": g, "advisory_summary": "x",
+                                 "advisory_url": f"https://github.com/advisories/{g}"} for g, s in found]}
+
+
+CLEAN_COMPARE = [_change("removed", "requests", "2.31.0", (GHSA, "high")), _change("added", "requests", "2.32.0")]
+IDNA_COMPARE = [*CLEAN_COMPARE, _change("added", "idna", "3.0", (IDNA_GHSA, "high"))]
+
+
+def _compare_calls(gh_alerts) -> list[list[str]]:
+    return [c for c in gh_alerts.calls() if c[:1] == ["api"] and c[1].startswith(vuln.REVIEW_API)]
+
+
+def _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, compare: list | None, status: str = "",
+                on: bool = True):
+    """A vuln run walked through `finish` and `ci` with CI passing and `vuln.dependency_review` set to `on`; the fake
+    `gh` serves `compare` as the dependency-graph compare (or fails with HTTP `status`). Returns the run and what
+    `advance` returned."""
+    _ci_checks(monkeypatch, tmp_path, CI_PASS)
+    if compare is not None:
+        path = tmp_path / "compare.json"
+        path.write_text(json.dumps(compare), encoding="utf-8")
+        monkeypatch.setenv("FAKE_GH_COMPARE", str(path))
+    if status:
+        monkeypatch.setenv("FAKE_GH_COMPARE_STATUS", status)
+    run = _at_ship(flow_repo, patch=deep_merge(CI_PATCH, {"vuln": {"dependency_review": on}}), autopilot=True)
+    return run, pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions())
+
+
+def test_dependency_review_clean_marks_ready(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    run, outcome = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, CLEAN_COMPARE)
+    assert outcome == "done"
+    [review] = flow_repo.events(run, "dependency_reviewed")
+    head = _origin_head(flow_repo, run)
+    base = run_git(flow_repo.origin, "rev-parse", flow_repo.cfg.project.fork_from).strip()
+    assert (review["key"], review["head"], review["base"]) == (CI_KEY, head, base)
+    assert (review["ok"], review["verdict"], review["floor"], review["advisories"]) == (True, "ok", "low", [])
+    [call] = _compare_calls(gh_alerts)
+    assert call == ["api", f"{vuln.REVIEW_API}/{base}...{head}"]
+    [ready] = flow_repo.events(run, "pr_marked_ready")
+    assert review["seq"] < ready["seq"]
+    body = (run.dir / "pr.md").read_text(encoding="utf-8")
+    assert "Dependency review: no new advisory at or above low" in _section(body)
+
+
+def test_dependency_review_hit_stops_with_new_advisory(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    run, outcome = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, IDNA_COMPARE)
+    assert outcome == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("new_advisory", CI_KEY)
+    assert IDNA_GHSA in stop["summary"] and "idna" in stop["summary"]
+    [review] = flow_repo.events(run, "dependency_reviewed")
+    assert (review["ok"], review["verdict"]) == (False, "new_advisory")
+    assert review["advisories"] == [{"ghsa": IDNA_GHSA, "severity": "high", "package": "idna", "version": "3.0",
+                                     "manifest": "requirements.txt"}]
+    assert not flow_repo.events(run, "pr_marked_ready")
+    assert not [c for c in _gh_calls(gh_alerts) if c[:2] == ["pr", "ready"]]
+    inbox = run.inbox_path(CI_KEY).read_text(encoding="utf-8")
+    assert f"`agentflow approve {run.id} {CI_KEY}` accepts this head and marks the PR ready" in inbox
+    assert f"`agentflow retry {run.id} {CI_KEY}` asks GitHub again about the same head" in inbox
+    assert "Fix it on the branch" not in inbox
+
+
+def test_dependency_review_empty_compare_fails_closed(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    """An empty compare is the dependency graph not having caught up with the push, never a clean review."""
+    run, outcome = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, [])
+    assert outcome == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("dependency_review_failed", CI_KEY)
+    assert "no change to requests" in stop["summary"]
+    [review] = flow_repo.events(run, "dependency_reviewed")
+    assert (review["ok"], review["verdict"]) == (False, "dependency_review_failed") and review["error"]
+    assert not flow_repo.events(run, "pr_marked_ready")
+
+
+@pytest.mark.parametrize("status", ["403", "404"])
+def test_dependency_review_api_error_fails_closed(flow_repo, gh_alerts, monkeypatch, tmp_path, status):
+    run, outcome = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, CLEAN_COMPARE, status=status)
+    assert outcome == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("dependency_review_failed", CI_KEY)
+    assert f"HTTP {status}" in stop["summary"]
+    assert not flow_repo.events(run, "pr_marked_ready")
+
+
+def test_dependency_review_hostile_reply_never_reaches_the_stop(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    hostile = [*CLEAN_COMPARE, _change("added", "evil\n## owned", "1.0", (IDNA_GHSA, "critical"))]
+    run, outcome = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, hostile)
+    assert outcome == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert stop["kind"] == "dependency_review_failed"
+    assert "## owned" not in stop["summary"] and "evil" not in stop["summary"]
+    assert "## owned" not in json.dumps(flow_repo.events(run, "dependency_reviewed"))
+    body = (run.dir / "pr.md").read_text(encoding="utf-8")
+    assert "## owned" not in body and not flow_repo.events(run, "pr_marked_ready")
+
+
+def test_approving_new_advisory_accepts_that_sha_only(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    run, outcome = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, IDNA_COMPARE)
+    assert outcome == "waiting_human" and _stop(flow_repo, run)["kind"] == "new_advisory"
+    calls = len(_compare_calls(gh_alerts))
+    hitl.approve(run, CI_KEY, by="alice")
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
+    assert len(_compare_calls(gh_alerts)) == calls  # the accepted head is not asked about again
+    assert flow_repo.events(run, "pr_marked_ready")
+    body = (run.dir / "pr.md").read_text(encoding="utf-8")
+    assert f"Dependency review: accepted by alice ({IDNA_GHSA})" in _section(body)
+    # a head pushed after the approval is a new head: it is checked again, and the approval does not carry over
+    worktree = Path(run.state["worktree"])
+    moved = "b" * 40
+    run.emit("ci_round", key=CI_KEY, action="fix", round=1, sha=moved, note="fixed and pushed", failed=[], tail="")
+    verdict, summary = vuln.review_dependencies(flow_repo.cfg, run, worktree, CI_KEY, moved)
+    assert len(_compare_calls(gh_alerts)) == calls + 1 and verdict == "new_advisory" and IDNA_GHSA in summary
+    lines = vuln.pr_lines(run, pushed_sha=moved)
+    assert f"Dependency review: accepted by alice ({IDNA_GHSA})" not in lines
+    assert "Dependency review: not checked on the pushed head" in vuln.pr_lines(run, pushed_sha="c" * 40)
+
+
+@pytest.mark.parametrize("compare,kind", [(IDNA_COMPARE, "new_advisory"), ([], "dependency_review_failed")])
+def test_a_retry_asks_again_and_never_accepts_the_head(flow_repo, gh_alerts, monkeypatch, tmp_path, compare, kind):
+    """`run_control.retry` clears the stop with an approval by the person who retried: that asks GitHub again about
+    the same head and is never read as accepting it."""
+    from agentflow import run_control
+
+    run, outcome = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, compare)
+    assert outcome == "waiting_human" and _stop(flow_repo, run)["kind"] == kind
+    calls = len(_compare_calls(gh_alerts))
+    run_control.retry(run, CI_KEY, by="alice")
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"
+    assert len(_compare_calls(gh_alerts)) == calls + 1
+    assert _stop(flow_repo, run)["kind"] == kind and len(flow_repo.events(run, "dependency_reviewed")) == 2
+    assert not flow_repo.events(run, "pr_marked_ready")
+    assert not [line for line in vuln.pr_lines(run, pushed_sha=_origin_head(flow_repo, run)) if "accepted" in line]
+    hitl.approve(run, CI_KEY, by="bob")  # a plain approval after the retry still accepts it
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "done"
+    assert len(_compare_calls(gh_alerts)) == calls + 1 and flow_repo.events(run, "pr_marked_ready")
+    assert "Dependency review: accepted by bob" in (run.dir / "pr.md").read_text(encoding="utf-8")
+
+
+def test_an_approval_by_the_runner_never_accepts_a_new_advisory(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    from agentflow.autonomy import AUTO_BY
+
+    run, _ = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, IDNA_COMPARE)
+    head = _origin_head(flow_repo, run)
+    hitl.approve(run, CI_KEY, by=AUTO_BY)
+    calls = len(_compare_calls(gh_alerts))
+    verdict, _ = vuln.review_dependencies(flow_repo.cfg, run, Path(run.state["worktree"]), CI_KEY, head)
+    assert verdict == "new_advisory" and len(_compare_calls(gh_alerts)) == calls + 1
+
+
+def test_an_unknown_pushed_head_says_approve_cannot_accept_it(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    """A run whose events name no pushed sha (its `pr_opened` predates the `sha` field) has no head to pin an approval
+    to: the stop says so, and an approval only stops again, never marking the pull request ready."""
+    from agentflow.ci_lane import CILane
+
+    monkeypatch.setattr(CILane, "_pushed_sha", lambda self: "")
+    run, outcome = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, CLEAN_COMPARE)
+    assert outcome == "waiting_human"
+    stop = _stop(flow_repo, run)
+    assert (stop["kind"], stop["key"]) == ("dependency_review_failed", CI_KEY)
+    assert "The pushed head is unknown" in stop["summary"] and "`agentflow approve` cannot accept it" in stop["summary"]
+    assert f"`agentflow cancel {run.id}`" in stop["summary"] and "`vuln.dependency_review: false`" in stop["summary"]
+    assert _compare_calls(gh_alerts) == []
+    hitl.approve(run, CI_KEY, by="alice")
+    assert pipeline.advance(run, flow_repo.cfg, pipeline.RunOptions()) == "waiting_human"
+    again = _stop(flow_repo, run)
+    assert again["kind"] == "dependency_review_failed" and again["seq"] > stop["seq"]
+    assert not flow_repo.events(run, "pr_marked_ready") and _compare_calls(gh_alerts) == []
+
+
+def test_dependency_review_refuses_a_head_that_is_not_a_full_sha(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    run, _ = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, CLEAN_COMPARE)
+    calls = len(_compare_calls(gh_alerts))
+    for head in ("", "abc", "a" * 39 + "Z", "--paginate", "a" * 64):
+        verdict, _ = vuln.review_dependencies(flow_repo.cfg, run, Path(run.state["worktree"]), CI_KEY, head)
+        assert verdict == "dependency_review_failed"
+    assert len(_compare_calls(gh_alerts)) == calls
+
+
+def test_dependency_review_off_makes_no_call(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    run, outcome = _through_ci(flow_repo, gh_alerts, monkeypatch, tmp_path, IDNA_COMPARE, on=False)
+    assert outcome == "done" and flow_repo.events(run, "pr_marked_ready")
+    assert _compare_calls(gh_alerts) == [] and not flow_repo.events(run, "dependency_reviewed")
+    assert "Dependency review" not in (run.dir / "pr.md").read_text(encoding="utf-8")
+
+
+def test_dependency_review_is_vuln_only(flow_repo, gh_alerts, monkeypatch, tmp_path):
+    path = tmp_path / "compare.json"
+    path.write_text(json.dumps(IDNA_COMPARE), encoding="utf-8")
+    monkeypatch.setenv("FAKE_GH_COMPARE", str(path))
+    flow_repo.configure(patch={"vuln": {"probe": "ok", "dependency_review": True}}, edit=add_vuln_lane)
+    run = flow_repo.new_run()
+    assert vuln.review_dependencies(flow_repo.cfg, run, flow_repo.root, CI_KEY, flow_repo.head()) == ("off", "")
+    assert _compare_calls(gh_alerts) == [] and not flow_repo.events(run, "dependency_reviewed")

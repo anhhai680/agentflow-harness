@@ -651,6 +651,25 @@ VULN_ALERT: dict[str, Any] = {
 }
 
 
+# A global security advisory as GitHub's REST API returns it (`GET /advisories/{ghsa_id}`), cut to the fields the vuln
+# lane reads. `first_patched_version` is a plain string here, unlike a Dependabot alert's `{identifier}`. Tests copy
+# it with `copy.deepcopy` before they change a field.
+GLOBAL_ADVISORY: dict[str, Any] = {
+    "ghsa_id": "GHSA-cfgh-2345-vwxj",
+    "cve_id": "CVE-2024-1234",
+    "html_url": "https://github.com/advisories/GHSA-cfgh-2345-vwxj",
+    "summary": "Requests leaks credentials on redirect",
+    "description": "A crafted redirect makes requests resend the Authorization header to another host.",
+    "severity": "high",
+    "withdrawn_at": None,
+    "references": ["https://github.com/advisories/GHSA-cfgh-2345-vwxj"],
+    "vulnerabilities": [
+        {"package": {"ecosystem": "pip", "name": "requests"}, "vulnerable_version_range": "< 2.32.0",
+         "first_patched_version": "2.32.0"},
+    ],
+}
+
+
 def vuln_steps() -> dict[str, list[dict]]:
     """Per phase, the engine defaults' steps whose `lanes` include `vuln`, in their order."""
     from agentflow import layers
@@ -721,4 +740,23 @@ def gh_alerts(flow_repo: FlowRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("PATH", f"{GH_BIN}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_GH_LOG", str(handle.log))
     monkeypatch.setenv("FAKE_GH_ALERTS", str(handle.path))
+    return handle
+
+
+@pytest.fixture
+def gh_advisories(flow_repo: FlowRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> GhAlerts:
+    """`flow_repo` set up as `gh_alerts` sets it (the vuln lane, `vuln.probe: ok`, `requirements.txt` on `fork_from`,
+    pushed), but with the fake `gh` serving `[GLOBAL_ADVISORY]` as `$FAKE_GH_ADVISORIES` and no Dependabot alerts.
+    `write` replaces the list; `calls` is every `gh` argv."""
+    (flow_repo.root / "requirements.txt").write_text("requests==2.31.0\n", encoding="utf-8")
+    run_git(flow_repo.root, "add", "requirements.txt")
+    run_git(flow_repo.root, "commit", "-q", "-m", "requirements")
+    run_git(flow_repo.root, "push", "-q", "origin", flow_repo.cfg.project.fork_from)
+    flow_repo.configure(patch={"vuln": {"probe": "ok"}}, edit=add_vuln_lane)
+    handle = GhAlerts(tmp_path / "advisories.json", tmp_path / "gh.jsonl")
+    handle.write([copy.deepcopy(GLOBAL_ADVISORY)])
+    monkeypatch.setenv("PATH", f"{GH_BIN}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(handle.log))
+    monkeypatch.setenv("FAKE_GH_ADVISORIES", str(handle.path))
+    monkeypatch.delenv("FAKE_GH_ALERTS", raising=False)
     return handle

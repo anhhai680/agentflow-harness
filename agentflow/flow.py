@@ -530,7 +530,7 @@ def cmd_reject(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- running
 
 
-PARAM_FLAGS = ("module", "topic", "issue", "log", "task", "slice", "alert")
+PARAM_FLAGS = ("module", "topic", "issue", "log", "task", "slice", "alert", "advisory", "package", "manifest")
 
 
 def _run_cfg(run, args: argparse.Namespace):
@@ -664,7 +664,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         new_module = _parse_new_module(args.new_module)
         if not params:
-            raise ValueError("run needs one of --module, --topic, --issue, --log, --task or --alert")
+            raise ValueError("run needs one of --module, --topic, --issue, --log, --task, --alert or --advisory")
         cfg = _load_cfg(args)
         opts = RunOptions(from_phase=args.from_phase, to_phase=args.to_phase,
                           model_overrides=_parse_models(args.model, cfg.phases), dry_run=args.dry_run,
@@ -742,10 +742,10 @@ def cmd_explain(args: argparse.Namespace) -> int:
     from agentflow.conditions import explain, make_ctx, plan_warnings
 
     params = {k: v for k, v in (("module", args.module), ("topic", args.topic), ("issue", args.issue),
-                                ("alert", args.alert)) if v}  # an alert is only named: explain calls no `gh`
+                                ("alert", args.alert), ("advisory", args.advisory)) if v}  # only named: explain calls no `gh`
     try:
         if not params:
-            raise ValueError("explain needs --module <id>, --topic <text>, --issue <ref> or --alert <n>")
+            raise ValueError("explain needs --module <id>, --topic <text>, --issue <ref>, --alert <n> or --advisory <id>")
         cfg = _load_cfg(args)
         overrides = _parse_models(args.model, cfg.phases)
         ctx = make_ctx(cfg, _find_repo(), args.lane, params)
@@ -1174,8 +1174,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="start the workflow for a lane; it stops for a human after each phase with needs_approval: true")
     run.add_argument("lane", help="the kind of work, which selects the workflow's steps: feature, bug, vuln, eval or design")
+    flag_help = {"advisory": "a GHSA or CVE id: the vuln lane reads it from GitHub's advisory database (with --package, "
+                             "--manifest)",
+                 "package": "with --advisory: the package the run upgrades", "manifest": "with --advisory: the "
+                 "manifest that pins the package, a file at project.fork_from"}
     for flag in PARAM_FLAGS:
-        run.add_argument(f"--{flag}", help=f"the run's {flag}")
+        run.add_argument(f"--{flag}", help=flag_help.get(flag, f"the run's {flag}"))
     run.add_argument("--from", dest="from_phase", help="start at this phase instead of the first")
     run.add_argument("--to", dest="to_phase", help="end the run once this phase is approved")
     run.add_argument("--model", action="append", default=[], metavar="PHASE=MODEL", help="override one phase's model")
@@ -1201,6 +1205,7 @@ def build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--topic", help="a design topic")
     exp.add_argument("--issue", help="a bug or issue reference")
     exp.add_argument("--alert", help="a Dependabot alert number (the vuln lane); explain does not read it")
+    exp.add_argument("--advisory", help="a GHSA or CVE id (the vuln lane); explain does not read it")
     exp.add_argument("--model", action="append", default=[], metavar="PHASE=MODEL", help="override one phase's model")
     exp.add_argument("--profile", choices=ROUTE_PROFILES,
                      help="show the steps this route profile skips (one of the pack's route.profiles)")

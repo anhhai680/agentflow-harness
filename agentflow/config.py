@@ -221,7 +221,8 @@ ON_FAIL_VALUES = ("block",)
 CONFORMANCE_FAILED = "conformance_failed"  # the audit at `finish` found an obligation with no evidence (`block` mode)
 RECONCILE_CHANGED = "reconcile_changed_conditions"  # a reconcile edit changed which steps of its phase run
 NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable",
-                  CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed", "environment")
+                  CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed", "environment",
+                  "new_advisory", "dependency_review_failed")  # a person accepts a head the dependency review stopped
 PREFLIGHT_KEYS = ("enabled",)
 WATCHDOG_KEYS = ("no_progress_min", "read_only_idle_min")
 PARALLEL_KEYS = ("max_subagents", "serial_paths")
@@ -439,6 +440,7 @@ class VulnPolicy:
     sync: bool = False  # true: open alerts become Backlog cards
     dependency_files: tuple[str, ...] = DEPENDENCY_FILES  # globs counted as dependency files; the PR names changes outside them
     forbid: tuple[str, ...] = ()  # added to `vuln.ENGINE_FORBID`, never in place of it
+    dependency_review: bool = False  # true: GitHub's dependency review of the pushed head must pass before CI marks the PR ready
 
 
 FLOOR_ID = "engine_floor"  # the obligation code adds after the layers merge: no layer can remove or replace it
@@ -1701,6 +1703,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             sync=_optional(vuln, "sync", "vuln", bool, False),
             dependency_files=tuple(_string_list(vuln.get("dependency_files", list(DEPENDENCY_FILES)), "vuln.dependency_files")),
             forbid=tuple(_string_list(vuln.get("forbid", []), "vuln.forbid")),
+            dependency_review=_optional(vuln, "dependency_review", "vuln", bool, False),
         ),
         gates=_build_gates(_require(raw, "gates", "", dict)),
         gate_sets={name: _string_list(members, f"gate_sets.{name}") for name, members in gate_sets.items()},
@@ -2879,8 +2882,9 @@ class _Validator:
                 self.error(f"usage.{key}", "unknown usage key")
 
     def vuln(self) -> None:
-        """`vuln`: where the vuln lane's alerts come from, how severe, which gate probes for the advisory and which
-        files count as dependency files (the PR names changes outside them); and each gate's `ok_exit` and `found_exit`, which only a probe reads."""
+        """`vuln`: where the vuln lane's alerts come from, how severe, which gate probes for the advisory, which
+        files count as dependency files (the PR names changes outside them) and whether the pushed head's dependency
+        review gates the ready PR (`dependency_review`, a vuln-lane check); and each gate's `ok_exit` and `found_exit`, which only a probe reads."""
         pol = self.cfg.vuln
         if pol.source not in VULN_SOURCES:
             self.error("vuln.source", "must be `dependabot`, or `\"\"` for no alert intake")
@@ -2894,6 +2898,9 @@ class _Validator:
                                                  ("a vuln.probe gate", not pol.probe)) if absent]
             if missing:
                 self.error("vuln.sync", f"is on, but the Backlog cannot start an alert without {' and '.join(missing)}")
+        if pol.dependency_review and "vuln" not in self.cfg.lanes:
+            self.error("vuln.dependency_review", "is on, but only a run of the `vuln` lane reviews its dependencies, "
+                       "and `vuln` is not in lanes")
         for key in ("dependency_files", "forbid"):
             for i, glob in enumerate(getattr(pol, key)):
                 if not glob.strip():

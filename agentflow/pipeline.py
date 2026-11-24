@@ -159,7 +159,7 @@ def _free_branch(repo: Path, name: str) -> str:
 def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions) -> Run:
     """Create the run and the checkout it works in (D7), recording the options for `resume`.
 
-    The run's inputs (`--issue`, `--log`, `--task`, `--alert`; `intake`) are read before anything is created, so a
+    The run's inputs (`--issue`, `--log`, `--task`, `--alert`, `--advisory`; `intake`) are read before anything is created, so a
     bad one leaves no run, and saved in the run directory once it exists. Intake's warnings (an open Dependabot PR)
     are recorded as `intake_warning` events, which the CLI prints.
     """
@@ -178,10 +178,20 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
         raise ValueError("the vuln lane needs `vuln.probe`, the audit gate that must name the advisory before the patch "
                          "and not after: set it in the pack's config (the starters set `audit`)")
     has_alert = params.get("alert") not in (None, "")
-    if pipeline == "vuln" and not has_alert:
-        raise ValueError("the vuln lane starts from a Dependabot alert: agentflow run vuln --alert N")
-    if has_alert and pipeline != "vuln":
-        raise ValueError(f"--alert starts a vuln run, not a {pipeline} run: agentflow run vuln --alert N")
+    has_advisory = params.get("advisory") not in (None, "")
+    has_package, has_manifest = params.get("package") not in (None, ""), params.get("manifest") not in (None, "")
+    if has_alert and has_advisory:
+        raise ValueError("--alert and --advisory start a run each: give one")
+    if (has_package or has_manifest) and not has_advisory:
+        raise ValueError("--package and --manifest go with --advisory")
+    if has_advisory and not (has_package and has_manifest):
+        raise ValueError("--advisory needs --package NAME and --manifest PATH")
+    if pipeline == "vuln" and not (has_alert or has_advisory):
+        raise ValueError("the vuln lane starts from a Dependabot alert or an advisory: agentflow run vuln --alert N, "
+                         "or --advisory ID --package NAME --manifest PATH")
+    if (has_alert or has_advisory) and pipeline != "vuln":
+        raise ValueError(f"--alert and --advisory start a vuln run, not a {pipeline} run: agentflow run vuln --alert N, "
+                         "or --advisory ID --package NAME --manifest PATH")
     slots.check_free(cfg, repo)  # the common refusal, before the inputs are read
     params, inputs, warnings = gather(params, repo, cfg.issues.epic_labels, cfg.vuln, fork)
     # `{date}` (in `plan_target`) is the day the run started, every day it runs: a step resumed tomorrow still names

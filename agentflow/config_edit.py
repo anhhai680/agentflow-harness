@@ -53,7 +53,7 @@ _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and p
     "phase_approval", "record_step", "resolve_step", "retro_step", "paths", "defaults.env", "defaults.env_inherit", "context.autocompact_env", "context.progress_file",
     "hitl.notify", "dashboard.host", "work_source", "skills", "starter", "policy",
     "route.lanes", "route.profiles", "autonomy.approvals", "autonomy.ramp_samples",
-    "vuln.source", "vuln.probe", "vuln.forbid",
+    "vuln.source", "vuln.probe", "vuln.forbid", "vuln.dependency_review",
 )
 PROTECTED = (
     *_PROTECTED_KEYS,
