@@ -37,18 +37,15 @@ def _one_line(text: str, limit: int = backlog_file.TITLE_MAX) -> str:
 
 
 def _plain(repo: Path, rel: str) -> Path | None:
-    """`repo / rel` when every part below `repo` is a real directory and the last is a regular file, else None."""
-    at = Path(repo)
-    parts = PurePosixPath(rel).parts
-    for i, part in enumerate(parts):
-        at = at / part
-        try:
-            mode = os.lstat(at).st_mode
-        except OSError:
-            return None
-        if stat.S_ISLNK(mode) or not (stat.S_ISREG(mode) if i == len(parts) - 1 else stat.S_ISDIR(mode)):
-            return None
-    return at
+    """`repo / rel` when `rel` is a path an item may name (`backlog_file.bad_path`), no part of it is a symlink, it
+    stays inside `repo` (`backlog_file.path_problem`) and it is a regular file; else None."""
+    if backlog_file.bad_path(rel) or backlog_file.path_problem(Path(repo), rel) is not None:
+        return None
+    at = Path(repo) / rel
+    try:
+        return at if stat.S_ISREG(os.lstat(at).st_mode) else None
+    except OSError:
+        return None
 
 
 def _heading(repo: Path, rel: str) -> str:
@@ -89,7 +86,7 @@ class _Plans:
         if not folder.is_dir():
             return
         try:
-            names = sorted(os.listdir(folder))[: sources.SPECS_MAX]
+            names = sorted(os.listdir(folder))[-sources.SPECS_MAX :]  # the newest names, past the limit
         except OSError:
             return
         for name in names:
@@ -258,6 +255,10 @@ def build(cfg: Config, repo: Path) -> tuple[list[BacklogItem], list[str]]:
         if PurePosixPath(name).stem.lower() in sources.NOT_MODULES:
             notes.append(f"note: {rel} is left out: it is not a spec")
             continue
+        if backlog_file.bad_path(rel):
+            notes.append(f"note: {rel[:80]!r} is left out: an item's spec can't name it (a control character, a "
+                         f"backslash, a leading '-' or over {backlog_file.PATH_MAX} characters): rename it")
+            continue
         ident, note = _orphan_id(cfg, name, taken)
         if note:
             notes.append(note)
@@ -292,7 +293,8 @@ def build(cfg: Config, repo: Path) -> tuple[list[BacklogItem], list[str]]:
     if problem:
         notes.append(f"note: a real import would be refused: {problem}")
     _, problems = backlog_file.parse(backlog_file.render(out))
-    notes += [f"note: the file would carry a {p.severity}: {p.where}: {p.message}" for p in problems]
+    notes += [f"note: the file would carry {'an error' if p.level == 'error' else 'a warning'}: {p.where}: {p.message}"
+              for p in problems]
     return out, notes
 
 

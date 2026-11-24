@@ -104,6 +104,17 @@ def test_spec_and_plan_are_set_when_the_files_exist(cm):
     assert (by_id["settings"].spec, by_id["settings"].plan) == ("", "")
 
 
+def test_past_the_listing_limit_the_newest_plans_are_kept(cm, monkeypatch):
+    from agentflow import sources
+
+    write(cm.root, "docs/specs/SPEC-crm.md", "# Spec: CRM\n")
+    for day in ("01", "02", "03"):
+        write(cm.root, f"docs/plans/2026-10-{day}-crm.md", PLAN_OPEN.format(spec="SPEC-crm.md"))
+    monkeypatch.setattr(sources, "SPECS_MAX", 2)
+    by_id, _, _ = built(cm)
+    assert by_id["crm"].plan == "docs/plans/2026-10-03-crm.md"
+
+
 def test_a_symlinked_spec_is_not_followed(cm, tmp_path):
     outside = tmp_path / "outside.md"
     outside.write_text("# Outside\n", encoding="utf-8")
@@ -185,6 +196,32 @@ def test_an_orphan_id_comes_from_the_spec_file_pattern_and_is_made_unique(sp):
     assert by_id["b-2"].spec == "docs/specs/z/SPEC-b.md"
     assert any("b-2" in n for n in notes)
     assert len(set(order)) == len(order)
+
+
+def test_an_orphan_whose_path_an_item_cannot_name_is_left_out_with_a_note(sp, capsys):
+    write(sp.root, "docs/specs/back\\slash.md", "# Back\n")
+    write(sp.root, "docs/specs/-dash.md", "# Dash\n")
+    write(sp.root, "docs/specs/" + "/".join(["l" * 100] * 3) + "/long.md", "# Long\n")  # over PATH_MAX
+    by_id, order, notes = built(sp)
+    assert order == ["b", "c", "a", "dash"]  # `docs/specs/-dash.md` starts with `d`: only a leading `-` is refused
+    assert sum("is left out: an item's spec can't name it" in n for n in notes) == 2
+    assert not any("would carry" in n for n in notes)
+    assert main(["backlog", "import", "--dry-run"]) == 0  # the command too: a note, never a traceback
+    assert "can't name it" in capsys.readouterr().err
+
+
+def test_a_problem_the_rendered_file_would_carry_is_a_note(sp, monkeypatch):
+    real = backlog_file.parse
+
+    def parse(text):
+        items, problems = real(text)
+        return items, [*problems, backlog_file.Problem("error", "items[0].lane", "x"),
+                       backlog_file.Problem("warning", "items[1].owner", "y")]
+
+    monkeypatch.setattr(backlog_file, "parse", parse)
+    _, _, notes = built(sp)
+    assert "note: the file would carry an error: items[0].lane: x" in notes
+    assert "note: the file would carry a warning: items[1].owner: y" in notes
 
 
 # --------------------------------------------------------------------------- form cards
