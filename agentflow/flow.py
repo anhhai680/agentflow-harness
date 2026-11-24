@@ -786,6 +786,8 @@ def cmd_queue(args: argparse.Namespace) -> int:
             raise ValueError(f"--interval must be above 0, got {args.interval}")
         cfg = _load_cfg(args)
         repo = _find_repo()
+        if cfg.work_source is not None and cfg.work_source.kind == "backlog" and args.include_specs:
+            print("note: --include-specs is ignored: a backlog pack starts the items its file marks `ready`")
         if cfg.work_source is not None and cfg.work_source.kind == "specs" and not args.include_specs:
             from agentflow import work_source
 

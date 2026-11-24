@@ -30,6 +30,7 @@ BY_HAND = "done by hand"
 SPEC_SAYS = "spec says done"
 MERGED = "merged"
 ISSUE_CLOSED = "issue closed"  # an `issue-<N>` module whose GitHub issue #N is closed
+FILE_SAYS = "backlog says done"  # a `backlog` item whose `status` is `done` in the backlog file's working tree
 
 _STATES = ("done", "not_done")
 
@@ -41,13 +42,14 @@ def plan_complete(branch: str) -> str:
 
 def from_origin(reason: str) -> bool:
     """Whether `reason` comes from origin evidence (`SPEC_SAYS` or `plan_complete`): the reasons a veto overrides. A
-    merge (`MERGED`) and a hand mark (`BY_HAND`) are not."""
+    merge (`MERGED`), a hand mark (`BY_HAND`) and the backlog file (`FILE_SAYS`: the file is edited, not vetoed) are
+    not."""
     return reason == SPEC_SAYS or reason.startswith(plan_complete(""))
 
 
 def vetoable(reason: str) -> bool:
-    """Whether a veto overrides a Done for `reason`: origin evidence, and a closed issue (it may be reopened). A merge
-    and a hand mark are not."""
+    """Whether a veto overrides a Done for `reason`: origin evidence, and a closed issue (it may be reopened). A merge,
+    a hand mark and the backlog file's `done` are not."""
     return from_origin(reason) or reason == ISSUE_CLOSED
 
 
@@ -162,5 +164,5 @@ def recorded(repo: Path) -> dict[str, str]:
     return done
 
 
-__all__ = ["BY_HAND", "ISSUE_CLOSED", "LOCK", "MARKS", "MERGED", "QUEUE_FILE", "SPEC_SAYS", "from_origin", "mark",
+__all__ = ["BY_HAND", "FILE_SAYS", "ISSUE_CLOSED", "LOCK", "MARKS", "MERGED", "QUEUE_FILE", "SPEC_SAYS", "from_origin", "mark",
            "plan_complete", "read_marks", "recorded", "unmark", "veto", "vetoable"]

@@ -66,11 +66,15 @@ def make_ctx(cfg: Config, repo: Path, pipeline: str, params: dict, run: Run | No
             break
     slug = slugify(slug_source) or slugify(pipeline)
     plan = sources.find_plan(repo / docs["plans"], module)
+    spec = f"{docs['specs']}/{cfg.project.spec_file.format(module=module)}" if module else ""
+    if module and cfg.work_source is not None and cfg.work_source.kind == "backlog":
+        entry = work_source.item(cfg, repo, module)  # an item that names a spec says where it is
+        spec = entry.spec if entry is not None and entry.spec else spec
     values = {
         "module": module,
         "module_pkg": module.replace("-", "_"),
         "lane": pipeline,
-        "spec": f"{docs['specs']}/{cfg.project.spec_file.format(module=module)}" if module else "",
+        "spec": spec,
         "plan": plan.relative_to(repo).as_posix() if plan else "",
         "plan_target": f"{docs['plans']}/{today}-{module}-{slug}.md" if module else "",
         "idea": docs.get("idea") or "",

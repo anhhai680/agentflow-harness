@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agentflow import finished, gitops, governor, pack, slots, sources, work_source
+from agentflow.backlog_file import BacklogItem
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.gitops import uncommitted_paths
 from agentflow.guards import path_matches
@@ -489,6 +490,8 @@ def done_reason(
     tell is no problem: the module just stays). When origin could not be read in full, a prior Done from
     origin evidence or a merge stays as it was. When the marks file is unreadable, a prior hand mark stays, and
     origin evidence makes no new Done (the file may hold a veto) but keeps an earlier one."""
+    if isinstance(node, BacklogItem) and node.status == "done":  # the file says so: nothing else is asked
+        return finished.FILE_SAYS, None
     by_hand, error = marks
     mark = (by_hand.get(node.id) or {}).get("state")
     said = old.get("done_reason")
@@ -501,6 +504,8 @@ def done_reason(
         spec_name = cfg.project.spec_file.format(module=node.id)
     except (KeyError, IndexError, ValueError, AttributeError):  # `validate` reports it; origin then decides nothing
         spec_name = None
+    if isinstance(node, BacklogItem) and node.spec:  # an item names its own spec file
+        spec_name = Path(node.spec).name
     problem = None
     if trust_origin and isinstance(view.specs, gitops.Listing) and spec_name in view.specs.blobs:
         blob = view.specs.blobs[spec_name]
@@ -674,7 +679,7 @@ def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = 
     noun = work_source.noun(cfg)
     view = origin_view(cfg, repo)  # one bounded read of origin per assessment
     known = known_ids(cfg, repo, view)
-    marks = finished.read_marks(repo)
+    marks = ({}, None) if work_source.kind(cfg) == "backlog" else finished.read_marks(repo)  # a backlog file has no marks
     entries, problems, occupied, notes = [], {}, 0, []
     if marks[1]:
         notes.append(f"queue: {marks[1]}; until then origin evidence marks no module newly done")
@@ -715,9 +720,14 @@ def queue_tick(
     state = QueueState(entries)
     done = {e["id"] for e in entries if e["status"] == "done"}
     started: list[str] = []
+    nodes = {n.id: n for n in found.nodes}
+    lanes = ("", module_lane(cfg))
     for entry in entries:
         if entry["status"] != "backlog" or entry["run_id"] or entry["id"] in blocked or not set(entry["deps"]) <= done:
             continue
+        item = nodes.get(entry["id"])
+        if isinstance(item, BacklogItem) and (item.status != "ready" or item.lane not in lanes):
+            continue  # a backlog file starts what it marks `ready`, in the lane of its `module_lane`
         if hold is not None or occupied >= max_parallel:
             break
         wait = slots.queue_hold(cfg, repo)  # per start: a start made this tick counts

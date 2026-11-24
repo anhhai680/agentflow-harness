@@ -701,3 +701,13 @@ def test_add_item_is_a_no_op_for_a_backlog_pack(tmp_cfg, tmp_path):
     write(tmp_path, "backlog.yml", BACKLOG)
     work_source.add_item(cfg, tmp_path, {}, {"module": "z", "responsibility": "x", "deps": []})
     assert (tmp_path / "backlog.yml").read_text(encoding="utf-8") == BACKLOG
+
+
+def test_spec_placeholder_is_the_items_spec(tmp_cfg, tmp_path):
+    cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None}}))
+    write(tmp_path, "backlog.yml", BACKLOG)
+    assert make_ctx(cfg, tmp_path, "feature", {"module": "b"}).values["spec"] == "docs/specs/b.md"
+    plain = make_ctx(cfg, tmp_path, "feature", {"module": "a"}).values["spec"]  # `a` names no spec
+    assert plain == f"{cfg.project.docs['specs']}/{cfg.project.spec_file.format(module='a')}"
+    gone = make_ctx(cfg, tmp_path, "feature", {"module": "zz"}).values["spec"]  # not an item at all
+    assert gone == f"{cfg.project.docs['specs']}/{cfg.project.spec_file.format(module='zz')}"
