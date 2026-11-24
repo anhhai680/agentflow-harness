@@ -755,10 +755,18 @@ def queue_tick(
 def cached_entries(repo: Path, nodes: list[sources.ModuleNode], runs: dict[str, Run],
                    hand_marks: bool = True) -> list[dict]:
     """`queue.json`-shaped entries for the map, from files only (no git, no `gh`): `done` (with its `done_reason`) is
-    what the last assessment recorded with the live hand marks and vetoes on top (`finished.recorded`), a module with
+    what the last assessment recorded with the live hand marks and vetoes on top (`finished.recorded`; for a backlog
+    item, the file's own `status` decides `FILE_SAYS`), a module with
     a run is `running` or `waiting`, the rest is `backlog`. `hand_marks=False` (a `backlog` pack) ignores the marks."""
     prior = {m["id"]: m for m in QueueState.load(repo).modules}
     done = finished.recorded(repo, hand_marks=hand_marks)
+    for node in nodes:
+        if not isinstance(node, BacklogItem):
+            continue
+        if node.status == "done":  # the file says so, whether or not an assessment has recorded it yet
+            done[node.id] = finished.FILE_SAYS
+        elif done.get(node.id) == finished.FILE_SAYS:  # recorded from an earlier edit of the file: it says otherwise now
+            del done[node.id]
     entries = []
     for node in nodes:
         run = runs.get(node.id)

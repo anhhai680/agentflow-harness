@@ -35,7 +35,8 @@ Routes:
 - `GET /api/runs/<id>/sessions` (every agent session of the run) and `/sessions/<s…>/transcript?after=<byte>` (its
   transcript as turns, in whole-line pages of at most `dashboard.artifact_max_kb`).
 - `POST /api/backlog` (add a card: `lane`, `fields`, `after`, `to_phase`), `POST /api/backlog/start` (`module` or
-  `item`: `card:<id>`, `module:<id>`, a synced `issue:<number>` or a Dependabot `alert:<number>`) and
+  `item`: `card:<id>`, `module:<id>`, a synced `issue:<number>` or a Dependabot `alert:<number>`; `confirm: true`
+  starts a backlog-file item whose status is `backlog`, which is refused with 409 without it) and
   `POST /api/backlog/remove` (`item`, a card only: a synced issue leaves Backlog when it is closed or loses its label,
   an alert group when Dependabot closes it). A start re-checks that the card is not blocked and has no
   duplicate (409 with the reason otherwise), answers 202 at once and runs the slow part (`flow.py run --detach`)
@@ -746,7 +747,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "key": f"card:{item.id}", "id": item.id})
             elif path == "/api/backlog/start":
                 key = self._start_key(body)
-                job = backlog.begin_start(server.cfg, server.repo, key)
+                confirm = body.get("confirm", False)
+                if not isinstance(confirm, bool):
+                    raise BadRequest("confirm must be true or false")
+                job = backlog.begin_start(server.cfg, server.repo, key, confirm=confirm)
                 thread = threading.Thread(target=self._start_worker, args=(job,), daemon=True)
                 server.starts.append(thread)
                 thread.start()

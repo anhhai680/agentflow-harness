@@ -192,9 +192,35 @@ function cardNode(card) {
 
 // Nothing starts by itself: a developer drags a card to its first phase or presses Start. A blocked card is locked.
 
+const BACKLOG_ARM_MS = 4000;  // an idea's first Start click arms it this long; a second one in that time confirms. The Inbox's Approve does the same.
+let backlogArmTimer = null;
+
+function disarmBacklog() {
+  clearTimeout(backlogArmTimer);
+  backlogArmTimer = null;
+  if (ui.backlogArm !== null) { ui.backlogArm = null; if (ui.board) renderBoard(ui.board); }
+}
+
+// An idea (a backlog-file item whose status is `backlog`) starts on a second click: the first arms the card, and the
+// start then carries `confirm: true`, which the server asks for.
+function armedFor(item) { return ui.backlogArm === item.key && Date.now() - ui.backlogArmAt < BACKLOG_ARM_MS; }
+
 async function startItem(item) {
+  const idea = item.planning === "backlog";
+  if (idea && !armedFor(item)) {
+    clearTimeout(backlogArmTimer);
+    ui.backlogArm = item.key;
+    ui.backlogArmAt = Date.now();
+    backlogArmTimer = setTimeout(disarmBacklog, BACKLOG_ARM_MS);
+    toast(item.label + " is an idea: press Start again to confirm");
+    if (ui.board) renderBoard(ui.board);
+    return;
+  }
+  if (idea) { clearTimeout(backlogArmTimer); backlogArmTimer = null; ui.backlogArm = null; }
   try {
-    await api("/api/backlog/start", item.kind === "module" ? { module: item.id } : { item: item.key });
+    const body = item.kind === "module" ? { module: item.id } : { item: item.key };
+    if (idea) body.confirm = true;
+    await api("/api/backlog/start", body);
     toast("Starting " + item.label + "…");
   } catch (err) {
     toast("Could not start " + item.label + ": " + err.message);
@@ -245,10 +271,11 @@ function alertLines(item) {
 }
 
 function backlogNode(item) {
-  const canStart = item.status === "parallel" || item.status === "ready";
+  const canStart = (item.status === "parallel" || item.status === "ready") && item.startable !== false;
   const names = (list) => list.map((p) => p.label).join(", ");
   const buttons = [];
-  if (canStart) buttons.push(el("button", { type: "button", class: "primary", text: "Start", onclick: (ev) => { ev.stopPropagation(); startItem(item); } }));
+  if (canStart) buttons.push(el("button", { type: "button", class: "primary", text: item.armed ? "Confirm start" : "Start", onclick: (ev) => { ev.stopPropagation(); startItem(item); } }));
+  else if (item.startable === false) buttons.push(el("button", { type: "button", class: "primary", text: "Start", disabled: "disabled", title: item.note || "" }));
   if (item.removable) buttons.push(el("button", { type: "button", class: "danger", text: "Remove", onclick: (ev) => { ev.stopPropagation(); removeItem(item); } }));
   const isAlert = item.kind === "alert";
   const sev = isAlert ? severityClass(item.severity) : null;
@@ -256,6 +283,7 @@ function backlogNode(item) {
     el("div", { class: "title", text: item.label }),
     sev ? el("span", { class: "pill " + sev, text: item.severity }) : null,
     backlogMark(item),
+    item.planning === "backlog" ? el("span", { class: "badge", text: "idea", title: "status: backlog. Start asks for a second click." }) : null,
     isAlert ? alertLines(item).map((line) => el("div", { class: "sub", text: line })) : null,
     item.url ? linkNode(item.url, isAlert ? "Alert ↗" : "Issue ↗") : null,
     item.blocked_by.length ? el("div", { class: "sub", text: "Runs after: " + item.blocked_by.map((b) => b.text).join(", ") }) : null,
@@ -296,7 +324,7 @@ function newTaskDialog() {
     if (wanted.includes("new_module")) {
       parts.push(...text("nt-module", "Module id (lowercase, - or _)", false, 60));
       parts.push(...text("nt-resp", "What it does", "short", 400));
-      parts.push(...pick("nt-deps", "Depends on", true, data.modules.map((m) => ({ key: m, label: m })), data.work_source_kind === "specs" ? "Only modules already in the spec files." : "Only modules already in the map."));
+      parts.push(...pick("nt-deps", "Depends on", true, data.modules.map((m) => ({ key: m, label: m })), data.work_source_kind === "specs" ? "Only modules already in the spec files." : data.work_source_kind === "backlog" ? "Only items already in backlog.yml." : "Only modules already in the map."));
     }
     const phases = data.lane_phases[kind()] || [];
     parts.push(...pick("nt-stop", "Stop after", false, [{ key: "", label: "(run to the end)" }, ...phases.map((p) => ({ key: p, label: p }))]));
@@ -342,10 +370,11 @@ function columnEntries(data, name, shownCards) {
   const count = name === "Backlog" ? data.backlog.length : cards.length;
   const entries = [entry("col-head", { name: name, count: count }, (head) => el("h2", {}, el("span", { text: head.name }), el("span", { text: String(head.count) })))];
   if (name === "Backlog") {
-    entries.push(...data.backlog.map((item) => entry(item.key || item.id, item, backlogNode)));
+    entries.push(...data.backlog.map((item) => entry(item.key || item.id, item.planning === "backlog" ? Object.assign({}, item, { armed: armedFor(item) }) : item, backlogNode)));
     if (data.done_note) entries.push(entry("done-note", data.done_note, (note) => el("div", { class: "muted gate-bad", text: "Done marks not read: " + note })));
     if ((data.backlog_done || []).length) entries.push(entry("done", data.backlog_done, () => doneNode(data.backlog_done)));
-    if ((data.backlog_skipped || []).length) entries.push(entry("skipped", data.backlog_skipped, (names) => el("div", { class: "muted", text: "Not modules: " + names.join(", ") })));
+    if ((data.backlog_dropped || []).length) entries.push(entry("dropped", data.backlog_dropped, droppedNode));
+    if ((data.backlog_skipped || []).length) entries.push(entry("skipped", data.backlog_skipped, (names) => skippedNode(names, data.work_source_kind)));
   }
   if (name === "Done") {
     const page = doneCards(cards, ui.doneShown, ui.doneAll);
@@ -419,6 +448,22 @@ function doneNode(done) {
     done.map((item) => el("div", { class: "muted", text: item.id + " · " + item.reason })));
 }
 
+// Spec files no item names. A backlog pack calls them "Not on the backlog" and folds them away; other kinds say "Not modules".
+function skippedNode(names, kind) {
+  if (kind !== "backlog") return el("div", { class: "muted", text: "Not modules: " + names.join(", ") });
+  return el("details", { class: "done-modules", open: ui.skippedOpen ? "true" : null, ontoggle: (ev) => { ui.skippedOpen = ev.target.open; } },
+    el("summary", { text: "Not on the backlog (" + names.length + ")" }),
+    names.map((name) => el("div", { class: "muted", text: name })));
+}
+
+// Dropped backlog items: never cards. One line each (id and title as text), folded away; the open state survives the SSE re-render.
+function droppedNode(dropped) {
+  if (!dropped.length) return null;
+  return el("details", { class: "done-modules", open: ui.droppedOpen ? "true" : null, ontoggle: (ev) => { ui.droppedOpen = ev.target.open; } },
+    el("summary", { text: "Dropped (" + dropped.length + ")" }),
+    dropped.map((item) => el("div", { class: "muted", text: item.id + (item.title ? " · " + item.title : "") })));
+}
+
 // The usage window as the header shows it. A pure function of `board().usage`: the pill (`text` empty hides it), its
 // hover (`title`) and the note under it (the interactive-use warning, else a broken window file, else nothing).
 const two = (n) => ("0" + n).slice(-2);
@@ -459,6 +504,8 @@ function renderBoard(data) {
   $("new-task").hidden = !Object.keys(data.new_task).length;
   $("sync-note").hidden = !data.sync_note;
   $("sync-note").textContent = data.sync_note ? "Base branch not updated: " + data.sync_note : "";
+  $("backlog-note").hidden = !data.backlog_note;
+  $("backlog-note").textContent = data.backlog_note || "";
   $("issues-note").hidden = !data.issues_note;
   $("issues-note").textContent = data.issues_note || "";
   $("alerts-note").hidden = !data.alerts_note;

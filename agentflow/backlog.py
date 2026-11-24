@@ -39,7 +39,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agentflow import finished, intake, module_queue, sources, vuln, work_source
+from agentflow import backlog_file, finished, intake, module_queue, sources, vuln, work_source
+from agentflow.backlog_file import BacklogItem
 from agentflow.conditions import first_phase_with_work, make_ctx
 from agentflow.config import check_lane
 from agentflow.events import EventLog, nfc
@@ -292,6 +293,8 @@ def _reopen_hint(module: str, reason: str) -> str | None:
         return f"run `agentflow backlog undone {module}`"
     if reason == finished.ISSUE_CLOSED:
         return f"reopen its issue, then run `agentflow backlog undone {module}`"
+    if reason == finished.FILE_SAYS:
+        return f"set its status in the backlog file: `agentflow backlog set {module} status=ready`"
     return None
 
 
@@ -831,10 +834,38 @@ def _refuse_taken(number: str, pic: dict) -> None:
         raise Refused(f"issue #{number} {TAKEN}")
 
 
+NOTE_MAX = 300
+
+
+def _file_note(problems: list[backlog_file.Problem]) -> str:
+    """The Board's note for a backlog file that cannot be read: its first file-level error (an item's own error
+    keeps the item on the Board and is `validate`'s to report), or `""`."""
+    for problem in problems:
+        if problem.level == "error" and not problem.where.startswith("items["):
+            return _one_line(f"backlog file {problem.where} {problem.message}", NOTE_MAX)
+    return ""
+
+
+NOT_STARTABLE = "runs in {lane}: only dashboard.backlog.module_lane items start from the Board"
+
+
+def _startable(item: BacklogItem | None, lane: str | None) -> bool:
+    """Whether a backlog item belongs to the module lane (an item with no `lane:` does)."""
+    return item is None or not item.lane or item.lane == lane
+
+
 def _picture(cfg: Config, repo: Path) -> dict:
     """Everything the board and the start rules need, read from files (no `gh`, no git)."""
     runs = list_runs(repo)
-    nodes = _map_nodes(cfg, repo)
+    file_items: list[BacklogItem] = []
+    problems: list[backlog_file.Problem] = []
+    if work_source.kind(cfg) == "backlog":  # one read of the file, so the cards, dropped list and note agree
+        found, problems = work_source.indexed(cfg, repo)
+        file_items = [item for _, item in found]
+        nodes: list[sources.ModuleNode] = (
+            [i for i in file_items if i.status != "dropped"] if module_queue.module_lane(cfg) else [])
+    else:
+        nodes = _map_nodes(cfg, repo)
     source = work_source.file(cfg, repo)
     mapped = cfg.work_source is not None and cfg.work_source.kind == "capability_map"
     if not nodes and mapped and module_queue.module_lane(cfg) and source is not None and not source.is_file():
@@ -847,7 +878,9 @@ def _picture(cfg: Config, repo: Path) -> dict:
     state = _load_state(repo)
     merged = {k: v for k, v in (state.get("merged") or {}).items() if isinstance(k, str)}
     pic = {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "state": state,
-           "issues": _synced(cfg, state)}
+           "issues": _synced(cfg, state), "file_items": {i.id: i for i in file_items},
+           "dropped": [{"id": i.id, "title": i.title} for i in file_items if i.status == "dropped"],
+           "file_note": _file_note(problems)}
     pic["alerts"] = _synced_alerts(cfg, state)
     pic["alert_runs"] = {}  # the lowest alert number of each held group -> the run that holds it
     vuln_runs = _vuln_runs(runs) if pic["alerts"] else []
@@ -958,8 +991,19 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         entry = by_entry[node.id]
         if entry["status"] != "backlog":
             continue
-        cards.append(make(f"module:{node.id}", "module", node.id, node.id, lane or "", book.overlay(node.id),
-                          deps=list(node.deps), note=entry.get("blocked")))
+        file_item = pic["file_items"].get(node.id)
+        if file_item is None:
+            cards.append(make(f"module:{node.id}", "module", node.id, node.id, lane or "", book.overlay(node.id),
+                              deps=list(node.deps), note=entry.get("blocked")))
+            continue
+        startable = _startable(file_item, lane)
+        title = file_item.title or node.id
+        card = make(f"module:{node.id}", "module", node.id, title, file_item.lane or lane or "", book.overlay(node.id),
+                    deps=list(node.deps), note=entry.get("blocked"), title=title, planning=file_item.status,
+                    startable=startable)
+        if not startable:
+            card["note"] = NOT_STARTABLE.format(lane=file_item.lane)
+        cards.append(card)
     for item in book.cards():
         if item.status in ("started", "removed"):
             continue
@@ -1015,6 +1059,8 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         "after_choices": choices,
         "modules": [n.id for n in pic["nodes"]],
         "skipped": work_source.skipped(cfg, repo),
+        "dropped": pic["dropped"],
+        "backlog_note": pic["file_note"],
         "sync_note": pic["state"].get("sync_note") or "",
         "issues_note": pic["state"].get("issues_note") or "" if cfg.issues.sync_label else "",
         "alerts_note": pic["state"].get("alerts_note") or "" if _alerts_on(cfg) else "",
@@ -1108,8 +1154,10 @@ def parse_key(key: Any) -> tuple[str, str]:
     return kind, name
 
 
-def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
-    """Check that `key` may start now and record `item_starting`. `Refused` (409) says why not."""
+def begin_start(cfg: Config, repo: Path, key: str, confirm: bool = False) -> StartJob:
+    """Check that `key` may start now and record `item_starting`. `Refused` (409) says why not.
+
+    A backlog item whose status is `backlog` (an idea) starts only with `confirm`; the caller asks for a second click."""
     repo = Path(repo)
     kind, name = parse_key(key)
     reason = module_queue.usage_hold(cfg)
@@ -1129,7 +1177,12 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
                 raise Refused(f"module {name} already has a run or is done")
             item = book.overlay(name)
             params, new_module, to_phase, item_lane = {"module": name}, None, None, lane or ""
+            file_item = pic["file_items"].get(name)
+            if not _startable(file_item, lane):
+                raise Refused(NOT_STARTABLE.format(lane=file_item.lane))
             number = _module_issue(name, pic)
+            if file_item is not None and file_item.issue is not None:
+                number = str(file_item.issue)
             if number is not None:
                 unknown = _deps_unknown(f"module:{name}", {}, pic)
                 if unknown:
@@ -1192,6 +1245,9 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
         if info and info["blocked_by"]:
             raise Refused(f"{_label_of(key, pic)} is blocked: runs after "
                           + ", ".join(b["text"] for b in info["blocked_by"]))
+        file_item = pic["file_items"].get(name) if kind == "module" else None
+        if file_item is not None and file_item.status == "backlog" and not confirm:
+            raise Refused(f"module {name} is an idea (status backlog) and must be confirmed to start")
         clash = _live_clash(params, item_lane, pic["runs"])
         if clash:
             raise Refused(clash)
