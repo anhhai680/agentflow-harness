@@ -58,8 +58,11 @@ def _unsafe(cfg: Config, repo: Path) -> str | None:
     raw = cfg.work_source.path
     if Path(raw).is_absolute():
         return raw
-    root = Path(repo).resolve()
-    if not (root / raw).resolve().is_relative_to(root):
+    try:
+        root = Path(repo).resolve()
+        if not (root / raw).resolve().is_relative_to(root):
+            return raw
+    except (OSError, RuntimeError):  # a symlink loop on the way (RuntimeError on Python 3.12)
         return raw
     return None
 

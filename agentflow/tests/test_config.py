@@ -3316,11 +3316,38 @@ def test_a_backlog_pack_without_a_module_lane_gets_a_warning(tmp_cfg, tmp_path):
     assert ("warning", "dashboard.backlog.module_lane") not in other  # a capability map pack is not asked for one here
 
 
-@pytest.mark.parametrize("value", ["docs/*", 3, [3], ["a\nb"], ["/abs/*"], ["../x"], ["a/../b"], ["x" * 201], [""]])
-def test_ignore_specs_must_be_a_list_of_short_relative_one_line_globs(tmp_cfg, tmp_path, value):
-    text = "version: 1\nitems: []\n"
-    found = _blg(tmp_cfg, tmp_path, text, {"backlog": {"ignore_specs": value}})
-    assert [e for e in found if e[0] == "error" and e[1].startswith("backlog.ignore_specs")], found
+@pytest.mark.parametrize("value, path", [
+    ("docs/*", "backlog.ignore_specs"), (3, "backlog.ignore_specs"), ([3], "backlog.ignore_specs[0]"),
+    (["a\nb"], "backlog.ignore_specs[0]"), (["/abs/*"], "backlog.ignore_specs[0]"),
+    (["../x"], "backlog.ignore_specs[0]"), (["a/../b"], "backlog.ignore_specs[0]"),
+    (["ok", "x" * 201], "backlog.ignore_specs[1]"), ([""], "backlog.ignore_specs[0]"),
+    (["a\\b"], "backlog.ignore_specs[0]"),
+])
+def test_ignore_specs_must_be_a_list_of_short_relative_one_line_globs(tmp_cfg, tmp_path, value, path):
+    found = _blg(tmp_cfg, tmp_path, "version: 1\nitems: []\n", {"backlog": {"ignore_specs": value}})
+    assert [(level, where) for level, where, _ in found if where.startswith("backlog")] == [("error", path)]
+
+
+def test_a_symlinked_directory_in_the_work_source_path_that_leaves_the_repository_is_an_error(tmp_cfg, tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-away"
+    outside.mkdir()
+    (outside / "backlog.yml").write_text("version: 1\nitems: []\n", encoding="utf-8")
+    (tmp_path / "link").symlink_to(outside, target_is_directory=True)
+    path = tmp_cfg({"work_source": {"kind": "backlog", "path": "link/backlog.yml"}})
+    found = [(i.level, i.path) for i in validate(load_config(path), tmp_path) if "work_source" in i.path]
+    assert found == [("error", "work_source.path")]
+
+
+def test_a_symlink_loop_in_the_work_source_path_is_an_error_not_a_crash(tmp_cfg, tmp_path):
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    path = tmp_cfg({"work_source": {"kind": "backlog", "path": "loop/backlog.yml"}})
+    cfg = load_config(path)
+    from agentflow import work_source
+
+    found = [(i.level, i.path) for i in validate(cfg, tmp_path) if i.path.startswith(("work_source", "loop/backlog.yml"))]
+    # Python 3.12 raises on the loop (`_unsafe` says so); newer ones resolve it and the read fails instead
+    assert found in ([("error", "work_source.path")], [("error", "loop/backlog.yml")])
+    assert work_source.items(cfg, tmp_path) == [] and work_source.all_items(cfg, tmp_path) == []
 
 
 def test_ignore_specs_accepts_a_list_of_globs(tmp_cfg, tmp_path):

@@ -1818,6 +1818,11 @@ def _same_label(a: str, b: str) -> bool:
     return unicodedata.normalize("NFC", a).casefold() == unicodedata.normalize("NFC", b).casefold()
 
 
+def _bad_source_path(path: str) -> bool:
+    """A `work_source.path` that is empty, absolute or has a `..` segment (the lexical check; symlinks are another)."""
+    return not path or posixpath.isabs(path) or ".." in posixpath.normpath(path).split("/")
+
+
 class _Validator:
     def __init__(self, cfg: Config, repo: Path) -> None:
         self.cfg = cfg
@@ -2261,7 +2266,7 @@ class _Validator:
             self.specs_source()
             return
         path = ws.path.strip()
-        if not path or posixpath.isabs(path) or ".." in posixpath.normpath(path).split("/"):
+        if _bad_source_path(path):
             self.error("work_source.path", "path is a file inside the repository, relative to its root and without '..'")
 
     def specs_source(self) -> None:
@@ -2304,11 +2309,14 @@ class _Validator:
         def at(where: str) -> str:
             if where == backlog_file.FILE:
                 return name
+            if where == "work_source.path":  # not the file's own: a path that leaves the repository
+                return where
             return f"{name} {where}"
 
         found, problems = work_source.indexed(self.cfg, repo)
         for problem in problems:
-            if problem.where != "work_source.path":  # `work_source` reported a path that leaves the repository
+            # `work_source` already reports a path that is absolute or has `..`; a symlink that leaves the repository is new
+            if problem.where != "work_source.path" or not _bad_source_path(ws.path.strip()):
                 self.add(problem.level, at(problem.where), problem.message)
         module_lane = module_queue.module_lane(self.cfg)
         if module_lane is None:
