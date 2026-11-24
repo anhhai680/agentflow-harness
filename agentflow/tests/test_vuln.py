@@ -455,6 +455,17 @@ def test_parse_advisory_refuses_bad_ids_and_severity(changes):
         _advisory(**changes)
 
 
+def test_parse_advisory_reads_null_vulnerabilities_as_none_named():
+    assert _advisory(vulnerabilities=None).vulnerabilities == ()
+
+
+def test_parse_advisory_keeps_string_references_capped():
+    refs = ["https://example.com/a", 7, None, {"url": "https://example.com/b"}]
+    assert _advisory(references=refs).references == ("https://example.com/a",)
+    assert len(_advisory(references=["https://example.com/x"] * 50).references) == vuln.MAX_REFERENCES
+    assert _advisory(references=None).references == ()
+
+
 def test_parse_advisory_refuses_a_non_object():
     with pytest.raises(vuln.AlertError):
         vuln.parse_advisory([])

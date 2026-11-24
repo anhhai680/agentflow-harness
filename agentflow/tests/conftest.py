@@ -662,7 +662,7 @@ GLOBAL_ADVISORY: dict[str, Any] = {
     "description": "A crafted redirect makes requests resend the Authorization header to another host.",
     "severity": "high",
     "withdrawn_at": None,
-    "references": [{"url": "https://github.com/advisories/GHSA-cfgh-2345-vwxj"}],
+    "references": ["https://github.com/advisories/GHSA-cfgh-2345-vwxj"],
     "vulnerabilities": [
         {"package": {"ecosystem": "pip", "name": "requests"}, "vulnerable_version_range": "< 2.32.0",
          "first_patched_version": "2.32.0"},

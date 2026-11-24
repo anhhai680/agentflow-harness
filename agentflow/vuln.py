@@ -216,6 +216,12 @@ def _vulnerability(entry: object) -> Vulnerability | None:
         return None
 
 
+def _advisory_references(advisory: dict) -> tuple[str, ...]:
+    """A global advisory's `references` are plain URL strings (a Dependabot alert's are `{url}` objects)."""
+    refs = advisory.get("references")
+    return tuple(r for r in refs if isinstance(r, str))[:MAX_REFERENCES] if isinstance(refs, list) else ()
+
+
 def parse_advisory(data: object) -> Advisory:
     """The validated facts of one global advisory (GitHub's REST shape); `AlertError` when an id or the severity is
     bad. An entry of `vulnerabilities` that fails its checks is dropped, never repaired."""
@@ -225,14 +231,16 @@ def parse_advisory(data: object) -> Advisory:
     if severity not in (*SEVERITIES, "unknown"):
         raise AlertError(f"the severity {severity!r} is not one of {', '.join((*SEVERITIES, 'unknown'))}")
     entries = root.get("vulnerabilities")
+    if entries is None:  # GitHub documents it as "array of objects or null": an advisory that names no package
+        entries = []
     if not isinstance(entries, list):
-        raise AlertError("the advisory's vulnerabilities are missing or not a list")
+        raise AlertError("the advisory's vulnerabilities are not a list")
     found = (_vulnerability(entry) for entry in entries)
     return Advisory(
         ghsa=ids[0], cve=ids[1] if root.get("cve_id") is not None else None, severity=severity,
         withdrawn=root.get("withdrawn_at") is not None, url=_url(str(root.get("html_url") or "")),
         summary=str(root.get("summary") or "")[:MAX_TEXT], description=str(root.get("description") or "")[:MAX_TEXT],
-        references=_references(root), vulnerabilities=tuple(v for v in found if v is not None))
+        references=_advisory_references(root), vulnerabilities=tuple(v for v in found if v is not None))
 
 
 def same_package(ecosystem: str, a: str, b: str) -> bool:
