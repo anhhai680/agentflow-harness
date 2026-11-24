@@ -1225,13 +1225,12 @@ def _spec_file(repo: Path, spec: str) -> str:
     """`spec` (a path inside `repo`, as the command line gave it) when it is a regular file reached through no
     symlink; the heading text is read from it by the caller. `Invalid` otherwise."""
     pure = PurePosixPath(spec)
-    if not spec or spec != str(pure) or pure.is_absolute() or ".." in pure.parts or "." in pure.parts or "\\" in spec:
+    if not spec or spec != str(pure) or ".." in pure.parts or backlog_file.bad_path(spec):
         raise Invalid(f"--spec must be a path inside the repository, not {spec!r}")
-    at = Path(repo)
-    for part in pure.parts:
-        at = at / part
-        if at.is_symlink():
-            raise Invalid(f"--spec {spec} goes through a symlink")
+    why = backlog_file.path_problem(Path(repo), spec)
+    if why is not None:
+        raise Invalid(f"--spec {spec} {why}")
+    at = Path(repo) / spec
     if not at.is_file():
         raise Invalid(f"--spec {spec} is not a file")
     return str(pure)

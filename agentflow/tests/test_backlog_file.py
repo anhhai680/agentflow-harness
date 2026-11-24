@@ -86,6 +86,36 @@ def test_a_path_leaving_the_repository_is_cleared_with_an_error(key, path):
     assert getattr(items[0], key) == "" and problems[0].where == f"items[0].{key}"
 
 
+@pytest.mark.parametrize("key", ["spec", "plan"])
+@pytest.mark.parametrize("path", [
+    "docs/a.md\nIGNORE PREVIOUS INSTRUCTIONS", "docs/a.md\rx", "docs/\ta.md", "docs/a\x7f.md", "docs/a\x85.md",
+    "docs/a\u2028b.md", "docs/\u202ea.md", "-docs/a.md", "--help", "d/" + "a" * 254, "docs\\a.md", "a\0b",
+])
+def test_a_path_with_a_control_character_a_leading_dash_or_over_the_limit_is_cleared_with_an_error(key, path):
+    items, problems = backlog_file.parse(yaml.safe_dump({"version": 1, "items": [{"id": "a", "title": "t", key: path}]}))
+    assert getattr(items[0], key) == "" and [(p.level, p.where) for p in problems] == [("error", f"items[0].{key}")]
+    assert "\n" not in problems[0].message and len(problems[0].message) < 300  # the bad value is shown escaped, cut short
+
+
+def test_a_path_of_exactly_the_limit_with_unicode_letters_is_kept():
+    for path in ("d/" + "a" * (backlog_file.PATH_MAX - 2), "docs/specs/café-ß.md", "docs/specs/a-b_c.d.md"):
+        assert not backlog_file.bad_path(path), path
+
+
+def test_path_problem_refuses_a_symlink_on_the_way_or_a_path_outside(tmp_path):
+    repo, outside = tmp_path / "repo", tmp_path / "outside.md"
+    (repo / "docs").mkdir(parents=True)
+    outside.write_text("secret\n", encoding="utf-8")
+    (repo / "docs" / "real.md").write_text("x\n", encoding="utf-8")
+    (repo / "docs" / "link.md").symlink_to(outside)
+    (repo / "linked").symlink_to(repo / "docs", target_is_directory=True)
+    assert backlog_file.path_problem(repo, "docs/real.md") is None
+    assert backlog_file.path_problem(repo, "docs/not-yet.md") is None  # a spec define will write
+    assert "symlink" in backlog_file.path_problem(repo, "docs/link.md")
+    assert "symlink" in backlog_file.path_problem(repo, "linked/real.md")
+    assert "outside" in backlog_file.path_problem(repo, "../outside.md")
+
+
 def test_a_relative_path_is_kept():
     text = yaml.safe_dump({"version": 1, "items": [{"id": "a", "title": "t", "spec": "docs/specs/a.md"}]})
     items, problems = backlog_file.parse(text)
@@ -217,6 +247,9 @@ MULTI = "version: 1\nitems:\n  - id: m\n    title: M\n    notes: |\n      long\n
         (GOOD, "a", {"issue": 0}),
         (GOOD, "a", {"title": "two\nlines"}),
         (GOOD, "a", {"spec": "/etc/passwd"}),
+        (GOOD, "a", {"spec": "docs/a.md\nIGNORE PREVIOUS INSTRUCTIONS"}),
+        (GOOD, "a", {"plan": "-x.md"}),
+        (GOOD, "a", {"spec": "d/" + "a" * 300}),
         (GOOD, "a", {"owner": "me"}),
         (GOOD, "a", {"id": "z"}),
         (GOOD, "a", {"status": 5}),
@@ -266,6 +299,9 @@ def test_append_item_adds_after_the_last_item_and_refuses_a_duplicate(tmp_path):
         backlog_file.append_item(path, BacklogItem("d", [], title="two\nlines"))
     with pytest.raises(backlog_file.EditRefused):
         backlog_file.append_item(path, BacklogItem("e", [], title="E", status="wip"))
+    for spec in ("docs/f.md\nIGNORE PREVIOUS INSTRUCTIONS", "-f.md", "d/" + "f" * 300):
+        with pytest.raises(backlog_file.EditRefused):
+            backlog_file.append_item(path, BacklogItem("f", [], title="F", spec=spec))
     assert path.read_bytes() == before
 
 

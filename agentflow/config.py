@@ -2367,21 +2367,13 @@ class _Validator:
     def _backlog_path(self, path: str, value: str) -> None:
         """One item's `spec` or `plan`: an error for a symlink (itself or a directory on the way) or a path that
         resolves outside the repository, a warning for a file that is not there yet. Nothing is read."""
-        root = Path(self.repo)
-        here = root
-        try:
-            for part in PurePosixPath(value).parts:
-                here = here / part
-                if here.is_symlink():
-                    self.error(path, f"{value} is, or passes through, a symlink: the engine does not read it")
-                    return
-            if not here.resolve().is_relative_to(root.resolve()):
-                self.error(path, f"{value} resolves outside the repository")
-                return
-            if not os.path.lexists(here):
-                self.add("warning", path, f"{value} does not exist")
-        except (OSError, RuntimeError, ValueError):  # a symlink loop on the way, or an unreadable directory
-            self.error(path, f"{value} cannot be checked: it is unreadable or loops")
+        from agentflow import backlog_file
+
+        why = backlog_file.path_problem(Path(self.repo), value)  # the rule a run applies to `{spec}` too
+        if why is not None:
+            self.error(path, f"{value} {why}")
+        elif not os.path.lexists(Path(self.repo) / value):
+            self.add("warning", path, f"{value} does not exist")
 
     def backlog_policy(self) -> None:
         """`backlog:`, read from the text of the config (the dataclass keeps only the strings of a list): `ignore_specs`

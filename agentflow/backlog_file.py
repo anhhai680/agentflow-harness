@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import posixpath
 import re
+import unicodedata
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 import yaml
@@ -26,6 +27,10 @@ ID_MAX = 64
 TITLE_MAX = 200
 NOTES_MAX = 4096
 FILE = "backlog.yml"
+PATH_MAX = 255  # characters of an item's `spec` or `plan`
+# A control (C0, DEL, C1), format (bidi overrides, zero-width), surrogate or line/paragraph-separator character: a path
+# that holds one could start a new line, or hide text, in the prompt `{spec}` reaches.
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 
 
 @dataclass
@@ -55,12 +60,34 @@ class _ItemError(Exception):
         self.message = message
 
 
-def _bad_path(value: str) -> bool:
-    """True for an absolute path or one with a `..` segment once normalised."""
-    if not value or value.startswith("/") or "\\" in value or "\0" in value:
+def bad_path(value: str) -> bool:
+    """True for a `spec` or `plan` an item can't name: empty, absolute, a `..` segment once normalised, a backslash, a
+    leading `-` (git would read it as an option), more than `PATH_MAX` characters, or any control, format, surrogate or
+    line/paragraph-separator character (the path reaches prompts as `{spec}`)."""
+    if not value or len(value) > PATH_MAX or value.startswith(("/", "-")) or "\\" in value:
+        return True
+    if any(unicodedata.category(ch) in _UNSAFE_CATEGORIES for ch in value):
         return True
     norm = posixpath.normpath(value)
     return norm.startswith("/") or ".." in norm.split("/")
+
+
+def path_problem(repo: Path, value: str) -> str | None:
+    """Why the item path `value` can't be used inside `repo`: it is, or passes through, a symlink, it resolves outside
+    `repo`, or it can't be checked (an unreadable directory or a symlink loop). None when it can; it need not exist.
+    Only `lstat` and `resolve` look at the tree: nothing is read."""
+    root = Path(repo)
+    here = root
+    try:
+        for part in PurePosixPath(value).parts:
+            here = here / part
+            if here.is_symlink():
+                return "is, or passes through, a symlink: the engine does not read it"
+        if not here.resolve().is_relative_to(root.resolve()):
+            return "resolves outside the repository"
+    except (OSError, RuntimeError, ValueError):  # a symlink loop on the way (RuntimeError on Python 3.12), or unreadable
+        return "cannot be checked: it is unreadable or loops"
+    return None
 
 
 def _depends(value: object) -> list[str]:
@@ -112,8 +139,11 @@ def _item(raw: dict, problems: list[Problem], at: str) -> BacklogItem:
     if not isinstance(notes, str) or len(notes) > NOTES_MAX:
         raise _ItemError("notes", f"must be a string of at most {NOTES_MAX} characters")
     for key, value in paths.items():
-        if value and _bad_path(value):
-            problems.append(Problem("error", f"{at}.{key}", f"{value!r} must be a path inside the repository"))
+        if value and bad_path(value):
+            shown = repr(value[:80]) + ("…" if len(value) > 80 else "")
+            problems.append(Problem("error", f"{at}.{key}", f"{shown} must be a path inside the repository: relative, "
+                                    f"at most {PATH_MAX} characters, with no `..`, backslash, leading `-` or control "
+                                    "character"))
             paths[key] = ""
     return BacklogItem(
         ident, deps, title=title, lane=lane, status=status, spec=paths["spec"], plan=paths["plan"], issue=issue, notes=notes
