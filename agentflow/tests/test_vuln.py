@@ -335,3 +335,71 @@ def test_read_alert_refuses_a_missing_or_empty_file(tmp_path):
     (tmp_path / vuln.ALERT_JSON).write_text(json.dumps({"ids": []}), encoding="utf-8")
     with pytest.raises(vuln.AlertError):
         vuln.read_alert(tmp_path)
+
+
+def test_severity_query_lists_the_floor_and_above():
+    assert vuln.severity_query("low") == "low,medium,high,critical"
+    assert vuln.severity_query("high") == "high,critical"
+
+
+def test_group_alerts_groups_by_package_and_manifest():
+    groups, skipped = vuln.group_alerts([_alert(42), SIBLING, OTHER_MANIFEST], "low")
+    assert skipped == 0
+    by_manifest = {g["manifest"]: g for g in groups}
+    main = by_manifest[_alert(42)["dependency"]["manifest_path"]]
+    assert main["alerts"] == [42, 43] and main["fixable"] == [42, 43]
+    assert main["severity"] == _alert(42)["security_advisory"]["severity"]  # SIBLING is low
+    assert main["ids"][0] == _alert(42)["security_advisory"]["ghsa_id"] and "GHSA-mmpq-2345-vwxj" in main["ids"]
+    assert main["url"].endswith("/dependabot/42") and main["dependabot_prs"] == []
+    assert by_manifest["web/requirements.txt"]["alerts"] == [44]
+
+
+def test_group_alerts_drops_closed_and_below_floor():
+    closed = _alert(45, state="fixed")
+    groups, _ = vuln.group_alerts([_alert(42), SIBLING, closed], "medium")
+    assert [g["alerts"] for g in groups] == [[42]]  # SIBLING is low, 45 is closed
+
+
+def test_a_group_whose_lowest_alert_has_no_fix_still_has_a_fixable_one():
+    nofix = _alert(40, **{"security_vulnerability.first_patched_version": None})
+    groups, _ = vuln.group_alerts([nofix, _alert(42)], "low")
+    assert groups[0]["alerts"] == [40, 42] and groups[0]["fixable"] == [42]
+    assert groups[0]["url"].endswith("/dependabot/42")
+
+
+def test_a_group_with_no_fix_has_no_fixable():
+    groups, _ = vuln.group_alerts([_alert(40, **{"security_vulnerability.first_patched_version": None})], "low")
+    assert groups[0]["fixable"] == []
+
+
+@pytest.mark.parametrize("change", [
+    {"dependency.package.name": "x; rm -rf ~"}, {"dependency.manifest_path": "../../etc/passwd"},
+    {"security_advisory.ghsa_id": "GHSA-bad"}, {"number": "42"}])
+def test_one_bad_entry_is_skipped_and_counted(change):
+    bad = _alert(41)
+    for path, value in change.items():  # applied here, as `_alert`'s own `number` argument can't be changed
+        bad = _set(bad, tuple(path.split(".")), value)
+    groups, skipped = vuln.group_alerts([bad, _alert(42), "junk"], "low")
+    assert skipped == 2 and [g["alerts"] for g in groups] == [[42]]
+
+
+def test_group_alerts_refuses_a_non_list():
+    with pytest.raises(vuln.AlertError):
+        vuln.group_alerts({"message": "x"}, "low")
+
+
+def test_check_group_round_trips_and_refuses_tampering():
+    group = vuln.group_alerts([_alert(42)], "low")[0][0]
+    assert vuln.check_group(group) == group
+    for key, bad in [("package", "a b"), ("manifest", "/etc/passwd"), ("severity", "urgent"),
+                     ("alerts", ["42"]), ("alerts", []), ("fixable", [99]), ("ids", ["not-an-id"]),
+                     ("url", "javascript:alert(1)"), ("dependabot_prs", [True]), ("ecosystem", "cobol")]:
+        assert vuln.check_group({**group, key: bad}) is None, key
+    assert vuln.check_group({**group, "extra": 1}) is None and vuln.check_group("x") is None
+
+
+def test_prs_naming_matches_whole_tokens_only():
+    prs = [{"number": 7, "title": "Bump requests from 2.31.0 to 2.32.0"},
+           {"number": 8, "title": "Bump requests-toolbelt from 1.0 to 1.1"}, {"number": True, "title": "requests"}]
+    assert vuln.prs_naming("requests", prs) == [7]
+    assert vuln.prs_naming("requests", "junk") == []

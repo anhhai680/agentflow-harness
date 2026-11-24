@@ -323,6 +323,77 @@ def _api(path: str, repo: Path, number: str) -> object:
         raise
 
 
+ALERTS_MAX = 100  # alerts one listing call asks for (`per_page`)
+_GROUP_KEYS = ("ecosystem", "package", "manifest", "severity", "alerts", "fixable", "ids", "url", "dependabot_prs")
+
+
+def severity_query(floor: str) -> str:
+    """The severities at or above `floor`, comma-joined for the alerts API's `severity` filter."""
+    return ",".join(s for s in SEVERITIES if severity_at_least(s, floor))
+
+
+def group_alerts(listing: object, floor: str) -> tuple[list[dict], int]:
+    """The open alerts at or above `floor`, grouped by package and manifest in first-seen order, and how many
+    entries were skipped as unreadable. One bad entry never stops the rest; a listing that is no list does."""
+    if not isinstance(listing, list):
+        raise AlertError("the alerts listing is not a list")
+    skipped = 0
+    found: dict[tuple[str, str, str], dict[int, Alert]] = {}
+    for entry in listing:
+        try:
+            alert = parse_alert(entry)
+        except AlertError:
+            skipped += 1
+            continue
+        if alert.state == "open" and severity_at_least(alert.severity, floor):
+            found.setdefault((alert.ecosystem, alert.package, alert.manifest), {})[alert.number] = alert
+    groups = []
+    for (ecosystem, package, manifest), by_number in found.items():
+        members = [by_number[n] for n in sorted(by_number)]
+        fixable = [a for a in members if a.patched is not None]
+        ids = list(dict.fromkeys(i for a in members for i in a.ids))
+        groups.append({
+            "ecosystem": ecosystem, "package": package, "manifest": manifest,
+            "severity": max((a.severity for a in members), key=SEVERITIES.index),
+            "alerts": [a.number for a in members], "fixable": [a.number for a in fixable], "ids": ids,
+            "url": _url((fixable or members)[0].url), "dependabot_prs": []})
+    return groups, skipped
+
+
+def _numbers(value: object) -> list[int] | None:
+    """`value` when it is a list of positive integers (no bools); None otherwise."""
+    if isinstance(value, list) and all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in value):
+        return value
+    return None
+
+
+def check_group(value: object) -> dict | None:
+    """A cached group, checked again as untrusted input with the same validators `parse_alert` uses: a copy of
+    it when every field passes, None when any does not."""
+    if not isinstance(value, dict) or set(value) != set(_GROUP_KEYS):
+        return None
+    alerts, fixable, prs = _numbers(value["alerts"]), _numbers(value["fixable"]), _numbers(value["dependabot_prs"])
+    ids, url = value["ids"], value["url"]
+    if (not alerts or alerts != sorted(set(alerts)) or fixable is None or fixable != sorted(set(fixable))
+            or not set(fixable) <= set(alerts) or prs is None):
+        return None
+    if not isinstance(ids, list) or not all(isinstance(i, str) and (GHSA_ID.fullmatch(i) or CVE_ID.fullmatch(i))
+                                            for i in ids):
+        return None
+    if not isinstance(url, str) or (url and _url(url) != url):
+        return None
+    if value["ecosystem"] not in ECOSYSTEMS or value["severity"] not in SEVERITIES:
+        return None
+    if not isinstance(value["package"], str) or not isinstance(value["manifest"], str):
+        return None
+    try:
+        _package(value["package"])
+        _manifest(value["manifest"])
+    except AlertError:
+        return None
+    return {**value, "alerts": list(alerts), "fixable": list(fixable), "ids": list(ids), "dependabot_prs": list(prs)}
+
+
 def _label(entry: object) -> str:
     number = entry.get("number") if isinstance(entry, dict) else None
     return f"#{number}" if isinstance(number, int) and not isinstance(number, bool) else "with no number"
@@ -331,6 +402,18 @@ def _label(entry: object) -> str:
 def _url(text: str) -> str:
     """`text` when it is a plain https URL (no space, quote, bracket or markup), else ""."""
     return text if _URL.fullmatch(text) else ""
+
+
+def prs_naming(package: str, prs: object) -> list[int]:
+    """The numbers of the PRs in a parsed `gh pr list` reply whose title names `package` as a whole token."""
+    token = re.compile(rf"(?<![\w.-]){re.escape(package)}(?![\w.-])", re.IGNORECASE)
+    found: list[int] = []
+    for pr in prs if isinstance(prs, list) else []:
+        number, title = (pr.get("number"), pr.get("title")) if isinstance(pr, dict) else (None, None)
+        if (isinstance(number, int) and not isinstance(number, bool) and number > 0 and isinstance(title, str)
+                and token.search(title) and number not in found):
+            found.append(number)
+    return found
 
 
 def _dependabot_prs(package: str, repo: Path) -> list[int]:
@@ -342,14 +425,7 @@ def _dependabot_prs(package: str, repo: Path) -> list[int]:
                         "--json", "number,title,url", "--limit", str(PR_SEARCH_LIMIT)], cwd=repo)
     except GhError:
         return []
-    token = re.compile(rf"(?<![\w.-]){re.escape(package)}(?![\w.-])", re.IGNORECASE)
-    found: list[int] = []
-    for pr in data if isinstance(data, list) else []:
-        number, title = (pr.get("number"), pr.get("title")) if isinstance(pr, dict) else (None, None)
-        if (isinstance(number, int) and not isinstance(number, bool) and number > 0 and isinstance(title, str)
-                and token.search(title) and number not in found):
-            found.append(number)
-    return found
+    return prs_naming(package, data)
 
 
 def _group(primary: Alert, listing: object, number: str) -> tuple[list[Alert], list[str]]:
