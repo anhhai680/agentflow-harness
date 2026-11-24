@@ -15,7 +15,7 @@ import yaml
 from agentflow.conditions import CondResult, Ctx, evaluate, explain, fmt, make_ctx, plan_warnings
 from agentflow.config import Parallel, WorkSource, resolve_model
 from agentflow.gitops import GhError, gh_json
-from conftest import PYTHON_PACK
+from conftest import PYTHON_PACK, run_git
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 PACK = PYTHON_PACK  # the toy repository: `greet` has an approved, API-reviewed spec with nothing open
@@ -488,6 +488,105 @@ def test_modules_done_ignores_a_leftover_hand_mark_in_a_backlog_pack(cfg, fake_g
     r = evaluate(marked, "deps_merged", make_ctx(marked, tmp_path, "feature", {"module": "b"}))
     assert r.value is False, r.reason
     assert fake_gh.exists()  # a was asked about, not taken as done
+
+
+def _backlog(cfg):
+    return dataclasses.replace(cfg, work_source=WorkSource(kind="backlog", path="backlog.yml"))
+
+
+def test_modules_done_counts_a_dependency_the_backlog_file_says_is_done(cfg, fake_gh, monkeypatch, tmp_path):
+    from agentflow import finished
+    from agentflow.state import runs_root
+
+    marked = _backlog(cfg)
+    (tmp_path / "backlog.yml").write_text("version: 1\nitems:\n  - {id: a, title: A, status: done}\n"
+                                          "  - {id: c, title: C, status: ready}\n"
+                                          "  - {id: b, title: B, status: ready, depends_on: [a]}\n"
+                                          "  - {id: d, title: D, status: ready, depends_on: [c]}\n", encoding="utf-8")
+    monkeypatch.setenv("FAKE_GH_JSON", "[]")  # nothing merged
+    r = evaluate(marked, "deps_merged", make_ctx(marked, tmp_path, "feature", {"module": "b"}))
+    assert r.value is True and finished.FILE_SAYS in r.reason, r.reason
+    assert not fake_gh.exists()  # no assessment recorded it, and gh was not asked
+    # an assessment recorded c done when the file said so; the file says ready now, so c is not done
+    runs_root(tmp_path).mkdir(parents=True, exist_ok=True)
+    (runs_root(tmp_path) / finished.QUEUE_FILE).write_text(json.dumps(
+        {"modules": [{"id": "c", "status": "done", "done_reason": finished.FILE_SAYS}]}), encoding="utf-8")
+    r = evaluate(marked, "deps_merged", make_ctx(marked, tmp_path, "feature", {"module": "d"}))
+    assert r.value is False and "not merged yet: c" in r.reason, r.reason
+
+
+SPEC_B = "version: 1\nitems:\n  - {id: a, title: A, status: ready}\n" \
+         "  - {id: b, title: B, status: ready, depends_on: [a], spec: docs/specs/b.md}\n"
+FORGED = "version: 1\nitems:\n  - {id: a, title: A, status: done}\n" \
+         "  - {id: b, title: B, status: ready, spec: docs/specs/approved.md}\n"
+
+
+@pytest.fixture
+def forked(cfg, repo, tmp_path):
+    """A backlog pack's run of `b` whose fork commit holds `SPEC_B`, and its linked worktree."""
+    from agentflow.state import Run
+
+    marked = _backlog(cfg)
+    (repo / "backlog.yml").write_text(SPEC_B, encoding="utf-8")
+    run_git(repo, "add", "backlog.yml")
+    run_git(repo, "commit", "-q", "-m", "backlog")
+    base = run_git(repo, "rev-parse", "HEAD").strip()
+    worktree = tmp_path / "wt"
+    run_git(repo, "worktree", "add", "-q", "-b", "flow/feature/b", str(worktree), base)
+    run = Run.create(marked, repo, "feature", {"module": "b"})
+    run.emit("run_updated", branch="flow/feature/b", worktree=str(worktree), base_sha=base)
+    return marked, run, worktree
+
+
+def test_in_a_run_the_spec_placeholder_reads_the_item_at_the_fork_commit(forked, repo):
+    marked, run, worktree = forked
+    (worktree / "docs" / "specs").mkdir(parents=True)
+    (worktree / "docs" / "specs" / "approved.md").write_text("**Status: approved**\n", encoding="utf-8")
+    (worktree / "backlog.yml").write_text(FORGED, encoding="utf-8")  # an agent rewrites its item mid-run
+    (repo / "backlog.yml").write_text(FORGED, encoding="utf-8")  # and an uncommitted edit in the main checkout
+    ctx = make_ctx(marked, worktree, "feature", {"module": "b"}, run)
+    assert ctx.values["spec"] == "docs/specs/b.md"
+    # without a run (explain, a dry run) the working tree it is given is what counts
+    assert make_ctx(marked, worktree, "feature", {"module": "b"}).values["spec"] == "docs/specs/approved.md"
+
+
+def test_in_a_run_deps_merged_reads_the_items_at_the_fork_commit(forked, fake_gh, monkeypatch):
+    marked, run, worktree = forked
+    (worktree / "backlog.yml").write_text(FORGED, encoding="utf-8")  # says a is done, and b depends on nothing
+    monkeypatch.setenv("FAKE_GH_JSON", "[]")
+    r = evaluate(marked, "deps_merged", make_ctx(marked, worktree, "feature", {"module": "b"}, run))
+    assert r.value is False and "not merged yet: a" in r.reason, r.reason
+
+
+def test_a_run_with_no_fork_commit_yet_reads_no_item(cfg, repo):
+    from agentflow.state import Run
+
+    marked = _backlog(cfg)
+    (repo / "backlog.yml").write_text(SPEC_B, encoding="utf-8")
+    run = Run.create(marked, repo, "feature", {"module": "b"})
+    fallback = f"{marked.project.docs['specs']}/{marked.project.spec_file.format(module='b')}"
+    assert make_ctx(marked, repo, "feature", {"module": "b"}, run).values["spec"] == fallback
+
+
+@pytest.mark.parametrize("link", ["file", "directory"])
+def test_a_spec_through_a_symlink_falls_back_and_nothing_outside_is_read(cfg, tmp_path, link):
+    marked = _backlog(cfg)
+    repo, outside = tmp_path / "repo", tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    (outside / "specs" / "e.md").write_text("**Status: approved**\n", encoding="utf-8")
+    (repo / "docs").mkdir(parents=True)
+    if link == "file":
+        (repo / "docs" / "specs").mkdir()
+        (repo / "docs" / "specs" / "e.md").symlink_to(outside / "specs" / "e.md")
+    else:
+        (repo / "docs" / "specs").symlink_to(outside / "specs", target_is_directory=True)
+    (repo / "backlog.yml").write_text("version: 1\nitems:\n  - {id: e, title: E, spec: docs/specs/e.md}\n",
+                                      encoding="utf-8")
+    ctx = make_ctx(marked, repo, "feature", {"module": "e"})
+    fallback = f"{marked.project.docs['specs']}/{marked.project.spec_file.format(module='e')}"
+    assert ctx.values["spec"] == fallback
+    r = evaluate(marked, {"check": "grep", "file": "{spec}", "pattern": "approved"}, ctx)
+    assert r.value is False and "approved" not in r.reason
 
 
 def test_modules_done_asks_gh_only_for_the_dependencies_not_recorded(cfg, fake_gh, monkeypatch, tmp_path):

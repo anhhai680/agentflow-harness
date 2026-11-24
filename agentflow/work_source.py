@@ -18,16 +18,18 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import stat
 import threading
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
-from agentflow import backlog_file, sources
+from agentflow import backlog_file, gitops, sources
 
 if TYPE_CHECKING:
     from agentflow.config import Config
 
+_FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _NOUNS = {"capability_map": "capability map", "specs": "spec files", "backlog": "backlog"}
 
 # Per specs directory: `{name: ((st_mtime_ns, st_size), deps)}` from the last listing, so a header is read again
@@ -211,6 +213,39 @@ def indexed(cfg: Config, repo: Path) -> tuple[list[tuple[int, backlog_file.Backl
 def item(cfg: Config, repo: Path, module: str) -> backlog_file.BacklogItem | None:
     """For `backlog`, the item with id `module` (a `dropped` one too), or None."""
     return next((i for i in all_items(cfg, repo) if i.id == module), None)
+
+
+def items_at(cfg: Config, checkout: Path, sha: object) -> list[backlog_file.BacklogItem]:
+    """For `backlog`, every item of the file as commit `sha` holds it (the `dropped` ones too), read in `checkout`
+    through `gitops.read_blob`, which proves every object against its id: no working tree, and so no agent's edit, is
+    read. `[]` when `sha` is not a full commit id, the file is not at that commit or can't be read there, and for other
+    kinds."""
+    if _kind(cfg) != "backlog" or not isinstance(sha, str) or _FULL_SHA.fullmatch(sha) is None:
+        return []
+    rel = PurePosixPath(cfg.work_source.path).as_posix()  # read_blob refuses an absolute path or a `..` segment
+    data = gitops.read_blob(Path(checkout), sha, rel, backlog_file.FILE_MAX)
+    if data is None:
+        return []
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    return backlog_file.parse(text)[0]
+
+
+def item_spec(cfg: Config, repo: Path, module: str, fork: tuple[Path, object] | None = None) -> str:
+    """For `backlog`, the `spec` the item `module` names, when a run may use it as `{spec}`; '' when there is no such
+    item, it names none, or its path is, or passes through, a symlink in `repo` or resolves outside it
+    (`backlog_file.path_problem`; the parser already cleared a path `backlog_file.bad_path` refuses).
+
+    `fork` is `(main checkout, state.base_sha)` for a run: the item is read from the file at the run's fork commit
+    (`items_at`, none before the run has one), never from the run's worktree. Without it (`explain`, a dry run, the
+    queue) the file in `repo` is read."""
+    found = all_items(cfg, repo) if fork is None else items_at(cfg, *fork)
+    entry = next((i for i in found if i.id == module), None)
+    if entry is None or not entry.spec or backlog_file.path_problem(Path(repo), entry.spec) is not None:
+        return ""
+    return entry.spec
 
 
 def problems(cfg: Config, repo: Path) -> list[backlog_file.Problem]:
