@@ -24,6 +24,7 @@ from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
 from agentflow.views import _badge, _strip, lane_phases, step_title
 from conftest import PYTHON_CONFIG, L, add_vuln_lane, awaiting, run_git, session_with_transcript
+from test_vuln import _alert
 
 TOKEN = "k3y-" + "x" * 40
 AGENTFLOW = Path(__file__).resolve().parents[1]
@@ -2383,3 +2384,37 @@ def test_the_usage_header_is_set_without_innerhtml():
     board_js = (UI_DIR / "board.js").read_text(encoding="utf-8")
     assert "innerHTML" not in board_js and '$("usage").textContent = label.text' in board_js
     assert '$("usage-note").textContent = label.note' in board_js
+
+
+@pytest.fixture
+def adash(bdash, gh_alerts):
+    """`bdash` with the vuln lane, `vuln.sync: true` and two alert groups listed: 42 (fixable) and 40 (no fix)."""
+    bdash.flow.configure(patch={"vuln": {"probe": "ok", "sync": True}}, edit=add_vuln_lane)
+    bdash.server.cfg = bdash.flow.cfg
+    gh_alerts.write([_alert(42), _alert(40, **{"dependency.package.name": "flask",
+                                               "security_vulnerability.first_patched_version": None})])
+    from agentflow.dashboard import refresh_once
+
+    refresh_once(bdash.server)
+    return bdash
+
+
+def test_the_board_carries_alert_cards_and_a_fixable_one_starts(adash):
+    data = payload(adash.get("/api/board")[2])
+    cards = {c["key"]: c for c in data["backlog"]}
+    assert cards["alert:42"]["status"] == "ready" and cards["alert:40"]["status"] == "no_fix"
+    assert adash.post("/api/backlog/start", {"item": "alert:42"})[0] == 202
+    settle(adash)
+    assert adash.fake.calls[-1]["lane"] == "vuln" and adash.fake.calls[-1]["params"] == {"alert": "42"}
+
+
+def test_an_alert_group_with_no_fix_answers_409_on_start_and_a_bad_key_400(adash):
+    code, _, body = adash.post("/api/backlog/start", {"item": "alert:40"})
+    assert code == 409 and "no patched version yet" in payload(body)["error"]
+    assert adash.post("/api/backlog/start", {"item": "alert:x; rm"})[0] == 400
+    assert adash.fake.calls == []
+
+
+def test_an_alert_card_cannot_be_removed(adash):
+    code, _, body = adash.post("/api/backlog/remove", {"item": "alert:42"})
+    assert code == 409 and "Dependabot" in payload(body)["error"]

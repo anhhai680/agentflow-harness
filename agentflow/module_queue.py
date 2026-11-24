@@ -1099,7 +1099,7 @@ def run_queue(
 
 
 _LANE = re.compile(r"^[a-z][a-z0-9_-]*$")
-SPAWN_PARAMS = ("module", "topic", "issue", "task", "slice")  # never `log`: it reads any local path into the agent
+SPAWN_PARAMS = ("module", "topic", "issue", "task", "slice", "alert")  # never `log`: it reads any local path into the agent
 
 
 def spawn_run(
@@ -1123,6 +1123,8 @@ def spawn_run(
         text = str(value)
         if name == "module" and not _MODULE_ID.fullmatch(text):
             raise StartFailed(f"module id {text!r} is not a plain slug")
+        if name == "alert" and not (text.isascii() and text.isdigit()):
+            raise StartFailed("alert must be a Dependabot alert number (digits only)")
         if "\0" in text or not text.strip():
             raise StartFailed(f"{name} must be non-empty text without NUL bytes")
         argv.append(f"--{name}={text}")

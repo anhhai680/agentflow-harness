@@ -7,13 +7,15 @@ import os
 from pathlib import Path
 
 import pytest
-from agentflow import backlog, finished, module_queue
+from agentflow import backlog, finished, module_queue, run_control
 from agentflow.flow import main
 from agentflow.backlog import Invalid, Refused
 from agentflow.state import Run, runs_root
 
 from conftest import ENGINE, add_vuln_lane, prime, release, run_git
-from test_vuln import SIBLING, _alert
+from agentflow.views import lane_first_phase
+import test_vuln
+from test_vuln import OTHER_MANIFEST, SIBLING, _alert
 
 GH_BIN = ENGINE / "tests" / "bin"
 # A is merged, B and C depend on A, D depends on B (the plan's example).
@@ -1703,3 +1705,116 @@ def test_turning_sync_off_clears_the_cache(abk, monkeypatch):
     _vuln(abk, sync=False)
     abk.refresh()
     assert backlog._load_state(abk.root).get("alerts") == []
+
+
+def test_an_alert_card_shows_the_group(abk, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_PR_LIST", json.dumps([{"number": 7, "title": "Bump requests from 2.31.0 to 2.32.0"}]))
+    abk.alerts.write([_alert(42), SIBLING])
+    abk.refresh()
+    card = abk.cards()["alert:42"]
+    assert (card["kind"], card["lane"], card["status"], card["label"]) == ("alert", "vuln", "ready", "requests (pip)")
+    assert card["id"] == "42" and card["severity"] == "high" and card["manifest"] == "requirements.txt"
+    assert card["alerts"] == [42, 43] and card["dependabot_prs"] == [7] and card["removable"] is False
+    assert card["ids"] and card["url"].startswith("https://")
+    assert card["first_phase"] == lane_first_phase(abk.cfg, "vuln")
+
+
+def test_alert_cards_stay_out_of_the_after_choices(abk):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    snap = backlog.snapshot(abk.cfg, abk.root)
+    assert "alert:42" in {c["key"] for c in snap["cards"]}
+    assert not [c for c in snap["after_choices"] if c["key"].startswith("alert:")]
+
+
+def test_the_snapshot_says_nothing_about_alerts_when_sync_is_off(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    monkeypatch.setenv("FAKE_GH_ALERTS_STATUS", "403")
+    abk.refresh()
+    assert backlog.snapshot(abk.cfg, abk.root)["alerts_note"].startswith("Dependabot alerts not updated:")
+    _vuln(abk, sync=False)  # the stale note stays in backlog_state.json until a refresh clears it
+    assert backlog._load_state(abk.root)["alerts_note"]
+    snap = backlog.snapshot(abk.cfg, abk.root)
+    assert snap["alerts_note"] == "" and not [c for c in snap["cards"] if c["kind"] == "alert"]
+
+
+def test_start_passes_the_lowest_fixable_alert(abk, monkeypatch):
+    abk.alerts.write([_alert(40, **{"security_vulnerability.first_patched_version": None}), _alert(42)])
+    abk.refresh()
+    job = backlog.begin_start(abk.cfg, abk.root, "alert:40")
+    assert (job.lane, job.params) == ("vuln", {"alert": "42"})
+    assert abk.cards()["alert:40"]["status"] == "starting"
+    with pytest.raises(Refused, match="alert:40 is already starting"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:40")
+    item = backlog.Backlog.load(abk.root).alert_overlay("40")
+    assert (item.source, item.kind, item.params, item.label) == ("alert", "alert", {"alert": "40"}, "alert #40")
+    assert item.key == "alert:40"
+
+
+def test_a_group_with_no_fix_shows_and_refuses_start(abk, monkeypatch):
+    abk.alerts.write([_alert(40, **{"security_vulnerability.first_patched_version": None})])
+    abk.refresh()
+    card = abk.cards()["alert:40"]
+    assert card["status"] == "no_fix" and card["note"] == "no patched version yet"
+    with pytest.raises(Refused, match="alert #40: no patched version yet"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:40")
+
+
+def test_start_refuses_a_group_that_is_not_on_the_board(abk):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    with pytest.raises(Refused, match=r"alert #41 is not an open alert group at or above low as of the last refresh"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:41")
+    _vuln(abk, sync=False)
+    with pytest.raises(Refused, match="alert sync is off"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:42")
+
+
+def test_a_cli_run_for_the_package_holds_the_card_and_a_cancel_frees_it(abk, monkeypatch):
+    abk.alerts.write([_alert(42), OTHER_MANIFEST])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)  # a real `run vuln --alert 42` intake: it writes alert.json
+    cards = abk.cards()
+    assert cards["alert:42"]["status"] == "in_progress" and run.id in cards["alert:42"]["note"]
+    assert cards["alert:44"]["status"] == "ready"  # same package, other manifest
+    with pytest.raises(Refused, match=f"alert #42: run {run.id} holds requests in requirements.txt"):
+        backlog.begin_start(abk.cfg, abk.root, "alert:42")
+    run_control.cancel(run, "test")
+    assert abk.cards()["alert:42"]["status"] == "ready"
+
+
+def test_a_run_without_readable_alert_facts_holds_nothing(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    run = test_vuln._start(abk.fr)
+    (run.dir / "alert.json").write_text("{not json", encoding="utf-8")
+    assert abk.cards()["alert:42"]["status"] == "ready"
+
+
+def test_an_alert_start_spawns_the_vuln_lane_and_a_started_card_is_held_by_its_run(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    assert abk.start("alert:42")
+    assert abk.spawn.calls[0]["lane"] == "vuln" and abk.spawn.calls[0]["params"] == {"alert": "42"}
+    assert abk.cards()["alert:42"]["status"] == "ready"  # the spawner's run has no alert.json, so it holds no group
+    with pytest.raises(Refused, match="already has a live run"):
+        abk.start("alert:42")  # but a live run of alert 42 still clashes
+
+
+def test_an_alert_start_that_fails_keeps_its_reason(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    abk.spawn.fail = "Dependabot alert #42 is fixed: only an open alert starts a vuln run"
+    abk.start("alert:42")
+    card = abk.cards()["alert:42"]
+    assert card["status"] == "ready" and card["failure"].startswith("Dependabot alert #42 is fixed")
+
+
+@pytest.mark.parametrize("key", ["alert:x", "alert:-1", "alert:", "alert:4 2", "alert:--x"])
+def test_a_bad_alert_key_is_invalid(key):
+    with pytest.raises(Invalid):
+        backlog.parse_key(key)
+
+
+def test_a_good_alert_key_is_normalised():
+    assert backlog.parse_key("alert:#42") == ("alert", "42")
