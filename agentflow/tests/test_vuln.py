@@ -546,3 +546,151 @@ def _with(index, **changes):
 def test_review_changes_refuses_a_hostile_reply(reply):
     with pytest.raises(vuln.AlertError):
         vuln.review_changes(reply, "medium", "requests", "pip")
+
+
+# --------------------------------------------------------------------------- intake: --advisory ID
+
+GHSA = "GHSA-cfgh-2345-vwxj"
+
+
+def _advisory_params(**changes) -> dict:
+    return {"advisory": GHSA, "package": "requests", "manifest": "requirements.txt", **changes}
+
+
+def _start_advisory(flow_repo, **changes):
+    return start(flow_repo.cfg, flow_repo.root, "vuln", _advisory_params(**changes), RunOptions())
+
+
+def _global(**changes) -> dict:
+    return {**copy.deepcopy(GLOBAL_ADVISORY), **changes}
+
+
+def _named(ecosystem: str = "pip", name: str = "requests", patched: str | None = "2.32.0") -> dict:
+    return {"package": {"ecosystem": ecosystem, "name": name}, "vulnerable_version_range": "< 2.32.0",
+            "first_patched_version": patched}
+
+
+def test_gather_advisory_by_ghsa(flow_repo, gh_advisories):
+    run = _start_advisory(flow_repo)
+    facts = vuln.read_alert(run.dir)
+    assert facts["source"] == "advisory" and facts["alert"] is None and facts["alerts"] == []
+    assert facts["ids"] == ["GHSA-cfgh-2345-vwxj", "CVE-2024-1234"]
+    assert (facts["package"], facts["ecosystem"], facts["manifest"], facts["severity"]) == (
+        "requests", "pip", "requirements.txt", "high")
+    assert facts["advisories"] == [{
+        "number": None, "severity": "high", "ids": ["GHSA-cfgh-2345-vwxj", "CVE-2024-1234"],
+        "vulnerable_range": "< 2.32.0", "patched": "2.32.0", "url": "https://github.com/advisories/" + GHSA}]
+    assert facts["dependabot_prs"] == []
+    params = run.state["params"]
+    assert params["advisory"] == GHSA and params["slug"] == "requests-ghsa-cfgh-2345-vwxj"
+    assert params["advisory_ids"] == facts["ids"]
+    text = (run.dir / vuln.ALERT_FILE).read_text(encoding="utf-8")
+    assert text.startswith(intake.DATA_NOTE)
+    assert "# Advisory GHSA-cfgh-2345-vwxj: requests (pip) in requirements.txt" in text
+    assert "Requests leaks credentials on redirect" in text and "crafted redirect" in text
+    assert "https://github.com/advisories/" + GHSA in text  # a reference, kept in the text only
+    assert "crafted redirect" not in (run.dir / vuln.ALERT_JSON).read_text(encoding="utf-8")
+    api = [c for c in gh_advisories.calls() if c[:1] == ["api"]]
+    assert api == [["api", f"advisories/{GHSA}"]]
+    assert [c[:2] for c in gh_advisories.calls() if c[:1] != ["api"]] == [["pr", "list"]]
+    [event] = flow_repo.events(run, "vuln_alert_read")
+    assert event["alerts"] == [] and event["ids"] == facts["ids"] and event["package"] == "requests"
+    assert {e["file"] for e in flow_repo.events(run, "intake_saved")} == {vuln.ALERT_FILE, vuln.ALERT_JSON}
+
+
+def test_an_alert_run_says_it_came_from_dependabot(flow_repo, gh_alerts):
+    assert vuln.read_alert(_start(flow_repo).dir)["source"] == "dependabot"
+
+
+def test_gather_advisory_by_cve_queries_by_cve_id(flow_repo, gh_advisories):
+    run = _start_advisory(flow_repo, advisory="CVE-2024-1234")
+    assert ["api", "advisories?cve_id=CVE-2024-1234&per_page=100"] in gh_advisories.calls()
+    assert vuln.read_alert(run.dir)["ids"] == ["GHSA-cfgh-2345-vwxj", "CVE-2024-1234"]
+    assert run.state["params"]["slug"] == "requests-ghsa-cfgh-2345-vwxj"
+
+
+def test_gather_advisory_by_cve_takes_every_advisory_that_names_the_package(flow_repo, gh_advisories):
+    other = _global(ghsa_id="GHSA-mmpq-2345-vwxj", severity="critical", html_url="https://github.com/advisories/x")
+    gh_advisories.write([_global(), other, _global(ghsa_id="GHSA-rrvw-2345-vwxj", cve_id="CVE-2000-1")])
+    facts = vuln.read_alert(_start_advisory(flow_repo, advisory="CVE-2024-1234").dir)
+    assert facts["ids"] == ["GHSA-cfgh-2345-vwxj", "GHSA-mmpq-2345-vwxj", "CVE-2024-1234"]
+    assert facts["severity"] == "critical" and len(facts["advisories"]) == 2
+
+
+@pytest.mark.parametrize("params,advisory,message", [
+    ({"advisory": "GHSA-cccc-2345-vwxj"}, None, "no GitHub advisory"),
+    ({"package": "urllib3"}, None, "does not name"),
+    ({}, _global(withdrawn_at="2024-02-01T00:00:00Z"), "withdrawn"),
+    ({}, _global(vulnerabilities=[_named(patched=None)]), "no patched version"),
+    ({}, _global(severity="unknown"), "severity"),
+    ({}, _global(severity="low"), "below vuln.min_severity"),
+    ({}, _global(vulnerabilities=[_named(), _named("npm")]), "more than one ecosystem"),
+    ({"manifest": "../x"}, None, "manifest"),
+    ({"manifest": "missing.txt"}, None, "not a file at project.fork_from"),
+    ({"package": "a b"}, None, "package name"),
+    ({"advisory": "--repo=evil/x"}, None, "--advisory")])
+def test_gather_advisory_refuses(flow_repo, gh_advisories, params, advisory, message):
+    flow_repo.configure(patch={"vuln": {"probe": "ok", "min_severity": "high"}}, edit=add_vuln_lane)
+    if advisory is not None:
+        gh_advisories.write([advisory])
+    with pytest.raises(ValueError, match=message) as caught:
+        _start_advisory(flow_repo, **params)
+    if message in ("package name", "manifest"):
+        assert isinstance(caught.value, vuln.AlertError)
+    if "patched" in message:
+        assert all(word in str(caught.value) for word in ("wait", "replace the package"))
+    assert _runs(flow_repo) == []
+
+
+def test_gather_advisory_ignores_vuln_source(flow_repo, gh_advisories):
+    flow_repo.configure(patch={"vuln": {"probe": "ok", "source": ""}}, edit=add_vuln_lane)
+    assert vuln.read_alert(_start_advisory(flow_repo).dir)["source"] == "advisory"
+
+
+def test_gather_advisory_warns_for_a_match_with_no_patch(flow_repo, gh_advisories):
+    gh_advisories.write([_global(vulnerabilities=[_named(patched=None), _named()])])
+    run = _start_advisory(flow_repo)
+    assert len(vuln.read_alert(run.dir)["advisories"]) == 1
+    [warning] = [e["text"] for e in flow_repo.events(run, "intake_warning")]
+    assert "no patched version" in warning and "requests" in warning
+
+
+def test_gather_advisory_matches_package_names_the_ecosystem_way(flow_repo, gh_advisories):
+    gh_advisories.write([_global(vulnerabilities=[_named(name="Requests")])])
+    assert vuln.read_alert(_start_advisory(flow_repo, package="REQUESTS").dir)["package"] == "Requests"  # as GitHub spells it
+
+
+def test_gather_advisory_warns_about_a_dependabot_pr(flow_repo, gh_advisories, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_PR_LIST", json.dumps([{"number": 7, "title": "Bump requests to 2.32.0", "url": "u"}]))
+    run = _start_advisory(flow_repo)
+    assert vuln.read_alert(run.dir)["dependabot_prs"] == [7]
+    assert [e["text"] for e in flow_repo.events(run, "intake_warning")] == [
+        "Dependabot PR #7 is open for requests; this run's PR will supersede it"]
+
+
+def test_advisory_text_never_reaches_argv_or_the_facts(flow_repo, gh_advisories):
+    hostile = "$(touch pwned) `touch pwned2`; touch pwned3"
+    gh_advisories.write([_global(summary=hostile, description=hostile + "d" * (1 << 20),
+                                 references=["https://x/$(touch pwned4)"])])
+    run = _start_advisory(flow_repo)
+    text = (run.dir / vuln.ALERT_FILE).read_text(encoding="utf-8")
+    assert hostile in text and len(text) < 2 * vuln.MAX_TEXT + 4096
+    assert "touch" not in (run.dir / vuln.ALERT_JSON).read_text(encoding="utf-8")
+    assert not any("touch" in arg for call in gh_advisories.calls() for arg in call)
+    for root in (flow_repo.root, run.dir, gh_advisories.path.parent):
+        assert not list(root.glob("pwned*"))
+
+
+def test_gather_advisory_other_gh_errors_pass_through(flow_repo, gh_advisories, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_FAIL_ON", f"api advisories/{GHSA}")
+    with pytest.raises(GhError):
+        _start_advisory(flow_repo)
+    assert _runs(flow_repo) == []
+
+
+def test_pr_lines_says_advisory_for_an_advisory_run(flow_repo, gh_advisories):
+    run = _start_advisory(flow_repo)
+    lines = vuln.pr_lines(run)
+    assert f"Advisory: https://github.com/advisories/{GHSA}" in lines
+    assert not [line for line in lines if line.startswith("Alert:")]
+    assert lines[0] == f"Advisories: {GHSA}, CVE-2024-1234"

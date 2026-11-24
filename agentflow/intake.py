@@ -1,10 +1,11 @@
-"""What a run starts from: `--issue N`, `--log PATH`, `--task TEXT` or `--alert N`, kept under `runs/<run>/`.
+"""What a run starts from: `--issue N`, `--log PATH`, `--task TEXT`, `--alert N` or `--advisory ID`, kept under `runs/<run>/`.
 
 `gather` runs before the run exists, so a bad reference or an unreachable GitHub leaves no run
 behind: `--issue N` reads `gh issue view N --json title,body,url,labels` (and names the run and branch
 `issue-<N>-<title>`, D14), `--log PATH` reads the file, `--task` takes the text. `save` writes them
 as `issue.md`, `bug.log` (byte for byte) and `task.md` once the run directory exists. `--alert N` (the vuln
-lane) reads a Dependabot alert and its open siblings (`vuln.gather_alert`) into `alert.json` and `alert.md`.
+lane) reads a Dependabot alert and its open siblings (`vuln.gather_alert`) into `alert.json` and `alert.md`, and
+`--advisory ID --package NAME --manifest PATH` reads a global advisory (`vuln.gather_advisory`) into the same two files.
 
 The text comes from people outside the run (an issue tracker, a log, the CLI): the files say it is data,
 the prompts only point at the files, and nothing here ever puts it in a shell command (`gh` gets an
@@ -68,8 +69,9 @@ def is_epic(data: dict, epic_labels: Iterable[str]) -> bool:
 def gather(params: dict, repo: Path, epic_labels: Iterable[str] = (), vuln_policy: VulnPolicy | None = None,
            fork_from: str = "") -> tuple[dict, dict[str, bytes], list[str]]:
     """`(params, files, warnings)`: the run's parameters (an issue adds `slug`, and `issue_epic` when one of its
-    labels is in `epic_labels`; an alert adds `slug` and `advisory_ids`), the input files to save, and lines for the
-    CLI to show. An alert is checked against `vuln_policy`, its manifest at the branch `fork_from`."""
+    labels is in `epic_labels`; an alert or an advisory adds `slug` and `advisory_ids`), the input files to save, and
+    lines for the CLI to show. An alert is checked against `vuln_policy`, its manifest at the branch `fork_from`, and
+    so is an advisory's `--manifest`."""
     params = dict(params)
     files: dict[str, bytes] = {}
     warnings: list[str] = []
@@ -77,6 +79,14 @@ def gather(params: dict, repo: Path, epic_labels: Iterable[str] = (), vuln_polic
         if vuln_policy is None:
             raise ValueError("--alert needs the pack's vuln settings")
         update, found, notes = vuln.gather_alert(vuln_policy, params["alert"], Path(repo), fork=fork_from)
+        params.update(update)
+        files.update(found)
+        warnings += notes
+    if params.get("advisory") not in (None, ""):
+        if vuln_policy is None:
+            raise ValueError("--advisory needs the pack's vuln settings")
+        update, found, notes = vuln.gather_advisory(vuln_policy, params["advisory"], params.get("package"),
+                                                    params.get("manifest"), Path(repo), fork=fork_from)
         params.update(update)
         files.update(found)
         warnings += notes

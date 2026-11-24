@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 import yaml
 from conftest import SPARSE_PACK, add_vuln_lane, deep_merge, run_git, vuln_steps
 
-from agentflow import conditions, hitl, pack, pipeline, vuln, workspace
+from agentflow import conditions, flow, hitl, pack, pipeline, vuln, workspace
 from agentflow.config import load_config, validate
 from agentflow.state import Run
 
@@ -209,14 +210,16 @@ def _done(summary: str = "ok") -> dict:
     return {"result": {"status": "done", "summary": summary}}
 
 
-def _vuln_run(flow_repo, audit: str = AUDIT, requirements: str = "requests==2.31.0\n", patch: dict | None = None):
-    """A vuln run started from alert 42 (`gh_alerts`), with `audit.py` and `requirements.txt` on the fork commit."""
+def _vuln_run(flow_repo, audit: str = AUDIT, requirements: str = "requests==2.31.0\n", patch: dict | None = None,
+              params: dict | None = None):
+    """A vuln run started from alert 42 (`gh_alerts`), or from `params`, with `audit.py` and `requirements.txt` on the
+    fork commit."""
     for name, text in (("audit.py", audit), ("requirements.txt", requirements)):
         (flow_repo.root / name).write_text(text, encoding="utf-8")
     run_git(flow_repo.root, "add", "audit.py", "requirements.txt")
     run_git(flow_repo.root, "commit", "-q", "-m", "audit")
     flow_repo.configure(patch=deep_merge(VULN_PATCH, patch or {}), edit=add_vuln_lane)
-    return pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", {"alert": "42"}, pipeline.RunOptions())
+    return pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", params or {"alert": "42"}, pipeline.RunOptions())
 
 
 def _build(flow_repo, run):
@@ -257,6 +260,63 @@ def test_happy_path_red_patch_cleared(flow_repo, gh_alerts):
     subject = run_git(Path(run.state["worktree"]), "log", "-1", "--format=%s", committed["sha"]).strip()
     assert subject == "Patch requests-ghsa-cfgh-2345-vwxj"
     assert run.state["steps"][RED_KEY]["status"] == "done" and run.state["steps"][PATCH]["status"] == "done"
+
+
+ADVISORY_RUN = {"advisory": GHSA, "package": "requests", "manifest": "requirements.txt"}
+
+
+def test_happy_path_from_an_advisory(flow_repo, gh_advisories):
+    run = _vuln_run(flow_repo, params=ADVISORY_RUN)
+    flow_repo.script({PATCH: [{"write": {"requirements.txt": FIXED}, **_done("bumped requests")}]})
+    assert _build(flow_repo, run) == "done"
+    present, cleared = flow_repo.events(run, "expectation_checked")
+    assert (present["expect"], present["ok"], present["matched"]) == ("advisory_present", True, [GHSA])
+    assert (cleared["expect"], cleared["ok"], cleared["matched"]) == ("advisory_cleared", True, [])
+    [read] = flow_repo.events(run, "vuln_alert_read")
+    assert read["alerts"] == [] and read["ids"] == [GHSA, "CVE-2024-1234"]
+    assert run.state["params"]["advisory"] == GHSA and run.state["branch"] == "flow/vuln/requests-ghsa-cfgh-2345-vwxj"
+
+
+@pytest.mark.parametrize("pipeline_name,params", [
+    ("vuln", {"advisory": GHSA}),
+    ("vuln", {"advisory": GHSA, "package": "requests"}),
+    ("vuln", {"advisory": GHSA, "manifest": "requirements.txt"}),
+    ("vuln", {"alert": "42", **ADVISORY_RUN}),
+    ("vuln", {"package": "requests"}),
+    ("vuln", {"manifest": "requirements.txt"}),
+    ("vuln", {"task": "bump requests"}),
+    ("bug", ADVISORY_RUN),
+    ("bug", {"alert": "42"})])
+def test_run_refuses_bad_advisory_input_combinations(flow_repo, gh_advisories, pipeline_name, params):
+    with pytest.raises(ValueError):
+        pipeline.start(flow_repo.cfg, flow_repo.root, pipeline_name, params, pipeline.RunOptions())
+    runs = pack.state_dir(flow_repo.root) / "runs"
+    assert (not runs.exists() or not list(runs.iterdir())) and gh_advisories.calls() == []
+
+
+@pytest.mark.parametrize("params,message", [
+    ({"alert": "42", **ADVISORY_RUN}, "--alert and --advisory"),
+    ({"package": "requests"}, "--package and --manifest go with --advisory"),
+    ({"advisory": GHSA, "package": "requests"}, "--advisory needs --package NAME and --manifest PATH"),
+    ({"task": "x"}, "--advisory ID --package NAME --manifest PATH")])
+def test_run_names_what_is_wrong_with_the_inputs(flow_repo, gh_advisories, params, message):
+    with pytest.raises(ValueError) as caught:
+        pipeline.start(flow_repo.cfg, flow_repo.root, "vuln", params, pipeline.RunOptions())
+    assert message in str(caught.value)
+
+
+def test_explain_vuln_with_an_advisory_calls_no_gh(sparse_repo, monkeypatch, tmp_path, capsys):
+    from conftest import GH_BIN
+
+    _sparse_with_probe(sparse_repo)
+    log = tmp_path / "gh.jsonl"
+    monkeypatch.setenv("PATH", f"{GH_BIN}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(log))
+    monkeypatch.chdir(sparse_repo)
+    assert flow.main(["explain", "vuln", "--advisory", GHSA]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith(f'explain vuln {{"advisory": "{GHSA}"}}') and "advisory_red" in out
+    assert not log.exists()
 
 
 def test_not_reproduced_stops_before_patch(flow_repo, gh_alerts):

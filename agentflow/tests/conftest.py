@@ -741,3 +741,22 @@ def gh_alerts(flow_repo: FlowRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("FAKE_GH_LOG", str(handle.log))
     monkeypatch.setenv("FAKE_GH_ALERTS", str(handle.path))
     return handle
+
+
+@pytest.fixture
+def gh_advisories(flow_repo: FlowRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> GhAlerts:
+    """`flow_repo` set up as `gh_alerts` sets it (the vuln lane, `vuln.probe: ok`, `requirements.txt` on `fork_from`,
+    pushed), but with the fake `gh` serving `[GLOBAL_ADVISORY]` as `$FAKE_GH_ADVISORIES` and no Dependabot alerts.
+    `write` replaces the list; `calls` is every `gh` argv."""
+    (flow_repo.root / "requirements.txt").write_text("requests==2.31.0\n", encoding="utf-8")
+    run_git(flow_repo.root, "add", "requirements.txt")
+    run_git(flow_repo.root, "commit", "-q", "-m", "requirements")
+    run_git(flow_repo.root, "push", "-q", "origin", flow_repo.cfg.project.fork_from)
+    flow_repo.configure(patch={"vuln": {"probe": "ok"}}, edit=add_vuln_lane)
+    handle = GhAlerts(tmp_path / "advisories.json", tmp_path / "gh.jsonl")
+    handle.write([copy.deepcopy(GLOBAL_ADVISORY)])
+    monkeypatch.setenv("PATH", f"{GH_BIN}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(handle.log))
+    monkeypatch.setenv("FAKE_GH_ADVISORIES", str(handle.path))
+    monkeypatch.delenv("FAKE_GH_ALERTS", raising=False)
+    return handle

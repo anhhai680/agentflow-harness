@@ -33,6 +33,10 @@ that match its `state`, `package` (`dependency.package.name`), `ecosystem` (`dep
 `severity` (a comma list matched against `security_advisory.severity`).
 `$FAKE_GH_ALERTS_STATUS=403` makes both forms write `gh: Resource not accessible by integration (HTTP 403)` to stderr
 and exit 1. `pr list --author app/dependabot ...` prints `$FAKE_GH_PR_LIST` (default `[]`).
+Global advisories come from `$FAKE_GH_ADVISORIES`, a file holding a JSON list of advisories (none when unset).
+`api advisories/<GHSA>` prints the one whose `ghsa_id` is that id, or writes `gh: Not Found (HTTP 404)` to stderr and
+exits 1. `api advisories?<query>` (the query URL-decoded) prints the advisories whose `cve_id` equals its `cve_id`
+(all of them when it has none).
 """
 
 import json
@@ -107,6 +111,23 @@ if args[:1] == ["api"] and len(args) > 1 and args[1].startswith(ALERTS_API):
                     and ("severity" not in query or severity in query["severity"].split(",")))
 
         print(json.dumps([a for a in alerts if matches(a)]))
+    sys.exit(0)
+ADVISORIES_API = "advisories"
+if args[:1] == ["api"] and len(args) > 1 and args[1].split("?")[0].split("/")[0] == ADVISORIES_API:
+    from urllib.parse import parse_qs, urlsplit
+
+    source = os.environ.get("FAKE_GH_ADVISORIES")
+    advisories = json.load(open(source, encoding="utf-8")) if source else []
+    parts = urlsplit(args[1])
+    if parts.path.startswith(ADVISORIES_API + "/"):
+        found = [a for a in advisories if a.get("ghsa_id") == parts.path[len(ADVISORIES_API) + 1:]]
+        if not found:
+            sys.stderr.write("gh: Not Found (HTTP 404)\n")
+            sys.exit(1)
+        print(json.dumps(found[0]))
+    else:
+        query = {key: values[0] for key, values in parse_qs(parts.query).items()}
+        print(json.dumps([a for a in advisories if "cve_id" not in query or a.get("cve_id") == query["cve_id"]]))
     sys.exit(0)
 if args[:2] == ["pr", "list"] and args[2:4] == ["--author", "app/dependabot"]:
     print(os.environ.get("FAKE_GH_PR_LIST", "[]"))
