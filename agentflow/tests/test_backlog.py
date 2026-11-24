@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 import pytest
-from agentflow import backlog, finished, module_queue, run_control
+from agentflow import backlog, finished, module_queue, run_control, vuln
 from agentflow.flow import main
 from agentflow.backlog import Invalid, Refused
 from agentflow.state import Run, runs_root
@@ -1825,7 +1825,9 @@ def test_a_tampered_cache_with_two_groups_sharing_an_alert_number_keeps_the_firs
     abk.refresh()
     first, second = backlog._load_state(abk.root)["alerts"][:2]
     assert first["alerts"] != second["alerts"]
-    backlog._save_state(abk.root, alerts=[first, {**second, "alerts": [*second["alerts"], *first["alerts"]]}])
+    tampered = {**second, "alerts": sorted({*second["alerts"], *first["alerts"]})}
+    assert vuln.check_group(tampered) is not None  # valid on its own: only the overlap with `first` drops it
+    backlog._save_state(abk.root, alerts=[first, tampered])
     assert [g["alerts"] for g in _cached(abk)] == [first["alerts"]]
 
 
