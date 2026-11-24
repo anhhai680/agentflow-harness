@@ -411,10 +411,10 @@ uvx ruff@0.17.4 check .
   section, starters and doctor. CLI only. One PR and a minor bump: adding a lane to the defaults breaks no pack.
 - **V2, the Backlog.** Alert sync and cards, grouping, the "no fix yet" state, and the dashboard's severity pill.
 - **V3, beyond Dependabot.**
-  - `--advisory GHSA-…|CVE-…` with `--package`, for repositories without Dependabot: the probe alone carries the
-    proof.
-  - After the push, an optional check against GitHub's dependency review API
-    (`dependency-graph/compare/base...head`), so the PR introduces no new advisory at or above `min_severity`.
+  - Shipped in 3.8: `--advisory GHSA-…|CVE-…` with `--package` and `--manifest`, for repositories without
+    Dependabot: the probe alone carries the proof.
+  - Shipped in 3.8: after the push, an optional check (`vuln.dependency_review`) against GitHub's dependency review
+    API (`dependency-graph/compare/base...head`), so the PR introduces no new advisory at or above `min_severity`.
   - A candidate, not a commitment: adopting a red Dependabot PR with `--pr N`.
   - A candidate: an engine-enforced release cooldown, if the package-manager setting and the review prove too weak.
 
