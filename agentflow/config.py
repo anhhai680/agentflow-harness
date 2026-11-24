@@ -268,8 +268,10 @@ DEFAULT_SPEC_FILE = "{module}.md"  # a module's spec is `<docs.specs>/<spec_file
 DEFAULT_DONE_STATUS = r"^[-*>\s]*Status[\s:*]+(done|shipped|implemented)(?![\w-])"
 REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea`, `decisions`, `glossary` are optional
 # `capability_map`: a Markdown table with `Module id` and `Depends on` columns (`sources.capability_map`);
-# `specs`: one module per spec file in `project.docs.specs`, its dependencies from the header (`sources.spec_deps`)
-WORK_SOURCE_KINDS = ("capability_map", "specs")
+# `specs`: one module per spec file in `project.docs.specs`, its dependencies from the header (`sources.spec_deps`);
+# `backlog`: one item per entry of the YAML backlog file at `path` (default `backlog.yml`, `backlog_file.py`)
+WORK_SOURCE_KINDS = ("capability_map", "specs", "backlog")
+DEFAULT_BACKLOG_FILE = "backlog.yml"
 SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "build_wave", "verify", "ship",
                    "review", "debug", "review_feedback", "doubt", "patch")  # review_feedback: the skill sent with blocking findings
 
@@ -292,8 +294,15 @@ class Project:
 class WorkSource:
     """Where the modules `agentflow queue`, the Backlog and `modules_done` walk come from (`work_source:`)."""
 
-    kind: Literal["capability_map", "specs"]
+    kind: Literal["capability_map", "specs", "backlog"]
     path: str  # relative to the repository root; `""` for `specs`, which always reads `project.docs.specs`
+
+
+@dataclass
+class BacklogPolicy:
+    """`backlog:`: how the backlog file's work source lists the spec files no item names."""
+
+    ignore_specs: tuple[str, ...] = ()  # globs, relative to `project.docs.specs`, of spec files that are not backlog items
 
 
 @dataclass
@@ -739,6 +748,7 @@ class Config:
     vuln: VulnPolicy = field(default_factory=VulnPolicy)  # the vuln lane: where its alerts come from and what it may touch
     policy: Policy = field(default_factory=Policy)  # the obligations a finished run must show evidence for
     route: Route = field(default_factory=Route)  # how much ceremony a run's route gets (`route.py` reads it)
+    backlog: BacklogPolicy = field(default_factory=BacklogPolicy)  # the backlog file's work source (`work_source: {kind: backlog}`)
 
 
 def _holds_finish(steps: list[Step]) -> bool:
@@ -1415,7 +1425,16 @@ def _work_source(raw: dict) -> WorkSource | None:
     kind = _require(block, "kind", "work_source", str)
     if kind == "capability_map":
         return WorkSource(kind=kind, path=_require(block, "path", "work_source", str))
+    if kind == "backlog":  # `path: None` (a deep-merge delete) leaves it unset
+        return WorkSource(kind=kind, path=_optional(block, "path", "work_source", str, None) or DEFAULT_BACKLOG_FILE)
     return WorkSource(kind=kind, path=_optional(block, "path", "work_source", str, ""))
+
+
+def _backlog_policy(raw: dict) -> BacklogPolicy:
+    block = _optional(raw, "backlog", "", dict, {})
+    ignore = block.get("ignore_specs")
+    globs = tuple(g for g in ignore if isinstance(g, str)) if isinstance(ignore, list) else ()
+    return BacklogPolicy(ignore_specs=globs)
 
 
 def _skills_map(raw: dict) -> dict[str, str]:
@@ -1753,6 +1772,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
         layer_origins=layer_origins,
         policy=_build_policy(policy, disabled),
         route=_build_route(raw.get("route")),
+        backlog=_backlog_policy(raw),
     )
 
 

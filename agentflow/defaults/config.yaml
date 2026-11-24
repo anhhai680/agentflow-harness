@@ -72,6 +72,9 @@ parallel:
 slots:
   count: 1        # live runs that each get their own {slot} (0 … count-1) in defaults.env and gate commands; 1 = off, at most 16
 
+backlog:
+  ignore_specs: []   # with work_source kind backlog: globs, relative to project.docs.specs, of spec files that are not backlog items
+
 queue:
   human_slot: 1   # with slots on, `agentflow queue` leaves this many slots free for a run you start by hand
 

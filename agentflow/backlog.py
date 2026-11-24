@@ -1175,7 +1175,7 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
             raise Refused(f"{key} is already starting")
         if item is not None and item.status == "started" and kind == "card":
             raise Refused(f"{key} has already started")
-        if kind == "card" and new_module is not None and work_source.kind(cfg) == "specs":
+        if kind == "card" and new_module is not None and work_source.kind(cfg) in ("specs", "backlog"):
             if any(n.id == params.get("module") for n in pic["nodes"]):
                 raise Refused(f"a spec for {params['module']} now exists; start module:{params['module']} instead")
             params["task"], new_module = _spec_task(new_module), None
