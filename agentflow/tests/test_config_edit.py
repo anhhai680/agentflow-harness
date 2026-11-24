@@ -415,6 +415,19 @@ def test_yaml_text_may_not_switch_the_work_source_to_specs(shipped):
         config_edit.propose(shipped, sha, text=text, repo=REPO)
 
 
+def test_yaml_text_may_not_switch_the_work_source_to_backlog(shipped):
+    _, sha = config_edit.read(shipped)
+    lines = SHIPPED.splitlines(keepends=True)
+    old = "".join(line for line in lines if line.startswith(("  kind: capability_map", "  path: docs/specs/CAPABILITY")))
+    assert old in SHIPPED
+    text = SHIPPED.replace(old, "  kind: backlog\n", 1)
+    assert yaml.safe_load(text)["work_source"] == {"kind": "backlog"}
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=text, repo=REPO)
+    with pytest.raises(Refused):  # nor does the form have a field for it
+        form(shipped, (["work_source", "kind"], "backlog"))
+
+
 def test_worktrees_dir_is_still_refused_by_the_page(shipped):
     _, sha = config_edit.read(shipped)
     with pytest.raises(Refused):
@@ -1410,3 +1423,30 @@ def test_vuln_source_probe_and_forbid_are_protected(shipped):
     for added in ("vuln: {source: ''}\n", "vuln: {probe: floor}\n", "vuln: {forbid: [x]}\n"):
         with pytest.raises(Refused, match="protected"):
             config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)
+
+
+# --------------------------------------------------------------------------- backlog.ignore_specs
+
+
+def test_the_form_saves_backlog_ignore_specs_as_a_list(sparse_repo):
+    path = _sparse(sparse_repo)
+    assert _fields(path)[("backlog", "ignore_specs")]["value"] in ([], None)
+    proposal = _sparse_form(path, (["backlog", "ignore_specs"], ["README.md", "*/index.md"]))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    assert load_config(path).backlog.ignore_specs == ("README.md", "*/index.md")
+    assert _fields(path)[("backlog", "ignore_specs")]["source"] == "project"
+
+
+@pytest.mark.parametrize("value", ["README.md", [""], ["a\nb"], [3]])
+def test_the_form_refuses_backlog_ignore_specs_that_is_not_a_list_of_texts(sparse_repo, value):
+    with pytest.raises(EditError):
+        _sparse_form(_sparse(sparse_repo), (["backlog", "ignore_specs"], value))
+
+
+def test_yaml_text_with_a_bad_backlog_ignore_specs_is_a_validate_error(sparse_repo):
+    path = _sparse(sparse_repo)
+    _, sha = config_edit.read(path)
+    text = path.read_text(encoding="utf-8") + "backlog:\n  ignore_specs: ['../x']\n"
+    proposal = config_edit.propose(path, sha, text=text, repo=path.parents[1])
+    assert [(i.level, i.path) for i in proposal.errors] == [("error", "backlog.ignore_specs[0]")]

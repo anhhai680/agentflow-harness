@@ -242,6 +242,8 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("dashboard", "backlog", "sync_base"), "Fast-forward the base branch", {"kind": "bool"}),
         (("dashboard", "backlog", "module_lane"), "Lane for map modules", {"kind": "enum", "options": "@lanes"}),
         (("dashboard", "backlog", "lane_labels"), "Lane labels", {"kind": "map", "value_kind": "text"}),
+        (("backlog", "ignore_specs"), "Spec files that are not backlog items (globs under the specs folder)",
+         {"kind": "list"}),
     ]),
 ]
 

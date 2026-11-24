@@ -122,8 +122,15 @@ def _item(raw: dict, problems: list[Problem], at: str) -> BacklogItem:
 
 def parse(text: str) -> tuple[list[BacklogItem], list[Problem]]:
     """The items of a backlog file's text and every problem found. Never raises."""
+    found, problems = parse_indexed(text)
+    return [item for _, item in found], problems
 
-    def broken(where: str, message: str) -> tuple[list[BacklogItem], list[Problem]]:
+
+def parse_indexed(text: str) -> tuple[list[tuple[int, BacklogItem]], list[Problem]]:
+    """`parse`, each kept item with its position in the file's `items` list (the `n` of `items[n]` in a problem's
+    `where`), so a caller can name an item the parser dropped neighbours of."""
+
+    def broken(where: str, message: str) -> tuple[list[tuple[int, BacklogItem]], list[Problem]]:
         return [], [Problem("error", where, message)]
 
     try:
@@ -142,7 +149,7 @@ def parse(text: str) -> tuple[list[BacklogItem], list[Problem]]:
         return broken("items", "must be a list")
     if len(raw_items) > ITEMS_MAX:
         return broken("items", f"has {len(raw_items)} entries; the limit is {ITEMS_MAX}")
-    items: list[BacklogItem] = []
+    items: list[tuple[int, BacklogItem]] = []
     problems: list[Problem] = []
     first: dict[str, int] = {}
     for n, raw in enumerate(raw_items):
@@ -161,12 +168,18 @@ def parse(text: str) -> tuple[list[BacklogItem], list[Problem]]:
             continue
         first[item.id] = n
         problems.extend(found)
-        items.append(item)
+        items.append((n, item))
     return items, problems
 
 
 def read(path: Path) -> tuple[list[BacklogItem], list[Problem]]:
     """`parse` of the file at `path`, read without following a symlink. Never raises."""
+    found, problems = read_indexed(path)
+    return [item for _, item in found], problems
+
+
+def read_indexed(path: Path) -> tuple[list[tuple[int, BacklogItem]], list[Problem]]:
+    """`parse_indexed` of the file at `path`, read without following a symlink. Never raises."""
     try:
         data = safeio.read_bytes(path, FILE_MAX + 1)
     except safeio.SymlinkRefused:
@@ -181,7 +194,7 @@ def read(path: Path) -> tuple[list[BacklogItem], list[Problem]]:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return [], [Problem("error", FILE, "is not valid UTF-8")]
-    return parse(text)
+    return parse_indexed(text)
 
 
 # --- rendering and in-place edits -------------------------------------------------------------------------------

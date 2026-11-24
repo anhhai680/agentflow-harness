@@ -175,7 +175,7 @@ def items(cfg: Config, repo: Path) -> list[sources.ModuleNode]:
     raise ValueError(f"work_source: unknown kind {cfg.work_source.kind!r}")
 
 
-def _read_backlog(cfg: Config, repo: Path) -> tuple[list[backlog_file.BacklogItem], list[backlog_file.Problem]]:
+def _read_backlog(cfg: Config, repo: Path) -> tuple[list[tuple[int, backlog_file.BacklogItem]], list[backlog_file.Problem]]:
     """The backlog file's items and problems; one error and no items when the path leaves `repo`. Never raises."""
     if _kind(cfg) != "backlog":
         return [], []
@@ -185,13 +185,19 @@ def _read_backlog(cfg: Config, repo: Path) -> tuple[list[backlog_file.BacklogIte
     path = file(cfg, repo)
     if path is None:
         return [], []
-    return backlog_file.read(path)
+    return backlog_file.read_indexed(path)
 
 
 def all_items(cfg: Config, repo: Path) -> list[backlog_file.BacklogItem]:
     """For `backlog`, every item of the file in file order, the `dropped` ones too (`[]` when the file can't be read);
     `[]` for other kinds."""
-    return _read_backlog(cfg, repo)[0]
+    return [item for _, item in _read_backlog(cfg, repo)[0]]
+
+
+def indexed(cfg: Config, repo: Path) -> tuple[list[tuple[int, backlog_file.BacklogItem]], list[backlog_file.Problem]]:
+    """For `backlog`, `all_items` with each item's position in the file's `items` list (an item the parser dropped
+    leaves a gap), and `problems`, from one read of the file; `([], [])` for other kinds."""
+    return _read_backlog(cfg, repo)
 
 
 def item(cfg: Config, repo: Path, module: str) -> backlog_file.BacklogItem | None:

@@ -261,7 +261,7 @@ def test_the_python_pack_has_no_work_source_or_skills_errors(cfg, repo_root):
 
 def test_a_work_source_of_another_kind_is_an_error(tmp_cfg, repo_root):
     cfg = load_config(tmp_cfg({"work_source": {"kind": "github_issues"}}))
-    assert errors_at(cfg, repo_root, "work_source.kind") == ["the work source kinds are capability_map and specs"]
+    assert errors_at(cfg, repo_root, "work_source.kind") == ["the work source kinds are capability_map, specs and backlog"]
 
 
 @pytest.mark.parametrize("path", ["", "/abs/map.md", "../map.md"])
