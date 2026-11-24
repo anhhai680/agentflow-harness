@@ -368,12 +368,16 @@ def prepare(server: DashboardServer) -> list[str]:
 
 def refresh_once(server: DashboardServer) -> None:
     """One round of keeping Backlog current: base branch, map assessment, merge state, synced issues. It starts
-    nothing. A pack with no `dashboard.backlog` block only syncs its issues, when `issues.sync_label` is set."""
+    nothing. A pack with no `dashboard.backlog` block only syncs its issues (when `issues.sync_label` is set) and its
+    Dependabot alerts (when `vuln.sync` is on)."""
     try:
         if module_queue.backlog_settings(server.cfg):
             backlog.refresh(server.cfg, server.repo)
-        elif server.cfg.issues.sync_label:
-            backlog.sync_issues(server.cfg, server.repo)
+        else:
+            if server.cfg.issues.sync_label:
+                backlog.sync_issues(server.cfg, server.repo)
+            if backlog._alerts_on(server.cfg):
+                backlog.sync_alerts(server.cfg, server.repo)
     except Exception as exc:  # a failed round must not end the loop; the next one tries again
         sys.stderr.write(f"dashboard: backlog refresh failed: {exc}\n")
 

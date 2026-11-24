@@ -29,7 +29,8 @@ one field per line under "Specify one or more comma-separated fields for `--json
 Dependabot alerts come from `$FAKE_GH_ALERTS`, a file holding a JSON list of alerts (none when unset).
 `api repos/{owner}/{repo}/dependabot/alerts/N` prints the one whose `number` is N, or writes `gh: Not Found (HTTP 404)`
 to stderr and exits 1. `api repos/{owner}/{repo}/dependabot/alerts?<query>` (the query URL-decoded) prints the alerts
-that match its `state`, `package` (`dependency.package.name`) and `ecosystem` (`dependency.package.ecosystem`).
+that match its `state`, `package` (`dependency.package.name`), `ecosystem` (`dependency.package.ecosystem`) and
+`severity` (a comma list matched against `security_advisory.severity`).
 `$FAKE_GH_ALERTS_STATUS=403` makes both forms write `gh: Resource not accessible by integration (HTTP 403)` to stderr
 and exit 1. `pr list --author app/dependabot ...` prints `$FAKE_GH_PR_LIST` (default `[]`).
 """
@@ -101,7 +102,9 @@ if args[:1] == ["api"] and len(args) > 1 and args[1].startswith(ALERTS_API):
         def matches(alert: dict) -> bool:
             package = alert.get("dependency", {}).get("package", {})
             found = {"state": alert.get("state"), "package": package.get("name"), "ecosystem": package.get("ecosystem")}
-            return all(key not in query or found[key] == query[key] for key in found)
+            severity = (alert.get("security_advisory") or {}).get("severity")
+            return (all(key not in query or found[key] == query[key] for key in found)
+                    and ("severity" not in query or severity in query["severity"].split(",")))
 
         print(json.dumps([a for a in alerts if matches(a)]))
     sys.exit(0)

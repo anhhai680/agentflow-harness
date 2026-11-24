@@ -23,7 +23,7 @@ from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
 from agentflow.views import _badge, _strip, lane_phases, step_title
-from conftest import PYTHON_CONFIG, L, awaiting, run_git, session_with_transcript
+from conftest import PYTHON_CONFIG, L, add_vuln_lane, awaiting, run_git, session_with_transcript
 
 TOKEN = "k3y-" + "x" * 40
 AGENTFLOW = Path(__file__).resolve().parents[1]
@@ -1533,6 +1533,19 @@ def test_a_pack_without_a_backlog_block_still_syncs_its_issues(idash, monkeypatc
     monkeypatch.setenv("FAKE_GH_ISSUE_LIST", "[]")
     refresh_once(idash.server)
     assert backlog._load_state(idash.flow.root)["issues"] == []
+
+
+def test_a_pack_without_a_backlog_block_still_syncs_its_alerts(idash, monkeypatch):
+    from agentflow import backlog
+    from agentflow.dashboard import refresh_once
+
+    seen = []
+    monkeypatch.setattr(backlog, "refresh", lambda cfg, repo: pytest.fail("no backlog block: no git refresh"))
+    monkeypatch.setattr(backlog, "sync_alerts", lambda cfg, repo: seen.append(repo) or "")
+    idash.flow.configure({"vuln": {"probe": "ok", "sync": True}, "dashboard": {"backlog": None}}, edit=add_vuln_lane)
+    idash.server.cfg = idash.flow.cfg
+    refresh_once(idash.server)
+    assert seen == [idash.flow.root]
 
 
 def test_the_page_names_no_lane_phase_or_path(bdash):

@@ -12,7 +12,8 @@ from agentflow.flow import main
 from agentflow.backlog import Invalid, Refused
 from agentflow.state import Run, runs_root
 
-from conftest import ENGINE, prime, release, run_git
+from conftest import ENGINE, add_vuln_lane, prime, release, run_git
+from test_vuln import SIBLING, _alert
 
 GH_BIN = ENGINE / "tests" / "bin"
 # A is merged, B and C depend on A, D depends on B (the plan's example).
@@ -1600,3 +1601,105 @@ def test_the_backlog_starts_in_observe_and_when_the_governor_fails(bk, monkeypat
     assert bk.start("module:b")
     monkeypatch.setattr(governor, "account_of", lambda cfg: 1 / 0)
     assert bk.start("module:c")
+
+
+# --- synced Dependabot alerts
+
+
+def _vuln(board, **keys) -> None:
+    board.fr.configure(patch={"vuln": {"probe": "ok", "sync": True, **keys}}, edit=add_vuln_lane)
+
+
+@pytest.fixture
+def abk(bk, gh_alerts):
+    """`bk` with the vuln lane, `vuln.sync: true` and the fake `gh` serving `abk.alerts`."""
+    _vuln(bk)
+    bk.alerts = gh_alerts
+    return bk
+
+
+def _cached(board) -> list[dict]:
+    return backlog._synced_alerts(board.cfg, backlog._load_state(board.root))
+
+
+def test_alert_sync_is_off_by_default_and_calls_no_gh(bk, gh_alerts):
+    assert bk.refresh()["alerts_note"] == ""  # gh_alerts adds the lane, but vuln.sync stays false
+    assert not [c for c in _gh_calls(bk) if c[:1] == ["api"]]
+    assert _cached(bk) == []
+
+
+def test_a_refresh_makes_one_alerts_call_and_one_pr_call(abk, monkeypatch):
+    abk.alerts.write([_alert(42), SIBLING])
+    abk.refresh()
+    calls = _gh_calls(abk)
+    assert [c for c in calls if c[:1] == ["api"]] == [
+        ["api", "repos/{owner}/{repo}/dependabot/alerts?state=open&severity=low,medium,high,critical&per_page=100"]]
+    assert ["pr", "list", "--author", "app/dependabot", "--state", "open", "--json", "number,title",
+            "--limit", "100"] in calls
+
+
+def test_the_severity_floor_goes_to_gh_and_is_applied_again_on_read(abk, monkeypatch):
+    abk.alerts.write([_alert(42), SIBLING])  # 42 is high, SIBLING low: one group
+    abk.refresh()
+    assert [g["alerts"] for g in _cached(abk)] == [[42, 43]]
+    _vuln(abk, min_severity="critical")  # raised after the sync: no gh call needed
+    assert _cached(abk) == []
+
+
+def test_a_floor_above_low_is_sent_to_gh_and_filters_the_listing(abk, monkeypatch):
+    _vuln(abk, min_severity="high")
+    abk.alerts.write([_alert(42), SIBLING])
+    abk.refresh()
+    assert [c for c in _gh_calls(abk) if c[:1] == ["api"]] == [
+        ["api", "repos/{owner}/{repo}/dependabot/alerts?state=open&severity=high,critical&per_page=100"]]
+    assert [g["alerts"] for g in _cached(abk)] == [[42]]
+
+
+def test_a_failed_alerts_call_keeps_the_last_list_and_says_why(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    monkeypatch.setenv("FAKE_GH_ALERTS_STATUS", "403")
+    assert abk.refresh()["alerts_note"].startswith("Dependabot alerts not updated:")
+    assert [g["alerts"] for g in _cached(abk)] == [[42]]
+
+
+def test_a_failed_pr_list_drops_only_the_pr_lines(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    monkeypatch.setenv("FAKE_GH_FAIL_ON", "pr list")
+    assert "Dependabot pull requests not read" in abk.refresh()["alerts_note"]
+    assert _cached(abk)[0]["dependabot_prs"] == []
+
+
+def test_a_group_names_the_dependabot_prs_for_its_package(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    monkeypatch.setenv("FAKE_GH_PR_LIST", json.dumps([{"number": 7, "title": "Bump requests from 2.31.0 to 2.32.0"},
+                                                      {"number": 8, "title": "Bump flask from 2 to 3"}]))
+    assert abk.refresh()["alerts_note"] == ""
+    assert _cached(abk)[0]["dependabot_prs"] == [7]
+
+
+def test_an_unreadable_alert_is_counted_not_shown(abk, monkeypatch):
+    abk.alerts.write([_alert(41, **{"dependency.package.name": "x; rm -rf ~"}), _alert(42)])
+    assert "1 alert(s) could not be read" in abk.refresh()["alerts_note"]
+    assert [g["alerts"] for g in _cached(abk)] == [[42]]
+
+
+def test_a_full_page_says_only_the_first_alerts_are_shown(abk, monkeypatch):
+    abk.alerts.write([_alert(n) for n in range(1, 101)])
+    assert "only the first 100 open alerts are shown" in abk.refresh()["alerts_note"]
+
+
+def test_a_tampered_cache_group_is_dropped(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    state = backlog._load_state(abk.root)
+    backlog._save_state(abk.root, alerts=[{**state["alerts"][0], "package": "$(id)"}])
+    assert _cached(abk) == []
+
+
+def test_turning_sync_off_clears_the_cache(abk, monkeypatch):
+    abk.alerts.write([_alert(42)])
+    abk.refresh()
+    _vuln(abk, sync=False)
+    abk.refresh()
+    assert backlog._load_state(abk.root).get("alerts") == []

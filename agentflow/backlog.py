@@ -18,6 +18,10 @@ Open GitHub issues that carry `issues.sync_label` are a third kind: `refresh` re
 Nothing from an issue's text reaches an argv, a module id, a map row or a refusal: an issue-backed run in the
 module lane works on the derived module `issue-<N>`, and the issue is named only by its number.
 
+Open Dependabot alerts are a fourth kind, when `vuln.sync` is on: `refresh` reads them with one `gh api` call (and
+one `gh pr list`) into `backlog_state.json`, grouped by package and manifest. Only `vuln.py`'s validators let an
+alert's package, manifest or advisory ids into the cache; its titles and summaries never reach the board.
+
 Item keys are typed so they cannot clash: `module:<id>`, `card:<id>`, `issue:<number>` and `run:<id>`.
 """
 
@@ -32,7 +36,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agentflow import finished, intake, module_queue, sources, work_source
+from agentflow import finished, intake, module_queue, sources, vuln, work_source
 from agentflow.conditions import first_phase_with_work, make_ctx
 from agentflow.config import check_lane
 from agentflow.events import EventLog, nfc
@@ -615,6 +619,57 @@ def _synced(cfg: Config, state: dict) -> list[dict]:
     return out
 
 
+# --------------------------------------------------------------------------- synced Dependabot alerts
+
+
+def _alerts_on(cfg: Config) -> bool:
+    return bool(cfg.vuln.sync and cfg.vuln.source == "dependabot" and "vuln" in cfg.lanes)
+
+
+def sync_alerts(cfg: Config, repo: Path) -> str:
+    """Read the open Dependabot alerts at or above `vuln.min_severity` into `backlog_state.json`, grouped by package
+    and manifest; returns the note the board shows ("" when all is well). It never raises: when `gh` fails, the last
+    list stays and the note says why. One call reads the alerts and one the open Dependabot PRs."""
+    repo = Path(repo)
+    if not _alerts_on(cfg):
+        if _load_state(repo).get("alerts"):
+            _save_state(repo, alerts=[], alerts_note="")
+        return ""
+    floor = cfg.vuln.min_severity
+    try:
+        listing = gh_json(["api", f"{vuln.ALERTS_API}?state=open&severity={vuln.severity_query(floor)}"
+                           f"&per_page={vuln.ALERTS_MAX}"], cwd=repo)
+        groups, skipped = vuln.group_alerts(listing, floor)
+    except (GhError, OSError, ValueError, TypeError, RecursionError) as exc:  # AlertError is a ValueError
+        note = f"Dependabot alerts not updated: {_reason(exc)}"
+        _save_state(repo, alerts_note=note)
+        return note
+    notes = []
+    try:
+        prs = gh_json(["pr", "list", "--author", "app/dependabot", "--state", "open", "--json", "number,title",
+                       "--limit", "100"], cwd=repo)
+    except (GhError, OSError, ValueError, TypeError, RecursionError):
+        prs = []
+        notes.append("Dependabot pull requests not read")
+    for group in groups:
+        group["dependabot_prs"] = vuln.prs_naming(group["package"], prs)
+    if skipped:
+        notes.append(f"{skipped} alert(s) could not be read and are not shown")
+    if len(listing) >= vuln.ALERTS_MAX:
+        notes.append(f"only the first {vuln.ALERTS_MAX} open alerts are shown")
+    note = "; ".join(notes)
+    _save_state(repo, alerts=groups, alerts_note=note, alerts_at=datetime.now(UTC).isoformat(timespec="seconds"))
+    return note
+
+
+def _synced_alerts(cfg: Config, state: dict) -> list[dict]:
+    """The cached alert groups that pass `vuln.check_group` and sit at or above the current `vuln.min_severity`."""
+    if not _alerts_on(cfg) or not isinstance(state.get("alerts"), list):
+        return []
+    groups = (vuln.check_group(entry) for entry in state["alerts"])
+    return [g for g in groups if g and vuln.severity_at_least(g["severity"], cfg.vuln.min_severity)]
+
+
 def _issue_blocker(number: str, pic: dict) -> str | None:
     """Why synced issue `number` is not a Backlog card of its own: a run, a card or a module here has it."""
     for run in pic["runs"]:
@@ -1115,6 +1170,7 @@ def refresh(cfg: Config, repo: Path) -> dict:
     `agentflow queue` holds the queue lock."""
     repo = Path(repo)
     issues_note = sync_issues(cfg, repo)  # never raises, and touches no git
+    alerts_note = sync_alerts(cfg, repo)  # the same
     note = sync_branch(repo, cfg.project.fork_from) if module_queue.backlog_settings(cfg).get("sync_base", False) else ""
     # origin/<fork_from> is where a merged plan lands; fetching it never touches a local branch or the work tree
     fetch_remote_branch(repo, cfg.project.fork_from)
@@ -1130,7 +1186,7 @@ def refresh(cfg: Config, repo: Path) -> dict:
     if merged is not None:
         changes["merged"] = merged
     _save_state(repo, **changes)
-    return {"note": note, "skipped": skipped, "issues_note": issues_note}
+    return {"note": note, "skipped": skipped, "issues_note": issues_note, "alerts_note": alerts_note}
 
 
 def _blocker_runs(entry: dict, runs: dict[str, Run]) -> set[str]:
