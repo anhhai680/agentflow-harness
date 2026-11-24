@@ -10,7 +10,10 @@ step, plus the step's `forbid`. Each round is:
    (`run_held`, reason `ci_pending`, which frees its queue slot) for up to that many hours of wall-clock time, and
    a human is told once that nothing is needed. During the watch a `gh` error or no checks is no verdict; past its
    end the hold ends, then the `ci_failed` stop is raised. Every way out of the watch ends the hold, once.
-2. All passing or skipped: refresh the pull request's body, mark it ready, and finish.
+2. All passing or skipped: in a vuln run with `vuln.dependency_review`, GitHub's dependency review of the pushed head
+   must name no new advisory at or above `vuln.min_severity` (`vuln.review_dependencies`); a hit is a `new_advisory`
+   stop and a review that cannot be read a `dependency_review_failed` one, and a person's approval accepts that head
+   only. Then refresh the pull request's body, mark it ready, and finish.
 
 A draft opened early (`ci.early_pr_after`, `pr_opened` with `early`) is watched only once `finish` has audited and
 updated it (`pr_updated`); before that the step stops as if no pull request were open. Its checks are read only while
@@ -52,6 +55,7 @@ from agentflow.gitops import (
 )
 from agentflow.hitl import EVENT_EXTRA_MAX, notify_run, raise_hitl
 from agentflow.issue_status import link
+from agentflow.vuln import REVIEW_STOPS, review_dependencies
 
 if TYPE_CHECKING:
     from agentflow.state import Run
@@ -108,6 +112,10 @@ class CILane:
             if verdict == "stopped":
                 return "stopped"
             if verdict == "pass":
+                review, summary = review_dependencies(self.cfg, self.run, self.worktree, key, self._pushed_sha())
+                if review in REVIEW_STOPS:
+                    self._ci_raise(review, key, summary)
+                    return "stopped"
                 return self._ready(key, url)
             if fixes >= int(self.cfg.ci["fix_rounds"]):
                 return self._ci_stop(key, f"CI is still failing after {fixes} fix round(s): {detail}.", self._report(key, checks))

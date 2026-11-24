@@ -37,6 +37,8 @@ Global advisories come from `$FAKE_GH_ADVISORIES`, a file holding a JSON list of
 `api advisories/<GHSA>` prints the one whose `ghsa_id` is that id, or writes `gh: Not Found (HTTP 404)` to stderr and
 exits 1. `api advisories?<query>` (the query URL-decoded) prints the advisories whose `cve_id` equals its `cve_id`
 (all of them when it has none).
+`api repos/{owner}/{repo}/dependency-graph/compare/<basehead>` prints the file `$FAKE_GH_COMPARE` (`[]` when unset);
+`$FAKE_GH_COMPARE_STATUS=403|404` writes the matching `gh: … (HTTP 403|404)` to stderr and exits 1.
 """
 
 import json
@@ -111,6 +113,16 @@ if args[:1] == ["api"] and len(args) > 1 and args[1].startswith(ALERTS_API):
                     and ("severity" not in query or severity in query["severity"].split(",")))
 
         print(json.dumps([a for a in alerts if matches(a)]))
+    sys.exit(0)
+COMPARE_API = "repos/{owner}/{repo}/dependency-graph/compare/"
+if args[:1] == ["api"] and len(args) > 1 and args[1].startswith(COMPARE_API):
+    status = os.environ.get("FAKE_GH_COMPARE_STATUS")
+    if status in ("403", "404"):
+        reason = "Resource not accessible by integration" if status == "403" else "Not Found"
+        sys.stderr.write(f"gh: {reason} (HTTP {status})\n")
+        sys.exit(1)
+    source = os.environ.get("FAKE_GH_COMPARE")
+    print(open(source, encoding="utf-8").read() if source else "[]")
     sys.exit(0)
 ADVISORIES_API = "advisories"
 if args[:1] == ["api"] and len(args) > 1 and args[1].split("?")[0].split("/")[0] == ADVISORIES_API:

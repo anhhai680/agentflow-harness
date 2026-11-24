@@ -1,8 +1,9 @@
 """The vuln lane's alert model, its validation, its intake from GitHub and the probe verdict.
 
-Everything but `gather_alert`, `gather_advisory` and `read_alert` is a pure function. `gather_alert` reads a Dependabot
-alert, and `gather_advisory` a global advisory, through `gh` (an argv list, never a shell) before any run exists, and
-`read_alert` reads back the facts they kept (`alert.json`).
+Everything but `gather_alert`, `gather_advisory`, `read_alert` and `review_dependencies` is a pure function.
+`gather_alert` reads a Dependabot alert, and `gather_advisory` a global advisory, through `gh` (an argv list, never a
+shell) before any run exists, `read_alert` reads back the facts they kept (`alert.json`), and `review_dependencies`
+asks GitHub's dependency graph what the pushed head adds (`vuln.dependency_review`).
 
 Trust model. A Dependabot alert is data from outside the run: GitHub's reply carries text that other people wrote
 (package names, advisory summaries, version ranges). `parse_alert` is the one place that turns it into `Alert`, and it
@@ -15,7 +16,8 @@ scanner that dies must never read as a clean scan, so `judge` answers "failed" u
 
 `config.py` imports this module's constants at module level, so this module imports nothing from `agentflow` at
 module level (`config`, `gates` and `state` would be a cycle): `gather_alert` and `gather_advisory` import `gitops`,
-`intake` and `state` when they run, and `run_probe` imports `config`, `gates` and `guards`.
+`intake` and `state` when they run, `run_probe` imports `config`, `gates` and `guards`, and `review_dependencies`
+imports `gitops`, `hitl` and `autonomy`.
 """
 
 from __future__ import annotations
@@ -825,6 +827,98 @@ def read_alert(run_dir: Path) -> dict:
     return data
 
 
+# --------------------------------------------------------------------------- the pushed head: `vuln.dependency_review`
+
+REVIEW_API = "repos/{owner}/{repo}/dependency-graph/compare"  # `gh api` fills in `{owner}` and `{repo}` itself
+REVIEW_STOPS = ("new_advisory", "dependency_review_failed")  # the stops `review_dependencies` names; a person's approval accepts the head
+_FULL_SHA1 = re.compile(r"^[0-9a-f]{40}$")
+HITS_SHOWN = 10  # advisories a `new_advisory` summary names before `and <n> more`
+
+
+def _accepted_by(events: list[dict], review: dict) -> str | None:
+    """The person who accepted the failing `review`: the first approval on its key after it, when that approves a
+    dependency-review stop and is not the runner's own (`AUTO_BY`). A `step_retry` on the key first means no one
+    accepted it. None when no one did."""
+    from agentflow.autonomy import AUTO_BY  # it imports `config`, which imports this module
+
+    for event in events:
+        if event.get("seq", -1) <= review.get("seq", -1) or event.get("key") != review.get("key"):
+            continue
+        if event["type"] == "step_retry":
+            return None
+        if event["type"] == "hitl_approved":
+            by = str(event.get("by") or "")
+            return by if event.get("kind") in REVIEW_STOPS and by and by != AUTO_BY else None
+    return None
+
+
+def _reviews(events: list[dict], head: str, key: str | None = None) -> list[dict]:
+    return [e for e in events if e.get("type") == "dependency_reviewed" and head and e.get("head") == head
+            and (key is None or e.get("key") == key)]
+
+
+def _hit_text(hit: dict) -> str:
+    return f"{hit['ghsa']} ({hit['severity']}) in {hit['package']} {hit['version']} ({hit['manifest']})"
+
+
+def review_dependencies(cfg: Config, run: Run, worktree: Path, key: str, head: str) -> tuple[str, str]:
+    """GitHub's dependency review of the pushed `head` against `origin/<fork_from>`: `(verdict, summary)`.
+
+    `off` when `vuln.dependency_review` is false or `run` is not a vuln run (nothing is asked or recorded); `accepted`
+    when a person approved the stop a failing review of this same `head` raised on `key` (nothing is asked again);
+    otherwise one `gh api <REVIEW_API>/<base>...<head>` (a GET: no fields; both full 40-hex shas, checked before `gh` sees them),
+    read by `review_changes` against the run's package (`alert.json`) and `vuln.min_severity`: `ok`, `new_advisory`
+    when the head adds an advisory at or above it, or `dependency_review_failed` for a `gh` error, a reply that is not
+    the documented shape or shows no change to the package yet, or a sha that cannot be read. The check fails closed:
+    nothing but `ok` and `accepted` lets the pull request be marked ready. Each verdict but `off` and `accepted` is a
+    `dependency_reviewed` event. Text from GitHub reaches the summary and the event only as `review_changes`' validated
+    fields or a `gh` error, and each passes `hitl.clean_fact`."""
+    from agentflow.gitops import GhError, commit_at, gh_json
+    from agentflow.hitl import clean_fact
+
+    if not cfg.vuln.dependency_review or run.state.get("pipeline") != "vuln":
+        return "off", ""
+    events = run.events.read()
+    mine = _reviews(events, head, key)
+    if mine and mine[-1].get("ok") is not True:
+        by = _accepted_by(events, mine[-1])
+        if by is not None:
+            return "accepted", clean_fact(f"{by} accepted the dependency review of {head[:12]}.")
+    floor = cfg.vuln.min_severity
+    fork = cfg.project.fork_from
+    base = commit_at(worktree, f"refs/remotes/origin/{fork}") or ""
+    hits: list[dict] = []
+    error = ""
+    if not _FULL_SHA1.fullmatch(head or ""):
+        error = "the pushed head is not a full 40-character commit id"
+    elif not _FULL_SHA1.fullmatch(base):
+        error = f"origin/{fork} is not a commit with a full 40-character id in the worktree"
+    else:
+        try:
+            alert = read_alert(run.dir)
+            reply = gh_json(["api", f"{REVIEW_API}/{base}...{head}"], cwd=worktree)
+            hits = review_changes(reply, floor, str(alert.get("package") or ""), str(alert.get("ecosystem") or ""))
+        except (GhError, AlertError) as exc:
+            error = clean_fact(str(exc))
+    hits = [{field: clean_fact(str(hit[field])) for field in ("ghsa", "severity", "package", "version", "manifest")}
+            for hit in hits]
+    short = head[:12] if _FULL_SHA1.fullmatch(head or "") else "the pushed head"
+    if error:
+        verdict = "dependency_review_failed"
+        summary = f"GitHub's dependency review of {short} could not be read: {error}"
+    elif hits:
+        verdict = "new_advisory"
+        more = f" and {len(hits) - HITS_SHOWN} more" if len(hits) > HITS_SHOWN else ""
+        summary = (f"The pushed head {short} adds {len(hits)} advisory(ies) at or above {floor}: "
+                   f"{'; '.join(_hit_text(h) for h in hits[:HITS_SHOWN])}{more}.")
+    else:
+        verdict = "ok"
+        summary = f"GitHub's dependency review of {short} names no new advisory at or above {floor}."
+    run.emit("dependency_reviewed", key=key, head=head if _FULL_SHA1.fullmatch(head or "") else "", base=base,
+             floor=floor, ok=verdict == "ok", verdict=verdict, advisories=hits, error=error)
+    return verdict, clean_fact(summary)
+
+
 # --------------------------------------------------------------------------- the pull request: `finish`
 
 TARGET_MAX = 64  # characters of each of the triage's versions (current, target) the pull request shows
@@ -886,13 +980,41 @@ def _versions(facts: object) -> str:
     return "Target: unknown" if old == new == "unknown" else f"Target: {old} → {new}"
 
 
-def pr_lines(run: Run, pushed_tree: str = "") -> list[str]:
+def _review_line(events: list[dict], pushed_sha: str) -> str:
+    """The `Dependency review:` line, from the `dependency_reviewed` events alone ("" when there is none: the check is
+    off, or has not run yet). The last review of `pushed_sha` (the head the body goes out with) says `no new advisory
+    at or above <floor>`, or `accepted by <by> (<ids>)` when a person approved its stop; reviews of other heads only
+    say `not checked on the pushed head`. Only GHSA ids and a known severity name are shown."""
+    from agentflow.hitl import clean_fact
+
+    if not any(e.get("type") == "dependency_reviewed" for e in events):
+        return ""
+    mine = _reviews(events, pushed_sha)
+    if not mine:
+        return "Dependency review: not checked on the pushed head"
+    last = mine[-1]
+    if last.get("ok") is True:
+        floor = str(last.get("floor") or "")
+        return f"Dependency review: no new advisory at or above {floor if floor in SEVERITIES else 'unknown'}"
+    ids = list(dict.fromkeys(str(a.get("ghsa")) for a in last.get("advisories") or []
+                             if isinstance(a, dict) and GHSA_ID.fullmatch(str(a.get("ghsa")))))
+    named = ", ".join(ids) or "unchecked"
+    by = _accepted_by(events, last)
+    if by is not None:
+        return f"Dependency review: accepted by {clean_fact(by)[:100]} ({named})"
+    if last.get("verdict") == "new_advisory":
+        return f"Dependency review: new advisory on the pushed head ({named})"
+    return "Dependency review: could not be read on the pushed head"
+
+
+def pr_lines(run: Run, pushed_tree: str = "", pushed_sha: str = "") -> list[str]:
     """The lines of the pull request's `Security advisory` section; [] for a run with no readable `alert.json`.
 
     They come from the facts intake validated (`alert.json`), the probe's `expectation_checked` events (`cleared`
     only for a check on `pushed_tree`, the tree of the head the body goes out with; "" never shows it), the triage's
     cleaned facts (`triage_rendered`, the current and target versions as inline code, each cut to `TARGET_MAX`) and
-    the last `vuln_scope`. The advisory's summary and description never go in, and each line passes `hitl.clean_fact`, so no
+    the last `vuln_scope`, and the `dependency_reviewed` events (`_review_line`, for `pushed_sha`, the head's commit).
+    The advisory's summary and description never go in, and each line passes `hitl.clean_fact`, so no
     text from outside the run or from a model can start a heading, a list item or a line of its own."""
     from agentflow.hitl import clean_fact
 
@@ -928,6 +1050,9 @@ def pr_lines(run: Run, pushed_tree: str = "") -> list[str]:
     lines += [f"Supersedes #{n} (Dependabot)" for n in alert.get("dependabot_prs") or []
               if isinstance(n, int) and not isinstance(n, bool) and n > 0]
     lines.append(_probe_line(events, pushed_tree))
+    review = _review_line(events, pushed_sha)
+    if review:
+        lines.append(review)
     scopes = [e for e in events if e.get("type") == "vuln_scope"]
     paths = [str(p) for p in (scopes[-1].get("code_paths") or [] if scopes else [])]
     if paths:

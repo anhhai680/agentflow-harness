@@ -1392,7 +1392,7 @@ class FeatureLane:
             except (GitError, GhError) as exc:
                 raise_hitl(self.cfg, self.run, "blocked", key, f"Could not push {branch} or open the pull request: {exc}")
                 return "stopped"
-            self.run.emit("pr_opened", url=url, key=key)
+            self.run.emit("pr_opened", url=url, key=key, sha=sha)  # the pushed head `ci` watches and reviews
         link(self.run)  # as soon as the PR exists, before a conflict or a CI stop can park the run
         if self.confirm_mergeable(phase, step, key, url) != "done":
             return "stopped"
@@ -1643,16 +1643,18 @@ def _conformance(run: Run, events: list[dict]) -> str | None:
 
 def _security_advisory(run: Run) -> str | None:
     """The Security advisory section of a vuln run (`vuln.pr_lines`); None for a run with no alert. The probe line
-    is read against the tree of the worktree's `HEAD`, the commit every caller of the body has just pushed or is
-    about to push ("" when it cannot be read, which never shows "cleared")."""
+    is read against the tree of the worktree's `HEAD`, and the dependency review line against its commit: the commit
+    every caller of the body has just pushed or is about to push ("" when it cannot be read, which never shows
+    "cleared" or a passing review)."""
     if not (run.dir / vuln.ALERT_JSON).is_file():
         return None
     worktree = str(run.state.get("worktree") or "")
     try:
-        tree = head_tree(Path(worktree)) if worktree and Path(worktree).is_dir() else ""
+        found = worktree and Path(worktree).is_dir()
+        tree, sha = (head_tree(Path(worktree)), head(Path(worktree))) if found else ("", "")
     except (GitError, subprocess.CalledProcessError, OSError):
-        tree = ""
-    lines = vuln.pr_lines(run, tree)
+        tree, sha = "", ""
+    lines = vuln.pr_lines(run, tree, sha)
     return _section("Security advisory", lines) if lines else None
 
 

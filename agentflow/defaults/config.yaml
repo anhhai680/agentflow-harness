@@ -126,6 +126,7 @@ vuln:                          # the vuln lane (patching Dependabot alerts): whe
                      "**/pnpm-lock.yaml", "**/package-lock.json", "**/yarn.lock", "**/go.mod", "**/go.sum",
                      "**/Cargo.toml", "**/Cargo.lock", "**/Gemfile", "**/Gemfile.lock"]   # files counted as dependency files; changes outside them are named in the PR (not a boundary)
   forbid: []                   # globs a patch may not touch, added to the engine's fixed list (scanner configs, workflows), never in place of it
+  dependency_review: false     # true: before CI marks the PR ready, GitHub's dependency review of the pushed head must name no new advisory at or above min_severity (needs the dependency graph; a 403 or an empty compare stops the run)
 
 policy:                        # what a finished run must show before it counts as conformant; a pack's own entries merge by id
   enforce: report              # report | block (`block` stops `finish` with `conformance_failed` when an obligation is missing)

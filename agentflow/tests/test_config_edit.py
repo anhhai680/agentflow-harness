@@ -336,6 +336,16 @@ def test_reconciles_blocks_on_findings_and_the_doubt_skill_are_protected(shipped
             config_edit.propose(shipped, sha, text=SHIPPED.replace(old, new, 1), repo=REPO)
 
 
+def test_dependency_review_is_protected(shipped):
+    assert "vuln.dependency_review" in config_edit.PROTECTED
+    assert "vuln.dependency_review" in config_edit.form_fields(shipped)["protected"]
+    with pytest.raises(Refused):  # the form has no field for it
+        form(shipped, (["vuln", "dependency_review"], True))
+    _, sha = config_edit.read(shipped)
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=SHIPPED + "vuln: {dependency_review: true}\n", repo=REPO)
+
+
 def test_retro_step_is_protected(shipped):
     assert "retro_step" in config_edit.PROTECTED
     with pytest.raises(Refused):  # the form has no field for it
