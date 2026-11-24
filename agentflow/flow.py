@@ -855,6 +855,7 @@ def cmd_backlog(args: argparse.Namespace) -> int:
     from agentflow.backlog_file import EditRefused
 
     verb = args.backlog_command
+    code = 0
     try:
         cfg, repo = _load_cfg(args), _find_repo()
         if verb in ("done", "undone") and work_source.kind(cfg) == "backlog":
@@ -871,7 +872,7 @@ def cmd_backlog(args: argparse.Namespace) -> int:
         elif verb == "import":
             from agentflow import backlog_import
 
-            lines, notes = backlog_import.run(cfg, repo, args.dry_run)
+            lines, notes, code = backlog_import.run(cfg, repo, args.dry_run)
             for note in notes:
                 print(note, file=sys.stderr)
         elif verb == "add":
@@ -882,7 +883,7 @@ def cmd_backlog(args: argparse.Namespace) -> int:
             lines = backlog.set_item(cfg, repo, args.id, args.pairs)
         for line in lines:
             print(line)
-        return 0
+        return code
     except (backlog.Refused, EditRefused, OSError, *_human_errors()) as exc:
         print(f"error: {exc}")
         return 1

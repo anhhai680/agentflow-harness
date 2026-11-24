@@ -288,6 +288,9 @@ def build(cfg: Config, repo: Path) -> tuple[list[BacklogItem], list[str]]:
     if _done_marks_present(repo):
         notes.append(f"note: runs/{finished.MARKS} is read in: its marks count as done evidence above, and a real "
                      f"import moves it to runs/{IMPORTED}")
+    problem = _marks_problem(repo)
+    if problem:
+        notes.append(f"note: a real import would be refused: {problem}")
     _, problems = backlog_file.parse(backlog_file.render(out))
     notes += [f"note: the file would carry a {p.severity}: {p.where}: {p.message}" for p in problems]
     return out, notes
@@ -314,35 +317,76 @@ def _move_marks(repo: Path) -> bool:
     return True
 
 
-def preflight(repo: Path) -> None:
-    """Refuse, before anything is written, what `write` would refuse after writing the file."""
+def _marks_problem(repo: Path) -> str | None:
+    """Why `_move_marks` would fail, from a look at the files; None when there are no marks to move or it can go."""
     root = runs_root(repo)
-    if os.path.lexists(root / finished.MARKS) and os.path.lexists(root / IMPORTED):
-        raise ValueError(f"{root / IMPORTED} already exists: move it away first, so the hand marks are not lost")
+    source, target, lock = root / finished.MARKS, root / IMPORTED, root / finished.LOCK
+    try:
+        if not os.path.lexists(source):
+            return None
+        if not stat.S_ISREG(os.lstat(source).st_mode):
+            return f"{source} is not a regular file: move it away by hand"
+        if os.path.lexists(target):
+            return f"{target} already exists: move it away first, so the hand marks are not lost"
+        if os.path.lexists(lock) and stat.S_ISLNK(os.lstat(lock).st_mode):
+            return f"{lock} is a symlink: remove it first"
+    except OSError as exc:
+        return f"cannot look at {source}: {exc.strerror or type(exc).__name__}"
+    return None
+
+
+def preflight(repo: Path) -> None:
+    """Refuse (`ValueError`), before anything is written, what moving the marks aside would refuse after the file is
+    written: a marks file that is not a regular file, an existing `.imported`, a symlinked lock file."""
+    problem = _marks_problem(Path(repo))
+    if problem:
+        raise ValueError(problem)
+
+
+class MarksNotMoved(Exception):
+    """`backlog.yml` was written, but `runs/done_marks.json` could not be moved aside."""
+
+    def __init__(self, path: Path, why: str) -> None:
+        super().__init__(f"wrote {path}, but could not move runs/{finished.MARKS}: {why}")
+        self.path = path
+        self.why = why
+
+
+def _create(repo: Path, items: list[BacklogItem]) -> tuple[Path, bool]:
+    """`(the file written, whether the marks were moved)`. `MarksNotMoved` once the file is written but the marks stay."""
+    preflight(repo)
+    path = safeio.write_new(repo / backlog_file.FILE, backlog_file.render(items))
+    try:
+        return path, _move_marks(repo)
+    except (OSError, ValueError) as exc:
+        raise MarksNotMoved(path, str(exc)) from exc
 
 
 def write(cfg: Config, repo: Path, items: list[BacklogItem]) -> Path:
     """Create `<repo>/backlog.yml` from `items` (`FileExistsError` when anything is there) and move the hand marks
-    aside. Nothing is committed, and the pack's config is not changed."""
-    repo = Path(repo)
-    preflight(repo)
-    path = safeio.write_new(repo / backlog_file.FILE, backlog_file.render(items))
-    _move_marks(repo)
-    return path
+    aside (`MarksNotMoved`, after the file is written, when that fails). Nothing is committed, and the pack's config
+    is not changed."""
+    return _create(Path(repo), items)[0]
 
 
-def run(cfg: Config, repo: Path, dry_run: bool) -> tuple[list[str], list[str]]:
-    """`(stdout lines, stderr lines)` of `agentflow backlog import`: a dry run prints the file's text and the notes
-    (apart, so the text can be redirected into the file) and writes nothing; a real run writes the file and prints
-    where it went, the notes and the `work_source` line to switch to."""
+def run(cfg: Config, repo: Path, dry_run: bool) -> tuple[list[str], list[str], int]:
+    """`(stdout lines, stderr lines, exit code)` of `agentflow backlog import`: a dry run prints the file's text and the
+    notes (apart, so the text can be redirected into the file) and writes nothing; a real run writes the file and
+    prints where it went, the notes and the `work_source` line to switch to. When the file is written but the hand
+    marks could not be moved aside, it prints all of that and says why, and the code is 1."""
     repo = Path(repo)
     items, notes = build(cfg, repo)
-    had_marks = _done_marks_present(repo)
     if dry_run:
-        return backlog_file.render(items).splitlines(), notes
+        return backlog_file.render(items).splitlines(), notes, 0
+    switch = SWITCH.format(path=backlog_file.FILE)
     try:
-        path = write(cfg, repo, items)
+        path, moved = _create(repo, items)
     except FileExistsError:
         raise ValueError(f"{repo / backlog_file.FILE} already exists: nothing was written (move it away to import again)") from None
-    moved = [f"moved runs/{finished.MARKS} to runs/{IMPORTED}"] if had_marks else []
-    return [f"wrote {path} ({len(items)} items; not committed)", *notes, *moved, SWITCH.format(path=backlog_file.FILE)], []
+    except MarksNotMoved as exc:
+        return [f"wrote {exc.path} ({len(items)} items; not committed)", *notes,
+                f"error: could not move runs/{finished.MARKS} to runs/{IMPORTED}: {exc.why}",
+                f"the file is written and a backlog pack ignores the marks: once you move runs/{finished.MARKS} away by "
+                "hand, nothing is left to do", switch], [], 1
+    done = [f"moved runs/{finished.MARKS} to runs/{IMPORTED}"] if moved else []
+    return [f"wrote {path} ({len(items)} items; not committed)", *notes, *done, switch], [], 0

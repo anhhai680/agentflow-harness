@@ -331,3 +331,61 @@ def test_a_dry_run_leaves_the_done_marks_in_place(cm, capsys):
     assert main(["backlog", "import", "--dry-run"]) == 0
     assert (runs_root(cm.root) / finished.MARKS).exists()
     assert "crm" in capsys.readouterr().out
+
+
+def test_a_marks_file_that_is_a_directory_or_a_symlink_is_refused_before_anything_is_written(cm, capsys):
+    marks = runs_root(cm.root) / finished.MARKS
+    marks.mkdir(parents=True)
+    assert main(["backlog", "import"]) == 1
+    assert "not a regular file" in capsys.readouterr().out
+    assert not (cm.root / "backlog.yml").exists()
+    marks.rmdir()
+    marks.symlink_to(cm.root / "README.md")
+    assert main(["backlog", "import"]) == 1
+    assert "not a regular file" in capsys.readouterr().out
+    assert not (cm.root / "backlog.yml").exists()
+    assert marks.is_symlink()
+
+
+def test_a_symlinked_lock_file_is_refused_before_anything_is_written(cm, capsys):
+    finished.mark(cm.root, "crm", "me")
+    lock = runs_root(cm.root) / finished.LOCK
+    lock.unlink()
+    lock.symlink_to(cm.root / "README.md")
+    assert main(["backlog", "import"]) == 1
+    assert "symlink" in capsys.readouterr().out
+    assert not (cm.root / "backlog.yml").exists()
+    assert (runs_root(cm.root) / finished.MARKS).exists()
+
+
+def test_a_dry_run_says_when_a_real_import_would_be_refused(cm, capsys):
+    finished.mark(cm.root, "crm", "me")
+    (runs_root(cm.root) / backlog_import.IMPORTED).write_text("{}\n", encoding="utf-8")
+    assert main(["backlog", "import", "--dry-run"]) == 0
+    assert "a real import would be refused" in capsys.readouterr().err
+
+
+def test_a_move_that_fails_after_the_write_names_the_file_the_notes_the_switch_line_and_the_failure(cm, monkeypatch, capsys):
+    finished.mark(cm.root, "crm", "me")
+    real = os.rename
+
+    def refuse(src, dst, *args, **kwargs):
+        if Path(src).name == finished.MARKS:
+            raise PermissionError(13, "Permission denied")
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(backlog_import.os, "rename", refuse)
+    assert main(["backlog", "import"]) == 1
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].startswith(f"wrote {cm.root / 'backlog.yml'}")
+    assert any(line.startswith("note: ") for line in out)
+    assert any("could not move" in line and "Permission denied" in line for line in out)
+    assert out[-1] == "work_source: {kind: backlog, path: backlog.yml}"
+    assert [i.id for i in read(cm.root)][-1] == "crm"  # the file is there and fine
+    assert (runs_root(cm.root) / finished.MARKS).exists()
+    assert not (runs_root(cm.root) / backlog_import.IMPORTED).exists()
+
+
+def test_the_moved_line_is_printed_only_when_the_marks_were_moved(cm, capsys):
+    assert main(["backlog", "import"]) == 0  # no marks file: nothing to move
+    assert "moved runs/" not in capsys.readouterr().out
