@@ -133,14 +133,17 @@ def unmark(repo: Path, module: str) -> bool:
     return _change(repo, lambda marks: marks.pop(str(module), None) is not None)
 
 
-def recorded(repo: Path) -> dict[str, str]:
+def recorded(repo: Path, *, hand_marks: bool = True) -> dict[str, str]:
     """`{module: reason}` for every module that is done now, from files only (no git, no `gh`).
 
     The last assessment's done entries in `QUEUE_FILE` (a missing reason, from before reasons were kept, is
     `MERGED`; a broken file counts as none), less an entry done by hand whose mark is gone and an entry done by
     origin evidence or a closed issue (`vetoable`) with a live veto, plus every live done mark as `BY_HAND`. A veto
     never undoes a merge: a module done as `MERGED` stays done. When the marks file cannot be read, the entries stay
-    as recorded, so a module marked done by hand stays done."""
+    as recorded, so a module marked done by hand stays done.
+
+    With `hand_marks=False` (a `backlog` pack, whose file is the only say) the marks file is not read: no mark adds a
+    Done, no veto removes one, and an entry recorded as `BY_HAND` is dropped."""
     try:
         data = json.loads((runs_root(repo) / QUEUE_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -151,6 +154,8 @@ def recorded(repo: Path) -> dict[str, str]:
         if isinstance(entry, dict) and entry.get("status") == "done" and isinstance(entry.get("id"), str):
             reason = entry.get("done_reason")
             done[entry["id"]] = reason if isinstance(reason, str) and reason else MERGED
+    if not hand_marks:
+        return {m: r for m, r in done.items() if r != BY_HAND}
     marks, error = read_marks(repo)
     if error:
         return done

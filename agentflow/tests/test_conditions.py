@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 from agentflow.conditions import CondResult, Ctx, evaluate, explain, fmt, make_ctx, plan_warnings
-from agentflow.config import Parallel, resolve_model
+from agentflow.config import Parallel, WorkSource, resolve_model
 from agentflow.gitops import GhError, gh_json
 from conftest import PYTHON_PACK
 
@@ -475,6 +475,19 @@ def test_modules_done_counts_recorded_dependencies_without_asking_gh(cfg, fake_g
         r = evaluate(cfg, "deps_merged", make_ctx(cfg, tmp_path, "feature", {"module": module}))
         assert r.value is True, r.reason
     assert not fake_gh.exists()
+
+
+def test_modules_done_ignores_a_leftover_hand_mark_in_a_backlog_pack(cfg, fake_gh, monkeypatch, tmp_path):
+    from agentflow import finished
+
+    marked = dataclasses.replace(cfg, work_source=WorkSource(kind="backlog", path="backlog.yml"))
+    (tmp_path / "backlog.yml").write_text("version: 1\nitems:\n  - {id: a, title: A, status: ready}\n"
+                                          "  - {id: b, title: B, status: ready, depends_on: [a]}\n", encoding="utf-8")
+    finished.mark(tmp_path, "a", "t")  # left over from before `backlog import`
+    monkeypatch.setenv("FAKE_GH_JSON", "[]")  # nothing merged
+    r = evaluate(marked, "deps_merged", make_ctx(marked, tmp_path, "feature", {"module": "b"}))
+    assert r.value is False, r.reason
+    assert fake_gh.exists()  # a was asked about, not taken as done
 
 
 def test_modules_done_asks_gh_only_for_the_dependencies_not_recorded(cfg, fake_gh, monkeypatch, tmp_path):

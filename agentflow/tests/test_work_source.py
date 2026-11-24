@@ -711,3 +711,12 @@ def test_spec_placeholder_is_the_items_spec(tmp_cfg, tmp_path):
     assert plain == f"{cfg.project.docs['specs']}/{cfg.project.spec_file.format(module='a')}"
     gone = make_ctx(cfg, tmp_path, "feature", {"module": "zz"}).values["spec"]  # not an item at all
     assert gone == f"{cfg.project.docs['specs']}/{cfg.project.spec_file.format(module='zz')}"
+
+
+def test_an_absolute_spec_in_the_file_falls_back_for_the_spec_placeholder(tmp_cfg, tmp_path):
+    cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None}}))
+    write(tmp_path, "backlog.yml", "version: 1\nitems:\n  - {id: e, title: E, spec: /etc/passwd}\n")
+    assert work_source.item(cfg, tmp_path, "e").spec == ""  # the parser reports it and keeps no spec
+    assert work_source.problems(cfg, tmp_path)
+    fallback = f"{cfg.project.docs['specs']}/{cfg.project.spec_file.format(module='e')}"
+    assert make_ctx(cfg, tmp_path, "feature", {"module": "e"}).values["spec"] == fallback

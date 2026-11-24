@@ -272,7 +272,7 @@ def rule_checked_plan(cfg: Config, repo: Path, plan: Path | None) -> NextAnswer 
     if plan is None or not sources.parse_plan(plan):
         return None
     module = plan_module(plan, _module_ids(cfg, repo))
-    if module in finished.recorded(repo):
+    if module in finished.recorded(repo, hand_marks=work_source.hand_marks(cfg)):
         return None
     branch = module_branch(cfg, module, feature_runs(cfg, repo).get(module))
     merged, why = branch_is_merged(cfg, repo, branch)
@@ -294,7 +294,7 @@ def rule_spec_without_plan(cfg: Config, repo: Path) -> NextAnswer | None:
     by_module = sources.spec_modules(specs_dir, cfg.project.spec_file)
     order = [m for m in _module_ids(cfg, repo) if m in by_module]
     order += sorted(m for m in by_module if m not in order)
-    done = finished.recorded(repo)
+    done = finished.recorded(repo, hand_marks=work_source.hand_marks(cfg))
     for module in order:
         if module in done:
             continue
@@ -679,7 +679,7 @@ def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = 
     noun = work_source.noun(cfg)
     view = origin_view(cfg, repo)  # one bounded read of origin per assessment
     known = known_ids(cfg, repo, view)
-    marks = ({}, None) if work_source.kind(cfg) == "backlog" else finished.read_marks(repo)  # a backlog file has no marks
+    marks = finished.read_marks(repo) if work_source.hand_marks(cfg) else ({}, None)  # a backlog file has no marks
     entries, problems, occupied, notes = [], {}, 0, []
     if marks[1]:
         notes.append(f"queue: {marks[1]}; until then origin evidence marks no module newly done")
@@ -752,12 +752,13 @@ def queue_tick(
 # --------------------------------------------------------------------------- what may run beside what
 
 
-def cached_entries(repo: Path, nodes: list[sources.ModuleNode], runs: dict[str, Run]) -> list[dict]:
+def cached_entries(repo: Path, nodes: list[sources.ModuleNode], runs: dict[str, Run],
+                   hand_marks: bool = True) -> list[dict]:
     """`queue.json`-shaped entries for the map, from files only (no git, no `gh`): `done` (with its `done_reason`) is
     what the last assessment recorded with the live hand marks and vetoes on top (`finished.recorded`), a module with
-    a run is `running` or `waiting`, the rest is `backlog`."""
+    a run is `running` or `waiting`, the rest is `backlog`. `hand_marks=False` (a `backlog` pack) ignores the marks."""
     prior = {m["id"]: m for m in QueueState.load(repo).modules}
-    done = finished.recorded(repo)
+    done = finished.recorded(repo, hand_marks=hand_marks)
     entries = []
     for node in nodes:
         run = runs.get(node.id)

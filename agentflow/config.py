@@ -2353,7 +2353,7 @@ class _Validator:
             if item.status in ("backlog", "ready"):
                 if done is None:
                     try:
-                        done = finished.recorded(repo)
+                        done = finished.recorded(repo, hand_marks=False)  # a backlog file has no marks
                     except (OSError, ValueError):
                         done = {}
                 if item.id in done:

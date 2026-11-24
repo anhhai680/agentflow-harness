@@ -368,7 +368,7 @@ def add(cfg: Config, repo: Path, lane: str, fields: dict, after: Any = (), to_ph
                 params[name] = _text(fields[name], name)
             else:
                 new_module = _new_module_fields(fields["new_module"], nodes, book, work_source.noun(cfg),
-                                                finished.recorded(repo))
+                                                finished.recorded(repo, hand_marks=work_source.hand_marks(cfg)))
                 params["module"], kind = new_module["module"], "module"
         refs = _check_after(cfg, repo, after, nodes, book)
         if "issue" in params:
@@ -842,7 +842,7 @@ def _picture(cfg: Config, repo: Path) -> dict:
         # source has no modules at all, so the board holds only the cards added on the page)
         nodes = [sources.ModuleNode(m["id"], list(m.get("deps") or [])) for m in module_queue.QueueState.load(repo).modules]
     mod_runs = module_queue.feature_runs(cfg, repo, runs)
-    entries = module_queue.cached_entries(repo, nodes, mod_runs)
+    entries = module_queue.cached_entries(repo, nodes, mod_runs, hand_marks=work_source.hand_marks(cfg))
     book = Backlog.load(repo)
     state = _load_state(repo)
     merged = {k: v for k, v in (state.get("merged") or {}).items() if isinstance(k, str)}
@@ -1008,7 +1008,7 @@ def snapshot(cfg: Config, repo: Path) -> dict:
     return {
         "cards": cards,
         "done": done,
-        "done_note": finished.read_marks(repo)[1] or "",
+        "done_note": (finished.read_marks(repo)[1] or "") if work_source.hand_marks(cfg) else "",
         "new_task": forms,
         "lane_phases": {ln: lane_phases(cfg, ln) for ln in forms},
         "lane_labels": lane_labels(cfg),

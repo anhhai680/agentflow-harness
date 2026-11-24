@@ -45,6 +45,11 @@ def kind(cfg: Config) -> str | None:
     return _kind(cfg)
 
 
+def hand_marks(cfg: Config) -> bool:
+    """Whether `runs/done_marks.json` counts for this pack: not for `backlog`, whose file is the only say."""
+    return _kind(cfg) != "backlog"
+
+
 def noun(cfg: Config) -> str:
     """The words messages use for where the modules are listed: `capability map` (also with no work source),
     `spec files` or `backlog`."""

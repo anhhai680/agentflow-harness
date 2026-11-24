@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 import pytest
-from agentflow import governor, hitl, module_queue
+from agentflow import governor, hitl, module_queue, work_source
 from agentflow.flow import main
 from agentflow.module_queue import NextAnswer, QueueBusy, QueueState, StartFailed, next_step, queue_tick
 from agentflow.state import runs_root
@@ -930,13 +930,16 @@ def gh_calls(fr) -> list[list[str]]:
 def test_a_done_item_is_done_with_file_says(bqrepo):
     from agentflow import finished
 
+    write(bqrepo.root, "docs/plans/2026-10-28-a.md", PLAN_DONE)  # a finished plan: gh is asked about it, were `a` not done
+    write(bqrepo.root, "docs/plans/2026-10-28-r.md", PLAN_DONE)  # the control: `r` is not done, so gh is asked
     entries = {e["id"]: e for e in module_queue.assess_modules(bqrepo.cfg, bqrepo.root).entries}
     assert finished.FILE_SAYS == "backlog says done"
     assert (entries["a"]["status"], entries["a"]["done_reason"]) == ("done", "backlog says done")
     assert entries["r"]["status"] == "backlog" and "done_reason" not in entries["r"]
     assert finished.recorded(bqrepo.root) == {"a": finished.FILE_SAYS}
     assert not finished.vetoable(finished.FILE_SAYS) and not finished.from_origin(finished.FILE_SAYS)
-    assert gh_calls(bqrepo) == []
+    asked = json.dumps(gh_calls(bqrepo))
+    assert "flow/feature/r" in asked and "flow/feature/a" not in asked  # gh is called here, but never for `a`
 
 
 def test_hand_marks_are_ignored_by_a_backlog_pack(bqrepo):
@@ -947,6 +950,18 @@ def test_hand_marks_are_ignored_by_a_backlog_pack(bqrepo):
     entries = {e["id"]: e for e in module_queue.assess_modules(bqrepo.cfg, bqrepo.root).entries}
     assert entries["b"]["status"] == "backlog"  # the mark says nothing here
     assert entries["a"]["done_reason"] == finished.FILE_SAYS  # nor does a veto
+
+
+def test_a_leftover_done_mark_does_not_make_a_ready_item_done_on_the_cached_board(bqrepo):
+    from agentflow import finished
+
+    finished.mark(bqrepo.root, "r", "me")  # left over from before `backlog import`
+    nodes = work_source.items(bqrepo.cfg, bqrepo.root)
+    cached = {e["id"]: e for e in module_queue.cached_entries(bqrepo.root, nodes, {},
+                                                              hand_marks=work_source.hand_marks(bqrepo.cfg))}
+    assert cached["r"]["status"] == "backlog"
+    assert finished.recorded(bqrepo.root, hand_marks=work_source.hand_marks(bqrepo.cfg)).get("r") is None
+    assert finished.recorded(bqrepo.root)["r"] == finished.BY_HAND  # the other kinds still honour it
 
 
 def test_an_unreadable_marks_file_adds_no_note_to_a_backlog_pack(bqrepo):

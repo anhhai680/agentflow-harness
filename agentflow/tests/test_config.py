@@ -3299,7 +3299,7 @@ def test_a_spec_no_item_names_is_a_warning_until_it_is_added_or_ignored(tmp_cfg,
 def test_an_item_that_is_done_by_the_runs_but_not_in_the_file_is_a_warning(tmp_cfg, tmp_path, monkeypatch):
     from agentflow import finished
 
-    monkeypatch.setattr(finished, "recorded", lambda repo: {"a": "merged", "b": "merged", "c": "merged", "zz": "merged"})
+    monkeypatch.setattr(finished, "recorded", lambda repo, **kw: {"a": "merged", "b": "merged", "c": "merged", "zz": "merged"})
     text = ("version: 1\nitems:\n  - {id: a, title: A, status: ready}\n  - {id: b, title: B, status: done}\n"
             "  - {id: c, title: C, status: dropped}\n")
     found = _blg(tmp_cfg, tmp_path, text)

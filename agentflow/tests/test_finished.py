@@ -102,6 +102,19 @@ def test_recorded_merges_queue_entries_and_live_marks(tmp_git):
     }
 
 
+def test_recorded_without_hand_marks_reads_neither_marks_nor_vetoes(tmp_git):
+    _queue(tmp_git, [
+        {"id": "a", "status": "done", "done_reason": finished.FILE_SAYS},
+        {"id": "b", "status": "done", "done_reason": finished.SPEC_SAYS},  # vetoed, but a veto says nothing here
+        {"id": "c", "status": "done", "done_reason": finished.BY_HAND},    # left over from another work source
+    ])
+    finished.mark(tmp_git, "d", "pat")
+    finished.veto(tmp_git, "b", "pat")
+    assert finished.recorded(tmp_git, hand_marks=False) == {"a": finished.FILE_SAYS, "b": finished.SPEC_SAYS}
+    assert finished.recorded(tmp_git)["d"] == finished.BY_HAND  # the default is as it was
+    assert "b" not in finished.recorded(tmp_git)
+
+
 def test_from_origin_names_the_reasons_a_veto_overrides():
     assert finished.from_origin(finished.SPEC_SAYS) and finished.from_origin(finished.plan_complete("main"))
     assert not any(finished.from_origin(r) for r in (finished.MERGED, finished.BY_HAND, finished.ISSUE_CLOSED, "",

@@ -488,7 +488,7 @@ def test_an_issue_with_a_live_run_cannot_be_added_again(bk):
     ("merged", None),
 ])
 def test_a_new_task_named_after_a_done_module_says_it_is_done_and_how_to_add_work(sbk, monkeypatch, reason, says):
-    monkeypatch.setattr(backlog.finished, "recorded", lambda repo: {"a": reason})
+    monkeypatch.setattr(backlog.finished, "recorded", lambda repo, **kw: {"a": reason})
     with pytest.raises(Invalid) as caught:
         backlog.add(sbk.cfg, sbk.root, "feature", {"new_module": {"module": "a", "responsibility": "more", "deps": []}})
     message = str(caught.value)

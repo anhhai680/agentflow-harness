@@ -287,7 +287,7 @@ def _modules_done(spec: dict, ctx: Ctx) -> tuple[bool | None, str]:
         return None, f"module '{module}' is not in the {work_source.noun(ctx.cfg)}"
     if not node.deps:
         return True, f"{module} has no dependencies"
-    done = finished.recorded(ctx.repo)
+    done = finished.recorded(ctx.repo, hand_marks=work_source.hand_marks(ctx.cfg))
     missing = [dep for dep in node.deps if dep not in done]
     if not missing:
         return True, "done: " + ", ".join(f"{dep} ({done[dep]})" for dep in node.deps)
