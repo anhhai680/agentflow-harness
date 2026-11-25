@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal
 
-from agentflow import backlog_file, finished, intake, module_queue, sources, vuln, work_source
+from agentflow import backlog_file, claim_sync, finished, intake, module_queue, sources, vuln, work_source
 from agentflow.backlog_file import BacklogItem
 from agentflow.conditions import first_phase_with_work, make_ctx
 from agentflow.config import check_lane
@@ -1703,6 +1703,7 @@ def refresh(cfg: Config, repo: Path) -> dict:
     note = sync_branch(repo, cfg.project.fork_from) if module_queue.backlog_settings(cfg).get("sync_base", False) else ""
     # origin/<fork_from> is where a merged plan lands; fetching it never touches a local branch or the work tree
     fetch_remote_branch(repo, cfg.project.fork_from)
+    claim_sync.release_merged(cfg, repo)  # this clone's own merged runs only; it pushes nothing for any other
     skipped = False
     try:
         with module_queue.queue_lock(repo):

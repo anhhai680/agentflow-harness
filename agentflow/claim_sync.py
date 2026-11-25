@@ -30,7 +30,7 @@ from agentflow import backlog_writes, claims, gitops, pack, work_source
 from agentflow.backlog_file import BacklogItem
 from agentflow.config import CLAIM_STEP_ID, Config, backlog_path
 from agentflow.hitl import raise_hitl
-from agentflow.state import TERMINAL, Run
+from agentflow.state import TERMINAL, Run, list_runs
 
 if TYPE_CHECKING:
     from agentflow.pipeline import RunOptions
@@ -46,7 +46,8 @@ CLAIM_STATUS = {"running": "running", "refining": "running", "waiting_human": "w
                 "done": "waiting"}
 RELEASED_BY = ("failed", "cancelled")
 
-__all__ = ["CLAIM_STATUS", "record", "release_run", "release_start", "start", "sync", "sync_quietly", "target"]
+__all__ = ["CLAIM_STATUS", "record", "release_merged", "release_run", "release_start", "start", "sync", "sync_quietly",
+           "target"]
 
 
 def _cut(text: object) -> str:
@@ -332,6 +333,84 @@ def release_run(cfg: Config, run: Run, reason: str) -> None:
         run.emit("claim_release_failed", item=item, error=_error(exc))
         return
     run.emit("claim_released", item=item, reason=reason)
+
+
+# --------------------------------------------------------------------------- a merged item
+
+
+def _candidates(repo: Path) -> list[Run]:
+    """The local runs whose own claim is unreleased and not lost, and that are `done`: the only runs a merge can
+    release. The state alone decides; no other run is looked at past its `state.json`."""
+    found: list[Run] = []
+    for run in list_runs(repo):
+        try:
+            state = run.refresh()
+        except Exception:  # one unreadable run is not a reason to look at no other
+            continue
+        row = _row(state)
+        if row is not None and state["status"] == "done" and not row.get("released") and not row.get("lost"):
+            found.append(run)
+    return found
+
+
+def _merged_ids(cfg: Config, repo: Path) -> set[str]:
+    """The ids of the items that are `status: done` in the backlog file at `origin/<fork_from>`, as the last fetch
+    left it."""
+    tip = gitops.commit_at(repo, f"refs/remotes/origin/{cfg.project.fork_from}")
+    return {i.id for i in work_source.items_at(cfg, repo, tip) if i.status == "done"} if tip else set()
+
+
+def release_merged(cfg: Config, repo: Path, fetch: bool = False) -> list[str]:
+    """Release the claims of this clone's runs whose item is merged: a run of this clone whose own `state["claim"]`
+    is unreleased and not lost, whose status is `done`, and whose item is `status: done` in the backlog file at
+    `origin/<fork_from>` (`reason: merged`). Returns the released item ids.
+
+    Only the claimant's machine releases a merged item's claim (D4): a clone with no such run reads nothing and pushes
+    nothing, whatever `origin` holds. `fetch` first brings `origin/<fork_from>` up to date, and only when there is a
+    run to release. Each release holds the run's claim lock, and the run's state is read again under it, so a live
+    runner of the same run never races it. Never raises: a failure is `claim_release_failed` on the run (one line of
+    at most `TEXT_MAX` characters), tried again by the next call."""
+    released: list[str] = []
+    try:
+        repo = Path(repo)
+        if backlog_path(cfg.work_source) is None:
+            return released
+        runs = _candidates(repo)
+        if not runs:
+            return released
+        if fetch:
+            gitops.fetch_remote_branch(repo, cfg.project.fork_from)
+        merged = _merged_ids(cfg, repo)
+        for run in runs:
+            item = str((_row(run.state) or {}).get("item"))
+            if item in merged and _release_merged(cfg, run, item):
+                released.append(item)
+    except Exception as exc:  # the caller (a refresh, a watch, an archive) is never stopped by this
+        _log_failure(run=None, item="?", exc=exc)
+    return released
+
+
+def _release_merged(cfg: Config, run: Run, item: str) -> bool:
+    try:
+        with _serial(run):
+            row = _row(run.refresh())  # again, under the lock: the runner may have moved or released it meanwhile
+            if row is None or run.state["status"] != "done" or row.get("released") or row.get("lost"):
+                return False
+            release_run(cfg, run, "merged")
+            row = _row(run.refresh())
+            return bool(row and row.get("released"))
+    except Exception as exc:
+        _log_failure(run, item, exc)
+        return False
+
+
+def _log_failure(run: Run | None, item: str, exc: BaseException) -> None:
+    if run is None:
+        return
+    try:
+        run.emit("claim_release_failed", item=item, error=_error(exc))
+    except Exception:  # the log itself can't be written: nothing more to do here
+        pass
 
 
 def sync_quietly(cfg: Config | None, run: Run) -> None:

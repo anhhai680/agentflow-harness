@@ -8,18 +8,20 @@ import threading
 from pathlib import Path
 
 import pytest
+import test_ci
 import test_conformance
 from conftest import run_git
 from test_backlog_runs import DONE_ACT, PLAN_TEXT, SPEC, SPEC_TEXT, BacklogFlow
 from test_claims import OTHER, remote_refs, run_git_input, second_clone
 
-from agentflow import claim_sync, claims, conditions, hitl, pipeline, run_control, slots, work_source
+from agentflow import backlog, claim_sync, claims, conditions, hitl, pipeline, run_control, slots, work_source
 from agentflow.hitl import approve
 from agentflow.pipeline import RunOptions, advance, start
 from agentflow.state import Run, list_runs, runs_root
 
 # The fake `gh` fixture of whole runs, bound by assignment so pytest finds it here.
 ci_gh = test_conformance.ci_gh
+clock = test_ci.clock  # the CI watch's clock, which never sleeps
 
 class ClaimFlow(BacklogFlow):
     """`BacklogFlow` with claims on, and its `next` (the fork, with `backlog.yml`) pushed to `origin`, so a second
@@ -606,3 +608,103 @@ def test_a_gone_commit_and_no_origin_is_only_a_failed_sync(cflow, tmp_path):
     assert failed["action"] == "advance" and len(failed["error"]) <= 300 and "\n" not in failed["error"]
     state = run.refresh()
     assert "claim_lost" not in _types(run) and state["status"] == "paused" and not state["claim"]["lost"]
+
+
+# --------------------------------------------------------------------------- a merged item's claim (Task 7)
+
+
+def _done_run(cflow, ci_gh) -> Run:
+    """A finished `feature` run of `b` that still holds its claim (`waiting`, its PR not merged)."""
+    from test_backlog_runs import _walk, _whole
+
+    run, _ = _whole(cflow, claims=True)
+    assert _walk(cflow, run) == "done", run.state["waiting"]
+    assert not run.refresh()["claim"]["released"]
+    return run
+
+
+def _merge_b(cflow, tmp_path: Path) -> None:
+    """The run's pull request merges: `b` is `done` in the file at the tip of `origin/<fork_from>`."""
+    from conftest import land_on_origin
+    from test_backlog_runs import DONE_YML
+
+    land_on_origin(cflow.repo, tmp_path, {"backlog.yml": DONE_YML})
+
+
+def test_the_claimants_refresh_releases_a_merged_item(cflow, ci_gh, tmp_path):
+    run = _done_run(cflow, ci_gh)
+    assert _on_origin(cflow) is not None
+    backlog.refresh(cflow.cfg, cflow.repo.root)
+    assert _on_origin(cflow) is not None  # not merged yet: the claim stays
+    _merge_b(cflow, tmp_path)
+    backlog.refresh(cflow.cfg, cflow.repo.root)
+    assert claims.read(cflow.cfg, cflow.repo.root, "b") is None and _claim_refs(cflow.repo) == {}
+    assert [e["reason"] for e in run.events.read() if e["type"] == "claim_released"] == ["merged"]
+    assert run.refresh()["claim"]["released"] is True
+    assert claim_sync.release_merged(cflow.cfg, cflow.repo.root) == []  # released once, never twice
+    assert _types(run).count("claim_released") == 1
+
+
+def test_a_second_clone_pushes_nothing(cflow, ci_gh, tmp_path, monkeypatch):
+    _done_run(cflow, ci_gh)
+    _merge_b(cflow, tmp_path)
+    other = cflow.clone(tmp_path)  # a clone with no run of `b`
+    cfg = cflow.configure()
+    calls = _count_pushes(monkeypatch)
+    pushed: list[list[str]] = []
+    real = subprocess.run
+
+    def spy(argv, *args, **kwargs):
+        if isinstance(argv, list) and argv[:1] == ["git"] and "push" in argv:
+            pushed.append(argv)
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    backlog.refresh(cfg, other)
+    assert claim_sync.release_merged(cfg, other) == []
+    assert not [c for c in calls if "push" in c or "update-ref" in c] and pushed == []
+    assert claims.ref(cfg, "b") in _claim_refs(cflow.repo)  # the claimant's ref is still there
+
+
+def test_an_unmerged_item_keeps_its_claim(cflow, ci_gh):
+    run = _done_run(cflow, ci_gh)
+    assert claim_sync.release_merged(cflow.cfg, cflow.repo.root) == []
+    assert _on_origin(cflow) is not None and "claim_released" not in _types(run)
+    # a run that is not done, or whose claim is lost or released, is no candidate either
+    live = start(cflow.cfg, cflow.repo.root, "feature", {"module": "i"}, RunOptions())
+    assert live.refresh()["claim"] is not None
+    assert claim_sync.release_merged(cflow.cfg, cflow.repo.root) == []
+
+
+def test_a_failed_release_is_recorded_and_never_raises(cflow, ci_gh, tmp_path, monkeypatch):
+    run = _done_run(cflow, ci_gh)
+    _merge_b(cflow, tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("origin\nwent away " + "x" * 600)
+
+    monkeypatch.setattr(claims, "release", boom)
+    assert claim_sync.release_merged(cflow.cfg, cflow.repo.root) == []
+    [failed] = [e for e in run.events.read() if e["type"] == "claim_release_failed"]
+    assert "\n" not in failed["error"] and len(failed["error"]) <= claim_sync.TEXT_MAX
+    assert not run.refresh()["claim"]["released"]
+
+
+def test_ci_watch_releases_once_the_merge_lands(cflow, ci_gh, clock, tmp_path):
+    from test_ci import PASS, PENDING, WATCH
+
+    done = _done_run(cflow, ci_gh)
+    _merge_b(cflow, tmp_path)
+    cfg = cflow.repo.configure({**WATCH, "work_source": {"kind": "backlog", "path": None},
+                                "backlog": {"claims": True}}, autopilot=True)
+    ci_gh.checks.with_name(ci_gh.checks.name + ".cursor").unlink(missing_ok=True)  # play from the first entry again
+    ci_gh.play(PENDING, PENDING, PASS)
+    watcher = start(cfg, cflow.repo.root, "bug", {"task": "fix the thing"}, RunOptions())
+    cflow.repo.script({"build/regression_test": [{"result": {"status": "done", "summary": "red", "signals": {
+        "test_command": "test -f fixed.txt"}}}], "build/fix": [{"write": {"fixed.txt": "ok\n"},
+                                                                 "result": {"status": "done", "summary": "fixed"}}]})
+    assert advance(watcher, cfg, RunOptions()) == "awaiting_approval"
+    approve(watcher, "define", by="me")
+    assert advance(watcher, cfg, RunOptions()) == "done"
+    assert [e["reason"] for e in done.events.read() if e["type"] == "claim_released"] == ["merged"]
+    assert claims.read(cfg, cflow.repo.root, "b") is None

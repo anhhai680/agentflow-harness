@@ -36,6 +36,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from agentflow import claim_sync
 from agentflow.autonomy import AUTO_BY
 from agentflow.config import Config, Phase, Step
 from agentflow.conformance import probe_before_push
@@ -226,6 +227,9 @@ class CILane:
                     held = self._end_hold(key, held)
                     return "fail", ", ".join(_failed_names(checks)), checks
                 if deadline is not None:  # watching: a `gh` error or no checks (just after a re-run) is no verdict
+                    # a long watch keeps this machine busy for hours: a merge of an item whose run finished here
+                    # lands meanwhile, and its claim is this machine's to release (never raises)
+                    claim_sync.release_merged(self.cfg, Path(self.run.repo), fetch=True)
                     if time.time() >= deadline:
                         why = error or stale or (f"{len(pending)} check(s) still pending" if checks
                                                  else "GitHub reported no checks")
