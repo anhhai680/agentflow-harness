@@ -41,6 +41,10 @@ Routes:
   an alert group when Dependabot closes it). A start re-checks that the card is not blocked and has no
   duplicate (409 with the reason otherwise), answers 202 at once and runs the slow part (`flow.py run --detach`)
   on a worker thread, one start at a time. Nothing starts by itself: only these calls start work.
+- `POST /api/backlog/file` (a `backlog` pack: `op` `add` with `item`, `edit` with `id` and `fields`, or `move` with
+  `id` and `direction`, and always `sha256`, the board's `backlog_sha256`) edits `backlog.yml` in the working tree and
+  never commits. It answers 200 `{ok, sha256}` (the file's new sha), 409 when the file changed since the page read it
+  or a `done`/`dropped` status meets a live run, and 400 for a bad key, value or edit.
 - `GET /api/config` (the Settings page: the config's text, hash and form fields), `POST /api/config/preview` and
   `POST /api/config/save` with `base_sha256` and either `changes` (the form) or `text` (the YAML tab); see
   `config_edit`. A save is refused unless the new config validates, leaves the protected settings as they are and
@@ -83,7 +87,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from agentflow import activity, backlog, config_edit, hitl, module_queue, pack, preflight
+from agentflow import activity, backlog, backlog_file, config_edit, hitl, module_queue, pack, preflight
 from agentflow.artifacts import (
     SHA,
     NotFound,
@@ -128,7 +132,8 @@ EVENTS_LIMIT_DEFAULT = 200
 EVENTS_LIMIT_MAX = 500
 ACTION_ROUTE = re.compile(r"^/api/runs/([^/]+)/([a-z]+)$")
 TEXT_MAX = backlog.TEXT_MAX
-BACKLOG_ROUTES = ("/api/backlog", "/api/backlog/start", "/api/backlog/remove")
+BACKLOG_ROUTES = ("/api/backlog", "/api/backlog/start", "/api/backlog/remove", "/api/backlog/file")
+FILE_OPS = {"add": ("item",), "edit": ("id", "fields"), "move": ("id", "direction")}  # each op's keys, with sha256
 CONFIG_ROUTES = ("/api/config/preview", "/api/config/save")
 CONFIG_MAX_BODY = config_edit.MAX_TEXT + 64 * 1024  # the YAML tab sends the whole file
 BACKLOG_LOG = "backlog"  # the `run_id` the live stream gives backlog events
@@ -167,6 +172,31 @@ def _text(body: dict, name: str, required: bool = False) -> str | None:
     if not isinstance(value, str) or len(value) > TEXT_MAX:
         raise BadRequest(f"{name} must be text of at most {TEXT_MAX} characters")
     return value
+
+
+def _file_edit(cfg: Config, repo: Path, body: dict) -> str:
+    """`POST /api/backlog/file`: one page edit of the backlog file in the working tree; the file's new sha-256.
+    `BadRequest` for a body that is not one op with exactly its keys; the rest is `backlog`'s to check."""
+    op = body.get("op")
+    if not isinstance(op, str) or op not in FILE_OPS:
+        raise BadRequest(f"op must be one of {', '.join(FILE_OPS)}")
+    wanted = {"op", "sha256", *FILE_OPS[op]}
+    stray = sorted(str(k) for k in body if k not in wanted)
+    missing = sorted(k for k in wanted if k not in body)
+    if stray or missing:
+        raise BadRequest(f"{op} takes {', '.join(sorted(wanted))}" + (f", not {', '.join(stray)}" if stray else ""))
+    sha = body["sha256"]
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise BadRequest("sha256 must be the backlog_sha256 the board sent")
+    if op == "add":
+        return backlog.add_file_item(cfg, repo, body["item"], sha)
+    item_id = _text(body, "id", required=True) or ""
+    if op == "edit":
+        return backlog.edit_item(cfg, repo, item_id, body["fields"], sha)
+    direction = body["direction"]
+    if direction not in ("up", "down"):
+        raise BadRequest("direction must be up or down")
+    return backlog.move(cfg, repo, item_id, direction, sha)
 
 
 # --------------------------------------------------------------------------- actions
@@ -745,6 +775,8 @@ class _Handler(BaseHTTPRequestHandler):
                                    body.get("fields") if "fields" in body else {}, body.get("after") or [],
                                    _text(body, "to_phase"))
                 self._json(200, {"ok": True, "key": f"card:{item.id}", "id": item.id})
+            elif path == "/api/backlog/file":
+                self._json(200, {"ok": True, "sha256": _file_edit(server.cfg, server.repo, body)})
             elif path == "/api/backlog/start":
                 key = self._start_key(body)
                 confirm = body.get("confirm", False)
@@ -770,9 +802,9 @@ class _Handler(BaseHTTPRequestHandler):
                     raise backlog.Refused(backlog.unremovable(server.cfg))
                 backlog.remove(server.cfg, server.repo, name)
                 self._json(200, {"ok": True})
-        except backlog.Refused as exc:
+        except (backlog.Refused, backlog_file.Stale) as exc:
             self._error(409, str(exc))
-        except (BadRequest, backlog.Invalid) as exc:
+        except (BadRequest, backlog.Invalid, backlog_file.EditRefused) as exc:
             self._error(400, str(exc))
 
     def _config_post(self, path: str) -> None:

@@ -2073,3 +2073,130 @@ def test_a_new_module_card_in_a_backlog_pack_keeps_new_module_and_task(bbk):
     job = backlog.begin_start(bbk.cfg, bbk.root, "card:card-1")
     assert job.params == {"module": "n", "task": "Do the new thing\n\nDepends on: a"}
     assert job.new_module == new
+
+
+# --------------------------------------------------------------------------- editing backlog.yml from the page
+
+
+def _file_sha(bbk) -> str:
+    import hashlib
+
+    return hashlib.sha256((bbk.root / "backlog.yml").read_bytes()).hexdigest()
+
+
+def test_the_snapshot_carries_the_files_sha_and_each_file_cards_item(bbk):
+    snap = backlog.snapshot(bbk.cfg, bbk.root)
+    assert snap["backlog_sha256"] == _file_sha(bbk)
+    cards = {c["key"]: c for c in snap["cards"]}
+    assert cards["module:b"]["item"] == {"title": "Bee", "lane": "", "status": "ready", "depends_on": ["a"],
+                                         "issue": 7, "spec": "", "notes": ""}
+    assert cards["module:b"]["local"] is False and cards["module:x"]["item"]["lane"] == "bug"
+    (bbk.root / "backlog.yml").unlink()
+    assert backlog.snapshot(bbk.cfg, bbk.root)["backlog_sha256"] == ""
+
+
+def test_the_snapshot_has_no_sha_and_no_item_in_other_packs(bk):
+    snap = backlog.snapshot(bk.cfg, bk.root)
+    assert snap["backlog_sha256"] == ""
+    assert all("item" not in c and "local" not in c for c in snap["cards"])
+
+
+def test_a_card_is_local_until_its_item_is_committed(bbk):
+    new_sha = backlog.add_file_item(bbk.cfg, bbk.root, {"id": "n", "title": "New one", "status": "ready"},
+                                    _file_sha(bbk))
+    assert new_sha == _file_sha(bbk)
+    bbk.refresh()
+    snap = backlog.snapshot(bbk.cfg, bbk.root)
+    assert snap["backlog_sha256"] == new_sha
+    cards = {c["key"]: c for c in snap["cards"]}
+    assert cards["module:n"]["local"] is True and cards["module:b"]["local"] is False
+    run_git(bbk.root, "add", "backlog.yml")
+    run_git(bbk.root, "commit", "-q", "-m", "add n")
+    assert bbk.cards()["module:n"]["local"] is True  # the snapshot runs no git: the Board knows on its next refresh
+    bbk.refresh()
+    assert bbk.cards()["module:n"]["local"] is False
+    backlog.edit_item(bbk.cfg, bbk.root, "n", {"notes": "changed here"}, _file_sha(bbk))
+    bbk.refresh()
+    assert bbk.cards()["module:n"]["local"] is True  # different from the file on fork_from
+
+
+def test_edit_and_move_change_the_file_in_the_work_tree(bbk):
+    backlog.add_file_item(bbk.cfg, bbk.root, {"id": "m", "title": "Em", "status": "backlog", "depends_on": ["a"],
+                                              "lane": "bug", "issue": 9, "notes": "n"}, _file_sha(bbk))
+    backlog.add_file_item(bbk.cfg, bbk.root, {"id": "n", "title": "En", "status": "ready"}, _file_sha(bbk))
+    backlog.edit_item(bbk.cfg, bbk.root, "n", {"title": "Renamed", "lane": "", "issue": None}, _file_sha(bbk))
+    backlog.move(bbk.cfg, bbk.root, "n", "up", _file_sha(bbk))
+    found, _ = backlog.backlog_file.read(bbk.root / "backlog.yml")
+    assert [i.id for i in found][-2:] == ["n", "m"]
+    by_id = {i.id: i for i in found}
+    assert (by_id["n"].title, by_id["m"].lane, by_id["m"].issue, by_id["m"].deps) == ("Renamed", "bug", 9, ["a"])
+
+
+@pytest.mark.parametrize("fields,match", [
+    ({"plan": "docs/plans/x.md"}, "'plan' is not a key the page edits"),
+    ({"id": "q"}, "'id' is not a key the page edits"),
+    ({"title": 3}, "title must be text"),
+    ({"title": ""}, "title must not be empty"),
+    ({"status": "doing"}, "status must be one of"),
+    ({"lane": "nope"}, "lane 'nope' is not a lane"),
+    ({"depends_on": "a"}, "depends_on must be a list of item ids"),
+    ({"issue": True}, "issue must be a positive whole number"),
+    ({"issue": "7"}, "issue must be a positive whole number"),
+    ({"spec": "../x.md"}, "spec must be a path inside the repository"),
+    ({"notes": ["x"]}, "notes must be text"),
+    ({}, "nothing to set"),
+])
+def test_an_edit_with_a_bad_key_or_value_is_invalid(bbk, fields, match):
+    backlog.add_file_item(bbk.cfg, bbk.root, {"id": "n", "title": "En", "status": "ready"}, _file_sha(bbk))
+    before = (bbk.root / "backlog.yml").read_bytes()
+    with pytest.raises(Invalid, match=match):
+        backlog.edit_item(bbk.cfg, bbk.root, "n", fields, _file_sha(bbk))
+    assert (bbk.root / "backlog.yml").read_bytes() == before
+
+
+def test_done_or_dropped_is_refused_on_an_item_with_a_live_run(bbk):
+    backlog.add_file_item(bbk.cfg, bbk.root, {"id": "n", "title": "En", "status": "ready"}, _file_sha(bbk))
+    Run.create(bbk.cfg, bbk.root, "feature", {"module": "n"})
+    for status in ("done", "dropped"):
+        with pytest.raises(Refused, match="n has a live run"):
+            backlog.edit_item(bbk.cfg, bbk.root, "n", {"status": status}, _file_sha(bbk))
+    backlog.edit_item(bbk.cfg, bbk.root, "n", {"status": "backlog"}, _file_sha(bbk))  # any other change goes through
+
+
+def test_a_stale_sha_is_refused_by_each_page_edit(bbk):
+    backlog.add_file_item(bbk.cfg, bbk.root, {"id": "n", "title": "En", "status": "ready"}, _file_sha(bbk))
+    before = (bbk.root / "backlog.yml").read_bytes()
+    stale = "0" * 64
+    for call in (lambda: backlog.add_file_item(bbk.cfg, bbk.root, {"id": "q", "title": "Q"}, stale),
+                 lambda: backlog.edit_item(bbk.cfg, bbk.root, "n", {"title": "T"}, stale),
+                 lambda: backlog.move(bbk.cfg, bbk.root, "n", "up", stale)):
+        with pytest.raises(backlog.backlog_file.Stale):
+            call()
+    assert (bbk.root / "backlog.yml").read_bytes() == before
+
+
+def test_add_file_item_derives_id_and_title_from_a_spec(bbk):
+    write(bbk.root, "docs/specs/y.md", "# The Y module\n\nStatus: proposed\n")
+    backlog.add_file_item(bbk.cfg, bbk.root, {"spec": "docs/specs/y.md", "status": "backlog"}, _file_sha(bbk))
+    item = {i.id: i for i in backlog.backlog_file.read(bbk.root / "backlog.yml")[0]}["y"]
+    assert (item.title, item.spec, item.status) == ("The Y module", "docs/specs/y.md", "backlog")
+    with pytest.raises(Invalid, match="give an id"):
+        backlog.add_file_item(bbk.cfg, bbk.root, {"title": "No id"}, _file_sha(bbk))
+
+
+def test_a_move_direction_is_up_or_down(bbk):
+    with pytest.raises(Invalid, match="direction must be up or down"):
+        backlog.move(bbk.cfg, bbk.root, "b", "left", _file_sha(bbk))
+
+
+def test_the_page_edits_need_a_backlog_pack(bk):
+    with pytest.raises(Invalid, match="work_source kind backlog"):
+        backlog.add_file_item(bk.cfg, bk.root, {"id": "n", "title": "En"}, "")
+
+
+def test_a_new_module_card_is_refused_in_a_backlog_pack(bbk):
+    fields = {"new_module": {"module": "e", "responsibility": "eee", "deps": []}}
+    with pytest.raises(Invalid, match=r"^in a backlog pack a new module is an item of backlog\.yml: "
+                                      r"POST /api/backlog/file$"):
+        backlog.add(bbk.cfg, bbk.root, "feature", fields)
+    assert backlog.Backlog.load(bbk.root).items == {}

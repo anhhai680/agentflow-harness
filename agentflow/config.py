@@ -1846,8 +1846,8 @@ class _Validator:
         self.issues: list[Issue] = []
         self.roles = {role for agent in cfg.agents.values() for role in agent.models}
 
-    def add(self, level: Literal["error", "warning"], path: str, message: str) -> None:
-        issue = Issue(level, path, message)
+    def add(self, level: Literal["error", "warning"], path: str, message: str, fixable: bool = False) -> None:
+        issue = Issue(level, path, message, fixable)
         if issue not in self.issues:
             self.issues.append(issue)
 
@@ -2375,7 +2375,7 @@ class _Validator:
                 if item.id in done:
                     self.add("warning", at(f"{where}.status"),
                              f"{item.id} is done by its runs ({done[item.id]}) but the file says {item.status}: "
-                             f"agentflow backlog set {item.id} status=done")
+                             f"agentflow backlog set {item.id} status=done", fixable=True)  # backlog.fix_done
         for rel in work_source.skipped(self.cfg, repo):
             self.add("warning", name, f"{rel} is not on the backlog: agentflow backlog add --spec {rel}, "
                      "or list it in backlog.ignore_specs")

@@ -71,8 +71,9 @@ def _print_validation(cfg, repo: Path, config_path: Path) -> int:
 
 
 def _fix_pack(cfg, repo: Path, config_path: Path, dry_run: bool) -> int:
-    """`validate --fix`: print each fix, apply them (unless `dry_run`), then validate again."""
-    from agentflow import pack_fix
+    """`validate --fix`: print each fix, apply them (unless `dry_run`), then validate again. The pack's prompts are
+    `pack_fix`'s; the backlog file's done items are `backlog.fix_done`'s."""
+    from agentflow import backlog, pack_fix
 
     try:
         pack_fix.check_pack(repo)
@@ -84,14 +85,18 @@ def _fix_pack(cfg, repo: Path, config_path: Path, dry_run: bool) -> int:
         print(pack_fix.render(fix, repo), end="")
     for skip in found.skipped:
         print(f"skipped {pack_fix.shown(os.path.relpath(skip.path, repo))}: {skip.reason}")
+    done = backlog.fix_done(cfg, repo, dry_run)  # the backlog file's items that their runs finished
+    for line in done:
+        print(pack_fix.shown(line))
+    backlog_files = 1 if any(not line.startswith("skipped ") for line in done) else 0
     if dry_run:
         code = _print_validation(cfg, repo, config_path)
-        print(f"dry run: {len(found.fixes)} files would change; nothing written")
+        print(f"dry run: {len(found.fixes) + backlog_files} files would change; nothing written")
         return code
     applied, skipped = pack_fix.apply(found.fixes)
     for skip in skipped:
         print(f"skipped {pack_fix.shown(os.path.relpath(skip.path, repo))}: {skip.reason}")
-    print(f"fixed {len(applied)} files")
+    print(f"fixed {len(applied) + backlog_files} files")
     return _print_validation(cfg, repo, config_path)
 
 

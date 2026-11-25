@@ -1383,6 +1383,91 @@ def test_the_board_carries_a_backlog_files_items_dropped_list_and_note(kdash):
     assert data["backlog"] == [] and data["backlog_note"].startswith("backlog file ")
 
 
+BLOCK_YML = ("version: 1\nitems:\n  - id: i\n    title: An idea\n    status: backlog\n"
+             "  - id: r\n    title: Ready one\n    status: ready\n")
+
+
+def _block_file(kdash) -> str:
+    """`kdash`'s file rewritten in block style and committed; the page's sha of it."""
+    (kdash.flow.root / "backlog.yml").write_text(BLOCK_YML, encoding="utf-8")
+    run_git(kdash.flow.root, "add", "backlog.yml")
+    run_git(kdash.flow.root, "commit", "-q", "-m", "block style")
+    return payload(kdash.get("/api/board")[2])["backlog_sha256"]
+
+
+def test_the_file_endpoint_adds_edits_and_moves_in_the_work_tree_only(kdash):
+    sha = _block_file(kdash)
+    root = kdash.flow.root
+    head = run_git(root, "rev-parse", "HEAD")
+    shas = [sha]
+    for body in ({"op": "add", "item": {"id": "n", "title": "New one", "status": "ready"}},
+                 {"op": "edit", "id": "n", "fields": {"title": "Renamed", "depends_on": ["i"]}},
+                 {"op": "move", "id": "n", "direction": "up"}):
+        code, _, raw = kdash.post("/api/backlog/file", {**body, "sha256": shas[-1]})
+        answer = payload(raw)
+        assert (code, answer["ok"]) == (200, True) and answer["sha256"] not in shas
+        shas.append(answer["sha256"])
+    text = (root / "backlog.yml").read_text(encoding="utf-8")
+    assert text == ("version: 1\nitems:\n  - id: i\n    title: An idea\n    status: backlog\n"
+                    "  - id: n\n    depends_on: [i]\n    title: Renamed\n    status: ready\n"
+                    "  - id: r\n    title: Ready one\n    status: ready\n")
+    assert payload(kdash.get("/api/board")[2])["backlog_sha256"] == shas[-1]
+    assert run_git(root, "status", "--porcelain").splitlines() == [" M backlog.yml"]
+    assert run_git(root, "rev-parse", "HEAD") == head  # no commit
+    card = backlog_of(kdash)["module:n"]
+    assert card["item"]["title"] == "Renamed" and card["item"]["depends_on"] == ["i"]
+
+
+def test_the_file_endpoint_answers_409_on_a_stale_sha_and_400_on_a_bad_key(kdash):
+    sha = _block_file(kdash)
+    root = kdash.flow.root
+    (root / "backlog.yml").write_text(BLOCK_YML.replace("Ready one", "Ready, edited"), encoding="utf-8")
+    before = (root / "backlog.yml").read_bytes()
+    code, _, raw = kdash.post("/api/backlog/file", {"op": "edit", "sha256": sha, "id": "r", "fields": {"title": "X"}})
+    assert code == 409 and payload(raw)["error"] == "backlog.yml changed on disk since the page read it: reload"
+    assert (root / "backlog.yml").read_bytes() == before
+    fresh = payload(kdash.get("/api/board")[2])["backlog_sha256"]
+    for body in ({"op": "edit", "sha256": fresh, "id": "r", "fields": {"plan": "docs/plans/x.md"}},
+                 {"op": "edit", "sha256": fresh, "id": "r", "fields": {"lane": "nope"}},
+                 {"op": "edit", "sha256": fresh, "id": "nope", "fields": {"title": "X"}},
+                 {"op": "move", "sha256": fresh, "id": "i", "direction": "up"},
+                 {"op": "move", "sha256": fresh, "id": "r", "direction": "sideways"},
+                 {"op": "rename", "sha256": fresh, "id": "r"},
+                 {"op": "edit", "id": "r", "fields": {"title": "X"}},
+                 {"op": "add", "sha256": fresh, "item": "x"},
+                 {"op": "edit", "sha256": fresh, "id": "r", "fields": {"title": "X"}, "extra": 1}):
+        code, _, raw = kdash.post("/api/backlog/file", body)
+        assert code == 400, body
+        assert payload(raw)["error"]
+    assert (root / "backlog.yml").read_bytes() == before
+    Run.create(kdash.flow.cfg, root, "feature", {"module": "r"})
+    code, _, raw = kdash.post("/api/backlog/file", {"op": "edit", "sha256": fresh, "id": "r",
+                                                    "fields": {"status": "done"}})
+    assert code == 409 and "r has a live run" in payload(raw)["error"]
+    assert (root / "backlog.yml").read_bytes() == before
+
+
+def test_add_from_a_spec_derives_id_and_title(kdash):
+    sha = _block_file(kdash)
+    spec = kdash.flow.root / "docs" / "specs" / "x.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text("# The X module\n\nStatus: proposed\n", encoding="utf-8")
+    code, _, raw = kdash.post("/api/backlog/file", {"op": "add", "sha256": sha,
+                                                    "item": {"spec": "docs/specs/x.md", "status": "backlog"}})
+    assert code == 200, raw
+    card = backlog_of(kdash)["module:x"]
+    assert card["item"]["title"] == "The X module" and card["item"]["spec"] == "docs/specs/x.md"
+    assert card["item"]["status"] == "backlog"
+
+
+def test_the_file_endpoint_needs_the_token_and_our_origin(kdash):
+    sha = _block_file(kdash)
+    body = {"op": "add", "sha256": sha, "item": {"id": "n", "title": "New"}}
+    assert kdash.post("/api/backlog/file", body, token=None)[0] == 403
+    assert kdash.post("/api/backlog/file", body, headers={"Origin": "https://evil.example"})[0] == 403
+    assert (kdash.flow.root / "backlog.yml").read_text(encoding="utf-8") == BLOCK_YML
+
+
 def test_an_idea_starts_only_with_confirm_true(kdash):
     code, _, body = kdash.post("/api/backlog/start", {"module": "i"})
     assert code == 409 and "must be confirmed" in payload(body)["error"]

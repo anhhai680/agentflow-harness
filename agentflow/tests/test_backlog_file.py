@@ -378,3 +378,106 @@ def test_set_fields_text_and_append_item_text_match_the_file_functions(tmp_path)
     with pytest.raises(backlog_file.EditRefused):
         backlog_file.set_fields_text(FLOW, "f", {"status": "done"})
     assert path.read_bytes() == text.encode()
+
+
+# --------------------------------------------------------------------------- the page's sha, and moving an item
+
+
+def _sha(path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("edit", [
+    lambda p, sha: backlog_file.set_fields(p, "a", {"title": "New"}, expect_sha=sha),
+    lambda p, sha: backlog_file.append_item(p, BacklogItem("c", [], title="C"), expect_sha=sha),
+    lambda p, sha: backlog_file.move_item(p, "b", up=True, expect_sha=sha),
+], ids=["set_fields", "append_item", "move_item"])
+def test_a_stale_sha_is_refused_and_the_file_is_unchanged(tmp_path, edit):
+    path = tmp_path / "backlog.yml"
+    path.write_text(GOOD, encoding="utf-8")
+    page_sha = _sha(path)
+    changed = GOOD.replace("title: B", "title: Bee")
+    path.write_text(changed, encoding="utf-8")  # an editor saved while the page was open
+    with pytest.raises(backlog_file.Stale, match=r"^backlog\.yml changed on disk since the page read it: reload$"):
+        edit(path, page_sha)
+    assert path.read_text(encoding="utf-8") == changed
+    new_sha = edit(path, _sha(path))  # with the sha of what is on disk it goes through
+    assert new_sha == _sha(path) and new_sha != page_sha
+
+
+def test_the_path_edits_return_the_new_sha_and_take_no_sha_too(tmp_path):
+    path = tmp_path / "backlog.yml"
+    path.write_text(GOOD, encoding="utf-8")
+    assert backlog_file.set_fields(path, "a", {"title": "New"}) == _sha(path)
+    assert backlog_file.append_item(path, BacklogItem("c", [], title="C")) == _sha(path)
+    assert backlog_file.move_item(path, "c", up=True) == _sha(path)
+    assert isinstance(backlog_file.Stale("x"), backlog_file.EditRefused)
+
+
+MOVE = """version: 1
+items:
+  - id: a
+    title: A
+    status: ready
+  - id: d
+    title: D
+    status: done
+  # about b
+  - id: b
+    title: B
+    status: ready
+"""
+
+
+def test_move_swaps_with_the_nearest_open_item_and_keeps_comments(tmp_path):
+    path = tmp_path / "backlog.yml"
+    path.write_text(MOVE, encoding="utf-8")
+    backlog_file.move_item(path, "b", up=True)
+    text = path.read_text(encoding="utf-8")
+    assert [i.id for i in backlog_file.parse(text)[0]] == ["b", "d", "a"]
+    assert text == ("version: 1\nitems:\n  # about b\n  - id: b\n    title: B\n    status: ready\n"
+                    "  - id: d\n    title: D\n    status: done\n  - id: a\n    title: A\n    status: ready\n")
+    with pytest.raises(backlog_file.EditRefused, match="b is already first"):
+        backlog_file.move_item(path, "b", up=True)
+    with pytest.raises(backlog_file.EditRefused, match="a is already last"):
+        backlog_file.move_item(path, "a", up=False)
+    backlog_file.move_item(path, "b", up=False)  # and back down, over d again
+    assert path.read_text(encoding="utf-8") == MOVE
+    flow = MOVE.replace("  - id: a\n    title: A\n    status: ready\n", "  - {id: a, title: A, status: ready}\n")
+    path.write_text(flow, encoding="utf-8")
+    with pytest.raises(backlog_file.EditRefused, match="flow style"):
+        backlog_file.move_item(path, "b", up=True)
+    assert path.read_text(encoding="utf-8") == flow
+
+
+def test_move_keeps_a_last_line_without_an_ending_and_crlf(tmp_path):
+    path = tmp_path / "backlog.yml"
+    text = MOVE.replace("\n", "\r\n").removesuffix("\r\n")
+    path.write_bytes(text.encode("utf-8"))
+    backlog_file.move_item(path, "b", up=True)
+    moved = path.read_bytes().decode("utf-8")
+    assert [i.id for i in backlog_file.parse(moved)[0]] == ["b", "d", "a"]
+    assert not moved.endswith("\n") and "\n" not in moved.replace("\r\n", "")
+    backlog_file.move_item(path, "b", up=False)
+    assert path.read_bytes().decode("utf-8") == text
+
+
+def test_move_refuses_a_done_item_and_an_unknown_one(tmp_path):
+    path = tmp_path / "backlog.yml"
+    path.write_text(MOVE, encoding="utf-8")
+    with pytest.raises(backlog_file.EditRefused, match="only a backlog or ready item moves"):
+        backlog_file.move_item(path, "d", up=True)
+    with pytest.raises(backlog_file.EditRefused, match="not in backlog.yml"):
+        backlog_file.move_item(path, "nope", up=True)
+    assert path.read_text(encoding="utf-8") == MOVE
+
+
+def test_move_carries_an_items_own_warning_with_it(tmp_path):
+    path = tmp_path / "backlog.yml"
+    path.write_text(MOVE.replace("    title: B\n", "    title: B\n    owner: me\n"), encoding="utf-8")
+    backlog_file.move_item(path, "b", up=True)
+    items, problems = backlog_file.read(path)
+    assert [i.id for i in items] == ["b", "d", "a"]
+    assert [p.where for p in problems] == ["items[0].owner"]

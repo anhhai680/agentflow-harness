@@ -187,15 +187,24 @@ def items(cfg: Config, repo: Path) -> list[sources.ModuleNode]:
 
 def _read_backlog(cfg: Config, repo: Path) -> tuple[list[tuple[int, backlog_file.BacklogItem]], list[backlog_file.Problem]]:
     """The backlog file's items and problems; one error and no items when the path leaves `repo`. Never raises."""
+    found, problems, _ = indexed_digest(cfg, repo)
+    return found, problems
+
+
+def indexed_digest(
+    cfg: Config, repo: Path
+) -> tuple[list[tuple[int, backlog_file.BacklogItem]], list[backlog_file.Problem], str]:
+    """`indexed`, and the sha-256 hex of the bytes that one read gave (`backlog_file.read_digest`; `""` when the file
+    was not read). Never raises."""
     if _kind(cfg) != "backlog":
-        return [], []
+        return [], [], ""
     bad = _unsafe(cfg, repo)
     if bad is not None:
-        return [], [backlog_file.Problem("error", "work_source.path", f"must stay inside the repository: {bad}")]
+        return [], [backlog_file.Problem("error", "work_source.path", f"must stay inside the repository: {bad}")], ""
     path = file(cfg, repo)
     if path is None:
-        return [], []
-    return backlog_file.read_indexed(path)
+        return [], [], ""
+    return backlog_file.read_digest(path)
 
 
 def all_items(cfg: Config, repo: Path) -> list[backlog_file.BacklogItem]:
