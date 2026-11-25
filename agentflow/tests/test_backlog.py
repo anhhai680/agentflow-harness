@@ -2180,8 +2180,16 @@ def test_add_file_item_derives_id_and_title_from_a_spec(bbk):
     backlog.add_file_item(bbk.cfg, bbk.root, {"spec": "docs/specs/y.md", "status": "backlog"}, _file_sha(bbk))
     item = {i.id: i for i in backlog.backlog_file.read(bbk.root / "backlog.yml")[0]}["y"]
     assert (item.title, item.spec, item.status) == ("The Y module", "docs/specs/y.md", "backlog")
+    write(bbk.root, "docs/specs/w.md", "# The W module\n")
+    backlog.add_file_item(bbk.cfg, bbk.root, {"id": "", "title": "", "status": "", "lane": None, "issue": None,
+                                              "spec": "docs/specs/w.md"}, _file_sha(bbk))
+    item = {i.id: i for i in backlog.backlog_file.read(bbk.root / "backlog.yml")[0]}["w"]
+    assert (item.title, item.status, item.lane, item.issue) == ("The W module", "backlog", "", None)
     with pytest.raises(Invalid, match="give an id"):
         backlog.add_file_item(bbk.cfg, bbk.root, {"title": "No id"}, _file_sha(bbk))
+    for bad in (0, False, [], {}, 7):
+        with pytest.raises(Invalid, match="id must be text"):
+            backlog.add_file_item(bbk.cfg, bbk.root, {"id": bad, "title": "T"}, _file_sha(bbk))
 
 
 def test_a_move_direction_is_up_or_down(bbk):

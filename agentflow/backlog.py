@@ -1423,10 +1423,13 @@ def add_file_item(cfg: Config, repo: Path, item: dict, sha: str) -> str:
     sha = _sha_arg(sha)
     if not isinstance(item, dict):
         raise Invalid("item must be an object")
-    item_id = item.get("id") or ""
+    item_id = item.get("id")
+    if item_id is None:
+        item_id = ""
     if not isinstance(item_id, str):
         raise Invalid("id must be text")
-    fields = _edit_fields(cfg, repo, {k: v for k, v in item.items() if k != "id"})
+    # an empty value is a value not given: `id` and `title` then come from the spec, `status` is `backlog`
+    fields = _edit_fields(cfg, repo, {k: v for k, v in item.items() if k != "id" and v not in ("", None)})
     title = str(fields.get("title") or "")
     spec = str(fields.get("spec") or "")
     if spec and (not item_id or not title):

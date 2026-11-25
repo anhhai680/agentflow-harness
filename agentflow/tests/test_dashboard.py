@@ -1453,7 +1453,8 @@ def test_add_from_a_spec_derives_id_and_title(kdash):
     spec.parent.mkdir(parents=True, exist_ok=True)
     spec.write_text("# The X module\n\nStatus: proposed\n", encoding="utf-8")
     code, _, raw = kdash.post("/api/backlog/file", {"op": "add", "sha256": sha,
-                                                    "item": {"spec": "docs/specs/x.md", "status": "backlog"}})
+                                                    "item": {"id": "", "title": "", "spec": "docs/specs/x.md",
+                                                             "status": "backlog"}})
     assert code == 200, raw
     card = backlog_of(kdash)["module:x"]
     assert card["item"]["title"] == "The X module" and card["item"]["spec"] == "docs/specs/x.md"
