@@ -1236,10 +1236,29 @@ class Run:
 
     # -- construction
 
+    @staticmethod
+    def _base_id(pipeline: str, params: dict) -> str:
+        return f"{datetime.now():%Y%m%d-%H%M}-{pipeline}-{_slug_for(pipeline, params)}"
+
     @classmethod
-    def create(cls, cfg: Config, repo: Path, pipeline: str, params: dict, *, engine_pipeline: bool = False) -> Run:
+    def next_id(cls, cfg: Config, repo: Path, pipeline: str, params: dict) -> str:
+        """The id `create` would give a run of `pipeline` with `params` now: the first of `<base>`, `<base>-2`, ... with
+        no run directory. Nothing is created, so a start can name its run (in a claim) before the run exists."""
+        check_lane(cfg, pipeline)
+        root = runs_root(repo)
+        base = cls._base_id(pipeline, params)
+        run_id, n = base, 1
+        while (root / run_id).exists() or (root / run_id).is_symlink():
+            n += 1
+            run_id = f"{base}-{n}"
+        return run_id
+
+    @classmethod
+    def create(cls, cfg: Config, repo: Path, pipeline: str, params: dict, *, engine_pipeline: bool = False,
+               run_id: str | None = None) -> Run:
         """A new run of `pipeline`: a lane of the pack's, or with `engine_pipeline` one of `ENGINE_PIPELINES` (the
-        retro), which no `lanes:` lists, so `agentflow run <it>` still says it is no lane."""
+        retro), which no `lanes:` lists, so `agentflow run <it>` still says it is no lane. With `run_id` (from
+        `next_id`) the run is exactly that directory, and `FileExistsError` is raised when it exists."""
         if engine_pipeline:
             if pipeline not in ENGINE_PIPELINES:
                 raise ValueError(f"{pipeline!r} is not an engine pipeline; known: {', '.join(ENGINE_PIPELINES)}")
@@ -1247,15 +1266,20 @@ class Run:
             check_lane(cfg, pipeline)
         root = runs_root(repo)
         root.mkdir(parents=True, exist_ok=True)
-        base = f"{datetime.now():%Y%m%d-%H%M}-{pipeline}-{_slug_for(pipeline, params)}"
-        run_id, n = base, 1
-        while True:
-            try:
-                (root / run_id).mkdir()
-                break
-            except FileExistsError:
-                n += 1
-                run_id = f"{base}-{n}"
+        if run_id is not None:
+            if run_id in ("", ".", "..") or Path(run_id).name != run_id:
+                raise ValueError(f"not a run id: {run_id!r}")
+            (root / run_id).mkdir()
+        else:
+            base = cls._base_id(pipeline, params)
+            run_id, n = base, 1
+            while True:
+                try:
+                    (root / run_id).mkdir()
+                    break
+                except FileExistsError:
+                    n += 1
+                    run_id = f"{base}-{n}"
         run = cls(repo, run_id)
         run.agent_dir.mkdir(parents=True, exist_ok=True)
         run.emit("run_started", run_id=run_id, pipeline=pipeline, params=params,

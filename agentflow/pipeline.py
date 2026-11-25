@@ -57,7 +57,7 @@ from agentflow.autonomy import (
     runner_settles,
 )
 from agentflow import (
-    backlog_writes, constraint, doubt, governor, pack, preflight, route_lane, run_env, safeio, slots, speculation,
+    backlog_writes, claim_sync, claims, constraint, doubt, governor, pack, preflight, route_lane, run_env, safeio, slots, speculation,
     work_source,
 )
 from agentflow.commit_checks import runner_head
@@ -163,6 +163,9 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     The run's inputs (`--issue`, `--log`, `--task`, `--alert`, `--advisory`; `intake`) are read before anything is created, so a
     bad one leaves no run, and saved in the run directory once it exists. Intake's warnings (an open Dependabot PR)
     are recorded as `intake_warning` events, which the CLI prints.
+    A start that claims its backlog item (`claim_sync.target`) claims it on `origin` next, for the run id it reserves,
+    so a refused claim leaves no run, worktree or branch; the run records the claim (`item_claimed`) as soon as it
+    exists, and any failure after the claim releases it (`claim_sync.release_start`).
     """
     _check_range(cfg, pipeline, opts)
     _check_new_module(cfg, params, opts.new_module)
@@ -200,17 +203,26 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     # the file the plan step wrote today, and a reconcile step may edit only that file.
     if params.get("date") in (None, ""):
         params["date"] = date.today().isoformat()
+    # the item's claim on `origin` comes before the run, which it names: a refused claim (`ValueError`) leaves nothing
+    claimed = claim_sync.start(cfg, repo, pipeline, params, opts, opts.new_module)
     run = None
     try:
         # one hold of the slots lock: the check again, the run and its number, so a start that lost the last number
         # while it read its inputs raises `SlotsFull` with no run created
         with slots.starting(cfg, repo) as take:
-            run = Run.create(cfg, repo, pipeline, params)
+            run = Run.create(cfg, repo, pipeline, params, run_id=claimed[0] if claimed else None)
+            if claimed:
+                claim_sync.record(run, claimed[1], claims.ref(cfg, claimed[1].item))
             take(run)
         _set_up(cfg, repo, run, pipeline, params, inputs, opts, warnings, first)
-    except Exception as exc:  # once the run exists it must never be left `running` with nothing behind it
-        if run is not None:
+    except BaseException as exc:  # once the run exists it must never be left `running` with nothing behind it
+        if run is not None and isinstance(exc, Exception):
             run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}")
+        if claimed:  # and no claim outlives the start that made it
+            why = claim_sync.release_start(cfg, repo, run, claimed[1])
+            if why and run is None:
+                exc.add_note(f"the claim on {claimed[1].item} is still on origin ({why}): "
+                             f"agentflow backlog release {claimed[1].item} frees it")
         raise
     mark(cfg, run)
     return run
