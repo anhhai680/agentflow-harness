@@ -301,21 +301,30 @@ def mark_done(cfg: Config, run: Run, worktree: Path) -> str | None:
 
     When the item is not in the file at `HEAD` (a teammate removed it on `fork_from` and the base sync merged that in),
     nothing is written and `backlog_skipped` says so, for a run that wrote to the backlog: `applies` to the item as the
-    run's latest backlog commit, or its fork commit, had it. `write`'s refusals reach the caller."""
+    run's latest backlog commit, or its fork commit, had it. An item that is `dropped` at `HEAD` (a person dropped it
+    while the run went on) is never set to `done`: `backlog_skipped` says that instead. Either is said once, and the
+    run goes on. `write`'s refusals reach the caller."""
     item_id = str(run.state["params"].get("module") or "")
     path = backlog_path(cfg.work_source)
     head = runner_head(run)
     if not item_id or path is None or head is None:
         return None
     worktree = Path(worktree)
+
+    def skip(reason: str) -> None:
+        if not any(e["type"] == "backlog_skipped" and e.get("change") == "done" for e in run.events.read()):
+            run.emit("backlog_skipped", item=item_id, change="done", reason=reason)  # a resumed `finish` says it once
+
     item = _item_at(worktree, head, path, item_id)
     if item is None:
         earlier = _item_at(worktree, run.state.get("backlog_sha") or run.state.get("base_sha"), path, item_id)
-        told = any(e["type"] == "backlog_skipped" and e.get("change") == "done" for e in run.events.read())
-        if applies(cfg, run, earlier) and not told:  # a resumed `finish` says it once
-            run.emit("backlog_skipped", item=item_id, change="done", reason=f"{item_id} is not in {path} at HEAD")
+        if applies(cfg, run, earlier):
+            skip(f"{item_id} is not in {path} at HEAD")
         return None
     if item.status == "done" or not applies(cfg, run, item):
+        return None
+    if item.status == "dropped":  # a person dropped it on `fork_from` while the run went on: that decision stands
+        skip(f"{item_id} is dropped in {path} at HEAD")
         return None
     return write(cfg, run, worktree, "done", lambda text: backlog_file.set_fields_text(text, item_id, {"status": "done"}),
                  f"Mark {item_id} done in the backlog")

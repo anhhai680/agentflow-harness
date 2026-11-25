@@ -507,6 +507,20 @@ def test_finish_keeps_a_teammates_edit_merged_by_the_sync(bflow, ci_gh, tmp_path
     fully_met(bflow.repo, run)
 
 
+def test_finish_leaves_an_item_a_teammate_dropped(bflow, ci_gh, tmp_path):
+    run_git(bflow.repo.root, "push", "-q", "origin", "next")
+    run, _ = _whole(bflow)
+    dropped = BACKLOG_YML.replace("    title: Bee\n    status: ready\n", "    title: Bee\n    status: dropped\n")
+    status = _walk(bflow, run, at_plan=lambda: land_on_origin(bflow.repo, tmp_path, {"backlog.yml": dropped}))
+    assert status == "done", run.state["waiting"]
+    assert bflow.events(run, "base_synced") and _done_events(bflow, run) == []
+    [skipped] = bflow.events(run, "backlog_skipped")
+    assert (skipped["change"], skipped["reason"]) == ("done", "b is dropped in backlog.yml at HEAD")
+    assert _pushed_item(bflow, run).status == "dropped"
+    assert backlog_writes.mark_done(bflow.cfg, run, bflow.worktree(run)) is None  # said once
+    assert len(bflow.events(run, "backlog_skipped")) == 1
+
+
 def test_a_resumed_finish_does_not_mark_done_twice(bflow, ci_gh, monkeypatch):
     monkeypatch.setenv("FAKE_GH_FAIL_ONCE", "pr create")
     run, _ = _whole(bflow)
