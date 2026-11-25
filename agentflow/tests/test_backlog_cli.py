@@ -355,6 +355,49 @@ def test_release_names_a_live_local_run(flow_repo, capsys):
     assert capsys.readouterr().out.strip() == "no claim on b"
 
 
+def _release_lines(capsys, item: str = "b") -> str:
+    assert main(["backlog", "release", item]) == 0
+    return capsys.readouterr().out
+
+
+def test_release_names_only_a_run_that_still_holds_the_claim(flow_repo, tmp_path, capsys):
+    from test_claim_runs import ClaimFlow
+
+    cflow = ClaimFlow(flow_repo)
+    flow_repo.install_pack()
+    cfg, root = cflow.cfg, flow_repo.root
+
+    # a run that already lost the claim to another claimant is not named
+    lost = start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    lost.emit("claim_lost", item="b", why="taken")
+    assert lost.refresh()["claim"]["lost"] is True
+    out = _release_lines(capsys)
+    assert "released the claim of Test" in out and "holds this claim" not in out and "claim_lost" not in out
+
+    # a finished run has no next change: it is named, and not as one that will stop
+    done = start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    done.emit("run_finished")
+    assert done.refresh()["status"] == "done"
+    out = _release_lines(capsys)
+    assert f"run {done.id} (done)" in out and "no more changes" in out and "claim_lost" not in out
+    assert "holds this claim here:" not in out
+
+    # a run whose own row is an older, superseded claim is not named for another machine's claim
+    old = start(cfg, root, "feature", {"module": "i"}, RunOptions())
+    assert main(["backlog", "release", "i"]) == 0
+    capsys.readouterr()
+    other = cflow.clone(tmp_path)
+    claims.create(cfg, other, "i", run="20261125-1000-feature-i", lane="feature", phase="plan")
+    out = _release_lines(capsys, "i")
+    assert "released the claim of Other" in out and "holds this claim" not in out and "claim_lost" not in out
+    assert old.refresh()["claim"]["released"] is False
+
+    # a live run that holds it is still named, with what happens to it
+    live = start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    out = _release_lines(capsys)
+    assert f"run {live.id} holds this claim here" in out and "its next change stops it with claim_lost" in out
+
+
 def _finish(bf, tmp_path: Path, claim_phase: str) -> None:
     """`a` (done in the file) holds a claim at `claim_phase`, and its file on origin says `done`."""
     _claim(bf, "a", claim_phase, "waiting")

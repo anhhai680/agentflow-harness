@@ -1288,7 +1288,8 @@ def _by(held: claims.Claim) -> str:
 def release_item(cfg: Config, repo: Path, item_id: str) -> list[str]:
     """`backlog release <id>`: free the claim on `item_id` on `origin`, whoever holds it and however old it is (an
     unreadable one too). The lines to print: the claimant, and, when a run of this clone holds that claim (its
-    `state["claim"]` names the item and is unreleased), that its next change to the claim stops it with `claim_lost`;
+    `state["claim"]` names the item, is unreleased and not lost, and is this run's or this sha's), that a live run's
+    next change to the claim stops it with `claim_lost` (a finished run makes none);
     `no claim on <id>` when there was none. `Invalid` outside a `backlog` pack, `ValueError` for a bad id and
     `Refused` when `origin` can't be reached or another claim took the ref meanwhile."""
     repo = Path(repo)
@@ -1309,7 +1310,13 @@ def release_item(cfg: Config, repo: Path, item_id: str) -> list[str]:
             row = run.refresh().get("claim")
         except Exception:  # one unreadable run is not a reason to look at no other
             continue
-        if isinstance(row, dict) and row.get("item") == item_id and not row.get("released"):
+        if (not isinstance(row, dict) or row.get("item") != item_id or row.get("released") or row.get("lost")
+                or not (run.id == freed.run or row.get("sha") == freed.sha)):
+            continue  # not this claim, or one the run already lost or let go
+        if run.state["status"] in TERMINAL:
+            lines.append(f"run {run.id} ({run.state['status']}) holds this claim here but makes no more changes "
+                         "to it")
+        else:
             lines.append(f"run {run.id} holds this claim here: its next change stops it with claim_lost")
     return lines
 
