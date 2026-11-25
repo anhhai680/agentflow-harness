@@ -695,6 +695,25 @@ def test_a_sync_the_runner_cannot_replay_stops_and_names_the_item(bflow, ci_gh, 
     assert not [c for c in bflow.repo.calls() if "/sync-" in c["step"]]
 
 
+def test_a_sync_stops_rather_than_drop_an_unpushed_backlog_change(bflow, ci_gh, tmp_path):
+    """The run forked from a local `fork_from` that carries a committed, unpushed change to the backlog file (item `u`),
+    and a teammate changed the file on origin: settling the file from origin's copy would drop `u`, so the sync stops
+    and says to push it first."""
+    run_git(bflow.repo.root, "push", "-q", "origin", "next")
+    unpushed = BACKLOG_YML + "  - id: u\n    title: Unpushed\n    status: backlog\n"
+    (bflow.repo.root / "backlog.yml").write_text(unpushed, encoding="utf-8")
+    run_git(bflow.repo.root, "commit", "-q", "-am", "Add u")
+    run, _ = _whole(bflow)
+    status = _walk(bflow, run, at_plan=lambda: land_on_origin(bflow.repo, tmp_path, {"backlog.yml": NOTED}))
+    assert status == "waiting_human"
+    waiting = run.refresh()["waiting"]
+    assert (waiting["kind"], waiting["key"]) == ("blocked", FINISH)
+    assert "not on origin/next" in waiting["summary"] and "push" in waiting["summary"]
+    assert gitops.merge_in_progress(bflow.worktree(run)) and not bflow.events(run, "base_synced")
+    assert _done_events(bflow, run) == []
+    assert "id: u" in (bflow.repo.root / "backlog.yml").read_text(encoding="utf-8")  # the checkout keeps it
+
+
 def test_a_teammates_drop_stands_over_the_runs_ready(bflow, ci_gh, tmp_path):
     """The run set its `backlog` item `ready` and a teammate dropped it: the replay keeps the drop, and `finish` leaves
     the item dropped."""

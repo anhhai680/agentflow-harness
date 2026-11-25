@@ -728,6 +728,13 @@ def blob_id(worktree: Path, sha: str, path: str, stage: bool = False) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
+def merge_base(worktree: Path, a: str, b: str) -> str:
+    """The best common ancestor of commits `a` and `b`, or "" when they have none (or either is unknown)."""
+    proc = subprocess.run(["git", *HARDENED, "merge-base", a, b], cwd=Path(worktree),
+                          capture_output=True, text=True, encoding="utf-8", check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
 def stage_resolved(worktree: Path, path: str, data: bytes) -> str:
     """Stage `data`, exactly those bytes (no filter), as the regular file `path` of the merge in progress, resolving
     any conflict on it, and return the blob id. The caller has written the same bytes to the work tree, so a later

@@ -444,6 +444,19 @@ def replay(cfg: Config, run: Run, worktree: Path, target_sha: str) -> str:
     return text
 
 
+def _check_pushed(cfg: Config, run: Run, worktree: Path, target_sha: str, path: str) -> None:
+    """`EditRefused` when the run's fork commit holds a backlog file other than the one at its merge base with
+    `target_sha`: the fork carries a change to the file that the target does not have (committed on the local
+    `fork_from`, not pushed), which `replay` would drop. A fork commit the target already contains passes."""
+    fork, base = cfg.project.fork_from, str(run.state.get("base_sha") or "")
+    common = gitops.merge_base(worktree, base, target_sha) if base else ""
+    if not common:
+        raise backlog_file.EditRefused(f"the run's fork commit and origin/{fork} have no common commit")
+    if gitops.blob_id(worktree, base, path) != gitops.blob_id(worktree, common, path):
+        raise backlog_file.EditRefused(f"{path} at the run's fork commit has changes that are not on origin/{fork}: "
+                                       f"push your local {fork} first")
+
+
 def bring_in(cfg: Config, run: Run, worktree: Path, target_sha: str, conflicts: list[str]) -> str:
     """Settle the backlog file of the merge of `target_sha` that `gitops.pull_base` just started, and return the blob
     the runner staged for it ("" when it had nothing to settle).
@@ -453,7 +466,11 @@ def bring_in(cfg: Config, run: Run, worktree: Path, target_sha: str, conflicts: 
     tree (no symlink followed) and staged as exactly those bytes (`gitops.stage_resolved`), so no session is told about
     it and `gitops.commit_sync` lets that blob, and nothing else, through. `backlog_file.EditRefused` when the replay
     cannot be made, `OSError`/`ValueError` when the file cannot be written, `gitops.GitError` when it cannot be staged:
-    the merge is left in progress for the caller to stop on."""
+    the merge is left in progress for the caller to stop on.
+
+    The replay starts from the target's file, so it would drop a change to the file that the run's fork commit carries
+    and the target lacks: one committed on the local `fork_from` and never pushed. That is `EditRefused` too, before
+    anything is written: the file at the fork commit must be the file at its merge base with the target."""
     path = backlog_path(cfg.work_source)
     if path is None:
         return ""
@@ -462,6 +479,7 @@ def bring_in(cfg: Config, run: Run, worktree: Path, target_sha: str, conflicts: 
         merged = gitops.merged_blob(worktree, path)
         if merged in (gitops.blob_id(worktree, "HEAD", path), gitops.blob_id(worktree, target_sha, path)):
             return ""  # one side's file, as it is: the commit's own check lets it through
+    _check_pushed(cfg, run, worktree, target_sha, path)
     text = replay(cfg, run, worktree, target_sha)
     safeio.write_text(worktree / path, text)
     return gitops.stage_resolved(worktree, path, text.encode("utf-8"))
