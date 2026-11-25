@@ -12,6 +12,9 @@ commit (`commit_checks.RUNNER_COMMITS`), and `state["backlog_sha"]` keeps the ne
 only the main checkout's work tree has), its `ready` status, or nothing; it refuses a start the file says no to.
 `first_commit` makes that commit once the run's worktree exists. `after_output` records the spec and plan a step
 wrote, and `mark_done` sets `status: done` in `finish`, after the base sync and before the audit and the push.
+
+`bring_in` settles the backlog file of the base sync's merge itself: the target's file with the run's own recorded
+changes made on it again (`replay`), staged as the runner's, so `gitops.commit_sync` lets exactly that blob through.
 """
 
 from __future__ import annotations
@@ -34,7 +37,8 @@ from agentflow.state import Run
 CHANGES = ("added", "ready", "spec", "plan", "done")
 _ATTR = {"depends_on": "deps"}  # a backlog key -> its `BacklogItem` attribute, where they differ
 
-__all__ = ["CHANGES", "StartWrite", "after_output", "applies", "first_commit", "mark_done", "plan_start", "write"]
+__all__ = ["CHANGES", "StartWrite", "after_output", "applies", "bring_in", "first_commit", "mark_done", "plan_start",
+           "replay", "write"]
 
 
 @dataclass(frozen=True)
@@ -362,3 +366,93 @@ def mark_done(cfg: Config, run: Run, worktree: Path) -> str | None:
         return None
     return write(cfg, run, worktree, "done", lambda text: backlog_file.set_fields_text(text, item_id, {"status": "done"}),
                  f"Mark {item_id} done in the backlog")
+
+
+# --------------------------------------------------------------------------- the base sync's merge
+
+
+def _decoded(data: bytes | None, what: str) -> str:
+    try:
+        return (data or b"").decode("utf-8")
+    except UnicodeDecodeError:
+        raise backlog_file.EditRefused(f"{what} is not valid UTF-8") from None
+
+
+def _replay_added(text: str, worktree: Path, event: dict, path: str, fork: str) -> str:
+    """`text` with the item the run's `added` commit appended: its block as that commit holds it (read through
+    `gitops.read_blob`; a runner commit, so the comments and unknown keys it copied are the runner's own), or, when the
+    target already has an item with that id, that item, which must be the same one but for its `status`."""
+    item_id = str(event["item"])
+    source = _decoded(gitops.read_blob(worktree, str(event.get("sha") or ""), path, backlog_file.FILE_MAX),
+                      f"{path} at the run's commit adding {item_id}")
+    added = next((i for i in backlog_file.parse(source)[0] if i.id == item_id), None)
+    if added is None:
+        raise backlog_file.EditRefused(f"item {item_id} cannot be read from the run's commit that added it to {path}")
+    there = next((i for i in backlog_file.parse(text)[0] if i.id == item_id), None)
+    if there is not None:
+        if dataclasses.replace(there, status=added.status) != added:
+            raise backlog_file.EditRefused(f"item {item_id} is already in {path} on {fork} as a different item")
+        if there.status in (added.status, "dropped"):  # a person's drop stands, as `mark_done` keeps it
+            return text
+        return backlog_file.set_fields_text(text, item_id, {"status": added.status}, name=path)
+    try:
+        return backlog_file.append_span_text(text if text.strip() else backlog_file.render([]), source, item_id,
+                                             name=path)
+    except backlog_file.EditRefused:
+        return _append(text, added)
+
+
+def replay(cfg: Config, run: Run, worktree: Path, target_sha: str) -> str:
+    """The backlog file for the merge of `target_sha` into the run's branch: the file as commit `target_sha` holds it
+    (read through `gitops.read_blob`; an empty file when it has none) with this run's own recorded changes made on it
+    again, in event order, by `backlog_file`'s text functions, so every other line is the target's.
+
+    An `added` item is appended as the run's commit wrote it (`_replay_added`). For `ready`, `spec`, `plan` and `done`
+    the event's `fields` are set; a `status` is not set on an item that is `dropped` on the target (a person's drop
+    stands, as in `mark_done`). Line endings follow the target's file. `backlog_file.EditRefused` names the item when a
+    change cannot be made (the target removed the item, say)."""
+    path = backlog_path(cfg.work_source)
+    if path is None:
+        raise ValueError("only a backlog pack replays its backlog changes")
+    fork = cfg.project.fork_from
+    worktree = Path(worktree)
+    text = _decoded(gitops.read_blob(worktree, target_sha, path, backlog_file.FILE_MAX), f"{path} on {fork}")
+    for event in run.events.read():
+        if event["type"] != "backlog_updated" or event.get("path", path) != path:
+            continue
+        if event.get("change") == "added":
+            text = _replay_added(text, worktree, event, path, fork)
+            continue
+        item_id = str(event["item"])
+        fields = dict(event.get("fields") or {})
+        there = next((i for i in backlog_file.parse(text)[0] if i.id == item_id), None)
+        if there is not None and there.status == "dropped":
+            fields.pop("status", None)
+        if fields:
+            text = backlog_file.set_fields_text(text, item_id, fields, name=path)
+    if len(text.encode("utf-8")) > backlog_file.FILE_MAX:
+        raise backlog_file.EditRefused(f"the merge would make {path} larger than {backlog_file.FILE_MAX} bytes")
+    return text
+
+
+def bring_in(cfg: Config, run: Run, worktree: Path, target_sha: str, conflicts: list[str]) -> str:
+    """Settle the backlog file of the merge of `target_sha` that `gitops.pull_base` just started, and return the blob
+    the runner staged for it ("" when it had nothing to settle).
+
+    Only a `backlog` pack, and only when git conflicted on the file (it is in `conflicts`) or merged it into something
+    that is neither the branch's (`HEAD`) nor the target's file. The file is then `replay`'s text, written to the work
+    tree (no symlink followed) and staged as exactly those bytes (`gitops.stage_resolved`), so no session is told about
+    it and `gitops.commit_sync` lets that blob, and nothing else, through. `backlog_file.EditRefused` when the replay
+    cannot be made, `OSError`/`ValueError` when the file cannot be written, `gitops.GitError` when it cannot be staged:
+    the merge is left in progress for the caller to stop on."""
+    path = backlog_path(cfg.work_source)
+    if path is None:
+        return ""
+    worktree = Path(worktree)
+    if path not in conflicts:
+        merged = gitops.merged_blob(worktree, path)
+        if merged in (gitops.blob_id(worktree, "HEAD", path), gitops.blob_id(worktree, target_sha, path)):
+            return ""  # one side's file, as it is: the commit's own check lets it through
+    text = replay(cfg, run, worktree, target_sha)
+    safeio.write_text(worktree / path, text)
+    return gitops.stage_resolved(worktree, path, text.encode("utf-8"))

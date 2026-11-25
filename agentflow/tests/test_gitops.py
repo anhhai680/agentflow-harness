@@ -1540,25 +1540,47 @@ def test_commit_sync_refuses_a_forbidden_path_the_merge_decided(tmp_git, cfg):
     assert caught.value.kind == "forbidden_path" and gitops.merge_in_progress(tmp_git)
 
 
-def test_commit_sync_lets_a_clean_path_through_while_it_holds_what_git_merged(tmp_git, cfg):
+def test_commit_sync_lets_the_runners_staged_file_through_while_it_holds_that_blob(tmp_git, cfg):
     other = _auto_merged(tmp_git)
-    merged = gitops.merged_blob(tmp_git, "CONSTRAINTS.md")
-    assert merged and gitops.merged_blob(tmp_git, "no-such-file") == ""
-    sha = gitops.commit_sync(tmp_git, "Merge other", cfg, other, clean_paths={"CONSTRAINTS.md": merged})
+    text = "top\nrules\nbottom\nand the runner's line\n"
+    _write(tmp_git, "CONSTRAINTS.md", text)
+    blob = gitops.stage_resolved(tmp_git, "CONSTRAINTS.md", text.encode())
+    assert blob == gitops.merged_blob(tmp_git, "CONSTRAINTS.md") and gitops.merged_blob(tmp_git, "no-such-file") == ""
+    sha = gitops.commit_sync(tmp_git, "Merge other", cfg, other, runner_blob=("CONSTRAINTS.md", blob))
     assert sha == _head(tmp_git) and not gitops.merge_in_progress(tmp_git)
-    assert run_git(tmp_git, "show", f"{sha}:CONSTRAINTS.md") == "top\nrules\nbottom\n"
+    assert run_git(tmp_git, "show", f"{sha}:CONSTRAINTS.md") == text
+    assert gitops.blob_id(tmp_git, sha, "CONSTRAINTS.md") == blob and gitops.blob_id(tmp_git, sha, "nope") == ""
 
 
-def test_commit_sync_refuses_a_clean_path_changed_after_the_merge(tmp_git, cfg):
+def test_commit_sync_refuses_the_runners_file_changed_after_it_was_staged(tmp_git, cfg):
     other = _auto_merged(tmp_git)
-    merged = gitops.merged_blob(tmp_git, "CONSTRAINTS.md")
-    _write(tmp_git, "CONSTRAINTS.md", "top\nrules\nbottom\nand an edit\n")  # not git's merge any more
+    text = "top\nrules\nbottom\n"
+    blob = gitops.stage_resolved(tmp_git, "CONSTRAINTS.md", text.encode())
+    _write(tmp_git, "CONSTRAINTS.md", text + "and an edit\n")  # a session or a person, after the runner staged it
     with pytest.raises(CommitRejected, match="CONSTRAINTS.md") as caught:
-        gitops.commit_sync(tmp_git, "Merge other", cfg, other, clean_paths={"CONSTRAINTS.md": merged})
+        gitops.commit_sync(tmp_git, "Merge other", cfg, other, runner_blob=("CONSTRAINTS.md", blob))
     assert caught.value.kind == "forbidden_path" and gitops.merge_in_progress(tmp_git)
-    with pytest.raises(CommitRejected) as caught:  # a path with no recorded blob is never exempt
-        gitops.commit_sync(tmp_git, "Merge other", cfg, other, clean_paths={"CONSTRAINTS.md": ""})
-    assert caught.value.kind == "forbidden_path"
+    _write(tmp_git, "CONSTRAINTS.md", text)
+    for exempt in (("CONSTRAINTS.md", ""), ("README.md", blob), None):  # no blob, another path, nothing recorded
+        with pytest.raises(CommitRejected) as caught:
+            gitops.commit_sync(tmp_git, "Merge other", cfg, other, runner_blob=exempt)
+        assert caught.value.kind == "forbidden_path"
+
+
+def test_stage_resolved_settles_a_conflicted_path_with_exactly_those_bytes(tmp_git):
+    run_git(tmp_git, "checkout", "-q", "-b", "other")
+    _write(tmp_git, "README.md", "theirs\n")
+    _commit(tmp_git, "theirs")
+    run_git(tmp_git, "checkout", "-q", "main")
+    _write(tmp_git, "README.md", "ours\n")
+    _commit(tmp_git, "ours")
+    subprocess.run(["git", "merge", "-q", "--no-commit", "--no-ff", "other"], cwd=tmp_git, capture_output=True,
+                   check=False)
+    assert gitops.unmerged_paths(tmp_git) == ["README.md"]
+    _write(tmp_git, "README.md", "both\r\n")
+    blob = gitops.stage_resolved(tmp_git, "README.md", b"both\r\n")
+    shown = subprocess.run(["git", "cat-file", "-p", blob], cwd=tmp_git, capture_output=True, check=True).stdout
+    assert gitops.unmerged_paths(tmp_git) == [] and shown == b"both\r\n"
 
 
 def test_merged_blob_is_empty_for_a_conflicted_path(tmp_git):

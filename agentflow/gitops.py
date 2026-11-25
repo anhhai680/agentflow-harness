@@ -11,7 +11,7 @@ import stat
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -716,9 +716,34 @@ def unmerged_paths(worktree: Path) -> list[str]:
 def merged_blob(worktree: Path, path: str) -> str:
     """The blob id the index holds for `path` at stage 0, that is what a merge in progress staged for it once merged:
     "" when the index has no such entry (the path is absent, or still conflicted). Never raises for a missing path."""
-    proc = subprocess.run(["git", *HARDENED, "rev-parse", "--verify", "--quiet", f":0:{path}"], cwd=Path(worktree),
+    return blob_id(worktree, "", path, stage=True)
+
+
+def blob_id(worktree: Path, sha: str, path: str, stage: bool = False) -> str:
+    """The blob id commit `sha` holds for `path` (with `stage`, the index's stage-0 entry instead), or "" when there is
+    none. Never raises for a missing path."""
+    spec = f":0:{path}" if stage else f"{sha}:{path}"
+    proc = subprocess.run(["git", *HARDENED, "rev-parse", "--verify", "--quiet", spec], cwd=Path(worktree),
                           capture_output=True, text=True, encoding="utf-8", check=False)
     return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def stage_resolved(worktree: Path, path: str, data: bytes) -> str:
+    """Stage `data`, exactly those bytes (no filter), as the regular file `path` of the merge in progress, resolving
+    any conflict on it, and return the blob id. The caller has written the same bytes to the work tree, so a later
+    `add -A` stages that blob again, unless the file changed since (or a filter rewrites it), which `commit_sync`'s
+    check then sees. `GitError` when git fails, or the index does not hold that blob for `path` at stage 0 after."""
+    worktree = Path(worktree)
+    hashed = subprocess.run(["git", *HARDENED, "hash-object", "-w", "--no-filters", "--stdin"], cwd=worktree,
+                            input=data, capture_output=True, check=False)
+    if hashed.returncode != 0:
+        detail = hashed.stderr.decode("utf-8", "replace").strip() or f"exit {hashed.returncode}"
+        raise GitError(f"git hash-object failed: {detail}")
+    blob = hashed.stdout.decode().strip()
+    _git_or_raise(worktree, *HARDENED, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+    if merged_blob(worktree, path) != blob or path in unmerged_paths(worktree):
+        raise GitError(f"the index does not hold {shown(path)} as blob {blob[:12]} after staging it")
+    return blob
 
 
 def pull_base(worktree: Path, target: str, timeout: int = 180) -> PullResult:
@@ -759,16 +784,17 @@ def conflict_markers(worktree: Path, paths: Sequence[str]) -> list[str]:
 
 
 def commit_sync(worktree: Path, message: str, cfg: Config, target_sha: str, expected_head: str | None = None,
-                forbid: Sequence[str] = (), clean_paths: Mapping[str, str] | None = None) -> str:
+                forbid: Sequence[str] = (), runner_blob: tuple[str, str] | None = None) -> str:
     """Conclude the merge in progress with a commit (the trailer appended) and return its sha.
 
     Like `commit`, with these differences: everything is staged, and the forbidden-path check applies to what the
     merge itself decided, that is the paths whose content equals neither the branch's (`HEAD`) nor the target's
     (`target_sha`), against `guardrails.forbidden_paths` and the caller's `forbid`. A forbidden file that only came
     in from the target, or that only the branch changed, passes.
-    `clean_paths` maps a path to the blob git's own conflict-free merge staged for it (`merged_blob`, read right after
-    the pull): such a path passes that check too, but only while what is staged for it is still exactly that blob.
-    A rejected commit leaves the merge in progress."""
+    `runner_blob` is `(path, blob)`: the one file the runner resolved and staged itself (the backlog file,
+    `backlog_writes.bring_in`, recorded on `sync_started`). That path passes the check too, but only while what is
+    staged for it after everything is staged is still exactly that blob: an edit made since, by a session or a person,
+    is refused. A rejected commit leaves the merge in progress."""
     worktree = Path(worktree)
     before = head(worktree)
     if expected_head is not None and before != expected_head:
@@ -793,7 +819,8 @@ def commit_sync(worktree: Path, message: str, cfg: Config, target_sha: str, expe
         return {p for p in out.split("\0") if p}
 
     decided = differing(before) & differing(target_sha)
-    merged = {p for p, blob in (clean_paths or {}).items() if blob and merged_blob(worktree, p) == blob}
+    own, blob = runner_blob or ("", "")
+    merged = {own} if own and blob and merged_blob(worktree, own) == blob else set()
     patterns = [*cfg.guardrails.forbidden_paths, *forbid]
     forbidden = sorted(p for p in decided - merged if any(path_matches(p, g) for g in patterns))
     if forbidden:
