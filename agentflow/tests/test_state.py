@@ -1332,3 +1332,17 @@ def test_a_run_from_before_claims_has_no_claim_key_and_still_loads():
     old = initial_state()
     del old["claim"]  # state.json written before this change
     assert reduce(old, _claim_event(1, "claim_lost", item="crm", why="gone")).get("claim") is None
+
+
+def test_a_claim_lost_stop_waits_behind_the_runs_own_stop():
+    state = reduce(initial_state(), _claim_event(1, "item_claimed", **CLAIM))
+    state = reduce(state, _claim_event(2, "hitl_raised", kind="blocked", key="define/draft", summary="which db?"))
+    state = reduce(state, _claim_event(3, "hitl_raised", kind="claim_lost", key="define/claim", summary="gone"))
+    assert state["waiting"]["key"] == "define/draft" and state["status"] == "waiting_human"
+    assert [w["key"] for w in state["waiting_queue"]] == ["define/claim"]
+    state = reduce(state, _claim_event(4, "hitl_approved", key="define/draft", kind="blocked", summary="which db?"))
+    assert state["waiting"]["key"] == "define/claim" and state["status"] == "waiting_human"
+    state = reduce(state, _claim_event(5, "hitl_raised", kind="claim_lost", key="define/claim", summary="again"))
+    assert state["waiting"]["summary"] == "again" and state["waiting_queue"] == []  # its own key: it replaces itself
+    alone = reduce(initial_state(), _claim_event(1, "hitl_raised", kind="claim_lost", key="plan/claim", summary="x"))
+    assert alone["waiting"]["key"] == "plan/claim" and alone["status"] == "waiting_human"

@@ -424,6 +424,27 @@ def _descends(repo: Path, ancestor: str, sha: str) -> bool:
     return _run(repo, "merge-base", "--is-ancestor", ancestor, sha).returncode == 0
 
 
+def held(cfg: Config, repo: Path, item_id: str, sha: str, run: str) -> Claim:
+    """The claim commit `sha` that this clone made for `run` on `item_id`, read from `repo`'s own objects (no
+    network): what `advance` takes. `ClaimError` when it is not a readable claim of `run` here."""
+    _check_id(item_id)
+    if not isinstance(sha, str) or _FULL_SHA.fullmatch(sha) is None:
+        raise ClaimError(f"not a claim this clone holds: {str(sha)[:80]!r}")
+    found = _load(cfg, repo, item_id, sha)
+    if found.unreadable:
+        raise ClaimError(f"the claim {sha[:12]} on {item_id} can't be read here: {found.unreadable}")
+    if found.run != run:
+        raise ClaimError(f"the claim {sha[:12]} on {item_id} is not run {run}'s")
+    return found
+
+
+def own(repo: Path, held_sha: str, run: str, claim: Claim | None) -> bool:
+    """`claim` (one `Lost` carries) is a newer claim of the same run: the run id `run`, on a commit built on
+    `held_sha`, as another process of the run makes it. Another machine's claim starts from a root commit."""
+    return (claim is not None and not claim.unreadable and claim.run == run
+            and _descends(repo, held_sha, claim.sha))
+
+
 def _settle(cfg: Config, repo: Path, held: Claim, expected: str, proc: subprocess.CompletedProcess,
             retried: bool) -> Claim | None:
     """After a leased push on `expected` failed: the claim of the same run to retry on, or None when the ref is

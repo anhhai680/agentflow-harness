@@ -7,14 +7,18 @@ import threading
 from pathlib import Path
 
 import pytest
+import test_conformance
 from conftest import run_git
-from test_backlog_runs import BacklogFlow
+from test_backlog_runs import DONE_ACT, PLAN_TEXT, SPEC, SPEC_TEXT, BacklogFlow
 from test_claims import OTHER, remote_refs, run_git_input, second_clone
 
-from agentflow import claims, pipeline, slots, work_source
-from agentflow.pipeline import RunOptions, start
+from agentflow import claim_sync, claims, conditions, pipeline, run_control, slots, work_source
+from agentflow.hitl import approve
+from agentflow.pipeline import RunOptions, advance, start
 from agentflow.state import Run, list_runs, runs_root
 
+# The fake `gh` fixture of whole runs, bound by assignment so pytest finds it here.
+ci_gh = test_conformance.ci_gh
 
 class ClaimFlow(BacklogFlow):
     """`BacklogFlow` with claims on, and its `next` (the fork, with `backlog.yml`) pushed to `origin`, so a second
@@ -251,3 +255,222 @@ def test_a_new_item_is_claimed_by_its_id(cflow):
     assert "n" not in [i.id for i in work_source.items_at(cfg, root, state["base_sha"])]
     worktree = Path(state["worktree"])
     assert "n" in [i.id for i in work_source.items_at(cfg, worktree, run_git(worktree, "rev-parse", "HEAD").strip())]
+
+
+# --------------------------------------------------------------------------- the claim follows the run (Task 6)
+
+
+def _plan_script(cflow, run) -> None:
+    """Script the define and plan steps of `run`: the draft writes the spec, the plan step the plan."""
+    values = conditions.make_ctx(cflow.cfg, cflow.repo.root, "feature", run.state["params"], run).values
+    cflow.repo.script({"define/draft": [{"write": {SPEC: SPEC_TEXT}, **DONE_ACT}],
+                       "plan/plan": [{"write": {values["plan_target"]: PLAN_TEXT}, **DONE_ACT}]})
+
+
+def _defined(cflow) -> Run:
+    """A `feature` run of `b`, advanced to the define phase's approval."""
+    run = start(cflow.cfg, cflow.repo.root, "feature", {"module": "b"}, RunOptions(to_phase="plan"))
+    _plan_script(cflow, run)
+    assert advance(run, cflow.cfg, RunOptions(to_phase="plan")) == "awaiting_approval"
+    return run
+
+
+def _moves(run: Run) -> list[tuple[str, str]]:
+    return [(e["phase"], e["status"]) for e in run.events.read() if e["type"] == "claim_advanced"]
+
+
+def _on_origin(cflow, item: str = "b") -> tuple[str, str, str] | None:
+    found = claims.read(cflow.cfg, cflow.repo.root, item)
+    return None if found is None else (found.run, found.phase, found.status)
+
+
+def _count_pushes(monkeypatch) -> list[tuple[str, ...]]:
+    """Every git call `claims` makes from here on (pushes among them)."""
+    calls: list[tuple[str, ...]] = []
+    real = claims._run
+
+    def spy(repo, *args, **kwargs):
+        calls.append(args)
+        return real(repo, *args, **kwargs)
+
+    monkeypatch.setattr(claims, "_run", spy)
+    return calls
+
+
+def test_the_claim_follows_the_run(cflow, monkeypatch):
+    run = _defined(cflow)
+    assert _on_origin(cflow) == (run.id, "define", "waiting")
+    approve(run, "define", by="me")
+    assert advance(run, cflow.cfg, RunOptions(to_phase="plan")) == "awaiting_approval"
+    assert _on_origin(cflow) == (run.id, "plan", "waiting")
+    assert _moves(run) == [("define", "waiting"), ("define", "running"), ("plan", "running"), ("plan", "waiting")]
+    state = run.refresh()
+    assert (state["claim"]["phase"], state["claim"]["status"]) == ("plan", "waiting")
+    assert state["claim"]["sha"] == _claim_refs(cflow.repo)[claims.ref(cflow.cfg, "b")]
+    calls = _count_pushes(monkeypatch)
+    assert claim_sync.sync(cflow.cfg, run) is True
+    assert calls == [] and len(_moves(run)) == 4  # no change: nothing pushed, nothing recorded
+
+
+def test_pause_and_resume_move_the_claim(cflow, monkeypatch):
+    cfg, root = cflow.cfg, cflow.repo.root
+    run = start(cfg, root, "feature", {"module": "b"}, RunOptions(to_phase="plan"))
+    _plan_script(cflow, run)
+    run_control.pause(run, "me", cfg=cfg)
+    assert _on_origin(cflow) == (run.id, "define", "paused")
+    assert run_control.resume(run, "me") is True  # no config given: the run's own is loaded
+    assert _on_origin(cflow) == (run.id, "define", "running")
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "awaiting_approval"
+    assert _moves(run) == [("define", "paused"), ("define", "running"), ("define", "waiting")]
+    approve(run, "define", by="me")
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("the runner died here")
+
+    monkeypatch.setattr(pipeline, "write_handoff", crash)
+    with pytest.raises(RuntimeError, match="died"):
+        advance(run, cfg, RunOptions(to_phase="plan"))
+    assert run.refresh()["status"] == "error"
+    assert _on_origin(cflow) == (run.id, "define", "stopped")
+
+
+def test_cancel_fail_and_archive_release(cflow):
+    cfg, root = cflow.cfg, cflow.repo.root
+    cancelled = start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    run_control.cancel(cancelled, "me", cfg=cfg)
+    assert claims.read(cfg, root, "b") is None
+
+    failed = start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    failed.emit("run_failed", reason="a step failed")
+    assert advance(failed, cfg, RunOptions()) == "failed"
+    assert claims.read(cfg, root, "b") is None
+
+    archived = start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    archived.emit("run_finished")
+    assert claim_sync.sync(cfg, archived) is True  # a done run keeps its claim
+    assert _on_origin(cflow) == (archived.id, "define", "waiting")
+    run_control.archive(archived, "me")
+    assert claims.read(cfg, root, "b") is None and _claim_refs(cflow.repo) == {}
+    for run, reason in ((cancelled, "cancelled"), (failed, "failed"), (archived, "archived")):
+        assert [e["reason"] for e in run.events.read() if e["type"] == "claim_released"] == [reason]
+        assert run.refresh()["claim"]["released"] is True
+        assert claim_sync.sync(cfg, run) is True and _types(run).count("claim_released") == 1
+
+
+def test_a_done_run_keeps_its_claim_at_the_last_phase(cflow, ci_gh):
+    from test_backlog_runs import _whole, _walk
+
+    run, _ = _whole(cflow, claims=True)
+    assert _walk(cflow, run) == "done", run.state["waiting"]
+    last = list(cflow.cfg.phases)[-1]
+    assert run.refresh()["phase"] == last
+    assert _on_origin(cflow) == (run.id, last, "waiting")
+    assert claims.ref(cflow.cfg, "b") in _claim_refs(cflow.repo)
+    assert not run.state["claim"]["released"] and "claim_released" not in _types(run)
+
+
+def _delete_on_origin(cflow, tmp_path: Path) -> None:
+    other = cflow.clone(tmp_path, "Eve")
+    run_git(other, "push", "-q", "origin", f":{claims.ref(cflow.cfg, 'b')}")
+
+
+def test_a_deleted_claim_stops_the_run(cflow, tmp_path, monkeypatch):
+    cfg = cflow.cfg
+    run = _defined(cflow)
+    _delete_on_origin(cflow, tmp_path)
+    approve(run, "define", by="me")
+    calls = _count_pushes(monkeypatch)
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"
+    state = run.refresh()
+    waiting = state["waiting"]
+    assert waiting["kind"] == "claim_lost" and "gone" in waiting["summary"] and "b" in waiting["summary"]
+    assert "claim_lost" in _types(run) and state["claim"]["lost"] is True
+    assert claims.read(cfg, cflow.repo.root, "b") is None  # nothing was pushed over it
+    assert [c for c in calls if c[0] == "push"] and all("--force-with-lease" in " ".join(c) for c in calls
+                                                        if c[0] == "push")
+    assert "phase_started" not in [e["type"] for e in run.events.read() if e.get("phase") == "plan"]
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"  # still stopped: nothing re-claimed
+    assert _types(run).count("item_claimed") == 1
+
+    approve(run, waiting["key"], by="me")
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "awaiting_approval"
+    state = run.refresh()
+    assert _types(run).count("item_claimed") == 2 and state["claim"]["lost"] is False
+    assert state["steps"][waiting["key"]]["status"] == "done"
+    assert state["waiting"]["kind"] == "phase_approval" and state["waiting"]["phase"] == "plan"
+    assert _on_origin(cflow) == (run.id, "plan", "waiting")
+
+
+def test_a_claim_taken_by_another_run_stops_again(cflow, tmp_path):
+    cfg = cflow.cfg
+    run = _defined(cflow)
+    other = cflow.clone(tmp_path)
+    run_git(other, "push", "-q", "origin", f":{claims.ref(cfg, 'b')}")
+    theirs = claims.create(cfg, other, "b", run=OTHER, lane="feature", phase="build")  # it is overwritten
+    approve(run, "define", by="me")
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"
+    waiting = run.refresh()["waiting"]
+    assert waiting["kind"] == "claim_lost" and "Other" in waiting["summary"] and OTHER in waiting["summary"]
+    approve(run, waiting["key"], by="me")
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"
+    again = run.refresh()["waiting"]
+    assert again["kind"] == "claim_lost" and "Other" in again["summary"] and OTHER in again["summary"]
+    assert _types(run).count("claim_lost") == 2 and _types(run).count("item_claimed") == 1
+    assert _claim_refs(cflow.repo)[claims.ref(cfg, "b")] == theirs.sha  # theirs stands
+
+
+def test_origin_going_away_mid_run_does_not_stop_it(cflow, tmp_path):
+    cfg, origin = cflow.cfg, cflow.repo.origin
+    run = start(cfg, cflow.repo.root, "feature", {"module": "b"}, RunOptions(to_phase="plan"))
+    _plan_script(cflow, run)
+    shutil.move(origin, tmp_path / "moved.git")
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "awaiting_approval"
+    [failed] = [e for e in run.events.read() if e["type"] == "claim_sync_failed"]
+    assert failed["item"] == "b" and failed["action"] == "advance"
+    assert len(failed["error"]) <= 300 and "\n" not in failed["error"]
+    state = run.refresh()
+    assert state["status"] == "awaiting_approval" and not state["claim"]["lost"]
+    assert (state["claim"]["phase"], state["claim"]["status"]) == ("define", "running")
+    shutil.move(tmp_path / "moved.git", origin)
+    assert claim_sync.sync(cfg, run) is True
+    assert _on_origin(cflow) == (run.id, "define", "waiting")
+
+
+def test_an_interrupted_start_stops_on_its_next_advance(cflow, monkeypatch):
+    cfg, root = cflow.cfg, cflow.repo.root
+    real = pipeline._set_up
+
+    def interrupted(*args, **kwargs):
+        real(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pipeline, "_set_up", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        start(cfg, root, "feature", {"module": "b"}, RunOptions(to_phase="plan"))
+    monkeypatch.setattr(pipeline, "_set_up", real)
+    [run] = list_runs(root)
+    assert [e["reason"] for e in run.events.read() if e["type"] == "claim_released"] == ["interrupted"]
+    assert claims.read(cfg, root, "b") is None
+    _plan_script(cflow, run)
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"  # never a silent claim again
+    waiting = run.refresh()["waiting"]
+    assert waiting["kind"] == "claim_lost" and "interrupted" in waiting["summary"]
+    assert _types(run).count("item_claimed") == 1 and claims.read(cfg, root, "b") is None
+    approve(run, waiting["key"], by="me")
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "awaiting_approval"
+    assert _on_origin(cflow) == (run.id, "define", "waiting")
+
+
+def test_a_claim_lost_at_a_step_stop_waits_behind_it(cflow, tmp_path):
+    cfg = cflow.cfg
+    run = start(cfg, cflow.repo.root, "feature", {"module": "b"}, RunOptions(to_phase="plan"))
+    cflow.repo.script({"define/draft": [{"result": {"status": "blocked", "summary": "which database?"}}]})
+    _delete_on_origin(cflow, tmp_path)
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"
+    state = run.refresh()
+    assert state["waiting"]["key"] == "define/draft" and state["waiting"]["kind"] != "claim_lost"  # kept
+    assert [w["kind"] for w in state["waiting_queue"]] == ["claim_lost"] and state["claim"]["lost"]
+    approve(run, "define/draft", by="me")
+    assert run.refresh()["waiting"]["kind"] == "claim_lost"
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"  # nothing claimed until a person says
+    assert _types(run).count("item_claimed") == 1 and claims.read(cfg, cflow.repo.root, "b") is None

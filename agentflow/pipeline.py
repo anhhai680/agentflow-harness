@@ -57,7 +57,7 @@ from agentflow.autonomy import (
     runner_settles,
 )
 from agentflow import (
-    backlog_writes, claim_sync, claims, constraint, doubt, governor, pack, preflight, route_lane, run_env, safeio, slots, speculation,
+    backlog_writes, claim_sync, constraint, doubt, governor, pack, preflight, route_lane, run_env, safeio, slots, speculation,
     work_source,
 )
 from agentflow.commit_checks import runner_head
@@ -212,14 +212,16 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
         with slots.starting(cfg, repo) as take:
             run = Run.create(cfg, repo, pipeline, params, run_id=claimed[0] if claimed else None)
             if claimed:
-                claim_sync.record(run, claimed[1], claims.ref(cfg, claimed[1].item))
+                claim_sync.record(cfg, run, claimed[1])
             take(run)
         _set_up(cfg, repo, run, pipeline, params, inputs, opts, warnings, first)
     except BaseException as exc:  # once the run exists it must never be left `running` with nothing behind it
         if run is not None and isinstance(exc, Exception):
             run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}")
-        if claimed:  # and no claim outlives the start that made it
-            why = claim_sync.release_start(cfg, repo, run, claimed[1])
+        if claimed:  # and no claim outlives the start that made it; an interrupted start's run stays `running`, and
+            # its next `sync` stops it (`claim_lost`) rather than claim again by itself
+            why = claim_sync.release_start(cfg, repo, run, claimed[1],
+                                           "failed" if isinstance(exc, Exception) else "interrupted")
             if why and run is None:
                 exc.add_note(f"the claim on {claimed[1].item} is still on origin ({why}): "
                              f"agentflow backlog release {claimed[1].item} frees it")
@@ -305,7 +307,8 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
     An unexpected exception is recorded as `runner_error` (the run's status becomes `error`, which a
     `resume` goes on from) before the lock is released and the exception goes on to the caller. Taking the run's
     slot comes first: `slots.SlotsFull` (or any failure of that step) releases the lock and is raised with no
-    `runner_error`, so the run's status is left as it was."""
+    `runner_error`, so the run's status is left as it was. The run's claim on its backlog item follows the status it
+    ends this turn with (`claim_sync.sync_quietly`), before the slot and the issue label are released."""
     if run.refresh().get("pipeline") == RETRO_PIPELINE:  # it walks no phase: resuming one would run the whole workflow
         raise ValueError(f"{run.id} is a retro run, which cannot be resumed; cancel it and run `agentflow retro` again")
     lock = run.lock()
@@ -323,8 +326,11 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
         run.emit("runner_error", error=str(exc) or repr(exc), exception=type(exc).__name__)
         raise
     finally:
-        lock.release()
-        release(run)  # after the lock, and it never raises, so it cannot hide the exception on its way out
+        try:
+            claim_sync.sync_quietly(cfg, run)  # never raises, so it cannot hide the exception on its way out
+        finally:
+            lock.release()
+            release(run)  # after the lock, and it never raises, so it cannot hide the exception on its way out
 
 
 class _Loop:
@@ -419,6 +425,8 @@ class _Loop:
             self.opts.to_phase = None
         if state["status"] in ("paused", "error", "ready"):  # a human resumed, or the last runner stopped on an error
             run.emit("run_resumed")
+        if not claim_sync.sync(self.cfg, run):  # the claim on the backlog item was lost: a person decides
+            return self.status()
         self.record_env()
         self.tell_speculative()
         names = list(self.cfg.phases)
@@ -521,6 +529,8 @@ class _Loop:
             if executor.route_record() is not None:  # a plan bigger than the triage said raises the route first
                 executor.reroute(tasks=executor.plan_open_tasks(), risk=False)
             run.emit("phase_started", phase=name, start_sha=head(self.worktree))
+            if not claim_sync.sync(self.cfg, run):
+                return self.status()
         outcome, ran = self.walk(phase, executor)
         if outcome == "stopped":
             return self.status()

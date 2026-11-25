@@ -496,12 +496,12 @@ PLAN_TEXT = "# Plan: b\n\n### Task 1: One\n\n**Depends on:** none\n\n- [ ] **Ste
 NOTED = BACKLOG_YML.replace("    status: ready\n", "    status: ready\n    notes: Seen by a teammate\n")
 
 
-def _whole(bflow, module: str = "b", new_module: dict | None = None, **acts: list[dict]):
+def _whole(bflow, module: str = "b", new_module: dict | None = None, claims: bool = False, **acts: list[dict]):
     """A `feature` run of item `module` (`b`) with the workflow as shipped and the `ok` gate, started and not advanced;
-    its define and plan steps write the spec and the plan."""
+    its define and plan steps write the spec and the plan. `claims` turns `backlog.claims` on."""
     from test_ci import PIPE
 
-    bflow.repo.configure({**PIPE, "work_source": {"kind": "backlog", "path": None}, "backlog": {"claims": False}},
+    bflow.repo.configure({**PIPE, "work_source": {"kind": "backlog", "path": None}, "backlog": {"claims": claims}},
                          autopilot=True)
     run = start(bflow.cfg, bflow.repo.root, "feature", {"module": module}, RunOptions(new_module=new_module))
     values = conditions.make_ctx(bflow.cfg, bflow.repo.root, "feature", run.state["params"], run).values

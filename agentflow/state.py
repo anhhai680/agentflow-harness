@@ -562,7 +562,10 @@ def _on_hitl_raised(state: dict, ev: dict) -> None:
     if state["status"] in TERMINAL:  # a stop raised after a cancel is logged, never a wait to act on
         return
     state.setdefault("parked", {}).pop(key, None)  # a parked stop that stops the run is now the wait
-    if _approval_pending(state):
+    current = state["waiting"]
+    # A lost claim is found after the turn's own stop was raised (`claim_sync.sync`): that stop stays the wait.
+    behind = ev["kind"] == "claim_lost" and current is not None and current.get("key") != key
+    if _approval_pending(state) or behind:
         state["waiting_queue"].append(wait)  # the approval stays; this one is shown once it ends
     else:
         state["waiting"] = wait
