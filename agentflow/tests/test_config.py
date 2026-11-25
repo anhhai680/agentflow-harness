@@ -3355,6 +3355,28 @@ def test_ignore_specs_accepts_a_list_of_globs(tmp_cfg, tmp_path):
     assert not [e for e in found if e[1].startswith("backlog")]
 
 
+def test_backlog_claim_keys_default_and_load(tmp_cfg):
+    policy = load_config(tmp_cfg(None)).backlog
+    assert (policy.claims, policy.claim_ref, policy.claim_stale_h) == (True, "refs", 24)
+    block = {"backlog": {"claims": False, "claim_ref": "branch", "claim_stale_h": 48}}
+    policy = load_config(tmp_cfg(block)).backlog
+    assert (policy.claims, policy.claim_ref, policy.claim_stale_h) == (False, "branch", 48)
+
+
+@pytest.mark.parametrize("key, value", [
+    ("claims", "yes"), ("claim_ref", "tag"), ("claim_stale_h", 0), ("claim_stale_h", 721),
+    ("claim_stale_h", True), ("claim_stale_h", "24"),
+])
+def test_validate_refuses_bad_claim_keys(tmp_cfg, tmp_path, key, value):
+    found = _blg(tmp_cfg, tmp_path, "version: 1\nitems: []\n", {"backlog": {key: value}})
+    assert [(level, where) for level, where, _ in found if where.startswith("backlog")] == [("error", f"backlog.{key}")]
+
+
+def test_a_claim_ref_of_branch_with_claims_off_is_no_error(tmp_cfg, tmp_path):
+    found = _blg(tmp_cfg, tmp_path, "version: 1\nitems: []\n", {"backlog": {"claims": False, "claim_ref": "branch"}})
+    assert not [e for e in found if e[1].startswith("backlog")]
+
+
 def test_backlog_checks_only_run_for_a_backlog_pack(tmp_cfg, tmp_path):
     (tmp_path / "backlog.yml").write_text("version: 2\n", encoding="utf-8")
     baseline = [(i.level, i.path) for i in validate(load_config(tmp_cfg(None)), tmp_path)]

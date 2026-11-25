@@ -1458,3 +1458,28 @@ def test_yaml_text_with_a_bad_backlog_ignore_specs_is_a_validate_error(sparse_re
     text = path.read_text(encoding="utf-8") + "backlog:\n  ignore_specs: ['../x']\n"
     proposal = config_edit.propose(path, sha, text=text, repo=path.parents[1])
     assert [(i.level, i.path) for i in proposal.errors] == [("error", "backlog.ignore_specs[0]")]
+
+
+def test_the_settings_form_saves_the_claim_keys(sparse_repo):
+    path = _sparse(sparse_repo)
+    fields = _fields(path)
+    assert fields[("backlog", "claims")]["kind"] == "bool"
+    assert fields[("backlog", "claim_ref")]["kind"] == "enum"
+    assert fields[("backlog", "claim_ref")]["options"] == ["refs", "branch"]
+    assert fields[("backlog", "claim_stale_h")]["kind"] == "int"
+    assert (fields[("backlog", "claim_stale_h")]["min"], fields[("backlog", "claim_stale_h")]["max"]) == (1, 720)
+    assert (fields[("backlog", "claims")]["value"], fields[("backlog", "claim_ref")]["value"],
+            fields[("backlog", "claim_stale_h")]["value"]) == (True, "refs", 24)
+    proposal = _sparse_form(path, (["backlog", "claims"], False), (["backlog", "claim_ref"], "branch"),
+                            (["backlog", "claim_stale_h"], 48))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    policy = load_config(path).backlog
+    assert (policy.claims, policy.claim_ref, policy.claim_stale_h) == (False, "branch", 48)
+    assert _fields(path)[("backlog", "claim_ref")]["source"] == "project"
+
+
+@pytest.mark.parametrize("key, value", [("claim_ref", "tag"), ("claim_stale_h", 0), ("claim_stale_h", 721), ("claims", "yes")])
+def test_the_settings_form_refuses_a_bad_claim_value(sparse_repo, key, value):
+    with pytest.raises(EditError):
+        _sparse_form(_sparse(sparse_repo), (["backlog", key], value))
