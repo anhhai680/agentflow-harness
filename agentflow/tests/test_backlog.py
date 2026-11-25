@@ -2,23 +2,28 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
 import pytest
-from agentflow import backlog, finished, module_queue, run_control, vuln
+from agentflow import backlog, claims, finished, module_queue, run_control, vuln
 from agentflow.flow import main
 from agentflow.backlog import Invalid, Refused
 from agentflow.state import Run, runs_root
 
 from conftest import ENGINE, add_vuln_lane, prime, release, run_git
 from agentflow.views import lane_first_phase
+import test_claim_runs
 import test_vuln
+from test_claim_runs import _defined
 from test_vuln import OTHER_MANIFEST, SIBLING, _alert
 
 GH_BIN = ENGINE / "tests" / "bin"
+cflow = test_claim_runs.cflow  # a backlog pack with claims on and a second clone (bound so pytest finds it here)
 # A is merged, B and C depend on A, D depends on B (the plan's example).
 MAP = """# Capability map
 
@@ -2208,3 +2213,257 @@ def test_a_new_module_card_is_refused_in_a_backlog_pack(bbk):
                                       r"POST /api/backlog/file$"):
         backlog.add(bbk.cfg, bbk.root, "feature", fields)
     assert backlog.Backlog.load(bbk.root).items == {}
+
+
+# --------------------------------------------------------------------------- other machines' claims (B3, D5, D9)
+
+CLAIM_YML = """version: 1
+items:
+  - {id: a, title: Alpha, status: ready}
+  - {id: b, title: Bee, status: ready}
+"""
+CLAIM_RUN = "20261125-0930-feature-b"
+
+
+class ClaimBoard:
+    """A `backlog` pack with claims on, its `next` (with `backlog.yml`) on `origin`, and a second clone, "Other",
+    that claims items there."""
+
+    def __init__(self, flow_repo, tmp_path: Path, yml: str = CLAIM_YML) -> None:
+        from test_claims import second_clone
+
+        self.fr, self.root = flow_repo, flow_repo.root
+        flow_repo.configure({"work_source": {"kind": "backlog", "path": None}, "backlog": {"claims": True}})
+        self.commit(yml)
+        self.other = second_clone(flow_repo, tmp_path)
+
+    @property
+    def cfg(self):
+        return self.fr.cfg
+
+    def commit(self, yml: str) -> None:
+        write(self.root, "backlog.yml", yml)
+        run_git(self.root, "add", "-A")
+        run_git(self.root, "commit", "-q", "-m", "backlog")
+        run_git(self.root, "push", "-q", "origin", "next")
+
+    def claim(self, item: str, status: str = "running", phase: str = "plan", run: str = CLAIM_RUN):
+        return claims.create(self.cfg, self.other, item, run=run, lane="feature", phase=phase, status=status)
+
+    def push_raw(self, item: str, files: dict[str, str]) -> None:
+        """A claim commit holding `files` ({name: text}), pushed from the other clone to `item`'s claim ref."""
+        from test_claims import run_git_input
+
+        lines = ""
+        for name, text in files.items():
+            blob = run_git_input(self.other, text, "hash-object", "-w", "--stdin").strip()
+            lines += f"100644 blob {blob}\t{name}\n"
+        tree = run_git_input(self.other, lines, "mktree").strip()
+        sha = run_git(self.other, "commit-tree", tree, "-m", "by hand").strip()
+        run_git(self.other, "push", "-q", "origin", f"{sha}:{claims.ref(self.cfg, item)}")
+
+    def snap(self, **kw) -> dict:
+        return backlog.snapshot(self.cfg, self.root, **kw)
+
+    def remote(self, **kw) -> dict[str, dict]:
+        return {c["id"]: c for c in self.snap(**kw)["remote_claims"]}
+
+    def take_origin_away(self) -> None:
+        shutil.move(str(self.fr.origin), str(self.fr.origin.with_name("gone.git")))
+
+
+@pytest.fixture
+def cb(flow_repo, tmp_path) -> ClaimBoard:
+    return ClaimBoard(flow_repo, tmp_path)
+
+
+def test_a_teammates_board_shows_my_runs_phase_and_status(cflow, tmp_path):
+    from agentflow.views import board
+
+    run = _defined(cflow)  # clone A: a run of `b` waiting for the define approval
+    other = cflow.clone(tmp_path)
+    assert "module:b" in {c["key"] for c in board(other, cflow.cfg)["backlog"]}  # not refreshed yet: no claim known
+    backlog.refresh(cflow.cfg, other)
+    data = board(other, cflow.cfg)
+    assert [(c["id"], c["column"], c["phase"], c["status"], c["by"], c["run"]) for c in data["remote_claims"]] == [
+        ("b", "define", "define", "waiting", "Test", run.id)]
+    assert data["claims_note"] == ""
+    assert "module:b" not in {c["key"] for c in data["backlog"]}
+    assert board(other, cflow.cfg, lane="bug")["remote_claims"] == []
+    mine = board(cflow.repo.root, cflow.cfg)  # A's own Board shows its run, never its own claim as a remote one
+    backlog.refresh(cflow.cfg, cflow.repo.root)
+    assert board(cflow.repo.root, cflow.cfg)["remote_claims"] == [] and mine["remote_claims"] == []
+
+
+def _board_state(cb: ClaimBoard, item: str = "b") -> str:
+    snap = cb.snap()
+    remote = {c["id"]: c for c in snap["remote_claims"]}
+    cards = {c["id"]: c for c in snap["cards"] if c["kind"] == "module"}
+    if item in remote:
+        return f"claim {remote[item]['status']}"
+    if item in cards:
+        return "blocked" if cards[item]["status"] == "blocked" else cards[item]["planning"]
+    if item in [d["id"] for d in snap["done"]]:
+        return "done"
+    if item in [d["id"] for d in snap["dropped"]]:
+        return "dropped"
+    return "run"
+
+
+def _done_evidence(root: Path, item: str) -> None:
+    """Record `item` as done by the last assessment (what a merge or the spec on origin leaves in `queue.json`)."""
+    path = runs_root(root) / "queue.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for entry in data["modules"]:
+        if entry["id"] == item:
+            entry.update(status="done", done_reason=finished.MERGED)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+@pytest.mark.parametrize("b_line, evidence, local, claim, board_state, view_state", [
+    ("{id: b, title: Bee, status: dropped}", False, False, "running", "dropped", "dropped"),
+    ("{id: b, title: Bee, status: done}", False, False, "running", "done", "done"),
+    ("{id: b, title: Bee, status: ready}", True, False, "waiting", "done", "done"),
+    ("{id: b, title: Bee, status: ready}", False, True, "running", "run", "build"),
+    ("{id: b, title: Bee, status: ready}", False, False, "running", "claim running", "plan"),
+    ("{id: b, title: Bee, status: ready}", False, False, "waiting", "claim waiting", "plan"),
+    ("{id: b, title: Bee, status: backlog}", False, False, "paused", "claim paused", "plan"),
+    ("{id: b, title: Bee, status: ready, depends_on: [a]}", False, False, "stopped", "claim stopped", "plan"),
+    ("{id: b, title: Bee, status: ready, depends_on: [a]}", False, False, None, "blocked", "blocked"),
+    ("{id: b, title: Bee, status: ready}", False, False, None, "ready", "ready"),
+    ("{id: b, title: Bee, status: backlog}", False, False, None, "backlog", "backlog"),
+])
+def test_d5_precedence_table(flow_repo, tmp_path, b_line, evidence, local, claim, board_state, view_state):
+    cb = ClaimBoard(flow_repo, tmp_path, CLAIM_YML.replace("{id: b, title: Bee, status: ready}", b_line))
+    if claim:
+        cb.claim("b", status=claim)
+    if local:
+        run = Run.create(cb.cfg, cb.root, "feature", {"module": "b"})
+        run.emit("phase_started", phase="build")
+    backlog.refresh(cb.cfg, cb.root)
+    if evidence:
+        _done_evidence(cb.root, "b")
+    assert _board_state(cb) == board_state
+    view = {v["id"]: v for v in backlog.backlog_view(cb.cfg, cb.root)}  # `agentflow backlog list`: origin, live
+    assert view["b"]["state"] == view_state
+    if board_state.startswith("claim"):
+        assert view["b"]["claim"]["status"] == claim and view["b"]["detail"].startswith("claimed by Other (")
+    else:
+        assert view["b"]["claim"] is None
+
+
+def test_a_claim_for_an_item_this_file_lacks_is_still_shown(cb):
+    cb.claim("newone", phase="define", status="waiting")
+    backlog.refresh(cb.cfg, cb.root)
+    found = cb.remote()["newone"]
+    assert (found["key"], found["title"], found["lane"], found["column"], found["by"]) == (
+        "claim:newone", "newone", "feature", "define", "Other")
+    assert {v["id"]: v for v in backlog.backlog_view(cb.cfg, cb.root)}["newone"]["state"] == "define"
+
+
+def test_stale_and_unreadable_claims(cb):
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    then = (now - timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cb.push_raw("b", {"claim.json": json.dumps({"item": "b", "run": CLAIM_RUN, "lane": "feature", "phase": "build",
+                                                "status": "running", "by": "Other", "started": then,
+                                                "updated": then}) + "\n"})
+    cb.push_raw("a", {"other.json": "{}\n"})  # forged: no claim.json at all
+    backlog.refresh(cb.cfg, cb.root)
+    found = cb.remote(now=now)
+    old, forged = found["b"], found["a"]
+    assert old["stale"] is True and abs(old["age_s"] - 90000) < 600 and old["column"] == "build"
+    assert old["unreadable"] == ""
+    assert forged["unreadable"] and "claim.json" in forged["unreadable"]
+    assert (forged["column"], forged["phase"], forged["status"], forged["by"], forged["run"]) == (
+        "Backlog", "", "", "", "")
+    assert forged["stale"] is False and forged["age_s"] is None and forged["title"] == "Alpha"
+    fresh = cb.claim("newone")
+    backlog.refresh(cb.cfg, cb.root)
+    assert cb.remote()["newone"]["stale"] is False and fresh.status == "running"
+
+
+def test_begin_start_refuses_a_cached_claim(cb):
+    cb.claim("b", status="waiting")
+    backlog.refresh(cb.cfg, cb.root)
+    with pytest.raises(Refused, match=rf"b is claimed by Other \(run {CLAIM_RUN}, plan, waiting"):
+        backlog.begin_start(cb.cfg, cb.root, "module:b")
+    log = runs_root(cb.root) / backlog.LOG_NAME
+    assert not log.is_file() or "item_starting" not in log.read_text(encoding="utf-8")
+    assert backlog.begin_start(cb.cfg, cb.root, "module:a").params == {"module": "a"}  # a claim on b holds only b
+
+
+def test_refresh_keeps_old_claims_when_origin_is_unreachable(cb):
+    cb.claim("b")
+    backlog.refresh(cb.cfg, cb.root)
+    assert cb.snap()["claims_note"] == ""
+    cb.take_origin_away()
+    backlog.refresh(cb.cfg, cb.root)
+    snap = cb.snap()
+    assert snap["claims_note"].startswith("could not read claims on origin: ") and "\n" not in snap["claims_note"]
+    assert len(snap["claims_note"]) <= 300
+    assert [c["id"] for c in snap["remote_claims"]] == ["b"]
+
+
+def test_claims_off_says_why(cb):
+    cb.claim("b")
+    backlog.refresh(cb.cfg, cb.root)
+    cfg = cb.fr.configure({"work_source": {"kind": "backlog", "path": None}, "backlog": {"claims": False}})
+    snap = backlog.snapshot(cfg, cb.root)  # the setting counts at once, before any refresh
+    assert snap["remote_claims"] == [] and snap["claims_note"] == "claims are off: backlog.claims is false"
+    backlog.refresh(cfg, cb.root)
+    assert backlog.snapshot(cfg, cb.root)["claims_note"] == "claims are off: backlog.claims is false"
+    cfg = cb.fr.configure({"work_source": {"kind": "backlog", "path": None}, "backlog": {"claims": True}})
+    run_git(cb.root, "remote", "remove", "origin")
+    backlog.refresh(cfg, cb.root)
+    assert backlog.snapshot(cfg, cb.root)["claims_note"] == "claims are off: this clone has no origin remote"
+
+
+def test_snapshot_reads_no_network(cb, monkeypatch):
+    from agentflow.views import board
+
+    cb.claim("b")
+    backlog.refresh(cb.cfg, cb.root)
+
+    def no_git(*args, **kwargs):
+        raise AssertionError("the snapshot ran git")
+
+    monkeypatch.setattr(claims, "_run", no_git)
+    assert [c["id"] for c in cb.snap()["remote_claims"]] == ["b"]
+    assert [c["id"] for c in board(cb.root, cb.cfg)["remote_claims"]] == ["b"]
+
+
+@pytest.mark.parametrize("cached", [
+    "not a dict",
+    {"b": "text"},
+    {"../b": {"sha": "a" * 40, "unreadable": "x"}},
+    {"b": {"sha": "nope", "unreadable": "x"}},
+    {"b": {"sha": "a" * 40, "unreadable": "line\nbreak <img src=x onerror=1>" + "y" * 5000}},
+    {"b": {"sha": "a" * 40, "unreadable": "", "item": "b", "run": "r", "lane": "feature", "phase": "nope",
+           "status": "running", "by": "Mallory", "started": "2026-11-25T09:30:00Z", "updated": "2026-11-25T09:30:00Z"}},
+    {"b": {"sha": "a" * 40, "unreadable": "", "item": "b", "run": "r", "lane": "feature", "phase": "plan",
+           "status": "running", "by": "x" * 5000, "started": "2026-11-25T09:30:00Z", "updated": "2026-11-25T09:30:00Z"}},
+    {"b": {"sha": "a" * 40, "unreadable": "", "item": "b", "run": ["r"], "lane": "feature", "phase": "plan",
+           "status": "running", "by": "M", "started": "2026-11-25T09:30:00Z", "updated": "2026-11-25T09:30:00Z"}},
+    {"b": {"sha": "a" * 40, "unreadable": "", "item": "a", "run": "r", "lane": "feature", "phase": "plan",
+           "status": "running", "by": "M", "started": "2026-11-25T09:30:00Z", "updated": "2026-11-25T09:30:00Z"}},
+])
+def test_a_hostile_cache_is_checked_again_and_never_raises(cb, cached):
+    backlog._save_state(cb.root, claims=cached, claims_note=["not", "text"])
+    snap = cb.snap()
+    assert snap["claims_note"] == ""
+    for found in snap["remote_claims"]:  # only an unreadable claim survives, as one capped line of text
+        assert found["unreadable"] and "\n" not in found["unreadable"] and len(found["unreadable"]) <= 300
+        assert found["by"] == "" and found["column"] == "Backlog"
+    with pytest.raises(Refused) if snap["remote_claims"] else contextlib.nullcontext():
+        backlog.begin_start(cb.cfg, cb.root, "module:b")
+    backlog.refresh(cb.cfg, cb.root)  # origin holds no claim: the cache is replaced, nothing raised
+    assert cb.snap()["remote_claims"] == []
+
+
+def test_a_deeply_nested_state_file_never_raises(cb):
+    runs_root(cb.root).mkdir(parents=True, exist_ok=True)
+    (runs_root(cb.root) / backlog.STATE_NAME).write_text("[" * 100000, encoding="utf-8")
+    assert cb.snap()["remote_claims"] == []
+    backlog.refresh(cb.cfg, cb.root)

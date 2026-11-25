@@ -430,7 +430,7 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
     from agentflow.module_queue import module_lane
     from agentflow.retro import due_or_none
 
-    pile = snapshot(cfg, repo)
+    pile = snapshot(cfg, repo, now=now)
     cards, counts, spend_today = [], Counter(), 0.0
     by_agent, by_model = Counter(), Counter()
     for run in list_runs(repo):
@@ -474,6 +474,8 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
         "backlog_dropped": pile["dropped"] if lane is None or lane == module_lane(cfg) else [],
         "backlog_note": pile["backlog_note"],
         "backlog_sha256": pile["backlog_sha256"],
+        "remote_claims": [c for c in pile["remote_claims"] if lane is None or c["lane"] == lane],
+        "claims_note": pile["claims_note"],
         "work_source_kind": work_source.kind(cfg),
         "needs_human": needs,
         "retro_due": due_or_none(repo, cfg, now),

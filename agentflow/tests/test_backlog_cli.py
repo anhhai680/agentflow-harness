@@ -87,9 +87,27 @@ def test_list_json_prints_the_view(bf, capsys):
     assert printed == backlog.backlog_view(bf.cfg, bf.root)
     assert [p["id"] for p in printed] == ["a", "b", "i", "z"]
     first = printed[0]
-    assert set(first) == {"id", "title", "lane", "status", "state", "detail"}
+    assert set(first) == {"id", "title", "lane", "status", "state", "detail", "claim"}
     assert (first["state"], first["detail"], first["status"]) == ("done", finished.FILE_SAYS, "done")
     assert printed[3]["state"] == "dropped"
+
+
+def test_list_shows_a_claim_on_origin_live_and_warns_when_origin_is_gone(bf, tmp_path, capsys):
+    from test_claims import OTHER, second_clone
+
+    claims.create(bf.cfg, second_clone(bf, tmp_path), "i", run=OTHER, lane="feature", phase="plan", status="waiting")
+    assert main(["backlog", "list"]) == 0  # no Board refresh: `list` reads origin itself
+    out = capsys.readouterr().out.splitlines()
+    assert out == ["a  done  Alpha", "b  ready  Bee", f"i  plan  An idea  claimed by Other (waiting, run {OTHER})"]
+    assert main(["backlog", "list", "--json"]) == 0
+    claim = {v["id"]: v for v in json.loads(capsys.readouterr().out)}["i"]["claim"]
+    assert (claim["by"], claim["run"], claim["phase"], claim["status"], claim["stale"]) == (
+        "Other", OTHER, "plan", "waiting", False)
+    shutil.move(str(bf.origin), str(bf.origin.with_name("gone.git")))
+    assert main(["backlog", "list"]) == 0
+    printed = capsys.readouterr()
+    assert printed.out.splitlines() == ["a  done  Alpha", "b  ready  Bee", "i  backlog  An idea"]
+    assert printed.err.startswith("warning: could not read claims on origin: ")
 
 
 def test_the_view_shows_the_phase_of_a_local_run(bf):

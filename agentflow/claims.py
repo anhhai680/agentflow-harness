@@ -375,6 +375,52 @@ def list_remote(cfg: Config, repo: Path, seen: Mapping[str, Claim] | None = None
     raise Unreachable("could not fetch the claims from origin")
 
 
+OFF = "claims are off: {why}"
+UNREAD = "could not read claims on origin: {error}"
+
+
+def one_line(text: object, limit: int = _DETAIL_MAX) -> str:
+    """`text` as one printable line of at most `limit` characters: for text from `origin` or a cache."""
+    return " ".join("".join(c if c.isprintable() else " " for c in str(text)).split())[:limit]
+
+
+def survey(cfg: Config, repo: Path, seen: Mapping[str, Claim] | None = None) -> tuple[dict[str, Claim] | None, str]:
+    """`(claims, note)`: every claim on `origin` now (`list_remote`), and the note a Board or a queue shows. Outside
+    a `backlog` pack `({}, "")`; with claims off, or no `origin` remote, `({}, "claims are off: <why>")`; when
+    `origin` can't be read `(None, "could not read claims on origin: <error>")`. Never raises."""
+    source = cfg.work_source
+    if source is None or source.kind != "backlog":
+        return {}, ""
+    if not cfg.backlog.claims:
+        return {}, OFF.format(why="backlog.claims is false")
+    try:
+        if not enabled(cfg, repo):
+            return {}, OFF.format(why="this clone has no origin remote")
+        return list_remote(cfg, repo, seen), ""
+    except Exception as exc:  # noqa: BLE001 - a Board refresh or a queue tick must not die on origin
+        return None, one_line(UNREAD.format(error=one_line(exc) or type(exc).__name__))
+
+
+def restore(cfg: Config, item_id: object, record: object) -> Claim | None:
+    """The claim a cache kept for `item_id` (`dataclasses.asdict(Claim)`), checked again as `parse_claim` checks a
+    `claim.json`: None when `item_id` is not a module id, the sha is not a full sha, a field is not text, or the
+    claim is not one this pack can read. An unreadable claim keeps its reason as one capped line. Never raises: the
+    cache is a file on disk, not trusted."""
+    if not isinstance(item_id, str) or MODULE_ID.fullmatch(item_id) is None or not isinstance(record, dict):
+        return None
+    sha, why = record.get("sha"), record.get("unreadable")
+    if not isinstance(sha, str) or _FULL_SHA.fullmatch(sha) is None or not isinstance(why, str):
+        return None
+    if why:
+        return _unreadable(item_id, sha, one_line(why) or "unreadable")
+    try:
+        text = json.dumps({key: record.get(key) for key in FIELDS})
+    except (TypeError, ValueError, RecursionError):
+        return None
+    found = parse_claim(cfg, item_id, text, sha)
+    return None if found.unreadable else found
+
+
 # --------------------------------------------------------------------------- the protocol
 
 

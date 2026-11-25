@@ -856,7 +856,7 @@ def cmd_backlog(args: argparse.Namespace) -> int:
     """`backlog done <module>` marks a module finished by hand; `backlog undone <module>` takes that mark off, or
     (with none) vetoes the origin evidence or closed issue that says it is done. With a `backlog` work source those
     two edit the file instead, and `list`, `add` and `set` read and edit it. Nothing here commits."""
-    from agentflow import backlog, work_source
+    from agentflow import backlog, claims, work_source
     from agentflow.backlog_file import EditRefused
 
     verb = args.backlog_command
@@ -870,10 +870,14 @@ def cmd_backlog(args: argparse.Namespace) -> int:
         elif verb == "undone":
             lines = backlog.mark_not_done(cfg, repo, args.module, _by(args))
         elif verb == "list":
-            shown = [v for v in backlog.backlog_view(cfg, repo) if args.all or v["state"] != "dropped"]
             if work_source.kind(cfg) != "backlog":
                 raise backlog.Invalid(backlog.NEEDS_BACKLOG.format(noun=work_source.noun(cfg)))
-            lines = [json.dumps(shown)] if args.json else [f"{v['id']}  {v['state']}  {v['title']}" for v in shown]
+            held, note = claims.survey(cfg, repo)  # origin, live: a list must not show a stale claim
+            if held is None:
+                print(f"warning: {note}", file=sys.stderr)
+            shown = [v for v in backlog.backlog_view(cfg, repo, held or {}) if args.all or v["state"] != "dropped"]
+            lines = [json.dumps(shown)] if args.json else [
+                f"{v['id']}  {v['state']}  {v['title']}" + (f"  {v['detail']}" if v["claim"] else "") for v in shown]
         elif verb == "import":
             from agentflow import backlog_import
 
