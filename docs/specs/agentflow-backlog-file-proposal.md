@@ -298,7 +298,7 @@ TB-A2's done evidence does. A run reads the file at its fork commit (`state.base
 added to `config.NEVER_RESOLVED`), `claim_refused` (the start that lost, or `claim_refused_by_host`; a start that loses has no run to log it in, so the
 refusal is the start's error text and the Board's `item_failed`), `claim_sync_failed` (a claim push that could not
 reach `origin`; the run goes on and the next change catches the claim up), `claim_release_failed` (a release that
-failed; the next `sync` tries again, and a person can free the claim with `backlog release`) and `backlog_updated` (a runner commit to the
+failed; the claimant's next Board refresh or CI watch tries again, and a person can free the claim with `backlog release`) and `backlog_updated` (a runner commit to the
 file, with the fields set). `activity.py` gets a sentence for each.
 
 ## Security

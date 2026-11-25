@@ -222,12 +222,21 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
             # its next `sync` stops it (`claim_lost`) rather than claim again by itself
             why = claim_sync.release_start(cfg, repo, run, claimed[1],
                                            "failed" if isinstance(exc, Exception) else "interrupted")
-            if why and run is None:
-                exc.add_note(f"the claim on {claimed[1].item} is still on origin ({why}): "
-                             f"agentflow backlog release {claimed[1].item} frees it")
+            if why and run is None:  # no run to record it in: the start's own error says so, which the CLI prints
+                _tell(exc, f"The claim on {claimed[1].item} is still on origin ({why}): "
+                           f"agentflow backlog release {claimed[1].item} frees it.")
         raise
     mark(cfg, run)
     return run
+
+
+def _tell(exc: BaseException, sentence: str) -> None:
+    """Add `sentence` to the message of `exc` on a line of its own, so whoever prints the error prints it too. An
+    exception whose message is not its one text argument (or that has none) gets it as a note instead."""
+    if isinstance(exc, Exception) and len(exc.args) == 1 and isinstance(exc.args[0], str) and str(exc) == exc.args[0]:
+        exc.args = (f"{exc.args[0]}\n{sentence}",)
+    else:
+        exc.add_note(sentence)
 
 
 def _set_up(cfg: Config, repo: Path, run: Run, pipeline: str, params: dict, inputs: dict, opts: RunOptions,

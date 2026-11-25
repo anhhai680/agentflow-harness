@@ -20,6 +20,8 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ### Changed
 - `claim` is a reserved step id (the stop of a lost claim is `<phase>/claim`), and the Board's Edit of `backlog.yml` answers with `notes` about the claim of a reopened item.
+- A claim push that `origin` refuses is tried once more before the start is refused, and the refusal shows git's own message; it suggests `backlog.claim_ref: branch` only as a maybe (credentials or read-only access refuse a push too), and never to a pack already on `branch`.
+- When the release of a `failed`, `cancelled` or archived run's claim fails (say `origin` was unreachable), the claimant's next Board refresh or CI watch tries it again, so the item doesn't stay claimed.
 
 ## [3.10] - 2026-11-25
 

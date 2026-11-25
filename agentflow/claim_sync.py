@@ -84,8 +84,18 @@ def _claimed(item_id: str, held: claims.Claim) -> str:
     if held.unreadable:
         return (f"module {item_id} has a claim on origin that agentflow can't read ({_cut(held.unreadable)}): "
                 f"agentflow backlog release {item_id} frees it")
-    return (f"module {item_id} is claimed by {held.by}: run {held.run}, phase {held.phase}, {held.status}, "
-            f"updated {held.updated} (agentflow backlog release {item_id} frees it)")
+    by, run, phase, status, updated = (_cut(getattr(held, key)) for key in ("by", "run", "phase", "status", "updated"))
+    return (f"module {item_id} is claimed by {by}: run {run}, phase {phase}, {status}, "
+            f"updated {updated} (agentflow backlog release {item_id} frees it)")
+
+
+def _refused(cfg: Config, exc: claims.HostRefused) -> str:
+    """The refusal of a start whose claim ref `origin` refused: git's own words, then the advice that can help. The
+    `backlog.claim_ref: branch` fallback is a maybe (credentials or read-only access refuse a push too), and a pack
+    already on `branch` is never sent there."""
+    advice = ("if origin refuses custom refs, set backlog.claim_ref: branch in config.yaml, or "
+              if cfg.backlog.claim_ref == "refs" else "")
+    return f"origin refused the claim ref {exc.name}: {_cut(exc.detail)}; {advice}{NO_CLAIMS}"
 
 
 def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions,
@@ -104,8 +114,7 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     except claims.Claimed as exc:
         raise ValueError(_claimed(item_id, exc.claim)) from exc
     except claims.HostRefused as exc:
-        raise ValueError(f"origin refused the claim ref {claims.ref(cfg, item_id)}: set backlog.claim_ref: branch in "
-                         "config.yaml, or backlog.claims: false to start without claims") from exc
+        raise ValueError(_refused(cfg, exc)) from exc
     except claims.Unreachable as exc:
         raise ValueError(f"could not reach origin to claim {item_id}: {_cut(exc)}; start again when it is reachable, "
                          f"or {NO_CLAIMS}") from exc
@@ -124,19 +133,31 @@ def release_start(cfg: Config, repo: Path, run: Run | None, held: claims.Claim, 
     """Release the claim of a start that failed (`reason: failed`) or was interrupted (`interrupted`) after it was
     made (a leased delete), recording `claim_released` or `claim_release_failed` on `run` when the run exists. Never
     raises: returns "" when the claim was released, else why not. A run interrupted before it recorded the claim
-    records it first, so the release marks it and the run's next `sync` stops it rather than run unclaimed."""
-    if run is not None and _row(run.refresh()) is None:
-        record(cfg, run, held)
+    records it first, so the release marks it and the run's next `sync` stops it rather than run unclaimed; a failure
+    to record it (or to log the outcome) never skips the release."""
+    try:
+        if run is not None and _row(run.refresh()) is None:
+            record(cfg, run, held)
+    except Exception:  # never hide the failure of the start itself, and release all the same
+        pass
     try:
         claims.release(cfg, Path(repo), held)
     except Exception as exc:  # never hide the failure of the start itself
         why = _error(exc)
-        if run is not None:
-            run.emit("claim_release_failed", item=held.item, error=why)
+        _log(run, "claim_release_failed", item=held.item, error=why)
         return why
-    if run is not None:
-        run.emit("claim_released", item=held.item, reason=reason)
+    _log(run, "claim_released", item=held.item, reason=reason)
     return ""
+
+
+def _log(run: Run | None, kind: str, **fields: object) -> None:
+    """`run.emit(kind, **fields)` when the run exists, where a log that can't be written is not an error."""
+    if run is None:
+        return
+    try:
+        run.emit(kind, **fields)
+    except Exception:  # the log itself can't be written: nothing more to do here
+        pass
 
 
 # --------------------------------------------------------------------------- the claim follows the run
@@ -254,9 +275,7 @@ def _sync(cfg: Config, run: Run) -> bool:
     repo = Path(run.repo)
     try:
         held = _held(cfg, repo, run, item, str(row["sha"]))
-        if isinstance(held, str):
-            return _lose(cfg, run, item, phase, held)
-        moved = claims.advance(cfg, repo, held, phase=phase, status=want)
+        moved = None if isinstance(held, str) else claims.advance(cfg, repo, held, phase=phase, status=want)
     except claims.Lost as exc:
         if claims.own(repo, str(row["sha"]), run.id, exc.claim):  # another process of this run moved it twice
             run.emit("claim_sync_failed", item=item, action="advance", error=_error(exc))
@@ -265,6 +284,8 @@ def _sync(cfg: Config, run: Run) -> bool:
     except (claims.ClaimError, ValueError, OSError) as exc:  # `origin` can't be reached, or a local git failure
         run.emit("claim_sync_failed", item=item, action="advance", error=_error(exc))
         return True
+    if moved is None:  # `origin` says the claim is lost: a stop, outside the `try`, as one a push found
+        return _lose(cfg, run, item, phase, str(held))
     run.emit("claim_advanced", item=item, sha=moved.sha, phase=moved.phase, status=moved.status)
     return True
 
@@ -297,7 +318,7 @@ def _claim_again(cfg: Config, run: Run, state: dict, item: str, phase: str, key:
     except claims.Claimed as exc:
         return _lose(cfg, run, item, phase, f"the claim on {item} was taken: {claims.describe(exc.claim)}")
     except claims.HostRefused as exc:
-        return _lose(cfg, run, item, phase, f"origin refused the claim ref: {_error(exc)}")
+        return _lose(cfg, run, item, phase, _error(exc))  # "origin refused the claim ref <ref>: <git's reason>"
     except (claims.ClaimError, ValueError, OSError) as exc:
         error = _error(exc)
         run.emit("claim_sync_failed", item=item, action="claim", error=error)
@@ -312,8 +333,9 @@ def _claim_again(cfg: Config, run: Run, state: dict, item: str, phase: str, key:
 
 def release_run(cfg: Config, run: Run, reason: str) -> None:
     """Release the run's claim (a leased delete on the sha it holds) and record `claim_released` with `reason`.
-    Never raises: a failure is `claim_release_failed`, tried again by the next `sync`. A claim another clone holds
-    now is not the run's to delete: it is recorded as `claim_lost`, and stays."""
+    Never raises: a failure is `claim_release_failed`, tried again by `release_merged` (the Board's refresh, a CI
+    watch, an archive), since an ended run gets no further `sync`. A claim another clone holds now is not the run's
+    to delete: it is recorded as `claim_lost`, and stays."""
     row = _row(run.refresh())
     if row is None or row.get("released"):
         return
@@ -338,17 +360,32 @@ def release_run(cfg: Config, run: Run, reason: str) -> None:
 # --------------------------------------------------------------------------- a merged item
 
 
+def _ended(state: dict) -> str:
+    """The reason an ended run releases its claim with no merge: `failed` or `cancelled`, or `archived` for an
+    archived run; "" for any other run (a `done` one waits for its merge)."""
+    if state["status"] in RELEASED_BY:
+        return str(state["status"])
+    return "archived" if state["status"] in TERMINAL and state.get("archived") else ""
+
+
+def _holds(state: dict) -> bool:
+    """The run's own claim is unreleased and not lost, and the run is `done` (its merge releases it) or ended
+    (`_ended`: its own release failed, and no `sync` comes again to try it)."""
+    row = _row(state)
+    return (row is not None and not row.get("released") and not row.get("lost")
+            and (state["status"] == "done" or bool(_ended(state))))
+
+
 def _candidates(repo: Path) -> list[Run]:
-    """The local runs whose own claim is unreleased and not lost, and that are `done`: the only runs a merge can
-    release. The state alone decides; no other run is looked at past its `state.json`."""
+    """The local runs `release_merged` may release (`_holds`). The state alone decides; no other run is looked at
+    past its `state.json`."""
     found: list[Run] = []
     for run in list_runs(repo):
         try:
             state = run.refresh()
         except Exception:  # one unreadable run is not a reason to look at no other
             continue
-        row = _row(state)
-        if row is not None and state["status"] == "done" and not row.get("released") and not row.get("lost"):
+        if _holds(state):
             found.append(run)
     return found
 
@@ -363,13 +400,15 @@ def _merged_ids(cfg: Config, repo: Path) -> set[str]:
 def release_merged(cfg: Config, repo: Path, fetch: bool = False) -> list[str]:
     """Release the claims of this clone's runs whose item is merged: a run of this clone whose own `state["claim"]`
     is unreleased and not lost, whose status is `done`, and whose item is `status: done` in the backlog file at
-    `origin/<fork_from>` (`reason: merged`). Returns the released item ids.
+    `origin/<fork_from>` (`reason: merged`). It also tries again the release of an ended run of this clone whose
+    own release failed (`failed`, `cancelled` or archived, its claim unreleased and not lost; no `sync` comes again
+    to it), with its own reason and no merge to wait for. Returns the released item ids.
 
-    Only the claimant's machine releases a merged item's claim (D4): a clone with no such run reads nothing and pushes
-    nothing, whatever `origin` holds. `fetch` first brings `origin/<fork_from>` up to date, and only when there is a
-    run to release. Each release holds the run's claim lock, and the run's state is read again under it, so a live
-    runner of the same run never races it. Never raises: a failure is `claim_release_failed` on the run (one line of
-    at most `TEXT_MAX` characters), tried again by the next call."""
+    Only the claimant's machine releases its claims (D4): a clone with no such run reads nothing and pushes nothing,
+    whatever `origin` holds. `fetch` first brings `origin/<fork_from>` up to date, and only when there is a `done` run
+    to release. Each release holds the run's claim lock, and the run's state is read again under it, so a live runner
+    of the same run never races it. Never raises: a failure is `claim_release_failed` on the run (one line of at most
+    `TEXT_MAX` characters), tried again by the next call."""
     released: list[str] = []
     try:
         repo = Path(repo)
@@ -378,12 +417,13 @@ def release_merged(cfg: Config, repo: Path, fetch: bool = False) -> list[str]:
         runs = _candidates(repo)
         if not runs:
             return released
-        if fetch:
+        waiting = [run for run in runs if not _ended(run.state)]
+        if fetch and waiting:
             gitops.fetch_remote_branch(repo, cfg.project.fork_from)
-        merged = _merged_ids(cfg, repo)
+        merged = _merged_ids(cfg, repo) if waiting else set()
         for run in runs:
             item = str((_row(run.state) or {}).get("item"))
-            if item in merged and _release_merged(cfg, run, item):
+            if (_ended(run.state) or item in merged) and _release_merged(cfg, run, item):
                 released.append(item)
     except Exception as exc:  # the caller (a refresh, a watch, an archive) is never stopped by this
         _log_failure(run=None, item="?", exc=exc)
@@ -391,12 +431,14 @@ def release_merged(cfg: Config, repo: Path, fetch: bool = False) -> list[str]:
 
 
 def _release_merged(cfg: Config, run: Run, item: str) -> bool:
+    """Release the claim of the candidate `run` (`_holds`) under its claim lock: an ended run's with its own reason,
+    a `done` run's (its item merged) with `merged`. True when it was released."""
     try:
         with _serial(run):
-            row = _row(run.refresh())  # again, under the lock: the runner may have moved or released it meanwhile
-            if row is None or run.state["status"] != "done" or row.get("released") or row.get("lost"):
+            state = run.refresh()  # again, under the lock: the runner may have moved or released it meanwhile
+            if not _holds(state):
                 return False
-            release_run(cfg, run, "merged")
+            release_run(cfg, run, _ended(state) or "merged")
             row = _row(run.refresh())
             return bool(row and row.get("released"))
     except Exception as exc:

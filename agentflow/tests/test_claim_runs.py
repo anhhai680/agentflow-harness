@@ -14,7 +14,7 @@ from conftest import run_git
 from test_backlog_runs import DONE_ACT, PLAN_TEXT, SPEC, SPEC_TEXT, BacklogFlow
 from test_claims import OTHER, remote_refs, run_git_input, second_clone
 
-from agentflow import backlog, claim_sync, claims, conditions, hitl, pipeline, run_control, slots, work_source
+from agentflow import backlog, claim_sync, claims, conditions, gitops, hitl, pipeline, run_control, slots, work_source
 from agentflow.hitl import approve
 from agentflow.pipeline import RunOptions, advance, start
 from agentflow.state import Run, list_runs, runs_root
@@ -140,8 +140,7 @@ def test_refusals_leave_no_run_and_no_claim(cflow, tmp_path, case):
                     "agentflow backlog release b frees it")
     elif case == "hidden":
         run_git(origin, "config", "receive.hideRefs", "refs/agentflow/")
-        expected = (f"origin refused the claim ref {name}: set backlog.claim_ref: branch in config.yaml, or "
-                    "backlog.claims: false to start without claims")
+        expected = f"origin refused the claim ref {name}: "
     else:
         shutil.move(origin, tmp_path / "moved.git")
         expected = "could not reach origin to claim b: "
@@ -153,12 +152,50 @@ def test_refusals_leave_no_run_and_no_claim(cflow, tmp_path, case):
         assert text.endswith("; start again when it is reachable, or set backlog.claims: false to start without claims")
         assert len(text) < 500
         shutil.move(tmp_path / "moved.git", origin)
+    elif case == "hidden":  # git's own words in between, then the advice, worded as a maybe
+        assert text.startswith(expected) and len(text) < 700 and "\n" not in text, text
+        assert text.endswith("; if origin refuses custom refs, set backlog.claim_ref: branch in config.yaml, or set "
+                             "backlog.claims: false to start without claims"), text
     else:
         assert text == expected
     _nothing_started(root)
     if case == "hidden":
         run_git(origin, "config", "--unset", "receive.hideRefs")
     assert _claim_refs(cflow.repo) == before
+
+
+@pytest.mark.parametrize("form", ["refs", "branch"])
+def test_a_push_refused_for_another_reason_names_gits_reason(cflow, monkeypatch, form):
+    """Not every refused push is a host that hides custom refs: git's own words are shown, the `claim_ref` advice
+    is a maybe, and it is never given to a pack already on `branch`."""
+    cfg, root = cflow.configure({"backlog": {"claim_ref": form}}), cflow.repo.root
+    pushes: list[str] = []
+
+    def denied(repo, name, expected, source):
+        pushes.append(name)
+        return subprocess.CompletedProcess(["git", "push"], 128, "",
+                                           "fatal: unable to access: Permission denied (publickey)\x1b[0m")
+
+    monkeypatch.setattr(claims, "_push", denied)
+    with pytest.raises(ValueError) as caught:
+        start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    text = str(caught.value)
+    assert len(pushes) == 2 and text.isprintable(), text
+    assert f"origin refused the claim ref {claims.ref(cfg, 'b')}: fatal: unable to access: Permission denied " \
+           "(publickey)?[0m; " in text
+    assert text.endswith("set backlog.claims: false to start without claims")
+    assert ("backlog.claim_ref: branch" in text) is (form == "refs")
+    if form == "refs":
+        assert "if origin refuses custom refs, set backlog.claim_ref: branch" in text
+    _nothing_started(root)
+    assert _claim_refs(cflow.repo) == {}
+
+
+def test_a_refused_start_prints_every_claim_field_on_one_line():
+    odd = claims.Claim(item="b", run="r\x1b[2J", lane="feature", phase="plan\n", status="running\r", by="T\x07",
+                       started="x", updated="2026-01-01\n00:00:00+00:00", sha="a" * 40)
+    text = claim_sync._claimed("b", odd)
+    assert text.isprintable() and text.endswith("(agentflow backlog release b frees it)"), text
 
 
 # --------------------------------------------------------------------------- a failure after the claim
@@ -223,6 +260,40 @@ def test_a_release_that_fails_after_a_failed_start_is_recorded(cflow, monkeypatc
     [failed] = [e for e in run.events.read() if e["type"] == "claim_release_failed"]
     assert failed["item"] == "b" and failed["error"].startswith("could not reach origin") and len(failed["error"]) <= 300
     assert not run.refresh()["claim"]["released"]
+
+
+def test_a_failure_recording_the_claim_neither_hides_the_start_error_nor_skips_the_release(cflow, monkeypatch):
+    cfg, root = cflow.cfg, cflow.repo.root
+    failures = iter(["the first record failed", "the second record failed"])
+
+    def no_record(*args, **kwargs):
+        raise OSError(next(failures))
+
+    monkeypatch.setattr(claim_sync, "record", no_record)
+    with pytest.raises(OSError, match="the first record failed"):
+        start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    assert claims.read(cfg, root, "b") is None and _claim_refs(cflow.repo) == {}  # released all the same
+
+
+def test_a_runless_start_whose_release_failed_says_so_in_its_error(cflow, monkeypatch):
+    cfg = cflow.configure({"slots": {"count": 2}})
+    root = cflow.repo.root
+    for task in ("one", "two"):  # two live runs hold both slots
+        slots.acquire(cfg, Run.create(cfg, root, "bug", {"task": task}))
+    monkeypatch.setattr(slots, "check_free", lambda cfg, repo: None)
+
+    def unreachable(*args, **kwargs):
+        raise claims.Unreachable("could not reach origin:\n" + "x" * 5000)
+
+    monkeypatch.setattr(claims, "release", unreachable)
+    with pytest.raises(slots.SlotsFull) as caught:
+        start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    text = str(caught.value)
+    assert text.startswith("all 2 slots are held"), text
+    [first, second] = text.split("\n")
+    assert second.startswith("The claim on b is still on origin (could not reach origin:?xxx")
+    assert second.endswith("): agentflow backlog release b frees it.") and len(second) < 450
+    assert claims.read(cfg, root, "b") is not None  # it was claimed, and the release failed
 
 
 # --------------------------------------------------------------------------- starts that claim nothing
@@ -586,6 +657,34 @@ def test_a_lost_claim_is_found_when_the_runs_own_commit_is_gone(cflow, tmp_path)
     assert _claim_refs(cflow.repo)[claims.ref(cfg, "b")] == theirs.sha
 
 
+def test_a_lost_claim_found_on_origin_is_a_stop_even_when_raising_it_fails(cflow, tmp_path, monkeypatch):
+    """A loss found through `origin` (the run's own commit is gone here) behaves as one found by a push: a stop that
+    can't be raised is an error, never a quiet `claim_sync_failed`, and the next sync raises it again."""
+    cfg = cflow.cfg
+    run = start(cfg, cflow.repo.root, "feature", {"module": "b"}, RunOptions())
+    other = cflow.clone(tmp_path)
+    run_git(other, "push", "-q", "origin", f":{claims.ref(cfg, 'b')}")
+    theirs = claims.create(cfg, other, "b", run=OTHER, lane="feature", phase="build")
+    _forget_own_commit(cflow, run.refresh()["claim"]["sha"])
+    run.emit("run_paused", by="me")
+
+    def no_inbox(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(claim_sync, "raise_hitl", no_inbox)
+    calls = _count_pushes(monkeypatch)
+    with pytest.raises(OSError, match="disk full"):
+        claim_sync.sync(cfg, run)
+    state = run.refresh()
+    assert state["claim"]["lost"] and "claim_sync_failed" not in _types(run)
+    assert not [c for c in calls if c[0] == "push"]
+    monkeypatch.setattr(claim_sync, "raise_hitl", hitl.raise_hitl)
+    assert claim_sync.sync(cfg, run) is False
+    waiting = run.refresh()["waiting"]
+    assert waiting["kind"] == "claim_lost" and OTHER in waiting["summary"]
+    assert _claim_refs(cflow.repo)[claims.ref(cfg, "b")] == theirs.sha
+
+
 def test_the_runs_own_claim_is_adopted_from_origin_when_its_commit_is_gone(cflow):
     cfg = cflow.cfg
     run = start(cfg, cflow.repo.root, "feature", {"module": "b"}, RunOptions())
@@ -688,6 +787,48 @@ def test_a_failed_release_is_recorded_and_never_raises(cflow, ci_gh, tmp_path, m
     [failed] = [e for e in run.events.read() if e["type"] == "claim_release_failed"]
     assert "\n" not in failed["error"] and len(failed["error"]) <= claim_sync.TEXT_MAX
     assert not run.refresh()["claim"]["released"]
+
+
+def test_a_failed_release_of_an_ended_run_is_tried_again_by_the_refresh(cflow, tmp_path):
+    """A cancelled run gets no further sync: the Board's refresh tries its release again, with its own reason and
+    no merge, once."""
+    cfg, root, origin = cflow.cfg, cflow.repo.root, cflow.repo.origin
+    run = start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    shutil.move(origin, tmp_path / "moved.git")
+    try:
+        run_control.cancel(run, "me", cfg=cfg)
+        assert "claim_release_failed" in _types(run) and not run.refresh()["claim"]["released"]
+        assert claim_sync.release_merged(cfg, root) == []  # still unreachable: recorded again, never raised
+    finally:
+        shutil.move(tmp_path / "moved.git", origin)
+    assert _types(run).count("claim_release_failed") == 2
+    assert claims.ref(cfg, "b") in _claim_refs(cflow.repo)
+    backlog.refresh(cfg, root)
+    assert claims.read(cfg, root, "b") is None and _claim_refs(cflow.repo) == {}
+    assert [e["reason"] for e in run.events.read() if e["type"] == "claim_released"] == ["cancelled"]
+    assert run.refresh()["claim"]["released"] is True
+    backlog.refresh(cfg, root)
+    assert claim_sync.release_merged(cfg, root) == []
+    assert _types(run).count("claim_released") == 1
+
+
+def test_only_an_ended_runs_own_unreleased_claim_is_tried_again(cflow, tmp_path, monkeypatch):
+    cfg, root = cflow.cfg, cflow.repo.root
+    lost = start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    lost.emit("claim_lost", item="b", why="the claim on b was taken", key="define/claim")
+    lost.emit("run_cancelled", by="me")
+    failed = start(cfg, root, "feature", {"module": "i"}, RunOptions())
+    failed.emit("run_failed", reason="a step failed")
+    failed.emit("claim_released", item="i", reason="failed")  # its own release went through
+    Run.create(cfg, root, "bug", {"task": "fix the thing"}).emit("run_cancelled", by="me")  # holds no claim
+    assert lost.refresh()["claim"]["lost"] and failed.refresh()["claim"]["released"]
+    calls = _count_pushes(monkeypatch)
+    fetched: list[object] = []
+    monkeypatch.setattr(gitops, "fetch_remote_branch", lambda *args, **kwargs: fetched.append(args))
+    assert claim_sync.release_merged(cfg, root, fetch=True) == []
+    assert calls == [] and fetched == []  # no git at all: no run of this clone has a claim to release
+    assert _types(lost).count("claim_released") == 0
+    assert claims.ref(cfg, "b") in _claim_refs(cflow.repo)  # a lost claim is not the run's to delete
 
 
 def test_ci_watch_releases_once_the_merge_lands(cflow, ci_gh, clock, tmp_path):
