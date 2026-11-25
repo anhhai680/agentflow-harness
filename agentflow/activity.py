@@ -178,6 +178,19 @@ def _sentence(event: dict) -> tuple[str, str]:
     if etype == "backlog_skipped":
         what = _BACKLOG_CHANGES.get(str(event.get("change")), "Changed {item} in the backlog")
         return f"Did not record this: {what.format(item=_text(event.get('item')))}", _detail(event.get("reason"))
+    if etype == "item_claimed":
+        return f"Claimed {_text(event.get('item'))} on origin ({_text(event.get('phase'))}, {_text(event.get('status'))})", ""
+    if etype == "claim_advanced":
+        return (f"Moved the claim on {_text(event.get('item'))} to {_text(event.get('phase'))}, "
+                f"{_text(event.get('status'))}"), ""
+    if etype == "claim_released":
+        return f"Released the claim on {_text(event.get('item'))}", _detail(event.get("reason"))
+    if etype == "claim_lost":
+        return f"Lost the claim on {_text(event.get('item'))}", _detail(event.get("why"))
+    if etype == "claim_sync_failed":
+        return f"Could not move the claim on {_text(event.get('item'))} ({_text(event.get('action'))})", _detail(event.get("error"))
+    if etype == "claim_release_failed":
+        return f"Could not release the claim on {_text(event.get('item'))}", _detail(event.get("error"))
     if etype == "pr_opened":
         return "Draft pull request opened", _detail(event.get("url"))
     if etype == "pr_marked_ready":

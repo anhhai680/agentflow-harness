@@ -178,3 +178,20 @@ def test_total_counts_the_whole_log_and_an_empty_page_has_no_cursor():
     assert page["total"] == 50 and page["before"] == 7
     assert activity_page(events, 1, (), 3, turns=True) == {"entries": [], "before": None, "total": 50}
     assert activity_page([], None, (), 3, turns=False) == {"entries": [], "before": None, "total": 0}
+
+
+def test_activity_has_a_sentence_for_each_claim_event():
+    claimed = sentence(ev(1, "item_claimed", item="crm", ref="refs/agentflow/claims/crm", sha="a" * 40, phase="define",
+                          status="running"))
+    assert "crm" in claimed[0] and "Claimed" in claimed[0]
+    advanced = sentence(ev(2, "claim_advanced", item="crm", sha="b" * 40, phase="build", status="waiting"))
+    assert "crm" in advanced[0] and "build" in advanced[0] and "waiting" in advanced[0]
+    assert "crm" in sentence(ev(3, "claim_released", item="crm", reason="finished"))[0]
+    assert sentence(ev(3, "claim_released", item="crm", reason="finished"))[1] == "finished"
+    lost = sentence(ev(4, "claim_lost", item="crm", why="held by run r2"))
+    assert "crm" in lost[0] and lost[1] == "held by run r2"
+    sync = sentence(ev(5, "claim_sync_failed", item="crm", action="advance", error="no route to origin"))
+    assert "crm" in sync[0] and sync[1] == "no route to origin"
+    release = sentence(ev(6, "claim_release_failed", item="crm", error="no route to origin"))
+    assert "crm" in release[0] and release[1] == "no route to origin"
+    assert sentence(ev(7, "claim_lost"))[0].count("?") == 1  # a missing item reads as "?"

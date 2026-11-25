@@ -52,6 +52,7 @@ def initial_state() -> dict:
         "base_sha": None,
         "pr_url": None,
         "backlog_sha": None,  # the newest `backlog_updated` commit: the run reads its own item at this sha
+        "claim": None,  # the run's claim on its backlog item on `origin` (`_on_item_claimed`); None when it holds none
         "phase": None,
         "step": None,
         "task": None,
@@ -925,6 +926,36 @@ def _on_backlog_updated(state: dict, ev: dict) -> None:
     state["backlog_sha"] = ev["sha"]
 
 
+def _on_item_claimed(state: dict, ev: dict) -> None:
+    """A claim made (or made again after a `claim_lost` was approved) replaces the whole row and clears `lost`."""
+    state["claim"] = {"item": ev["item"], "ref": ev.get("ref"), "sha": ev["sha"], "phase": ev.get("phase"),
+                      "status": ev.get("status"), "released": False, "lost": False}
+
+
+def _claim_row(state: dict) -> dict | None:
+    """The run's claim, None for a run that holds none (or that was written before claims: it has no `claim` key)."""
+    row = state.get("claim")
+    return row if isinstance(row, dict) else None
+
+
+def _on_claim_advanced(state: dict, ev: dict) -> None:
+    row = _claim_row(state)
+    if row is not None:
+        row.update(sha=ev["sha"], phase=ev.get("phase"), status=ev.get("status"))
+
+
+def _on_claim_released(state: dict, ev: dict) -> None:
+    row = _claim_row(state)
+    if row is not None:
+        row["released"] = True
+
+
+def _on_claim_lost(state: dict, ev: dict) -> None:
+    row = _claim_row(state)
+    if row is not None:
+        row["lost"] = True
+
+
 def _on_permission_denied(state: dict, ev: dict) -> None:
     row = _step_row(state, ev["key"])
     row["permission_denials"] = row.get("permission_denials", 0) + 1
@@ -952,6 +983,10 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "runner_error": _on_runner_error,
     "pr_opened": _on_pr_opened,
     "backlog_updated": _on_backlog_updated,
+    "item_claimed": _on_item_claimed,
+    "claim_advanced": _on_claim_advanced,
+    "claim_released": _on_claim_released,
+    "claim_lost": _on_claim_lost,
     "phase_started": _on_phase_started,
     "phase_skipped": _on_phase_skipped,
     "phase_approval_raised": _on_phase_approval_raised,
@@ -1049,6 +1084,12 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "hitl_raised": ("kind", "key"),
     "module_added": ("module", "sha"),
     "backlog_updated": ("item", "change", "sha"),
+    "item_claimed": ("item", "ref", "sha", "phase", "status"),
+    "claim_advanced": ("item", "sha", "phase", "status"),
+    "claim_released": ("item", "reason"),
+    "claim_lost": ("item", "why"),
+    "claim_sync_failed": ("item", "action", "error"),
+    "claim_release_failed": ("item", "error"),
     "run_held": ("key", "reason", "until"),
     "run_hold_ended": ("key",),
     "usage_governed": ("key", "level"),

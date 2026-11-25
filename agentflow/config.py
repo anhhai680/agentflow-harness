@@ -223,7 +223,8 @@ CONFORMANCE_FAILED = "conformance_failed"  # the audit at `finish` found an obli
 RECONCILE_CHANGED = "reconcile_changed_conditions"  # a reconcile edit changed which steps of its phase run
 NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable",
                   CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed", "environment",
-                  "new_advisory", "dependency_review_failed")  # a person accepts a head the dependency review stopped
+                  "new_advisory", "dependency_review_failed",  # a person accepts a head the dependency review stopped
+                  "claim_lost")  # a person decides whose claim the backlog item is
 PREFLIGHT_KEYS = ("enabled",)
 WATCHDOG_KEYS = ("no_progress_min", "read_only_idle_min")
 PARALLEL_KEYS = ("max_subagents", "serial_paths")

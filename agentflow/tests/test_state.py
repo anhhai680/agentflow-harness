@@ -1272,3 +1272,63 @@ def test_a_session_capped_without_its_key_or_cap_is_malformed(event):
     assert [m["type"] for m in state["malformed_events"]] == ["session_capped"]
     ok = reduce(initial_state(), {"type": "session_capped", "seq": 1, "key": "build/impl", "cap": "turns", "wrap_up": True})
     assert ok["malformed_events"] == []
+
+
+# --------------------------------------------------------------------------- backlog claims
+
+
+CLAIM = {"item": "crm", "ref": "refs/agentflow/claims/crm", "sha": "a" * 40, "phase": "define", "status": "running"}
+
+
+def _claim_event(seq: int, etype: str, **fields) -> dict:
+    return {"seq": seq, "ts": "2026-11-25T10:00:00.000+00:00", "type": etype, **fields}
+
+
+def test_claim_events_fold_into_state_claim():
+    state = initial_state()
+    assert state["claim"] is None
+    state = reduce(state, _claim_event(1, "item_claimed", **CLAIM))
+    assert state["claim"] == {**CLAIM, "released": False, "lost": False}
+    state = reduce(state, _claim_event(2, "claim_advanced", item="crm", sha="b" * 40, phase="build", status="waiting"))
+    assert state["claim"] == {**CLAIM, "sha": "b" * 40, "phase": "build", "status": "waiting", "released": False,
+                              "lost": False}
+    before = copy.deepcopy(state["claim"])
+    for failed in (_claim_event(3, "claim_sync_failed", item="crm", action="advance", error="no route"),
+                   _claim_event(4, "claim_release_failed", item="crm", error="no route")):
+        state = reduce(state, failed)
+        assert state["claim"] == before and state["malformed_events"] == []
+    state = reduce(state, _claim_event(5, "claim_lost", item="crm", why="held by another run"))
+    assert state["claim"]["lost"] is True and state["claim"]["released"] is False
+    state = reduce(state, _claim_event(6, "item_claimed", **{**CLAIM, "sha": "c" * 40}))  # approved: claimed again
+    assert state["claim"] == {**CLAIM, "sha": "c" * 40, "released": False, "lost": False}
+    state = reduce(state, _claim_event(7, "claim_released", item="crm", reason="finished"))
+    assert state["claim"]["released"] is True and state["claim"]["lost"] is False
+
+
+def test_claim_events_without_a_claim_do_not_invent_one():
+    for event in (_claim_event(1, "claim_advanced", item="crm", sha="b" * 40, phase="build", status="running"),
+                  _claim_event(2, "claim_lost", item="crm", why="gone"),
+                  _claim_event(3, "claim_released", item="crm", reason="finished")):
+        assert reduce(initial_state(), event)["claim"] is None
+
+
+@pytest.mark.parametrize("etype, fields, missing", [
+    ("item_claimed", {k: v for k, v in CLAIM.items() if k != "sha"}, "sha"),
+    ("item_claimed", {k: v for k, v in CLAIM.items() if k != "item"}, "item"),
+    ("claim_advanced", {"item": "crm", "phase": "build", "status": "running"}, "sha"),
+    ("claim_released", {"item": "crm"}, "reason"),
+    ("claim_lost", {"item": "crm"}, "why"),
+    ("claim_sync_failed", {"item": "crm", "action": "advance"}, "error"),
+    ("claim_release_failed", {"item": "crm"}, "error"),
+])
+def test_claim_events_need_their_fields(etype, fields, missing):
+    state = reduce(initial_state(), _claim_event(1, etype, **fields))
+    assert state["claim"] is None
+    [bad] = state["malformed_events"]
+    assert bad["type"] == etype and repr(missing) in bad["error"]
+
+
+def test_a_run_from_before_claims_has_no_claim_key_and_still_loads():
+    old = initial_state()
+    del old["claim"]  # state.json written before this change
+    assert reduce(old, _claim_event(1, "claim_lost", item="crm", why="gone")).get("claim") is None

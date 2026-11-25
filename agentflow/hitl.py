@@ -640,6 +640,11 @@ def _way_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config, tim
                 f"has not caught up). `agentflow retry {run.id} {key}` asks GitHub again about the same head, "
                 f"`agentflow approve {run.id} {key}` accepts this head unchecked and marks the PR ready, or set "
                 f"`vuln.dependency_review: false`.")
+    if kind == "claim_lost":
+        return (f"This run's claim on its backlog item was taken or deleted on `origin`, so it stopped before changing "
+                f"anything there. `agentflow approve {run.id} {key}` claims the item again and goes on (it stops again, "
+                f"naming the new claimant, if the item is not free); `agentflow backlog release <id>` frees "
+                f"another claim that is in the way; `agentflow cancel {run.id}` ends the run.")
     if kind == "review_unresolved":
         return (f"Fix the code yourself if you want, then `agentflow approve {run.id} {key}` gives the reviewer one last "
                 f"look, runs the gates again and commits the task, with any finding still open listed in the commit body; "
