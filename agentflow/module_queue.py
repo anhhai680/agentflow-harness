@@ -687,9 +687,9 @@ def assess_modules(
     about it. A dependent says it is waiting on the module that is stuck.
 
     In a `backlog` pack with claims on, the claims on `origin` are read once (`claims.survey`), or taken from
-    `remote` (what the caller just read). A module with no local run and a claim gets `entry["claim"]` and the
-    problem `claimed by <by> (<phase>, <status>)`, so it does not start and its dependents wait; it holds no slot
-    here. A failed read sets `Assessment.claims_error`.
+    `remote` (what the caller just read). A module with no run here that still holds it (`issue_run_holds`) and a
+    claim that is not its run's own gets `entry["claim"]` and the problem `claimed by <by> (<phase>, <status>)`, so
+    it does not start and its dependents wait; it holds no slot here. A failed read sets `Assessment.claims_error`.
     """
     repo = Path(repo)
     held, note = claims.survey(cfg, repo) if remote is None else remote
@@ -710,7 +710,11 @@ def assess_modules(
     for node in nodes:
         run = runs.get(node.id)
         entry, holds, problem = _assess(cfg, repo, node, run, prior.get(node.id, {}), notes, view, known, marks)
-        claim = held.get(node.id) if run is None and entry["status"] != "done" else None
+        # a claim elsewhere counts unless a run here still holds the item (a failed, cancelled or archived one gave it
+        # up) or the claim is that run's own
+        claim = held.get(node.id) if entry["status"] != "done" else None
+        if claim is not None and run is not None and (issue_run_holds(run) or claim.run == run.id):
+            claim = None
         if claim is not None:
             entry["claim"] = _claim_entry(claim)
             problem = _claimed(claim)
@@ -840,7 +844,8 @@ _ABANDONED = ("failed", "cancelled")  # a run that will never open or merge a pu
 
 def issue_run_holds(run: Run) -> bool:
     """Whether an issue's run here still holds the issue after GitHub closed it: one that is live, stopped on an
-    error (it can be resumed) or `done` with its pull request open. A failed, cancelled or archived run does not."""
+    error (it can be resumed) or `done` with its pull request open. A failed, cancelled or archived run does not. The
+    same rule decides whether a module's run here still holds a backlog item against a claim on `origin` (D5)."""
     return not run.state.get("archived") and run.state["status"] not in _ABANDONED
 
 

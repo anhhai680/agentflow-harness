@@ -2320,18 +2320,32 @@ def _done_evidence(root: Path, item: str) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+# a run here of `b`, as it ends: each list of events follows its start and `phase_started build`
+LOCAL_RUNS = {
+    "live": [],
+    "failed": [("run_failed", {"reason": "boom"})],
+    "cancelled": [("run_cancelled", {"by": "test", "killed": [], "skipped": []})],
+    "archived": [("run_finished", {}), ("run_archived", {"by": "test"})],
+}
+
+
 @pytest.mark.parametrize("b_line, evidence, local, claim, board_state, view_state", [
-    ("{id: b, title: Bee, status: dropped}", False, False, "running", "dropped", "dropped"),
-    ("{id: b, title: Bee, status: done}", False, False, "running", "done", "done"),
-    ("{id: b, title: Bee, status: ready}", True, False, "waiting", "done", "done"),
-    ("{id: b, title: Bee, status: ready}", False, True, "running", "run", "build"),
-    ("{id: b, title: Bee, status: ready}", False, False, "running", "claim running", "plan"),
-    ("{id: b, title: Bee, status: ready}", False, False, "waiting", "claim waiting", "plan"),
-    ("{id: b, title: Bee, status: backlog}", False, False, "paused", "claim paused", "plan"),
-    ("{id: b, title: Bee, status: ready, depends_on: [a]}", False, False, "stopped", "claim stopped", "plan"),
-    ("{id: b, title: Bee, status: ready, depends_on: [a]}", False, False, None, "blocked", "blocked"),
-    ("{id: b, title: Bee, status: ready}", False, False, None, "ready", "ready"),
-    ("{id: b, title: Bee, status: backlog}", False, False, None, "backlog", "backlog"),
+    ("{id: b, title: Bee, status: dropped}", False, None, "running", "dropped", "dropped"),
+    ("{id: b, title: Bee, status: done}", False, None, "running", "done", "done"),
+    ("{id: b, title: Bee, status: ready}", True, None, "waiting", "done", "done"),
+    ("{id: b, title: Bee, status: ready}", False, "live", "running", "run", "build"),
+    # a run here that gave the item up (D4 released its claim) does not hide the claim another machine took next
+    ("{id: b, title: Bee, status: ready}", False, "failed", "running", "claim running", "plan"),
+    ("{id: b, title: Bee, status: ready}", False, "cancelled", "waiting", "claim waiting", "plan"),
+    ("{id: b, title: Bee, status: ready}", False, "archived", "running", "claim running", "plan"),
+    ("{id: b, title: Bee, status: ready}", False, "failed", None, "run", "build"),
+    ("{id: b, title: Bee, status: ready}", False, None, "running", "claim running", "plan"),
+    ("{id: b, title: Bee, status: ready}", False, None, "waiting", "claim waiting", "plan"),
+    ("{id: b, title: Bee, status: backlog}", False, None, "paused", "claim paused", "plan"),
+    ("{id: b, title: Bee, status: ready, depends_on: [a]}", False, None, "stopped", "claim stopped", "plan"),
+    ("{id: b, title: Bee, status: ready, depends_on: [a]}", False, None, None, "blocked", "blocked"),
+    ("{id: b, title: Bee, status: ready}", False, None, None, "ready", "ready"),
+    ("{id: b, title: Bee, status: backlog}", False, None, None, "backlog", "backlog"),
 ])
 def test_d5_precedence_table(flow_repo, tmp_path, b_line, evidence, local, claim, board_state, view_state):
     cb = ClaimBoard(flow_repo, tmp_path, CLAIM_YML.replace("{id: b, title: Bee, status: ready}", b_line))
@@ -2340,6 +2354,8 @@ def test_d5_precedence_table(flow_repo, tmp_path, b_line, evidence, local, claim
     if local:
         run = Run.create(cb.cfg, cb.root, "feature", {"module": "b"})
         run.emit("phase_started", phase="build")
+        for event, fields in LOCAL_RUNS[local]:
+            run.emit(event, **fields)
     backlog.refresh(cb.cfg, cb.root)
     if evidence:
         _done_evidence(cb.root, "b")
@@ -2350,6 +2366,24 @@ def test_d5_precedence_table(flow_repo, tmp_path, b_line, evidence, local, claim
         assert view["b"]["claim"]["status"] == claim and view["b"]["detail"].startswith("claimed by Other (")
     else:
         assert view["b"]["claim"] is None
+
+
+def test_a_claim_on_an_item_done_on_origin_is_not_shown(cb, tmp_path):
+    from conftest import land_on_origin
+
+    cfg = cb.fr.configure({"work_source": {"kind": "backlog", "path": None}, "backlog": {"claims": True},
+                           "dashboard": {"backlog": {"sync_base": False}}})  # this checkout never pulls the merge
+    cb.claim("b")
+    land_on_origin(cb.fr, tmp_path, {"backlog.yml": CLAIM_YML.replace("{id: b, title: Bee, status: ready}",
+                                                                      "{id: b, title: Bee, status: done}")})
+    backlog.refresh(cfg, cb.root)
+    assert "{id: b, title: Bee, status: ready}" in (cb.root / "backlog.yml").read_text(encoding="utf-8")
+    assert {e["id"]: e for e in module_queue.QueueState.load(cb.root).modules}["b"]["status"] != "done"
+    assert backlog._load_state(cb.root)["origin_done"] == ["b"]
+    assert backlog.snapshot(cfg, cb.root)["remote_claims"] == []
+    assert {v["id"]: v for v in backlog.backlog_view(cfg, cb.root)}["b"]["claim"] is None
+    backlog._save_state(cb.root, origin_done=["../b", 7, ["b"]])  # a hostile cache hides nothing and never raises
+    assert [c["id"] for c in backlog.snapshot(cfg, cb.root)["remote_claims"]] == ["b"]
 
 
 def test_a_claim_for_an_item_this_file_lacks_is_still_shown(cb):

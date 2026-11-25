@@ -900,17 +900,34 @@ def _own_claim(item_id: str, held: claims.Claim, runs: list[Run]) -> bool:
         r.id == held.run and str((r.state.get("params") or {}).get("module")) == item_id for r in runs)
 
 
+def _origin_done(state: dict) -> set[str]:
+    """The items `done` in the file at `origin/<fork_from>` as the last `refresh` recorded them (`origin_done`), each
+    a module id. The state file is on disk: anything else in it is ignored."""
+    found = state.get("origin_done")
+    if not isinstance(found, list):
+        return set()
+    return {i for i in found[:claims.LIST_MAX] if isinstance(i, str) and sources.MODULE_ID.fullmatch(i)}
+
+
 def _shown_claims(pic: dict, held: dict[str, claims.Claim]) -> dict[str, claims.Claim]:
-    """The claims of `held` that decide their item's state (D5): not on a `dropped` item, not on a `done` one (the
-    file says so, or the done evidence does), and not on an item with a run here (the run's own phase wins)."""
+    """The claims of `held` that decide their item's state (D5), for the Board and `backlog list` alike: not on a
+    `dropped` item, not on a `done` one (the file here says so, the file at `origin/<fork_from>` does as the last
+    `refresh` read it, or the done evidence does), not on an item whose run here still holds it
+    (`module_queue.issue_run_holds`: the run's own phase wins), and not the claim of a run here. A failed, cancelled
+    or archived run here gave the item up, so another machine's claim on it is shown."""
     by_entry = {e["id"]: e for e in pic["entries"]}
+    runs = {r.id: r for r in pic["runs"]}
+    done_on_origin = _origin_done(pic["state"])
     shown: dict[str, claims.Claim] = {}
     for item_id, claim in held.items():
         file_item = pic["file_items"].get(item_id)
         entry = by_entry.get(item_id)
         if file_item is not None and file_item.status in ("dropped", "done"):
             continue
-        if entry is not None and (entry["status"] == "done" or entry.get("run_id")):
+        if item_id in done_on_origin or (entry is not None and entry["status"] == "done"):
+            continue
+        local = runs.get(entry.get("run_id")) if entry is not None else None
+        if local is not None and module_queue.issue_run_holds(local):
             continue
         if _own_claim(item_id, claim, pic["runs"]):
             continue
@@ -1284,11 +1301,11 @@ def backlog_view(cfg: Config, repo: Path, held: dict[str, claims.Claim] | None =
             state, detail = "done", entry.get("done_reason") or finished.MERGED
         elif item.status == "done":
             state, detail = "done", finished.FILE_SAYS
-        elif entry is not None and entry.get("run_id") in runs:
-            state, detail = str(runs[entry["run_id"]].state.get("phase") or "running"), entry["run_id"]
-        elif item.id in remote:
+        elif item.id in remote:  # `_shown_claims` left out a claim a run here still holds the item against
             claim = _claim_fields(cfg, remote[item.id], now)
             state, detail = claim["phase"] or "claimed", _claim_detail(claim)
+        elif entry is not None and entry.get("run_id") in runs:
+            state, detail = str(runs[entry["run_id"]].state.get("phase") or "running"), entry["run_id"]
         else:
             waiting = [b["key"].partition(":")[2] for b in pic["view"].get(f"module:{item.id}", {}).get("blocked_by", [])]
             if waiting:
@@ -1901,7 +1918,8 @@ def refresh(cfg: Config, repo: Path) -> dict:
     """Bring the base branch up to date, re-assess the map modules and re-check what cards run after. In a `backlog`
     pack it records the items of the file at the `fork_from` tip (`committed_items`), for the cards' `local` badge,
     and, after releasing this clone's merged claims, caches every claim on `origin` (`claims`, `claims_note`; when
-    `origin` can't be read, the note says so and the claims read last time stay).
+    `origin` can't be read, the note says so and the claims read last time stay) and the items `done` in the file at
+    `origin/<fork_from>` (`origin_done`), whose claims the Board hides.
 
     It only refreshes what the cards show and never starts anything. It skips the assessment when
     `agentflow queue` holds the queue lock."""
@@ -1931,6 +1949,10 @@ def refresh(cfg: Config, repo: Path) -> dict:
     if work_source.kind(cfg) == "backlog":  # what the Board's `local` badge compares with: the commit a run forks from
         tip = commit_at(repo, cfg.project.fork_from)
         changes["committed_items"] = {i.id: _committed(i) for i in work_source.items_at(cfg, repo, tip)} if tip else {}
+        # the items done on origin, which hide a claim left on them (D5) before this checkout pulls the merge
+        remote_tip = commit_at(repo, f"refs/remotes/origin/{cfg.project.fork_from}")
+        changes["origin_done"] = sorted(
+            i.id for i in (work_source.items_at(cfg, repo, remote_tip) if remote_tip else []) if i.status == "done")
     _save_state(repo, **changes)
     return {"note": note, "skipped": skipped, "issues_note": issues_note, "alerts_note": alerts_note}
 

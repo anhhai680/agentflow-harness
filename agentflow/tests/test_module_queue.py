@@ -47,6 +47,30 @@ def test_queue_skips_a_claimed_item_and_starts_ready_ones(flow_repo, tmp_path):
     assert module_queue.assess_modules(cb.cfg, cb.root).claims_error.startswith("could not read claims on origin: ")
 
 
+def test_a_failed_run_here_gives_way_to_a_claim_elsewhere(flow_repo, tmp_path):
+    from agentflow.state import Run
+
+    cb = ClaimBoard(flow_repo, tmp_path, QUEUE_YML)
+    mine = Run.create(cb.cfg, cb.root, "feature", {"module": "a"})
+    mine.emit("run_failed", reason="boom")
+    cb.claim("a", status="running")  # D4 released this run's claim, and the other clone took the item
+    said: list[str] = []
+    queue_tick(cb.cfg, cb.root, 5, lambda module: f"run-{module}", log=said.append)
+    assert "queue: a blocked \u2014 claimed by Other (plan, running)" in said
+    assert not any("a human must retry" in s for s in said)
+    assert QueueState.load(cb.root).modules[0]["claim"]["by"] == "Other"
+
+
+def test_a_live_run_here_wins_over_a_claim_elsewhere(flow_repo, tmp_path):
+    from agentflow.state import Run
+
+    cb = ClaimBoard(flow_repo, tmp_path, QUEUE_YML)
+    Run.create(cb.cfg, cb.root, "feature", {"module": "a"})
+    cb.claim("a")
+    queue_tick(cb.cfg, cb.root, 5, lambda module: f"run-{module}")
+    assert "claim" not in QueueState.load(cb.root).modules[0]
+
+
 def test_a_capability_map_queue_reads_no_claims(flow_repo, monkeypatch):
     from agentflow import claims
 
