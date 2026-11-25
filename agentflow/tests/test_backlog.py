@@ -962,6 +962,25 @@ def test_a_refresh_lists_the_labelled_open_issues_and_the_board_shows_them_witho
     assert "issue:12" not in [c["key"] for c in pile["after_choices"]]
 
 
+def test_a_star_sync_label_lists_every_open_issue_whatever_its_labels(ibk, monkeypatch):
+    ibk.fr.configure({"issues": {"sync_label": "*"}, **ISSUE_FORM})
+    _list_issues(monkeypatch, _issue(12, labels=("enhancement",)), _issue(13, "Crash on save", ("bug",)),
+                 _issue(14, "No labels", ()))
+    assert ibk.refresh()["issues_note"] == ""
+    assert [c for c in _gh_calls(ibk) if c[:2] == ["issue", "list"]] == [
+        ["issue", "list", "--state", "open", "--json", "number,title,labels,url,blockedBy,blocking",
+         "--limit", "100"]]  # no --label: every open issue
+    cards = ibk.cards()
+    assert (cards["issue:12"]["lane"], cards["issue:13"]["lane"], cards["issue:14"]["lane"]) == (
+        "feature", "bug", "feature")
+
+
+def test_a_star_sync_label_names_no_label_when_the_list_is_cut(ibk, monkeypatch):
+    ibk.fr.configure({"issues": {"sync_label": "*"}, **ISSUE_FORM})
+    _list_issues(monkeypatch, *(_issue(n) for n in range(1, backlog.ISSUES_MAX + 1)))
+    assert ibk.refresh()["issues_note"] == f"only the first {backlog.ISSUES_MAX} open issues are shown"
+
+
 def test_the_sync_asks_for_blocked_by_and_keeps_bare_refs(ibk, monkeypatch):
     _list_issues(monkeypatch, _issue(2, blocked_by=[_node(1), _node(9, "CLOSED"), _node(1, repo="other/lib")],
                                      blocking=[_node(3)]))

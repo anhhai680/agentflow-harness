@@ -758,8 +758,11 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 kind, name = backlog.parse_key(_text(body, "item", required=True))
                 if kind == "issue":
-                    raise backlog.Refused(f"issue #{name} leaves Backlog when it is closed or loses the "
-                                          f"{server.cfg.issues.sync_label!r} label on GitHub")
+                    label = server.cfg.issues.sync_label
+                    raise backlog.Refused(f"issue #{name} leaves Backlog when it is closed on GitHub"
+                                          if label == backlog.ALL_ISSUES else
+                                          f"issue #{name} leaves Backlog when it is closed or loses the "
+                                          f"{label!r} label on GitHub")
                 if kind == "alert":
                     raise backlog.Refused(f"alert #{name} leaves Backlog when Dependabot closes it, or when "
                                           "vuln.sync is turned off")

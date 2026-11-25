@@ -1117,6 +1117,14 @@ def test_the_issue_sync_fields_round_trip(sparse_repo):
     assert cfg.issues.lane_labels == {"bug": "bug", "type: bug": "bug"}
 
 
+def test_a_star_sync_label_saves_and_validates(sparse_repo):
+    path = _sparse(sparse_repo)
+    proposal = _sparse_form(path, (["issues", "sync_label"], "*"))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(path, proposal)
+    assert load_config(path).issues.sync_label == "*"
+
+
 @pytest.mark.parametrize("key, value", [
     (["issues", "in_progress_label"], "a,b"),    # validate refuses it
     (["issues", "in_progress_label"], "two\nlines"),  # allow_empty keeps the newline check

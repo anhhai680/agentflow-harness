@@ -429,7 +429,7 @@ class IssuePolicy:
     in_progress_label: str = "agentflow:in-progress"  # "" turns off the label and the start comment, never the PR link
     comment: bool = True  # also post one comment when a run starts from an issue
     epic_labels: tuple[str, ...] = ("epic",)  # an issue with one of these gets `Refs #N`, never `Closes #N`
-    sync_label: str = ""  # open issues with this label become Backlog cards; "" turns the sync off
+    sync_label: str = ""  # open issues with this label become Backlog cards; "*" syncs every open issue, "" is off
     sync_lane: str = "feature"  # the lane of a synced issue that no `lane_labels` entry matches
     lane_labels: dict[str, str] = field(default_factory=lambda: {"bug": "bug"})  # issue label: lane, first match wins
 

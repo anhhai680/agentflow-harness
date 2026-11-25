@@ -7,6 +7,9 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+- `issues.sync_label: "*"` syncs every open GitHub issue to the Backlog, whatever its labels, and `issues.lane_labels` still picks each one's lane (so a `bug` issue is a bug card). Before, only issues carrying the one sync label were shown.
+
 ## [3.9] - 2026-11-24
 
 ### Added

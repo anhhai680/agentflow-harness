@@ -12,7 +12,7 @@ interrupted is never repeated: `settle_interrupted` turns it into a failure for 
 Names here are agentflow's own vocabulary (`issue`, `task`, `topic`, `new_module`, `after`). Lanes, phases, the map
 file and the base branch all come from `config.yaml`; this module names none of them.
 
-Open GitHub issues that carry `issues.sync_label` are a third kind: `refresh` reads them with `gh issue list` into
+Open GitHub issues that carry `issues.sync_label` (every open issue, when it is `*`) are a third kind: `refresh` reads them with `gh issue list` into
 `backlog_state.json`, and `snapshot` shows them from there (it never calls `gh`). An issue that carries
 `issues.in_progress_label` with no run on this machine is "taken": someone else picked it up, so it cannot start.
 Nothing from an issue's text reaches an argv, a module id, a map row or a refusal: an issue-backed run in the
@@ -65,6 +65,7 @@ INTERRUPTED = ("interrupted: the dashboard stopped while this card was starting.
 ISSUE_MODULE = "issue-{number}"  # the module of an issue-backed run in the module lane: never from the issue's text
 ISSUE_RESPONSIBILITY = "GitHub issue #{number}"  # its capability-map row's responsibility, fixed text too
 ISSUES_MAX = 100  # the most synced issues the Backlog shows
+ALL_ISSUES = "*"  # an `issues.sync_label` that syncs every open issue, whatever its labels
 TITLE_MAX = 200
 ISSUE_LIST_FIELDS = "number,title,labels,url,blockedBy,blocking"
 ISSUE_LIST_FIELDS_OLD = "number,title,labels,url"  # what a `gh` without the relationship fields can list
@@ -579,9 +580,15 @@ def _old_gh(exc: GhError) -> bool:
     return "unknown json field" in str(exc).lower()
 
 
+def _synced_words(label: str) -> str:
+    """How the board names the synced set: open issues `labelled 'x'`, or no words for `*` (every open issue)."""
+    return "" if label == ALL_ISSUES else f" labelled {label!r}"
+
+
 def sync_issues(cfg: Config, repo: Path) -> str:
-    """Read the open issues that carry `issues.sync_label` into `backlog_state.json`; returns the note the board
-    shows ("" when all is well). It never raises: when `gh` fails, the last list stays and the note says why."""
+    """Read the open issues that carry `issues.sync_label` (every open issue for `*`) into `backlog_state.json`;
+    returns the note the board shows ("" when all is well). It never raises: when `gh` fails, the last list stays
+    and the note says why."""
     repo = Path(repo)
     label = cfg.issues.sync_label
     if not label:
@@ -589,22 +596,23 @@ def sync_issues(cfg: Config, repo: Path) -> str:
             _save_state(repo, issues=[], issues_label="", issues_note="")
         return ""
     old_gh = False
+    which = [] if label == ALL_ISSUES else ["--label", label]
     try:
         try:
-            reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS,
+            reply = gh_json(["issue", "list", *which, "--state", "open", "--json", ISSUE_LIST_FIELDS,
                              "--limit", str(ISSUES_MAX)], cwd=repo)
         except GhError as exc:
             if not _old_gh(exc):
                 raise
             old_gh = True  # a `gh` without the relationship fields: ask once more for the rest
-            reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS_OLD,
+            reply = gh_json(["issue", "list", *which, "--state", "open", "--json", ISSUE_LIST_FIELDS_OLD,
                              "--limit", str(ISSUES_MAX)], cwd=repo)
         issues = _parse_issues(cfg, reply, with_deps=not old_gh)
     except (GhError, OSError, ValueError, TypeError, RecursionError) as exc:  # RecursionError: absurdly nested JSON
         note = f"GitHub issues not updated: {_reason(exc)}"
         _save_state(repo, issues_note=note)
         return note
-    notes = [f"only the first {ISSUES_MAX} open issues labelled {label!r} are shown"] if len(reply) >= ISSUES_MAX else []
+    notes = [f"only the first {ISSUES_MAX} open issues{_synced_words(label)} are shown"] if len(reply) >= ISSUES_MAX else []
     if old_gh:
         notes.append(f"issue dependencies not read: {UNKNOWN_OLD_GH}")
     note = "; ".join(notes)
@@ -1356,8 +1364,10 @@ def begin_start(cfg: Config, repo: Path, key: str, confirm: bool = False) -> Sta
         elif kind == "issue":
             entry = next((i for i in pic["issues"] if i["number"] == name), None)
             if entry is None:
-                raise Refused(f"issue #{name} is not open with the {cfg.issues.sync_label!r} label "
-                              "as of the last refresh" if cfg.issues.sync_label else "issue sync is off")
+                label = cfg.issues.sync_label
+                raise Refused(("issue sync is off" if not label else
+                               f"issue #{name} is not open as of the last refresh" if label == ALL_ISSUES else
+                               f"issue #{name} is not open with the {label!r} label as of the last refresh"))
             blocker = _issue_blocker(name, pic)
             if blocker is not None:
                 raise Refused(blocker)
