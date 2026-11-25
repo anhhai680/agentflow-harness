@@ -2425,6 +2425,20 @@ def test_a_card_lists_its_parked_items_and_its_slot(dash):
     assert card["parked"][1]["summary"] == "stuck"
 
 
+def test_the_run_card_carries_the_local_only_note(dash):
+    run = dash.flow.new_run({"module": "crm"})
+    run.emit("phase_started", phase="build")
+    assert card_of(dash)["backlog_note"] == ""
+    run.emit("backlog_updated", item="crm", change="ready", sha="a" * 40)
+    assert card_of(dash)["backlog_note"] == ""  # a shared item has nothing to discard
+    run.emit("backlog_updated", item="crm", change="added", sha="b" * 40, local=False)
+    assert card_of(dash)["backlog_note"] == ""
+    run.emit("backlog_updated", item="crm", change="added", sha="c" * 40, local=True)
+    assert card_of(dash)["backlog_note"] == (
+        "Your uncommitted backlog.yml entry for crm went into this run: discard it (git checkout backlog.yml) "
+        "before you pull the merge.")
+
+
 @pytest.mark.parametrize("ending", [("run_finished", {}), ("run_failed", {"reason": "x"}), ("run_cancelled", {})])
 def test_a_finished_card_shows_no_slot(dash, ending):
     run = dash.flow.new_run({"module": "crm"})

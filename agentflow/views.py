@@ -121,10 +121,13 @@ def _digest(run: Run, today: datetime, events: list[dict] | None = None) -> dict
     counted: dict[str, float] = {}
     spend_today = 0.0
     last_ts = None
+    local_item = None
     for event in run.events.read() if events is None else events:
         etype, key = event.get("type"), event.get("key")
         if event.get("ts"):
             last_ts = str(event["ts"])
+        if etype == "backlog_updated" and event.get("change") == "added" and event.get("local") is True:
+            local_item = (str(event.get("item") or ""), str(event.get("path") or "") or "backlog.yml")
         if etype == "phase_started" and event.get("phase"):
             started[str(event["phase"])] = str(event.get("ts"))
         elif etype in ("step_started", "hitl_approved", "step_retry") and key:
@@ -136,7 +139,19 @@ def _digest(run: Run, today: datetime, events: list[dict] | None = None) -> dict
             ts = parse_iso(event.get("ts"))
             if ts is not None and ts.astimezone().date() == today.astimezone().date():
                 spend_today += added
-    return {"phase_started": started, "fixes": fixes, "spend_today": round(spend_today, 6), "last_ts": last_ts}
+    return {"phase_started": started, "fixes": fixes, "spend_today": round(spend_today, 6), "last_ts": last_ts,
+            "local_item": local_item}
+
+
+def _backlog_note(digest: dict) -> str:
+    """What a run started from a local-only backlog item tells its developer: that item's entry in the main
+    checkout's file is theirs to discard before they pull the merge. Empty for every other run."""
+    found = digest.get("local_item")
+    if not found:
+        return ""
+    item, path = found
+    return (f"Your uncommitted {path} entry for {item} went into this run: discard it (git checkout {path}) "
+            "before you pull the merge.")
 
 
 def _strip(state: dict, phases: list[str]) -> list[dict]:
@@ -371,6 +386,7 @@ def _card(run: Run, status: str, cfg: Config, now: datetime, digest: dict, metri
         "failure": state.get("failure"),
         "wall_s": metrics["wall_s"],
         "phase_wall_s": {p["phase"]: p["wall_s"] for p in metrics["phases"]},
+        "backlog_note": _backlog_note(digest),
     }
 
 
