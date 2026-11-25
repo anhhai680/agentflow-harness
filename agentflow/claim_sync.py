@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 
 from agentflow import backlog_writes, claims, gitops, pack, work_source
 from agentflow.backlog_file import BacklogItem
-from agentflow.config import Config, backlog_path
+from agentflow.config import CLAIM_STEP_ID, Config, backlog_path
 from agentflow.hitl import raise_hitl
 from agentflow.state import TERMINAL, Run
 
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 TEXT_MAX = 300
 NO_CLAIMS = "set backlog.claims: false to start without claims"
 
-CLAIM_STEP = "claim"  # the stop of a lost claim is `<phase>/claim`
+CLAIM_STEP = CLAIM_STEP_ID  # the stop of a lost claim is `<phase>/claim`, a step id `validate` reserves
 LOCK_FILE = "claim.lock"
 # The run's status to its claim's (`claims.STATUSES`); `failed` and `cancelled` release the claim instead.
 CLAIM_STATUS = {"running": "running", "refining": "running", "waiting_human": "waiting",
@@ -179,18 +179,29 @@ def _phase(state: dict, row: dict) -> str:
     return str(state.get("phase") or row.get("phase"))
 
 
-def _stop(cfg: Config, run: Run, phase: str, summary: str) -> bool:
-    """Stop the run for a person (`claim_lost`, never resolved by the runner); False, the value `sync` returns."""
-    raise_hitl(cfg, run, "claim_lost", f"{phase}/{CLAIM_STEP}", summary)
-    return False
+def _summary(item: str, why: str) -> str:
+    return f"Stopped before changing the claim on {item} on origin: {why}. Nothing was pushed over it."
 
 
 def _lose(cfg: Config, run: Run, item: str, phase: str, why: str) -> bool:
-    """Record that the run no longer holds its claim (`claim_lost`) and stop it."""
-    why = _cut(why)
-    run.emit("claim_lost", item=item, why=why)
-    return _stop(cfg, run, phase, f"Stopped before changing the claim on {item} on origin: {why}. Nothing was "
-                                  "pushed over it.")
+    """Record that the run no longer holds its claim (`claim_lost`, naming its stop's key) and stop the run for a
+    person (`claim_lost`, never resolved by the runner); False, the value `sync` returns."""
+    why, key = _cut(why), f"{phase}/{CLAIM_STEP}"
+    run.emit("claim_lost", item=item, why=why, key=key)
+    raise_hitl(cfg, run, "claim_lost", key, _summary(item, why))
+    return False
+
+
+def _last_lost(run: Run, phase: str) -> tuple[dict, str, bool]:
+    """The run's last `claim_lost` event, its stop's key, and whether a person approved that stop since: a
+    `hitl_approved` on the key after the event (`approve`, or `retry` of the key). Only that settles it: a stop that
+    left the wait any other way (dropped with a speculated phase, never raised) is not an approval."""
+    events = run.events.read()
+    lost = next((e for e in reversed(events) if e["type"] == "claim_lost"), {})
+    key = str(lost.get("key") or f"{phase}/{CLAIM_STEP}")
+    approved = any(e["type"] == "hitl_approved" and e.get("key") == key and e["seq"] > lost.get("seq", -1)
+                   for e in events)
+    return lost, key, approved
 
 
 def sync(cfg: Config, run: Run) -> bool:
@@ -201,9 +212,11 @@ def sync(cfg: Config, run: Run) -> bool:
     differs from what `state["claim"]` records, so a second `sync` with no change pushes nothing. A `failed` or
     `cancelled` run, or an archived one, releases it (`release_run`). A claim that is gone from `origin` or held by
     another claim stops the run (`claim_lost`); so does a live run whose claim was released (its start was
-    interrupted after the claim): it never claims again by itself. Once that stop is settled the next `sync` claims
-    the item again (`claims.create`, which needs the ref not to exist), and stops again naming the claimant when
-    another holds it. A claim `origin` could not be reached for is `claim_sync_failed`, and True: the run goes on.
+    interrupted after the claim): it never claims again by itself. Only once a person approved that stop
+    (`hitl_approved` on its key, after the last `claim_lost`) does the next `sync` claim the item again
+    (`claims.create`, which needs the ref not to exist), and it stops again naming the claimant when another holds
+    it; a stop that left the wait without an approval is raised again. When the run's own claim commit can't be read
+    here, `origin` is asked: its claim is adopted only when it is this run's. A claim `origin` could not be reached for is `claim_sync_failed`, and True: the run goes on.
     A run with no claim, or a released one, is a no-op: True."""
     if _idle(run.refresh()):
         return True
@@ -224,7 +237,11 @@ def _sync(cfg: Config, run: Run) -> bool:
     if row["lost"]:
         if _lost_stop_open(state):
             return False
-        return _claim_again(cfg, run, state, item, phase)
+        lost, key, approved = _last_lost(run, phase)
+        if not approved:  # its stop is not open and no person approved it: raise it again, never claim by itself
+            raise_hitl(cfg, run, "claim_lost", key, _summary(item, _cut(lost.get("why") or "the claim was lost")))
+            return False
+        return _claim_again(cfg, run, state, item, phase, key)
     if row["released"]:
         if status in TERMINAL:
             return True
@@ -235,7 +252,10 @@ def _sync(cfg: Config, run: Run) -> bool:
         return True
     repo = Path(run.repo)
     try:
-        moved = claims.advance(cfg, repo, claims.held(cfg, repo, item, row["sha"], run.id), phase=phase, status=want)
+        held = _held(cfg, repo, run, item, str(row["sha"]))
+        if isinstance(held, str):
+            return _lose(cfg, run, item, phase, held)
+        moved = claims.advance(cfg, repo, held, phase=phase, status=want)
     except claims.Lost as exc:
         if claims.own(repo, str(row["sha"]), run.id, exc.claim):  # another process of this run moved it twice
             run.emit("claim_sync_failed", item=item, action="advance", error=_error(exc))
@@ -248,10 +268,27 @@ def _sync(cfg: Config, run: Run) -> bool:
     return True
 
 
-def _claim_again(cfg: Config, run: Run, state: dict, item: str, phase: str) -> bool:
-    """Claim `item` again after a person settled the `claim_lost` stop: the ref must not exist. A claim in the way
-    stops the run again, naming it; so does an `origin` that can't be reached, since the run must not go on
-    unclaimed."""
+def _held(cfg: Config, repo: Path, run: Run, item: str, sha: str) -> claims.Claim | str:
+    """The claim the run holds, to move: its own commit `sha`, read here; when that can't be read here (the object
+    is gone), the claim on `origin` if it is this run's (`sha` itself, or a newer commit of the run built on it).
+    Else why the claim is lost, as text. `Unreachable` when `origin` can't be read."""
+    try:
+        return claims.held(cfg, repo, item, sha, run.id)
+    except claims.ClaimError:
+        pass
+    current = claims.read(cfg, repo, item)  # fetching it also brings `sha` back when it is an ancestor
+    if current is None:
+        return str(claims.Lost(None, item))
+    if current.unreadable or current.run != run.id or not (current.sha == sha or claims.own(repo, sha, run.id,
+                                                                                           current)):
+        return str(claims.Lost(current, item))
+    return current
+
+
+def _claim_again(cfg: Config, run: Run, state: dict, item: str, phase: str, key: str) -> bool:
+    """Claim `item` again after a person approved the `claim_lost` stop `key`: the ref must not exist. A claim in the
+    way stops the run again, naming it; so does an `origin` that can't be reached, since the run must not go on
+    unclaimed. Each new stop needs its own approval."""
     status = CLAIM_STATUS.get(state["status"], "running")
     try:
         held = claims.create(cfg, Path(run.repo), item, run=run.id, lane=str(state["pipeline"]), phase=phase,
@@ -263,12 +300,12 @@ def _claim_again(cfg: Config, run: Run, state: dict, item: str, phase: str) -> b
     except (claims.ClaimError, ValueError, OSError) as exc:
         error = _error(exc)
         run.emit("claim_sync_failed", item=item, action="claim", error=error)
-        return _stop(cfg, run, phase, f"Could not claim {item} on origin again: {error}. Approve once origin is "
-                                      "reachable to try again.")
+        return _lose(cfg, run, item, phase, f"could not claim {item} on origin again ({error}); approve once origin "
+                                            "is reachable to try again")
     record(cfg, run, held)
-    for key, step in list(run.state["steps"].items()):  # the stop's own row: settled, as preflight settles its own
-        if key.endswith(f"/{CLAIM_STEP}") and step.get("status") != "done":
-            run.emit("step_finished", key=key, status="done", summary=f"claimed {item} again")
+    row = run.state["steps"].get(key)
+    if row is not None and row.get("status") != "done":  # the approved stop's own row, as preflight settles its own
+        run.emit("step_finished", key=key, status="done", summary=f"claimed {item} again")
     return True
 
 

@@ -3,6 +3,7 @@ second start of a claimed item refused first. Against a real bare `origin` and r
 from __future__ import annotations
 
 import shutil
+import subprocess
 import threading
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from conftest import run_git
 from test_backlog_runs import DONE_ACT, PLAN_TEXT, SPEC, SPEC_TEXT, BacklogFlow
 from test_claims import OTHER, remote_refs, run_git_input, second_clone
 
-from agentflow import claim_sync, claims, conditions, pipeline, run_control, slots, work_source
+from agentflow import claim_sync, claims, conditions, hitl, pipeline, run_control, slots, work_source
 from agentflow.hitl import approve
 from agentflow.pipeline import RunOptions, advance, start
 from agentflow.state import Run, list_runs, runs_root
@@ -474,3 +475,134 @@ def test_a_claim_lost_at_a_step_stop_waits_behind_it(cflow, tmp_path):
     assert run.refresh()["waiting"]["kind"] == "claim_lost"
     assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"  # nothing claimed until a person says
     assert _types(run).count("item_claimed") == 1 and claims.read(cfg, cflow.repo.root, "b") is None
+
+
+# --------------------------------------------------------------------------- only a person's approval claims again
+
+
+def _claimed_again(run: Run) -> int:
+    return _types(run).count("item_claimed") - 1
+
+
+def test_a_stop_raised_after_pause_found_the_loss_does_not_settle_it(cflow, tmp_path):
+    cfg = cflow.cfg
+    run = start(cfg, cflow.repo.root, "feature", {"module": "b"}, RunOptions(to_phase="plan"))
+    _plan_script(cflow, run)
+    _delete_on_origin(cflow, tmp_path)
+    run_control.pause(run, "me", cfg=cfg)  # the runner is still on its step
+    assert run.refresh()["waiting"]["kind"] == "claim_lost"
+    hitl.raise_hitl(cfg, run, "blocked", "define/draft", "which database?")  # the live step then stops
+    state = run.refresh()
+    assert state["waiting"]["kind"] == "claim_lost" and [w["key"] for w in state["waiting_queue"]] == ["define/draft"]
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"
+    assert _claimed_again(run) == 0 and claims.read(cfg, cflow.repo.root, "b") is None
+    approve(run, "define/claim", by="me")
+    assert run.refresh()["waiting"]["key"] == "define/draft"
+    advance(run, cfg, RunOptions(to_phase="plan"))
+    assert _claimed_again(run) == 1 and _on_origin(cflow)[0] == run.id
+
+
+def test_a_claim_stop_dropped_with_a_speculated_phase_is_raised_again(cflow, tmp_path):
+    cfg = cflow.cfg
+    run = _defined(cflow)
+    _delete_on_origin(cflow, tmp_path)
+    run.emit("claim_lost", item="b", why="the claim on b is gone from origin", key="plan/claim")
+    run.emit("hitl_raised", kind="claim_lost", key="plan/claim", phase="plan", summary="gone", speculative=True)
+    assert [w["key"] for w in run.refresh()["waiting_queue"]] == ["plan/claim"]
+    hitl.reject(run, "define", by="me", note="say more about the rollback")  # drops the speculated phase's stops
+    assert run.refresh()["waiting"] is None
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"
+    waiting = run.refresh()["waiting"]
+    assert (waiting["kind"], waiting["key"]) == ("claim_lost", "plan/claim") and "gone" in waiting["summary"]
+    assert _claimed_again(run) == 0 and claims.read(cfg, cflow.repo.root, "b") is None
+    approve(run, "plan/claim", by="me")
+    advance(run, cfg, RunOptions(to_phase="plan"))
+    assert _claimed_again(run) == 1 and _on_origin(cflow)[0] == run.id
+
+
+def test_a_claim_stop_that_failed_to_be_raised_is_raised_again(cflow, tmp_path, monkeypatch):
+    cfg = cflow.cfg
+    run = _defined(cflow)
+    _delete_on_origin(cflow, tmp_path)
+    approve(run, "define", by="me")
+
+    def no_inbox(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(claim_sync, "raise_hitl", no_inbox)
+    with pytest.raises(OSError, match="disk full"):
+        advance(run, cfg, RunOptions(to_phase="plan"))
+    state = run.refresh()
+    assert state["status"] == "error" and state["claim"]["lost"] and state["waiting"] is None
+    monkeypatch.setattr(claim_sync, "raise_hitl", hitl.raise_hitl)
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"
+    assert run.refresh()["waiting"]["kind"] == "claim_lost"
+    assert _claimed_again(run) == 0 and claims.read(cfg, cflow.repo.root, "b") is None
+    approve(run, "define/claim", by="me")
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "awaiting_approval"
+    assert _claimed_again(run) == 1 and _on_origin(cflow) == (run.id, "plan", "waiting")
+
+
+def test_claiming_again_settles_only_the_stops_own_row(cflow, tmp_path):
+    cfg = cflow.cfg
+    run = _defined(cflow)
+    _delete_on_origin(cflow, tmp_path)
+    approve(run, "define", by="me")
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "waiting_human"
+    for other in ("build/claim", "build/task-1/claim"):  # rows the stop is not
+        run.emit("step_started", key=other)
+    approve(run, "define/claim", by="me")
+    assert advance(run, cfg, RunOptions(to_phase="plan")) == "awaiting_approval"
+    steps = run.refresh()["steps"]
+    assert steps["define/claim"]["status"] == "done"
+    assert steps["build/claim"]["status"] == steps["build/task-1/claim"]["status"] == "running"
+
+
+# --------------------------------------------------------------------------- the run's own claim commit is gone here
+
+
+def _forget_own_commit(cflow, sha: str) -> None:
+    """Drop this clone's refs to its claim commit `sha` and the object itself, as a `gc` would once a fetch moved the
+    local copy away."""
+    root = cflow.repo.root
+    for name in ("refs/agentflow/remote-claims/b", "refs/agentflow/held-claims/b"):
+        run_git(root, "update-ref", "-d", name)
+    (root / ".git" / "objects" / sha[:2] / sha[2:]).unlink()
+    assert subprocess.run(["git", "cat-file", "-e", sha], cwd=root).returncode != 0
+
+
+def test_a_lost_claim_is_found_when_the_runs_own_commit_is_gone(cflow, tmp_path):
+    cfg = cflow.cfg
+    run = start(cfg, cflow.repo.root, "feature", {"module": "b"}, RunOptions())
+    other = cflow.clone(tmp_path)
+    run_git(other, "push", "-q", "origin", f":{claims.ref(cfg, 'b')}")
+    theirs = claims.create(cfg, other, "b", run=OTHER, lane="feature", phase="build")
+    _forget_own_commit(cflow, run.refresh()["claim"]["sha"])
+    run_control.pause(run, "me", cfg=cfg)
+    waiting = run.refresh()["waiting"]
+    assert waiting["kind"] == "claim_lost" and "Other" in waiting["summary"] and OTHER in waiting["summary"]
+    assert _claim_refs(cflow.repo)[claims.ref(cfg, "b")] == theirs.sha
+
+
+def test_the_runs_own_claim_is_adopted_from_origin_when_its_commit_is_gone(cflow):
+    cfg = cflow.cfg
+    run = start(cfg, cflow.repo.root, "feature", {"module": "b"}, RunOptions())
+    _forget_own_commit(cflow, run.refresh()["claim"]["sha"])
+    run_control.pause(run, "me", cfg=cfg)
+    assert _on_origin(cflow) == (run.id, "define", "paused") and "claim_lost" not in _types(run)
+    assert run.refresh()["status"] == "paused"
+
+
+def test_a_gone_commit_and_no_origin_is_only_a_failed_sync(cflow, tmp_path):
+    cfg, origin = cflow.cfg, cflow.repo.origin
+    run = start(cfg, cflow.repo.root, "feature", {"module": "b"}, RunOptions())
+    _forget_own_commit(cflow, run.refresh()["claim"]["sha"])
+    shutil.move(origin, tmp_path / "moved.git")
+    try:
+        run_control.pause(run, "me", cfg=cfg)
+    finally:
+        shutil.move(tmp_path / "moved.git", origin)
+    [failed] = [e for e in run.events.read() if e["type"] == "claim_sync_failed"]
+    assert failed["action"] == "advance" and len(failed["error"]) <= 300 and "\n" not in failed["error"]
+    state = run.refresh()
+    assert "claim_lost" not in _types(run) and state["status"] == "paused" and not state["claim"]["lost"]

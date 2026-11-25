@@ -1719,6 +1719,13 @@ def test_governor_is_a_reserved_step_id(tmp_cfg):
     assert any(i.level == "error" and "step id 'governor' is reserved" in i.message for i in found)
 
 
+def test_claim_is_a_reserved_step_id(tmp_cfg):
+    def patch(data):
+        phase_step(data, "build", "build")["id"] = "claim"
+    found = issues_for(tmp_cfg, patch)
+    assert any(i.level == "error" and "step id 'claim' is reserved" in i.message for i in found)
+
+
 @pytest.mark.parametrize("block, path, message", [
     ({"governor": "sometimes"}, "usage.governor", 'governor must be "on", "observe" or "off"'),
     ({"five_hour_soft": 0.95}, "usage.five_hour_soft", "five_hour_soft must be above 0 and below five_hour_hard"),

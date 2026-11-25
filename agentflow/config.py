@@ -240,6 +240,7 @@ WATCHDOG_MAX_MIN = 1440  # `watchdog.no_progress_min` above a day is a typo, not
 USAGE_KEYS = ("governor", "five_hour_soft", "five_hour_hard", "seven_day_soft", "finish_first")
 USAGE_GOVERNORS = ("on", "observe", "off")
 GOVERNOR_STEP_ID = "governor"  # the usage governor's owner is `<phase>/governor`: no step's id
+CLAIM_STEP_ID = "claim"  # a lost backlog claim's stop is `<phase>/claim` (`claim_sync`): no step's id
 GATE_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # a gate's `group` or `resource`
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -1955,6 +1956,9 @@ class _Validator:
             elif step.id == GOVERNOR_STEP_ID:
                 self.error(_join(step.path, "id"), f"step id '{step.id}' is reserved: the runner's usage governor "
                                                    f"uses `<phase>/{GOVERNOR_STEP_ID}`")
+            elif step.id == CLAIM_STEP_ID:
+                self.error(_join(step.path, "id"), f"step id '{step.id}' is reserved: the stop of a lost backlog "
+                                                   f"claim uses `<phase>/{CLAIM_STEP_ID}`")
             seen.add(step.id)
             if step.review is not None:
                 self.unique_ids([step.review], seen)

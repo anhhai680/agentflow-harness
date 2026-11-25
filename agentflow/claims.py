@@ -38,6 +38,7 @@ CLAIM_MAX_BYTES = 4096  # a larger `claim.json` is unreadable, never read
 BY_MAX = 100
 LIST_MAX = 1000  # claim refs `list_remote` reads at most; past it, the first by name
 LOCAL_PREFIX = "refs/agentflow/remote-claims/"  # where fetched claims (and the commits this clone pushed) are kept
+HELD_PREFIX = "refs/agentflow/held-claims/"  # the last commit this clone pushed of each claim: no fetch overwrites it
 GIT_TIMEOUT_S = 60
 EMAIL = "agentflow@localhost"
 _PREFIX = {"refs": "refs/agentflow/claims/", "branch": "refs/heads/agentflow/claims/"}
@@ -277,8 +278,10 @@ def _commit(repo: Path, claim: Claim, parent: str | None) -> str:
 
 
 def _keep(repo: Path, item_id: str, sha: str) -> None:
-    """Point the local copy of `item_id`'s claim at `sha`, so the commit this clone pushed is never pruned."""
+    """Point the local copy of `item_id`'s claim, and the ref of the claim this clone holds (which no fetch moves), at
+    `sha`, so the commit this clone pushed is never pruned while it holds it."""
     _run(repo, "update-ref", _local(item_id), sha)
+    _run(repo, "update-ref", HELD_PREFIX + _check_id(item_id), sha)
 
 
 # --------------------------------------------------------------------------- origin
@@ -505,6 +508,7 @@ def release(cfg: Config, repo: Path, held: Claim) -> None:
             break
         expected = current.sha
     _run(repo, "update-ref", "-d", _local(held.item))
+    _run(repo, "update-ref", "-d", HELD_PREFIX + held.item)
 
 
 # --------------------------------------------------------------------------- age

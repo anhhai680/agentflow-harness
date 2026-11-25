@@ -563,8 +563,10 @@ def _on_hitl_raised(state: dict, ev: dict) -> None:
         return
     state.setdefault("parked", {}).pop(key, None)  # a parked stop that stops the run is now the wait
     current = state["waiting"]
-    # A lost claim is found after the turn's own stop was raised (`claim_sync.sync`): that stop stays the wait.
-    behind = ev["kind"] == "claim_lost" and current is not None and current.get("key") != key
+    # A lost claim is found after the turn's own stop was raised (`claim_sync.sync`): that stop stays the wait. And a
+    # stop raised while a lost claim is the wait (a step that ended after `pause` found the loss) queues behind it, so
+    # the claim's stop is only ever cleared by a person's approval.
+    behind = current is not None and current.get("key") != key and "claim_lost" in (ev["kind"], current.get("kind"))
     if _approval_pending(state) or behind:
         state["waiting_queue"].append(wait)  # the approval stays; this one is shown once it ends
     else:
