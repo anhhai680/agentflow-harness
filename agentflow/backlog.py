@@ -765,7 +765,8 @@ def _issue_blocker(number: str, pic: dict) -> str | None:
 
 def _issue_run_params(cfg: Config, lane: str, number: str, pic: dict) -> tuple[dict, dict | None]:
     """`(params, new_module)` for a run of `lane` from issue `number`. The module lane works on the derived module
-    `issue-<N>` (a new map row in a capability map); nothing in either comes from the issue's text."""
+    `issue-<N>` (a new map row in a capability map, a new item appended by the run's first commit in a `backlog`
+    pack); nothing in either comes from the issue's text."""
     params: dict = {"issue": number}
     if lane != module_queue.module_lane(cfg):
         return params, None
@@ -775,7 +776,7 @@ def _issue_run_params(cfg: Config, lane: str, number: str, pic: dict) -> tuple[d
         if {e["id"]: e for e in pic["entries"]}[module]["status"] != "backlog":
             raise Refused(f"module {module} already has a run or is done")
         return params, None
-    if work_source.kind(cfg) == "capability_map":
+    if work_source.kind(cfg) in ("capability_map", "backlog"):
         return params, {"module": module, "responsibility": ISSUE_RESPONSIBILITY.format(number=number), "deps": []}
     return params, None
 
@@ -1405,7 +1406,10 @@ def begin_start(cfg: Config, repo: Path, key: str, confirm: bool = False) -> Sta
         if kind == "card" and new_module is not None and work_source.kind(cfg) in ("specs", "backlog"):
             if any(n.id == params.get("module") for n in pic["nodes"]):
                 raise Refused(f"a spec for {params['module']} now exists; start module:{params['module']} instead")
-            params["task"], new_module = _spec_task(new_module), None
+            # a specs pack has no file to add the module to; a backlog pack's run appends it in its first commit
+            params["task"] = _spec_task(new_module)
+            if work_source.kind(cfg) == "specs":
+                new_module = None
         if kind == "card" and params.get("issue"):
             unknown = _deps_unknown(key, params, pic)
             if unknown:

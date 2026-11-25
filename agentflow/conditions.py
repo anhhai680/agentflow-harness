@@ -89,8 +89,11 @@ def make_ctx(cfg: Config, repo: Path, pipeline: str, params: dict, run: Run | No
 
 
 def _fork(run: Run | None) -> tuple[Path, object] | None:
-    """`(main checkout, state.base_sha)` of `run`, where its backlog file is read; None with no run."""
-    return None if run is None else (pack.checkout_root(run.repo), run.state.get("base_sha"))
+    """`(main checkout, commit)` of `run`, where its backlog file is read: the commit is the runner's newest backlog
+    commit (`state.backlog_sha`), so an item its first commit appended is found, else its fork commit
+    (`state.base_sha`); None with no run."""
+    return None if run is None else (pack.checkout_root(run.repo),
+                                     run.state.get("backlog_sha") or run.state.get("base_sha"))
 
 
 def fmt(template: str, ctx_or_values: Ctx | dict[str, Any]) -> str:

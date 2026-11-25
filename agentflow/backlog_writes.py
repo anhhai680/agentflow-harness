@@ -7,25 +7,43 @@ is never committed and never lost: the write is refused instead. Each commit is 
 commit (`commit_checks.RUNNER_COMMITS`), and `state["backlog_sha"]` keeps the newest one's sha.
 
 `applies` says whether a run writes at all: a `backlog` pack, and a run with a `module` param in the item's lane.
+
+`plan_start` decides, before a run exists, what the run's first commit writes: a new item (`--new-module`, or an item
+only the main checkout's work tree has), its `ready` status, or nothing; it refuses a start the file says no to.
+`first_commit` makes that commit once the run's worktree exists.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
-from agentflow import backlog_file, gitops, module_queue, safeio
+from agentflow import backlog_file, gitops, module_queue, pack, safeio, work_source
 from agentflow.backlog_file import BacklogItem
 from agentflow.commit_checks import runner_head
 from agentflow.config import Config, backlog_path
 from agentflow.gitops import CommitRejected
+from agentflow.intake import issue_number
 from agentflow.state import Run
 
 CHANGES = ("added", "ready", "spec", "plan", "done")
 _ATTR = {"depends_on": "deps"}  # a backlog key -> its `BacklogItem` attribute, where they differ
 
-__all__ = ["CHANGES", "applies", "write"]
+__all__ = ["CHANGES", "StartWrite", "applies", "first_commit", "plan_start", "write"]
+
+
+@dataclass(frozen=True)
+class StartWrite:
+    """What a backlog run's first commit writes: `item` appended (`added`; `local` when it came from the main
+    checkout's work tree rather than `--new-module`), or its status set to `ready` (`ready`)."""
+
+    change: Literal["added", "ready"]
+    item: BacklogItem
+    local: bool
 
 
 def applies(cfg: Config, run: Run, item: BacklogItem | None) -> bool:
@@ -138,3 +156,102 @@ def write(cfg: Config, run: Run, worktree: Path, change: str, edit: Callable[[st
         data["local"] = bool(local)
     run.emit("backlog_updated", **data)
     return sha
+
+
+def _one_line(text: str, limit: int = backlog_file.TITLE_MAX) -> str:
+    """`text` as one line of at most `limit` characters, cut with `…`."""
+    line = " ".join(text.split())
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def _append(text: str, item: BacklogItem) -> str:
+    """`append_item_text`, or a new file holding `item` alone when the commit has no backlog file."""
+    return backlog_file.append_item_text(text, item) if text.strip() else backlog_file.render([item])
+
+
+def _ready(item_id: str) -> Callable[[str], str]:
+    return lambda text: backlog_file.set_fields_text(text, item_id, {"status": "ready"})
+
+
+def plan_start(cfg: Config, repo: Path, pipeline: str, params: dict, new_module: dict | None) -> StartWrite | None:
+    """What the first commit of a run of `pipeline` with `params` writes to the backlog file, or None when it writes
+    nothing. Called before the run exists, so a `ValueError` refuses the start with nothing created.
+
+    Only a `backlog` pack and a run with a `module` param are concerned. The item is looked up in the file at the tip
+    of `project.fork_from` (the commit the run forks from, read through `gitops.read_blob`) and then in the main
+    checkout's work tree (read only, never written). A `--new-module` is appended as `ready`; an item only the work
+    tree has is appended as it is there (`ready` when it said `backlog`); an item the fork has as `backlog` is set to
+    `ready`; `done` and `dropped` items are refused, and so is a module-lane run of an item neither has. An item in
+    another lane than `pipeline` is left alone. An appended item's `depends_on` must all be in the fork's file, and
+    the edit is tried on the fork's text here, so one the file would refuse stops the start too."""
+    path = backlog_path(cfg.work_source)
+    item_id = str(params.get("module") or "")
+    if path is None or not item_id:
+        return None
+    repo = Path(repo)
+    fork = cfg.project.fork_from
+    sha = gitops.commit_at(repo, fork)
+    data = gitops.read_blob(repo, sha, path, backlog_file.FILE_MAX) if sha else None
+    try:
+        text: str | None = (data or b"").decode("utf-8")
+    except UnicodeDecodeError:
+        text = None
+    at_fork = {i.id: i for i in backlog_file.parse(text)[0]} if text else {}
+    local = work_source.item(cfg, pack.checkout_root(repo), item_id)
+    module_lane = module_queue.module_lane(cfg) or ""
+
+    def edited(edit: Callable[[str], str]) -> None:
+        if text is None:
+            raise ValueError(f"{path} on {fork} is not valid UTF-8: fix it before a run writes to it")
+        edit(text)  # `EditRefused` is a `ValueError`: the start is refused with the file's own reason
+
+    def added(item: BacklogItem, is_local: bool) -> StartWrite:
+        for dep in item.deps:
+            if dep not in at_fork:
+                raise ValueError(f"{item.id} depends on {dep}, which is not in {path} on {fork}: commit it first")
+        edited(lambda t: _append(t, item))
+        return StartWrite("added", item, is_local)
+
+    def open_(item: BacklogItem) -> None:
+        if item.status in ("done", "dropped"):
+            raise ValueError(f"module {item.id} is {item.status} in {path}: set it to ready first")
+
+    if new_module is not None:
+        if item_id in at_fork or local is not None:
+            raise ValueError(f"{item_id} is already an item in {path}: start module:{item_id}")
+        issue = params.get("issue")
+        item = BacklogItem(item_id, [str(d) for d in new_module.get("deps") or []],
+                           title=_one_line(str(new_module.get("responsibility") or "")), status="ready",
+                           issue=int(issue_number(issue)) if issue not in (None, "") else None)
+        return added(item, False)
+    found = at_fork.get(item_id)
+    if found is not None:
+        if (found.lane or module_lane) != pipeline:
+            return None
+        open_(found)
+        if found.status != "backlog":
+            return None
+        edited(_ready(item_id))
+        return StartWrite("ready", found, False)
+    if local is not None:
+        if (local.lane or module_lane) != pipeline:
+            return None
+        open_(local)
+        return added(dataclasses.replace(local, status="ready") if local.status == "backlog" else local, True)
+    if module_lane and pipeline == module_lane:
+        raise ValueError(f"module {item_id} is not in {path}: add it (agentflow backlog add {item_id} --title …) or "
+                         "start it from the dashboard")
+    return None
+
+
+def first_commit(cfg: Config, run: Run, worktree: Path, plan: StartWrite) -> str:
+    """Make the run's first commit as `plan` says, on top of its fork commit; return its sha ('' when the edit changed
+    nothing, which only a `fork_from` that moved since `plan_start` can bring about). `write`'s refusals reach the
+    caller."""
+    item = plan.item
+    if plan.change == "added":
+        sha = write(cfg, run, worktree, "added", lambda text: _append(text, item), f"Add {item.id} to the backlog",
+                    local=plan.local)
+    else:
+        sha = write(cfg, run, worktree, "ready", _ready(item.id), f"Mark {item.id} ready in the backlog")
+    return sha or ""

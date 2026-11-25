@@ -688,12 +688,14 @@ def test_other_kinds_have_no_backlog_items_problems_or_unlisted_specs(cfg, tmp_p
     assert work_source.item(cfg, tmp_path, "a") is None
 
 
-def test_a_new_module_in_a_backlog_pack_is_refused_like_a_specs_pack(tmp_cfg):
+def test_a_new_module_in_a_backlog_pack_needs_no_row_but_must_match_the_run(tmp_cfg):
     from agentflow import pipeline
 
     cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None}}))
-    with pytest.raises(ValueError, match="backlog.*--task"):
-        pipeline._check_new_module(cfg, {"module": "e"}, {"module": "e", "responsibility": "x", "deps": []})
+    new = {"module": "e", "responsibility": "x", "deps": []}
+    assert pipeline._check_new_module(cfg, {"module": "e"}, new) is None  # the run's first commit appends the item
+    with pytest.raises(ValueError, match="--new-module is for module 'e'"):
+        pipeline._check_new_module(cfg, {"module": "f"}, new)
 
 
 def test_add_item_is_a_no_op_for_a_backlog_pack(tmp_cfg, tmp_path):
