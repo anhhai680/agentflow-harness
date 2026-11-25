@@ -11,7 +11,7 @@ import test_conformance
 from conftest import land_on_origin, run_git
 from test_conformance import fully_met
 
-from agentflow import activity, backlog_file, backlog_writes, conditions, gitops, work_source
+from agentflow import activity, backlog, backlog_file, backlog_writes, conditions, gitops, work_source
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.config import load_config
 from agentflow.gitops import CommitRejected, NothingToCommit
@@ -580,3 +580,46 @@ def test_mark_done_leaves_a_run_outside_the_items_lane_alone(bflow):
     worktree = bflow.worktree(run)
     assert backlog_writes.mark_done(bflow.cfg, run, worktree) is None
     assert bflow.events(run, "backlog_skipped") == [] and gitops.head(worktree) == run.state["base_sha"]
+
+
+# --------------------------------------------------------------------------- the slice, end to end
+
+
+def test_a_run_from_a_new_card_ends_with_a_pr_whose_diff_sets_done(bflow, ci_gh):
+    import hashlib
+
+    from test_ci import PIPE
+
+    bflow.repo.configure({**PIPE, "work_source": {"kind": "backlog", "path": None},
+                          "dashboard": {"backlog": {"module_lane": "feature"}}}, autopilot=True)
+    repo, started = bflow.repo.root, []
+    path = repo / "backlog.yml"
+    sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    backlog.add_file_item(bflow.cfg, repo, {"id": "n", "title": "The new thing", "status": "ready"}, sha)
+    assert "  - id: n\n" in path.read_text(encoding="utf-8")
+    assert "  - id: n\n" not in run_git(repo, "show", "HEAD:backlog.yml")  # the Board's write is never committed
+
+    def spawn(repo, lane, params, *, to_phase=None, new_module=None, config=None):
+        """What `flow.py run <lane> --module=n` does: start the run (the test advances it)."""
+        run = start(bflow.cfg, repo, lane, params, RunOptions(to_phase=to_phase, new_module=new_module))
+        started.append(run)
+        return run.id
+
+    job = backlog.begin_start(bflow.cfg, repo, "module:n")
+    run_id = backlog.run_start(bflow.cfg, repo, job, spawn=spawn)
+    [run] = started
+    assert run_id == run.id and run.state["params"]["module"] == "n"
+    plan = conditions.make_ctx(bflow.cfg, repo, "feature", run.state["params"], run).values["plan_target"]
+    bflow.repo.script({"define/draft": [{"write": {"docs/specs/SPEC-n.md": SPEC_TEXT.replace("`b`", "`n`")}, **DONE_ACT}],
+                       "plan/plan": [{"write": {plan: PLAN_TEXT.replace("b", "n", 1)}, **DONE_ACT}]})
+    assert _walk(bflow, run) == "done", run.state["waiting"]
+    [opened] = [e for e in bflow.events(run, "pr_opened") if e["key"] == FINISH]
+    worktree = bflow.worktree(run)
+    diff = run_git(worktree, "diff", f"{bflow.cfg.project.fork_from}...{opened['sha']}", "--", "backlog.yml")
+    added = [ln[1:] for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
+    assert added[0] == "  - id: n" and "    title: The new thing" in added  # the diff adds the item's whole block
+    assert "    status: done" in added and "    status: ready" not in added
+    item = _pushed_item(bflow, run, "n")
+    assert (item.status, item.plan) == ("done", plan)
+    assert [e["change"] for e in bflow.events(run, "backlog_updated")][0] == "added"
+    fully_met(bflow.repo, run)
