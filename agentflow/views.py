@@ -145,13 +145,15 @@ def _digest(run: Run, today: datetime, events: list[dict] | None = None) -> dict
 
 def _backlog_note(digest: dict) -> str:
     """What a run started from a local-only backlog item tells its developer: that item's entry in the main
-    checkout's file is theirs to discard before they pull the merge. Empty for every other run."""
+    checkout's file is theirs to remove before they pull the merge. Only that entry: every Board edit is an uncommitted
+    edit of the same file, so discarding the whole file is right only when nothing else of theirs is in it. Empty for
+    every other run."""
     found = digest.get("local_item")
     if not found:
         return ""
     item, path = found
-    return (f"Your uncommitted {path} entry for {item} went into this run: discard it (git checkout {path}) "
-            "before you pull the merge.")
+    return (f"Your uncommitted {path} entry for {item} went into this run: remove that entry from your {path} (or run "
+            f"git checkout {path} if nothing else of yours is in it) before you pull the merge.")
 
 
 def _strip(state: dict, phases: list[str]) -> list[dict]:

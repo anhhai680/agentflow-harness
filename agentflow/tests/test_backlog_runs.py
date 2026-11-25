@@ -262,6 +262,29 @@ def test_a_local_only_item_goes_into_the_first_commit_and_the_work_tree_is_untou
     assert main.read_bytes() == before
 
 
+def test_a_local_only_items_block_is_copied_as_written(bflow):
+    """The block comes from the main checkout's work tree byte for byte: the comment above it, an unknown key, a
+    multi-line note; only its `backlog` status becomes `ready`, and the lines take the fork file's endings."""
+    block = ("  # Why l: the Board added it\n  - id: l\n    title: Local\n    owner: x\n    status: backlog\n"
+             "    notes: |\n      one\n      two\n")
+    main = bflow.repo.root / "backlog.yml"
+    main.write_text(BACKLOG_YML + block, encoding="utf-8")
+    run, worktree = _first(bflow, "l")
+    head = gitops.head(worktree)
+    assert run_git(worktree, "show", f"{head}:backlog.yml") == BACKLOG_YML + block.replace(
+        "status: backlog", "status: ready")
+    [event] = bflow.events(run, "backlog_updated")
+    assert (event["change"], event["local"], event["fields"]["status"]) == ("added", True, "ready")
+
+
+def test_a_local_only_block_in_flow_style_is_rendered(bflow):
+    main = bflow.repo.root / "backlog.yml"
+    main.write_text(BACKLOG_YML + "  - {id: l, title: Local, status: ready}\n", encoding="utf-8")
+    run, worktree = _first(bflow, "l")
+    shown = run_git(worktree, "show", "HEAD:backlog.yml")
+    assert shown == BACKLOG_YML + "  - id: l\n    title: Local\n    status: ready\n"
+
+
 def test_starting_a_backlog_status_item_sets_ready_in_the_first_commit(bflow):
     run, worktree = _first(bflow, "i")
     head = gitops.head(worktree)

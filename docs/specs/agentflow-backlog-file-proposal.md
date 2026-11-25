@@ -171,8 +171,9 @@ specs).
   changed on disk since the page read it (its sha-256 is sent with the edit), and the page asks you to reload.
 - **Start on a local-only item** (one in the working tree and not on `origin/<fork_from>`) works. The run's first
   commit carries the item's block (D3), and its claim shows it to the team. The card then says your uncommitted
-  copy went into the run, and that you should discard it (`git checkout backlog.yml`) before pulling the merge,
-  because git refuses a merge over a locally modified file. The runner never touches your working tree.
+  copy went into the run, and that you should remove that entry (or `git checkout backlog.yml`, when nothing else of
+  yours is in the file) before pulling the merge, because git refuses a merge over a locally modified file. The
+  runner never touches your working tree.
 - **Start now** on the New task form does what it does today: the item goes into the run's first commit.
   `runs/backlog.jsonl` keeps only start attempts and failures, and no longer holds items.
 - **Issues.** An item can name `issue: N`, and a run of it does everything an `--issue N` run does today (the

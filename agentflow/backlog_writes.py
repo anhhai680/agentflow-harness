@@ -40,11 +40,13 @@ __all__ = ["CHANGES", "StartWrite", "after_output", "applies", "first_commit", "
 @dataclass(frozen=True)
 class StartWrite:
     """What a backlog run's first commit writes: `item` appended (`added`; `local` when it came from the main
-    checkout's work tree rather than `--new-module`), or its status set to `ready` (`ready`)."""
+    checkout's work tree rather than `--new-module`), or its status set to `ready` (`ready`). `source` is the text of
+    the main checkout's file a local item came from, whose block the commit copies as it is written there."""
 
     change: Literal["added", "ready"]
     item: BacklogItem
     local: bool
+    source: str = ""
 
 
 def applies(cfg: Config, run: Run, item: BacklogItem | None) -> bool:
@@ -174,6 +176,37 @@ def _ready(item_id: str) -> Callable[[str], str]:
     return lambda text: backlog_file.set_fields_text(text, item_id, {"status": "ready"})
 
 
+def _copied(item: BacklogItem, source: str) -> Callable[[str], str]:
+    """The edit that appends `item`'s block as `source` writes it (`backlog_file.append_span_text`: its comments and
+    unknown keys kept), with `item`'s status set on it when that differs (`ready` for a `backlog` item); `item` rendered
+    (`_append`) when `source` is empty, the block cannot be copied cleanly, or it no longer reads as `item`."""
+
+    def edit(text: str) -> str:
+        if not source:
+            return _append(text, item)
+        try:
+            new = backlog_file.append_span_text(text if text.strip() else backlog_file.render([]), source, item.id)
+        except backlog_file.EditRefused:
+            return _append(text, item)
+        copied = next(i for i in backlog_file.parse(new)[0] if i.id == item.id)
+        if dataclasses.replace(copied, status=item.status) != item:  # the file changed since `item` was read from it
+            return _append(text, item)
+        return new if copied.status == item.status else backlog_file.set_fields_text(new, item.id,
+                                                                                     {"status": item.status})
+
+    return edit
+
+
+def _checkout_text(cfg: Config, root: Path) -> str:
+    """The text of the backlog file in the main checkout's work tree (read only, no symlink followed), or ''."""
+    target = work_source.file(cfg, root)
+    try:
+        data = safeio.read_bytes(target, backlog_file.FILE_MAX) if target is not None else None
+        return data.decode("utf-8") if data is not None else ""
+    except (OSError, ValueError):  # unreadable, a symlink, too large, or not UTF-8 (`UnicodeDecodeError`)
+        return ""
+
+
 def plan_start(cfg: Config, repo: Path, pipeline: str, params: dict, new_module: dict | None) -> StartWrite | None:
     """What the first commit of a run of `pipeline` with `params` writes to the backlog file, or None when it writes
     nothing. Called before the run exists, so a `ValueError` refuses the start with nothing created.
@@ -211,8 +244,9 @@ def plan_start(cfg: Config, repo: Path, pipeline: str, params: dict, new_module:
         for dep in item.deps:
             if dep not in at_fork:
                 raise ValueError(f"{item.id} depends on {dep}, which is not in {path} on {fork}: commit it first")
-        edited(lambda t: _append(t, item))
-        return StartWrite("added", item, is_local)
+        source = _checkout_text(cfg, pack.checkout_root(repo)) if is_local else ""
+        edited(_copied(item, source))
+        return StartWrite("added", item, is_local, source)
 
     def open_(item: BacklogItem) -> None:
         if item.status in ("done", "dropped"):
@@ -254,7 +288,7 @@ def first_commit(cfg: Config, run: Run, worktree: Path, plan: StartWrite) -> str
     caller."""
     item = plan.item
     if plan.change == "added":
-        sha = write(cfg, run, worktree, "added", lambda text: _append(text, item), f"Add {item.id} to the backlog",
+        sha = write(cfg, run, worktree, "added", _copied(item, plan.source), f"Add {item.id} to the backlog",
                     local=plan.local)
     else:
         sha = write(cfg, run, worktree, "ready", _ready(item.id), f"Mark {item.id} ready in the backlog")

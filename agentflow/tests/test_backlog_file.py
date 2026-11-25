@@ -481,3 +481,46 @@ def test_move_carries_an_items_own_warning_with_it(tmp_path):
     items, problems = backlog_file.read(path)
     assert [i.id for i in items] == ["b", "d", "a"]
     assert [p.where for p in problems] == ["items[0].owner"]
+
+
+# --------------------------------------------------------------------------- copying an item's block as it is written
+
+SOURCE = (
+    "version: 1\nitems:\n  - id: a\n    title: A\n    status: ready\n"
+    "  # why l matters\n  # (two lines)\n  - id: l\n    title: Local\n    owner: x\n    status: backlog\n"
+    "    notes: |\n      first\n\n      second\n"
+)
+L_SPAN = (
+    "  # why l matters\n  # (two lines)\n  - id: l\n    title: Local\n    owner: x\n    status: backlog\n"
+    "    notes: |\n      first\n\n      second\n"
+)
+
+
+def test_append_span_text_copies_the_block_with_its_comments_and_unknown_keys():
+    new = backlog_file.append_span_text(GOOD, SOURCE, "l")
+    assert new == GOOD + L_SPAN
+    items, problems = backlog_file.parse(new)
+    assert [i.id for i in items] == ["a", "b", "l"] and items[-1].notes == "first\n\nsecond\n"
+    assert [p.where for p in problems] == ["items[2].owner"]
+
+
+def test_append_span_text_takes_the_targets_line_endings_and_column():
+    crlf = GOOD.replace("\n", "\r\n")
+    assert backlog_file.append_span_text(crlf, SOURCE, "l") == crlf + L_SPAN.replace("\n", "\r\n")
+    flush = SOURCE.replace("\n  ", "\n")  # the source's list at column 0
+    assert backlog_file.append_span_text(GOOD, flush, "l") == GOOD + L_SPAN
+    assert backlog_file.append_span_text(GOOD.replace("\n  ", "\n"), SOURCE, "l") == (
+        GOOD.replace("\n  ", "\n") + L_SPAN.replace("\n  ", "\n").removeprefix("  "))
+    empty = "version: 1\nitems: []\n"
+    assert backlog_file.parse(backlog_file.append_span_text(empty, SOURCE, "l"))[0][0].id == "l"
+
+
+@pytest.mark.parametrize("source,item_id,why", [
+    (SOURCE, "a2", "not in"),
+    (SOURCE.replace("  - id: a\n    title: A\n", "  - id: b\n    title: A\n"), "b", "already in"),
+    ("version: 1\nitems:\n  - {id: l, title: Local}\n", "l", "flow style"),
+    (SOURCE.replace("    title: Local\n", "    title: Local\n    spec: /abs.md\n"), "l", "not valid"),
+])
+def test_append_span_text_refuses_what_it_cannot_copy_cleanly(source, item_id, why):
+    with pytest.raises(backlog_file.EditRefused, match=why):
+        backlog_file.append_span_text(GOOD, source, item_id)

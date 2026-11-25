@@ -498,6 +498,19 @@ def append_item_text(text: str, item: BacklogItem, *, name: str = FILE) -> str:
     items, problems = parse(text)
     if any(other.id == item.id for other in items):
         raise EditRefused(f"item {item.id} is already in {name}")
+    out, at, indent, nl = _list_end(text, name)
+    out[at:at] = [line + nl for line in _block(item, indent)]
+    new = "".join(out)
+    after_items, after_problems = parse(new)
+    if after_items != [*items, item] or _new_problems(problems, after_problems):
+        raise EditRefused(f"item {item.id} is not valid: {_why(problems, after_problems, {})}")
+    return new
+
+
+def _list_end(text: str, name: str) -> tuple[list[str], int, int, str]:
+    """Where a new item goes in `text`: `(its lines, ready to splice, the index after the last item, the column of the
+    list's dashes, the text's line ending)`. An `items: []` line becomes `items:`. `EditRefused` for no `items:` list, or
+    one written in flow style."""
     lines = _LINE.findall(text)
     head = next((n for n, line in enumerate(lines) if re.match(r"items:", line)), None)
     if head is None:
@@ -505,34 +518,69 @@ def append_item_text(text: str, item: BacklogItem, *, name: str = FILE) -> str:
     rest = lines[head][len("items:") :].split("#", 1)[0].strip()  # no regex: the line may hold a long run of blanks
     nl = _ending(lines[head]) or ("\r\n" if "\r\n" in text else "\n")
     out = list(lines)
-    if rest == "":
-        last = head
-        indent = 2
-        for j in range(head + 1, len(lines)):
-            if _skippable(lines[j]):
-                continue
-            if _indent(lines[j]) == 0 and not lines[j].startswith("- "):
-                break
-            if last == head:
-                found = re.match(r"( *)- ", lines[j])
-                if found is None:
-                    raise EditRefused(f"the items list of {name} is not written as a block")
-                indent = len(found.group(1))
-            last = j
-        at = last + 1
-        if last != head and not _ending(out[last]):
-            out[last] += nl
-    elif re.fullmatch(r"\[\s*\]", rest):
+    if re.fullmatch(r"\[\s*\]", rest):
         out[head] = "items:" + nl
-        at = head + 1
-    else:
+        return out, head + 1, 2, nl
+    if rest != "":
         raise EditRefused(f"the items list of {name} is written in flow style: edit it by hand")
-    block = [line + nl for line in _block(item, indent if rest == "" else 2)]
+    last = head
+    indent = 2
+    for j in range(head + 1, len(lines)):
+        if _skippable(lines[j]):
+            continue
+        if _indent(lines[j]) == 0 and not lines[j].startswith("- "):
+            break
+        if last == head:
+            found = re.match(r"( *)- ", lines[j])
+            if found is None:
+                raise EditRefused(f"the items list of {name} is not written as a block")
+            indent = len(found.group(1))
+        last = j
+    if last != head and not _ending(out[last]):
+        out[last] += nl
+    return out, last + 1, indent, nl
+
+
+def append_span_text(text: str, source: str, item_id: str, *, name: str = FILE) -> str:
+    """`text` with the item `item_id` of `source` added after its last item exactly as `source` writes it: its span (the
+    block, every key kept, unknown ones included, and the comment lines directly above its `- id:` line, as `move_item`
+    moves them), moved to the column of `text`'s list and ended with `text`'s line endings. Every other line as it is.
+
+    The new text is parsed first: `text`'s items and then the copied one, and no new problem but the copied item's own
+    warnings (an unknown key). `EditRefused` for an item `source` does not hold, one `text` already holds, a block that
+    cannot be cut out or moved cleanly (flow style, say), or one that would read differently; the caller may then write
+    the item with `append_item_text` instead."""
+    wanted = next((i for i in parse(source)[0] if i.id == item_id), None)
+    if wanted is None:
+        raise EditRefused(f"item {item_id} is not in the file it is copied from, or has an error")
+    items, problems = parse(text)
+    if any(other.id == item_id for other in items):
+        raise EditRefused(f"item {item_id} is already in {name}")
+    src = _LINE.findall(source)
+    start, end = _span(src, item_id)
+    out, at, indent, nl = _list_end(text, name)
+    shift = indent - _indent(src[_find_block(src, item_id)[0]])
+    block: list[str] = []
+    for line in src[start:end]:
+        bare = line.rstrip("\r\n")
+        if shift >= 0:
+            bare = " " * shift + bare if bare else bare
+        elif _indent(bare) >= -shift:
+            bare = bare[-shift:]
+        elif _skippable(bare):
+            bare = bare.lstrip(" ")
+        else:
+            raise EditRefused(f"item {item_id} cannot be moved to the column of the items list of {name}")
+        block.append(bare + nl)
     out[at:at] = block
     new = "".join(out)
-    after_items, after_problems = parse(new)
-    if after_items != [*items, item] or _new_problems(problems, after_problems):
-        raise EditRefused(f"item {item.id} is not valid: {_why(problems, after_problems, {})}")
+    found, after_problems = parse_indexed(new)
+    if [i for _, i in found] != [*items, wanted]:
+        raise EditRefused(f"item {item_id} is not valid: it reads differently once copied into {name}")
+    own = f"items[{found[-1][0]}]."
+    fresh = [p for p in _new_problems(problems, after_problems) if not (p.level == "warning" and p.where.startswith(own))]
+    if fresh:
+        raise EditRefused(f"item {item_id} is not valid: {'; '.join(f'{p.where} {p.message}' for p in fresh)}")
     return new
 
 

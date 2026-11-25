@@ -716,14 +716,14 @@ def test_a_saved_write_toasts_and_reloads():
 
 def test_the_run_card_shows_its_local_only_note_as_text():
     node = js(["board.js"], FAKE_EL + "ui = {}; money = limits = arrow = ago = dur = () => ''; goRun = openPeek = () => {}; cardNode(args)",
-              {"run_id": "r", "module": "m", "status": "running", "badge": "b", "gates": [], "strip": [], "backlog_note": "<b>x</b> discard it",
+              {"run_id": "r", "module": "m", "status": "running", "badge": "b", "gates": [], "strip": [], "backlog_note": "<b>x</b> remove that entry",
                "agent": None, "agents": [], "time_in_phase_s": 1, "wall_s": 1})
     def texts(n):
         if isinstance(n, dict):
             yield n["p"].get("text")
             for child in n["c"]:
                 yield from texts(child)
-    notes = [t for t in texts(node) if t == "<b>x</b> discard it"]
+    notes = [t for t in texts(node) if t == "<b>x</b> remove that entry"]
     assert len(notes) == 1
 
 

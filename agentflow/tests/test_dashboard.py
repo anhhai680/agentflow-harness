@@ -2435,8 +2435,8 @@ def test_the_run_card_carries_the_local_only_note(dash):
     assert card_of(dash)["backlog_note"] == ""
     run.emit("backlog_updated", item="crm", change="added", sha="c" * 40, local=True)
     assert card_of(dash)["backlog_note"] == (
-        "Your uncommitted backlog.yml entry for crm went into this run: discard it (git checkout backlog.yml) "
-        "before you pull the merge.")
+        "Your uncommitted backlog.yml entry for crm went into this run: remove that entry from your backlog.yml (or run "
+        "git checkout backlog.yml if nothing else of yours is in it) before you pull the merge.")
 
 
 @pytest.mark.parametrize("ending", [("run_finished", {}), ("run_failed", {"reason": "x"}), ("run_cancelled", {})])
