@@ -11,7 +11,7 @@ import stat
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -713,6 +713,14 @@ def unmerged_paths(worktree: Path) -> list[str]:
     return sorted(p for p in out.split("\0") if p)
 
 
+def merged_blob(worktree: Path, path: str) -> str:
+    """The blob id the index holds for `path` at stage 0, that is what a merge in progress staged for it once merged:
+    "" when the index has no such entry (the path is absent, or still conflicted). Never raises for a missing path."""
+    proc = subprocess.run(["git", *HARDENED, "rev-parse", "--verify", "--quiet", f":0:{path}"], cwd=Path(worktree),
+                          capture_output=True, text=True, encoding="utf-8", check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
 def pull_base(worktree: Path, target: str, timeout: int = 180) -> PullResult:
     """Fetch `origin/<target>` and start bringing it into the checked-out branch, without committing.
 
@@ -751,13 +759,15 @@ def conflict_markers(worktree: Path, paths: Sequence[str]) -> list[str]:
 
 
 def commit_sync(worktree: Path, message: str, cfg: Config, target_sha: str, expected_head: str | None = None,
-                forbid: Sequence[str] = ()) -> str:
+                forbid: Sequence[str] = (), clean_paths: Mapping[str, str] | None = None) -> str:
     """Conclude the merge in progress with a commit (the trailer appended) and return its sha.
 
     Like `commit`, with these differences: everything is staged, and the forbidden-path check applies to what the
     merge itself decided, that is the paths whose content equals neither the branch's (`HEAD`) nor the target's
     (`target_sha`), against `guardrails.forbidden_paths` and the caller's `forbid`. A forbidden file that only came
     in from the target, or that only the branch changed, passes.
+    `clean_paths` maps a path to the blob git's own conflict-free merge staged for it (`merged_blob`, read right after
+    the pull): such a path passes that check too, but only while what is staged for it is still exactly that blob.
     A rejected commit leaves the merge in progress."""
     worktree = Path(worktree)
     before = head(worktree)
@@ -783,8 +793,9 @@ def commit_sync(worktree: Path, message: str, cfg: Config, target_sha: str, expe
         return {p for p in out.split("\0") if p}
 
     decided = differing(before) & differing(target_sha)
+    merged = {p for p, blob in (clean_paths or {}).items() if blob and merged_blob(worktree, p) == blob}
     patterns = [*cfg.guardrails.forbidden_paths, *forbid]
-    forbidden = sorted(p for p in decided if any(path_matches(p, g) for g in patterns))
+    forbidden = sorted(p for p in decided - merged if any(path_matches(p, g) for g in patterns))
     if forbidden:
         raise CommitRejected("the merge resolution would change forbidden path(s): " + ", ".join(forbidden),
                              kind="forbidden_path")

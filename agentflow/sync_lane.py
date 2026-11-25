@@ -13,7 +13,9 @@ the latest `origin/<fork_from>` first, and never lets the merge break the system
    still break behaviour. A failing gate goes back to the `sync` session as a fix attempt; none left, or no
    session, and a human gets it.
 4. The runner commits the merge (`gitops.commit_sync`) and records `base_synced`, so `foreign_commits` knows
-   the merge is its own and the target's commits are not.
+   the merge is its own and the target's commits are not. A forbidden path the merge decided (content equal to
+   neither side) stops the run, with one exception: in a `backlog` pack, the backlog file as git's own merge left
+   it, on a fresh pull with no conflict at all (no session resolved anything, and no half-done merge was resumed).
 
 A stop leaves the merge in progress in the work tree and pushes nothing, so a human can finish it and resume.
 This module only brings the target branch into the run's branch: nothing is pushed to the target, and a human
@@ -30,7 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from agentflow import vuln
-from agentflow.config import Config, Phase, Step
+from agentflow.config import Config, Phase, Step, backlog_path
 from agentflow.conformance import probe_before_push
 from agentflow.gates import GateResult, gates_ok, record_results, run_gates, run_gates_reusing
 from agentflow.gitops import (
@@ -44,6 +46,7 @@ from agentflow.gitops import (
     head,
     merge_in_progress,
     merge_target,
+    merged_blob,
     pr_mergeable,
     pull_base,
     push,
@@ -81,11 +84,16 @@ class SyncLane:
         """Bring `origin/<fork_from>` into the branch: "done" (up to date, or merged and committed) or "stopped"."""
         target = self.cfg.project.fork_from
         wt = self.worktree
+        clean: dict[str, str] = {}  # the backlog file as git's own conflict-free merge left it, when that is all it was
         try:
             if merge_in_progress(wt):  # a stop, or a human, left a merge half done: pick it up where it is
                 pulled = PullResult("conflicted" if unmerged_paths(wt) else "merged", merge_target(wt), unmerged_paths(wt))
             else:
                 pulled = pull_base(wt, target)
+                backlog = backlog_path(self.cfg.work_source)
+                if backlog is not None and pulled.status != "up_to_date" and not pulled.conflicts:
+                    blob = merged_blob(wt, backlog)
+                    clean = {backlog: blob} if blob else {}
         except GitError as exc:
             raise_hitl(self.cfg, self.run, "blocked", key, f"Could not bring origin/{target} into the branch: {exc}")
             return "stopped"
@@ -102,7 +110,8 @@ class SyncLane:
         if notes:
             message += "\n\n" + "\n".join(notes)
         try:
-            sha = commit_sync(wt, message, self.cfg, pulled.target_sha, forbid=vuln.run_forbidden(self.cfg, self.run))
+            sha = commit_sync(wt, message, self.cfg, pulled.target_sha, forbid=vuln.run_forbidden(self.cfg, self.run),
+                              clean_paths=clean)
         except CommitRejected as exc:
             raise_hitl(self.cfg, self.run, "guard_violation", key, f"Guard violation in {key}: {exc.kind}: {exc}")
             return "stopped"
