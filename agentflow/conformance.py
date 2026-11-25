@@ -3,8 +3,9 @@
 `evaluate` is pure: nothing in it reads a file or the clock. It takes the run's events, the obligations that apply
 and the tree that will be pushed, and returns one finding per obligation. Evidence counts only when it comes after
 the last code change that makes it stale (steps, expectations; see `_staling`) or was made on exactly the final
-tree (gates, and the vuln lane's `advisory_cleared`), or by a gate whose `input_hash` there equals the one on the result (the files it declares as `inputs`
-are the same). An affected-tier result (`tier: "affected"`, passed or skipped) is never gate evidence: it checked
+tree (gates, and the vuln lane's `advisory_cleared`; a gate's pass also on the tree just before the runner's own
+`status: done` commit, `gates.carried_trees`), or by a gate whose `input_hash` there equals the one on the result
+(the files it declares as `inputs` are the same). An affected-tier result (`tier: "affected"`, passed or skipped) is never gate evidence: it checked
 only the files a fix changed. Events from older runs
 carry no `tree`, so every reader uses `.get` and a missing tree is no evidence.
 
@@ -34,7 +35,7 @@ from agentflow.config import (
     Evidence,
     Obligation,
 )
-from agentflow.gates import failure_report, gates_ok, input_hashes, record_results, run_gates
+from agentflow.gates import carried_trees, failure_report, gates_ok, input_hashes, record_results, run_gates
 from agentflow.gitops import GitError, dirty_paths, head, merge_in_progress
 from agentflow.guards import changed_paths, path_matches, snapshot
 from agentflow.hitl import clean_fact, raise_hitl
@@ -128,11 +129,12 @@ def _gates(cfg: Config, events: list[dict], set_name: str, final_tree: str,
     seqs: list[int] = []
     notes: list[str] = []
     unmet: list[str] = []
+    trees = carried_trees(events, final_tree)  # the final tree, and the tree before the runner's `status: done` commit
     for name in names:
         wanted = (hashes or {}).get(name)
         result = _last([e for e in events if e.get("type") == "gate_result" and e.get("gate") == name and final_tree
                         and e.get("tier") != "affected"  # it checked only the files a fix changed: never the floor
-                        and (e.get("tree") == final_tree or (e.get("input_hash") and e.get("input_hash") == wanted))])
+                        and (e.get("tree") in trees or (e.get("input_hash") and e.get("input_hash") == wanted))])
         if result is None:
             unmet.append(f"{name}: no result on the final tree")
         elif result.get("skipped"):
@@ -290,8 +292,9 @@ def evaluate(cfg: Config, events: list[dict], obligations: list[Obligation], fin
     is never waived. Otherwise it is `missing`, with a note for each unmet item. An obligation with no evidence
     items is `missing`: it fails closed, never vacuously met.
 
-    A gate's result counts when its `tree` is `final_tree`, or when it carries an `input_hash` equal to
-    `input_hashes[gate]`, the gate's hash on the final tree (only a gate with `inputs` has one).
+    A gate's result counts when its `tree` is `final_tree`, or the tree before the runner's `status: done` commit on
+    it (`gates.carried_trees`), or when it carries an `input_hash` equal to `input_hashes[gate]`, the gate's hash on
+    the final tree (only a gate with `inputs` has one).
 
     With `security` (the security overlay holds on the tree to be pushed), an approval the runner gave on the approval
     ramp is no evidence: only a person approves such a run's phases."""

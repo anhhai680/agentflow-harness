@@ -99,7 +99,8 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import carry, constraint, overlays, park, route, sizing, sources, verification, vuln, waves
+from agentflow import (backlog_file, backlog_writes, carry, constraint, overlays, park, route, sizing, sources,
+                       verification, vuln, waves)
 from agentflow.autonomy import AUTO_BY, FORBIDDEN, GUARD_KIND, Resolver, as_finding, blocking_of, finding_line
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.conditions import Ctx, fmt, forbidden_plan_files, skill_text
@@ -1334,8 +1335,9 @@ class FeatureLane:
     # ------------------------------------------------------------------ finish
 
     def run_finish(self, phase: Phase, step: Step, key: str) -> Outcome:
-        """Bring the latest target branch in; refuse uncommitted changes; push the branch (never forced) and open a
-        draft pull request against `fork_from`, the branch the run was cut from; then check it merges cleanly."""
+        """Bring the latest target branch in; refuse uncommitted changes; in a backlog run, mark the item done
+        (`backlog_writes.mark_done`); push the branch (never forced) and open a draft pull request against `fork_from`,
+        the branch the run was cut from; then check it merges cleanly."""
         self.run.refresh()
         if self.run.state["waiting"] is not None:
             return "stopped"
@@ -1360,6 +1362,12 @@ class FeatureLane:
         if self.run_sync(phase, step, key) != "done":
             return "stopped"
         if not self.runner_commits_only(key):
+            return "stopped"
+        try:  # on top of the merge, before the audit: the gates' evidence carries across this one commit
+            backlog_writes.mark_done(self.cfg, self.run, self.worktree)
+        except (CommitRejected, NothingToCommit, backlog_file.EditRefused, GitError,
+                subprocess.CalledProcessError) as exc:
+            raise_hitl(self.cfg, self.run, "blocked", key, f"Could not mark the item done in the backlog: {exc}")
             return "stopped"
         if deferred_full(self.run.events.read()):  # a fix step ran the affected tier: the full set is still owed
             if self.final_check(phase, step, key) != "done" or not self.runner_commits_only(key):

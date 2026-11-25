@@ -177,6 +177,7 @@ function cardNode(card) {
     skips.length ? el("div", { class: "sub" }, skips) : null,
     parked.length ? el("div", { class: "sub" }, parked.map((p) => el("span", { class: "badge", text: p.text, title: p.title }))) : null,
     typeof card.slot === "number" ? el("span", { class: "badge lock", text: "slot " + card.slot }) : null,
+    card.backlog_note ? el("div", { class: "sub", text: card.backlog_note }) : null,
     el("div", { class: "sub", text: "in phase " + ago(card.time_in_phase_s) + " · total " + dur(card.wall_s) }),
     card.pr_link ? prNode(card) : null,
     card.ready ? movesNode(card) : null);
@@ -277,6 +278,7 @@ function backlogNode(item) {
   if (canStart) buttons.push(el("button", { type: "button", class: "primary", text: item.armed ? "Confirm start" : "Start", onclick: (ev) => { ev.stopPropagation(); startItem(item); } }));
   else if (item.startable === false) buttons.push(el("button", { type: "button", class: "primary", text: "Start", disabled: "disabled", title: item.note || "" }));
   if (item.removable) buttons.push(el("button", { type: "button", class: "danger", text: "Remove", onclick: (ev) => { ev.stopPropagation(); removeItem(item); } }));
+  if (isOpenFileCard(item)) buttons.push(...fileButtons(item));
   const isAlert = item.kind === "alert";
   const sev = isAlert ? severityClass(item.severity) : null;
   const node = el("article", { class: "card backlog " + item.status + (item.failure ? " failed-start" : ""), draggable: canStart ? "true" : null },
@@ -284,6 +286,7 @@ function backlogNode(item) {
     sev ? el("span", { class: "pill " + sev, text: item.severity }) : null,
     backlogMark(item),
     item.planning === "backlog" ? el("span", { class: "badge", text: "idea", title: "status: backlog. Start asks for a second click." }) : null,
+    item.item && item.local === true ? el("span", { class: "badge", text: LOCAL_BADGE, title: LOCAL_TITLE }) : null,
     isAlert ? alertLines(item).map((line) => el("div", { class: "sub", text: line })) : null,
     item.url ? linkNode(item.url, isAlert ? "Alert ↗" : "Issue ↗") : null,
     item.blocked_by.length ? el("div", { class: "sub", text: "Runs after: " + item.blocked_by.map((b) => b.text).join(", ") }) : null,
@@ -296,14 +299,147 @@ function backlogNode(item) {
   return node;
 }
 
-function newTaskDialog() {
+// ------------------------------------------------------------------ the backlog file
+//
+// In a `backlog` pack the Board edits `backlog.yml` in the working tree (never a commit) through `POST /api/backlog/file`.
+// Every write carries the sha-256 the page read (`backlog_sha256`); the server refuses it with a 409 when the file has
+// changed since. Every value reaches the DOM as text or a control's `.value`, never as HTML.
+
+const LOCAL_BADGE = "local: commit to share";
+const LOCAL_TITLE = "This item is not in backlog.yml on the base branch yet: commit and push the file to share it.";
+const FILE_STALE = "backlog.yml changed on disk since the page read it: reload";
+const FILE_STATUSES = ["backlog", "ready", "done", "dropped"];
+const RESP_TITLE_MAX = 200;
+
+const fileSha = () => (ui.board && ui.board.backlog_sha256) || "";
+
+// A write is built from what the page showed, so it carries the sha of the render that showed it: a card's `sha` (set when
+// the Backlog column is drawn), never the one of a later refresh. A refresh that comes while a dialog is open must not
+// let a save past the server's stale-file check.
+const shaOf = (card) => (typeof card.sha === "string" ? card.sha : fileSha());
+
+// A card read from the file whose item is still open: the only kind the page edits and moves.
+const isOpenFileCard = (card) => !!(card && card.kind === "module" && card.item && ["backlog", "ready"].includes(card.item.status));
+
+const sameSet = (a, b) => { const x = a.slice().sort(); const y = b.slice().sort(); return x.length === y.length && x.every((v, i) => v === y[i]); };
+
+// The `edit` body of `form` (what the dialog holds) against `card.item` (what the page read): only the keys that differ.
+function editBody(card, form, sha) {
+  const was = card.item || {};
+  const fields = {};
+  for (const key of ["title", "lane", "status", "spec"]) {
+    const now = String(form[key] === undefined || form[key] === null ? "" : form[key]).trim();
+    if (now !== String(was[key] === undefined || was[key] === null ? "" : was[key])) fields[key] = now;
+  }
+  const notes = String(form.notes === undefined || form.notes === null ? "" : form.notes);
+  if (notes !== String(was.notes || "")) fields.notes = notes;
+  const deps = Array.isArray(form.depends_on) ? form.depends_on : [];
+  if (!sameSet(deps, was.depends_on || [])) fields.depends_on = deps;
+  const issue = String(form.issue === undefined || form.issue === null ? "" : form.issue).trim();
+  if (issue !== (was.issue === null || was.issue === undefined ? "" : String(was.issue))) fields.issue = issue === "" ? null : /^\d+$/.test(issue) ? Number(issue) : issue;
+  return { op: "edit", id: card.id, fields: fields, sha256: sha };
+}
+
+const moveBody = (card, up, sha) => ({ op: "move", id: card.id, direction: up ? "up" : "down", sha256: sha });
+
+const addFromSpecBody = (path, sha) => ({ op: "add", item: { spec: path, status: "backlog" }, sha256: sha });
+
+// One line of at most `RESP_TITLE_MAX` characters, cut with an ellipsis.
+function oneLine(text) {
+  const line = String(text || "").replace(/\s+/g, " ").trim();
+  return line.length > RESP_TITLE_MAX ? line.slice(0, RESP_TITLE_MAX - 1) + "…" : line;
+}
+
+// A new module of the New task form, as an item of the file: ready to start, its title the responsibility as one line.
+function newModuleBody(form, sha) {
+  const item = { id: String(form.module || "").trim(), title: oneLine(form.responsibility), depends_on: form.deps || [], status: "ready" };
+  const issue = String(form.issue === undefined || form.issue === null ? "" : form.issue).trim();
+  if (issue) item.issue = /^\d+$/.test(issue) ? Number(issue) : issue;
+  return { op: "add", item: item, sha256: sha };
+}
+
+// The server's message, except that a bare status line from `api` reads as the stale-file text.
+function fileWriteError(err) {
+  if (err.status === 409) return err.message && !/^HTTP \d+$/.test(err.message) ? err.message : FILE_STALE;
+  return "Could not save: " + err.message;
+}
+
+// One write: "saved", "stale" (a 409: the page shows what is on disk now) or "failed". The board refreshes after any of them.
+async function writeBacklogFile(body, said) {
+  let result = "saved";
+  try {
+    await api("/api/backlog/file", body);
+    toast(said);
+  } catch (err) {
+    toast(fileWriteError(err));
+    result = err.status === 409 ? "stale" : "failed";
+  }
+  refreshAfter();
+  return result;
+}
+
+const moveItem = (card, up) => writeBacklogFile(moveBody(card, up, shaOf(card)), card.label + " moved " + (up ? "up" : "down"));
+
+const addSpec = (path, sha) => writeBacklogFile(addFromSpecBody(path, sha), "Added " + path + " to backlog.yml as an idea");
+
+// The Edit dialog's save: the changed keys against the item the dialog showed, with the sha from when it opened.
+async function saveEdit(card, form, sha) {
+  const wanted = editBody(card, form, sha);
+  if (!Object.keys(wanted.fields).length) { toast("Nothing changed"); return true; }
+  return (await writeBacklogFile(wanted, "Saved " + card.id + " in backlog.yml")) !== "failed";  // a stale file closes the dialog: edit again from what the page now shows
+}
+
+function fileButtons(card) {
+  const button = (text, label, onclick) => el("button", { type: "button", text: text, "aria-label": label + " " + card.label,
+    onclick: (ev) => { ev.stopPropagation(); onclick(); } });
+  return [button("Edit", "Edit", () => editDialog(card)), button("Move up", "Move up", () => moveItem(card, true)),
+    button("Move down", "Move down", () => moveItem(card, false))];
+}
+
+function editDialog(card) {
   const data = ui.board;
-  const kinds = Object.keys(data.new_task);
-  if (!kinds.length) return;
-  const radios = kinds.map((name, index) => el("input", { type: "radio", name: "nt-kind", value: name, checked: index === 0 ? "checked" : null }));
-  const kind = () => radios.find((radio) => radio.checked).value;
-  const fields = el("div", {});
-  const inputs = {};
+  const sha = shaOf(card);  // of the render that drew this card, whatever a refresh brings while the dialog is open
+  const item = card.item;
+  const control = (id, label, input) => { input.setAttribute("id", id); return [el("label", { for: id, text: label }), input]; };
+  const lanes = Array.from(new Set([...(data.lanes || []), item.lane].filter(Boolean)));  // every lane of the pack, not only the New task form's
+  const choose = (id, multi, choices, selected) => {
+    const select = el("select", { id: id, multiple: multi ? "multiple" : null }, choices.map((c) => el("option", { value: c.key, text: c.label })));
+    for (const option of Array.from(select.options)) option.selected = selected.includes(option.value);
+    return select;
+  };
+  const deps = Array.from(new Set([...(data.modules || []).filter((m) => m !== card.id), ...(item.depends_on || [])]));
+  const inputs = {
+    title: el("input", { type: "text", maxlength: 200 }),
+    lane: choose("ei-lane", false, [{ key: "", label: "(the module lane)" }, ...lanes.map((l) => ({ key: l, label: workLabel(l) }))], [item.lane || ""]),
+    status: choose("ei-status", false, FILE_STATUSES.map((v) => ({ key: v, label: v })), [item.status]),
+    depends_on: choose("ei-deps", true, deps.map((d) => ({ key: d, label: d })), item.depends_on || []),
+    issue: el("input", { type: "text", maxlength: 12 }),
+    spec: el("input", { type: "text", maxlength: 400 }),
+    notes: el("textarea", { maxlength: 4000 }),
+  };
+  inputs.title.value = item.title || "";
+  inputs.issue.value = item.issue === null || item.issue === undefined ? "" : String(item.issue);
+  inputs.spec.value = item.spec || "";
+  inputs.notes.value = item.notes || "";
+  const body = [...control("ei-title", "Title", inputs.title), ...control("ei-lane", "Lane", inputs.lane), ...control("ei-status", "Status", inputs.status),
+    ...control("ei-deps", "Depends on", inputs.depends_on), ...control("ei-issue", "Issue number", inputs.issue),
+    ...control("ei-spec", "Spec", inputs.spec), ...control("ei-notes", "Notes", inputs.notes)];
+  dialog("Edit " + card.id, body, async () => {
+    const form = { title: inputs.title.value, lane: inputs.lane.value, status: inputs.status.value, issue: inputs.issue.value, spec: inputs.spec.value,
+      notes: inputs.notes.value, depends_on: Array.from(inputs.depends_on.selectedOptions).map((o) => o.value) };
+    return saveEdit(card, form, sha);
+  });
+}
+
+// ------------------------------------------------------------------ New task
+
+// A new module of a `backlog` pack goes to the file, ready to start, so the form leaves out "Stop after" and "Runs after".
+const addsToFile = (data, name) => data.work_source_kind === "backlog" && (data.new_task[name] || []).includes("new_module");
+
+// The form's fields for one kind of work, in order. Each input is also recorded in `inputs`, by its id.
+function taskFormParts(data, name, inputs) {
+  const wanted = data.new_task[name];
+  const parts = [];
   const pick = (id, label, multi, choices, hint) => {
     const select = el("select", { id: id, multiple: multi ? "multiple" : null }, choices.map((c) => el("option", { value: c.key, text: c.label })));
     inputs[id] = select;
@@ -314,31 +450,50 @@ function newTaskDialog() {
     inputs[id] = input;
     return [el("label", { for: id, text: label }), input];
   };
+  if (wanted.includes("issue") && wanted.includes("new_module")) parts.push(el("div", { class: "sub", text: "Fill in the issue number, a new module, or both: an issue marks it on GitHub and links the pull request." }));
+  if (wanted.includes("issue")) parts.push(...text("nt-issue", "Issue number", false, 12));
+  if (wanted.includes("task")) parts.push(...text("nt-task", "Task (paste a log here if it helps)", true, 16000));
+  if (wanted.includes("topic")) parts.push(...text("nt-topic", "Topic", false, 400));
+  if (wanted.includes("new_module")) {
+    parts.push(...text("nt-module", "Module id (lowercase, - or _)", false, 60));
+    parts.push(...text("nt-resp", "What it does", "short", 400));
+    parts.push(...pick("nt-deps", "Depends on", true, data.modules.map((m) => ({ key: m, label: m })), data.work_source_kind === "specs" ? "Only modules already in the spec files." : data.work_source_kind === "backlog" ? "Only items already in backlog.yml." : "Only modules already in the map."));
+  }
+  if (addsToFile(data, name)) return parts.filter(Boolean);
+  const phases = data.lane_phases[name] || [];
+  parts.push(...pick("nt-stop", "Stop after", false, [{ key: "", label: "(run to the end)" }, ...phases.map((p) => ({ key: p, label: p }))]));
+  if (wanted.includes("after")) parts.push(...pick("nt-after", "Runs after (optional)", true, data.after_choices, "The card stays locked until each one is merged."));
+  return parts.filter(Boolean);
+}
+
+function newTaskDialog() {
+  const data = ui.board;
+  const sha = fileSha();  // when the form opened: a refresh while it is open does not move it
+  const kinds = Object.keys(data.new_task);
+  if (!kinds.length) return;
+  const radios = kinds.map((name, index) => el("input", { type: "radio", name: "nt-kind", value: name, checked: index === 0 ? "checked" : null }));
+  const kind = () => radios.find((radio) => radio.checked).value;
+  const fields = el("div", {});
+  let inputs = {};
   const build = () => {
-    const wanted = data.new_task[kind()];
-    const parts = [];
-    if (wanted.includes("issue") && wanted.includes("new_module")) parts.push(el("div", { class: "sub", text: "Fill in the issue number, a new module, or both: an issue marks it on GitHub and links the pull request." }));
-    if (wanted.includes("issue")) parts.push(...text("nt-issue", "Issue number", false, 12));
-    if (wanted.includes("task")) parts.push(...text("nt-task", "Task (paste a log here if it helps)", true, 16000));
-    if (wanted.includes("topic")) parts.push(...text("nt-topic", "Topic", false, 400));
-    if (wanted.includes("new_module")) {
-      parts.push(...text("nt-module", "Module id (lowercase, - or _)", false, 60));
-      parts.push(...text("nt-resp", "What it does", "short", 400));
-      parts.push(...pick("nt-deps", "Depends on", true, data.modules.map((m) => ({ key: m, label: m })), data.work_source_kind === "specs" ? "Only modules already in the spec files." : data.work_source_kind === "backlog" ? "Only items already in backlog.yml." : "Only modules already in the map."));
-    }
-    const phases = data.lane_phases[kind()] || [];
-    parts.push(...pick("nt-stop", "Stop after", false, [{ key: "", label: "(run to the end)" }, ...phases.map((p) => ({ key: p, label: p }))]));
-    if (wanted.includes("after")) parts.push(...pick("nt-after", "Runs after (optional)", true, data.after_choices, "The card stays locked until each one is merged."));
-    fields.replaceChildren(...parts.filter(Boolean));
+    inputs = {};
+    const parts = taskFormParts(data, kind(), inputs);
+    fields.replaceChildren(...parts.filter(Boolean));  // `replaceChildren` prints a null as "null"
   };
   for (const radio of radios) radio.addEventListener("change", build);
   build();
-  const chosen = (id) => Array.from(inputs[id].selectedOptions).map((o) => o.value);
+  const chosen = (id) => (inputs[id] ? Array.from(inputs[id].selectedOptions).map((o) => o.value) : []);
   const picker = el("fieldset", {}, el("legend", { text: "What kind of work?" }),
     kinds.map((name, index) => el("label", { class: "kind" }, radios[index], workLabel(name))));
   dialog("New task", [picker, fields], async () => {
     const wanted = data.new_task[kind()];
-    const body = { lane: kind(), fields: {}, after: wanted.includes("after") ? chosen("nt-after") : [], to_phase: inputs["nt-stop"].value || null };
+    if (addsToFile(data, kind()) && (inputs["nt-module"].value.trim() || inputs["nt-resp"].value.trim())) {
+      const form = { module: inputs["nt-module"].value, responsibility: inputs["nt-resp"].value, deps: chosen("nt-deps"),
+        issue: wanted.includes("issue") ? inputs["nt-issue"].value : "" };
+      const result = await writeBacklogFile(newModuleBody(form, sha), "Added " + form.module.trim() + " to backlog.yml: press Start when it is ready");
+      return result !== "failed";  // a stale file closes the dialog: add again from what the page now shows
+    }
+    const body = { lane: kind(), fields: {}, after: wanted.includes("after") ? chosen("nt-after") : [], to_phase: inputs["nt-stop"] ? inputs["nt-stop"].value || null : null };
     if (wanted.includes("issue")) body.fields.issue = inputs["nt-issue"].value.trim();
     if (wanted.includes("task")) body.fields.task = inputs["nt-task"].value;
     if (wanted.includes("topic")) body.fields.topic = inputs["nt-topic"].value.trim();
@@ -370,11 +525,13 @@ function columnEntries(data, name, shownCards) {
   const count = name === "Backlog" ? data.backlog.length : cards.length;
   const entries = [entry("col-head", { name: name, count: count }, (head) => el("h2", {}, el("span", { text: head.name }), el("span", { text: String(head.count) })))];
   if (name === "Backlog") {
-    entries.push(...data.backlog.map((item) => entry(item.key || item.id, item.planning === "backlog" ? Object.assign({}, item, { armed: armedFor(item) }) : item, backlogNode)));
+    // A card carries the sha of this render, so a node drawn before the file changed is drawn again, never reused.
+    entries.push(...data.backlog.map((item) => entry(item.key || item.id,
+      Object.assign({}, item, { sha: data.backlog_sha256 || "" }, item.planning === "backlog" ? { armed: armedFor(item) } : {}), backlogNode)));
     if (data.done_note) entries.push(entry("done-note", data.done_note, (note) => el("div", { class: "muted gate-bad", text: "Done marks not read: " + note })));
     if ((data.backlog_done || []).length) entries.push(entry("done", data.backlog_done, () => doneNode(data.backlog_done)));
     if ((data.backlog_dropped || []).length) entries.push(entry("dropped", data.backlog_dropped, droppedNode));
-    if ((data.backlog_skipped || []).length) entries.push(entry("skipped", data.backlog_skipped, (names) => skippedNode(names, data.work_source_kind)));
+    if ((data.backlog_skipped || []).length) entries.push(entry("skipped", { names: data.backlog_skipped, sha: data.backlog_sha256 || "" }, (skipped) => skippedNode(skipped.names, data.work_source_kind, skipped.sha)));
   }
   if (name === "Done") {
     const page = doneCards(cards, ui.doneShown, ui.doneAll);
@@ -449,11 +606,12 @@ function doneNode(done) {
 }
 
 // Spec files no item names. A backlog pack calls them "Not on the backlog" and folds them away; other kinds say "Not modules".
-function skippedNode(names, kind) {
+function skippedNode(names, kind, sha) {
   if (kind !== "backlog") return el("div", { class: "muted", text: "Not modules: " + names.join(", ") });
   return el("details", { class: "done-modules", open: ui.skippedOpen ? "true" : null, ontoggle: (ev) => { ui.skippedOpen = ev.target.open; } },
     el("summary", { text: "Not on the backlog (" + names.length + ")" }),
-    names.map((name) => el("div", { class: "muted", text: name })));
+    names.map((name) => el("div", { class: "muted", text: name },
+      el("button", { type: "button", text: "Add", "aria-label": "Add " + name + " to the backlog", onclick: () => addSpec(name, sha) }))));
 }
 
 // Dropped backlog items: never cards. One line each (id and title as text), folded away; the open state survives the SSE re-render.

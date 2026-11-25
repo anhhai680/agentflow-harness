@@ -13,7 +13,11 @@ the latest `origin/<fork_from>` first, and never lets the merge break the system
    still break behaviour. A failing gate goes back to the `sync` session as a fix attempt; none left, or no
    session, and a human gets it.
 4. The runner commits the merge (`gitops.commit_sync`) and records `base_synced`, so `foreign_commits` knows
-   the merge is its own and the target's commits are not.
+   the merge is its own and the target's commits are not. A forbidden path the merge decided (content equal to
+   neither side) stops the run, with one exception: in a `backlog` pack, the backlog file the runner settled itself
+   right after the pull (`backlog_writes.bring_in`: the target's file with the run's own recorded changes made on it
+   again), recorded as `backlog_blob` on `sync_started`, and only while that exact blob is what is staged. A resumed
+   merge takes the blob back from the `sync_started` of the same target; with none, the file is refused as before.
 
 A stop leaves the merge in progress in the work tree and pushes nothing, so a human can finish it and resume.
 This module only brings the target branch into the run's branch: nothing is pushed to the target, and a human
@@ -29,8 +33,9 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from agentflow import vuln
-from agentflow.config import Config, Phase, Step
+from agentflow import backlog_writes, vuln
+from agentflow.backlog_file import EditRefused
+from agentflow.config import Config, Phase, Step, backlog_path
 from agentflow.conformance import probe_before_push
 from agentflow.gates import GateResult, gates_ok, record_results, run_gates, run_gates_reusing
 from agentflow.gitops import (
@@ -81,17 +86,33 @@ class SyncLane:
         """Bring `origin/<fork_from>` into the branch: "done" (up to date, or merged and committed) or "stopped"."""
         target = self.cfg.project.fork_from
         wt = self.worktree
+        backlog = backlog_path(self.cfg.work_source)
+        blob = ""  # the backlog file the runner settled and staged itself for this merge
         try:
             if merge_in_progress(wt):  # a stop, or a human, left a merge half done: pick it up where it is
                 pulled = PullResult("conflicted" if unmerged_paths(wt) else "merged", merge_target(wt), unmerged_paths(wt))
+                blob = self._settled_backlog(pulled.target_sha)
             else:
                 pulled = pull_base(wt, target)
+                if pulled.status != "up_to_date":
+                    blob = backlog_writes.bring_in(self.cfg, self.run, wt, pulled.target_sha, pulled.conflicts)
         except GitError as exc:
             raise_hitl(self.cfg, self.run, "blocked", key, f"Could not bring origin/{target} into the branch: {exc}")
             return "stopped"
+        except (EditRefused, OSError, ValueError) as exc:  # the replay of the run's own backlog changes
+            raise_hitl(self.cfg, self.run, "blocked", key,
+                       f"Could not bring {backlog} in from origin/{target} with this run's changes: {exc}",
+                       extra=f"The merge is left in progress in the run's work tree; nothing was committed or pushed. "
+                             f"If the item is committed only on your local {target}, push it first, then run "
+                             "`git merge --abort` in the run's work tree and resume, so the sync starts again.")
+            return "stopped"
         if pulled.status == "up_to_date":
             return "done"
-        self.run.emit("sync_started", key=key, target=target, target_sha=pulled.target_sha, conflicts=pulled.conflicts)
+        if blob:  # settled by the runner: never a conflict a session is told about, nor code a person resolved
+            pulled = replace(pulled, conflicts=[p for p in pulled.conflicts if p != backlog])
+        extra = {"backlog_blob": blob} if blob else {}
+        self.run.emit("sync_started", key=key, target=target, target_sha=pulled.target_sha, conflicts=pulled.conflicts,
+                      **extra)
         notes: list[str] = []  # what the resolver said, for the pull request
         if pulled.conflicts and self._resolve_conflicts(phase, step, key, notes) == "stopped":
             return "stopped"
@@ -102,7 +123,8 @@ class SyncLane:
         if notes:
             message += "\n\n" + "\n".join(notes)
         try:
-            sha = commit_sync(wt, message, self.cfg, pulled.target_sha, forbid=vuln.run_forbidden(self.cfg, self.run))
+            sha = commit_sync(wt, message, self.cfg, pulled.target_sha, forbid=vuln.run_forbidden(self.cfg, self.run),
+                              runner_blob=(backlog, blob) if backlog and blob else None)
         except CommitRejected as exc:
             raise_hitl(self.cfg, self.run, "guard_violation", key, f"Guard violation in {key}: {exc.kind}: {exc}")
             return "stopped"
@@ -112,6 +134,15 @@ class SyncLane:
         self.run.emit("base_synced", key=key, sha=sha, target=pulled.target_sha, branch=target,
                       conflicts=pulled.conflicts, notes=notes, gates=self._merge_gates_line(key))
         return "done"
+
+    def _settled_backlog(self, target_sha: str) -> str:
+        """The backlog blob the runner staged for the merge of `target_sha`, read back from the latest `sync_started`
+        of that target ("" when there is none: a merge from before the runner settled the file, or a person's)."""
+        latest: dict = {}
+        for e in self.run.events.read():
+            if e["type"] == "sync_started" and e.get("target_sha") == target_sha:
+                latest = e
+        return str(latest.get("backlog_blob") or "")
 
     # ------------------------------------------------------------------ conflicts
 

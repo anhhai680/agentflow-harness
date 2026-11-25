@@ -7,6 +7,7 @@ dependency is known is `validate`'s business, not the parser's."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import posixpath
 import re
@@ -210,21 +211,30 @@ def read(path: Path) -> tuple[list[BacklogItem], list[Problem]]:
 
 def read_indexed(path: Path) -> tuple[list[tuple[int, BacklogItem]], list[Problem]]:
     """`parse_indexed` of the file at `path`, read without following a symlink. Never raises."""
+    found, problems, _ = read_digest(path)
+    return found, problems
+
+
+def read_digest(path: Path) -> tuple[list[tuple[int, BacklogItem]], list[Problem], str]:
+    """`read_indexed`, and the sha-256 hex of the bytes that one read gave (`""` when nothing was read: a missing,
+    symlinked or unreadable file), so a page that shows the items can send back the sha of exactly what it showed.
+    Never raises."""
     try:
         data = safeio.read_bytes(path, FILE_MAX + 1)
     except safeio.SymlinkRefused:
-        return [], [Problem("error", FILE, "is a symlink: the engine does not read it")]
+        return [], [Problem("error", FILE, "is a symlink: the engine does not read it")], ""
     except (OSError, ValueError) as exc:
-        return [], [Problem("error", FILE, f"cannot be read: {exc}")]
+        return [], [Problem("error", FILE, f"cannot be read: {exc}")], ""
     if data is None:
-        return [], [Problem("error", FILE, "missing: agentflow backlog import writes it")]
+        return [], [Problem("error", FILE, "missing: agentflow backlog import writes it")], ""
+    digest = hashlib.sha256(data).hexdigest()
     if len(data) > FILE_MAX:
-        return [], [Problem("error", FILE, f"is larger than {FILE_MAX} bytes")]
+        return [], [Problem("error", FILE, f"is larger than {FILE_MAX} bytes")], digest
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        return [], [Problem("error", FILE, "is not valid UTF-8")]
-    return parse_indexed(text)
+        return [], [Problem("error", FILE, "is not valid UTF-8")], digest
+    return *parse_indexed(text), digest
 
 
 # --- rendering and in-place edits -------------------------------------------------------------------------------
@@ -245,6 +255,10 @@ _FIELD = {"depends_on": "deps"}
 
 class EditRefused(ValueError):
     """An edit that could not be made safely. The file is untouched."""
+
+
+class Stale(EditRefused):
+    """The file's bytes are not the ones the caller read (`expect_sha`): someone changed it since. Untouched too."""
 
 
 def _reads_back(text: str, as_value: str, expect: object) -> bool:
@@ -308,7 +322,9 @@ def render(items: list[BacklogItem]) -> str:
     return "".join(out)
 
 
-def _load(path: Path) -> str:
+def _load(path: Path, expect_sha: str | None = None) -> tuple[str, str]:
+    """The file's text and the sha-256 hex of the raw bytes read. `Stale` when `expect_sha` is given and those bytes
+    hash to anything else; `EditRefused` for a symlink, a missing or unreadable file, or one that is not UTF-8."""
     try:
         data = safeio.read_bytes(path, FILE_MAX + 1)
     except safeio.SymlinkRefused:
@@ -317,19 +333,25 @@ def _load(path: Path) -> str:
         raise EditRefused(f"{path.name} cannot be read: {exc}") from None
     if data is None:
         raise EditRefused(f"{path.name} is missing: agentflow backlog import writes it")
+    digest = hashlib.sha256(data).hexdigest()
+    if expect_sha is not None and digest != expect_sha:
+        raise Stale(f"{path.name} changed on disk since the page read it: reload")
     try:
-        return data.decode("utf-8")
+        return data.decode("utf-8"), digest
     except UnicodeDecodeError:
         raise EditRefused(f"{path.name} is not valid UTF-8") from None
 
 
-def _store(path: Path, text: str) -> None:
-    if len(text.encode("utf-8")) > FILE_MAX:
+def _store(path: Path, text: str) -> str:
+    """Write `text` to `path` (no symlink followed); the sha-256 hex of the bytes written."""
+    data = text.encode("utf-8")
+    if len(data) > FILE_MAX:
         raise EditRefused(f"the edit would make {path.name} larger than {FILE_MAX} bytes")
     try:
         safeio.write_text(path, text)
     except (OSError, ValueError) as exc:
         raise EditRefused(f"{path.name} cannot be written: {exc}") from None
+    return hashlib.sha256(data).hexdigest()
 
 
 def _ending(line: str) -> str:
@@ -394,12 +416,19 @@ def _key_lines(lines: list[str], first: int, end: int, col: int, item_id: str) -
     return keys
 
 
-def set_fields(path: Path, item_id: str, fields: dict[str, object]) -> None:
-    """Set `fields` of the item `item_id` in the file at `path`, changing only those lines. A key's line is replaced,
-    or inserted after the `- id:` line; an empty value (`""`, `[]`, `None`) removes the key's line. The new text is parsed
-    first: the item must hold the new values and nothing else may change. `EditRefused`, with the file untouched, when
-    it cannot."""
-    text = _load(path)
+def set_fields(path: Path, item_id: str, fields: dict[str, object], expect_sha: str | None = None) -> str:
+    """Set `fields` of the item `item_id` in the file at `path`, changing only those lines (`set_fields_text`), and
+    return the new file's sha-256 hex. `Stale` when `expect_sha` is given and the file's bytes hash to anything else;
+    `EditRefused`, with the file untouched, when it cannot."""
+    text, _ = _load(path, expect_sha)
+    return _store(path, set_fields_text(text, item_id, fields, name=path.name))
+
+
+def set_fields_text(text: str, item_id: str, fields: dict[str, object], *, name: str = FILE) -> str:
+    """`text` with `fields` of the item `item_id` set, changing only those lines. A key's line is replaced, or inserted
+    after the `- id:` line; an empty value (`""`, `[]`, `None`) removes the key's line. The new text is parsed first: the
+    item must hold the new values and nothing else may change. `EditRefused` when it cannot; `name` is the file's name
+    in its message."""
     for key in fields:
         if key == "id":
             raise EditRefused("an item's id is never renamed")
@@ -410,7 +439,7 @@ def set_fields(path: Path, item_id: str, fields: dict[str, object]) -> None:
     items, problems = parse(text)
     index = next((n for n, item in enumerate(items) if item.id == item_id), None)
     if index is None:
-        raise EditRefused(f"item {item_id} is not in {path.name}, or has an error")
+        raise EditRefused(f"item {item_id} is not in {name}, or has an error")
     lines = _LINE.findall(text)
     first, end, col = _find_block(lines, item_id)
     keys = _key_lines(lines, first + 1, end, col, item_id)
@@ -447,7 +476,7 @@ def set_fields(path: Path, item_id: str, fields: dict[str, object]) -> None:
         or _new_problems(problems, after_problems)
     ):
         raise EditRefused(f"the new values for item {item_id} are not valid: {_why(problems, after_problems, fields)}")
-    _store(path, new)
+    return new
 
 
 def _why(before: list[Problem], after: list[Problem], fields: dict[str, object]) -> str:
@@ -455,46 +484,168 @@ def _why(before: list[Problem], after: list[Problem], fields: dict[str, object])
     return "; ".join(f"{p.where} {p.message}" for p in fresh) or ", ".join(f"{k}={v!r}" for k, v in fields.items())
 
 
-def append_item(path: Path, item: BacklogItem) -> None:
-    """Add `item` after the last item of the file at `path`, leaving every other line as it is. `EditRefused`, with the
-    file untouched, for a missing file, a duplicate id, a list written in flow style, or an item that does not parse."""
-    text = _load(path)
+def append_item(path: Path, item: BacklogItem, expect_sha: str | None = None) -> str:
+    """Add `item` after the last item of the file at `path` (`append_item_text`) and return the new file's sha-256
+    hex. `Stale` as `set_fields` says; `EditRefused`, with the file untouched, for a missing file or anything
+    `append_item_text` refuses."""
+    text, _ = _load(path, expect_sha)
+    return _store(path, append_item_text(text, item, name=path.name))
+
+
+def append_item_text(text: str, item: BacklogItem, *, name: str = FILE) -> str:
+    """`text` with `item` added after its last item, every other line as it is. `EditRefused` for a duplicate id, a list
+    written in flow style, or an item that does not parse; `name` is the file's name in its message."""
     items, problems = parse(text)
     if any(other.id == item.id for other in items):
-        raise EditRefused(f"item {item.id} is already in {path.name}")
-    lines = _LINE.findall(text)
-    head = next((n for n, line in enumerate(lines) if re.match(r"items:", line)), None)
-    if head is None:
-        raise EditRefused(f"{path.name} has no `items:` list")
-    rest = lines[head][len("items:") :].split("#", 1)[0].strip()  # no regex: the line may hold a long run of blanks
-    nl = _ending(lines[head]) or ("\r\n" if "\r\n" in text else "\n")
-    out = list(lines)
-    if rest == "":
-        last = head
-        indent = 2
-        for j in range(head + 1, len(lines)):
-            if _skippable(lines[j]):
-                continue
-            if _indent(lines[j]) == 0 and not lines[j].startswith("- "):
-                break
-            if last == head:
-                found = re.match(r"( *)- ", lines[j])
-                if found is None:
-                    raise EditRefused(f"the items list of {path.name} is not written as a block")
-                indent = len(found.group(1))
-            last = j
-        at = last + 1
-        if last != head and not _ending(out[last]):
-            out[last] += nl
-    elif re.fullmatch(r"\[\s*\]", rest):
-        out[head] = "items:" + nl
-        at = head + 1
-    else:
-        raise EditRefused(f"the items list of {path.name} is written in flow style: edit it by hand")
-    block = [line + nl for line in _block(item, indent if rest == "" else 2)]
-    out[at:at] = block
+        raise EditRefused(f"item {item.id} is already in {name}")
+    out, at, indent, nl = _list_end(text, name)
+    out[at:at] = [line + nl for line in _block(item, indent)]
     new = "".join(out)
     after_items, after_problems = parse(new)
     if after_items != [*items, item] or _new_problems(problems, after_problems):
         raise EditRefused(f"item {item.id} is not valid: {_why(problems, after_problems, {})}")
-    _store(path, new)
+    return new
+
+
+def _list_end(text: str, name: str) -> tuple[list[str], int, int, str]:
+    """Where a new item goes in `text`: `(its lines, ready to splice, the index after the last item, the column of the
+    list's dashes, the text's line ending)`. An `items: []` line becomes `items:`. `EditRefused` for no `items:` list, or
+    one written in flow style."""
+    lines = _LINE.findall(text)
+    head = next((n for n, line in enumerate(lines) if re.match(r"items:", line)), None)
+    if head is None:
+        raise EditRefused(f"{name} has no `items:` list")
+    rest = lines[head][len("items:") :].split("#", 1)[0].strip()  # no regex: the line may hold a long run of blanks
+    nl = _ending(lines[head]) or ("\r\n" if "\r\n" in text else "\n")
+    out = list(lines)
+    if re.fullmatch(r"\[\s*\]", rest):
+        out[head] = "items:" + nl
+        return out, head + 1, 2, nl
+    if rest != "":
+        raise EditRefused(f"the items list of {name} is written in flow style: edit it by hand")
+    last = head
+    indent = 2
+    for j in range(head + 1, len(lines)):
+        if _skippable(lines[j]):
+            continue
+        if _indent(lines[j]) == 0 and not lines[j].startswith("- "):
+            break
+        if last == head:
+            found = re.match(r"( *)- ", lines[j])
+            if found is None:
+                raise EditRefused(f"the items list of {name} is not written as a block")
+            indent = len(found.group(1))
+        last = j
+    if last != head and not _ending(out[last]):
+        out[last] += nl
+    return out, last + 1, indent, nl
+
+
+def append_span_text(text: str, source: str, item_id: str, *, name: str = FILE) -> str:
+    """`text` with the item `item_id` of `source` added after its last item exactly as `source` writes it: its span (the
+    block, every key kept, unknown ones included, and the comment lines directly above its `- id:` line, as `move_item`
+    moves them), moved to the column of `text`'s list and ended with `text`'s line endings. Every other line as it is.
+
+    The new text is parsed first: `text`'s items and then the copied one, and no new problem but the copied item's own
+    warnings (an unknown key). `EditRefused` for an item `source` does not hold, one `text` already holds, a block that
+    cannot be cut out or moved cleanly (flow style, say), or one that would read differently; the caller may then write
+    the item with `append_item_text` instead."""
+    wanted = next((i for i in parse(source)[0] if i.id == item_id), None)
+    if wanted is None:
+        raise EditRefused(f"item {item_id} is not in the file it is copied from, or has an error")
+    items, problems = parse(text)
+    if any(other.id == item_id for other in items):
+        raise EditRefused(f"item {item_id} is already in {name}")
+    src = _LINE.findall(source)
+    start, end = _span(src, item_id)
+    out, at, indent, nl = _list_end(text, name)
+    shift = indent - _indent(src[_find_block(src, item_id)[0]])
+    block: list[str] = []
+    for line in src[start:end]:
+        bare = line.rstrip("\r\n")
+        if shift >= 0:
+            bare = " " * shift + bare if bare else bare
+        elif _indent(bare) >= -shift:
+            bare = bare[-shift:]
+        elif _skippable(bare):
+            bare = bare.lstrip(" ")
+        else:
+            raise EditRefused(f"item {item_id} cannot be moved to the column of the items list of {name}")
+        block.append(bare + nl)
+    out[at:at] = block
+    new = "".join(out)
+    found, after_problems = parse_indexed(new)
+    if [i for _, i in found] != [*items, wanted]:
+        raise EditRefused(f"item {item_id} is not valid: it reads differently once copied into {name}")
+    own = f"items[{found[-1][0]}]."
+    fresh = [p for p in _new_problems(problems, after_problems) if not (p.level == "warning" and p.where.startswith(own))]
+    if fresh:
+        raise EditRefused(f"item {item_id} is not valid: {'; '.join(f'{p.where} {p.message}' for p in fresh)}")
+    return new
+
+
+OPEN = ("backlog", "ready")  # the statuses `move_item` moves, and swaps with
+
+
+def move_item(path: Path, item_id: str, up: bool, expect_sha: str | None = None) -> str:
+    """Move the item `item_id` one place up or down among the open items of the file at `path` (`move_item_text`)
+    and return the new file's sha-256 hex. `Stale` as `set_fields` says; `EditRefused`, with the file untouched,
+    for anything `move_item_text` refuses."""
+    text, _ = _load(path, expect_sha)
+    return _store(path, move_item_text(text, item_id, up, name=path.name))
+
+
+def _span(lines: list[str], item_id: str) -> tuple[int, int]:
+    """(first line, line after the last) of the item's span: its block, and the comment lines directly above its
+    `- id:` line with no blank line between. `EditRefused` for an item not in block style."""
+    first, end, col = _find_block(lines, item_id)
+    _key_lines(lines, first + 1, end, col, item_id)
+    start = first
+    while start > 0 and lines[start - 1].strip().startswith("#"):
+        start -= 1
+    return start, end
+
+
+def move_item_text(text: str, item_id: str, up: bool, *, name: str = FILE) -> str:
+    """`text` with the span of the item `item_id` swapped with that of the nearest item above (`up`) or below it whose
+    status is `backlog` or `ready`; done and dropped items stay where they are, and every other line as it is. The new
+    text is parsed first: the same items, with only those two swapped, and no new problem. `EditRefused` for an item
+    that is not there or not open, one with no such neighbour (`already first` / `last`), and when either block is
+    not in block style."""
+    found, problems = parse_indexed(text)
+    items = [item for _, item in found]
+    index = next((n for n, item in enumerate(items) if item.id == item_id), None)
+    if index is None:
+        raise EditRefused(f"item {item_id} is not in {name}, or has an error")
+    if items[index].status not in OPEN:
+        raise EditRefused(f"{item_id} is {items[index].status}: only a backlog or ready item moves")
+    order = range(index - 1, -1, -1) if up else range(index + 1, len(items))
+    other = next((n for n in order if items[n].status in OPEN), None)
+    if other is None:
+        raise EditRefused(f"{item_id} is already {'first' if up else 'last'}")
+    lines = _LINE.findall(text)
+    upper, lower = sorted((index, other))
+    s1, e1 = _span(lines, items[upper].id)
+    s2, e2 = _span(lines, items[lower].id)
+    if not s1 < e1 <= s2 < e2:
+        raise EditRefused(f"items {items[upper].id} and {items[lower].id} are not written as separate blocks")
+    top, bottom = lines[s1:e1], lines[s2:e2]
+    if not _ending(bottom[-1]):  # the file's last line, with no ending: it moves up, so it gets one, and top loses it
+        bottom[-1] += _ending(lines[e1 - 1]) or ("\r\n" if "\r\n" in text else "\n")
+        top[-1] = top[-1].rstrip("\r\n")
+    new = "".join([*lines[:s1], *bottom, *lines[e1:s2], *top, *lines[e2:]])
+    expected = list(items)
+    expected[upper], expected[lower] = items[lower], items[upper]
+    after_items, after_problems = parse(new)
+    # an item's own warning (an unknown key) moves with it: name it at the position it had, to compare
+    moved = [_swap_where(p, found[upper][0], found[lower][0]) for p in after_problems]
+    if after_items != expected or _new_problems(problems, moved):
+        raise EditRefused(f"item {item_id} cannot be moved: {_why(problems, moved, {}) or 'the file reads differently'}")
+    return new
+
+
+def _swap_where(problem: Problem, a: int, b: int) -> Problem:
+    """`problem` with `items[a]` and `items[b]` swapped in its `where` (`items[3].lane` names item 3)."""
+    head, dot, rest = problem.where.partition(".")
+    swap = {f"items[{a}]": f"items[{b}]", f"items[{b}]": f"items[{a}]"}
+    return replace(problem, where=swap[head] + dot + rest) if head in swap else problem

@@ -475,11 +475,34 @@ def setup_gate_names(cfg: Config) -> set[str]:
         return set()
 
 
+def carried_trees(events: list[dict], tree: str | None) -> frozenset[str]:
+    """The trees whose gate results count for `tree`: `tree` itself, plus the `before_tree` of every `backlog_updated`
+    event with `change: "done"` whose `tree` is already in the set, followed to a fixpoint. Empty for no `tree`.
+
+    Pure. The runner's `status: done` commit (`backlog_writes.mark_done`, in `finish`) changes one line of the backlog
+    file and nothing a gate checks, so gate evidence carries across it. No other change carries: every other runner
+    write to the backlog file happens before `verify`."""
+    if not tree:
+        return frozenset()
+    edges = [(str(e["before_tree"]), str(e["tree"])) for e in events
+             if e.get("type") == "backlog_updated" and e.get("change") == "done" and e.get("before_tree") and e.get("tree")]
+    found = {tree}
+    grew = True
+    while grew:
+        grew = False
+        for before, after in edges:
+            if after in found and before not in found:
+                found.add(before)
+                grew = True
+    return frozenset(found)
+
+
 def reusable_passes(events: list[dict], gates: list[Gate], tree: str | None, digests: Mapping[str, str],
                     never: set[str] | frozenset[str] = frozenset(),
                     hashes: Mapping[str, str] | None = None) -> dict[str, dict]:
-    """Gate name -> the latest `gate_result` that passed (not skipped) on exactly `tree` with the digest in `digests`,
-    or, for a gate in `hashes` (its input hash on `tree`), whose `input_hash` equals that one, on whatever tree.
+    """Gate name -> the latest `gate_result` that passed (not skipped) on `tree` (or on a tree whose evidence carries
+    to it, `carried_trees`) with the digest in `digests`, or, for a gate in `hashes` (its input hash on `tree`), whose
+    `input_hash` equals that one, on whatever tree.
 
     Pure. A gate in `never`, an event with no `tree` or no `cmd` (older runs), a failure, a skip and an affected-tier
     result (`tier: "affected"`: it checked only the paths a step changed) never count."""
@@ -487,6 +510,7 @@ def reusable_passes(events: list[dict], gates: list[Gate], tree: str | None, dig
         return {}
     wanted = {g.name for g in gates if g.name not in never and g.name in digests}
     hashes = hashes or {}
+    trees = carried_trees(events, tree)
     found: dict[str, dict] = {}
     for e in events:
         if e.get("type") != "gate_result" or not e.get("passed") or e.get("skipped") or e.get("tier") == "affected":
@@ -494,7 +518,7 @@ def reusable_passes(events: list[dict], gates: list[Gate], tree: str | None, dig
         name = e.get("gate")
         if name not in wanted:
             continue
-        same_tree = e.get("tree") == tree and e.get("cmd") and e.get("cmd") == digests[name]
+        same_tree = e.get("tree") in trees and e.get("cmd") and e.get("cmd") == digests[name]
         same_inputs = bool(e.get("input_hash")) and e.get("input_hash") == hashes.get(name)
         if same_tree or same_inputs:
             found[name] = e
@@ -520,7 +544,9 @@ def run_gates_reusing(cfg: Config, run: Run, key: str, names: str | list[str], c
     env = cfg.defaults.env
     digests = {g.name: command_digest(g, env) for g in gates}
     hashes = input_hashes(cfg, gates, cwd, tree) if tree else {}
-    reused = reusable_passes(run.events.read(), gates, tree, digests, setup_gate_names(cfg), hashes)
+    events = run.events.read()
+    reused = reusable_passes(events, gates, tree, digests, setup_gate_names(cfg), hashes)
+    trees = carried_trees(events, tree)
     fresh = iter(run_gates(cfg, [g.name for g in gates if g.name not in reused], cwd, log_dir, tier=tier,
                            changed=changed) if len(reused) < len(gates) else [])
     results: list[GateResult] = []
@@ -535,7 +561,7 @@ def run_gates_reusing(cfg: Config, run: Run, key: str, names: str | list[str], c
         results.append(GateResult(g.name, True, False, f"reused: passed on this tree in {e.get('key')}", log, "",
                                   cmd=digests[g.name], reused_from=str(e.get("key")), input_hash=hashes.get(g.name)))
     for name, e in sorted(reused.items()):
-        if e.get("tree") != tree:  # a pass taken from another tree: the gate's inputs are what made it the same check
+        if e.get("tree") not in trees:  # a pass from another tree: the gate's inputs are what made it the same check
             run.emit("gate_cache_hit", key=key, gate=name, input_hash=hashes[name], **{"from": str(e.get("key"))})
     if reused:
         run.emit("gates_reused", key=key, tree=tree, gates=sorted(reused),

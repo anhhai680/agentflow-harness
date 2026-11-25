@@ -68,6 +68,17 @@ def test_gates_evidence_needs_the_final_tree(cfg):
     assert evaluate(cfg, events, [floor], "t2")[0].status == "missing"
 
 
+def test_the_audit_takes_a_pass_on_the_tree_before_the_done_commit(cfg):
+    floor = [ob(FLOOR_ID, "gates:verify")]
+    n = len(cfg.gate_sets["verify"])
+
+    def written(change: str) -> dict:
+        return ev(n + 1, "backlog_updated", item="b", change=change, before_tree="T0", tree="T1")
+
+    assert evaluate(cfg, [*gates(1, cfg, "T0"), written("done")], floor, "T1")[0].status == "satisfied"
+    assert evaluate(cfg, [*gates(1, cfg, "T0"), written("spec")], floor, "T1")[0].status == "missing"
+
+
 def test_gate_result_without_tree_is_not_evidence(cfg):
     events = [{k: v for k, v in e.items() if k != "tree"} for e in gates(1, cfg, "t1")]
     assert evaluate(cfg, events, [ob(FLOOR_ID, "gates:verify")], "t1")[0].status == "missing"

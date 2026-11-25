@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -262,3 +263,31 @@ def test_list_add_and_set_need_the_backlog_kind(flow_repo, capsys, argv):
     assert main(["backlog", *argv]) == 1
     out = capsys.readouterr().out
     assert out.startswith("error: ") and "needs work_source kind backlog" in out
+
+
+# --------------------------------------------------------------------------- validate --fix
+
+
+def test_validate_fix_sets_done_on_items_their_runs_finished(bf, capsys):
+    queue = runs_root(bf.root) / finished.QUEUE_FILE
+    queue.parent.mkdir(parents=True, exist_ok=True)
+    queue.write_text(json.dumps({"modules": [{"id": "b", "status": "done", "done_reason": finished.MERGED}]}),
+                     encoding="utf-8")
+    assert main(["validate"]) == 0
+    out = capsys.readouterr().out
+    assert "b is done by its runs (merged) but the file says ready: agentflow backlog set b status=done (fixable)" in out
+    warnings = int(re.search(r"\((\d+) warnings\)", out).group(1))
+    assert main(["validate", "--fix", "--dry-run"]) == 0
+    assert "b: status set to done" in capsys.readouterr().out.splitlines()
+    assert text(bf) == YML
+    assert main(["validate", "--fix"]) == 0
+    assert "b: status set to done" in capsys.readouterr().out.splitlines()
+    assert items(bf)["b"].status == "done"
+    assert text(bf) == YML.replace("title: Bee\n    status: ready", "title: Bee\n    status: done")
+    assert main(["validate"]) == 0
+    out = capsys.readouterr().out  # the fixture pack's own warnings stay: only the backlog one is gone
+    assert "done by its runs" not in out and "fixable" not in out and f"({warnings - 1} warnings)" in out
+
+
+def test_fix_done_is_nothing_outside_a_backlog_pack(flow_repo):
+    assert backlog.fix_done(flow_repo.cfg, flow_repo.root, dry_run=False) == []

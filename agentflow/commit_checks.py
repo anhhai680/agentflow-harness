@@ -10,6 +10,7 @@ the runner's to vouch for: commits already on it are left out.
 A person's constraint override (`constraint_approved`, written by `constraint.write`) is a runner commit too, and the
 one commit whose message may carry `guardrails.constraint_override.trailer`: that trailer's rejection is dropped for its
 sha alone, and every other rejected trailer, on it or on any other commit, still counts.
+A runner write to the backlog file (`backlog_updated`, made by `backlog_writes.write`) is a runner commit too.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from agentflow.guards import check_message
 from agentflow.state import Run
 
 RUNNER_COMMITS = ("step_committed", "task_committed", "decision_recorded", "module_added", "base_synced",
-                  "constraint_approved")
+                  "constraint_approved", "backlog_updated")
 HEAD_FIELDS = {"run_updated": "base_sha", "step_started": "start_head", "step_rebased": "start_head",
                **{etype: "sha" for etype in RUNNER_COMMITS}}
 

@@ -7,6 +7,16 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.10] - 2026-11-25
+
+### Added
+- In a backlog pack the runner writes `backlog.yml` on the run's branch, as its own commits: it appends a new or local-only item first (a local-only item's block as your working tree writes it, comments and unknown keys included), sets a `backlog` item `ready` when its run starts, records `spec` and `plan` after the step that wrote each, and sets `status: done` in `finish` before the push, so the PR's diff marks the item done. A run reads its item at its latest backlog commit. A gate's pass on the tree before the `done` commit counts for the tree after it. The events are `backlog_updated` and `backlog_skipped`; an item set `dropped` during the run stays dropped.
+- The Board adds, edits and moves items of `backlog.yml` in your working tree (Add on "Not on the backlog", Edit and Move up/down on a card), and marks an item that differs from the file on `fork_from` with a `local` badge until you commit it. A write is refused with 409 when the file changed on disk since the page read it. `validate --fix` repairs "done by its runs".
+
+### Changed
+- In a backlog pack, agents can't edit `backlog.yml` in a run (its path joins `guardrails.forbidden_paths`), and the base sync settles the file itself: `fork_from`'s file with the run's own recorded changes made on it again, the only version of the file the merge commit lets through. A change to the file committed on the local `fork_from` and not pushed stops the sync instead of being dropped.
+- A `module_lane` run of an id that is not an item of `backlog.yml` is refused before any run exists, and the New task form writes a new module to `backlog.yml` as a `ready` item in a backlog pack.
+
 ## [3.9] - 2026-11-24
 
 ### Added

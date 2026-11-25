@@ -40,6 +40,7 @@ _BY_KIND = {
     "commits": (
         "step_committed", "task_committed", "module_added", "pr_opened", "pr_updated", "pr_marked_ready",
         "early_pr_failed", "ci_watching", "ci_round", "base_synced", "sync_started", "lessons_committed",
+        "backlog_updated", "backlog_skipped",
     ),
     "stops": (
         "hitl_raised", "step_parked", "run_held", "run_hold_ended", "guard_tripped", "watchdog_fired", "runner_error",
@@ -89,6 +90,22 @@ def _answers(value: Any) -> str:
 
 def _bool_word(value: Any) -> str:
     return "true" if value is True else "false" if value is False else "?"
+
+
+# A `backlog_updated` or `backlog_skipped` event's `change` -> what the runner's commit does, with `{item}` in it.
+_BACKLOG_CHANGES = {
+    "added": "Added {item} to the backlog",
+    "ready": "Marked {item} ready in the backlog",
+    "spec": "Recorded the {item} spec in the backlog",
+    "plan": "Recorded the {item} plan in the backlog",
+    "done": "Marked {item} done in the backlog",
+}
+
+
+def _backlog_fields(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    return "; ".join(f"{key}: {', '.join(map(str, v)) if isinstance(v, list) else v}" for key, v in value.items())
 
 
 def sentence(event: dict) -> tuple[str, str]:
@@ -153,6 +170,14 @@ def _sentence(event: dict) -> tuple[str, str]:
         return "Run started", ""
     if etype == "run_finished":
         return "Run finished", ""
+    if etype == "backlog_updated":
+        what = _BACKLOG_CHANGES.get(str(event.get("change")), "Changed {item} in the backlog")
+        local = f" (it was only in the local {_text(event.get('path'))})" if event.get("local") is True else ""
+        return (f"{what.format(item=_text(event.get('item')))} ({_text(str(event.get('sha') or '')[:7])}){local}",
+                _backlog_fields(event.get("fields")))
+    if etype == "backlog_skipped":
+        what = _BACKLOG_CHANGES.get(str(event.get("change")), "Changed {item} in the backlog")
+        return f"Did not record this: {what.format(item=_text(event.get('item')))}", _detail(event.get("reason"))
     if etype == "pr_opened":
         return "Draft pull request opened", _detail(event.get("url"))
     if etype == "pr_marked_ready":

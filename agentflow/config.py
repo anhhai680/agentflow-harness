@@ -1431,6 +1431,20 @@ def _work_source(raw: dict) -> WorkSource | None:
     return WorkSource(kind=kind, path=_optional(block, "path", "work_source", str, ""))
 
 
+def backlog_path(work_source: WorkSource | None) -> str | None:
+    """The backlog file's path, normalised (`./backlog.yml` becomes `backlog.yml`), or None unless the work source is
+    `backlog`."""
+    if work_source is None or work_source.kind != "backlog":
+        return None
+    return PurePosixPath(work_source.path).as_posix()
+
+
+def _backlog_forbidden(work_source: WorkSource | None) -> list[str]:
+    """The backlog file's path as a forbidden path, for a `backlog` work source."""
+    path = backlog_path(work_source)
+    return [path] if path else []
+
+
 def _backlog_policy(raw: dict) -> BacklogPolicy:
     block = _optional(raw, "backlog", "", dict, {})
     ignore = block.get("ignore_specs")
@@ -1659,6 +1673,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
     docs = dict(_optional(project, "docs", "project", dict, {}))
     builder = _Builder(origins)
 
+    work_source = _work_source(raw)
     return Config(
         version=_require(raw, "version", "", int),
         project=Project(
@@ -1731,6 +1746,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             forbidden_paths=list(dict.fromkeys([  # the pack's own first; the engine's floor always holds
                 *_string_list(guardrails.get("forbidden_paths", []), "guardrails.forbidden_paths"),
                 *pack.ENGINE_FORBIDDEN,
+                *_backlog_forbidden(work_source),  # only the runner edits the backlog file, never an agent
             ])),
             reject_trailers=_string_list(guardrails.get("reject_trailers", []), "guardrails.reject_trailers"),
             user_only_skills=_string_list(guardrails.get("user_only_skills", []), "guardrails.user_only_skills"),
@@ -1767,7 +1783,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
         resolve_step=builder.step(raw["resolve_step"], "resolve_step") if raw.get("resolve_step") else None,
         retro_step=builder.step(raw["retro_step"], "retro_step") if raw.get("retro_step") else None,
         ci=_optional(raw, "ci", "", dict, {}),
-        work_source=_work_source(raw),
+        work_source=work_source,
         skills_map=_skills_map(raw),
         merged=merged,
         layer_origins=layer_origins,
@@ -1830,8 +1846,8 @@ class _Validator:
         self.issues: list[Issue] = []
         self.roles = {role for agent in cfg.agents.values() for role in agent.models}
 
-    def add(self, level: Literal["error", "warning"], path: str, message: str) -> None:
-        issue = Issue(level, path, message)
+    def add(self, level: Literal["error", "warning"], path: str, message: str, fixable: bool = False) -> None:
+        issue = Issue(level, path, message, fixable)
         if issue not in self.issues:
             self.issues.append(issue)
 
@@ -2359,7 +2375,7 @@ class _Validator:
                 if item.id in done:
                     self.add("warning", at(f"{where}.status"),
                              f"{item.id} is done by its runs ({done[item.id]}) but the file says {item.status}: "
-                             f"agentflow backlog set {item.id} status=done")
+                             f"agentflow backlog set {item.id} status=done", fixable=True)  # backlog.fix_done
         for rel in work_source.skipped(self.cfg, repo):
             self.add("warning", name, f"{rel} is not on the backlog: agentflow backlog add --spec {rel}, "
                      "or list it in backlog.ignore_specs")

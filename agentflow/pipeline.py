@@ -57,7 +57,8 @@ from agentflow.autonomy import (
     runner_settles,
 )
 from agentflow import (
-    constraint, doubt, governor, pack, preflight, route_lane, run_env, safeio, slots, speculation, work_source,
+    backlog_writes, constraint, doubt, governor, pack, preflight, route_lane, run_env, safeio, slots, speculation,
+    work_source,
 )
 from agentflow.commit_checks import runner_head
 from agentflow.conditions import Ctx, evaluate, fmt, make_ctx
@@ -169,6 +170,7 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
     fork = cfg.project.fork_from
     if not branch_exists(repo, fork):
         raise GitError(f"project.fork_from {fork!r} is not a local branch of {repo}")
+    first = backlog_writes.plan_start(cfg, repo, pipeline, params, opts.new_module)  # refuses before the run exists
 
     if pipeline == "vuln" and opts.from_phase and _past_triage(cfg, opts.from_phase):
         raise ValueError(f"a vuln run can't start --from {opts.from_phase}: it would skip the triage and its approval in "
@@ -205,7 +207,7 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
         with slots.starting(cfg, repo) as take:
             run = Run.create(cfg, repo, pipeline, params)
             take(run)
-        _set_up(cfg, repo, run, pipeline, params, inputs, opts, warnings)
+        _set_up(cfg, repo, run, pipeline, params, inputs, opts, warnings, first)
     except Exception as exc:  # once the run exists it must never be left `running` with nothing behind it
         if run is not None:
             run.emit("run_failed", reason=f"{type(exc).__name__}: {exc}")
@@ -215,7 +217,7 @@ def start(cfg: Config, repo: Path, pipeline: str, params: dict, opts: RunOptions
 
 
 def _set_up(cfg: Config, repo: Path, run: Run, pipeline: str, params: dict, inputs: dict, opts: RunOptions,
-            warnings: list[str]) -> None:
+            warnings: list[str], first: backlog_writes.StartWrite | None = None) -> None:
     save(run, inputs, warnings)
     run.emit("run_options", from_phase=opts.from_phase, to_phase=opts.to_phase,
              model_overrides=dict(opts.model_overrides), **start_options(cfg.path, layer_files(cfg)))
@@ -227,25 +229,28 @@ def _set_up(cfg: Config, repo: Path, run: Run, pipeline: str, params: dict, inpu
     template = _check_new_module(cfg, params, opts.new_module)
     if template is not None:
         _add_module_row(cfg, run, path, template, opts.new_module)
+    if first is not None:  # a backlog pack: the new item, or its `ready` status, before any step runs
+        backlog_writes.first_commit(cfg, run, path, first)
 
 
 def _check_new_module(cfg: Config, params: dict, new_module: dict | None) -> dict | None:
-    """The module row template for `new_module`, or None when the run adds no module. Raises `ValueError` when it
-    cannot be added, before any run exists."""
+    """The module row template for `new_module`, or None when the run adds no row (no new module, or a `backlog` pack,
+    whose first commit appends the item: `backlog_writes.plan_start`). Raises `ValueError` when it cannot be added,
+    before any run exists."""
     if new_module is None:
         return None
     if cfg.work_source is None:
         raise ValueError("a new module needs a work_source in config.yaml: this pack has no table to add it to")
     if cfg.work_source.kind == "specs":
         raise ValueError("with work_source specs a new module has no row: run --module <id> --task <text>")
-    if cfg.work_source.kind == "backlog":
-        raise ValueError("with work_source backlog a new module has no row: run --module <id> --task <text>")
-    template = (cfg.dashboard.get("backlog") or {}).get("module_row")
-    if not isinstance(template, dict) or not template:
-        raise ValueError("a new module needs dashboard.backlog.module_row in config.yaml")
     module = str(new_module.get("module"))
     if params.get("module") != module:
         raise ValueError(f"--new-module is for module {module!r}, but the run is for {params.get('module')!r}")
+    if cfg.work_source.kind == "backlog":
+        return None
+    template = (cfg.dashboard.get("backlog") or {}).get("module_row")
+    if not isinstance(template, dict) or not template:
+        raise ValueError("a new module needs dashboard.backlog.module_row in config.yaml")
     return template
 
 

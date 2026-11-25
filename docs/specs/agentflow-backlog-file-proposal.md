@@ -95,6 +95,9 @@ module id or a prompt.
 
 Agents in a run can't edit `backlog.yml`: the engine adds the work source's path to the paths a run always refuses,
 as it does for `.agentflow/**`. A developer outside a run edits it like any file and merges it with a normal PR.
+When `finish` brings `origin/<fork_from>` in and git conflicts on `backlog.yml` or merges it into something new, the
+runner settles the file itself: `fork_from`'s file with the rows above that this run recorded made on it again. It
+stages exactly that, and the merge commit lets that one blob of the file through and nothing else.
 
 **D4. A claim is a custom ref on `origin`, created with a compare-and-swap.** Item `<id>`'s claim is
 `refs/agentflow/claims/<id>`, or `refs/heads/agentflow/claims/<id>` with `backlog.claim_ref: branch`. Its commit
@@ -171,8 +174,9 @@ specs).
   changed on disk since the page read it (its sha-256 is sent with the edit), and the page asks you to reload.
 - **Start on a local-only item** (one in the working tree and not on `origin/<fork_from>`) works. The run's first
   commit carries the item's block (D3), and its claim shows it to the team. The card then says your uncommitted
-  copy went into the run, and that you should discard it (`git checkout backlog.yml`) before pulling the merge,
-  because git refuses a merge over a locally modified file. The runner never touches your working tree.
+  copy went into the run, and that you should remove that entry (or `git checkout backlog.yml`, when nothing else of
+  yours is in the file) before pulling the merge, because git refuses a merge over a locally modified file. The
+  runner never touches your working tree.
 - **Start now** on the New task form does what it does today: the item goes into the run's first commit.
   `runs/backlog.jsonl` keeps only start attempts and failures, and no longer holds items.
 - **Issues.** An item can name `issue: N`, and a run of it does everything an `--issue N` run does today (the
@@ -406,7 +410,7 @@ TDD, with `fake_agent.py` and the fake `gh`. Claims are tested against a real ba
 - **The phase in `backlog.yml`** was rejected in D1.
 - **One file per item (`backlog/<id>.yml`)** never conflicts, even when two branches add items at once. One file
   was chosen because a team reads it top to bottom as a priority list. Two branches that both append at the end
-  conflict textually, and that conflict is small and easy to resolve. Reconsider if it happens often.
+  conflict textually; the runner settles that conflict in the base sync (D3). Reconsider if it happens often.
 - **GitHub Issues or Projects as the only store** would need `gh` and the network for every Board render. It
   would also put the backlog outside the repository's history and leave offline and non-GitHub teams with
   nothing. Issues stay an optional link (D7).

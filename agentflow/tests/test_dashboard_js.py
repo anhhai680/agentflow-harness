@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from conftest import NODE, js, js_async
+from conftest import NODE, js, js_async, walk
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not on PATH")
 
@@ -592,3 +592,190 @@ def test_dropped_items_fold_under_a_counted_heading_and_draw_their_titles_as_tex
     assert node["tag"] == "details" and node["c"][0]["p"]["text"] == "Dropped (2)"
     assert [c["p"] for c in node["c"][1:]] == [{"class": "muted", "text": "z · <b>Gone</b>"}, {"class": "muted", "text": "y"}]
     assert js(["board.js"], FAKE_EL + "ui = {}; droppedNode(args)", []) is None
+
+
+# ------------------------------------------------------------------ the backlog file on the Board
+
+FILE_ITEM = {"title": "An idea", "lane": "", "status": "backlog", "depends_on": ["a", "b"], "issue": None, "spec": "docs/specs/i.md",
+             "notes": "keep this"}
+FILE_CARD = {**IDEA, "item": FILE_ITEM, "local": False}
+SHA = "ab" * 32
+NEW_SHA = "cd" * 32
+BOARD = "ui = {board: {backlog_sha256: '" + NEW_SHA + "', modules: ['a', 'b', 'i']}};"  # a refresh has moved it since the card was drawn
+
+
+def _buttons(node: dict) -> list:
+    return [b["p"]["text"] for k in node["c"] if k["p"].get("class") == "moves" for b in k["c"]]
+
+
+def test_edit_sends_only_the_changed_fields_with_the_sha():
+    form = {"title": "An idea", "lane": "", "status": "ready", "depends_on": ["b", "a"], "issue": "12", "spec": "docs/specs/i.md",
+            "notes": "keep this"}
+    got = js(["board.js"], BOARD + "editBody(args.card, args.form, '" + SHA + "')", {"card": FILE_CARD, "form": form})
+    assert got == {"op": "edit", "id": "i", "fields": {"status": "ready", "issue": 12}, "sha256": SHA}  # the dependencies are the same set
+    form = {"title": " New ", "lane": "bug", "status": "backlog", "depends_on": ["b"], "issue": "", "spec": "", "notes": ""}
+    got = js(["board.js"], BOARD + "editBody(args.card, args.form, '" + SHA + "')", {"card": FILE_CARD, "form": form})
+    assert got["fields"] == {"title": "New", "lane": "bug", "depends_on": ["b"], "spec": "", "notes": ""}
+    unchanged = {**FILE_ITEM}
+    assert js(["board.js"], BOARD + "editBody(args.card, args.form, '" + SHA + "').fields", {"card": FILE_CARD, "form": unchanged}) == {}
+    cleared = js(["board.js"], BOARD + "editBody(args.card, args.form, '" + SHA + "').fields",
+                 {"card": {**FILE_CARD, "item": {**FILE_ITEM, "issue": 7}}, "form": {**FILE_ITEM, "issue": ""}})
+    assert cleared == {"issue": None}
+
+
+def test_move_and_add_bodies_carry_the_sha():
+    assert js(["board.js"], BOARD + "moveBody(args, true, '" + SHA + "')", FILE_CARD) == {"op": "move", "id": "i", "direction": "up", "sha256": SHA}
+    assert js(["board.js"], BOARD + "moveBody(args, false, '" + SHA + "')", FILE_CARD)["direction"] == "down"
+    assert js(["board.js"], BOARD + "addFromSpecBody(args, '" + SHA + "')", "docs/specs/x.md") == {
+        "op": "add", "item": {"spec": "docs/specs/x.md", "status": "backlog"}, "sha256": SHA}
+
+
+def test_move_buttons_only_on_open_file_cards():
+    on = _buttons(js(["board.js"], FAKE_EL + "backlogNode(args)", FILE_CARD))
+    assert "Move up" in on and "Move down" in on and "Edit" in on
+    form_card = {**IDEA, "kind": "card", "key": "card:c1", "removable": True}
+    issue_card = {**IDEA, "kind": "issue", "key": "issue:7"}
+    for card in (form_card, issue_card, IDEA):
+        shown = _buttons(js(["board.js"], FAKE_EL + "backlogNode(args)", card))
+        assert "Move up" not in shown and "Move down" not in shown and "Edit" not in shown
+    done = {**FILE_CARD, "item": {**FILE_ITEM, "status": "done"}}
+    assert "Move up" not in _buttons(js(["board.js"], FAKE_EL + "backlogNode(args)", done))
+
+
+def test_a_local_card_has_a_local_badge():
+    def badges(card):
+        return [k["p"].get("text") for k in js(["board.js"], FAKE_EL + "backlogNode(args)", card)["c"]]
+    assert "local: commit to share" in badges({**FILE_CARD, "local": True})
+    assert "local: commit to share" not in badges(FILE_CARD)
+    assert "local: commit to share" not in badges({**IDEA, "local": True})  # only a card read from the file has an item
+
+
+def test_not_on_the_backlog_entries_have_an_add_button_that_sends_the_spec():
+    stubs = FAKE_EL + "ui = {skippedOpen: false};"
+    node = js(["board.js"], stubs + "skippedNode(args, 'backlog')", ["a.md", "<b>b</b>.md"])
+    rows = node["c"][1:]
+    assert [r["p"]["text"] for r in rows] == ["a.md", "<b>b</b>.md"]
+    assert [[b["p"]["text"] for b in r["c"]] for r in rows] == [["Add"], ["Add"]]
+    other = js(["board.js"], stubs + "skippedNode(args, 'specs')", ["a.md"])
+    assert other["p"]["text"] == "Not modules: a.md" and not other.get("c")
+    got = js_async(["board.js"], BOARD + "var sent = []; toast = () => {}; refreshAfter = () => {};"
+                   "api = async (url, body) => { sent.push([url, body]); return {ok: true}; };"
+                   "(async () => { await addSpec(args, '" + SHA + "'); return sent; })()", "docs/specs/x.md")
+    assert got == [["/api/backlog/file", {"op": "add", "item": {"spec": "docs/specs/x.md", "status": "backlog"}, "sha256": SHA}]]
+
+
+NEW_DATA = {"work_source_kind": "backlog", "new_task": {"feature": ["issue", "new_module"], "bug": ["issue", "task"]},
+            "modules": ["a", "b"], "lane_phases": {"feature": ["define", "plan"], "bug": ["debug"]}, "after_choices": [{"key": "x", "label": "x"}]}
+
+
+def _ids(nodes) -> list:
+    return [n["p"]["id"] for n in walk(nodes) if "id" in n.get("p", {})]
+
+
+def test_the_new_task_form_in_a_backlog_pack_adds_to_the_file_and_hides_stop_and_after():
+    parts = js(["board.js"], FAKE_EL + "taskFormParts(args, 'feature', {})", NEW_DATA)
+    ids = _ids(parts)
+    assert ids == ["nt-issue", "nt-module", "nt-resp", "nt-deps"]
+    # other kinds of work and other packs keep today's form
+    assert "nt-stop" in _ids(js(["board.js"], FAKE_EL + "taskFormParts(args, 'bug', {})", NEW_DATA))
+    other = js(["board.js"], FAKE_EL + "taskFormParts(args, 'feature', {})", {**NEW_DATA, "work_source_kind": "specs"})
+    assert "nt-stop" in _ids(other)
+    body = js(["board.js"], "newModuleBody(args, '" + SHA + "')",
+              {"module": " crm ", "responsibility": "Does the  CRM\n  thing", "deps": ["a"], "issue": "12"})
+    assert body == {"op": "add", "item": {"id": "crm", "title": "Does the CRM thing", "depends_on": ["a"], "status": "ready", "issue": 12},
+                    "sha256": SHA}
+    no_issue = js(["board.js"], "newModuleBody(args, '" + SHA + "')", {"module": "m", "responsibility": "x" * 300, "deps": [], "issue": ""})
+    assert "issue" not in no_issue["item"] and len(no_issue["item"]["title"]) == 200 and no_issue["item"]["title"].endswith("…")
+
+
+STALE = "backlog.yml changed on disk since the page read it: reload"
+WRITE_STUBS = ("var said = [], reloads = 0; toast = (t) => said.push(t); refreshAfter = () => { reloads++; };"
+               "var fail = (status, message) => { api = async () => { const e = new Error(message); e.status = status; throw e; }; };")
+
+
+def test_a_409_tells_the_person_to_reload():
+    got = js_async(["board.js"], WRITE_STUBS + """(async () => {
+      fail(409, "backlog.yml changed on disk since the page read it: reload");
+      const first = await writeBacklogFile({op: "move"}, "ok");
+      fail(409, "HTTP 409");
+      const second = await writeBacklogFile({op: "move"}, "ok");
+      fail(409, "crm has a live run, r1 (running); cancel it first or let it finish");
+      await writeBacklogFile({op: "edit"}, "ok");
+      fail(400, "already first");
+      const third = await writeBacklogFile({op: "move"}, "ok");
+      return [first, second, third, said, reloads];
+    })()""", None)
+    assert got == ["stale", "stale", "failed",
+                   [STALE, STALE, "crm has a live run, r1 (running); cancel it first or let it finish", "Could not save: already first"], 4]
+
+
+def test_a_saved_write_toasts_and_reloads():
+    got = js_async(["board.js"], WRITE_STUBS + "api = async () => ({ok: true}); (async () => [await writeBacklogFile({}, 'Saved'), said, reloads])()", None)
+    assert got == ["saved", ["Saved"], 1]
+
+
+def test_the_run_card_shows_its_local_only_note_as_text():
+    node = js(["board.js"], FAKE_EL + "ui = {}; money = limits = arrow = ago = dur = () => ''; goRun = openPeek = () => {}; cardNode(args)",
+              {"run_id": "r", "module": "m", "status": "running", "badge": "b", "gates": [], "strip": [], "backlog_note": "<b>x</b> remove that entry",
+               "agent": None, "agents": [], "time_in_phase_s": 1, "wall_s": 1})
+    def texts(n):
+        if isinstance(n, dict):
+            yield n["p"].get("text")
+            for child in n["c"]:
+                yield from texts(child)
+    notes = [t for t in texts(node) if t == "<b>x</b> remove that entry"]
+    assert len(notes) == 1
+
+
+# A write carries the sha of the render that drew what the person acted on, not the one a later refresh brought.
+CLICK_STUBS = (BOARD + "var sent = []; toast = () => {}; refreshAfter = () => {}; dialog = () => {};"
+               "api = async (url, body) => { sent.push(body); return {ok: true}; };")
+
+
+def test_a_save_carries_the_sha_from_when_the_dialog_opened():
+    form = {**FILE_ITEM, "status": "ready"}
+    got = js_async(["board.js"], CLICK_STUBS + "(async () => { await saveEdit(args.card, args.form, '" + SHA + "'); return sent; })()",
+                   {"card": FILE_CARD, "form": form})  # ui.board now holds NEW_SHA
+    assert got == [{"op": "edit", "id": "i", "fields": {"status": "ready"}, "sha256": SHA}]
+    nothing = js_async(["board.js"], CLICK_STUBS + "(async () => { await saveEdit(args.card, args.form, '" + SHA + "'); return sent; })()",
+                       {"card": FILE_CARD, "form": FILE_ITEM})
+    assert nothing == []
+
+
+def _click(card: dict, text: str):
+    return js_async(["board.js"], FAKE_EL + CLICK_STUBS + """(async () => {
+      const node = backlogNode(args);
+      const button = node.c.filter((k) => k.p.class === "moves").flatMap((k) => k.c).find((b) => b.p.text === '""" + text + """');
+      await button.p.onclick({stopPropagation() {}});
+      return sent;
+    })()""", card)
+
+
+def test_move_and_edit_buttons_use_the_sha_of_the_render_that_drew_the_card():
+    assert _click({**FILE_CARD, "sha": SHA}, "Move up") == [{"op": "move", "id": "i", "direction": "up", "sha256": SHA}]
+    assert _click({**FILE_CARD, "sha": SHA}, "Move down")[0]["sha256"] == SHA
+
+
+def test_the_add_button_uses_the_sha_of_the_render_that_drew_the_row():
+    got = js_async(["board.js"], FAKE_EL + CLICK_STUBS + "ui.skippedOpen = false;"
+                   "(async () => { const row = skippedNode(args, 'backlog', '" + SHA + "').c[1]; await row.c[0].p.onclick(); return sent; })()", ["a.md"])
+    assert got == [{"op": "add", "item": {"spec": "a.md", "status": "backlog"}, "sha256": SHA}]
+
+
+def test_a_refresh_that_changes_the_file_redraws_the_backlog_cards():
+    # the entry's data holds the sha, so `patchChildren` builds the card again instead of keeping one that carries the old sha
+    source = Path(__file__).resolve().parent.parent.joinpath("dashboard_ui", "board.js").read_text(encoding="utf-8")
+    assert source.count("sha: data.backlog_sha256") == 2
+
+
+def test_the_edit_dialogs_lane_choices_are_the_packs_lanes():
+    """Every lane of the pack, not only the New task form's, and the item's own lane even when the pack has dropped it."""
+    stubs = ("el = (tag, p, ...c) => { const kids = c.flat().filter((x) => x);"
+             " const n = {tag, p: p || {}, c: kids, addEventListener() {}, setAttribute(k, v) { n.p[k] = v; }};"
+             " if (tag === 'select') n.options = kids; return n; }; globalThis.Node = Object;"
+             "workLabel = (l) => l; var body; dialog = (title, b) => { body = b; };"
+             "ui = {board: {backlog_sha256: 'x', modules: ['a', 'i'], lanes: ['feature', 'bug', 'vuln'],"
+             " lane_phases: {feature: ['define']}}};")
+    got = js(["board.js"], stubs + """editDialog(args);
+      body.find((n) => n.p.id === 'ei-lane').c.map((o) => o.p.value)""", {**FILE_CARD, "item": {**FILE_ITEM, "lane": "old"}})
+    assert got == ["", "feature", "bug", "vuln", "old"]

@@ -30,6 +30,7 @@ Item keys are typed so they cannot clash: `module:<id>`, `card:<id>`, `issue:<nu
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import threading
@@ -37,14 +38,14 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from agentflow import backlog_file, finished, intake, module_queue, sources, vuln, work_source
 from agentflow.backlog_file import BacklogItem
 from agentflow.conditions import first_phase_with_work, make_ctx
 from agentflow.config import check_lane
 from agentflow.events import EventLog, nfc
-from agentflow.gitops import GhError, fetch_remote_branch, gh_json, sync_branch
+from agentflow.gitops import GhError, commit_at, fetch_remote_branch, gh_json, sync_branch
 from agentflow.state import TERMINAL, Run, list_runs, runs_root
 from agentflow.views import lane_first_phase, lane_phases
 
@@ -59,6 +60,7 @@ STATE_NAME = "backlog_state.json"
 INPUT_FIELDS = ("issue", "task", "topic", "new_module")
 FIELDS = (*INPUT_FIELDS, "after")
 LIVE = ("backlog", "starting")
+NEW_MODULE_IN_FILE = "in a backlog pack a new module is an item of backlog.yml: POST /api/backlog/file"
 INTERRUPTED = ("interrupted: the dashboard stopped while this card was starting. Check `git branch` and "
                "`agentflow status` for a run it may have created, then press Start if there is none")
 
@@ -86,6 +88,7 @@ TAKEN = ("carries the in-progress label, but no run on this machine is working o
 
 _SPAWN_LOCK = threading.Lock()  # one start at a time: also closes the check-then-create race on a branch name
 _STATE_LOCK = threading.Lock()  # backlog_state.json is read, changed and written by the refresh thread and by starts
+_FILE_LOCK = threading.Lock()  # one page edit of the backlog file at a time: its sha check, read and write are one step
 
 
 class Invalid(ValueError):
@@ -348,6 +351,8 @@ def add(cfg: Config, repo: Path, lane: str, fields: dict, after: Any = (), to_ph
     filled = [k for k in INPUT_FIELDS if k in allowed and fields.get(k) not in (None, "")]
     if not filled:
         raise Invalid(f"fill in {' or '.join(f for f in allowed if f in INPUT_FIELDS)}")
+    if "new_module" in filled and work_source.kind(cfg) == "backlog":
+        raise Invalid(NEW_MODULE_IN_FILE)
     if to_phase is not None:
         from agentflow.pipeline import RunOptions, _check_range
 
@@ -765,7 +770,8 @@ def _issue_blocker(number: str, pic: dict) -> str | None:
 
 def _issue_run_params(cfg: Config, lane: str, number: str, pic: dict) -> tuple[dict, dict | None]:
     """`(params, new_module)` for a run of `lane` from issue `number`. The module lane works on the derived module
-    `issue-<N>` (a new map row in a capability map); nothing in either comes from the issue's text."""
+    `issue-<N>` (a new map row in a capability map, a new item appended by the run's first commit in a `backlog`
+    pack); nothing in either comes from the issue's text."""
     params: dict = {"issue": number}
     if lane != module_queue.module_lane(cfg):
         return params, None
@@ -775,7 +781,7 @@ def _issue_run_params(cfg: Config, lane: str, number: str, pic: dict) -> tuple[d
         if {e["id"]: e for e in pic["entries"]}[module]["status"] != "backlog":
             raise Refused(f"module {module} already has a run or is done")
         return params, None
-    if work_source.kind(cfg) == "capability_map":
+    if work_source.kind(cfg) in ("capability_map", "backlog"):
         return params, {"module": module, "responsibility": ISSUE_RESPONSIBILITY.format(number=number), "deps": []}
     return params, None
 
@@ -867,8 +873,9 @@ def _picture(cfg: Config, repo: Path) -> dict:
     runs = list_runs(repo)
     file_items: list[BacklogItem] = []
     problems: list[backlog_file.Problem] = []
-    if work_source.kind(cfg) == "backlog":  # one read of the file, so the cards, dropped list and note agree
-        found, problems = work_source.indexed(cfg, repo)
+    digest = ""
+    if work_source.kind(cfg) == "backlog":  # one read of the file, so the cards, dropped list, note and sha agree
+        found, problems, digest = work_source.indexed_digest(cfg, repo)
         file_items = [item for _, item in found]
         nodes: list[sources.ModuleNode] = (
             [i for i in file_items if i.status != "dropped"] if module_queue.module_lane(cfg) else [])
@@ -888,7 +895,7 @@ def _picture(cfg: Config, repo: Path) -> dict:
     pic = {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "state": state,
            "issues": _synced(cfg, state), "file_items": {i.id: i for i in file_items},
            "dropped": [{"id": i.id, "title": i.title} for i in file_items if i.status == "dropped"],
-           "file_note": _file_note(problems)}
+           "file_note": _file_note(problems), "backlog_sha256": digest}
     pic["alerts"] = _synced_alerts(cfg, state)
     pic["alert_runs"] = {}  # the lowest alert number of each held group -> the run that holds it
     vuln_runs = _vuln_runs(runs) if pic["alerts"] else []
@@ -957,10 +964,31 @@ def _first_phase(cfg: Config, repo: Path, lane: str, module: str | None) -> str 
     return lane_first_phase(cfg, lane)
 
 
+def _committed(item: BacklogItem) -> str:
+    """How `refresh` records an item of the file at the `fork_from` tip, to compare with the work tree's."""
+    return json.dumps(dataclasses.asdict(item), sort_keys=True)
+
+
+def _is_local(item: BacklogItem, committed: Any) -> bool:
+    """Whether the work tree's `item` is missing from, or differs from, the file at the `fork_from` tip as the last
+    `refresh` recorded it (`committed_items`). False before any refresh has recorded it: not known yet."""
+    if not isinstance(committed, dict):
+        return False
+    return committed.get(item.id) != _committed(item)
+
+
+def _item_fields(item: BacklogItem) -> dict:
+    """The fields the page's Edit form shows and sends back (`EDIT_KEYS`)."""
+    return {"title": item.title, "lane": item.lane, "status": item.status, "depends_on": list(item.deps),
+            "issue": item.issue, "spec": item.spec, "notes": item.notes}
+
+
 def snapshot(cfg: Config, repo: Path) -> dict:
     """The Backlog column for the board: `cards`, the finished modules (`done`, each with its `reason`, and
     `done_note`, the error from reading the hand marks or `""`), the New task form (`new_task`, `lane_phases`,
-    `after_choices`) and the last base-branch sync note."""
+    `after_choices`) and the last base-branch sync note. In a `backlog` pack, `backlog_sha256` is the sha-256 of the
+    file's bytes the cards were read from (`""` when it was not read), and each file card carries `item` (its
+    `EDIT_KEYS` fields) and `local` (`_is_local`). It runs no git and no `gh`."""
     repo = Path(repo)
     pic = _picture(cfg, repo)
     view, book, lane = pic["view"], pic["book"], module_queue.module_lane(cfg)
@@ -993,6 +1021,7 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         }
 
     by_entry = {e["id"]: e for e in pic["entries"]}
+    committed = pic["state"].get("committed_items")
     live_issues = {str((r.state.get("params") or {}).get("issue") or "") for r in _live_runs(pic["runs"])}
     taken = {i["number"] for i in pic["issues"] if i.get("in_progress") and i["number"] not in live_issues}
     for node in pic["nodes"]:
@@ -1008,7 +1037,8 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         title = file_item.title or node.id
         card = make(f"module:{node.id}", "module", node.id, title, file_item.lane or lane or "", book.overlay(node.id),
                     deps=list(node.deps), note=entry.get("blocked"), title=title, planning=file_item.status,
-                    startable=startable)
+                    startable=startable, local=_is_local(file_item, committed))
+        card["item"] = _item_fields(file_item)  # not through `make`, whose `item` is the card's log record
         if not startable:
             card["note"] = NOT_STARTABLE.format(lane=file_item.lane)
         cards.append(card)
@@ -1069,6 +1099,7 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         "skipped": work_source.skipped(cfg, repo),
         "dropped": pic["dropped"],
         "backlog_note": pic["file_note"],
+        "backlog_sha256": pic["backlog_sha256"],
         "sync_note": pic["state"].get("sync_note") or "",
         "issues_note": pic["state"].get("issues_note") or "" if cfg.issues.sync_label else "",
         "alerts_note": pic["state"].get("alerts_note") or "" if _alerts_on(cfg) else "",
@@ -1222,9 +1253,7 @@ def set_status(cfg: Config, repo: Path, item_id: str, status: str) -> list[str]:
     repo = Path(repo)
     path = _backlog_path(cfg, repo)
     if status == "done":
-        run = module_queue.feature_runs(cfg, repo).get(item_id)
-        if run is not None and run.state["status"] in module_queue._LIVE:
-            raise Refused(f"{item_id} has a live run, {run.id} ({run.state['status']}); cancel it first or let it finish")
+        _refuse_live(cfg, repo, item_id)
     backlog_file.set_fields(path, item_id, {"status": status})
     return [f"{item_id}: status set to {status} in {path.name} (not committed)"]
 
@@ -1291,6 +1320,165 @@ def add_item(cfg: Config, repo: Path, item_id: str | None, *, spec: str | None =
                        spec=spec or "", issue=_positive(issue) if issue else None, notes=notes)
     backlog_file.append_item(path, item)
     return [f"{item_id}: added to {path.name} as {status} (not committed)"]
+
+
+def _refuse_live(cfg: Config, repo: Path, item_id: str) -> None:
+    """`Refused` while the item `item_id` has a live module-lane run (the run the Board ties to its card)."""
+    run = module_queue.feature_runs(cfg, repo).get(item_id)
+    if run is not None and run.state["status"] in module_queue._LIVE:
+        raise Refused(f"{item_id} has a live run, {run.id} ({run.state['status']}); cancel it first or let it finish")
+
+
+def fix_done(cfg: Config, repo: Path, dry_run: bool) -> list[str]:
+    """`validate --fix` for the backlog file: set `status: done` on each open item that `validate` warns is done by
+    its runs. The lines to print: `<id>: status set to done` for each (also on a `dry_run`, which writes nothing), or
+    `skipped <id>: <why>` when the file cannot take the edit. `[]` outside a `backlog` pack."""
+    repo = Path(repo)
+    path = work_source.file(cfg, repo) if work_source.kind(cfg) == "backlog" else None
+    if path is None:
+        return []
+    try:
+        done = finished.recorded(repo, hand_marks=False)  # as `validate` reads it: a backlog file has no marks
+    except (OSError, ValueError):
+        return []
+    lines = []
+    for item in work_source.all_items(cfg, repo):
+        if item.status not in backlog_file.OPEN or item.id not in done:
+            continue
+        if not dry_run:
+            try:
+                backlog_file.set_fields(path, item.id, {"status": "done"})
+            except backlog_file.EditRefused as exc:
+                lines.append(f"skipped {item.id}: {exc}")
+                continue
+        lines.append(f"{item.id}: status set to done")
+    return lines
+
+
+# --------------------------------------------------------------------------- the backlog file from the page
+
+EDIT_KEYS = ("title", "lane", "status", "depends_on", "issue", "spec", "notes")
+
+
+def _sha_arg(sha: Any) -> str:
+    if not isinstance(sha, str):
+        raise Invalid("sha256 must be the sha-256 of backlog.yml the page read")
+    return sha
+
+
+def _edit_value(cfg: Config, repo: Path, key: str, value: Any) -> object:
+    """`value` for the item key `key` from the page, checked for its type: `Invalid` otherwise, before the file is
+    touched (`backlog_file` checks the item as a whole)."""
+    if key not in EDIT_KEYS:
+        raise Invalid(f"{key!r} is not a key the page edits: it edits {', '.join(EDIT_KEYS)}")
+    if key == "depends_on":
+        if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+            raise Invalid("depends_on must be a list of item ids")
+        return list(dict.fromkeys(v.strip() for v in value))
+    if key == "issue":
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise Invalid("issue must be a positive whole number, or null")
+        return value
+    if not isinstance(value, str):
+        raise Invalid(f"{key} must be text")
+    if key in ("title", "status") and not value.strip():
+        raise Invalid(f"{key} must not be empty")
+    if key == "status" and value not in backlog_file.STATUSES:
+        raise Invalid("status must be one of " + ", ".join(backlog_file.STATUSES))
+    if key == "lane" and value:
+        try:
+            check_lane(cfg, value)
+        except ValueError:
+            raise Invalid(f"lane {value!r} is not a lane: it is one of {', '.join(cfg.lanes)}") from None
+    if key == "spec" and value:
+        if backlog_file.bad_path(value):
+            raise Invalid(f"spec must be a path inside the repository, not {value[:80]!r}")
+        why = backlog_file.path_problem(Path(repo), value)
+        if why is not None:
+            raise Invalid(f"spec {value} {why}")
+    return value
+
+
+def _edit_fields(cfg: Config, repo: Path, fields: Any) -> dict[str, object]:
+    if not isinstance(fields, dict):
+        raise Invalid("fields must be an object")
+    return {str(k): _edit_value(cfg, repo, str(k), v) for k, v in fields.items()}
+
+
+def _refuse_closing_live(cfg: Config, repo: Path, item_id: str, fields: dict[str, object]) -> None:
+    if fields.get("status") in ("done", "dropped"):
+        _refuse_live(cfg, repo, item_id)
+
+
+def add_file_item(cfg: Config, repo: Path, item: dict, sha: str) -> str:
+    """Append an item to the backlog file in the work tree (nothing is committed) and return the file's new sha-256.
+    `item` holds `id` and `EDIT_KEYS`; an empty `id` or `title` comes from `item["spec"]` as `backlog add --spec`
+    derives it. `Invalid` for a bad key or value, `Refused` for `done`/`dropped` on an id with a live run,
+    `backlog_file.Stale` when the file's bytes do not hash to `sha`, `backlog_file.EditRefused` when the file
+    cannot take the item."""
+    repo = Path(repo)
+    path = _backlog_path(cfg, repo)
+    sha = _sha_arg(sha)
+    if not isinstance(item, dict):
+        raise Invalid("item must be an object")
+    item_id = item.get("id")
+    if item_id is None:
+        item_id = ""
+    if not isinstance(item_id, str):
+        raise Invalid("id must be text")
+    # an empty value is a value not given: `id` and `title` then come from the spec, `status` is `backlog`
+    fields = _edit_fields(cfg, repo, {k: v for k, v in item.items() if k != "id" and v not in ("", None)})
+    title = str(fields.get("title") or "")
+    spec = str(fields.get("spec") or "")
+    if spec and (not item_id or not title):
+        spec = _spec_file(repo, spec)
+        item_id = item_id or _spec_id(cfg, spec)
+        title = title or _spec_title(repo, spec)
+    if not item_id:
+        raise Invalid("give an id, or a spec to take it from")
+    if not title:
+        raise Invalid("give a title (the spec has no '# ' heading)" if spec else "give a title")
+    status = str(fields.get("status") or "backlog")
+    deps, issue = fields.get("depends_on"), fields.get("issue")
+    new = BacklogItem(id=item_id, deps=deps if isinstance(deps, list) else [], title=title,
+                      lane=str(fields.get("lane") or ""), status=status, spec=spec,
+                      issue=issue if isinstance(issue, int) else None, notes=str(fields.get("notes") or ""))
+    with _FILE_LOCK:
+        _refuse_closing_live(cfg, repo, item_id, {"status": status})
+        return backlog_file.append_item(path, new, expect_sha=sha)
+
+
+def edit_item(cfg: Config, repo: Path, item_id: str, fields: dict, sha: str) -> str:
+    """Set `fields` (`EDIT_KEYS` only) of the item `item_id` in the work tree's backlog file (nothing is committed)
+    and return the file's new sha-256. The errors are those of `add_file_item`."""
+    repo = Path(repo)
+    path = _backlog_path(cfg, repo)
+    sha = _sha_arg(sha)
+    if not isinstance(item_id, str) or not item_id:
+        raise Invalid("id must be an item id")
+    checked = _edit_fields(cfg, repo, fields)
+    if not checked:
+        raise Invalid("nothing to set: send the fields to change")
+    with _FILE_LOCK:
+        _refuse_closing_live(cfg, repo, item_id, checked)
+        return backlog_file.set_fields(path, item_id, checked, expect_sha=sha)
+
+
+def move(cfg: Config, repo: Path, item_id: str, direction: Literal["up", "down"], sha: str) -> str:
+    """Swap the item `item_id` with the nearest open item above or below it in the work tree's backlog file (nothing
+    is committed; `backlog_file.move_item`) and return the file's new sha-256. `Invalid` for a bad id or direction;
+    `backlog_file.Stale` and `backlog_file.EditRefused` as `add_file_item` says."""
+    repo = Path(repo)
+    path = _backlog_path(cfg, repo)
+    sha = _sha_arg(sha)
+    if not isinstance(item_id, str) or not item_id:
+        raise Invalid("id must be an item id")
+    if direction not in ("up", "down"):
+        raise Invalid("direction must be up or down")
+    with _FILE_LOCK:
+        return backlog_file.move_item(path, item_id, up=direction == "up", expect_sha=sha)
 
 
 # --------------------------------------------------------------------------- starting
@@ -1405,7 +1593,10 @@ def begin_start(cfg: Config, repo: Path, key: str, confirm: bool = False) -> Sta
         if kind == "card" and new_module is not None and work_source.kind(cfg) in ("specs", "backlog"):
             if any(n.id == params.get("module") for n in pic["nodes"]):
                 raise Refused(f"a spec for {params['module']} now exists; start module:{params['module']} instead")
-            params["task"], new_module = _spec_task(new_module), None
+            # a specs pack has no file to add the module to; a backlog pack's run appends it in its first commit
+            params["task"] = _spec_task(new_module)
+            if work_source.kind(cfg) == "specs":
+                new_module = None
         if kind == "card" and params.get("issue"):
             unknown = _deps_unknown(key, params, pic)
             if unknown:
@@ -1501,7 +1692,8 @@ def settle_interrupted(repo: Path) -> list[str]:
 
 
 def refresh(cfg: Config, repo: Path) -> dict:
-    """Bring the base branch up to date, re-assess the map modules and re-check what cards run after.
+    """Bring the base branch up to date, re-assess the map modules and re-check what cards run after. In a `backlog`
+    pack it records the items of the file at the `fork_from` tip (`committed_items`), for the cards' `local` badge.
 
     It only refreshes what the cards show and never starts anything. It skips the assessment when
     `agentflow queue` holds the queue lock."""
@@ -1522,6 +1714,9 @@ def refresh(cfg: Config, repo: Path) -> dict:
     changes: dict[str, Any] = {"sync_note": note, "at": datetime.now(UTC).isoformat(timespec="seconds")}
     if merged is not None:
         changes["merged"] = merged
+    if work_source.kind(cfg) == "backlog":  # what the Board's `local` badge compares with: the commit a run forks from
+        tip = commit_at(repo, cfg.project.fork_from)
+        changes["committed_items"] = {i.id: _committed(i) for i in work_source.items_at(cfg, repo, tip)} if tip else {}
     _save_state(repo, **changes)
     return {"note": note, "skipped": skipped, "issues_note": issues_note, "alerts_note": alerts_note}
 

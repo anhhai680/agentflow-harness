@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from agentflow.config import backlog_path
 from agentflow.guards import HARDENED, Violation, check_message, path_matches
 from agentflow.pack import LESSONS_FILE
 
@@ -429,10 +430,10 @@ def outside_only(worktree: Path, only: str, baseline: dict[str, Any] | None = No
     return found
 
 
-def _artifact_refused(worktree: Path, why: str) -> CommitRejected:
-    """Put the index back at `HEAD` (the working tree is untouched) and name the refusal."""
+def _artifact_refused(worktree: Path, why: str, what: str = "reconcile") -> CommitRejected:
+    """Put the index back at `HEAD` (the working tree is untouched) and name the refusal of the `what` commit."""
     _git(worktree, *HARDENED, "--literal-pathspecs", "reset", "-q")
-    return CommitRejected(f"the reconcile commit was refused: {why}", kind="outside_output")
+    return CommitRejected(f"the {what} commit was refused: {why}", kind="outside_output")
 
 
 def commit_artifact(worktree: Path, message: str, cfg: Config, path: str, expected_head: str | None = None) -> str:
@@ -450,6 +451,31 @@ def commit_artifact(worktree: Path, message: str, cfg: Config, path: str, expect
     exactly `path` changed, as mode 100644 and the checked blob; no rejected trailer. A failure there raises
     `CommitRejected` naming the commit, which is left in place for a human (never rolled back silently), as
     `commit_lessons` does."""
+    return _commit_one(worktree, message, cfg, path, expected_head, cfg.guardrails.forbidden_paths, "reconcile")
+
+
+def commit_backlog(worktree: Path, message: str, cfg: Config, path: str, expected_text: str,
+                   expected_head: str) -> str:
+    """Commit the backlog file `path`, and nothing else, with `project.commit_trailer` appended; return the new sha.
+    The runner's own write to `work_source.path`, which `config` makes a forbidden path for every agent step.
+
+    `path` must be the pack's backlog file (`config.backlog_path`), else the commit is refused (`outside_output`, the
+    index reset). Then `commit_artifact`'s checks, with every forbidden path but that one file still refused; and the
+    file read must be `expected_text`'s UTF-8 bytes exactly (the text the caller wrote), so a process that rewrote it
+    after the write is refused (`outside_output`, the index reset). An unchanged file raises `NothingToCommit`."""
+    own = backlog_path(cfg.work_source)
+    if own is None or path != own:
+        raise _artifact_refused(Path(worktree), f"{shown(path)} is not the backlog file "
+                                f"({shown(own) if own else 'the pack has no backlog work source'})", "backlog")
+    forbidden = [glob for glob in cfg.guardrails.forbidden_paths if glob != own]
+    return _commit_one(worktree, message, cfg, path, expected_head, forbidden, "backlog",
+                       expected_text.encode("utf-8"))
+
+
+def _commit_one(worktree: Path, message: str, cfg: Config, path: str, expected_head: str | None,
+                forbidden: Sequence[str], what: str, expected: bytes | None = None) -> str:
+    """`commit_artifact`'s body, with the forbidden paths given (`forbidden`), the refusals naming the `what` commit, and
+    with `expected`, the bytes the file must hold when it is read."""
     worktree = Path(worktree)
     before = head(worktree)
     if expected_head is not None and before != expected_head:
@@ -462,21 +488,24 @@ def commit_artifact(worktree: Path, message: str, cfg: Config, path: str, expect
     rejected = check_message(cfg, text)
     if rejected:
         raise CommitRejected("commit message carries a rejected trailer: " + ", ".join(v.detail for v in rejected))
-    if any(path_matches(path, g) for g in cfg.guardrails.forbidden_paths):
+    if any(path_matches(path, g) for g in forbidden):
         raise CommitRejected(f"commit would include forbidden path(s): {shown(path)}", kind="forbidden_path")
     try:
         fd = os.open(worktree / path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     except OSError as exc:
-        raise _artifact_refused(worktree, f"{shown(path)} cannot be read as a regular file: {exc}") from exc
+        raise _artifact_refused(worktree, f"{shown(path)} cannot be read as a regular file: {exc}", what) from exc
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o111 or info.st_size == 0:
             raise _artifact_refused(worktree, f"{shown(path)} is not a non-empty, non-executable regular file with "
-                                    "one name")
+                                    "one name", what)
         with os.fdopen(fd, "rb", closefd=False) as handle:
             data = handle.read()
     finally:
         os.close(fd)
+    if expected is not None and data != expected:
+        raise _artifact_refused(worktree, f"{shown(path)} is not the text the runner wrote: something changed the file "
+                                "after it was written", what)
     hashed = subprocess.run(["git", *HARDENED, "hash-object", "--no-filters", "--stdin"], cwd=worktree, input=data,
                             capture_output=True, check=False)
     if hashed.returncode != 0:
@@ -492,14 +521,15 @@ def commit_artifact(worktree: Path, message: str, cfg: Config, path: str, expect
     if not staged:
         raise NothingToCommit(f"{shown(path)} is unchanged in {worktree}")
     if staged != [path]:
-        raise _artifact_refused(worktree, "the index holds other paths: " + ", ".join(shown(p) for p in staged))
+        raise _artifact_refused(worktree, "the index holds other paths: " + ", ".join(shown(p) for p in staged),
+                                what)
     _, mode, _, blob, *_ = raw[0].split()
     if mode != "100644":
         raise _artifact_refused(worktree, f"{shown(path)} would be committed with mode {mode}, not as a regular "
-                                "file (100644)")
+                                "file (100644)", what)
     if blob != wanted:
         raise _artifact_refused(worktree, f"the staged {shown(path)} (blob {blob[:12]}) is not the file the runner "
-                                f"checked (blob {wanted[:12]}): it changed, or a filter rewrote it")
+                                f"checked (blob {wanted[:12]}): it changed, or a filter rewrote it", what)
     proc = subprocess.run(
         ["git", *git, "commit", "--no-verify", "-q", "-F", "-"],
         cwd=worktree, input=text + "\n", capture_output=True, text=True, encoding="utf-8", check=False,
@@ -683,6 +713,46 @@ def unmerged_paths(worktree: Path) -> list[str]:
     return sorted(p for p in out.split("\0") if p)
 
 
+def merged_blob(worktree: Path, path: str) -> str:
+    """The blob id the index holds for `path` at stage 0, that is what a merge in progress staged for it once merged:
+    "" when the index has no such entry (the path is absent, or still conflicted). Never raises for a missing path."""
+    return blob_id(worktree, "", path, stage=True)
+
+
+def blob_id(worktree: Path, sha: str, path: str, stage: bool = False) -> str:
+    """The blob id commit `sha` holds for `path` (with `stage`, the index's stage-0 entry instead), or "" when there is
+    none. Never raises for a missing path."""
+    spec = f":0:{path}" if stage else f"{sha}:{path}"
+    proc = subprocess.run(["git", *HARDENED, "rev-parse", "--verify", "--quiet", spec], cwd=Path(worktree),
+                          capture_output=True, text=True, encoding="utf-8", check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def merge_base(worktree: Path, a: str, b: str) -> str:
+    """The best common ancestor of commits `a` and `b`, or "" when they have none (or either is unknown)."""
+    proc = subprocess.run(["git", *HARDENED, "merge-base", a, b], cwd=Path(worktree),
+                          capture_output=True, text=True, encoding="utf-8", check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def stage_resolved(worktree: Path, path: str, data: bytes) -> str:
+    """Stage `data`, exactly those bytes (no filter), as the regular file `path` of the merge in progress, resolving
+    any conflict on it, and return the blob id. The caller has written the same bytes to the work tree, so a later
+    `add -A` stages that blob again, unless the file changed since (or a filter rewrites it), which `commit_sync`'s
+    check then sees. `GitError` when git fails, or the index does not hold that blob for `path` at stage 0 after."""
+    worktree = Path(worktree)
+    hashed = subprocess.run(["git", *HARDENED, "hash-object", "-w", "--no-filters", "--stdin"], cwd=worktree,
+                            input=data, capture_output=True, check=False)
+    if hashed.returncode != 0:
+        detail = hashed.stderr.decode("utf-8", "replace").strip() or f"exit {hashed.returncode}"
+        raise GitError(f"git hash-object failed: {detail}")
+    blob = hashed.stdout.decode().strip()
+    _git_or_raise(worktree, *HARDENED, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+    if merged_blob(worktree, path) != blob or path in unmerged_paths(worktree):
+        raise GitError(f"the index does not hold {shown(path)} as blob {blob[:12]} after staging it")
+    return blob
+
+
 def pull_base(worktree: Path, target: str, timeout: int = 180) -> PullResult:
     """Fetch `origin/<target>` and start bringing it into the checked-out branch, without committing.
 
@@ -721,14 +791,17 @@ def conflict_markers(worktree: Path, paths: Sequence[str]) -> list[str]:
 
 
 def commit_sync(worktree: Path, message: str, cfg: Config, target_sha: str, expected_head: str | None = None,
-                forbid: Sequence[str] = ()) -> str:
+                forbid: Sequence[str] = (), runner_blob: tuple[str, str] | None = None) -> str:
     """Conclude the merge in progress with a commit (the trailer appended) and return its sha.
 
     Like `commit`, with these differences: everything is staged, and the forbidden-path check applies to what the
     merge itself decided, that is the paths whose content equals neither the branch's (`HEAD`) nor the target's
     (`target_sha`), against `guardrails.forbidden_paths` and the caller's `forbid`. A forbidden file that only came
     in from the target, or that only the branch changed, passes.
-    A rejected commit leaves the merge in progress."""
+    `runner_blob` is `(path, blob)`: the one file the runner resolved and staged itself (the backlog file,
+    `backlog_writes.bring_in`, recorded on `sync_started`). That path passes the check too, but only while what is
+    staged for it after everything is staged is still exactly that blob: an edit made since, by a session or a person,
+    is refused. A rejected commit leaves the merge in progress."""
     worktree = Path(worktree)
     before = head(worktree)
     if expected_head is not None and before != expected_head:
@@ -753,8 +826,10 @@ def commit_sync(worktree: Path, message: str, cfg: Config, target_sha: str, expe
         return {p for p in out.split("\0") if p}
 
     decided = differing(before) & differing(target_sha)
+    own, blob = runner_blob or ("", "")
+    merged = {own} if own and blob and merged_blob(worktree, own) == blob else set()
     patterns = [*cfg.guardrails.forbidden_paths, *forbid]
-    forbidden = sorted(p for p in decided if any(path_matches(p, g) for g in patterns))
+    forbidden = sorted(p for p in decided - merged if any(path_matches(p, g) for g in patterns))
     if forbidden:
         raise CommitRejected("the merge resolution would change forbidden path(s): " + ", ".join(forbidden),
                              kind="forbidden_path")
