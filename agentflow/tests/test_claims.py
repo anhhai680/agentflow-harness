@@ -415,3 +415,45 @@ def test_is_stale_counts_from_updated_whatever_the_status():
                               unreadable="bad")
     assert claims.age_s(unreadable, now) is None
     assert not claims.is_stale(unreadable, 24, now)
+
+
+# --------------------------------------------------------------------------- a person frees a claim
+
+
+def test_release_item_frees_what_it_read_and_reports_nothing_twice(flow_repo, tmp_path, cfg):
+    held = claims.create(cfg, flow_repo.root, "b", run=RUN, lane="feature", phase="plan", status="waiting")
+    other = second_clone(flow_repo, tmp_path)
+    freed = claims.release_item(cfg, other, "b")  # a person on another machine
+    assert freed == held and claims.ref(cfg, "b") not in remote_refs(flow_repo)
+    assert claims.release_item(cfg, other, "b") is None
+    with pytest.raises(ValueError):
+        claims.release_item(cfg, other, "../x")
+
+
+def test_release_item_frees_an_unreadable_claim_and_never_another_one(flow_repo, tmp_path, cfg, monkeypatch):
+    name = claims.ref(cfg, "b")
+    blob = run_git_input(flow_repo.root, "{}\n", "hash-object", "-w", "--stdin").strip()
+    tree = run_git_input(flow_repo.root, f"100644 blob {blob}\tother.json\n", "mktree").strip()
+    sha = run_git(flow_repo.root, "commit-tree", tree, "-m", "forged").strip()
+    run_git(flow_repo.root, "push", "-q", "origin", f"{sha}:{name}")
+    freed = claims.release_item(cfg, flow_repo.root, "b")
+    assert freed is not None and freed.unreadable and freed.sha == sha and name not in remote_refs(flow_repo)
+
+    # a claim made between the read and the delete is not deleted: the lease is on what was read
+    first = claims.create(cfg, flow_repo.root, "b", run=RUN, lane="feature", phase="plan")
+    other = second_clone(flow_repo, tmp_path)
+    real = claims.read
+    swaps: list[int] = []
+
+    def swapped(cfg, repo, item_id):
+        found = real(cfg, repo, item_id)
+        if not swaps:
+            swaps.append(1)
+            claims.release(cfg, flow_repo.root, first)
+            claims.create(cfg, other, "b", run=OTHER, lane="feature", phase="build")
+        return found
+
+    monkeypatch.setattr(claims, "read", swapped)
+    with pytest.raises(claims.Lost):
+        claims.release_item(cfg, flow_repo.root, "b")
+    assert name in remote_refs(flow_repo)

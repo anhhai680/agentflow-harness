@@ -511,6 +511,18 @@ def release(cfg: Config, repo: Path, held: Claim) -> None:
     _run(repo, "update-ref", "-d", HELD_PREFIX + held.item)
 
 
+def release_item(cfg: Config, repo: Path, item_id: str) -> Claim | None:
+    """A person frees the claim on `item_id`, whoever holds it: read it, then delete it leased on the sha just read
+    (`release`), so a claim made between the read and the delete stays. Works on an unreadable claim too, whose sha is
+    known. The claim freed, or None when there was none. `ValueError` for an id that is not a module id; `Lost` when
+    another claim took the ref meanwhile; `Unreachable` when `origin` can't be reached."""
+    found = read(cfg, repo, item_id)
+    if found is None:
+        return None
+    release(cfg, repo, found)
+    return found
+
+
 # --------------------------------------------------------------------------- age
 
 

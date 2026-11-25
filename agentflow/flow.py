@@ -880,6 +880,8 @@ def cmd_backlog(args: argparse.Namespace) -> int:
             lines, notes, code = backlog_import.run(cfg, repo, args.dry_run)
             for note in notes:
                 print(note, file=sys.stderr)
+        elif verb == "release":
+            lines = backlog.release_item(cfg, repo, args.id)
         elif verb == "add":
             lines = backlog.add_item(
                 cfg, repo, args.id, spec=args.spec, title=args.title, lane=args.lane or "", status=args.status,
@@ -1288,6 +1290,11 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("pairs", nargs="*", metavar="key=value",
                     help="title, lane, status, spec, plan, depends_on (comma list), issue, notes; empty clears a key")
     _config_arg(st)
+
+    rel = blg_sub.add_parser("release", help="free the claim on an item on origin, whoever holds it (a stale or "
+                                             "unreadable one too)")
+    rel.add_argument("id", help="the item id")
+    _config_arg(rel)
 
     que = sub.add_parser("queue", help="start modules in capability-map order as their dependencies merge")
     que.add_argument("--max-parallel", type=int, default=2, help="runs live at once (default 2)")

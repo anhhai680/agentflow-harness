@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from agentflow import backlog, finished
+from conftest import land_on_origin, run_git
+from test_claims import run_git_input
+
+from agentflow import backlog, claims, finished
 from agentflow.flow import main
+from agentflow.pipeline import RunOptions, start
 from agentflow.state import Run, runs_root
 
 YML = """version: 1
@@ -291,3 +297,122 @@ def test_validate_fix_sets_done_on_items_their_runs_finished(bf, capsys):
 
 def test_fix_done_is_nothing_outside_a_backlog_pack(flow_repo):
     assert backlog.fix_done(flow_repo.cfg, flow_repo.root, dry_run=False) == []
+
+
+# --------------------------------------------------------------------------- release and reopen (claims)
+
+
+def _claim(bf, item: str, phase: str, status: str = "running"):
+    return claims.create(bf.cfg, bf.root, item, run="20261125-0900-feature-" + item, lane="feature", phase=phase,
+                         status=status)
+
+
+def _forge(bf, tmp_path: Path, item: str) -> str:
+    """A claim commit holding no `claim.json` pushed to `item`'s claim ref; its sha."""
+    blob = run_git_input(bf.root, "{}\n", "hash-object", "-w", "--stdin").strip()
+    tree = run_git_input(bf.root, f"100644 blob {blob}\tother.json\n", "mktree").strip()
+    sha = run_git(bf.root, "commit-tree", tree, "-m", "forged").strip()
+    run_git(bf.root, "push", "-q", "origin", f"{sha}:{claims.ref(bf.cfg, item)}")
+    return sha
+
+
+def _on_origin(bf, item: str) -> bool:
+    return claims.ref(bf.cfg, item) in run_git(bf.origin, "for-each-ref", "--format=%(refname)").split()
+
+
+def test_release_frees_any_claim_including_a_stale_one(bf, tmp_path, capsys, monkeypatch):
+    old = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with monkeypatch.context() as patched:
+        patched.setattr(claims, "_now", lambda: old)
+        _claim(bf, "b", "plan", "waiting")
+    _forge(bf, tmp_path, "i")
+    assert _on_origin(bf, "b") and _on_origin(bf, "i")
+    assert main(["backlog", "release", "b"]) == 0
+    out = capsys.readouterr().out
+    assert "Test" in out and "plan" in out and old in out and not _on_origin(bf, "b")
+    assert main(["backlog", "release", "i"]) == 0
+    out = capsys.readouterr().out
+    assert "unreadable" in out and not _on_origin(bf, "i")
+    for item in ("b", "i"):
+        assert main(["backlog", "release", item]) == 0
+        assert capsys.readouterr().out.strip() == f"no claim on {item}"
+    assert main(["backlog", "release", "../x"]) == 1
+    assert capsys.readouterr().out.startswith("error: ")
+
+
+def test_release_names_a_live_local_run(flow_repo, capsys):
+    from test_claim_runs import ClaimFlow
+
+    cflow = ClaimFlow(flow_repo)
+    flow_repo.install_pack()
+    run = start(cflow.cfg, flow_repo.root, "feature", {"module": "b"}, RunOptions())
+    assert claims.read(cflow.cfg, flow_repo.root, "b") is not None
+    assert main(["backlog", "release", "b"]) == 0
+    out = capsys.readouterr().out
+    assert f"run {run.id}" in out and "claim_lost" in out and "Test" in out
+    assert claims.read(cflow.cfg, flow_repo.root, "b") is None
+    assert main(["backlog", "release", "b"]) == 0
+    assert capsys.readouterr().out.strip() == "no claim on b"
+
+
+def _finish(bf, tmp_path: Path, claim_phase: str) -> None:
+    """`a` (done in the file) holds a claim at `claim_phase`, and its file on origin says `done`."""
+    _claim(bf, "a", claim_phase, "waiting")
+    land_on_origin(bf, tmp_path, {"backlog.yml": YML})
+
+
+def test_reopen_releases_only_a_finished_claim(bf, tmp_path, capsys, monkeypatch):
+    last = list(bf.cfg.phases)[-1]
+    _finish(bf, tmp_path, last)
+    assert main(["backlog", "set", "a", "status=ready"]) == 0
+    out = capsys.readouterr().out
+    assert "a: set status" in out and "released" in out and "Test" in out
+    assert items(bf)["a"].status == "ready" and not _on_origin(bf, "a")
+
+    # a claim that is not at the last phase stays, and the output says so
+    write(bf.root, "backlog.yml", YML)
+    _claim(bf, "a", "build", "running")
+    assert main(["backlog", "set", "a", "status=backlog"]) == 0
+    out = capsys.readouterr().out
+    assert "left claim of Test (build, running)" in out and _on_origin(bf, "a")
+    assert items(bf)["a"].status == "backlog"
+
+    # a claim at the last phase of an item origin does not have as done stays too
+    write(bf.root, "backlog.yml", YML)
+    claims.release(bf.cfg, bf.root, claims.read(bf.cfg, bf.root, "a"))
+    land_on_origin(bf, tmp_path, {"backlog.yml": YML.replace("title: Alpha\n    status: done",
+                                                             "title: Alpha\n    status: ready")})
+    _claim(bf, "a", last, "waiting")
+    assert main(["backlog", "set", "a", "status=ready"]) == 0
+    assert f"left claim of Test ({last}, waiting)" in capsys.readouterr().out and _on_origin(bf, "a")
+
+    # an item that was not done never calls origin
+    calls: list[tuple] = []
+    real = claims._run
+    monkeypatch.setattr(claims, "_run", lambda *a, **k: calls.append(a) or real(*a, **k))
+    monkeypatch.setattr(backlog, "fetch_remote_branch", lambda *a, **k: calls.append(a) or True)
+    assert main(["backlog", "set", "b", "status=backlog"]) == 0
+    assert main(["backlog", "undone", "b"]) == 0
+    assert calls == []
+    capsys.readouterr()
+    assert backlog.release_on_reopen(bf.cfg, bf.root, "b", "ready") == [] and calls == []
+
+
+def test_reopen_with_origin_down_still_edits_the_file(bf, tmp_path, capsys):
+    _finish(bf, tmp_path, list(bf.cfg.phases)[-1])
+    moved = tmp_path / "moved.git"
+    shutil.move(bf.origin, moved)
+    try:
+        assert main(["backlog", "set", "a", "status=ready"]) == 0
+    finally:
+        shutil.move(moved, bf.origin)
+    out = capsys.readouterr().out
+    assert items(bf)["a"].status == "ready"
+    assert "a: set status" in out and "could not read the claim" in out
+    assert all(len(line) <= 400 for line in out.splitlines()) and _on_origin(bf, "a")
+
+
+def test_a_remote_text_in_a_reopen_line_is_one_short_line(bf, tmp_path, monkeypatch):
+    monkeypatch.setattr(claims, "read", lambda *a, **k: (_ for _ in ()).throw(claims.Unreachable("x\ny" + "z" * 900)))
+    [line] = backlog.release_on_reopen(bf.cfg, bf.root, "a", "done")
+    assert "\n" not in line and len(line) <= 420 and "could not read the claim" in line

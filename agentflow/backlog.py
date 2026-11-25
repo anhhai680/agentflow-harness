@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal
 
-from agentflow import backlog_file, claim_sync, finished, intake, module_queue, sources, vuln, work_source
+from agentflow import backlog_file, claim_sync, claims, finished, intake, module_queue, sources, vuln, work_source
 from agentflow.backlog_file import BacklogItem
 from agentflow.conditions import first_phase_with_work, make_ctx
 from agentflow.config import check_lane
@@ -1243,8 +1243,12 @@ def set_item(cfg: Config, repo: Path, item_id: str, pairs: list[str]) -> list[st
             fields[key] = value
     if not fields:
         raise Invalid("nothing to set: give key=value pairs")
+    was = _status_of(cfg, repo, item_id)
     backlog_file.set_fields(path, item_id, fields)
-    return [f"{item_id}: set {', '.join(fields)} in {path.name} (not committed)"]
+    lines = [f"{item_id}: set {', '.join(fields)} in {path.name} (not committed)"]
+    if fields.get("status") in REOPENED:
+        lines += release_on_reopen(cfg, repo, item_id, was)
+    return lines
 
 
 def set_status(cfg: Config, repo: Path, item_id: str, status: str) -> list[str]:
@@ -1254,8 +1258,90 @@ def set_status(cfg: Config, repo: Path, item_id: str, status: str) -> list[str]:
     path = _backlog_path(cfg, repo)
     if status == "done":
         _refuse_live(cfg, repo, item_id)
+    was = _status_of(cfg, repo, item_id)
     backlog_file.set_fields(path, item_id, {"status": status})
-    return [f"{item_id}: status set to {status} in {path.name} (not committed)"]
+    lines = [f"{item_id}: status set to {status} in {path.name} (not committed)"]
+    if status in REOPENED:
+        lines += release_on_reopen(cfg, repo, item_id, was)
+    return lines
+
+
+# --------------------------------------------------------------------------- claims: a person frees one
+
+REOPENED = ("ready", "backlog")  # the statuses a `done` item is reopened to
+
+
+def _status_of(cfg: Config, repo: Path, item_id: str) -> str:
+    """The status of `item_id` in the backlog file in the working tree now, or "" when it is not there."""
+    try:
+        found = work_source.item(cfg, Path(repo), item_id)
+    except Exception:  # the edit that follows says what is wrong with the file
+        return ""
+    return found.status if found is not None else ""
+
+
+def _by(held: claims.Claim) -> str:
+    """Who holds `held`, for a line a person reads: only validated fields, one line, cut short."""
+    return claim_sync._cut(f"{held.by} ({held.phase}, {held.status})")
+
+
+def release_item(cfg: Config, repo: Path, item_id: str) -> list[str]:
+    """`backlog release <id>`: free the claim on `item_id` on `origin`, whoever holds it and however old it is (an
+    unreadable one too). The lines to print: the claimant, and, when a run of this clone holds that claim (its
+    `state["claim"]` names the item and is unreleased), that its next change to the claim stops it with `claim_lost`;
+    `no claim on <id>` when there was none. `Invalid` outside a `backlog` pack, `ValueError` for a bad id and
+    `Refused` when `origin` can't be reached or another claim took the ref meanwhile."""
+    repo = Path(repo)
+    _backlog_path(cfg, repo)
+    try:
+        freed = claims.release_item(cfg, repo, item_id)
+    except claims.ClaimError as exc:
+        raise Refused(f"could not free the claim on {item_id}: {claim_sync._cut(exc)}") from exc
+    if freed is None:
+        return [f"no claim on {item_id}"]
+    if freed.unreadable:
+        lines = [f"{item_id}: released an unreadable claim ({claim_sync._cut(freed.unreadable)})"]
+    else:
+        lines = [f"{item_id}: released the claim of {claim_sync._cut(freed.by)} (run {freed.run}, {freed.phase}, "
+                 f"{freed.status}, updated {freed.updated})"]
+    for run in list_runs(repo):
+        try:
+            row = run.refresh().get("claim")
+        except Exception:  # one unreadable run is not a reason to look at no other
+            continue
+        if isinstance(row, dict) and row.get("item") == item_id and not row.get("released"):
+            lines.append(f"run {run.id} holds this claim here: its next change stops it with claim_lost")
+    return lines
+
+
+def release_on_reopen(cfg: Config, repo: Path, item_id: str, was: str) -> list[str]:
+    """After an item that was `done` (`was`) becomes `ready` or `backlog`: free its claim when the claim is a finished
+    one, the claim of the pack's last phase on an item that is `done` in the file at `origin/<fork_from>`. Any other
+    claim stays, and the line says whose it is (`left claim of <by> (<phase>, <status>)`). The lines to print; `[]`
+    when there is no claim or the item was not `done` (origin is not asked then). Never raises: a claim that can't be
+    read or freed is a line."""
+    if was != "done":
+        return []
+    repo = Path(repo)
+    try:
+        if not claims.enabled(cfg, repo):
+            return []
+        held = claims.read(cfg, repo, item_id)
+    except Exception as exc:
+        return [f"{item_id}: could not read the claim on origin ({claim_sync._cut(exc)}); it was left as it is"]
+    if held is None:
+        return []
+    try:
+        if held.unreadable:
+            return [f"{item_id}: left an unreadable claim ({claim_sync._cut(held.unreadable)}): "
+                    f"agentflow backlog release {item_id} frees it"]
+        fetch_remote_branch(repo, cfg.project.fork_from)
+        if held.phase == list(cfg.phases)[-1] and item_id in claim_sync._merged_ids(cfg, repo):
+            claims.release(cfg, repo, held)
+            return [f"{item_id}: released the finished claim of {_by(held)}"]
+        return [f"{item_id}: left claim of {_by(held)}; agentflow backlog release {item_id} frees it"]
+    except Exception as exc:
+        return [f"{item_id}: could not free the claim of {_by(held)} ({claim_sync._cut(exc)}); it was left"]
 
 
 def _spec_file(repo: Path, spec: str) -> str:
@@ -1450,9 +1536,10 @@ def add_file_item(cfg: Config, repo: Path, item: dict, sha: str) -> str:
         return backlog_file.append_item(path, new, expect_sha=sha)
 
 
-def edit_item(cfg: Config, repo: Path, item_id: str, fields: dict, sha: str) -> str:
+def edit_item(cfg: Config, repo: Path, item_id: str, fields: dict, sha: str) -> tuple[str, list[str]]:
     """Set `fields` (`EDIT_KEYS` only) of the item `item_id` in the work tree's backlog file (nothing is committed)
-    and return the file's new sha-256. The errors are those of `add_file_item`."""
+    and return the file's new sha-256, and the lines `release_on_reopen` has when a `done` item became `ready` or
+    `backlog`. The errors are those of `add_file_item`."""
     repo = Path(repo)
     path = _backlog_path(cfg, repo)
     sha = _sha_arg(sha)
@@ -1463,7 +1550,10 @@ def edit_item(cfg: Config, repo: Path, item_id: str, fields: dict, sha: str) -> 
         raise Invalid("nothing to set: send the fields to change")
     with _FILE_LOCK:
         _refuse_closing_live(cfg, repo, item_id, checked)
-        return backlog_file.set_fields(path, item_id, checked, expect_sha=sha)
+        was = _status_of(cfg, repo, item_id)
+        new_sha = backlog_file.set_fields(path, item_id, checked, expect_sha=sha)
+    notes = release_on_reopen(cfg, repo, item_id, was) if checked.get("status") in REOPENED else []
+    return new_sha, notes  # the claim is freed outside the lock: it waits on the network
 
 
 def move(cfg: Config, repo: Path, item_id: str, direction: Literal["up", "down"], sha: str) -> str:
