@@ -475,6 +475,11 @@ agentflow backlog set <id> status=ready [key=value …]   # edit an item: title,
 agentflow backlog import [--dry-run]                # write the first backlog.yml from the current work source (section 14)
                                                     # the Board edits backlog.yml too: Edit and Move up/down on a card, Add on "Not on the backlog"; a card marked
                                                     #   `local` is only in your working tree until you commit the file (section 14)
+agentflow backlog release <id>                      # free the claim on an item on origin, whoever holds it: a teammate's, a stale or an
+                                                    #   unreadable one (nothing frees a claim by itself, except its own machine's run ending
+                                                    #   or merging). Works with `backlog.claims: false`. A live run of that claim here stops at
+                                                    #   its next change with `claim_lost`. A phase longer than `backlog.claim_stale_h`
+                                                    #   shows stale on other Boards (no heartbeat), but is still held
 agentflow retro [--since YYYY-MM-DD]                # lessons from the runs ended since the last finished retro, as a
                                                     #   draft PR that changes only .agentflow/lessons.md (section 15)
 agentflow retro --dry-run                           # print the digest and the session's prompt; creates nothing
@@ -483,6 +488,8 @@ agentflow lessons [--json]                          # each lesson's verdict: its
 agentflow scorecard [--freeze]                      # the finished runs' signals against the baseline frozen on this machine,
                                                     #   conformance first; also the dashboard's Metrics tab
 ```
+
+**A `claim_lost` stop** (a backlog pack with `backlog.claims`): the run's next phase or status change found that its claim on `origin` was released or is now another run's, and the runner never pushes over it. The stop names the new claimant, or says the claim is gone, and the autonomy resolver never settles it. You decide: `agentflow approve <run> <phase>/claim` makes the next change claim the item again, which works when the item is free and stops again, naming the new claimant, when it isn't; `agentflow backlog release <id>` frees the other claim first; `agentflow cancel <run>` ends the run. A failed push to an unreachable `origin` is not a lost claim: the run goes on, records `claim_sync_failed`, and the next change catches the claim up.
 
 ## 11. Safety model in five lines
 

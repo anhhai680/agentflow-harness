@@ -2,7 +2,7 @@
 
 It looks at the agent CLIs and their logins, `gh`, Dependabot alert access (when the pack can run the `vuln` lane: `vuln` in
 `lanes`, `vuln.source` `dependabot` and a `vuln.probe`; one read-only `gh api` call), the dependency review API (with
-`vuln.dependency_review`; one more read-only `gh api` call), the `origin` remote, Docker (when a gate runs it), the state dir and the programs each gate
+`vuln.dependency_review`; one more read-only `gh api` call), the `origin` remote, the claims on it (with `backlog.claims` in a `backlog` pack; one read-only `git ls-remote`), Docker (when a gate runs it), the state dir and the programs each gate
 and the vuln probe run. Every external command is bounded by `TIMEOUT_S`. It changes nothing except
 creating the state dir and a probe file there that it removes at once.
 """
@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from agentflow import keepawake, layers, pack, run_env, safeio
+from agentflow import claims, keepawake, layers, pack, run_env, safeio
 from agentflow.config import Config, ConfigError, load_config
 from agentflow.vuln import REVIEW_API
 
@@ -255,6 +255,19 @@ def _remote_check(repo: Path) -> Check:
                  "add a remote named origin: `finish` pushes the run's branch there")
 
 
+def _claims_check(cfg: Config, repo: Path) -> Check:
+    """Claims on `origin`: one read-only `git ls-remote`, never a push. `ok` with how many there are."""
+    pattern = claims.prefix(cfg) + "*"
+    code, output = run_bounded(["git", "ls-remote", "--refs", "origin", pattern], repo)
+    if code != 0:
+        first = next((line.strip() for line in output.splitlines() if line.strip()), "")  # git's `fatal:` line leads
+        detail = "timed out" if code is None and output == "timed out" else (first or f"exit {code}")
+        return Check("claims", "fail", f"could not read the claims on origin: {detail}",
+                     "check the network and that you may read origin, or set `backlog.claims: false`")
+    count = sum(1 for line in output.splitlines() if "\t" in line)
+    return Check("claims", "ok", f"{count} claim{'' if count == 1 else 's'} on origin")
+
+
 def docker_check(repo: Path) -> Check:
     if not shutil.which("docker"):
         return Check("docker", "fail", "`docker` is not on PATH", "start Docker (install it first)")
@@ -400,7 +413,7 @@ def _gate_checks(cfg: Config) -> tuple[list[Check], bool]:
 
 
 def run_checks(cfg: Config, repo: Path) -> list[Check]:
-    """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), Dependabot alerts (when the pack can run the vuln lane), the dependency review API (with `vuln.dependency_review`), the remote, Docker (when a gate runs it), the state dir, keeping the
+    """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), Dependabot alerts (when the pack can run the vuln lane), the dependency review API (with `vuln.dependency_review`), the remote, the claims on it (a `backlog` pack with `backlog.claims`), Docker (when a gate runs it), the state dir, keeping the
     machine awake, the inherited environment, the gates and the vuln probe."""
     gate_checks, uses_docker = _gate_checks(cfg)
     checks = [*_agent_checks(cfg, repo)]
@@ -414,6 +427,8 @@ def run_checks(cfg: Config, repo: Path) -> list[Check]:
     if cfg.vuln.dependency_review and "vuln" in cfg.lanes and shutil.which("gh"):
         checks.append(_dependency_review_check(repo, cfg.project.fork_from))
     checks.append(_remote_check(repo))
+    if claims.enabled(cfg, repo):
+        checks.append(_claims_check(cfg, repo))
     if uses_docker:
         checks.append(docker_check(repo))
     checks.append(_state_dir_check(repo))

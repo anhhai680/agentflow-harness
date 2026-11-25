@@ -146,6 +146,11 @@ def _check_id(item_id: object) -> str:
     return item_id
 
 
+def prefix(cfg: Config) -> str:
+    """The ref prefix every claim of this pack's `backlog.claim_ref` form lives under (ends in `/`)."""
+    return _PREFIX[cfg.backlog.claim_ref]
+
+
 def ref(cfg: Config, item_id: str) -> str:
     """The claim ref of `item_id` on `origin`; `ValueError` for an id that is not a module id."""
     return _PREFIX[cfg.backlog.claim_ref] + _check_id(item_id)
