@@ -307,3 +307,117 @@ def test_refusals_leave_no_run(bflow, case):
         start(bflow.cfg, bflow.repo.root, "feature", {"module": module}, RunOptions(new_module=new))
     assert str(caught.value) == message.format(fork=bflow.cfg.project.fork_from)
     assert list_runs(bflow.repo.root) == [] and run_git(bflow.repo.root, "branch", "--list") == branches
+
+
+# --------------------------------------------------------------------------- spec and plan after their step
+
+SPEC = "docs/specs/SPEC-b.md"
+SPEC_TEXT = "# Spec: `b`\n\n**Status: approved**\n\n## Open Questions\n\nNone for this module.\n"
+DONE_ACT = {"result": {"status": "done", "summary": "ok"}}
+
+
+def _drafted(bflow, text: str = SPEC_TEXT):
+    """`feature` run of item `b` up to the end of the define phase: the draft step wrote `SPEC`."""
+    bflow.script(define=[{"write": {SPEC: text}, **DONE_ACT}])
+    return bflow.start("feature", module="b", to_phase="define")
+
+
+def _recorded(bflow, run, change: str) -> dict:
+    [event] = [e for e in bflow.events(run, "backlog_updated") if e["change"] == change]
+    return event
+
+
+def _commits_after(run, worktree: Path, key: str) -> tuple[str, str]:
+    """`(step sha, the commit right after it)` for the step `key`."""
+    [step] = [e for e in run.events.read() if e["type"] == "step_committed" and e["key"] == key]
+    after = run_git(worktree, "rev-list", "--reverse", f"{step['sha']}..HEAD").split()
+    return step["sha"], after[0] if after else ""
+
+
+def test_define_records_the_spec_path_it_wrote(bflow):
+    run = _drafted(bflow)
+    worktree = bflow.worktree(run)
+    step, after = _commits_after(run, worktree, "define/draft")
+    assert after and run_git(worktree, "log", "-1", "--format=%s", after).strip() == "Record the b spec in the backlog"
+    assert _changed(worktree, after) == ["backlog.yml"]
+    assert run_git(worktree, "rev-parse", f"{after}^").strip() == step
+    [item] = [i for i in _at(bflow, worktree, "HEAD") if i.id == "b"]
+    assert item.spec == SPEC
+    assert _recorded(bflow, run, "spec")["fields"] == {"spec": SPEC}
+    assert run.refresh()["waiting"]["kind"] != "guard_violation"
+    assert not [e for e in bflow.events(run, "backlog_updated") if e["change"] == "plan"]
+
+
+def test_plan_records_the_plan_path(bflow):
+    run = _drafted(bflow)
+    values = conditions.make_ctx(bflow.cfg, bflow.repo.root, "feature", run.state["params"], run).values
+    bflow.repo.script({"define/draft": [{"write": {SPEC: SPEC_TEXT}, **DONE_ACT}],
+                       "plan/plan": [{"write": {values["plan_target"]: "# Plan: b\n\n### Task 1: A\n\n- [ ] **Step 1: x**\n"},
+                                      **DONE_ACT}]})
+    from agentflow.hitl import approve
+
+    approve(run, "define", by="me")
+    advance(run, bflow.cfg, RunOptions(to_phase="plan"))
+    worktree = bflow.worktree(run)
+    step, after = _commits_after(run, worktree, "plan/plan")
+    assert after and run_git(worktree, "log", "-1", "--format=%s", after).strip() == "Record the b plan in the backlog"
+    assert _changed(worktree, after) == ["backlog.yml"]
+    [item] = [i for i in _at(bflow, worktree, "HEAD") if i.id == "b"]
+    assert (item.spec, item.plan) == (SPEC, values["plan_target"])
+    assert _recorded(bflow, run, "plan")["fields"] == {"plan": values["plan_target"]}
+    assert run.refresh()["waiting"]["kind"] != "guard_violation"
+
+
+def test_a_spec_the_item_already_names_writes_nothing(bflow):
+    (bflow.repo.root / "backlog.yml").write_text(BACKLOG_YML.replace(
+        "    title: Bee\n", f"    title: Bee\n    spec: {SPEC}\n"), encoding="utf-8")
+    run_git(bflow.repo.root, "commit", "-q", "-am", "b names its spec")
+    run = _drafted(bflow)
+    assert [e for e in bflow.events(run, "step_committed") if e["key"] == "define/draft"]
+    assert [e for e in bflow.events(run, "backlog_updated") if e["change"] == "spec"] == []
+    worktree = bflow.worktree(run)
+    assert run_git(worktree, "diff", "--name-only", run.state["base_sha"], "HEAD").split() == [SPEC]
+
+
+def test_a_reconcile_step_that_rewrites_the_same_spec_writes_nothing(bflow):
+    from conftest import with_doubt
+
+    bflow.repo.configure({"work_source": {"kind": "backlog", "path": None}}, autopilot=True, edit=with_doubt)
+    high = {"severity": "high", "file": SPEC, "line": 3, "text": "Thiếu trường hợp rollback"}
+    pending = SPEC_TEXT.replace("**Status: approved**", "**Status: proposed** (pending approval)")
+    bflow.script(**{
+        "define": [{"write": {SPEC: pending}, **DONE_ACT}],
+        "define/spec_review": [{"result": {"status": "done", "summary": "found", "findings": [high]}},
+                               {"result": {"status": "done", "summary": "clean"}}],
+        "define/spec_reconcile": [{"write": {SPEC: pending + "\nRollback.\n"},
+                                   "result": {"status": "done", "summary": "revised", "dispositions": [
+                                       {"finding": "R1-F1", "class": "fixed", "note": "ok"}]}}],
+    })
+    run = bflow.start("feature", module="b", to_phase="define")
+    worktree = bflow.worktree(run)
+    assert [e["key"] for e in bflow.events(run, "step_committed")][:2] == ["define/draft", "define/spec_reconcile"]
+    assert [e["change"] for e in bflow.events(run, "backlog_updated")] == ["spec"]
+    waiting = run.refresh().get("waiting") or {}
+    assert waiting.get("kind") != "guard_violation", waiting
+    assert (worktree / SPEC).read_text(encoding="utf-8").endswith("Rollback.\n")
+
+
+def test_a_crash_after_the_step_commit_is_recorded_on_resume(bflow, monkeypatch):
+    real = backlog_writes.after_output
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("the runner died here")
+
+    bflow.script(define=[{"write": {SPEC: SPEC_TEXT}, **DONE_ACT}])
+    run = start(bflow.cfg, bflow.repo.root, "feature", {"module": "b"}, RunOptions(to_phase="define"))
+    monkeypatch.setattr(backlog_writes, "after_output", crash)
+    with pytest.raises(RuntimeError, match="died"):
+        advance(run, bflow.cfg, RunOptions(to_phase="define"))
+    assert bflow.events(run, "backlog_updated") == []
+    monkeypatch.setattr(backlog_writes, "after_output", real)
+    advance(run, bflow.cfg, RunOptions(to_phase="define"))
+    assert _recorded(bflow, run, "spec")["fields"] == {"spec": SPEC}
+    worktree = bflow.worktree(run)
+    assert [i.spec for i in _at(bflow, worktree, "HEAD") if i.id == "b"] == [SPEC]
+    assert run.refresh()["waiting"]["kind"] != "guard_violation"
+    assert len([e for e in bflow.events(run, "backlog_updated") if e["change"] == "spec"]) == 1

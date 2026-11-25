@@ -33,7 +33,7 @@ from agentflow.state import Run
 CHANGES = ("added", "ready", "spec", "plan", "done")
 _ATTR = {"depends_on": "deps"}  # a backlog key -> its `BacklogItem` attribute, where they differ
 
-__all__ = ["CHANGES", "StartWrite", "applies", "first_commit", "plan_start", "write"]
+__all__ = ["CHANGES", "StartWrite", "after_output", "applies", "first_commit", "plan_start", "write"]
 
 
 @dataclass(frozen=True)
@@ -258,3 +258,31 @@ def first_commit(cfg: Config, run: Run, worktree: Path, plan: StartWrite) -> str
     else:
         sha = write(cfg, run, worktree, "ready", _ready(item.id), f"Mark {item.id} ready in the backlog")
     return sha or ""
+
+
+def after_output(cfg: Config, run: Run, worktree: Path, values: dict[str, str], output: str) -> str | None:
+    """Record in the run's item the path a committed step just wrote: `spec` when `output` is `values["spec"]`, `plan`
+    when it is `values["plan_target"]`; return the commit's sha, or None when nothing is written. The item is read from
+    the file at `runner_head(run)`; nothing is written when the run does not write to the backlog (`applies`), the item
+    is not in the file, or it already names `output`, so a step that rewrites its own artifact (a reconcile round) and a
+    step run again write nothing. `write`'s refusals reach the caller."""
+    item_id = str(run.state["params"].get("module") or "")
+    path = backlog_path(cfg.work_source)
+    head = runner_head(run)
+    if not output or not item_id or path is None or head is None:
+        return None
+    change = "spec" if output == values.get("spec") else "plan" if output == values.get("plan_target") else ""
+    if not change:
+        return None
+    blob = gitops.read_blob(Path(worktree), head, path, backlog_file.FILE_MAX)
+    if blob is None:
+        return None
+    try:
+        items, _ = backlog_file.parse(blob.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise backlog_file.EditRefused(f"{path} is not valid UTF-8") from None
+    item = next((i for i in items if i.id == item_id), None)
+    if item is None or not applies(cfg, run, item) or getattr(item, change) == output:
+        return None
+    return write(cfg, run, worktree, change, lambda text: backlog_file.set_fields_text(text, item_id, {change: output}),
+                 f"Record the {item_id} {change} in the backlog")

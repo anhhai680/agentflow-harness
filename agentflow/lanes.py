@@ -31,6 +31,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, TextIO
 
+from agentflow import backlog_file, backlog_writes
 from agentflow import brief as brief_mod
 from agentflow import lessons as lessons_mod
 from agentflow import (doubt, gitops, overlays, pack, run_env, safeio, sizing, sources, speculation, verification, vuln,
@@ -877,6 +878,9 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
             committed = [e for e in since if e["type"] == "step_committed" and e.get("key") == key]
             if committed:
                 last = committed[-1]
+                failed = self._record_output(sr)  # a crash after `step_committed` may have left the item unrecorded
+                if failed:
+                    return self._fail(sr, failed)
                 self.run.emit("step_finished", key=key, status="done", summary=last.get("summary", ""), sha=last["sha"])
                 return "done"
             wait_for_agents(self.run, self.cfg, key, self._timeout_s())
@@ -1427,11 +1431,29 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
                 sha = None
             if sha:
                 self.run.emit("step_committed", key=sr.key, sha=sha, summary=result.summary)
+                failed = self._record_output(sr)
+                if failed:
+                    return self._fail(sr, failed)
         extra = {"tree": tree} if tree else {}
         self._remember_code_map(sr, result)
         self._remember_lessons_cited(sr, result)
         self.run.emit("step_finished", key=sr.key, status="done", summary=result.summary, sha=sha, **extra)
         return "done"
+
+    def _record_output(self, sr: _StepRun) -> list[Violation]:
+        """After a step committed its `output`: put the path in the run's backlog item when it is the run's spec or
+        plan (`backlog_writes.after_output`). The violations that fail the step when the runner's own commit is refused;
+        none when the step wrote nothing to record."""
+        if not sr.step.output:
+            return []
+        try:
+            backlog_writes.after_output(self.cfg, self.run, self.worktree, self._values(sr),
+                                        fmt(str(sr.step.output), self._values(sr)))
+        except CommitRejected as exc:
+            return [Violation(exc.kind, str(exc))]
+        except backlog_file.EditRefused as exc:
+            return [Violation("guard_violation", str(exc))]
+        return []
 
     def _remember_code_map(self, sr: _StepRun, result: StepResult) -> None:
         """Keep the code map a finished step reported, once per entry (any case). A stopped step never gets here."""
