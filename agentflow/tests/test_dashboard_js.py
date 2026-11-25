@@ -779,3 +779,74 @@ def test_the_edit_dialogs_lane_choices_are_the_packs_lanes():
     got = js(["board.js"], stubs + """editDialog(args);
       body.find((n) => n.p.id === 'ei-lane').c.map((o) => o.p.value)""", {**FILE_CARD, "item": {**FILE_ITEM, "lane": "old"}})
     assert got == ["", "feature", "bug", "vuln", "old"]
+
+
+# ---- another machine's claim: a read-only card in its phase column
+
+CLAIM = {"key": "claim:crm", "id": "crm", "title": "CRM sync", "lane": "feature", "column": "build", "phase": "build",
+         "status": "running", "by": "Dana", "run": "20261125-120000-crm", "updated": "2026-11-22T12:00:00+00:00",
+         "age_s": 3 * 86400 + 600, "stale": False, "unreadable": ""}
+
+
+def _texts(node: dict) -> list:
+    return [n["p"].get("text") for n in walk([node]) if n["p"].get("text") is not None]
+
+
+def test_a_remote_claim_card_is_text_only():
+    markup = "<img src=x onerror=1>"
+    node = js(["board.js"], FAKE_EL + "remoteClaimNode(args)",
+              {**CLAIM, "by": markup, "run": "<b>r</b>", "title": "<script>x</script>"})
+    assert node["tag"] == "article" and "draggable" not in node["p"]
+    assert not [n for n in walk([node]) if n["tag"] in ("button", "a", "input") or "onclick" in n["p"]]
+    assert markup in " ".join(_texts(node))  # it is shown, as a text node, never parsed
+    assert all(set(n["p"]) <= {"class", "text", "title", "role", "aria-label"} for n in walk([node]))
+    # the run id reaches the page only as a tooltip, a text-valued property
+    assert "<b>r</b>" in [n["p"].get("title") for n in walk([node])]
+
+
+def test_the_card_names_the_claimant_phase_status_and_age():
+    texts = " | ".join(_texts(js(["board.js"], FAKE_EL + "remoteClaimNode(args)", CLAIM)))
+    for want in ("crm", "Dana", "build · running", "3 d"):
+        assert want in texts
+    assert "stale" not in texts
+    ages = js(["board.js"], "args.map(claimAge)", [None, 30, 600, 7200, 86400 * 2 + 5])
+    assert ages == ["", "just now", "10 min", "2 h", "2 d"]
+
+
+def test_remote_cards_sit_in_their_phase_column():
+    data = {"columns": ["Backlog", "plan", "build", "Done"], "backlog": [], "remote_claims": [
+        CLAIM, {**CLAIM, "key": "claim:bad", "id": "bad", "column": "Backlog", "phase": "", "status": "",
+                "by": "", "unreadable": "no claim.json", "age_s": None},
+        {**CLAIM, "key": "claim:odd", "id": "odd", "column": "retired-phase"}]}
+    stubs = FAKE_EL + "ui = {}; entry = (key, data, build) => ({key, data, build}); "
+
+    def keys(column):
+        return js(["board.js"], stubs + "columnEntries(args, " + repr(column) + ", []).map((e) => e.key)", data)
+
+    assert keys("build") == ["col-head", "claim:crm"]
+    assert keys("plan") == ["col-head"]
+    # an unreadable claim, and one whose column the pack does not have, are in Backlog: never dropped
+    assert keys("Backlog") == ["col-head", "claim:bad", "claim:odd"]
+    head = js(["board.js"], stubs + "columnEntries(args, 'Backlog', [])[0].data", data)
+    assert head["count"] == 2
+    bad = js(["board.js"], stubs + "remoteClaimNode(args.remote_claims[1])", data)
+    assert "no claim.json" in _texts(bad) and not [t for t in _texts(bad) if " · " in t]
+
+
+def test_the_card_says_stale_and_the_note_shows():
+    texts = _texts(js(["board.js"], FAKE_EL + "remoteClaimNode(args)", {**CLAIM, "stale": True}))
+    assert "stale" in texts
+    got = js(["board.js"], """
+      var shown = {}; $ = (id) => (shown[id] = shown[id] || {hidden: false, textContent: ""});
+      showClaimsNote(args); [shown["claims-note"].hidden, shown["claims-note"].textContent]""", "<b>origin</b> could not be read")
+    assert got == [False, "<b>origin</b> could not be read"]
+    assert js(["board.js"], """var shown = {}; $ = (id) => (shown[id] = shown[id] || {hidden: false, textContent: "x"});
+      showClaimsNote(args); [shown["claims-note"].hidden, shown["claims-note"].textContent]""", None) == [True, ""]
+    html = (Path(__file__).resolve().parent.parent / "dashboard.html").read_text(encoding="utf-8")
+    assert 'id="claims-note"' in html and html.index('id="backlog-note"') < html.index('id="claims-note"')
+
+
+def test_a_saved_edit_shows_the_notes_the_server_sent_as_text():
+    got = js_async(["board.js"], WRITE_STUBS + """api = async () => ({ok: true, notes: ["claim of crm freed", "<b>x</b>"]});
+      (async () => { await writeBacklogFile({}, 'Saved'); return said; })()""", None)
+    assert got == ["Saved. claim of crm freed. <b>x</b>"]

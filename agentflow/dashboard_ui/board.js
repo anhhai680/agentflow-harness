@@ -299,6 +299,52 @@ function backlogNode(item) {
   return node;
 }
 
+// ------------------------------------------------------------------ another machine's claim
+
+// How long ago a claim last moved, from the seconds the server computed: "3 d", "2 h", "10 min"; "" when it has no age
+// (an unreadable claim).
+function claimAge(seconds) {
+  if (typeof seconds !== "number" || !isFinite(seconds) || seconds < 0) return "";
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return Math.floor(seconds / 60) + " min";
+  if (seconds < 86400) return Math.floor(seconds / 3600) + " h";
+  return Math.floor(seconds / 86400) + " d";
+}
+
+// A claim another machine holds on `origin`, as a read-only card: no Start, Edit or drag, and every field is text (the
+// claimant, the run and the reason of an unreadable claim come from a file anyone with push access to origin can write).
+function remoteClaimNode(claim) {
+  const unreadable = !!claim.unreadable;
+  const where = [claim.phase, claim.status].filter(Boolean).join(" · ");
+  const line = (text, props) => (text ? el("div", Object.assign({ class: "sub", text: text }, props || {})) : null);
+  return el("article", { class: "card backlog claim" + (claim.stale ? " stale" : "") + (unreadable ? " failed-start" : "") },
+    el("div", { class: "title", text: claim.id }),
+    claim.title && claim.title !== claim.id ? line(claim.title) : null,
+    el("span", { class: "badge lock", text: unreadable ? "Claim unreadable" : "Claimed elsewhere" }),
+    claim.stale ? el("span", { class: "badge stale-mark", text: "stale", title: "No phase or status change for a while: the claimant may have stopped" }) : null,
+    unreadable ? el("div", { class: "sub gate-bad", text: claim.unreadable }) : null,
+    line(claim.by ? "by " + claim.by : ""),
+    line(where),
+    line(claimAge(claim.age_s), { title: claim.updated ? String(claim.updated) : null }),
+    claim.run ? line("run " + claim.run, { title: String(claim.run) }) : null);
+}
+
+// A claim sits in its own phase column. An unreadable one, or one whose phase this Board does not have (or `Done`, which
+// no claim has), sits in Backlog rather than vanishing: a claim that blocks a start must stay visible.
+function claimColumn(data, claim) {
+  const known = claim.column !== "Done" && (data.columns || []).includes(claim.column);
+  return claim.unreadable || !known ? "Backlog" : claim.column;
+}
+
+const claimsIn = (data, name) => (data.remote_claims || []).filter((claim) => claimColumn(data, claim) === name);
+
+const claimEntry = (claim) => entry(claim.key || "claim:" + claim.id, claim, remoteClaimNode);
+
+function showClaimsNote(note) {
+  $("claims-note").hidden = !note;
+  $("claims-note").textContent = note || "";
+}
+
 // ------------------------------------------------------------------ the backlog file
 //
 // In a `backlog` pack the Board edits `backlog.yml` in the working tree (never a commit) through `POST /api/backlog/file`.
@@ -368,8 +414,10 @@ function fileWriteError(err) {
 async function writeBacklogFile(body, said) {
   let result = "saved";
   try {
-    await api("/api/backlog/file", body);
-    toast(said);
+    const reply = await api("/api/backlog/file", body);
+    // what the server did besides the edit (a claim left or released when an item is reopened) goes in the same message, as text
+    const notes = reply && Array.isArray(reply.notes) ? reply.notes.filter((n) => typeof n === "string" && n) : [];
+    toast([said, ...notes].join(". "));
   } catch (err) {
     toast(fileWriteError(err));
     result = err.status === 409 ? "stale" : "failed";
@@ -522,12 +570,14 @@ function columnNode(name) {
 
 function columnEntries(data, name, shownCards) {
   const cards = name === "Backlog" ? [] : shownCards.filter((c) => c.column === name);
-  const count = name === "Backlog" ? data.backlog.length : cards.length;
+  const claims = claimsIn(data, name);
+  const count = (name === "Backlog" ? data.backlog.length : cards.length) + claims.length;
   const entries = [entry("col-head", { name: name, count: count }, (head) => el("h2", {}, el("span", { text: head.name }), el("span", { text: String(head.count) })))];
   if (name === "Backlog") {
     // A card carries the sha of this render, so a node drawn before the file changed is drawn again, never reused.
     entries.push(...data.backlog.map((item) => entry(item.key || item.id,
       Object.assign({}, item, { sha: data.backlog_sha256 || "" }, item.planning === "backlog" ? { armed: armedFor(item) } : {}), backlogNode)));
+    entries.push(...claims.map(claimEntry));
     if (data.done_note) entries.push(entry("done-note", data.done_note, (note) => el("div", { class: "muted gate-bad", text: "Done marks not read: " + note })));
     if ((data.backlog_done || []).length) entries.push(entry("done", data.backlog_done, () => doneNode(data.backlog_done)));
     if ((data.backlog_dropped || []).length) entries.push(entry("dropped", data.backlog_dropped, droppedNode));
@@ -543,6 +593,7 @@ function columnEntries(data, name, shownCards) {
     return entries;
   }
   entries.push(...cards.map((card) => entry(card.run_id, card, cardNode)));
+  if (name !== "Backlog") entries.push(...claims.map(claimEntry));  // Backlog drew its own, above its notes
   return entries;
 }
 
@@ -664,6 +715,7 @@ function renderBoard(data) {
   $("sync-note").textContent = data.sync_note ? "Base branch not updated: " + data.sync_note : "";
   $("backlog-note").hidden = !data.backlog_note;
   $("backlog-note").textContent = data.backlog_note || "";
+  showClaimsNote(data.claims_note);
   $("issues-note").hidden = !data.issues_note;
   $("issues-note").textContent = data.issues_note || "";
   $("alerts-note").hidden = !data.alerts_note;
