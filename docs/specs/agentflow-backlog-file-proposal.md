@@ -95,6 +95,9 @@ module id or a prompt.
 
 Agents in a run can't edit `backlog.yml`: the engine adds the work source's path to the paths a run always refuses,
 as it does for `.agentflow/**`. A developer outside a run edits it like any file and merges it with a normal PR.
+When `finish` brings `origin/<fork_from>` in and git conflicts on `backlog.yml` or merges it into something new, the
+runner settles the file itself: `fork_from`'s file with the rows above that this run recorded made on it again. It
+stages exactly that, and the merge commit lets that one blob of the file through and nothing else.
 
 **D4. A claim is a custom ref on `origin`, created with a compare-and-swap.** Item `<id>`'s claim is
 `refs/agentflow/claims/<id>`, or `refs/heads/agentflow/claims/<id>` with `backlog.claim_ref: branch`. Its commit
@@ -407,7 +410,7 @@ TDD, with `fake_agent.py` and the fake `gh`. Claims are tested against a real ba
 - **The phase in `backlog.yml`** was rejected in D1.
 - **One file per item (`backlog/<id>.yml`)** never conflicts, even when two branches add items at once. One file
   was chosen because a team reads it top to bottom as a priority list. Two branches that both append at the end
-  conflict textually, and that conflict is small and easy to resolve. Reconsider if it happens often.
+  conflict textually; the runner settles that conflict in the base sync (D3). Reconsider if it happens often.
 - **GitHub Issues or Projects as the only store** would need `gh` and the network for every Board render. It
   would also put the backlog outside the repository's history and leave offline and non-GitHub teams with
   nothing. Issues stay an optional link (D7).
