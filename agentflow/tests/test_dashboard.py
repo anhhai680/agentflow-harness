@@ -1352,6 +1352,47 @@ def test_a_start_that_fails_keeps_the_card_with_its_reason(bdash):
     assert len(bdash.fake.calls) == 2 and "module:c" not in backlog_of(bdash)
 
 
+@pytest.fixture
+def kdash(flow_repo):
+    """`bdash` over a pack whose work source is `backlog.yml`: `i` is an idea, `r` is ready, `z` is dropped."""
+    flow_repo.configure({"work_source": {"kind": "backlog", "path": None}})
+    (flow_repo.root / "backlog.yml").write_text(
+        "version: 1\nitems:\n  - {id: i, title: An idea, status: backlog}\n"
+        "  - {id: r, title: Ready one, status: ready}\n  - {id: z, title: Gone, status: dropped}\n", encoding="utf-8")
+    run_git(flow_repo.root, "add", "-A")
+    run_git(flow_repo.root, "commit", "-q", "-m", "backlog")
+    spawn = FakeSpawn(flow_repo)
+    server = make_server(flow_repo.root, flow_repo.cfg, "127.0.0.1", 0, TOKEN, spawn_run=spawn)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    dash = Dash(server, server.server_address[1], flow_repo, [])
+    dash.fake = spawn
+    yield dash
+    server.close()
+    thread.join(timeout=5)
+
+
+def test_the_board_carries_a_backlog_files_items_dropped_list_and_note(kdash):
+    data = payload(kdash.get("/api/board")[2])
+    cards = {c["key"]: c for c in data["backlog"]}
+    assert (cards["module:i"]["planning"], cards["module:i"]["label"]) == ("backlog", "An idea")
+    assert data["backlog_dropped"] == [{"id": "z", "title": "Gone"}] and data["backlog_note"] == ""
+    assert data["work_source_kind"] == "backlog"
+    (kdash.flow.root / "backlog.yml").write_text("version: 1\nitems: [", encoding="utf-8")  # half written
+    data = payload(kdash.get("/api/board")[2])
+    assert data["backlog"] == [] and data["backlog_note"].startswith("backlog file ")
+
+
+def test_an_idea_starts_only_with_confirm_true(kdash):
+    code, _, body = kdash.post("/api/backlog/start", {"module": "i"})
+    assert code == 409 and "must be confirmed" in payload(body)["error"]
+    assert kdash.post("/api/backlog/start", {"module": "i", "confirm": "yes"})[0] == 400
+    assert kdash.post("/api/backlog/start", {"module": "r"})[0] == 202  # a ready item needs no confirm
+    assert kdash.post("/api/backlog/start", {"module": "i", "confirm": True})[0] == 202
+    settle(kdash)
+    assert [c["params"] for c in kdash.fake.calls] == [{"module": "r"}, {"module": "i"}]
+
+
 def test_start_needs_a_module_or_an_item(bdash):
     assert bdash.post("/api/backlog/start", {})[0] == 400
     assert bdash.post("/api/backlog/start", {"item": "card:zzzz"})[0] == 409
@@ -1628,7 +1669,7 @@ def test_the_page_wires_the_backlog_actions():
 def test_a_blocked_backlog_card_gets_no_start_button_or_drag_handle():
     source = page_source()
     block = source[source.index("function backlogNode"):source.index("function renderBoard")]
-    assert 'const canStart = item.status === "parallel" || item.status === "ready"' in block  # not blocked, not starting
+    assert 'const canStart = (item.status === "parallel" || item.status === "ready") && item.startable !== false' in block  # not blocked, not starting, in the module lane
     assert "draggable: canStart" in block and "if (canStart) buttons.push" in block and "if (canStart) dragFrom" in block
 
 

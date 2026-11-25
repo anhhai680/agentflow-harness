@@ -1,30 +1,36 @@
 """The pack's work source: where the modules `agentflow queue`, the Backlog and `modules_done` walk come from.
 
-`work_source:` in the pack names a `kind`. This engine reads two:
+`work_source:` in the pack names a `kind`. This engine reads three:
 
 - `capability_map`, at `path`: a Markdown table with `Module id` and `Depends on` columns, one row per module in
   build order (`sources.capability_map`, `sources.add_module_row`).
 - `specs`, which takes no path: one module per file in `project.docs.specs` whose name fits
   `project.docs.spec_file`, its dependencies read from the spec's header (`sources.spec_deps`). A new module is a
   new spec file, which the run's define step writes, so `add_item` writes nothing.
+- `backlog`, at `path` (default `backlog.yml`): one item per entry of the YAML file (`backlog_file.read`), in file
+  order, and `skipped` lists the spec files no item names. `add_item` writes nothing: items are added through
+  `backlog_file.append_item`.
 
 A pack without a work source has no modules: `items` is empty and `add_item` refuses.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import os
+import re
 import stat
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
-from agentflow import sources
+from agentflow import backlog_file, gitops, sources
 
 if TYPE_CHECKING:
     from agentflow.config import Config
 
-_NOUNS = {"capability_map": "capability map", "specs": "spec files"}
+_FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_NOUNS = {"capability_map": "capability map", "specs": "spec files", "backlog": "backlog"}
 
 # Per specs directory: `{name: ((st_mtime_ns, st_size), deps)}` from the last listing, so a header is read again
 # only when its file changes (the Backlog lists the work source on every render).
@@ -37,13 +43,18 @@ def _kind(cfg: Config) -> str | None:
 
 
 def kind(cfg: Config) -> str | None:
-    """The work source's kind (`capability_map` or `specs`), or None when the pack has no work source."""
+    """The work source's kind (`capability_map`, `specs` or `backlog`), or None when the pack has no work source."""
     return _kind(cfg)
 
 
+def hand_marks(cfg: Config) -> bool:
+    """Whether `runs/done_marks.json` counts for this pack: not for `backlog`, whose file is the only say."""
+    return _kind(cfg) != "backlog"
+
+
 def noun(cfg: Config) -> str:
-    """The words messages use for where the modules are listed: `capability map` (also with no work source) or
-    `spec files`."""
+    """The words messages use for where the modules are listed: `capability map` (also with no work source),
+    `spec files` or `backlog`."""
     return _NOUNS.get(_kind(cfg) or "capability_map", "capability map")
 
 
@@ -54,25 +65,26 @@ def _unsafe(cfg: Config, repo: Path) -> str | None:
     raw = cfg.work_source.path
     if Path(raw).is_absolute():
         return raw
-    root = Path(repo).resolve()
-    if not (root / raw).resolve().is_relative_to(root):
+    try:
+        root = Path(repo).resolve()
+        if not (root / raw).resolve().is_relative_to(root):
+            return raw
+    except (OSError, RuntimeError):  # a symlink loop on the way (RuntimeError on Python 3.12)
         return raw
     return None
 
 
 def file(cfg: Config, repo: Path) -> Path | None:
     """The work source's file inside `repo`, or None when the pack has no work source, its kind has no file
-    (`specs`) or its path leaves `repo`."""
+    (`specs`) or its path leaves `repo`. For `backlog` it is the backlog file, which may not exist yet."""
     if cfg.work_source is None or _kind(cfg) == "specs" or _unsafe(cfg, repo) is not None:
         return None
     return Path(repo) / cfg.work_source.path
 
 
-def directory(cfg: Config, repo: Path) -> Path | None:
-    """For `specs`, the directory listed (`repo / project.docs.specs`); None when that path is absolute, resolves
-    outside `repo`, is a symlink or is not a directory, and always None for other kinds."""
-    if _kind(cfg) != "specs":
-        return None
+def _specs_dir(cfg: Config, repo: Path) -> Path | None:
+    """`repo / project.docs.specs`, or None when that path is absent, absolute, resolves outside `repo`, is a symlink
+    or is not a directory."""
     raw = cfg.project.docs.get("specs")
     if not isinstance(raw, str) or not raw.strip() or Path(raw).is_absolute():
         return None
@@ -84,6 +96,14 @@ def directory(cfg: Config, repo: Path) -> Path | None:
     if path.is_symlink() or not inside or not path.is_dir():
         return None
     return path
+
+
+def directory(cfg: Config, repo: Path) -> Path | None:
+    """For `specs`, the directory listed (`repo / project.docs.specs`); None when that path is absolute, resolves
+    outside `repo`, is a symlink or is not a directory, and always None for other kinds."""
+    if _kind(cfg) != "specs":
+        return None
+    return _specs_dir(cfg, repo)
 
 
 def _list_specs(cfg: Config, repo: Path) -> tuple[list[sources.ModuleNode], list[str]]:
@@ -147,11 +167,14 @@ def _list_specs(cfg: Config, repo: Path) -> tuple[list[sources.ModuleNode], list
 
 
 def items(cfg: Config, repo: Path) -> list[sources.ModuleNode]:
-    """The modules in the work source: in row order for `capability_map`, sorted by id for `specs`; `[]` when the
-    pack has none, its file or directory is missing or its path leaves `repo` (not an error here: the Backlog and
-    the queue read this on every render; `add_item` refuses)."""
+    """The modules in the work source: in row order for `capability_map`, sorted by id for `specs`, in file order
+    and without the `dropped` ones for `backlog`; `[]` when the pack has none, its file or directory is missing,
+    unreadable or its path leaves `repo` (not an error here: the Backlog and the queue read this on every render;
+    `add_item` refuses, and `problems` says what is wrong with a backlog file)."""
     if cfg.work_source is None:
         return []
+    if cfg.work_source.kind == "backlog":
+        return [i for i in all_items(cfg, repo) if i.status != "dropped"]
     if cfg.work_source.kind == "specs":
         return _list_specs(cfg, repo)[0]
     path = file(cfg, repo)
@@ -162,21 +185,137 @@ def items(cfg: Config, repo: Path) -> list[sources.ModuleNode]:
     raise ValueError(f"work_source: unknown kind {cfg.work_source.kind!r}")
 
 
+def _read_backlog(cfg: Config, repo: Path) -> tuple[list[tuple[int, backlog_file.BacklogItem]], list[backlog_file.Problem]]:
+    """The backlog file's items and problems; one error and no items when the path leaves `repo`. Never raises."""
+    if _kind(cfg) != "backlog":
+        return [], []
+    bad = _unsafe(cfg, repo)
+    if bad is not None:
+        return [], [backlog_file.Problem("error", "work_source.path", f"must stay inside the repository: {bad}")]
+    path = file(cfg, repo)
+    if path is None:
+        return [], []
+    return backlog_file.read_indexed(path)
+
+
+def all_items(cfg: Config, repo: Path) -> list[backlog_file.BacklogItem]:
+    """For `backlog`, every item of the file in file order, the `dropped` ones too (`[]` when the file can't be read);
+    `[]` for other kinds."""
+    return [item for _, item in _read_backlog(cfg, repo)[0]]
+
+
+def indexed(cfg: Config, repo: Path) -> tuple[list[tuple[int, backlog_file.BacklogItem]], list[backlog_file.Problem]]:
+    """For `backlog`, `all_items` with each item's position in the file's `items` list (an item the parser dropped
+    leaves a gap), and `problems`, from one read of the file; `([], [])` for other kinds."""
+    return _read_backlog(cfg, repo)
+
+
+def item(cfg: Config, repo: Path, module: str) -> backlog_file.BacklogItem | None:
+    """For `backlog`, the item with id `module` (a `dropped` one too), or None."""
+    return next((i for i in all_items(cfg, repo) if i.id == module), None)
+
+
+def items_at(cfg: Config, checkout: Path, sha: object) -> list[backlog_file.BacklogItem]:
+    """For `backlog`, every item of the file as commit `sha` holds it (the `dropped` ones too), read in `checkout`
+    through `gitops.read_blob`, which proves every object against its id: no working tree, and so no agent's edit, is
+    read. `[]` when `sha` is not a full commit id, the file is not at that commit or can't be read there, and for other
+    kinds."""
+    if _kind(cfg) != "backlog" or not isinstance(sha, str) or _FULL_SHA.fullmatch(sha) is None:
+        return []
+    rel = PurePosixPath(cfg.work_source.path).as_posix()  # read_blob refuses an absolute path or a `..` segment
+    data = gitops.read_blob(Path(checkout), sha, rel, backlog_file.FILE_MAX)
+    if data is None:
+        return []
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    return backlog_file.parse(text)[0]
+
+
+def item_spec(cfg: Config, repo: Path, module: str, fork: tuple[Path, object] | None = None) -> str:
+    """For `backlog`, the `spec` the item `module` names, when a run may use it as `{spec}`; '' when there is no such
+    item, it names none, or its path is, or passes through, a symlink in `repo` or resolves outside it
+    (`backlog_file.path_problem`; the parser already cleared a path `backlog_file.bad_path` refuses).
+
+    `fork` is `(main checkout, state.base_sha)` for a run: the item is read from the file at the run's fork commit
+    (`items_at`, none before the run has one), never from the run's worktree. Without it (`explain`, a dry run, the
+    queue) the file in `repo` is read."""
+    found = all_items(cfg, repo) if fork is None else items_at(cfg, *fork)
+    entry = next((i for i in found if i.id == module), None)
+    if entry is None or not entry.spec or backlog_file.path_problem(Path(repo), entry.spec) is not None:
+        return ""
+    return entry.spec
+
+
+def problems(cfg: Config, repo: Path) -> list[backlog_file.Problem]:
+    """For `backlog`, what is wrong with the file (a missing file is one error); `[]` for other kinds."""
+    return _read_backlog(cfg, repo)[1]
+
+
+def _unlisted_specs(cfg: Config, repo: Path, named: set[str]) -> list[str]:
+    """The Markdown files under `project.docs.specs` that no item names and `backlog.ignore_specs` doesn't silence,
+    as sorted repo-relative POSIX paths: symlinks and `project.docs.plans` are not entered, and at most
+    `sources.SPECS_MAX` files are examined."""
+    folder = _specs_dir(cfg, repo)
+    if folder is None:
+        return []
+    root = Path(repo)
+    plans = cfg.project.docs.get("plans")
+    skip_plans = root / plans if isinstance(plans, str) and plans.strip() and not Path(plans).is_absolute() else None
+    found: list[str] = []
+    examined = 0
+    for here, dirs, names in os.walk(folder, followlinks=False):
+        here_path = Path(here)
+        dirs[:] = sorted(d for d in dirs if skip_plans is None or here_path / d != skip_plans)
+        for name in sorted(names):
+            if examined >= sources.SPECS_MAX:
+                break
+            examined += 1
+            full = here_path / name
+            try:
+                regular = stat.S_ISREG(os.lstat(full).st_mode)
+            except OSError:
+                continue
+            if not regular or not name.endswith(".md"):
+                continue
+            within = PurePosixPath(*full.relative_to(folder).parts).as_posix()
+            if any(fnmatch.fnmatchcase(within, glob) for glob in cfg.backlog.ignore_specs):
+                continue
+            rel = PurePosixPath(*full.relative_to(root).parts).as_posix()
+            if rel not in named:
+                found.append(rel)
+        if examined >= sources.SPECS_MAX:
+            break
+    return sorted(found)
+
+
+def unlisted_specs(cfg: Config, repo: Path, named: set[str]) -> list[str]:
+    """`_unlisted_specs`, for `backlog import`: the Markdown files under `project.docs.specs` (any work source kind)
+    that are not in `named` (repo-relative POSIX paths), `backlog.ignore_specs` and `project.docs.plans` left out."""
+    return _unlisted_specs(cfg, repo, named)
+
+
 def skipped(cfg: Config, repo: Path) -> list[str]:
     """For `specs`, the sorted names that fit `spec_file` but are not modules: an id that is not a module id, a
     symlink or anything but a regular file, `<name> (unreadable)`, and one line for the entries past
-    `sources.SPECS_MAX`. `[]` for other kinds."""
-    if _kind(cfg) != "specs":
+    `sources.SPECS_MAX`. For `backlog`, the sorted repo-relative paths of the spec files no item's `spec` names
+    (`_unlisted_specs`). `[]` for other kinds."""
+    kind = _kind(cfg)
+    if kind == "backlog":
+        return _unlisted_specs(cfg, repo, {i.spec for i in all_items(cfg, repo) if i.spec})
+    if kind != "specs":
         return []
     return _list_specs(cfg, repo)[1]
 
 
 def add_item(cfg: Config, repo: Path, template: dict[str, str], values: dict) -> None:
     """Add one module to the work source (`values`: `module`, `responsibility`, `deps`), filled from `template`.
-    For `specs` it writes nothing: the new module's spec file is the run's to write."""
+    For `specs` it writes nothing: the new module's spec file is the run's to write. Nor does `backlog`: its items
+    are added with `backlog_file.append_item`."""
     if cfg.work_source is None:
         raise ValueError("this pack has no work_source")
-    if cfg.work_source.kind == "specs":
+    if cfg.work_source.kind in ("specs", "backlog"):
         return
     bad = _unsafe(cfg, repo)
     if bad is not None:

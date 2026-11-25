@@ -66,11 +66,14 @@ def make_ctx(cfg: Config, repo: Path, pipeline: str, params: dict, run: Run | No
             break
     slug = slugify(slug_source) or slugify(pipeline)
     plan = sources.find_plan(repo / docs["plans"], module)
+    spec = f"{docs['specs']}/{cfg.project.spec_file.format(module=module)}" if module else ""
+    if module and work_source.kind(cfg) == "backlog":  # an item that names a spec says where it is
+        spec = work_source.item_spec(cfg, repo, module, _fork(run)) or spec
     values = {
         "module": module,
         "module_pkg": module.replace("-", "_"),
         "lane": pipeline,
-        "spec": f"{docs['specs']}/{cfg.project.spec_file.format(module=module)}" if module else "",
+        "spec": spec,
         "plan": plan.relative_to(repo).as_posix() if plan else "",
         "plan_target": f"{docs['plans']}/{today}-{module}-{slug}.md" if module else "",
         "idea": docs.get("idea") or "",
@@ -83,6 +86,11 @@ def make_ctx(cfg: Config, repo: Path, pipeline: str, params: dict, run: Run | No
         "slug": slug,
     }
     return Ctx(repo=repo, cfg=cfg, values=values, run=run)
+
+
+def _fork(run: Run | None) -> tuple[Path, object] | None:
+    """`(main checkout, state.base_sha)` of `run`, where its backlog file is read; None with no run."""
+    return None if run is None else (pack.checkout_root(run.repo), run.state.get("base_sha"))
 
 
 def fmt(template: str, ctx_or_values: Ctx | dict[str, Any]) -> str:
@@ -275,15 +283,28 @@ def _merged_heads(ctx: Ctx) -> set[str]:
 def _modules_done(spec: dict, ctx: Ctx) -> tuple[bool | None, str]:
     """Whether every module the run's module depends on (in the pack's work source) is done: recorded done by the
     last assessment or by hand (`finished.recorded`, whatever the reason), else with a merged pull request. `gh` is
-    asked only about the dependencies not recorded."""
+    asked only about the dependencies not recorded. With `backlog` the file decides `FILE_SAYS` itself, as
+    `module_queue.cached_entries` does: a dependency whose `status` is `done` is done whether or not an assessment has
+    recorded it, and a recorded `FILE_SAYS` the file no longer says is not; in a run the file is read at its fork
+    commit (`work_source.items_at`), never from its worktree."""
     module = ctx.values.get("module", "")
-    nodes = work_source.items(ctx.cfg, ctx.repo)
+    backlog = work_source.kind(ctx.cfg) == "backlog"
+    if backlog and ctx.run is not None:
+        nodes: list = [i for i in work_source.items_at(ctx.cfg, *_fork(ctx.run)) if i.status != "dropped"]
+    else:
+        nodes = work_source.items(ctx.cfg, ctx.repo)
     node = next((n for n in nodes if n.id == module), None)
     if node is None:
         return None, f"module '{module}' is not in the {work_source.noun(ctx.cfg)}"
     if not node.deps:
         return True, f"{module} has no dependencies"
-    done = finished.recorded(ctx.repo)
+    done = finished.recorded(ctx.repo, hand_marks=work_source.hand_marks(ctx.cfg))
+    if backlog:
+        for other in nodes:
+            if getattr(other, "status", "") == "done":
+                done[other.id] = finished.FILE_SAYS
+            elif done.get(other.id) == finished.FILE_SAYS:
+                del done[other.id]
     missing = [dep for dep in node.deps if dep not in done]
     if not missing:
         return True, "done: " + ", ".join(f"{dep} ({done[dep]})" for dep in node.deps)

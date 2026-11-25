@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import posixpath
 import re
 import shlex
@@ -268,8 +269,10 @@ DEFAULT_SPEC_FILE = "{module}.md"  # a module's spec is `<docs.specs>/<spec_file
 DEFAULT_DONE_STATUS = r"^[-*>\s]*Status[\s:*]+(done|shipped|implemented)(?![\w-])"
 REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea`, `decisions`, `glossary` are optional
 # `capability_map`: a Markdown table with `Module id` and `Depends on` columns (`sources.capability_map`);
-# `specs`: one module per spec file in `project.docs.specs`, its dependencies from the header (`sources.spec_deps`)
-WORK_SOURCE_KINDS = ("capability_map", "specs")
+# `specs`: one module per spec file in `project.docs.specs`, its dependencies from the header (`sources.spec_deps`);
+# `backlog`: one item per entry of the YAML backlog file at `path` (default `backlog.yml`, `backlog_file.py`)
+WORK_SOURCE_KINDS = ("capability_map", "specs", "backlog")
+DEFAULT_BACKLOG_FILE = "backlog.yml"
 SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "build_wave", "verify", "ship",
                    "review", "debug", "review_feedback", "doubt", "patch")  # review_feedback: the skill sent with blocking findings
 
@@ -292,8 +295,15 @@ class Project:
 class WorkSource:
     """Where the modules `agentflow queue`, the Backlog and `modules_done` walk come from (`work_source:`)."""
 
-    kind: Literal["capability_map", "specs"]
+    kind: Literal["capability_map", "specs", "backlog"]
     path: str  # relative to the repository root; `""` for `specs`, which always reads `project.docs.specs`
+
+
+@dataclass
+class BacklogPolicy:
+    """`backlog:`: how the backlog file's work source lists the spec files no item names."""
+
+    ignore_specs: tuple[str, ...] = ()  # globs, relative to `project.docs.specs`, of spec files that are not backlog items
 
 
 @dataclass
@@ -419,7 +429,7 @@ class IssuePolicy:
     in_progress_label: str = "agentflow:in-progress"  # "" turns off the label and the start comment, never the PR link
     comment: bool = True  # also post one comment when a run starts from an issue
     epic_labels: tuple[str, ...] = ("epic",)  # an issue with one of these gets `Refs #N`, never `Closes #N`
-    sync_label: str = ""  # open issues with this label become Backlog cards; "" turns the sync off
+    sync_label: str = ""  # open issues with this label become Backlog cards; "*" syncs every open issue, "" is off
     sync_lane: str = "feature"  # the lane of a synced issue that no `lane_labels` entry matches
     lane_labels: dict[str, str] = field(default_factory=lambda: {"bug": "bug"})  # issue label: lane, first match wins
 
@@ -739,6 +749,7 @@ class Config:
     vuln: VulnPolicy = field(default_factory=VulnPolicy)  # the vuln lane: where its alerts come from and what it may touch
     policy: Policy = field(default_factory=Policy)  # the obligations a finished run must show evidence for
     route: Route = field(default_factory=Route)  # how much ceremony a run's route gets (`route.py` reads it)
+    backlog: BacklogPolicy = field(default_factory=BacklogPolicy)  # the backlog file's work source (`work_source: {kind: backlog}`)
 
 
 def _holds_finish(steps: list[Step]) -> bool:
@@ -1415,7 +1426,16 @@ def _work_source(raw: dict) -> WorkSource | None:
     kind = _require(block, "kind", "work_source", str)
     if kind == "capability_map":
         return WorkSource(kind=kind, path=_require(block, "path", "work_source", str))
+    if kind == "backlog":  # `path: None` (a deep-merge delete) leaves it unset
+        return WorkSource(kind=kind, path=_optional(block, "path", "work_source", str, None) or DEFAULT_BACKLOG_FILE)
     return WorkSource(kind=kind, path=_optional(block, "path", "work_source", str, ""))
+
+
+def _backlog_policy(raw: dict) -> BacklogPolicy:
+    block = _optional(raw, "backlog", "", dict, {})
+    ignore = block.get("ignore_specs")
+    globs = tuple(g for g in ignore if isinstance(g, str)) if isinstance(ignore, list) else ()
+    return BacklogPolicy(ignore_specs=globs)
 
 
 def _skills_map(raw: dict) -> dict[str, str]:
@@ -1753,6 +1773,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
         layer_origins=layer_origins,
         policy=_build_policy(policy, disabled),
         route=_build_route(raw.get("route")),
+        backlog=_backlog_policy(raw),
     )
 
 
@@ -1795,6 +1816,11 @@ def _label_problem(label: str) -> bool:
 def _same_label(a: str, b: str) -> bool:
     """GitHub compares label names without case."""
     return unicodedata.normalize("NFC", a).casefold() == unicodedata.normalize("NFC", b).casefold()
+
+
+def _bad_source_path(path: str) -> bool:
+    """A `work_source.path` that is empty, absolute or has a `..` segment (the lexical check; symlinks are another)."""
+    return not path or posixpath.isabs(path) or ".." in posixpath.normpath(path).split("/")
 
 
 class _Validator:
@@ -2229,18 +2255,18 @@ class _Validator:
                      "add it to .gitignore, or leave paths.state_dir unset for a state dir outside the repository")
 
     def work_source(self) -> None:
-        """`work_source:`: `capability_map` at a path inside the repository, or `specs`, which takes no path and
-        reads `project.docs.specs`."""
+        """`work_source:`: `capability_map` or `backlog` at a path inside the repository, or `specs`, which takes no
+        path and reads `project.docs.specs`. What a `backlog` file holds is `backlog_source`'s."""
         ws = self.cfg.work_source
         if ws is None:
             return
         if ws.kind not in WORK_SOURCE_KINDS:
-            self.error("work_source.kind", "the work source kinds are capability_map and specs")
+            self.error("work_source.kind", "the work source kinds are capability_map, specs and backlog")
         if ws.kind == "specs":
             self.specs_source()
             return
         path = ws.path.strip()
-        if not path or posixpath.isabs(path) or ".." in posixpath.normpath(path).split("/"):
+        if _bad_source_path(path):
             self.error("work_source.path", "path is a file inside the repository, relative to its root and without '..'")
 
     def specs_source(self) -> None:
@@ -2268,6 +2294,113 @@ class _Validator:
         if not (isinstance(block, dict) and block.get("module_lane")):
             self.add("warning", "dashboard.backlog.module_lane",
                      "a specs work source lists modules only for the module_lane")
+
+    def backlog_source(self) -> None:
+        """A `backlog` work source: what `backlog_file.read` says about the file, then each item against the pack and
+        the repository. An issue's path is the file's name and the problem's `where` (`backlog.yml items[1].lane`)."""
+        ws = self.cfg.work_source
+        if ws is None or ws.kind != "backlog":
+            return
+        from agentflow import backlog_file, finished, module_queue, work_source
+
+        repo = Path(self.repo)
+        name = ws.path.strip() or DEFAULT_BACKLOG_FILE
+
+        def at(where: str) -> str:
+            if where == backlog_file.FILE:
+                return name
+            if where == "work_source.path":  # not the file's own: a path that leaves the repository
+                return where
+            return f"{name} {where}"
+
+        found, problems = work_source.indexed(self.cfg, repo)
+        for problem in problems:
+            # `work_source` already reports a path that is absolute or has `..`; a symlink that leaves the repository is new
+            if problem.where != "work_source.path" or not _bad_source_path(ws.path.strip()):
+                self.add(problem.level, at(problem.where), problem.message)
+        module_lane = module_queue.module_lane(self.cfg)
+        if module_lane is None:
+            self.add("warning", "dashboard.backlog.module_lane",
+                     "a backlog work source starts items only in the module_lane")
+        lanes = self.cfg.lanes
+        by_id = {item.id: item for _, item in found}
+        first_issue: dict[int, int] = {}
+        deps = {item.id: list(item.deps) for _, item in found}
+        done = None
+        for pos, item in found:
+            where = f"items[{pos}]"
+            if item.lane and item.lane not in lanes:
+                self.error(at(f"{where}.lane"), f"{item.lane!r} is not a lane; known: {', '.join(lanes)}")
+            elif item.lane and module_lane is not None and item.lane != module_lane:
+                self.add("warning", at(f"{where}.lane"), f"runs in {item.lane}: B1 starts module_lane items only")
+            for dep in item.deps:
+                if dep not in by_id:
+                    self.error(at(f"{where}.depends_on"), f"{dep!r} is not an item of the file")
+                elif by_id[dep].status == "dropped":
+                    self.add("warning", at(f"{where}.depends_on"), f"{dep!r} is dropped, so {item.id} waits on it for good")
+            ring = module_queue._cycle_through(item.id, deps)
+            if ring is not None and item.id == min(ring[:-1]):  # one error per cycle: on its smallest id
+                self.error(at(f"{where}.depends_on"), f"depends_on makes a cycle: {' -> '.join(ring)}")
+            for key in ("spec", "plan"):
+                value = getattr(item, key)
+                if value:
+                    self._backlog_path(at(f"{where}.{key}"), value)
+            if item.issue is not None:
+                if item.issue in first_issue:
+                    self.error(at(f"{where}.issue"), f"issue #{item.issue} is also on items[{first_issue[item.issue]}]")
+                else:
+                    first_issue[item.issue] = pos
+            if item.status in ("backlog", "ready"):
+                if done is None:
+                    try:
+                        done = finished.recorded(repo, hand_marks=False)  # a backlog file has no marks
+                    except (OSError, ValueError):
+                        done = {}
+                if item.id in done:
+                    self.add("warning", at(f"{where}.status"),
+                             f"{item.id} is done by its runs ({done[item.id]}) but the file says {item.status}: "
+                             f"agentflow backlog set {item.id} status=done")
+        for rel in work_source.skipped(self.cfg, repo):
+            self.add("warning", name, f"{rel} is not on the backlog: agentflow backlog add --spec {rel}, "
+                     "or list it in backlog.ignore_specs")
+
+    def _backlog_path(self, path: str, value: str) -> None:
+        """One item's `spec` or `plan`: an error for a symlink (itself or a directory on the way) or a path that
+        resolves outside the repository, a warning for a file that is not there yet. Nothing is read."""
+        from agentflow import backlog_file
+
+        why = backlog_file.path_problem(Path(self.repo), value)  # the rule a run applies to `{spec}` too
+        if why is not None:
+            self.error(path, f"{value} {why}")
+        elif not os.path.lexists(Path(self.repo) / value):
+            self.add("warning", path, f"{value} does not exist")
+
+    def backlog_policy(self) -> None:
+        """`backlog:`, read from the text of the config (the dataclass keeps only the strings of a list): `ignore_specs`
+        is a list of one-line globs, relative to `project.docs.specs`, without `..` or a leading `/`."""
+        block = self.cfg.raw.get("backlog")
+        if block is None:
+            return
+        if not isinstance(block, dict):
+            self.error("backlog", "must be a mapping")
+            return
+        for key in block:
+            if key != "ignore_specs":
+                self.error(f"backlog.{key}", "unknown key; known: ignore_specs")
+        globs = block.get("ignore_specs")
+        if globs is None:
+            return
+        path = "backlog.ignore_specs"
+        if not isinstance(globs, list):
+            self.error(path, "must be a list of globs under project.docs.specs")
+            return
+        for n, glob in enumerate(globs):
+            if not isinstance(glob, str) or not glob.strip():
+                self.error(f"{path}[{n}]", "must be a non-empty glob")
+            elif "\n" in glob or "\r" in glob or len(glob) > 200:
+                self.error(f"{path}[{n}]", "must be one line of at most 200 characters")
+            elif glob.startswith("/") or "\\" in glob or ".." in glob.split("/"):
+                self.error(f"{path}[{n}]", "is relative to project.docs.specs: no leading '/', backslash or '..'")
 
     def skills_map(self) -> None:
         """`skills.map`: the skill `agentflow next` names for each kind of step; each one is in `skills_dir` or bundled."""
@@ -3353,7 +3486,8 @@ class _Validator:
         tasks = block.get("new_task")
         if tasks is None:
             return
-        specs = self.cfg.work_source is not None and self.cfg.work_source.kind == "specs"  # a new spec has no row
+        # a new spec file, or a new backlog item, has no row
+        specs = self.cfg.work_source is not None and self.cfg.work_source.kind in ("specs", "backlog")
         mapped = self.cfg.work_source is not None and self.cfg.work_source.kind == "capability_map"
         if not isinstance(tasks, dict):
             self.error(f"{path}.new_task", "must map a lane to its form fields")
@@ -3457,6 +3591,8 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.project()
     v.paths()
     v.work_source()
+    v.backlog_source()
+    v.backlog_policy()
     v.skills_map()
     v.agents()
     v.gate_definitions()

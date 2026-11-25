@@ -517,3 +517,78 @@ def test_an_alert_card_with_an_unknown_severity_draws_no_pill_and_an_issue_keeps
     issue = {**ALERT, "kind": "issue", "key": "issue:1", "label": "#1 · x"}
     link = js(["board.js"], FAKE_EL + "backlogNode(args)", issue)["c"][2]["c"][0]
     assert link["p"]["text"] == "Issue ↗"
+
+
+IDEA = {**ALERT, "kind": "module", "key": "module:i", "id": "i", "label": "An idea", "title": "An idea", "status": "ready",
+        "planning": "backlog", "startable": True, "severity": None, "alerts": [], "dependabot_prs": [], "url": ""}
+
+
+def _chips(item: dict) -> list:
+    return [k["p"].get("text") for k in js(["board.js"], FAKE_EL + "backlogNode(args)", item)["c"]]
+
+
+def test_an_idea_card_has_an_idea_chip_and_a_ready_one_does_not():
+    assert "idea" in _chips(IDEA) and "idea" not in _chips({**IDEA, "planning": "ready"})
+    assert "Start" in [b["p"].get("text") for k in js(["board.js"], FAKE_EL + "backlogNode(args)", IDEA)["c"]
+                       for b in k["c"] if k["p"].get("class") == "moves"]
+
+
+def test_an_item_that_is_not_startable_has_a_disabled_start_with_the_note():
+    note = "runs in bug: only dashboard.backlog.module_lane items start from the Board"
+    node = js(["board.js"], FAKE_EL + "backlogNode(args)", {**IDEA, "planning": "ready", "startable": False, "note": note})
+    start = next(b for k in node["c"] if k["p"].get("class") == "moves" for b in k["c"])
+    assert start["p"]["text"] == "Start" and start["p"]["disabled"] == "disabled" and start["p"]["title"] == note
+
+
+def test_an_armed_idea_card_says_confirm_start():
+    node = js(["board.js"], FAKE_EL + "backlogNode(args)", {**IDEA, "armed": True})
+    assert [b["p"]["text"] for k in node["c"] if k["p"].get("class") == "moves" for b in k["c"]] == ["Confirm start"]
+
+
+ARM_STUBS = ("ui = {board: null, backlogArm: null, backlogArmAt: 0}; var sent = [], timers = [], now = 1000;"
+             "setTimeout = (fn, ms) => { timers.push(ms); return 1; }; clearTimeout = () => {}; Date.now = () => now;"
+             "toast = () => {}; refreshAfter = () => {}; api = async (url, body) => { sent.push([url, body]); return {}; };")
+
+
+def test_an_idea_cards_start_arms_on_the_first_click_and_confirms_on_the_second_within_four_seconds():
+    got = js_async(["board.js"], ARM_STUBS + """(async () => {
+      await startItem(args);  // arms
+      const first = [sent.length, ui.backlogArm];
+      now += 3999;
+      await startItem(args);  // confirms
+      return [first, sent, ui.backlogArm, timers];
+    })()""", IDEA)
+    assert got == [[0, "module:i"], [["/api/backlog/start", {"module": "i", "confirm": True}]], None, [4000]]
+
+
+def test_an_idea_cards_arming_lapses_after_four_seconds():
+    got = js_async(["board.js"], ARM_STUBS + """(async () => {
+      await startItem(args);
+      now += 4001;
+      await startItem(args);  // too late: it arms again and sends nothing
+      return [sent, ui.backlogArm];
+    })()""", IDEA)
+    assert got == [[], "module:i"]
+
+
+def test_a_ready_item_starts_on_one_click_with_no_confirm():
+    got = js_async(["board.js"], ARM_STUBS + "(async () => { await startItem(args); return sent; })()",
+                   {**IDEA, "planning": "ready"})
+    assert got == [["/api/backlog/start", {"module": "i"}]]
+
+
+def test_the_skipped_list_is_headed_not_on_the_backlog_for_a_backlog_pack():
+    stubs = FAKE_EL + "ui = {skippedOpen: false};"
+    node = js(["board.js"], stubs + "skippedNode(args, 'backlog')", ["a.md", "<b>b</b>.md"])
+    assert node["tag"] == "details" and node["c"][0]["p"]["text"] == "Not on the backlog (2)"
+    assert [c["p"]["text"] for c in node["c"][1:]] == ["a.md", "<b>b</b>.md"]
+    other = js(["board.js"], stubs + "skippedNode(args, 'specs')", ["a.md"])
+    assert other["p"]["text"] == "Not modules: a.md"
+
+
+def test_dropped_items_fold_under_a_counted_heading_and_draw_their_titles_as_text():
+    node = js(["board.js"], FAKE_EL + "ui = {droppedOpen: false}; droppedNode(args)",
+              [{"id": "z", "title": "<b>Gone</b>"}, {"id": "y", "title": ""}])
+    assert node["tag"] == "details" and node["c"][0]["p"]["text"] == "Dropped (2)"
+    assert [c["p"] for c in node["c"][1:]] == [{"class": "muted", "text": "z · <b>Gone</b>"}, {"class": "muted", "text": "y"}]
+    assert js(["board.js"], FAKE_EL + "ui = {}; droppedNode(args)", []) is None

@@ -238,6 +238,8 @@ def _check_new_module(cfg: Config, params: dict, new_module: dict | None) -> dic
         raise ValueError("a new module needs a work_source in config.yaml: this pack has no table to add it to")
     if cfg.work_source.kind == "specs":
         raise ValueError("with work_source specs a new module has no row: run --module <id> --task <text>")
+    if cfg.work_source.kind == "backlog":
+        raise ValueError("with work_source backlog a new module has no row: run --module <id> --task <text>")
     template = (cfg.dashboard.get("backlog") or {}).get("module_row")
     if not isinstance(template, dict) or not template:
         raise ValueError("a new module needs dashboard.backlog.module_row in config.yaml")

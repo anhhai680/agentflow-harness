@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -488,7 +489,7 @@ def test_an_issue_with_a_live_run_cannot_be_added_again(bk):
     ("merged", None),
 ])
 def test_a_new_task_named_after_a_done_module_says_it_is_done_and_how_to_add_work(sbk, monkeypatch, reason, says):
-    monkeypatch.setattr(backlog.finished, "recorded", lambda repo: {"a": reason})
+    monkeypatch.setattr(backlog.finished, "recorded", lambda repo, **kw: {"a": reason})
     with pytest.raises(Invalid) as caught:
         backlog.add(sbk.cfg, sbk.root, "feature", {"new_module": {"module": "a", "responsibility": "more", "deps": []}})
     message = str(caught.value)
@@ -959,6 +960,25 @@ def test_a_refresh_lists_the_labelled_open_issues_and_the_board_shows_them_witho
     assert cards["issue:12"]["first_phase"] == next(iter(ibk.cfg.phases))
     pile = backlog.snapshot(ibk.cfg, ibk.root)
     assert "issue:12" not in [c["key"] for c in pile["after_choices"]]
+
+
+def test_a_star_sync_label_lists_every_open_issue_whatever_its_labels(ibk, monkeypatch):
+    ibk.fr.configure({"issues": {"sync_label": "*"}, **ISSUE_FORM})
+    _list_issues(monkeypatch, _issue(12, labels=("enhancement",)), _issue(13, "Crash on save", ("bug",)),
+                 _issue(14, "No labels", ()))
+    assert ibk.refresh()["issues_note"] == ""
+    assert [c for c in _gh_calls(ibk) if c[:2] == ["issue", "list"]] == [
+        ["issue", "list", "--state", "open", "--json", "number,title,labels,url,blockedBy,blocking",
+         "--limit", "100"]]  # no --label: every open issue
+    cards = ibk.cards()
+    assert (cards["issue:12"]["lane"], cards["issue:13"]["lane"], cards["issue:14"]["lane"]) == (
+        "feature", "bug", "feature")
+
+
+def test_a_star_sync_label_names_no_label_when_the_list_is_cut(ibk, monkeypatch):
+    ibk.fr.configure({"issues": {"sync_label": "*"}, **ISSUE_FORM})
+    _list_issues(monkeypatch, *(_issue(n) for n in range(1, backlog.ISSUES_MAX + 1)))
+    assert ibk.refresh()["issues_note"] == f"only the first {backlog.ISSUES_MAX} open issues are shown"
 
 
 def test_the_sync_asks_for_blocked_by_and_keeps_bare_refs(ibk, monkeypatch):
@@ -1907,3 +1927,127 @@ def test_a_bad_alert_key_is_invalid(key):
 
 def test_a_good_alert_key_is_normalised():
     assert backlog.parse_key("alert:#42") == ("alert", "42")
+
+
+# --------------------------------------------------------------------------- a pack whose work source is backlog.yml
+
+BACKLOG_YML = """version: 1
+items:
+  - {id: a, title: Alpha, status: done}
+  - {id: b, title: Bee, status: ready, depends_on: [a], issue: 7}
+  - {id: i, title: An idea, status: backlog}
+  - {id: x, title: Other lane, status: ready, lane: bug}
+  - {id: z, title: Dropped one, status: dropped}
+"""
+
+
+@pytest.fixture
+def bbk(flow_repo, monkeypatch, tmp_path):
+    """`sbk`'s Board over a `backlog` pack: a committed `backlog.yml` with a done, a ready, an idea, a bug-lane and a
+    dropped item."""
+    monkeypatch.setenv("PATH", f"{GH_BIN}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(tmp_path / "gh.log"))
+    merges = Merges()
+    monkeypatch.setattr(module_queue, "branch_is_merged", merges)
+    flow_repo.configure({"work_source": {"kind": "backlog", "path": None}})
+    write(flow_repo.root, "backlog.yml", BACKLOG_YML)
+    run_git(flow_repo.root, "add", "-A")
+    run_git(flow_repo.root, "commit", "-q", "-m", "backlog")
+    board = Board(flow_repo, merges)
+    board.refresh()
+    return board
+
+
+def test_a_backlog_card_shows_its_title_and_planning_status(bbk):
+    cards = bbk.cards()
+    assert "module:a" not in cards  # the file says done
+    ready, idea = cards["module:b"], cards["module:i"]
+    assert (ready["label"], ready["title"], ready["planning"], ready["startable"]) == ("Bee", "Bee", "ready", True)
+    assert (idea["label"], idea["id"], idea["planning"], idea["startable"]) == ("An idea", "i", "backlog", True)
+    assert idea["status"] in ("ready", "parallel")
+
+
+def test_a_done_item_shows_under_done_before_any_assessment(bbk):
+    (runs_root(bbk.root) / "queue.json").unlink(missing_ok=True)  # nothing was assessed yet
+    snap = backlog.snapshot(bbk.cfg, bbk.root)
+    assert snap["done"] == [{"key": "module:a", "id": "a", "reason": finished.FILE_SAYS}]
+    assert "module:a" not in {c["key"] for c in snap["cards"]}
+    write(bbk.root, "backlog.yml", BACKLOG_YML.replace("{id: a, title: Alpha, status: done}",
+                                                       "{id: a, title: Alpha, status: ready}"))
+    snap = backlog.snapshot(bbk.cfg, bbk.root)  # the file changed: it is no longer done, whatever queue.json says
+    assert snap["done"] == [] and "module:a" in {c["key"] for c in snap["cards"]}
+
+
+def test_dropped_items_are_listed_apart_and_not_as_cards(bbk):
+    snap = backlog.snapshot(bbk.cfg, bbk.root)
+    assert snap["dropped"] == [{"id": "z", "title": "Dropped one"}]
+    assert "module:z" not in {c["key"] for c in snap["cards"]} and "z" not in snap["modules"]
+    assert snap["backlog_note"] == ""
+
+
+def test_other_work_sources_have_no_dropped_items_and_no_note(bk):
+    snap = backlog.snapshot(bk.cfg, bk.root)
+    assert snap["dropped"] == [] and snap["backlog_note"] == ""
+    assert all("planning" not in c and "startable" not in c for c in snap["cards"])
+
+
+def test_starting_a_backlog_status_item_needs_confirm(bbk):
+    with pytest.raises(Refused, match=r"module i is an idea \(status backlog\) and must be confirmed"):
+        backlog.begin_start(bbk.cfg, bbk.root, "module:i")
+    assert bbk.spawn.calls == []
+    job = backlog.begin_start(bbk.cfg, bbk.root, "module:i", confirm=True)
+    assert backlog.run_start(bbk.cfg, bbk.root, job, spawn=bbk.spawn)
+    assert bbk.spawn.calls[-1]["params"] == {"module": "i"}
+
+
+def test_confirm_is_not_asked_of_a_ready_item(bbk):
+    assert bbk.start("module:b")
+    assert bbk.spawn.calls[-1]["lane"] == "feature"
+
+
+def test_an_item_in_another_lane_is_not_startable(bbk):
+    card = bbk.cards()["module:x"]
+    assert card["startable"] is False and card["lane"] == "bug"
+    assert "runs in bug: only dashboard.backlog.module_lane items start from the Board" in card["note"]
+    with pytest.raises(Refused, match="runs in bug: only dashboard.backlog.module_lane items start from the Board"):
+        backlog.begin_start(bbk.cfg, bbk.root, "module:x", confirm=True)
+
+
+def test_an_item_with_an_issue_starts_with_the_issue_param(bbk, tmp_path):
+    job = backlog.begin_start(bbk.cfg, bbk.root, "module:b")
+    assert job.params == {"module": "b", "issue": "7"}
+    script = tmp_path / "argv.py"
+    script.write_text("import json, sys\nopen(sys.argv[1], 'w').write(json.dumps(sys.argv[2:]))\nprint('Started r1 in x')\n")
+    out = tmp_path / "argv.json"
+    module_queue.spawn_run(bbk.root, job.lane, job.params, command=[sys.executable, str(script), str(out)])
+    argv = json.loads(out.read_text())
+    assert argv == ["run", "feature", "--module=b", "--issue=7", "--detach"]
+    assert "Bee" not in " ".join(argv)
+
+
+def test_a_half_written_file_gives_a_note_and_no_cards(bbk):
+    write(bbk.root, "backlog.yml", "version: 1\nitems:\n  - id: a\n    title: [unclosed")
+    snap = backlog.snapshot(bbk.cfg, bbk.root)
+    assert [c for c in snap["cards"] if c["kind"] == "module"] == []
+    assert "backlog.yml" in snap["backlog_note"] and snap["backlog_note"].startswith("backlog file ")
+    assert snap["dropped"] == [] and snap["modules"] == []
+    write(bbk.root, "backlog.yml", BACKLOG_YML)  # the editor finished: the next refresh recovers
+    snap = backlog.snapshot(bbk.cfg, bbk.root)
+    assert snap["backlog_note"] == "" and "module:b" in {c["key"] for c in snap["cards"]}
+
+
+def test_a_missing_backlog_file_is_a_note_not_an_error(bbk):
+    (bbk.root / "backlog.yml").unlink()
+    snap = backlog.snapshot(bbk.cfg, bbk.root)
+    assert snap["backlog_note"] and [c for c in snap["cards"] if c["kind"] == "module"] == []
+
+
+def test_an_item_problem_does_not_become_the_note(bbk):
+    write(bbk.root, "backlog.yml", BACKLOG_YML + "  - {id: q, title: Q, issue: nope}\n")
+    snap = backlog.snapshot(bbk.cfg, bbk.root)
+    assert snap["backlog_note"] == "" and "module:b" in {c["key"] for c in snap["cards"]}
+
+
+def test_the_reopen_hint_for_a_done_item_names_the_file():
+    hint = backlog._reopen_hint("a", finished.FILE_SAYS)
+    assert hint is not None and "backlog set a status=ready" in hint

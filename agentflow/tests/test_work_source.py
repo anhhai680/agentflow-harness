@@ -261,7 +261,7 @@ def test_the_python_pack_has_no_work_source_or_skills_errors(cfg, repo_root):
 
 def test_a_work_source_of_another_kind_is_an_error(tmp_cfg, repo_root):
     cfg = load_config(tmp_cfg({"work_source": {"kind": "github_issues"}}))
-    assert errors_at(cfg, repo_root, "work_source.kind") == ["the work source kinds are capability_map and specs"]
+    assert errors_at(cfg, repo_root, "work_source.kind") == ["the work source kinds are capability_map, specs and backlog"]
 
 
 @pytest.mark.parametrize("path", ["", "/abs/map.md", "../map.md"])
@@ -621,3 +621,102 @@ def test_a_symlink_loop_under_the_specs_directory_is_an_error_not_a_crash(specs,
     assert work_source.directory(loopy, specs.root) is None
     assert work_source.items(loopy, specs.root) == [] and work_source.skipped(loopy, specs.root) == []
     assert errors_at(loopy, specs.root, "project.docs.specs")
+
+
+# --------------------------------------------------------------------------- the backlog file
+
+BACKLOG = ("version: 1\nitems:\n  - {id: a, title: A, status: done}\n"
+           "  - {id: b, title: B, depends_on: [a], spec: docs/specs/b.md}\n  - {id: c, title: C, status: dropped}\n")
+
+
+def test_items_reads_the_backlog_file_without_dropped(tmp_cfg, tmp_path):
+    cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None}}))
+    assert cfg.work_source.path == "backlog.yml"
+    write(tmp_path, "backlog.yml", BACKLOG)
+    assert [i.id for i in work_source.items(cfg, tmp_path)] == ["a", "b"]
+    assert [i.id for i in work_source.all_items(cfg, tmp_path)] == ["a", "b", "c"]
+    assert work_source.item(cfg, tmp_path, "b").spec == "docs/specs/b.md" and work_source.noun(cfg) == "backlog"
+    assert work_source.item(cfg, tmp_path, "zz") is None
+    assert work_source.problems(cfg, tmp_path) == []
+
+
+def test_skipped_lists_specs_no_item_names_outside_plans_and_ignore_specs(tmp_cfg, tmp_path):
+    cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None},
+                               "project": {"docs": {"specs": "docs", "plans": "docs/plans"}},
+                               "backlog": {"ignore_specs": ["notes/*"]}}))
+    write(tmp_path, "backlog.yml", BACKLOG)
+    for rel in ("docs/specs/b.md", "docs/specs/x.md", "docs/plans/p.md", "docs/notes/n.md", "docs/specs/y.txt"):
+        write(tmp_path, rel, "# t\n")
+    (tmp_path / "docs/specs/link.md").symlink_to(tmp_path / "docs/specs/x.md")
+    assert work_source.skipped(cfg, tmp_path) == ["docs/specs/x.md"]
+
+
+def test_a_spec_named_only_by_a_dropped_item_is_not_skipped(tmp_cfg, tmp_path):
+    cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None}}))
+    write(tmp_path, "backlog.yml", "version: 1\nitems:\n  - {id: c, title: C, status: dropped, spec: docs/specs/c.md}\n")
+    write(tmp_path, "docs/specs/c.md", "# c\n")
+    write(tmp_path, "docs/specs/d.md", "# d\n")
+    assert work_source.skipped(cfg, tmp_path) == ["docs/specs/d.md"]
+
+
+def test_skipped_refuses_a_specs_dir_outside_the_repository_or_a_symlink(tmp_cfg, tmp_path):
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    write(outside, "x.md", "# x\n")
+    repo.mkdir()
+    (repo / "linked").symlink_to(outside, target_is_directory=True)
+    for bad in ("linked", "../outside", str(outside)):
+        cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None},
+                                   "project": {"docs": {"specs": bad}}}, name="b.yaml"))
+        assert work_source.skipped(cfg, repo) == [], bad
+
+
+def test_a_missing_or_broken_backlog_file_has_no_items_and_says_why(tmp_cfg, tmp_path):
+    cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None}}))
+    assert work_source.items(cfg, tmp_path) == [] and work_source.all_items(cfg, tmp_path) == []
+    assert [p.level for p in work_source.problems(cfg, tmp_path)] == ["error"]
+    write(tmp_path, "backlog.yml", "version: 2\nitems: []\n")
+    assert work_source.items(cfg, tmp_path) == []
+    assert [p.level for p in work_source.problems(cfg, tmp_path)] == ["error"]
+    outside = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": "../backlog.yml"}}, name="o.yaml"))
+    assert work_source.file(outside, tmp_path) is None and work_source.items(outside, tmp_path) == []
+    assert [p.level for p in work_source.problems(outside, tmp_path)] == ["error"]
+
+
+def test_other_kinds_have_no_backlog_items_problems_or_unlisted_specs(cfg, tmp_path):
+    assert work_source.all_items(cfg, tmp_path) == [] and work_source.problems(cfg, tmp_path) == []
+    assert work_source.item(cfg, tmp_path, "a") is None
+
+
+def test_a_new_module_in_a_backlog_pack_is_refused_like_a_specs_pack(tmp_cfg):
+    from agentflow import pipeline
+
+    cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None}}))
+    with pytest.raises(ValueError, match="backlog.*--task"):
+        pipeline._check_new_module(cfg, {"module": "e"}, {"module": "e", "responsibility": "x", "deps": []})
+
+
+def test_add_item_is_a_no_op_for_a_backlog_pack(tmp_cfg, tmp_path):
+    cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None}}))
+    write(tmp_path, "backlog.yml", BACKLOG)
+    work_source.add_item(cfg, tmp_path, {}, {"module": "z", "responsibility": "x", "deps": []})
+    assert (tmp_path / "backlog.yml").read_text(encoding="utf-8") == BACKLOG
+
+
+def test_spec_placeholder_is_the_items_spec(tmp_cfg, tmp_path):
+    cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None}}))
+    write(tmp_path, "backlog.yml", BACKLOG)
+    assert make_ctx(cfg, tmp_path, "feature", {"module": "b"}).values["spec"] == "docs/specs/b.md"
+    plain = make_ctx(cfg, tmp_path, "feature", {"module": "a"}).values["spec"]  # `a` names no spec
+    assert plain == f"{cfg.project.docs['specs']}/{cfg.project.spec_file.format(module='a')}"
+    gone = make_ctx(cfg, tmp_path, "feature", {"module": "zz"}).values["spec"]  # not an item at all
+    assert gone == f"{cfg.project.docs['specs']}/{cfg.project.spec_file.format(module='zz')}"
+
+
+def test_an_absolute_spec_in_the_file_falls_back_for_the_spec_placeholder(tmp_cfg, tmp_path):
+    cfg = load_config(tmp_cfg({"work_source": {"kind": "backlog", "path": None}}))
+    write(tmp_path, "backlog.yml", "version: 1\nitems:\n  - {id: e, title: E, spec: /etc/passwd}\n")
+    assert work_source.item(cfg, tmp_path, "e").spec == ""  # the parser reports it and keeps no spec
+    assert work_source.problems(cfg, tmp_path)
+    fallback = f"{cfg.project.docs['specs']}/{cfg.project.spec_file.format(module='e')}"
+    assert make_ctx(cfg, tmp_path, "feature", {"module": "e"}).values["spec"] == fallback

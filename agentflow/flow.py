@@ -786,6 +786,8 @@ def cmd_queue(args: argparse.Namespace) -> int:
             raise ValueError(f"--interval must be above 0, got {args.interval}")
         cfg = _load_cfg(args)
         repo = _find_repo()
+        if cfg.work_source is not None and cfg.work_source.kind == "backlog" and args.include_specs:
+            print("note: --include-specs is ignored: a backlog pack starts the items its file marks `ready`")
         if cfg.work_source is not None and cfg.work_source.kind == "specs" and not args.include_specs:
             from agentflow import work_source
 
@@ -847,15 +849,42 @@ def cmd_retro(args: argparse.Namespace) -> int:
 
 def cmd_backlog(args: argparse.Namespace) -> int:
     """`backlog done <module>` marks a module finished by hand; `backlog undone <module>` takes that mark off, or
-    (with none) vetoes the origin evidence or closed issue that says it is done."""
-    from agentflow import backlog
+    (with none) vetoes the origin evidence or closed issue that says it is done. With a `backlog` work source those
+    two edit the file instead, and `list`, `add` and `set` read and edit it. Nothing here commits."""
+    from agentflow import backlog, work_source
+    from agentflow.backlog_file import EditRefused
 
-    act = backlog.mark_done if args.backlog_command == "done" else backlog.mark_not_done
+    verb = args.backlog_command
+    code = 0
     try:
-        for line in act(_load_cfg(args), _find_repo(), args.module, _by(args)):
+        cfg, repo = _load_cfg(args), _find_repo()
+        if verb in ("done", "undone") and work_source.kind(cfg) == "backlog":
+            lines = backlog.set_status(cfg, repo, args.module, "done" if verb == "done" else "ready")
+        elif verb == "done":
+            lines = backlog.mark_done(cfg, repo, args.module, _by(args))
+        elif verb == "undone":
+            lines = backlog.mark_not_done(cfg, repo, args.module, _by(args))
+        elif verb == "list":
+            shown = [v for v in backlog.backlog_view(cfg, repo) if args.all or v["state"] != "dropped"]
+            if work_source.kind(cfg) != "backlog":
+                raise backlog.Invalid(backlog.NEEDS_BACKLOG.format(noun=work_source.noun(cfg)))
+            lines = [json.dumps(shown)] if args.json else [f"{v['id']}  {v['state']}  {v['title']}" for v in shown]
+        elif verb == "import":
+            from agentflow import backlog_import
+
+            lines, notes, code = backlog_import.run(cfg, repo, args.dry_run)
+            for note in notes:
+                print(note, file=sys.stderr)
+        elif verb == "add":
+            lines = backlog.add_item(
+                cfg, repo, args.id, spec=args.spec, title=args.title, lane=args.lane or "", status=args.status,
+                depends_on=args.depends_on or "", issue=args.issue, notes=args.notes or "")
+        else:
+            lines = backlog.set_item(cfg, repo, args.id, args.pairs)
+        for line in lines:
             print(line)
-        return 0
-    except (backlog.Refused, *_human_errors()) as exc:
+        return code
+    except (backlog.Refused, EditRefused, OSError, *_human_errors()) as exc:
         print(f"error: {exc}")
         return 1
 
@@ -1216,16 +1245,44 @@ def build_parser() -> argparse.ArgumentParser:
     nxt.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     nxt.set_defaults(func=cmd_next)
 
-    blg = sub.add_parser("backlog", help="mark a Backlog module finished (or not) by hand")
+    blg = sub.add_parser("backlog", help="the Backlog: mark a module finished by hand, or list and edit backlog.yml")
     blg_sub = blg.add_subparsers(dest="backlog_command", required=True)
-    for verb, text in (("done", "mark a module done by hand (refused while it has a live run)"),
+
+    def _config_arg(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+        parser.set_defaults(func=cmd_backlog)
+
+    for verb, text in (("done", "mark a module done by hand (refused while it has a live run); with a backlog file, "
+                                "set its status to done"),
                        ("undone", "remove a module's hand mark, or with none, ignore the origin evidence or closed "
-                                  "issue that says it is done")):
+                                  "issue that says it is done; with a backlog file, set its status to ready")):
         one = blg_sub.add_parser(verb, help=text)
         one.add_argument("module", help="a module id from the work source")
         one.add_argument("--by", help="who is marking it (default: the current user)")
-        one.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
-        one.set_defaults(func=cmd_backlog)
+        _config_arg(one)
+    lst = blg_sub.add_parser("list", help="the backlog file's items and their states")
+    lst.add_argument("--json", action="store_true", help="print the items as JSON")
+    lst.add_argument("--all", action="store_true", help="include dropped items")
+    _config_arg(lst)
+    add = blg_sub.add_parser("add", help="append an item to the backlog file (in the working tree; nothing is committed)")
+    add.add_argument("id", nargs="?", help="the item id (with --spec, taken from the spec's file name)")
+    add.add_argument("--title", help="one line (with --spec, the spec's first '# ' heading)")
+    add.add_argument("--lane")
+    add.add_argument("--status", default="backlog", help="backlog (default), ready, done or dropped")
+    add.add_argument("--depends-on", help="comma-separated item ids")
+    add.add_argument("--issue", help="a GitHub issue number")
+    add.add_argument("--spec", help="a spec file inside the repository")
+    add.add_argument("--notes")
+    _config_arg(add)
+    imp = blg_sub.add_parser("import", help="write backlog.yml from the capability map or spec files, the form cards and "
+                                            "the done marks (nothing is committed; the config is not edited)")
+    imp.add_argument("--dry-run", action="store_true", help="print the file (stdout) and the notes (stderr); write nothing")
+    _config_arg(imp)
+    st = blg_sub.add_parser("set", help="edit an item of the backlog file: set <id> key=value... (nothing is committed)")
+    st.add_argument("id")
+    st.add_argument("pairs", nargs="*", metavar="key=value",
+                    help="title, lane, status, spec, plan, depends_on (comma list), issue, notes; empty clears a key")
+    _config_arg(st)
 
     que = sub.add_parser("queue", help="start modules in capability-map order as their dependencies merge")
     que.add_argument("--max-parallel", type=int, default=2, help="runs live at once (default 2)")

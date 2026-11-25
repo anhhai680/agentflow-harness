@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 import pytest
-from agentflow import governor, hitl, module_queue
+from agentflow import governor, hitl, module_queue, work_source
 from agentflow.flow import main
 from agentflow.module_queue import NextAnswer, QueueBusy, QueueState, StartFailed, next_step, queue_tick
 from agentflow.state import runs_root
@@ -902,6 +902,94 @@ def test_cmd_queue_on_a_specs_pack_needs_include_specs(sqrepo, monkeypatch, caps
     assert main(["queue", "--once", "--include-specs"]) == 0
     assert spawned == [("platform", None)]
     assert "started platform" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- a backlog pack reads each item
+
+
+BACKLOG_FILE = ("version: 1\nitems:\n  - {id: a, title: A, status: done}\n"
+                "  - {id: r, title: R, status: ready}\n  - {id: i, title: I, status: backlog}\n"
+                "  - {id: x, title: X, status: ready, lane: bug}\n  - {id: b, title: B, status: ready, depends_on: [a]}\n")
+
+
+@pytest.fixture
+def bqrepo(fr):
+    """`fr` for a pack whose work source is `backlog.yml`: `a` done, `r` and `x` (lane bug) and `b` (after `a`)
+    ready, `i` in the backlog."""
+    fr.configure({"work_source": {"kind": "backlog", "path": "backlog.yml"}})
+    write(fr.root, "backlog.yml", BACKLOG_FILE)
+    commit_all(fr.root)
+    return fr
+
+
+def gh_calls(fr) -> list[list[str]]:
+    log = Path(os.environ["FAKE_GH_LOG"])
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+
+def test_a_done_item_is_done_with_file_says(bqrepo):
+    from agentflow import finished
+
+    write(bqrepo.root, "docs/plans/2026-10-28-a.md", PLAN_DONE)  # a finished plan: gh is asked about it, were `a` not done
+    write(bqrepo.root, "docs/plans/2026-10-28-r.md", PLAN_DONE)  # the control: `r` is not done, so gh is asked
+    entries = {e["id"]: e for e in module_queue.assess_modules(bqrepo.cfg, bqrepo.root).entries}
+    assert finished.FILE_SAYS == "backlog says done"
+    assert (entries["a"]["status"], entries["a"]["done_reason"]) == ("done", "backlog says done")
+    assert entries["r"]["status"] == "backlog" and "done_reason" not in entries["r"]
+    assert finished.recorded(bqrepo.root) == {"a": finished.FILE_SAYS}
+    assert not finished.vetoable(finished.FILE_SAYS) and not finished.from_origin(finished.FILE_SAYS)
+    asked = json.dumps(gh_calls(bqrepo))
+    assert "flow/feature/r" in asked and "flow/feature/a" not in asked  # gh is called here, but never for `a`
+
+
+def test_hand_marks_are_ignored_by_a_backlog_pack(bqrepo):
+    from agentflow import finished
+
+    finished.mark(bqrepo.root, "b", "me")
+    finished.veto(bqrepo.root, "a", "me")
+    entries = {e["id"]: e for e in module_queue.assess_modules(bqrepo.cfg, bqrepo.root).entries}
+    assert entries["b"]["status"] == "backlog"  # the mark says nothing here
+    assert entries["a"]["done_reason"] == finished.FILE_SAYS  # nor does a veto
+
+
+def test_a_leftover_done_mark_does_not_make_a_ready_item_done_on_the_cached_board(bqrepo):
+    from agentflow import finished
+
+    finished.mark(bqrepo.root, "r", "me")  # left over from before `backlog import`
+    nodes = work_source.items(bqrepo.cfg, bqrepo.root)
+    cached = {e["id"]: e for e in module_queue.cached_entries(bqrepo.root, nodes, {},
+                                                              hand_marks=work_source.hand_marks(bqrepo.cfg))}
+    assert cached["r"]["status"] == "backlog"
+    assert finished.recorded(bqrepo.root, hand_marks=work_source.hand_marks(bqrepo.cfg)).get("r") is None
+    assert finished.recorded(bqrepo.root)["r"] == finished.BY_HAND  # the other kinds still honour it
+
+
+def test_an_unreadable_marks_file_adds_no_note_to_a_backlog_pack(bqrepo):
+    runs_root(bqrepo.root).mkdir(parents=True, exist_ok=True)
+    (runs_root(bqrepo.root) / "done_marks.json").write_text("{not json", encoding="utf-8")
+    notes: list[str] = []
+    module_queue.assess_modules(bqrepo.cfg, bqrepo.root, log=notes.append)
+    assert not any("done_marks" in n or "unreadable" in n for n in notes)
+
+
+def test_queue_starts_ready_items_only(bqrepo):
+    go = Starter(bqrepo)
+    # `a` is done, so `b` (ready, after `a`) is startable too; `i` is not ready and `x` belongs to another lane
+    assert queue_tick(bqrepo.cfg, bqrepo.root, 5, go) == ["r", "b"]
+    assert go.started == ["r", "b"]
+
+
+def test_cmd_queue_ignores_include_specs_with_a_note(bqrepo, monkeypatch, capsys):
+    bqrepo.install_pack()
+    spawned: list[str] = []
+    monkeypatch.setattr("agentflow.flow._preflight", lambda cfg: None)
+    monkeypatch.setattr(module_queue, "spawn_feature_run",
+                        lambda repo, module, lane, config=None: spawned.append(module) or f"run-{module}")
+    assert main(["queue", "--once", "--include-specs"]) == 0
+    assert "--include-specs is ignored" in capsys.readouterr().out
+    assert spawned == ["r", "b"]
+    assert main(["queue", "--once"]) == 0
+    assert "--include-specs is ignored" not in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------- finished modules and their reasons

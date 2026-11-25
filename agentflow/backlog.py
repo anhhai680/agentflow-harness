@@ -12,7 +12,7 @@ interrupted is never repeated: `settle_interrupted` turns it into a failure for 
 Names here are agentflow's own vocabulary (`issue`, `task`, `topic`, `new_module`, `after`). Lanes, phases, the map
 file and the base branch all come from `config.yaml`; this module names none of them.
 
-Open GitHub issues that carry `issues.sync_label` are a third kind: `refresh` reads them with `gh issue list` into
+Open GitHub issues that carry `issues.sync_label` (every open issue, when it is `*`) are a third kind: `refresh` reads them with `gh issue list` into
 `backlog_state.json`, and `snapshot` shows them from there (it never calls `gh`). An issue that carries
 `issues.in_progress_label` with no run on this machine is "taken": someone else picked it up, so it cannot start.
 Nothing from an issue's text reaches an argv, a module id, a map row or a refusal: an issue-backed run in the
@@ -36,10 +36,11 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-from agentflow import finished, intake, module_queue, sources, vuln, work_source
+from agentflow import backlog_file, finished, intake, module_queue, sources, vuln, work_source
+from agentflow.backlog_file import BacklogItem
 from agentflow.conditions import first_phase_with_work, make_ctx
 from agentflow.config import check_lane
 from agentflow.events import EventLog, nfc
@@ -64,6 +65,7 @@ INTERRUPTED = ("interrupted: the dashboard stopped while this card was starting.
 ISSUE_MODULE = "issue-{number}"  # the module of an issue-backed run in the module lane: never from the issue's text
 ISSUE_RESPONSIBILITY = "GitHub issue #{number}"  # its capability-map row's responsibility, fixed text too
 ISSUES_MAX = 100  # the most synced issues the Backlog shows
+ALL_ISSUES = "*"  # an `issues.sync_label` that syncs every open issue, whatever its labels
 TITLE_MAX = 200
 ISSUE_LIST_FIELDS = "number,title,labels,url,blockedBy,blocking"
 ISSUE_LIST_FIELDS_OLD = "number,title,labels,url"  # what a `gh` without the relationship fields can list
@@ -292,6 +294,8 @@ def _reopen_hint(module: str, reason: str) -> str | None:
         return f"run `agentflow backlog undone {module}`"
     if reason == finished.ISSUE_CLOSED:
         return f"reopen its issue, then run `agentflow backlog undone {module}`"
+    if reason == finished.FILE_SAYS:
+        return f"set its status in the backlog file: `agentflow backlog set {module} status=ready`"
     return None
 
 
@@ -368,7 +372,7 @@ def add(cfg: Config, repo: Path, lane: str, fields: dict, after: Any = (), to_ph
                 params[name] = _text(fields[name], name)
             else:
                 new_module = _new_module_fields(fields["new_module"], nodes, book, work_source.noun(cfg),
-                                                finished.recorded(repo))
+                                                finished.recorded(repo, hand_marks=work_source.hand_marks(cfg)))
                 params["module"], kind = new_module["module"], "module"
         refs = _check_after(cfg, repo, after, nodes, book)
         if "issue" in params:
@@ -576,9 +580,15 @@ def _old_gh(exc: GhError) -> bool:
     return "unknown json field" in str(exc).lower()
 
 
+def _synced_words(label: str) -> str:
+    """How the board names the synced set: open issues `labelled 'x'`, or no words for `*` (every open issue)."""
+    return "" if label == ALL_ISSUES else f" labelled {label!r}"
+
+
 def sync_issues(cfg: Config, repo: Path) -> str:
-    """Read the open issues that carry `issues.sync_label` into `backlog_state.json`; returns the note the board
-    shows ("" when all is well). It never raises: when `gh` fails, the last list stays and the note says why."""
+    """Read the open issues that carry `issues.sync_label` (every open issue for `*`) into `backlog_state.json`;
+    returns the note the board shows ("" when all is well). It never raises: when `gh` fails, the last list stays
+    and the note says why."""
     repo = Path(repo)
     label = cfg.issues.sync_label
     if not label:
@@ -586,22 +596,23 @@ def sync_issues(cfg: Config, repo: Path) -> str:
             _save_state(repo, issues=[], issues_label="", issues_note="")
         return ""
     old_gh = False
+    which = [] if label == ALL_ISSUES else ["--label", label]
     try:
         try:
-            reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS,
+            reply = gh_json(["issue", "list", *which, "--state", "open", "--json", ISSUE_LIST_FIELDS,
                              "--limit", str(ISSUES_MAX)], cwd=repo)
         except GhError as exc:
             if not _old_gh(exc):
                 raise
             old_gh = True  # a `gh` without the relationship fields: ask once more for the rest
-            reply = gh_json(["issue", "list", "--label", label, "--state", "open", "--json", ISSUE_LIST_FIELDS_OLD,
+            reply = gh_json(["issue", "list", *which, "--state", "open", "--json", ISSUE_LIST_FIELDS_OLD,
                              "--limit", str(ISSUES_MAX)], cwd=repo)
         issues = _parse_issues(cfg, reply, with_deps=not old_gh)
     except (GhError, OSError, ValueError, TypeError, RecursionError) as exc:  # RecursionError: absurdly nested JSON
         note = f"GitHub issues not updated: {_reason(exc)}"
         _save_state(repo, issues_note=note)
         return note
-    notes = [f"only the first {ISSUES_MAX} open issues labelled {label!r} are shown"] if len(reply) >= ISSUES_MAX else []
+    notes = [f"only the first {ISSUES_MAX} open issues{_synced_words(label)} are shown"] if len(reply) >= ISSUES_MAX else []
     if old_gh:
         notes.append(f"issue dependencies not read: {UNKNOWN_OLD_GH}")
     note = "; ".join(notes)
@@ -831,10 +842,38 @@ def _refuse_taken(number: str, pic: dict) -> None:
         raise Refused(f"issue #{number} {TAKEN}")
 
 
+NOTE_MAX = 300
+
+
+def _file_note(problems: list[backlog_file.Problem]) -> str:
+    """The Board's note for a backlog file that cannot be read: its first file-level error (an item's own error
+    keeps the item on the Board and is `validate`'s to report), or `""`."""
+    for problem in problems:
+        if problem.level == "error" and not problem.where.startswith("items["):
+            return _one_line(f"backlog file {problem.where} {problem.message}", NOTE_MAX)
+    return ""
+
+
+NOT_STARTABLE = "runs in {lane}: only dashboard.backlog.module_lane items start from the Board"
+
+
+def _startable(item: BacklogItem | None, lane: str | None) -> bool:
+    """Whether a backlog item belongs to the module lane (an item with no `lane:` does)."""
+    return item is None or not item.lane or item.lane == lane
+
+
 def _picture(cfg: Config, repo: Path) -> dict:
     """Everything the board and the start rules need, read from files (no `gh`, no git)."""
     runs = list_runs(repo)
-    nodes = _map_nodes(cfg, repo)
+    file_items: list[BacklogItem] = []
+    problems: list[backlog_file.Problem] = []
+    if work_source.kind(cfg) == "backlog":  # one read of the file, so the cards, dropped list and note agree
+        found, problems = work_source.indexed(cfg, repo)
+        file_items = [item for _, item in found]
+        nodes: list[sources.ModuleNode] = (
+            [i for i in file_items if i.status != "dropped"] if module_queue.module_lane(cfg) else [])
+    else:
+        nodes = _map_nodes(cfg, repo)
     source = work_source.file(cfg, repo)
     mapped = cfg.work_source is not None and cfg.work_source.kind == "capability_map"
     if not nodes and mapped and module_queue.module_lane(cfg) and source is not None and not source.is_file():
@@ -842,12 +881,14 @@ def _picture(cfg: Config, repo: Path) -> dict:
         # source has no modules at all, so the board holds only the cards added on the page)
         nodes = [sources.ModuleNode(m["id"], list(m.get("deps") or [])) for m in module_queue.QueueState.load(repo).modules]
     mod_runs = module_queue.feature_runs(cfg, repo, runs)
-    entries = module_queue.cached_entries(repo, nodes, mod_runs)
+    entries = module_queue.cached_entries(repo, nodes, mod_runs, hand_marks=work_source.hand_marks(cfg))
     book = Backlog.load(repo)
     state = _load_state(repo)
     merged = {k: v for k, v in (state.get("merged") or {}).items() if isinstance(k, str)}
     pic = {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "state": state,
-           "issues": _synced(cfg, state)}
+           "issues": _synced(cfg, state), "file_items": {i.id: i for i in file_items},
+           "dropped": [{"id": i.id, "title": i.title} for i in file_items if i.status == "dropped"],
+           "file_note": _file_note(problems)}
     pic["alerts"] = _synced_alerts(cfg, state)
     pic["alert_runs"] = {}  # the lowest alert number of each held group -> the run that holds it
     vuln_runs = _vuln_runs(runs) if pic["alerts"] else []
@@ -958,8 +999,19 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         entry = by_entry[node.id]
         if entry["status"] != "backlog":
             continue
-        cards.append(make(f"module:{node.id}", "module", node.id, node.id, lane or "", book.overlay(node.id),
-                          deps=list(node.deps), note=entry.get("blocked")))
+        file_item = pic["file_items"].get(node.id)
+        if file_item is None:
+            cards.append(make(f"module:{node.id}", "module", node.id, node.id, lane or "", book.overlay(node.id),
+                              deps=list(node.deps), note=entry.get("blocked")))
+            continue
+        startable = _startable(file_item, lane)
+        title = file_item.title or node.id
+        card = make(f"module:{node.id}", "module", node.id, title, file_item.lane or lane or "", book.overlay(node.id),
+                    deps=list(node.deps), note=entry.get("blocked"), title=title, planning=file_item.status,
+                    startable=startable)
+        if not startable:
+            card["note"] = NOT_STARTABLE.format(lane=file_item.lane)
+        cards.append(card)
     for item in book.cards():
         if item.status in ("started", "removed"):
             continue
@@ -1008,13 +1060,15 @@ def snapshot(cfg: Config, repo: Path) -> dict:
     return {
         "cards": cards,
         "done": done,
-        "done_note": finished.read_marks(repo)[1] or "",
+        "done_note": (finished.read_marks(repo)[1] or "") if work_source.hand_marks(cfg) else "",
         "new_task": forms,
         "lane_phases": {ln: lane_phases(cfg, ln) for ln in forms},
         "lane_labels": lane_labels(cfg),
         "after_choices": choices,
         "modules": [n.id for n in pic["nodes"]],
         "skipped": work_source.skipped(cfg, repo),
+        "dropped": pic["dropped"],
+        "backlog_note": pic["file_note"],
         "sync_note": pic["state"].get("sync_note") or "",
         "issues_note": pic["state"].get("issues_note") or "" if cfg.issues.sync_label else "",
         "alerts_note": pic["state"].get("alerts_note") or "" if _alerts_on(cfg) else "",
@@ -1075,6 +1129,170 @@ def mark_not_done(cfg: Config, repo: Path, module: str, by: str) -> list[str]:
     return [message, *_reassess(cfg, repo)]
 
 
+# --------------------------------------------------------------------------- the backlog file from the command line
+
+NEEDS_BACKLOG = "this needs work_source kind backlog (it is {noun} here)"
+SET_KEYS = tuple(k for k in backlog_file.KEYS if k != "id")
+
+
+def backlog_view(cfg: Config, repo: Path) -> list[dict]:
+    """One dict per item of the backlog file, in file order, for `agentflow backlog list`: `id`, `title`, `lane`,
+    `status` (the file's), `state` and `detail`. `state` is the first that holds: `dropped`, `done` (`detail` is
+    the reason), the phase of the item's local run (`detail` is the run id), `blocked` (`detail` names the items
+    it waits for), else the file's `ready` or `backlog`. A claim on `origin` is not read here."""
+    repo = Path(repo)
+    if work_source.kind(cfg) != "backlog":
+        return []
+    pic = _picture(cfg, repo)
+    by_entry = {e["id"]: e for e in pic["entries"]}
+    runs = {r.id: r for r in pic["runs"]}
+    out = []
+    for item in pic["file_items"].values():
+        entry = by_entry.get(item.id)
+        state, detail = item.status, ""
+        if item.status == "dropped":
+            state = "dropped"
+        elif entry is not None and entry["status"] == "done":
+            state, detail = "done", entry.get("done_reason") or finished.MERGED
+        elif item.status == "done":
+            state, detail = "done", finished.FILE_SAYS
+        elif entry is not None and entry.get("run_id") in runs:
+            state, detail = str(runs[entry["run_id"]].state.get("phase") or "running"), entry["run_id"]
+        else:
+            waiting = [b["key"].partition(":")[2] for b in pic["view"].get(f"module:{item.id}", {}).get("blocked_by", [])]
+            if waiting:
+                state, detail = "blocked", ", ".join(waiting)
+        out.append({"id": item.id, "title": item.title, "lane": item.lane, "status": item.status,
+                    "state": state, "detail": detail})
+    return out
+
+
+def _backlog_path(cfg: Config, repo: Path) -> Path:
+    path = work_source.file(cfg, repo) if work_source.kind(cfg) == "backlog" else None
+    if path is None:
+        raise Invalid(NEEDS_BACKLOG.format(noun=work_source.noun(cfg)))
+    return path
+
+
+def _comma_list(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _positive(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise Invalid(f"issue must be a positive whole number, not {value!r}") from None
+    if number < 1:
+        raise Invalid(f"issue must be a positive whole number, not {value!r}")
+    return number
+
+
+def set_item(cfg: Config, repo: Path, item_id: str, pairs: list[str]) -> list[str]:
+    """`set <id> key=value...`: edit the item in the backlog file, in the working tree (nothing is committed).
+    Every pair is read before the file is touched. `Invalid` for a pair that cannot be read or a file that is not
+    a backlog; `backlog_file.EditRefused` when the file cannot take the edit."""
+    path = _backlog_path(cfg, repo)
+    fields: dict[str, object] = {}
+    for pair in pairs:
+        key, equals, value = pair.partition("=")
+        if not equals:
+            raise Invalid(f"{pair!r} is not key=value")
+        if key not in SET_KEYS:
+            raise Invalid(f"set takes the keys {', '.join(SET_KEYS)}, not {key!r}")
+        if key in fields:
+            raise Invalid(f"{key} is given twice")
+        if key == "status" and not value:
+            raise Invalid("status cannot be empty: it is one of " + ", ".join(backlog_file.STATUSES))
+        if key == "depends_on":
+            fields[key] = _comma_list(value)
+        elif key == "issue":
+            fields[key] = _positive(value) if value else None
+        else:
+            fields[key] = value
+    if not fields:
+        raise Invalid("nothing to set: give key=value pairs")
+    backlog_file.set_fields(path, item_id, fields)
+    return [f"{item_id}: set {', '.join(fields)} in {path.name} (not committed)"]
+
+
+def set_status(cfg: Config, repo: Path, item_id: str, status: str) -> list[str]:
+    """`done` and `undone` on a backlog pack: `set <id> status=<status>`. `done` is refused while the item has a
+    live run, as for the other work sources; it never touches `runs/done_marks.json`."""
+    repo = Path(repo)
+    path = _backlog_path(cfg, repo)
+    if status == "done":
+        run = module_queue.feature_runs(cfg, repo).get(item_id)
+        if run is not None and run.state["status"] in module_queue._LIVE:
+            raise Refused(f"{item_id} has a live run, {run.id} ({run.state['status']}); cancel it first or let it finish")
+    backlog_file.set_fields(path, item_id, {"status": status})
+    return [f"{item_id}: status set to {status} in {path.name} (not committed)"]
+
+
+def _spec_file(repo: Path, spec: str) -> str:
+    """`spec` (a path inside `repo`, as the command line gave it) when it is a regular file reached through no
+    symlink; the heading text is read from it by the caller. `Invalid` otherwise."""
+    pure = PurePosixPath(spec)
+    if not spec or spec != str(pure) or ".." in pure.parts or backlog_file.bad_path(spec):
+        raise Invalid(f"--spec must be a path inside the repository, not {spec!r}")
+    why = backlog_file.path_problem(Path(repo), spec)
+    if why is not None:
+        raise Invalid(f"--spec {spec} {why}")
+    at = Path(repo) / spec
+    if not at.is_file():
+        raise Invalid(f"--spec {spec} is not a file")
+    return str(pure)
+
+
+def _spec_id(cfg: Config, spec: str) -> str:
+    """The module id a spec file stands for: the `{module}` of `project.docs.spec_file` when the file name fits it,
+    else the file's lowercased slug stem. `Invalid` when that is not a module id."""
+    name = PurePosixPath(spec).name
+    pattern = re.escape(cfg.project.spec_file).replace(re.escape("{module}"), "(?P<module>.+)")
+    found = re.fullmatch(pattern, name)
+    if found:
+        derived = found.group("module")
+    else:
+        derived = re.sub(r"[^a-z0-9_-]+", "-", PurePosixPath(name).stem.lower()).strip("-")
+    if sources.MODULE_ID.fullmatch(derived) is None or len(derived) > backlog_file.ID_MAX:
+        raise Invalid(f"cannot make an item id from {name}: give one (a lowercase slug, at most "
+                      f"{backlog_file.ID_MAX} characters)")
+    return derived
+
+
+def _spec_title(repo: Path, spec: str) -> str:
+    try:
+        header = sources.read_header(Path(repo) / spec)
+    except OSError as exc:
+        raise Invalid(f"cannot read {spec}: {exc}") from None
+    for line, _ in sources.spec_header(header):
+        if line.startswith("# "):
+            return line[2:].strip()[: backlog_file.TITLE_MAX].rstrip()
+    return ""
+
+
+def add_item(cfg: Config, repo: Path, item_id: str | None, *, spec: str | None = None, title: str | None = None,
+             lane: str = "", status: str = "backlog", depends_on: str = "", issue: str | None = None,
+             notes: str = "") -> list[str]:
+    """`add [<id>] [--spec PATH] ...`: append an item to the backlog file, in the working tree (nothing is committed).
+    With `--spec` the id and the title come from the spec file unless given. `Invalid` for a bad argument;
+    `backlog_file.EditRefused` when the file cannot take the item."""
+    repo = Path(repo)
+    path = _backlog_path(cfg, repo)
+    if spec is not None:
+        spec = _spec_file(repo, spec)
+        item_id = item_id or _spec_id(cfg, spec)
+        title = title if title is not None else _spec_title(repo, spec)
+    if not item_id:
+        raise Invalid("give an item id, or --spec")
+    if not title:
+        raise Invalid("give --title (the spec has no '# ' heading)" if spec else "give --title")
+    item = BacklogItem(id=item_id, deps=_comma_list(depends_on), title=title, lane=lane, status=status,
+                       spec=spec or "", issue=_positive(issue) if issue else None, notes=notes)
+    backlog_file.append_item(path, item)
+    return [f"{item_id}: added to {path.name} as {status} (not committed)"]
+
+
 # --------------------------------------------------------------------------- starting
 
 
@@ -1108,8 +1326,10 @@ def parse_key(key: Any) -> tuple[str, str]:
     return kind, name
 
 
-def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
-    """Check that `key` may start now and record `item_starting`. `Refused` (409) says why not."""
+def begin_start(cfg: Config, repo: Path, key: str, confirm: bool = False) -> StartJob:
+    """Check that `key` may start now and record `item_starting`. `Refused` (409) says why not.
+
+    A backlog item whose status is `backlog` (an idea) starts only with `confirm`; the caller asks for a second click."""
     repo = Path(repo)
     kind, name = parse_key(key)
     reason = module_queue.usage_hold(cfg)
@@ -1129,7 +1349,12 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
                 raise Refused(f"module {name} already has a run or is done")
             item = book.overlay(name)
             params, new_module, to_phase, item_lane = {"module": name}, None, None, lane or ""
+            file_item = pic["file_items"].get(name)
+            if not _startable(file_item, lane):
+                raise Refused(NOT_STARTABLE.format(lane=file_item.lane))
             number = _module_issue(name, pic)
+            if file_item is not None and file_item.issue is not None:
+                number = str(file_item.issue)
             if number is not None:
                 unknown = _deps_unknown(f"module:{name}", {}, pic)
                 if unknown:
@@ -1139,8 +1364,10 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
         elif kind == "issue":
             entry = next((i for i in pic["issues"] if i["number"] == name), None)
             if entry is None:
-                raise Refused(f"issue #{name} is not open with the {cfg.issues.sync_label!r} label "
-                              "as of the last refresh" if cfg.issues.sync_label else "issue sync is off")
+                label = cfg.issues.sync_label
+                raise Refused(("issue sync is off" if not label else
+                               f"issue #{name} is not open as of the last refresh" if label == ALL_ISSUES else
+                               f"issue #{name} is not open with the {label!r} label as of the last refresh"))
             blocker = _issue_blocker(name, pic)
             if blocker is not None:
                 raise Refused(blocker)
@@ -1175,7 +1402,7 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
             raise Refused(f"{key} is already starting")
         if item is not None and item.status == "started" and kind == "card":
             raise Refused(f"{key} has already started")
-        if kind == "card" and new_module is not None and work_source.kind(cfg) == "specs":
+        if kind == "card" and new_module is not None and work_source.kind(cfg) in ("specs", "backlog"):
             if any(n.id == params.get("module") for n in pic["nodes"]):
                 raise Refused(f"a spec for {params['module']} now exists; start module:{params['module']} instead")
             params["task"], new_module = _spec_task(new_module), None
@@ -1192,6 +1419,9 @@ def begin_start(cfg: Config, repo: Path, key: str) -> StartJob:
         if info and info["blocked_by"]:
             raise Refused(f"{_label_of(key, pic)} is blocked: runs after "
                           + ", ".join(b["text"] for b in info["blocked_by"]))
+        file_item = pic["file_items"].get(name) if kind == "module" else None
+        if file_item is not None and file_item.status == "backlog" and not confirm:
+            raise Refused(f"module {name} is an idea (status backlog) and must be confirmed to start")
         clash = _live_clash(params, item_lane, pic["runs"])
         if clash:
             raise Refused(clash)

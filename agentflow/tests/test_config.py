@@ -3148,3 +3148,214 @@ def test_gate_exit_codes_parse(tmp_cfg):
 def test_gate_exit_codes_must_be_lists_of_ints(tmp_cfg, value):
     with pytest.raises(ConfigError, match="ok_exit"):
         load_config(tmp_cfg({"gates": {"scan": {"run": "x", "ok_exit": value}}}))
+
+
+# --------------------------------------------------------------------------- the backlog file's checks
+
+BACKLOG_PATCH = {"work_source": {"kind": "backlog", "path": None}}
+
+
+def _blg(tmp_cfg, tmp_path, text, patch=None, files=()):
+    """`validate`'s issues for a `backlog` pack whose `backlog.yml` holds `text`, as `(level, path, message)`."""
+    if text is not None:
+        (tmp_path / "backlog.yml").write_text(text, encoding="utf-8")
+    for rel in files:
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# t\n", encoding="utf-8")
+    path = tmp_cfg({**BACKLOG_PATCH, **(patch or {})})
+    return [(i.level, i.path, i.message) for i in validate(load_config(path), tmp_path)]
+
+
+def _at(found, prefix="backlog.yml"):
+    return [(level, path) for level, path, _ in found if path.startswith(prefix)]
+
+
+def _messages(found, path):
+    return [message for _, where, message in found if where == path]
+
+
+def test_a_clean_backlog_file_adds_no_issues(tmp_cfg, tmp_path):
+    text = "version: 1\nitems:\n  - {id: a, title: A, status: done}\n  - {id: b, title: B, depends_on: [a]}\n"
+    found = _blg(tmp_cfg, tmp_path, text)
+    assert _at(found) == [] and not [f for f in found if f[1].startswith(("work_source", "backlog"))]
+
+
+def test_a_problem_of_the_file_comes_through_at_its_own_level_with_the_file_name(tmp_cfg, tmp_path):
+    text = ("version: 1\nitems:\n  - {id: a, title: A, owner: me}\n  - {id: Bad Id, title: B}\n"
+            "  - {id: c, title: C, spec: ../x.md}\n")
+    found = _blg(tmp_cfg, tmp_path, text)
+    assert _at(found) == [("warning", "backlog.yml items[0].owner"), ("error", "backlog.yml items[1].id"),
+                          ("error", "backlog.yml items[2].spec")]
+
+
+def test_a_missing_or_broken_file_is_one_error_named_by_the_file(tmp_cfg, tmp_path):
+    assert _at(_blg(tmp_cfg, tmp_path, None)) == [("error", "backlog.yml")]
+    assert _at(_blg(tmp_cfg, tmp_path, "version: 2\nitems: []\n")) == [("error", "backlog.yml version")]
+    assert _at(_blg(tmp_cfg, tmp_path, "[1, 2")) == [("error", "backlog.yml")]
+
+
+def test_the_issue_path_uses_the_work_source_path(tmp_cfg, tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "todo.yml").write_text("version: 1\nitems:\n  - {id: a, title: A, lane: nope}\n", encoding="utf-8")
+    path = tmp_cfg({"work_source": {"kind": "backlog", "path": "docs/todo.yml"}})
+    found = [(i.level, i.path) for i in validate(load_config(path), tmp_path)]
+    assert ("error", "docs/todo.yml items[0].lane") in found
+
+
+def test_a_path_outside_the_repository_is_reported_once(tmp_cfg, tmp_path):
+    path = tmp_cfg({"work_source": {"kind": "backlog", "path": "../backlog.yml"}})
+    found = [(i.level, i.path) for i in validate(load_config(path), tmp_path) if "work_source" in i.path or "backlog" in i.path]
+    assert found == [("error", "work_source.path")]
+
+
+def test_a_lane_that_is_not_the_packs_is_an_error(tmp_cfg, tmp_path):
+    text = "version: 1\nitems:\n  - {id: a, title: A}\n  - {id: b, title: B, lane: nope}\n"
+    found = _blg(tmp_cfg, tmp_path, text)
+    assert _at(found) == [("error", "backlog.yml items[1].lane")]
+
+
+def test_a_lane_that_is_not_the_module_lane_is_a_warning(tmp_cfg, tmp_path):
+    text = "version: 1\nitems:\n  - {id: a, title: A, lane: feature}\n  - {id: b, title: B, lane: bug}\n"
+    found = _blg(tmp_cfg, tmp_path, text)
+    assert _at(found) == [("warning", "backlog.yml items[1].lane")]
+    assert _messages(found, "backlog.yml items[1].lane") == ["runs in bug: B1 starts module_lane items only"]
+
+
+def test_a_dependency_on_an_unknown_item_is_an_error(tmp_cfg, tmp_path):
+    text = "version: 1\nitems:\n  - {id: a, title: A}\n  - {id: b, title: B, depends_on: [a, zz]}\n"
+    found = _blg(tmp_cfg, tmp_path, text)
+    assert _at(found) == [("error", "backlog.yml items[1].depends_on")]
+    assert "zz" in _messages(found, "backlog.yml items[1].depends_on")[0]
+
+
+def test_a_dependency_cycle_is_one_error_that_names_the_ring(tmp_cfg, tmp_path):
+    text = ("version: 1\nitems:\n  - {id: c, title: C, depends_on: [a]}\n  - {id: b, title: B, depends_on: [c]}\n"
+            "  - {id: a, title: A, depends_on: [b]}\n  - {id: d, title: D, depends_on: [a]}\n")
+    found = _blg(tmp_cfg, tmp_path, text)
+    assert _at(found) == [("error", "backlog.yml items[2].depends_on")]  # on `a`, the smallest id of the ring
+    assert "a -> b -> c -> a" in _messages(found, "backlog.yml items[2].depends_on")[0]
+
+
+def test_a_dependency_on_a_dropped_item_is_a_warning(tmp_cfg, tmp_path):
+    text = "version: 1\nitems:\n  - {id: a, title: A, status: dropped}\n  - {id: b, title: B, depends_on: [a]}\n"
+    assert _at(_blg(tmp_cfg, tmp_path, text)) == [("warning", "backlog.yml items[1].depends_on")]
+
+
+def test_the_position_in_a_path_counts_the_items_the_parser_dropped(tmp_cfg, tmp_path):
+    text = "version: 1\nitems:\n  - {id: Bad Id, title: X}\n  - {id: a, title: A, lane: nope}\n"
+    assert _at(_blg(tmp_cfg, tmp_path, text)) == [("error", "backlog.yml items[0].id"),
+                                                  ("error", "backlog.yml items[1].lane")]
+
+
+def test_a_spec_or_plan_that_is_a_symlink_or_leaves_the_repository_is_an_error(tmp_cfg, tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "o.md").write_text("# o\n", encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "real.md").write_text("# r\n", encoding="utf-8")
+    (tmp_path / "docs" / "link.md").symlink_to(tmp_path / "docs" / "real.md")
+    (tmp_path / "escape").symlink_to(outside, target_is_directory=True)
+    text = ("version: 1\nitems:\n  - {id: a, title: A, spec: docs/link.md}\n  - {id: b, title: B, plan: escape/o.md}\n"
+            "  - {id: c, title: C, spec: docs/real.md}\n")
+    found = _blg(tmp_cfg, tmp_path, text, {"project": {"docs": {"specs": "docs"}}})
+    assert [f for f in _at(found) if f[0] == "error"] == [("error", "backlog.yml items[0].spec"),
+                                                          ("error", "backlog.yml items[1].plan")]
+    assert ("warning", "backlog.yml items[2].spec") not in _at(found)
+
+
+def test_a_missing_spec_or_plan_is_a_warning(tmp_cfg, tmp_path):
+    text = "version: 1\nitems:\n  - {id: a, title: A, spec: docs/specs/a.md, plan: docs/plans/a.md}\n"
+    assert _at(_blg(tmp_cfg, tmp_path, text)) == [("warning", "backlog.yml items[0].spec"),
+                                                  ("warning", "backlog.yml items[0].plan")]
+
+
+def test_a_spec_and_plan_that_exist_are_clean(tmp_cfg, tmp_path):
+    text = "version: 1\nitems:\n  - {id: a, title: A, spec: docs/specs/a.md, plan: docs/plans/a.md}\n"
+    assert _at(_blg(tmp_cfg, tmp_path, text, files=("docs/specs/a.md", "docs/plans/a.md"))) == []
+
+
+def test_an_issue_number_on_two_items_is_an_error(tmp_cfg, tmp_path):
+    text = "version: 1\nitems:\n  - {id: a, title: A, issue: 7}\n  - {id: b, title: B, issue: 7}\n  - {id: c, title: C, issue: 8}\n"
+    found = _blg(tmp_cfg, tmp_path, text)
+    assert _at(found) == [("error", "backlog.yml items[1].issue")]
+    assert "items[0]" in _messages(found, "backlog.yml items[1].issue")[0]
+
+
+def test_a_spec_no_item_names_is_a_warning_until_it_is_added_or_ignored(tmp_cfg, tmp_path):
+    text = "version: 1\nitems:\n  - {id: a, title: A, spec: docs/specs/a.md}\n"
+    files = ("docs/specs/a.md", "docs/specs/x.md", "docs/specs/notes/n.md")
+    found = _blg(tmp_cfg, tmp_path, text, files=files)
+    assert _at(found) == [("warning", "backlog.yml"), ("warning", "backlog.yml")]
+    assert sorted(m for _, p, m in found if p == "backlog.yml") == [
+        "docs/specs/notes/n.md is not on the backlog: agentflow backlog add --spec docs/specs/notes/n.md, "
+        "or list it in backlog.ignore_specs",
+        "docs/specs/x.md is not on the backlog: agentflow backlog add --spec docs/specs/x.md, "
+        "or list it in backlog.ignore_specs"]
+    ignored = _blg(tmp_cfg, tmp_path, text, {"backlog": {"ignore_specs": ["x.md", "notes/*"]}})
+    assert _at(ignored) == []
+
+
+def test_an_item_that_is_done_by_the_runs_but_not_in_the_file_is_a_warning(tmp_cfg, tmp_path, monkeypatch):
+    from agentflow import finished
+
+    monkeypatch.setattr(finished, "recorded", lambda repo, **kw: {"a": "merged", "b": "merged", "c": "merged", "zz": "merged"})
+    text = ("version: 1\nitems:\n  - {id: a, title: A, status: ready}\n  - {id: b, title: B, status: done}\n"
+            "  - {id: c, title: C, status: dropped}\n")
+    found = _blg(tmp_cfg, tmp_path, text)
+    assert _at(found) == [("warning", "backlog.yml items[0].status")]
+    assert "agentflow backlog set a status=done" in _messages(found, "backlog.yml items[0].status")[0]
+
+
+def test_a_backlog_pack_without_a_module_lane_gets_a_warning(tmp_cfg, tmp_path):
+    text = "version: 1\nitems:\n  - {id: a, title: A}\n"
+    found = _blg(tmp_cfg, tmp_path, text, {"dashboard": {"backlog": {"module_lane": None}}})
+    assert ("warning", "dashboard.backlog.module_lane") in [(level, path) for level, path, _ in found]
+    assert _at(found) == []
+    other = [(i.level, i.path) for i in validate(load_config(tmp_cfg({"dashboard": {"backlog": {"module_lane": None}}})), tmp_path)]
+    assert ("warning", "dashboard.backlog.module_lane") not in other  # a capability map pack is not asked for one here
+
+
+@pytest.mark.parametrize("value, path", [
+    ("docs/*", "backlog.ignore_specs"), (3, "backlog.ignore_specs"), ([3], "backlog.ignore_specs[0]"),
+    (["a\nb"], "backlog.ignore_specs[0]"), (["/abs/*"], "backlog.ignore_specs[0]"),
+    (["../x"], "backlog.ignore_specs[0]"), (["a/../b"], "backlog.ignore_specs[0]"),
+    (["ok", "x" * 201], "backlog.ignore_specs[1]"), ([""], "backlog.ignore_specs[0]"),
+    (["a\\b"], "backlog.ignore_specs[0]"),
+])
+def test_ignore_specs_must_be_a_list_of_short_relative_one_line_globs(tmp_cfg, tmp_path, value, path):
+    found = _blg(tmp_cfg, tmp_path, "version: 1\nitems: []\n", {"backlog": {"ignore_specs": value}})
+    assert [(level, where) for level, where, _ in found if where.startswith("backlog")] == [("error", path)]
+
+
+def test_a_symlinked_directory_in_the_work_source_path_that_leaves_the_repository_is_an_error(tmp_cfg, tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-away"
+    outside.mkdir()
+    (outside / "backlog.yml").write_text("version: 1\nitems: []\n", encoding="utf-8")
+    (tmp_path / "link").symlink_to(outside, target_is_directory=True)
+    path = tmp_cfg({"work_source": {"kind": "backlog", "path": "link/backlog.yml"}})
+    found = [(i.level, i.path) for i in validate(load_config(path), tmp_path) if "work_source" in i.path]
+    assert found == [("error", "work_source.path")]
+
+
+def test_a_symlink_loop_in_the_work_source_path_is_an_error_not_a_crash(tmp_cfg, tmp_path):
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    path = tmp_cfg({"work_source": {"kind": "backlog", "path": "loop/backlog.yml"}})
+    cfg = load_config(path)
+    from agentflow import work_source
+
+    found = [(i.level, i.path) for i in validate(cfg, tmp_path) if i.path.startswith(("work_source", "loop/backlog.yml"))]
+    # Python 3.12 raises on the loop (`_unsafe` says so); newer ones resolve it and the read fails instead
+    assert found in ([("error", "work_source.path")], [("error", "loop/backlog.yml")])
+    assert work_source.items(cfg, tmp_path) == [] and work_source.all_items(cfg, tmp_path) == []
+
+
+def test_ignore_specs_accepts_a_list_of_globs(tmp_cfg, tmp_path):
+    found = _blg(tmp_cfg, tmp_path, "version: 1\nitems: []\n", {"backlog": {"ignore_specs": ["README.md", "*/index.md"]}})
+    assert not [e for e in found if e[1].startswith("backlog")]
+
+
+def test_backlog_checks_only_run_for_a_backlog_pack(tmp_cfg, tmp_path):
+    (tmp_path / "backlog.yml").write_text("version: 2\n", encoding="utf-8")
+    baseline = [(i.level, i.path) for i in validate(load_config(tmp_cfg(None)), tmp_path)]
+    assert not [p for _, p in baseline if p.startswith("backlog")]

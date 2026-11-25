@@ -189,7 +189,7 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("issues", "in_progress_label"), "In-progress label (empty = off)", {"kind": "text", "allow_empty": True}),
         (("issues", "comment"), "Comment when a run starts", {"kind": "bool"}),
         (("issues", "epic_labels"), "Epic labels (these get Refs, never Closes)", {"kind": "list"}),
-        (("issues", "sync_label"), "Sync open issues with this label to Backlog (empty = off)",
+        (("issues", "sync_label"), "Sync open issues with this label to Backlog (* = every open issue, empty = off)",
          {"kind": "text", "allow_empty": True}),
         (("issues", "sync_lane"), "Lane for a synced issue no lane label matches", {"kind": "enum", "options": "@lanes"}),
         (("issues", "lane_labels"), "Lane by issue label (first match wins)", {"kind": "map", "value_kind": "text"}),
@@ -242,6 +242,8 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("dashboard", "backlog", "sync_base"), "Fast-forward the base branch", {"kind": "bool"}),
         (("dashboard", "backlog", "module_lane"), "Lane for map modules", {"kind": "enum", "options": "@lanes"}),
         (("dashboard", "backlog", "lane_labels"), "Lane labels", {"kind": "map", "value_kind": "text"}),
+        (("backlog", "ignore_specs"), "Spec files that are not backlog items (globs under the specs folder)",
+         {"kind": "list"}),
     ]),
 ]
 

@@ -297,6 +297,33 @@ def capability_map(path: Path) -> list[ModuleNode]:
     return nodes
 
 
+def capability_responsibilities(path: Path) -> dict[str, str]:
+    """`{module id: responsibility cell}` for the Modules table `capability_map` reads; `{}` when the table has no
+    `Responsibility` column. A cell is returned as written (backticks and all), cut to `LINE_MAX` characters."""
+    found: dict[str, str] = {}
+    id_col = deps_col = resp_col = None
+    in_table = False
+    for line in _read(path).splitlines():
+        if not line.lstrip().startswith("|"):
+            if in_table and found:
+                break
+            continue
+        cells = _cells(line)
+        if id_col is None:
+            lowered = [c.lower() for c in cells]
+            if "module id" in lowered and "depends on" in lowered:
+                id_col, deps_col = lowered.index("module id"), lowered.index("depends on")
+                resp_col = lowered.index("responsibility") if "responsibility" in lowered else None
+                in_table = True
+            continue
+        if resp_col is None or set("".join(cells)) <= set("-: "):
+            continue
+        if len(cells) <= max(id_col, deps_col, resp_col):
+            continue
+        found.setdefault(cells[id_col].strip("` "), cells[resp_col][:LINE_MAX])
+    return found
+
+
 def deps_cell(raw: str) -> list[str]:
     """The module ids in one `Depends on` value: comma-separated, backticks dropped; `—`, `-`, `–` or empty is none."""
     raw = raw.strip()

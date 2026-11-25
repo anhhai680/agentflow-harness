@@ -1,0 +1,74 @@
+# backlog.yml: every backlog item, highest priority first. `agentflow validate` checks it.
+# status: backlog (an idea) | ready (may start) | done | dropped. A run's phase is never written here: the Board
+# shows it from the run's claim (refs/agentflow/claims/<id>).
+version: 1
+items:
+  - id: doubt-review
+    title: "Proposal: a doubt review of the spec and the plan before a human approves them"
+    status: done
+    spec: docs/agentflow-doubt-review-proposal.md
+    plan: docs/plans/2026-11-13-doubt-review-pr1.md
+  - id: harness
+    title: "Proposal: from agentflow (fixed workflow) to an agent harness"
+    status: ready
+    spec: docs/agentflow-harness-proposal.md
+    plan: docs/plans/2026-11-12-agentflow-harness-slice-es.md
+  - id: backlog-file
+    title: "Proposal: one `backlog.yml` for every backlog item, with each item's state on the Board"
+    status: ready
+    spec: docs/specs/agentflow-backlog-file-proposal.md
+    plan: docs/plans/2026-11-24-agentflow-harness-backlog-b1.md
+  - id: conformance
+    title: "Proposal: obligations, conformance audit and scorecard (harness slice 1)"
+    status: done
+    spec: docs/specs/agentflow-conformance-proposal.md
+    plan: docs/plans/2026-11-10-agentflow-harness-slice-conformance.md
+  - id: cost
+    title: "Proposal: agentflow cost — fewer tokens per feature, and features that finish inside the usage window"
+    status: done
+    spec: docs/specs/agentflow-cost-proposal.md
+    plan: docs/plans/2026-11-20-agentflow-harness-cost-c6.md
+  - id: dashboard-ux
+    title: "Proposal: agentflow dashboard — from a board of cards to a run cockpit"
+    status: done
+    spec: docs/specs/agentflow-dashboard-ux-proposal.md
+    plan: docs/plans/2026-11-16-agentflow-harness-dashboard-u5.md
+  - id: agentflow-harness-slice-lr-lessons-retro
+    title: "Slice LR: lessons and retro (the self-improvement loop)"
+    status: done
+    spec: docs/specs/agentflow-harness-slice-lr-lessons-retro.md
+    plan: docs/plans/2026-11-08-agentflow-harness-slice-lr.md
+  - id: issue-dependencies
+    title: "Proposal: show and enforce GitHub issue dependencies on the Backlog"
+    status: done
+    spec: docs/specs/agentflow-issue-dependencies-proposal.md
+    plan: docs/plans/2026-11-14-agentflow-harness-issue-dependencies.md
+  - id: issue-status
+    title: "Proposal: mark a GitHub issue \"in progress\" while an agentflow run works on it"
+    status: done
+    spec: docs/specs/agentflow-issue-status-proposal.md
+    plan: docs/plans/2026-11-10-agentflow-harness-issue-status.md
+  - id: issue-sync
+    title: "Proposal: sync labelled GitHub issues into the Backlog, and mark every issue-backed run"
+    status: done
+    spec: docs/specs/agentflow-issue-sync-proposal.md
+  - id: throughput
+    title: "Proposal: agentflow throughput — from one serial agent to a scheduled team"
+    status: done
+    spec: docs/specs/agentflow-throughput-proposal.md
+    plan: docs/plans/2026-11-22-agentflow-harness-throughput-t7.md
+  - id: validate-fix
+    title: "Proposal: `agentflow validate --fix` repairs the pack problems that have one right answer"
+    status: done
+    spec: docs/specs/agentflow-validate-fix-proposal.md
+    plan: docs/plans/2026-11-13-agentflow-harness-validate-fix.md
+  - id: verify-review
+    title: "Proposal: give `verify` and `review` one purpose each"
+    status: done
+    spec: docs/specs/agentflow-verify-review-proposal.md
+    plan: docs/plans/2026-11-14-agentflow-verify-review.md
+  - id: vuln-fix
+    title: "Proposal: a `vuln` lane that patches vulnerable dependencies, from a Dependabot alert to a reviewed PR"
+    status: done
+    spec: docs/specs/agentflow-vuln-fix-proposal.md
+    plan: docs/plans/2026-11-24-agentflow-harness-vuln-v3.md

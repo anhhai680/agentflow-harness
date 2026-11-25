@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agentflow import finished, gitops, governor, pack, slots, sources, work_source
+from agentflow.backlog_file import BacklogItem
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.gitops import uncommitted_paths
 from agentflow.guards import path_matches
@@ -271,7 +272,7 @@ def rule_checked_plan(cfg: Config, repo: Path, plan: Path | None) -> NextAnswer 
     if plan is None or not sources.parse_plan(plan):
         return None
     module = plan_module(plan, _module_ids(cfg, repo))
-    if module in finished.recorded(repo):
+    if module in finished.recorded(repo, hand_marks=work_source.hand_marks(cfg)):
         return None
     branch = module_branch(cfg, module, feature_runs(cfg, repo).get(module))
     merged, why = branch_is_merged(cfg, repo, branch)
@@ -293,7 +294,7 @@ def rule_spec_without_plan(cfg: Config, repo: Path) -> NextAnswer | None:
     by_module = sources.spec_modules(specs_dir, cfg.project.spec_file)
     order = [m for m in _module_ids(cfg, repo) if m in by_module]
     order += sorted(m for m in by_module if m not in order)
-    done = finished.recorded(repo)
+    done = finished.recorded(repo, hand_marks=work_source.hand_marks(cfg))
     for module in order:
         if module in done:
             continue
@@ -489,6 +490,8 @@ def done_reason(
     tell is no problem: the module just stays). When origin could not be read in full, a prior Done from
     origin evidence or a merge stays as it was. When the marks file is unreadable, a prior hand mark stays, and
     origin evidence makes no new Done (the file may hold a veto) but keeps an earlier one."""
+    if isinstance(node, BacklogItem) and node.status == "done":  # the file says so: nothing else is asked
+        return finished.FILE_SAYS, None
     by_hand, error = marks
     mark = (by_hand.get(node.id) or {}).get("state")
     said = old.get("done_reason")
@@ -501,6 +504,8 @@ def done_reason(
         spec_name = cfg.project.spec_file.format(module=node.id)
     except (KeyError, IndexError, ValueError, AttributeError):  # `validate` reports it; origin then decides nothing
         spec_name = None
+    if isinstance(node, BacklogItem) and node.spec:  # an item names its own spec file
+        spec_name = Path(node.spec).name
     problem = None
     if trust_origin and isinstance(view.specs, gitops.Listing) and spec_name in view.specs.blobs:
         blob = view.specs.blobs[spec_name]
@@ -674,7 +679,7 @@ def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = 
     noun = work_source.noun(cfg)
     view = origin_view(cfg, repo)  # one bounded read of origin per assessment
     known = known_ids(cfg, repo, view)
-    marks = finished.read_marks(repo)
+    marks = finished.read_marks(repo) if work_source.hand_marks(cfg) else ({}, None)  # a backlog file has no marks
     entries, problems, occupied, notes = [], {}, 0, []
     if marks[1]:
         notes.append(f"queue: {marks[1]}; until then origin evidence marks no module newly done")
@@ -715,9 +720,14 @@ def queue_tick(
     state = QueueState(entries)
     done = {e["id"] for e in entries if e["status"] == "done"}
     started: list[str] = []
+    nodes = {n.id: n for n in found.nodes}
+    lanes = ("", module_lane(cfg))
     for entry in entries:
         if entry["status"] != "backlog" or entry["run_id"] or entry["id"] in blocked or not set(entry["deps"]) <= done:
             continue
+        item = nodes.get(entry["id"])
+        if isinstance(item, BacklogItem) and (item.status != "ready" or item.lane not in lanes):
+            continue  # a backlog file starts what it marks `ready`, in the lane of its `module_lane`
         if hold is not None or occupied >= max_parallel:
             break
         wait = slots.queue_hold(cfg, repo)  # per start: a start made this tick counts
@@ -742,12 +752,21 @@ def queue_tick(
 # --------------------------------------------------------------------------- what may run beside what
 
 
-def cached_entries(repo: Path, nodes: list[sources.ModuleNode], runs: dict[str, Run]) -> list[dict]:
+def cached_entries(repo: Path, nodes: list[sources.ModuleNode], runs: dict[str, Run],
+                   hand_marks: bool = True) -> list[dict]:
     """`queue.json`-shaped entries for the map, from files only (no git, no `gh`): `done` (with its `done_reason`) is
-    what the last assessment recorded with the live hand marks and vetoes on top (`finished.recorded`), a module with
-    a run is `running` or `waiting`, the rest is `backlog`."""
+    what the last assessment recorded with the live hand marks and vetoes on top (`finished.recorded`; for a backlog
+    item, the file's own `status` decides `FILE_SAYS`), a module with
+    a run is `running` or `waiting`, the rest is `backlog`. `hand_marks=False` (a `backlog` pack) ignores the marks."""
     prior = {m["id"]: m for m in QueueState.load(repo).modules}
-    done = finished.recorded(repo)
+    done = finished.recorded(repo, hand_marks=hand_marks)
+    for node in nodes:
+        if not isinstance(node, BacklogItem):
+            continue
+        if node.status == "done":  # the file says so, whether or not an assessment has recorded it yet
+            done[node.id] = finished.FILE_SAYS
+        elif done.get(node.id) == finished.FILE_SAYS:  # recorded from an earlier edit of the file: it says otherwise now
+            del done[node.id]
     entries = []
     for node in nodes:
         run = runs.get(node.id)

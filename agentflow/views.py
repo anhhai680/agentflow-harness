@@ -453,6 +453,8 @@ def board(repo: Path, cfg: Config, lane: str | None = None, now: datetime | None
         "after_choices": pile["after_choices"],
         "modules": pile["modules"],
         "backlog_skipped": pile["skipped"],
+        "backlog_dropped": pile["dropped"] if lane is None or lane == module_lane(cfg) else [],
+        "backlog_note": pile["backlog_note"],
         "work_source_kind": work_source.kind(cfg),
         "needs_human": needs,
         "retro_due": due_or_none(repo, cfg, now),

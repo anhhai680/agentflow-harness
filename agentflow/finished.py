@@ -30,6 +30,7 @@ BY_HAND = "done by hand"
 SPEC_SAYS = "spec says done"
 MERGED = "merged"
 ISSUE_CLOSED = "issue closed"  # an `issue-<N>` module whose GitHub issue #N is closed
+FILE_SAYS = "backlog says done"  # a `backlog` item whose `status` is `done` in the backlog file's working tree
 
 _STATES = ("done", "not_done")
 
@@ -41,13 +42,14 @@ def plan_complete(branch: str) -> str:
 
 def from_origin(reason: str) -> bool:
     """Whether `reason` comes from origin evidence (`SPEC_SAYS` or `plan_complete`): the reasons a veto overrides. A
-    merge (`MERGED`) and a hand mark (`BY_HAND`) are not."""
+    merge (`MERGED`), a hand mark (`BY_HAND`) and the backlog file (`FILE_SAYS`: the file is edited, not vetoed) are
+    not."""
     return reason == SPEC_SAYS or reason.startswith(plan_complete(""))
 
 
 def vetoable(reason: str) -> bool:
-    """Whether a veto overrides a Done for `reason`: origin evidence, and a closed issue (it may be reopened). A merge
-    and a hand mark are not."""
+    """Whether a veto overrides a Done for `reason`: origin evidence, and a closed issue (it may be reopened). A merge,
+    a hand mark and the backlog file's `done` are not."""
     return from_origin(reason) or reason == ISSUE_CLOSED
 
 
@@ -131,14 +133,17 @@ def unmark(repo: Path, module: str) -> bool:
     return _change(repo, lambda marks: marks.pop(str(module), None) is not None)
 
 
-def recorded(repo: Path) -> dict[str, str]:
+def recorded(repo: Path, *, hand_marks: bool = True) -> dict[str, str]:
     """`{module: reason}` for every module that is done now, from files only (no git, no `gh`).
 
     The last assessment's done entries in `QUEUE_FILE` (a missing reason, from before reasons were kept, is
     `MERGED`; a broken file counts as none), less an entry done by hand whose mark is gone and an entry done by
     origin evidence or a closed issue (`vetoable`) with a live veto, plus every live done mark as `BY_HAND`. A veto
     never undoes a merge: a module done as `MERGED` stays done. When the marks file cannot be read, the entries stay
-    as recorded, so a module marked done by hand stays done."""
+    as recorded, so a module marked done by hand stays done.
+
+    With `hand_marks=False` (a `backlog` pack, whose file is the only say) the marks file is not read: no mark adds a
+    Done, no veto removes one, and an entry recorded as `BY_HAND` is dropped."""
     try:
         data = json.loads((runs_root(repo) / QUEUE_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -149,6 +154,8 @@ def recorded(repo: Path) -> dict[str, str]:
         if isinstance(entry, dict) and entry.get("status") == "done" and isinstance(entry.get("id"), str):
             reason = entry.get("done_reason")
             done[entry["id"]] = reason if isinstance(reason, str) and reason else MERGED
+    if not hand_marks:
+        return {m: r for m, r in done.items() if r != BY_HAND}
     marks, error = read_marks(repo)
     if error:
         return done
@@ -162,5 +169,5 @@ def recorded(repo: Path) -> dict[str, str]:
     return done
 
 
-__all__ = ["BY_HAND", "ISSUE_CLOSED", "LOCK", "MARKS", "MERGED", "QUEUE_FILE", "SPEC_SAYS", "from_origin", "mark",
+__all__ = ["BY_HAND", "FILE_SAYS", "ISSUE_CLOSED", "LOCK", "MARKS", "MERGED", "QUEUE_FILE", "SPEC_SAYS", "from_origin", "mark",
            "plan_complete", "read_marks", "recorded", "unmark", "veto", "vetoable"]

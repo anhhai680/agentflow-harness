@@ -15,7 +15,9 @@ project:
     plans: docs/plans
   commit_trailer: "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
-work_source: {kind: specs}      # one module per file in `project.docs.specs` that fits `spec_file`
+work_source: {kind: backlog, path: backlog.yml}   # one module per item of `backlog.yml`; `agentflow backlog` edits it
+backlog:
+  ignore_specs: ["agentflow-playbook.md", "agentflow-harness-issue-status.md"]   # docs in `project.docs.specs` that are not backlog items
 
 skills:
   map:                          # the skill `agentflow next` names for each kind of next step
@@ -337,5 +339,5 @@ dashboard:
       feature: Feature
       bug: Bug fix
     new_task:                       # lane: its form fields; a lane left out can't be added from the page
-      feature: [new_module, issue, after]  # a feature card writes docs/agentflow-<id>-proposal.md, or works on issue-<N>
+      feature: [new_module, issue, after]  # a feature card starts a run that writes a new spec (then `agentflow backlog add --spec` lists it), or works on issue-<N>
       bug: [issue, task, after]
