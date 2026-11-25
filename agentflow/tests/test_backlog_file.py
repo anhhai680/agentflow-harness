@@ -198,7 +198,7 @@ def test_set_fields_changes_only_the_named_lines(tmp_path):
     path = tmp_path / "backlog.yml"
     path.write_text("# keep me\r\n" + GOOD.replace("\n", "\r\n"), newline="")
     backlog_file.set_fields(path, "a", {"status": "done", "plan": "docs/plans/p.md"})
-    text = path.read_text(newline="")
+    text = path.read_bytes().decode("utf-8")  # Path.read_text has no newline= before Python 3.13
     assert text.startswith("# keep me\r\n") and "\n" not in text.replace("\r\n", "")
     items, _ = backlog_file.parse(text)
     assert (items[0].status, items[0].plan) == ("done", "docs/plans/p.md") and items[1] == backlog_file.parse(GOOD)[0][1]
