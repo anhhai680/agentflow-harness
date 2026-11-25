@@ -766,3 +766,16 @@ def test_a_refresh_that_changes_the_file_redraws_the_backlog_cards():
     # the entry's data holds the sha, so `patchChildren` builds the card again instead of keeping one that carries the old sha
     source = Path(__file__).resolve().parent.parent.joinpath("dashboard_ui", "board.js").read_text(encoding="utf-8")
     assert source.count("sha: data.backlog_sha256") == 2
+
+
+def test_the_edit_dialogs_lane_choices_are_the_packs_lanes():
+    """Every lane of the pack, not only the New task form's, and the item's own lane even when the pack has dropped it."""
+    stubs = ("el = (tag, p, ...c) => { const kids = c.flat().filter((x) => x);"
+             " const n = {tag, p: p || {}, c: kids, addEventListener() {}, setAttribute(k, v) { n.p[k] = v; }};"
+             " if (tag === 'select') n.options = kids; return n; }; globalThis.Node = Object;"
+             "workLabel = (l) => l; var body; dialog = (title, b) => { body = b; };"
+             "ui = {board: {backlog_sha256: 'x', modules: ['a', 'i'], lanes: ['feature', 'bug', 'vuln'],"
+             " lane_phases: {feature: ['define']}}};")
+    got = js(["board.js"], stubs + """editDialog(args);
+      body.find((n) => n.p.id === 'ei-lane').c.map((o) => o.p.value)""", {**FILE_CARD, "item": {**FILE_ITEM, "lane": "old"}})
+    assert got == ["", "feature", "bug", "vuln", "old"]

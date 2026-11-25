@@ -2425,6 +2425,11 @@ def test_a_card_lists_its_parked_items_and_its_slot(dash):
     assert card["parked"][1]["summary"] == "stuck"
 
 
+def test_the_board_sends_every_lane_of_the_pack_for_the_edit_dialog(dash):
+    data = payload(dash.get("/api/board")[2])
+    assert data["lanes"] == list(dash.flow.cfg.lanes) and set(data["lanes"]) >= set(data["lane_phases"])
+
+
 def test_the_run_card_carries_the_local_only_note(dash):
     run = dash.flow.new_run({"module": "crm"})
     run.emit("phase_started", phase="build")

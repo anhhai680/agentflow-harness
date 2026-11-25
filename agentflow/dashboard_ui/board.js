@@ -401,7 +401,7 @@ function editDialog(card) {
   const sha = shaOf(card);  // of the render that drew this card, whatever a refresh brings while the dialog is open
   const item = card.item;
   const control = (id, label, input) => { input.setAttribute("id", id); return [el("label", { for: id, text: label }), input]; };
-  const lanes = Array.from(new Set([...Object.keys(data.lane_phases || {}), item.lane].filter(Boolean)));
+  const lanes = Array.from(new Set([...(data.lanes || []), item.lane].filter(Boolean)));  // every lane of the pack, not only the New task form's
   const choose = (id, multi, choices, selected) => {
     const select = el("select", { id: id, multiple: multi ? "multiple" : null }, choices.map((c) => el("option", { value: c.key, text: c.label })));
     for (const option of Array.from(select.options)) option.selected = selected.includes(option.value);
