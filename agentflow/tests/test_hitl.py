@@ -1129,3 +1129,9 @@ def test_claim_lost_names_the_three_ways_on(run, cfg):
     assert f"agentflow approve {run.id} build/build" in text and "claims" in text
     assert "agentflow backlog release <id>" in text
     assert f"agentflow cancel {run.id}" in text
+
+
+def test_claim_lost_names_the_item_to_release(run, cfg):
+    run.emit("item_claimed", item="b", ref="refs/agentflow/claims/b", sha="a" * 40, phase="build", status="running")
+    text = hitl._how_to_go_on(run, "claim_lost", "build/claim", False, cfg)
+    assert "`agentflow backlog release b` frees" in text and "<id>" not in text

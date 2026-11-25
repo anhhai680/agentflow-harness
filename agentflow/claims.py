@@ -78,7 +78,14 @@ class Claimed(ClaimError):
 
 
 class HostRefused(ClaimError):
-    """`origin` refused to create the claim ref, and the ref does not exist."""
+    """`origin` refused to create the claim ref twice, and the ref does not exist: a host that refuses custom refs,
+    or a push refused for another reason (credentials, read-only access). `detail` is git's last line, one printable
+    line cut short; the `backlog.claim_ref: branch` advice is a maybe, and never given to a pack already on `branch`."""
+
+    def __init__(self, name: str, detail: str, form: str) -> None:
+        self.name, self.detail = name, one_line(detail) or "git gave no reason"
+        advice = "; if origin refuses custom refs, backlog.claim_ref: branch is the fallback" if form == "refs" else ""
+        super().__init__(f"origin refused the claim ref {name}: {self.detail}{advice}")
 
 
 class Unreachable(ClaimError):
@@ -98,11 +105,12 @@ class Lost(ClaimError):
 
 
 def describe(claim: Claim) -> str:
-    """One line naming who holds `claim`, built only from validated fields."""
+    """One line naming who holds `claim`, built only from validated fields, each cut to one printable line."""
     if claim.unreadable:
-        return f"{claim.item} has an unreadable claim on origin ({claim.unreadable})"
-    return (f"{claim.item} is claimed by {claim.by} (run {claim.run}, {claim.phase}, {claim.status}, "
-            f"updated {claim.updated})")
+        return f"{one_line(claim.item)} has an unreadable claim on origin ({one_line(claim.unreadable)})"
+    by, run, phase, status, updated = (one_line(getattr(claim, key))
+                                       for key in ("by", "run", "phase", "status", "updated"))
+    return f"{one_line(claim.item)} is claimed by {by} (run {run}, {phase}, {status}, updated {updated})"
 
 
 # --------------------------------------------------------------------------- git
@@ -191,8 +199,10 @@ def _now() -> str:
 
 
 def _when(text: object) -> datetime | None:
-    """An ISO-8601 time with a zone, or None."""
-    if not isinstance(text, str) or not 0 < len(text) <= _TIME_MAX or not text.isascii():
+    """An ISO-8601 time with a zone, or None. Printable only: `fromisoformat` takes any one character as the date and
+    time separator, a newline or an escape among them."""
+    if (not isinstance(text, str) or not 0 < len(text) <= _TIME_MAX or not text.isascii()
+            or not text.isprintable()):
         return None
     try:
         found = datetime.fromisoformat(text)
@@ -445,23 +455,25 @@ def create(cfg: Config, repo: Path, item_id: str, *, run: str, lane: str, phase:
     """Claim `item_id` on `origin` for `run`: push a new claim commit leased on the ref not existing.
 
     On a failed push one `ls-remote` decides: the ref holds this very commit → success (the push reached `origin` and
-    only its answer was lost); it holds another → `Claimed` (with the claim, read); it doesn't exist → `HostRefused`
-    (git's message, and the fallback `backlog.claim_ref: branch`); `origin` can't be read → `Unreachable`."""
+    only its answer was lost); it holds another → `Claimed` (with the claim, read); it doesn't exist → push once more
+    (a claim released between the push and the listing, or a passing failure), and `HostRefused` (with git's message)
+    when the second push fails too and the ref still doesn't exist; `origin` can't be read → `Unreachable`."""
     name = ref(cfg, item_id)
     _check_fields(cfg, run, lane, phase, status)
     now = _now()
     claim = Claim(item=item_id, run=run, lane=lane, phase=phase, status=status, by=committer(repo),
                   started=now, updated=now)
     sha = _commit(repo, claim, None)
-    for _ in range(2):  # a claim released while it was being read is tried once more
+    for attempt in range(2):  # a claim released while it was being pushed or read is tried once more
         proc = _push(repo, name, "", sha)
         listed = _ls_remote(repo, name) if proc.returncode != 0 else {}
         if proc.returncode == 0 or listed.get(name) == sha:
             _keep(repo, item_id, sha)
             return replace(claim, sha=sha)
         if name not in listed:
-            raise HostRefused(f"origin refused the claim ref {name} ({_detail(proc)}); a host that refuses "
-                              "custom refs needs backlog.claim_ref: branch")
+            if attempt == 0:
+                continue
+            raise HostRefused(name, _detail(proc), cfg.backlog.claim_ref)
         current = read(cfg, repo, item_id)
         if current is not None and current.sha == sha:
             _keep(repo, item_id, sha)

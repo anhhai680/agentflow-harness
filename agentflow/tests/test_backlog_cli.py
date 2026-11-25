@@ -358,6 +358,14 @@ def test_release_frees_any_claim_including_a_stale_one(bf, tmp_path, capsys, mon
     assert capsys.readouterr().out.startswith("error: ")
 
 
+def test_release_prints_every_claim_field_on_one_line(bf, monkeypatch):
+    odd = claims.Claim(item="b", run="r\x1b[2J", lane="feature", phase="plan\n", status="running\r", by="Test",
+                       started="x", updated="2026-01-01\n00:00:00+00:00", sha="a" * 40)
+    monkeypatch.setattr(claims, "release_item", lambda cfg, repo, item_id: odd)
+    lines = backlog.release_item(bf.cfg, bf.root, "b")
+    assert lines and all(line.isprintable() for line in lines), lines
+
+
 def test_release_names_a_live_local_run(flow_repo, capsys):
     from test_claim_runs import ClaimFlow
 

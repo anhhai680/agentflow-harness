@@ -1425,8 +1425,9 @@ def release_item(cfg: Config, repo: Path, item_id: str) -> list[str]:
     if freed.unreadable:
         lines = [f"{item_id}: released an unreadable claim ({claim_sync._cut(freed.unreadable)})"]
     else:
-        lines = [f"{item_id}: released the claim of {claim_sync._cut(freed.by)} (run {freed.run}, {freed.phase}, "
-                 f"{freed.status}, updated {freed.updated})"]
+        by, run_id, phase, status, updated = (claim_sync._cut(getattr(freed, key))
+                                              for key in ("by", "run", "phase", "status", "updated"))
+        lines = [f"{item_id}: released the claim of {by} (run {run_id}, {phase}, {status}, updated {updated})"]
     for run in list_runs(repo):
         try:
             row = run.refresh().get("claim")

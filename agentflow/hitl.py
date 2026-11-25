@@ -26,6 +26,7 @@ from . import pack, safeio
 from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RECONCILE_CHANGED, RETRO_PIPELINE, Config, for_lane
 from .events import nfc, parse_iso
 from .park import radius_line
+from .sources import MODULE_ID
 from .state import TERMINAL, Run, list_runs, speculating
 
 RESULT_STATUSES = ("done", "blocked", "needs_human", "effort_change", "unchanged")
@@ -641,9 +642,11 @@ def _way_on(run: Run, kind: str, key: str, has_questions: bool, cfg: Config, tim
                 f"`agentflow approve {run.id} {key}` accepts this head unchecked and marks the PR ready, or set "
                 f"`vuln.dependency_review: false`.")
     if kind == "claim_lost":
+        item = (run.state.get("claim") or {}).get("item")
+        item = item if isinstance(item, str) and MODULE_ID.fullmatch(item) else "<id>"
         return (f"This run's claim on its backlog item was taken or deleted on `origin`, so it stopped before changing "
                 f"anything there. `agentflow approve {run.id} {key}` claims the item again and goes on (it stops again, "
-                f"naming the new claimant, if the item is not free); `agentflow backlog release <id>` frees "
+                f"naming the new claimant, if the item is not free); `agentflow backlog release {item}` frees "
                 f"another claim that is in the way; `agentflow cancel {run.id}` ends the run.")
     if kind == "review_unresolved":
         return (f"Fix the code yourself if you want, then `agentflow approve {run.id} {key}` gives the reviewer one last "

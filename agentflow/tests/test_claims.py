@@ -237,6 +237,39 @@ def test_a_host_that_hides_the_namespace_is_refused(flow_repo):
     assert not any("claims" in name for name in remote_refs(flow_repo))
 
 
+def _failing_push(monkeypatch, stderr: str, times: int) -> list[str]:
+    """Make the first `times` claim pushes fail with `stderr` (the rest go through); the names pushed to."""
+    real, pushed = claims._push, []
+
+    def push(repo, name, expected, source):
+        pushed.append(name)
+        if len(pushed) <= times:
+            return subprocess.CompletedProcess(["git", "push"], 128, "", stderr)
+        return real(repo, name, expected, source)
+
+    monkeypatch.setattr(claims, "_push", push)
+    return pushed
+
+
+def test_a_push_refused_for_another_reason_keeps_gits_text(flow_repo, cfg, form, monkeypatch):
+    denied = "remote: Permission to origin.git denied to someone.\nfatal: unable to access: \x1b[31m403\x1b[0m"
+    pushed = _failing_push(monkeypatch, denied, times=2)
+    with pytest.raises(claims.HostRefused) as caught:
+        claims.create(cfg, flow_repo.root, "b", run=RUN, lane="feature", phase="define")
+    text = str(caught.value)
+    assert len(pushed) == 2  # pushed once more before calling it a refusal
+    assert caught.value.detail == "fatal: unable to access: ?[31m403?[0m" and caught.value.detail in text
+    assert "\n" not in text and "\x1b" not in text
+    assert ("backlog.claim_ref: branch" in text) is (form == "refs")
+    assert claims.ref(cfg, "b") not in remote_refs(flow_repo)
+
+
+def test_a_claim_released_between_the_push_and_the_listing_is_pushed_again(flow_repo, cfg, monkeypatch):
+    pushed = _failing_push(monkeypatch, "! [rejected] (stale info)", times=1)
+    held = claims.create(cfg, flow_repo.root, "b", run=RUN, lane="feature", phase="define")
+    assert len(pushed) == 2 and remote_refs(flow_repo)[claims.ref(cfg, "b")] == held.sha
+
+
 def test_no_origin_or_claims_off_is_not_enabled(flow_repo):
     assert claims.enabled(pack(flow_repo), flow_repo.root)
     assert not claims.enabled(pack(flow_repo, claims=False), flow_repo.root)
@@ -326,6 +359,9 @@ def _without(key: str) -> bytes:
     ("by with a newline", _with(by="Mallory\nrm -rf")),
     ("by of 101 characters", _with(by="x" * 101)),
     ("updated yesterday", _with(updated="yesterday")),
+    ("a newline for the T", _with(started="2026-01-01\n00:00:00+00:00")),
+    ("a carriage return for the T", _with(updated="2026-01-01\r00:00:00+00:00")),
+    ("an escape for the T", _with(updated="2026-01-01\x1b00:00:00+00:00")),
     ("over 4096 bytes", _with(pad="x" * 5000)),
     ("not utf-8", b'{"item": "\xff"}'),
     ("no claim.json", None),
@@ -366,6 +402,14 @@ def run_git_input(cwd: Path, text: str, *args: str) -> str:
 def test_parse_claim_never_raises(flow_repo, text):
     found = claims.parse_claim(pack(flow_repo), "b", text, "a" * 40)
     assert found.unreadable and found.sha == "a" * 40 and found.item == "b"
+
+
+def test_describe_prints_every_field_on_one_line():
+    odd = claims.Claim(item="b", run="r\x1b[2J", lane="feature", phase="plan\n", status="running\r", by="T\x07",
+                       started="x", updated="2026-01-01\n00:00:00+00:00", sha="a" * 40)
+    assert claims.describe(odd).isprintable()
+    assert claims.describe(claims.Claim(**VALID, sha="a" * 40)) == (
+        "b is claimed by Test (run 20261125-0900-feature-b, build, waiting, updated 2026-11-24T10:40:55Z)")
 
 
 def test_parse_claim_reads_a_valid_claim(flow_repo):
