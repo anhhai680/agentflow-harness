@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -256,7 +257,8 @@ def _ident(by: str) -> str:
 
 
 def _commit(repo: Path, claim: Claim, parent: str | None) -> str:
-    """The commit of `claim` (one file, `claim.json`), on `parent` when given, written without a work tree."""
+    """The commit of `claim` (one file, `claim.json`), on `parent` when given, written without a work tree. Its
+    message carries a random nonce, so two commits are never equal: an equal sha on `origin` proves authorship."""
     blob = _ok(_run(repo, "hash-object", "-w", "--no-filters", "--stdin", input=_text(claim)), "write the claim")
     if not _FULL_SHA.fullmatch(blob):
         raise ClaimError(f"could not write the claim: git returned {blob[:80]!r}")
@@ -266,7 +268,8 @@ def _commit(repo: Path, claim: Claim, parent: str | None) -> str:
     name = _ident(claim.by)
     env = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": EMAIL, "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": EMAIL}
     parents = ("-p", parent) if parent else ()
-    sha = _ok(_run(repo, "-c", "commit.gpgsign=false", "commit-tree", tree, *parents, "-m", f"claim {claim.item}",
+    sha = _ok(_run(repo, "-c", "commit.gpgsign=false", "commit-tree", tree, *parents, "-m",
+                   f"claim {claim.item} {secrets.token_hex(8)}",
                    env=env), "commit the claim")
     if not _FULL_SHA.fullmatch(sha):
         raise ClaimError(f"could not commit the claim: git returned {sha[:80]!r}")
@@ -387,9 +390,9 @@ def create(cfg: Config, repo: Path, item_id: str, *, run: str, lane: str, phase:
            status: str = "running") -> Claim:
     """Claim `item_id` on `origin` for `run`: push a new claim commit leased on the ref not existing.
 
-    On a failed push one `ls-remote` decides: the ref exists → `Claimed` (with the claim, read); it doesn't →
-    `HostRefused` (git's message, and the fallback `backlog.claim_ref: branch`); `origin` can't be read →
-    `Unreachable`."""
+    On a failed push one `ls-remote` decides: the ref holds this very commit → success (the push reached `origin` and
+    only its answer was lost); it holds another → `Claimed` (with the claim, read); it doesn't exist → `HostRefused`
+    (git's message, and the fallback `backlog.claim_ref: branch`); `origin` can't be read → `Unreachable`."""
     name = ref(cfg, item_id)
     _check_fields(cfg, run, lane, phase, status)
     now = _now()
@@ -398,22 +401,36 @@ def create(cfg: Config, repo: Path, item_id: str, *, run: str, lane: str, phase:
     sha = _commit(repo, claim, None)
     for _ in range(2):  # a claim released while it was being read is tried once more
         proc = _push(repo, name, "", sha)
-        if proc.returncode == 0:
+        listed = _ls_remote(repo, name) if proc.returncode != 0 else {}
+        if proc.returncode == 0 or listed.get(name) == sha:
             _keep(repo, item_id, sha)
             return replace(claim, sha=sha)
-        if name not in _ls_remote(repo, name):
+        if name not in listed:
             raise HostRefused(f"origin refused the claim ref {name} ({_detail(proc)}); a host that refuses "
                               "custom refs needs backlog.claim_ref: branch")
         current = read(cfg, repo, item_id)
+        if current is not None and current.sha == sha:
+            _keep(repo, item_id, sha)
+            return replace(claim, sha=sha)
         if current is not None:
             raise Claimed(current)
     raise Unreachable(f"the claim ref {name} kept changing on origin")
 
 
+def _descends(repo: Path, ancestor: str, sha: str) -> bool:
+    """`sha` is `ancestor` or a commit built on it (both already in `repo`)."""
+    if not (_FULL_SHA.fullmatch(ancestor) and _FULL_SHA.fullmatch(sha)):
+        return False
+    return _run(repo, "merge-base", "--is-ancestor", ancestor, sha).returncode == 0
+
+
 def _settle(cfg: Config, repo: Path, held: Claim, expected: str, proc: subprocess.CompletedProcess,
             retried: bool) -> Claim | None:
     """After a leased push on `expected` failed: the claim of the same run to retry on, or None when the ref is
-    gone. `Lost` when another claim holds it (or the same run moved it again after the retry); `Unreachable` when
+    gone. The same run means the same run id *and* a commit that descends from `held.sha`: run ids are not unique
+    across machines, but another process of this run builds on this run's own commits, while another machine's
+    claim starts from a root commit. `Lost` when another claim holds the ref, or when the same run moved it again
+    after the one retry (the retry is exhausted, and `Lost` carries the run's own claim); `Unreachable` when
     `origin` can't be read, or still holds `expected` (the push failed for another reason than its lease)."""
     current = read(cfg, repo, held.item)
     if current is None:
@@ -422,15 +439,17 @@ def _settle(cfg: Config, repo: Path, held: Claim, expected: str, proc: subproces
         raise Lost(current, held.item)
     if current.sha == expected:
         raise Unreachable(f"could not push the claim on {held.item}: {_detail(proc)}")
-    if retried:
+    if not _descends(repo, held.sha, current.sha) or retried:
         raise Lost(current, held.item)
     return current
 
 
 def advance(cfg: Config, repo: Path, held: Claim, *, phase: str, status: str) -> Claim:
     """Move the claim `held` to `phase` and `status`: a new commit on top, pushed leased on `held.sha`. When the ref
-    holds a newer commit of the same run (another process of it), retry once on that. `Lost` when the claim is gone
-    or another claim holds the ref (nothing is pushed over it); `Unreachable` when `origin` can't be reached."""
+    holds a newer commit of the same run (the same run id, built on `held.sha`: another process of it), retry once
+    on that. `Lost` when the claim is gone, another claim holds the ref (nothing is pushed over it), or the same run
+    moved it again after the retry (`Lost` then carries the run's own claim); `Unreachable` when `origin` can't be
+    reached."""
     name = ref(cfg, held.item)
     expected = _held_sha(held)
     _check_fields(cfg, held.run, held.lane, phase, status)
@@ -451,8 +470,9 @@ def advance(cfg: Config, repo: Path, held: Claim, *, phase: str, status: str) ->
 
 def release(cfg: Config, repo: Path, held: Claim) -> None:
     """Delete the claim `held` from `origin`, leased on `held.sha`. A ref already gone is success; one holding a
-    newer commit of the same run is deleted on that, once. `Lost` when another claim holds the ref (it stays);
-    `Unreachable` when `origin` can't be reached."""
+    newer commit of the same run (the same run id, built on `held.sha`) is deleted on that, once. `Lost` when
+    another claim holds the ref (it stays), or the same run moved it again after the retry (`Lost` then carries the
+    run's own claim); `Unreachable` when `origin` can't be reached."""
     name = ref(cfg, held.item)
     expected = _held_sha(held)
     for retried in (False, True):

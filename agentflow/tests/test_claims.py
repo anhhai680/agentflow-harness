@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -145,6 +146,49 @@ def test_advance_over_a_newer_commit_of_the_same_run_retries_once(flow_repo, tmp
 
 
 # --------------------------------------------------------------------------- release
+
+
+def test_another_machines_claim_with_the_same_run_id_is_never_pushed_over(flow_repo, tmp_path, cfg):
+    """Run ids are not unique across machines: a claim that only shares the id, not the lineage, is lost."""
+    name = claims.ref(cfg, "b")
+    held = claims.create(cfg, flow_repo.root, "b", run=RUN, lane="feature", phase="define")
+    other = second_clone(flow_repo, tmp_path)
+    run_git(other, "push", "-q", "origin", f":{name}")
+    theirs = claims.create(cfg, other, "b", run=RUN, lane="feature", phase="define")
+    assert theirs.run == held.run and theirs.sha != held.sha
+
+    with pytest.raises(claims.Lost) as caught:
+        claims.advance(cfg, flow_repo.root, held, phase="build", status="running")
+    assert caught.value.claim == theirs
+    assert remote_refs(flow_repo)[name] == theirs.sha
+    with pytest.raises(claims.Lost) as caught:
+        claims.release(cfg, flow_repo.root, held)
+    assert caught.value.claim == theirs
+    assert remote_refs(flow_repo)[name] == theirs.sha
+
+
+def test_a_create_whose_answer_was_lost_is_still_made(flow_repo, cfg, monkeypatch):
+    real = claims._push
+
+    def lost_answer(repo, name, expected, source):
+        proc = real(repo, name, expected, source)
+        assert proc.returncode == 0
+        return subprocess.CompletedProcess(proc.args, 124, "", "git push timed out")
+
+    monkeypatch.setattr(claims, "_push", lost_answer)
+    held = claims.create(cfg, flow_repo.root, "b", run=RUN, lane="feature", phase="define")
+    assert remote_refs(flow_repo)[claims.ref(cfg, "b")] == held.sha
+    assert claims.read(cfg, flow_repo.root, "b") == held
+
+
+def test_two_claim_commits_from_identical_arguments_differ(flow_repo):
+    claim = claims.Claim(item="b", run=RUN, lane="feature", phase="define", status="running", by="Test",
+                         started="2026-11-25T09:00:00Z", updated="2026-11-25T09:00:00Z")
+    first = claims._commit(flow_repo.root, claim, None)
+    second = claims._commit(flow_repo.root, claim, None)
+    assert first != second
+    assert run_git(flow_repo.root, "rev-parse", f"{first}^{{tree}}") == run_git(
+        flow_repo.root, "rev-parse", f"{second}^{{tree}}")
 
 
 def test_release_deletes_with_a_lease(flow_repo, tmp_path, cfg):
