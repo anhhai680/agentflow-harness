@@ -395,11 +395,16 @@ def _key_lines(lines: list[str], first: int, end: int, col: int, item_id: str) -
 
 
 def set_fields(path: Path, item_id: str, fields: dict[str, object]) -> None:
-    """Set `fields` of the item `item_id` in the file at `path`, changing only those lines. A key's line is replaced,
-    or inserted after the `- id:` line; an empty value (`""`, `[]`, `None`) removes the key's line. The new text is parsed
-    first: the item must hold the new values and nothing else may change. `EditRefused`, with the file untouched, when
-    it cannot."""
-    text = _load(path)
+    """Set `fields` of the item `item_id` in the file at `path`, changing only those lines (`set_fields_text`).
+    `EditRefused`, with the file untouched, when it cannot."""
+    _store(path, set_fields_text(_load(path), item_id, fields, name=path.name))
+
+
+def set_fields_text(text: str, item_id: str, fields: dict[str, object], *, name: str = FILE) -> str:
+    """`text` with `fields` of the item `item_id` set, changing only those lines. A key's line is replaced, or inserted
+    after the `- id:` line; an empty value (`""`, `[]`, `None`) removes the key's line. The new text is parsed first: the
+    item must hold the new values and nothing else may change. `EditRefused` when it cannot; `name` is the file's name
+    in its message."""
     for key in fields:
         if key == "id":
             raise EditRefused("an item's id is never renamed")
@@ -410,7 +415,7 @@ def set_fields(path: Path, item_id: str, fields: dict[str, object]) -> None:
     items, problems = parse(text)
     index = next((n for n, item in enumerate(items) if item.id == item_id), None)
     if index is None:
-        raise EditRefused(f"item {item_id} is not in {path.name}, or has an error")
+        raise EditRefused(f"item {item_id} is not in {name}, or has an error")
     lines = _LINE.findall(text)
     first, end, col = _find_block(lines, item_id)
     keys = _key_lines(lines, first + 1, end, col, item_id)
@@ -447,7 +452,7 @@ def set_fields(path: Path, item_id: str, fields: dict[str, object]) -> None:
         or _new_problems(problems, after_problems)
     ):
         raise EditRefused(f"the new values for item {item_id} are not valid: {_why(problems, after_problems, fields)}")
-    _store(path, new)
+    return new
 
 
 def _why(before: list[Problem], after: list[Problem], fields: dict[str, object]) -> str:
@@ -456,16 +461,21 @@ def _why(before: list[Problem], after: list[Problem], fields: dict[str, object])
 
 
 def append_item(path: Path, item: BacklogItem) -> None:
-    """Add `item` after the last item of the file at `path`, leaving every other line as it is. `EditRefused`, with the
-    file untouched, for a missing file, a duplicate id, a list written in flow style, or an item that does not parse."""
-    text = _load(path)
+    """Add `item` after the last item of the file at `path` (`append_item_text`). `EditRefused`, with the file
+    untouched, for a missing file or anything `append_item_text` refuses."""
+    _store(path, append_item_text(_load(path), item, name=path.name))
+
+
+def append_item_text(text: str, item: BacklogItem, *, name: str = FILE) -> str:
+    """`text` with `item` added after its last item, every other line as it is. `EditRefused` for a duplicate id, a list
+    written in flow style, or an item that does not parse; `name` is the file's name in its message."""
     items, problems = parse(text)
     if any(other.id == item.id for other in items):
-        raise EditRefused(f"item {item.id} is already in {path.name}")
+        raise EditRefused(f"item {item.id} is already in {name}")
     lines = _LINE.findall(text)
     head = next((n for n, line in enumerate(lines) if re.match(r"items:", line)), None)
     if head is None:
-        raise EditRefused(f"{path.name} has no `items:` list")
+        raise EditRefused(f"{name} has no `items:` list")
     rest = lines[head][len("items:") :].split("#", 1)[0].strip()  # no regex: the line may hold a long run of blanks
     nl = _ending(lines[head]) or ("\r\n" if "\r\n" in text else "\n")
     out = list(lines)
@@ -480,7 +490,7 @@ def append_item(path: Path, item: BacklogItem) -> None:
             if last == head:
                 found = re.match(r"( *)- ", lines[j])
                 if found is None:
-                    raise EditRefused(f"the items list of {path.name} is not written as a block")
+                    raise EditRefused(f"the items list of {name} is not written as a block")
                 indent = len(found.group(1))
             last = j
         at = last + 1
@@ -490,11 +500,11 @@ def append_item(path: Path, item: BacklogItem) -> None:
         out[head] = "items:" + nl
         at = head + 1
     else:
-        raise EditRefused(f"the items list of {path.name} is written in flow style: edit it by hand")
+        raise EditRefused(f"the items list of {name} is written in flow style: edit it by hand")
     block = [line + nl for line in _block(item, indent if rest == "" else 2)]
     out[at:at] = block
     new = "".join(out)
     after_items, after_problems = parse(new)
     if after_items != [*items, item] or _new_problems(problems, after_problems):
         raise EditRefused(f"item {item.id} is not valid: {_why(problems, after_problems, {})}")
-    _store(path, new)
+    return new

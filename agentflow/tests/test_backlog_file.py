@@ -349,3 +349,32 @@ def test_set_fields_is_linear_on_a_long_run_of_blanks(tmp_path):
     long_list.write_text("version: 1\nitems:" + pad + "# note\n")
     backlog_file.append_item(long_list, BacklogItem("c", [], title="C"))
     assert [i.id for i in backlog_file.read(long_list)[0]] == ["c"]
+
+
+def test_set_fields_text_and_append_item_text_match_the_file_functions(tmp_path):
+    text = "# top\r\n" + GOOD.replace("\n", "\r\n")
+    path = tmp_path / "backlog.yml"
+    for fields in ({"status": "done", "plan": "docs/plans/p.md"}, {"depends_on": [], "notes": "n"}):
+        path.write_bytes(text.encode())
+        backlog_file.set_fields(path, "b", fields)
+        assert backlog_file.set_fields_text(text, "b", fields) == path.read_bytes().decode()
+    item = BacklogItem("c", ["a"], title="C", lane="bug")
+    path.write_bytes(text.encode())
+    backlog_file.append_item(path, item)
+    assert backlog_file.append_item_text(text, item) == path.read_bytes().decode()
+    for item_id, fields in (("nope", {"status": "done"}), ("a", {"status": "wip"}), ("a", {"id": "z"})):
+        path.write_bytes(text.encode())
+        with pytest.raises(backlog_file.EditRefused) as by_path:
+            backlog_file.set_fields(path, item_id, fields)
+        with pytest.raises(backlog_file.EditRefused) as by_text:
+            backlog_file.set_fields_text(text, item_id, fields)
+        assert str(by_text.value) == str(by_path.value)
+    for bad in (BacklogItem("a", [], title="again"), BacklogItem("d", [], title="two\nlines")):
+        with pytest.raises(backlog_file.EditRefused) as by_path:
+            backlog_file.append_item(path, bad)
+        with pytest.raises(backlog_file.EditRefused) as by_text:
+            backlog_file.append_item_text(text, bad)
+        assert str(by_text.value) == str(by_path.value)
+    with pytest.raises(backlog_file.EditRefused):
+        backlog_file.set_fields_text(FLOW, "f", {"status": "done"})
+    assert path.read_bytes() == text.encode()

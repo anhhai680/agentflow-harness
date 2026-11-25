@@ -1431,11 +1431,18 @@ def _work_source(raw: dict) -> WorkSource | None:
     return WorkSource(kind=kind, path=_optional(block, "path", "work_source", str, ""))
 
 
-def _backlog_forbidden(work_source: WorkSource | None) -> list[str]:
-    """The backlog file's path as a forbidden path (`./backlog.yml` becomes `backlog.yml`), for a `backlog` work source."""
+def backlog_path(work_source: WorkSource | None) -> str | None:
+    """The backlog file's path, normalised (`./backlog.yml` becomes `backlog.yml`), or None unless the work source is
+    `backlog`."""
     if work_source is None or work_source.kind != "backlog":
-        return []
-    return [PurePosixPath(work_source.path).as_posix()]
+        return None
+    return PurePosixPath(work_source.path).as_posix()
+
+
+def _backlog_forbidden(work_source: WorkSource | None) -> list[str]:
+    """The backlog file's path as a forbidden path, for a `backlog` work source."""
+    path = backlog_path(work_source)
+    return [path] if path else []
 
 
 def _backlog_policy(raw: dict) -> BacklogPolicy:

@@ -51,6 +51,7 @@ def initial_state() -> dict:
         "worktree": None,
         "base_sha": None,
         "pr_url": None,
+        "backlog_sha": None,  # the newest `backlog_updated` commit: the run reads its own item at this sha
         "phase": None,
         "step": None,
         "task": None,
@@ -920,6 +921,10 @@ def _on_pr_opened(state: dict, ev: dict) -> None:
     state["pr_url"] = ev.get("url") or state["pr_url"]
 
 
+def _on_backlog_updated(state: dict, ev: dict) -> None:
+    state["backlog_sha"] = ev["sha"]
+
+
 def _on_permission_denied(state: dict, ev: dict) -> None:
     row = _step_row(state, ev["key"])
     row["permission_denials"] = row.get("permission_denials", 0) + 1
@@ -946,6 +951,7 @@ HANDLERS: dict[str, Callable[[dict, dict], None]] = {
     "run_cancelled": _on_run_cancelled,
     "runner_error": _on_runner_error,
     "pr_opened": _on_pr_opened,
+    "backlog_updated": _on_backlog_updated,
     "phase_started": _on_phase_started,
     "phase_skipped": _on_phase_skipped,
     "phase_approval_raised": _on_phase_approval_raised,
@@ -1042,6 +1048,7 @@ REQUIRED: dict[str, tuple[Any, ...]] = {
     "handoff_written": ("phase",),
     "hitl_raised": ("kind", "key"),
     "module_added": ("module", "sha"),
+    "backlog_updated": ("item", "change", "sha"),
     "run_held": ("key", "reason", "until"),
     "run_hold_ended": ("key",),
     "usage_governed": ("key", "level"),
