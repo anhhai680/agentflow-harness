@@ -7,15 +7,13 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
-### Added
-- `issues.sync_label: "*"` syncs every open GitHub issue to the Backlog, whatever its labels, and `issues.lane_labels` still picks each one's lane (so a `bug` issue is a bug card). Before, only issues carrying the one sync label were shown.
-
 ## [3.9] - 2026-11-24
 
 ### Added
 - `work_source: {kind: backlog, path: backlog.yml}`: one `backlog.yml` holds every backlog item (`id`, `title`, `status` of `backlog`, `ready`, `done` or `dropped`, `lane`, `spec`, `plan`, `depends_on`, `issue`, `notes`), in priority order. An item's `spec` and `plan` replace the file-name rule, and in a run the file is read at the run's fork commit, never from its worktree. `backlog.ignore_specs` lists the spec-folder files that are docs and not items, and `validate` checks the file and warns about a Markdown spec no item names. This repository's pack now uses it.
 - `agentflow backlog list [--all] [--json]`, `add`, `set <id> key=value …` and `import [--dry-run]` read and edit `backlog.yml` (comments and line endings stay as they are), and `import` writes the first file from the current work source.
 - The Board shows backlog items with their title and an idea chip, lists `dropped` items under Dropped, and lists spec files no item names under Not on the backlog.
+- `issues.sync_label: "*"` syncs every open GitHub issue to the Backlog, whatever its labels, and `issues.lane_labels` still picks each one's lane (so a `bug` issue is a bug card). Before, only issues carrying the one sync label were shown.
 
 ### Changed
 - With a backlog pack, `agentflow backlog done` and `undone` edit the file's `status`, and `agentflow queue` starts only `ready` items and ignores `--include-specs` with a note.
