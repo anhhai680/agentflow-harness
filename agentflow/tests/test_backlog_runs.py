@@ -184,6 +184,21 @@ def test_a_refused_backlog_commit_puts_the_committed_file_back(bflow):
     assert run_git(worktree, "status", "--porcelain") == "" and bflow.events(run, "backlog_updated") == []
 
 
+def test_a_failed_backlog_commit_puts_the_file_and_the_index_back(bflow):
+    """`git commit` itself fails (a signing program that refuses): the file and the index are as committed, and the next
+    write works."""
+    run, worktree = _started(bflow)
+    run_git(worktree, "config", "commit.gpgsign", "true")
+    run_git(worktree, "config", "gpg.program", "false")
+    with pytest.raises(gitops.GitError) as caught:
+        backlog_writes.write(bflow.cfg, run, worktree, "done", _done, "Mark b done in the backlog")
+    assert not isinstance(caught.value, CommitRejected)
+    assert (worktree / "backlog.yml").read_text(encoding="utf-8") == BACKLOG_YML
+    assert run_git(worktree, "status", "--porcelain") == "" and bflow.events(run, "backlog_updated") == []
+    run_git(worktree, "config", "commit.gpgsign", "false")
+    assert backlog_writes.write(bflow.cfg, run, worktree, "done", _done, "Mark b done in the backlog")
+
+
 # --------------------------------------------------------------------------- the first commit
 
 
@@ -336,6 +351,19 @@ def test_refusals_leave_no_run(bflow, case):
         start(bflow.cfg, bflow.repo.root, "feature", {"module": module}, RunOptions(new_module=new))
     assert str(caught.value) == message.format(fork=bflow.cfg.project.fork_from)
     assert list_runs(bflow.repo.root) == [] and run_git(bflow.repo.root, "branch", "--list") == branches
+
+
+@pytest.mark.parametrize("closed", ["done", "dropped"])
+def test_an_item_reopened_only_in_the_work_tree_is_refused_with_commit_it_first(bflow, closed):
+    """The fork says done (or dropped) and your work tree already says ready: the start says to commit that change."""
+    at_fork = BACKLOG_YML.replace("    title: Alpha\n    status: done\n", f"    title: Alpha\n    status: {closed}\n")
+    (bflow.repo.root / "backlog.yml").write_text(at_fork, encoding="utf-8")
+    run_git(bflow.repo.root, "commit", "-q", "--allow-empty", "-am", f"a is {closed}")
+    (bflow.repo.root / "backlog.yml").write_text(at_fork.replace(f"status: {closed}", "status: ready"), encoding="utf-8")
+    with pytest.raises(ValueError) as caught:
+        start(bflow.cfg, bflow.repo.root, "feature", {"module": "a"}, RunOptions())
+    assert str(caught.value) == f"module a is {closed} on {bflow.cfg.project.fork_from}: commit the change first"
+    assert list_runs(bflow.repo.root) == []
 
 
 # --------------------------------------------------------------------------- spec and plan after their step

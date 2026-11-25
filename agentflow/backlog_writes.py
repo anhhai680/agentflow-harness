@@ -31,6 +31,7 @@ from agentflow.backlog_file import BacklogItem
 from agentflow.commit_checks import runner_head
 from agentflow.config import Config, backlog_path
 from agentflow.gitops import CommitRejected
+from agentflow.guards import HARDENED
 from agentflow.intake import issue_number
 from agentflow.state import Run
 
@@ -76,12 +77,15 @@ def _fields(before: BacklogItem | None, after: BacklogItem) -> dict[str, object]
 
 
 def _put_back(worktree: Path, path: str, head: str, written: str, committed: bytes | None) -> None:
-    """After a refused commit, put the committed file back where the runner wrote: only when no commit was made and the
-    file still holds exactly what the runner wrote, so a change another process made is never overwritten."""
+    """After a refused or failed commit, put the index and the committed file back where the runner wrote: only when no
+    commit was made, and the file only when it still holds exactly what the runner wrote, so a change another process
+    made is never overwritten."""
     target = worktree / path
     try:
         if gitops.head(worktree) != head:
             return  # a commit was made and left for a human: the file is what it records
+        subprocess.run(["git", *HARDENED, "--literal-pathspecs", "reset", "-q", "--", path], cwd=worktree,
+                       capture_output=True, check=False)  # the index back at `HEAD` for the file, as a refusal leaves it
         if safeio.read_bytes(target, backlog_file.FILE_MAX + 1) != written.encode("utf-8"):
             return
         if committed is None:
@@ -100,8 +104,9 @@ def write(cfg: Config, run: Run, worktree: Path, change: str, edit: Callable[[st
     `HEAD` must be `runner_head(run)` (`agent_commit`), and the work tree's file must hold the bytes committed there, or
     be absent where the commit has none (`outside_output`), else `CommitRejected` is raised with nothing written. The
     item is the run's `module` param, and `edit` may change only that item. `edit`'s `backlog_file.EditRefused`, an edit
-    that changes another item, a file that is not UTF-8, and `commit_backlog`'s `CommitRejected` all reach the caller;
-    after a refused commit the file is put back as committed, unless something other than the runner changed it since.
+    that changes another item, a file that is not UTF-8, and `commit_backlog`'s `CommitRejected` and `GitError` all reach
+    the caller; after a refused or failed commit the index and the file are put back as committed, the file unless
+    something other than the runner changed it since.
     A commit is recorded as `backlog_updated`: `item`, `change`, `fields` (the keys set and their values), `sha`,
     `path`, `before_tree` and `tree` (the trees of the commit before and of this one), and `local` for `change:
     "added"`."""
@@ -152,7 +157,7 @@ def write(cfg: Config, run: Run, worktree: Path, change: str, edit: Callable[[st
     safeio.write_text(worktree / path, new)
     try:
         sha = gitops.commit_backlog(worktree, message, cfg, path, new, head)
-    except (CommitRejected, gitops.NothingToCommit):
+    except gitops.GitError:  # a refusal (`CommitRejected`, `NothingToCommit`), or git failed (a signing program, say)
         _put_back(worktree, path, head, new, committed)
         raise
     data: dict[str, object] = {
@@ -219,8 +224,9 @@ def plan_start(cfg: Config, repo: Path, pipeline: str, params: dict, new_module:
     of `project.fork_from` (the commit the run forks from, read through `gitops.read_blob`) and then in the main
     checkout's work tree (read only, never written). A `--new-module` is appended as `ready` (with `lane: <pipeline>`
     when `pipeline` is not `module_lane`); an item only the work
-    tree has is appended as it is there (`ready` when it said `backlog`); an item the fork has as `backlog` is set to
-    `ready`; `done` and `dropped` items are refused, and so is a module-lane run of an item neither has. An item in
+    tree has is appended with its block as written there (`ready` when it said `backlog`); an item the fork has as
+    `backlog` is set to `ready`; `done` and `dropped` items are refused (`commit the change first` when the work tree has
+    already reopened it), and so is a module-lane run of an item neither has. An item in
     another lane than `pipeline` is left alone. An appended item's `depends_on` must all be in the fork's file, and
     the edit is tried on the fork's text here, so one the file would refuse stops the start too."""
     path = backlog_path(cfg.work_source)
@@ -253,8 +259,11 @@ def plan_start(cfg: Config, repo: Path, pipeline: str, params: dict, new_module:
         return StartWrite("added", item, is_local, source)
 
     def open_(item: BacklogItem) -> None:
-        if item.status in ("done", "dropped"):
-            raise ValueError(f"module {item.id} is {item.status} in {path}: set it to ready first")
+        if item.status not in ("done", "dropped"):
+            return
+        if item is found and local is not None and local.status in backlog_file.OPEN:  # reopened, not yet committed
+            raise ValueError(f"module {item.id} is {item.status} on {fork}: commit the change first")
+        raise ValueError(f"module {item.id} is {item.status} in {path}: set it to ready first")
 
     if new_module is not None:
         if item_id in at_fork or local is not None:
