@@ -7,12 +7,15 @@ from pathlib import Path
 import dataclasses
 
 import pytest
-from conftest import run_git
+import test_conformance
+from conftest import land_on_origin, run_git
+from test_conformance import fully_met
 
 from agentflow import activity, backlog_file, backlog_writes, conditions, gitops, work_source
 from agentflow.commit_checks import foreign_commits, runner_head
 from agentflow.config import load_config
 from agentflow.gitops import CommitRejected, NothingToCommit
+from agentflow.hitl import approve
 from agentflow.pipeline import RunOptions, advance, start
 from agentflow.state import list_runs
 
@@ -29,6 +32,9 @@ items:
     status: backlog
 """
 DONE_YML = BACKLOG_YML.replace("status: ready", "status: done")
+
+# The fake `gh` fixture of whole runs, bound by assignment so pytest finds it here.
+ci_gh = test_conformance.ci_gh
 
 
 class BacklogFlow:
@@ -354,8 +360,6 @@ def test_plan_records_the_plan_path(bflow):
     bflow.repo.script({"define/draft": [{"write": {SPEC: SPEC_TEXT}, **DONE_ACT}],
                        "plan/plan": [{"write": {values["plan_target"]: "# Plan: b\n\n### Task 1: A\n\n- [ ] **Step 1: x**\n"},
                                       **DONE_ACT}]})
-    from agentflow.hitl import approve
-
     approve(run, "define", by="me")
     advance(run, bflow.cfg, RunOptions(to_phase="plan"))
     worktree = bflow.worktree(run)
@@ -421,3 +425,144 @@ def test_a_crash_after_the_step_commit_is_recorded_on_resume(bflow, monkeypatch)
     assert [i.spec for i in _at(bflow, worktree, "HEAD") if i.id == "b"] == [SPEC]
     assert run.refresh()["waiting"]["kind"] != "guard_violation"
     assert len([e for e in bflow.events(run, "backlog_updated") if e["change"] == "spec"]) == 1
+
+
+# --------------------------------------------------------------------------- done in `finish`
+
+FINISH = "ship/finish"
+PLAN_TEXT = "# Plan: b\n\n### Task 1: One\n\n**Depends on:** none\n\n- [ ] **Step 1: Do it**\n"
+NOTED = BACKLOG_YML.replace("    status: ready\n", "    status: ready\n    notes: Seen by a teammate\n")
+
+
+def _whole(bflow, **acts: list[dict]):
+    """A `feature` run of item `b` with the workflow as shipped and the `ok` gate, started and not advanced; its define
+    and plan steps write the spec and the plan."""
+    from test_ci import PIPE
+
+    bflow.repo.configure({**PIPE, "work_source": {"kind": "backlog", "path": None}}, autopilot=True)
+    run = start(bflow.cfg, bflow.repo.root, "feature", {"module": "b"}, RunOptions())
+    plan = conditions.make_ctx(bflow.cfg, bflow.repo.root, "feature", run.state["params"], run).values["plan_target"]
+    bflow.repo.script({"define/draft": [{"write": {SPEC: SPEC_TEXT}, **DONE_ACT}],
+                       "plan/plan": [{"write": {plan: PLAN_TEXT}, **DONE_ACT}], **acts})
+    return run, plan
+
+
+def _walk(bflow, run, at_plan=None) -> str:
+    """Advance `run`, approving each phase that asks; `at_plan()` runs once, when the plan waits for approval."""
+    status = advance(run, bflow.cfg, RunOptions())
+    while status == "awaiting_approval":
+        phase = run.state["waiting"]["phase"]
+        if phase == "plan" and at_plan is not None:
+            at_plan()
+        approve(run, phase, by="me")
+        status = advance(run, bflow.cfg, RunOptions())
+    return status
+
+
+def _done_events(bflow, run) -> list[dict]:
+    return [e for e in bflow.events(run, "backlog_updated") if e["change"] == "done"]
+
+
+def _pushed_item(bflow, run, item_id: str = "b") -> backlog_file.BacklogItem:
+    text = run_git(bflow.repo.origin, "show", f"{run.state['branch']}:backlog.yml")
+    [item] = [i for i in backlog_file.parse(text)[0] if i.id == item_id]
+    return item
+
+
+def _diff_lines(worktree: Path, sha: str) -> list[str]:
+    diff = run_git(worktree, "diff", "-U0", f"{sha}^", sha).splitlines()
+    return [ln for ln in diff if ln[:1] in "+-" and ln[:3] not in ("+++", "---")]
+
+
+def test_finish_marks_the_item_done_before_the_push_and_reruns_no_gate(bflow, ci_gh):
+    run, plan = _whole(bflow)
+    assert _walk(bflow, run) == "done", run.state["waiting"]
+    [done] = _done_events(bflow, run)
+    [opened] = [e for e in bflow.events(run, "pr_opened") if e["key"] == FINISH]
+    worktree = bflow.worktree(run)
+    assert opened["sha"] == done["sha"] and done["seq"] < opened["seq"]
+    assert run_git(worktree, "log", "-1", "--format=%s", done["sha"]).strip() == "Mark b done in the backlog"
+    assert _changed(worktree, done["sha"]) == ["backlog.yml"]
+    assert _diff_lines(worktree, done["sha"]) == ["-    status: ready", "+    status: done"]
+    item = _pushed_item(bflow, run)
+    assert (item.status, item.spec, item.plan) == ("done", SPEC, plan)
+    assert not [e for e in run.events.read() if e["type"] == "gate_result" and e["seq"] > done["seq"]]
+    fully_met(bflow.repo, run)
+    (checked,) = bflow.events(run, "conformance_checked")
+    assert checked["tree"] == done["tree"]
+
+
+def test_finish_keeps_a_teammates_edit_merged_by_the_sync(bflow, ci_gh, tmp_path):
+    run_git(bflow.repo.root, "push", "-q", "origin", "next")
+    run, plan = _whole(bflow)
+    status = _walk(bflow, run, at_plan=lambda: land_on_origin(bflow.repo, tmp_path, {"backlog.yml": NOTED}))
+    assert status == "done", run.state["waiting"]
+    [synced] = bflow.events(run, "base_synced")
+    [done] = _done_events(bflow, run)
+    worktree = bflow.worktree(run)
+    assert synced["conflicts"] == [] and run_git(worktree, "rev-parse", f"{done['sha']}^").strip() == synced["sha"]
+    assert _diff_lines(worktree, done["sha"]) == ["-    status: ready", "+    status: done"]
+    item = _pushed_item(bflow, run)
+    assert (item.status, item.notes, item.spec, item.plan) == ("done", "Seen by a teammate", SPEC, plan)
+    fully_met(bflow.repo, run)
+
+
+def test_a_resumed_finish_does_not_mark_done_twice(bflow, ci_gh, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_FAIL_ONCE", "pr create")
+    run, _ = _whole(bflow)
+    assert _walk(bflow, run) == "waiting_human"
+    waiting = run.refresh()["waiting"]
+    assert (waiting["kind"], waiting["key"]) == ("blocked", FINISH) and "pull request" in waiting["summary"]
+    assert len(_done_events(bflow, run)) == 1
+    approve(run, FINISH, by="me")
+    assert _walk(bflow, run) == "done", run.state["waiting"]
+    [done] = _done_events(bflow, run)
+    [opened] = bflow.events(run, "pr_opened")
+    assert opened["sha"] == done["sha"] and _pushed_item(bflow, run).status == "done"
+
+
+def test_a_resolved_merge_may_not_decide_the_backlog_file(bflow, ci_gh, tmp_path):
+    """Git's own clean merge of `backlog.yml` is let through only when nothing else needed resolving: a merge that a
+    resolver session finished, and the same merge resumed, are refused as the forbidden path."""
+    run_git(bflow.repo.root, "push", "-q", "origin", "next")
+    run, _ = _whole(bflow, **{"ship/finish/sync-1": [
+        {"write": {"README.md": "hello from both\n"}, "result": {"status": "done", "summary": "resolved README.md"}}]})
+
+    def diverge() -> None:
+        worktree = bflow.worktree(run)
+        (worktree / "README.md").write_text("hello from the branch\n", encoding="utf-8")
+        run_git(worktree, "commit", "-q", "-am", "Own work")
+        run.emit("step_committed", key="build/own", sha=gitops.head(worktree), summary="own work")
+        land_on_origin(bflow.repo, tmp_path, {"backlog.yml": NOTED, "README.md": "hello from the target\n"})
+
+    assert _walk(bflow, run, at_plan=diverge) == "waiting_human"
+    waiting = run.refresh()["waiting"]
+    assert waiting["kind"] == "guard_violation" and "forbidden_path" in waiting["summary"]
+    assert "backlog.yml" in waiting["summary"]
+    assert gitops.merge_in_progress(bflow.worktree(run)) and _done_events(bflow, run) == []
+    approve(run, FINISH, by="me")
+    assert advance(run, bflow.cfg, RunOptions()) == "waiting_human"  # the half-done merge, resumed: still refused
+    waiting = run.refresh()["waiting"]
+    assert waiting["kind"] == "guard_violation" and "backlog.yml" in waiting["summary"]
+    assert _done_events(bflow, run) == [] and not bflow.events(run, "pr_opened")
+
+
+def test_mark_done_skips_an_item_the_sync_removed(bflow):
+    run, worktree = _started(bflow)
+    gone = BACKLOG_YML.replace("  - id: b\n    title: Bee\n    status: ready\n", "")
+    (worktree / "backlog.yml").write_text(gone, encoding="utf-8")
+    run_git(worktree, "commit", "-q", "-am", "A teammate removed b")  # as the base sync brings it in
+    run.emit("step_committed", key="ship/finish", sha=gitops.head(worktree), summary="merged")
+    head = gitops.head(worktree)
+    assert backlog_writes.mark_done(bflow.cfg, run, worktree) is None
+    assert backlog_writes.mark_done(bflow.cfg, run, worktree) is None  # a resumed `finish` says it once
+    [skipped] = bflow.events(run, "backlog_skipped")
+    assert (skipped["item"], skipped["change"], skipped["reason"]) == ("b", "done", "b is not in backlog.yml at HEAD")
+    assert gitops.head(worktree) == head and bflow.events(run, "backlog_updated") == []
+
+
+def test_mark_done_leaves_a_run_outside_the_items_lane_alone(bflow):
+    run = start(bflow.cfg, bflow.repo.root, "bug", {"module": "nope", "task": "fix it"}, RunOptions())
+    worktree = bflow.worktree(run)
+    assert backlog_writes.mark_done(bflow.cfg, run, worktree) is None
+    assert bflow.events(run, "backlog_skipped") == [] and gitops.head(worktree) == run.state["base_sha"]

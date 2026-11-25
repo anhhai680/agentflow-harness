@@ -10,7 +10,8 @@ commit (`commit_checks.RUNNER_COMMITS`), and `state["backlog_sha"]` keeps the ne
 
 `plan_start` decides, before a run exists, what the run's first commit writes: a new item (`--new-module`, or an item
 only the main checkout's work tree has), its `ready` status, or nothing; it refuses a start the file says no to.
-`first_commit` makes that commit once the run's worktree exists.
+`first_commit` makes that commit once the run's worktree exists. `after_output` records the spec and plan a step
+wrote, and `mark_done` sets `status: done` in `finish`, after the base sync and before the audit and the push.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from agentflow.state import Run
 CHANGES = ("added", "ready", "spec", "plan", "done")
 _ATTR = {"depends_on": "deps"}  # a backlog key -> its `BacklogItem` attribute, where they differ
 
-__all__ = ["CHANGES", "StartWrite", "after_output", "applies", "first_commit", "plan_start", "write"]
+__all__ = ["CHANGES", "StartWrite", "after_output", "applies", "first_commit", "mark_done", "plan_start", "write"]
 
 
 @dataclass(frozen=True)
@@ -260,6 +261,18 @@ def first_commit(cfg: Config, run: Run, worktree: Path, plan: StartWrite) -> str
     return sha or ""
 
 
+def _item_at(worktree: Path, sha: str | None, path: str, item_id: str) -> BacklogItem | None:
+    """Item `item_id` of the backlog file as committed at `sha`, or None (no sha, no file, no such item)."""
+    blob = gitops.read_blob(worktree, sha, path, backlog_file.FILE_MAX) if sha else None
+    if blob is None:
+        return None
+    try:
+        items, _ = backlog_file.parse(blob.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise backlog_file.EditRefused(f"{path} is not valid UTF-8") from None
+    return next((i for i in items if i.id == item_id), None)
+
+
 def after_output(cfg: Config, run: Run, worktree: Path, values: dict[str, str], output: str) -> str | None:
     """Record in the run's item the path a committed step just wrote: `spec` when `output` is `values["spec"]`, `plan`
     when it is `values["plan_target"]`; return the commit's sha, or None when nothing is written. The item is read from
@@ -274,15 +287,35 @@ def after_output(cfg: Config, run: Run, worktree: Path, values: dict[str, str], 
     change = "spec" if output == values.get("spec") else "plan" if output == values.get("plan_target") else ""
     if not change:
         return None
-    blob = gitops.read_blob(Path(worktree), head, path, backlog_file.FILE_MAX)
-    if blob is None:
-        return None
-    try:
-        items, _ = backlog_file.parse(blob.decode("utf-8"))
-    except UnicodeDecodeError:
-        raise backlog_file.EditRefused(f"{path} is not valid UTF-8") from None
-    item = next((i for i in items if i.id == item_id), None)
+    item = _item_at(Path(worktree), head, path, item_id)
     if item is None or not applies(cfg, run, item) or getattr(item, change) == output:
         return None
     return write(cfg, run, worktree, change, lambda text: backlog_file.set_fields_text(text, item_id, {change: output}),
                  f"Record the {item_id} {change} in the backlog")
+
+
+def mark_done(cfg: Config, run: Run, worktree: Path) -> str | None:
+    """Set `status: done` on the run's item in `finish`, as one commit on top of `runner_head(run)`; return its sha, or
+    None when nothing is written: the run does not write to the backlog (`applies`), or the item is already `done` in
+    the file at `HEAD`, so a resumed `finish` writes nothing twice.
+
+    When the item is not in the file at `HEAD` (a teammate removed it on `fork_from` and the base sync merged that in),
+    nothing is written and `backlog_skipped` says so, for a run that wrote to the backlog: `applies` to the item as the
+    run's latest backlog commit, or its fork commit, had it. `write`'s refusals reach the caller."""
+    item_id = str(run.state["params"].get("module") or "")
+    path = backlog_path(cfg.work_source)
+    head = runner_head(run)
+    if not item_id or path is None or head is None:
+        return None
+    worktree = Path(worktree)
+    item = _item_at(worktree, head, path, item_id)
+    if item is None:
+        earlier = _item_at(worktree, run.state.get("backlog_sha") or run.state.get("base_sha"), path, item_id)
+        told = any(e["type"] == "backlog_skipped" and e.get("change") == "done" for e in run.events.read())
+        if applies(cfg, run, earlier) and not told:  # a resumed `finish` says it once
+            run.emit("backlog_skipped", item=item_id, change="done", reason=f"{item_id} is not in {path} at HEAD")
+        return None
+    if item.status == "done" or not applies(cfg, run, item):
+        return None
+    return write(cfg, run, worktree, "done", lambda text: backlog_file.set_fields_text(text, item_id, {"status": "done"}),
+                 f"Mark {item_id} done in the backlog")

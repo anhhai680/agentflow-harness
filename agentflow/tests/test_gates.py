@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from agentflow.config import Affected, Gate, load_config
-from agentflow.gates import (GateResult, affected_gate, command_digest, deferred_full, gates_ok, hash_inputs,
-                             input_hashes, record_results, resume_report, reusable_passes, run_gates, run_gates_reusing,
+from agentflow.gates import (GateResult, affected_gate, carried_trees, command_digest, deferred_full, gates_ok,
+                             hash_inputs, input_hashes, record_results, resume_report, reusable_passes, run_gates, run_gates_reusing,
                              summarize)
 from agentflow.guards import snapshot
 from conftest import PYTHON_CONFIG
@@ -229,6 +229,42 @@ def test_a_setup_gate_is_never_reused():
 
 def test_no_tree_reuses_nothing():
     assert reusable_passes([_pass("t", "T1", "same")], [Gate("t", "x")], None, {"t": "same"}) == {}
+
+
+def bu(change: str, before: str, tree: str) -> dict:
+    """A `backlog_updated` event: the runner's backlog commit took the tree from `before` to `tree`."""
+    return {"type": "backlog_updated", "item": "b", "change": change, "before_tree": before, "tree": tree}
+
+
+def test_carried_trees_follows_only_done_commits():
+    assert carried_trees([bu("done", "T0", "T1")], "T1") == {"T0", "T1"}
+    assert carried_trees([bu("spec", "T0", "T1")], "T1") == {"T1"}
+    assert carried_trees([bu("done", "T0", "T1")], "T2") == {"T2"}
+    assert carried_trees([bu("done", "T1", "T2"), bu("done", "T0", "T1")], "T2") == {"T0", "T1", "T2"}  # a fixpoint
+
+
+def test_a_pass_on_the_tree_before_the_done_commit_is_reusable():
+    events = [_pass("t", "T0", "same"), bu("done", "T0", "T1")]
+    assert list(reusable_passes(events, [Gate("t", "x")], "T1", {"t": "same"})) == ["t"]
+    spec = [_pass("t", "T0", "same"), bu("spec", "T0", "T1")]
+    assert reusable_passes(spec, [Gate("t", "x")], "T1", {"t": "same"}) == {}
+
+
+def test_run_gates_reusing_takes_a_pass_across_the_done_commit(run, tmp_git, tmp_path):
+    cfg = cfg_with({"t": "echo ran >> ran.txt"})
+    before = snapshot(tmp_git)
+    first = run_gates_reusing(cfg, run, "verify/verify", ["t"], tmp_git, tmp_path / "logs", before)
+    record_results(run, "verify/verify", first, before)
+    (tmp_git / "backlog.yml").write_text("version: 1\nitems: []\n", encoding="utf-8")
+    after = snapshot(tmp_git)
+    run.emit("backlog_updated", item="b", change="done", fields={"status": "done"}, sha="0" * 40, path="backlog.yml",
+             before_tree=before, tree=after)
+    (again,) = run_gates_reusing(cfg, run, "ship/finish", ["t"], tmp_git, tmp_path / "logs", after)
+    assert again.passed and again.reused_from == "verify/verify"
+    assert (tmp_git / "ran.txt").read_text() == "ran\n"
+    events = run.events.read()
+    assert not [e for e in events if e["type"] == "gate_cache_hit"]
+    assert [e["gates"] for e in events if e["type"] == "gates_reused"] == [["t"]]
 
 
 # --------------------------------------------------------------------------- groups and resources
