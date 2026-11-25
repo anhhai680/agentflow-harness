@@ -230,6 +230,18 @@ def test_a_new_module_with_an_issue_records_it_and_a_long_responsibility_is_cut(
     assert (item.id, item.title, item.issue) == ("issue-7", plan.item.title, None)
 
 
+def test_a_new_module_outside_the_module_lane_names_the_runs_lane(bflow):
+    new = {"module": "n", "responsibility": "Fix the new thing", "deps": []}
+    run = start(bflow.cfg, bflow.repo.root, "bug", {"module": "n", "task": "fix it"}, RunOptions(new_module=new))
+    worktree = bflow.worktree(run)
+    item = _at(bflow, worktree, gitops.head(worktree))[-1]
+    assert (item.id, item.lane, item.status) == ("n", "bug", "ready")
+    assert "    lane: bug\n" in run_git(worktree, "show", "HEAD:backlog.yml")
+    assert backlog_writes.applies(bflow.cfg, run, item)
+    run, worktree = _first(bflow, "m", {"module": "m", "responsibility": "M", "deps": []})  # the module lane: no lane
+    assert _at(bflow, worktree, gitops.head(worktree))[-1].lane == ""
+
+
 def test_a_local_only_item_goes_into_the_first_commit_and_the_work_tree_is_untouched(bflow):
     main = bflow.repo.root / "backlog.yml"
     main.write_text(BACKLOG_YML + LOCAL, encoding="utf-8")

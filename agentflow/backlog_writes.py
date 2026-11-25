@@ -179,7 +179,8 @@ def plan_start(cfg: Config, repo: Path, pipeline: str, params: dict, new_module:
 
     Only a `backlog` pack and a run with a `module` param are concerned. The item is looked up in the file at the tip
     of `project.fork_from` (the commit the run forks from, read through `gitops.read_blob`) and then in the main
-    checkout's work tree (read only, never written). A `--new-module` is appended as `ready`; an item only the work
+    checkout's work tree (read only, never written). A `--new-module` is appended as `ready` (with `lane: <pipeline>`
+    when `pipeline` is not `module_lane`); an item only the work
     tree has is appended as it is there (`ready` when it said `backlog`); an item the fork has as `backlog` is set to
     `ready`; `done` and `dropped` items are refused, and so is a module-lane run of an item neither has. An item in
     another lane than `pipeline` is left alone. An appended item's `depends_on` must all be in the fork's file, and
@@ -220,8 +221,10 @@ def plan_start(cfg: Config, repo: Path, pipeline: str, params: dict, new_module:
         if item_id in at_fork or local is not None:
             raise ValueError(f"{item_id} is already an item in {path}: start module:{item_id}")
         issue = params.get("issue")
+        # outside the module lane the item names the run's lane, so the run's own later writes (`applies`) reach it
         item = BacklogItem(item_id, [str(d) for d in new_module.get("deps") or []],
-                           title=_one_line(str(new_module.get("responsibility") or "")), status="ready",
+                           title=_one_line(str(new_module.get("responsibility") or "")),
+                           lane=pipeline if pipeline != module_lane else "", status="ready",
                            issue=int(issue_number(issue)) if issue not in (None, "") else None)
         return added(item, False)
     found = at_fork.get(item_id)
