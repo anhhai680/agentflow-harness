@@ -600,7 +600,8 @@ FILE_ITEM = {"title": "An idea", "lane": "", "status": "backlog", "depends_on": 
              "notes": "keep this"}
 FILE_CARD = {**IDEA, "item": FILE_ITEM, "local": False}
 SHA = "ab" * 32
-BOARD = "ui = {board: {backlog_sha256: '" + SHA + "', modules: ['a', 'b', 'i']}};"
+NEW_SHA = "cd" * 32
+BOARD = "ui = {board: {backlog_sha256: '" + NEW_SHA + "', modules: ['a', 'b', 'i']}};"  # a refresh has moved it since the card was drawn
 
 
 def _buttons(node: dict) -> list:
@@ -610,22 +611,22 @@ def _buttons(node: dict) -> list:
 def test_edit_sends_only_the_changed_fields_with_the_sha():
     form = {"title": "An idea", "lane": "", "status": "ready", "depends_on": ["b", "a"], "issue": "12", "spec": "docs/specs/i.md",
             "notes": "keep this"}
-    got = js(["board.js"], BOARD + "editBody(args.card, args.form)", {"card": FILE_CARD, "form": form})
+    got = js(["board.js"], BOARD + "editBody(args.card, args.form, '" + SHA + "')", {"card": FILE_CARD, "form": form})
     assert got == {"op": "edit", "id": "i", "fields": {"status": "ready", "issue": 12}, "sha256": SHA}  # the dependencies are the same set
     form = {"title": " New ", "lane": "bug", "status": "backlog", "depends_on": ["b"], "issue": "", "spec": "", "notes": ""}
-    got = js(["board.js"], BOARD + "editBody(args.card, args.form)", {"card": FILE_CARD, "form": form})
+    got = js(["board.js"], BOARD + "editBody(args.card, args.form, '" + SHA + "')", {"card": FILE_CARD, "form": form})
     assert got["fields"] == {"title": "New", "lane": "bug", "depends_on": ["b"], "spec": "", "notes": ""}
     unchanged = {**FILE_ITEM}
-    assert js(["board.js"], BOARD + "editBody(args.card, args.form).fields", {"card": FILE_CARD, "form": unchanged}) == {}
-    cleared = js(["board.js"], BOARD + "editBody(args.card, args.form).fields",
+    assert js(["board.js"], BOARD + "editBody(args.card, args.form, '" + SHA + "').fields", {"card": FILE_CARD, "form": unchanged}) == {}
+    cleared = js(["board.js"], BOARD + "editBody(args.card, args.form, '" + SHA + "').fields",
                  {"card": {**FILE_CARD, "item": {**FILE_ITEM, "issue": 7}}, "form": {**FILE_ITEM, "issue": ""}})
     assert cleared == {"issue": None}
 
 
 def test_move_and_add_bodies_carry_the_sha():
-    assert js(["board.js"], BOARD + "moveBody(args, true)", FILE_CARD) == {"op": "move", "id": "i", "direction": "up", "sha256": SHA}
-    assert js(["board.js"], BOARD + "moveBody(args, false)", FILE_CARD)["direction"] == "down"
-    assert js(["board.js"], BOARD + "addFromSpecBody(args)", "docs/specs/x.md") == {
+    assert js(["board.js"], BOARD + "moveBody(args, true, '" + SHA + "')", FILE_CARD) == {"op": "move", "id": "i", "direction": "up", "sha256": SHA}
+    assert js(["board.js"], BOARD + "moveBody(args, false, '" + SHA + "')", FILE_CARD)["direction"] == "down"
+    assert js(["board.js"], BOARD + "addFromSpecBody(args, '" + SHA + "')", "docs/specs/x.md") == {
         "op": "add", "item": {"spec": "docs/specs/x.md", "status": "backlog"}, "sha256": SHA}
 
 
@@ -659,7 +660,7 @@ def test_not_on_the_backlog_entries_have_an_add_button_that_sends_the_spec():
     assert other["p"]["text"] == "Not modules: a.md" and not other.get("c")
     got = js_async(["board.js"], BOARD + "var sent = []; toast = () => {}; refreshAfter = () => {};"
                    "api = async (url, body) => { sent.push([url, body]); return {ok: true}; };"
-                   "(async () => { await addSpec(args); return sent; })()", "docs/specs/x.md")
+                   "(async () => { await addSpec(args, '" + SHA + "'); return sent; })()", "docs/specs/x.md")
     assert got == [["/api/backlog/file", {"op": "add", "item": {"spec": "docs/specs/x.md", "status": "backlog"}, "sha256": SHA}]]
 
 
@@ -724,3 +725,44 @@ def test_the_run_card_shows_its_local_only_note_as_text():
                 yield from texts(child)
     notes = [t for t in texts(node) if t == "<b>x</b> discard it"]
     assert len(notes) == 1
+
+
+# A write carries the sha of the render that drew what the person acted on, not the one a later refresh brought.
+CLICK_STUBS = (BOARD + "var sent = []; toast = () => {}; refreshAfter = () => {}; dialog = () => {};"
+               "api = async (url, body) => { sent.push(body); return {ok: true}; };")
+
+
+def test_a_save_carries_the_sha_from_when_the_dialog_opened():
+    form = {**FILE_ITEM, "status": "ready"}
+    got = js_async(["board.js"], CLICK_STUBS + "(async () => { await saveEdit(args.card, args.form, '" + SHA + "'); return sent; })()",
+                   {"card": FILE_CARD, "form": form})  # ui.board now holds NEW_SHA
+    assert got == [{"op": "edit", "id": "i", "fields": {"status": "ready"}, "sha256": SHA}]
+    nothing = js_async(["board.js"], CLICK_STUBS + "(async () => { await saveEdit(args.card, args.form, '" + SHA + "'); return sent; })()",
+                       {"card": FILE_CARD, "form": FILE_ITEM})
+    assert nothing == []
+
+
+def _click(card: dict, text: str):
+    return js_async(["board.js"], FAKE_EL + CLICK_STUBS + """(async () => {
+      const node = backlogNode(args);
+      const button = node.c.filter((k) => k.p.class === "moves").flatMap((k) => k.c).find((b) => b.p.text === '""" + text + """');
+      await button.p.onclick({stopPropagation() {}});
+      return sent;
+    })()""", card)
+
+
+def test_move_and_edit_buttons_use_the_sha_of_the_render_that_drew_the_card():
+    assert _click({**FILE_CARD, "sha": SHA}, "Move up") == [{"op": "move", "id": "i", "direction": "up", "sha256": SHA}]
+    assert _click({**FILE_CARD, "sha": SHA}, "Move down")[0]["sha256"] == SHA
+
+
+def test_the_add_button_uses_the_sha_of_the_render_that_drew_the_row():
+    got = js_async(["board.js"], FAKE_EL + CLICK_STUBS + "ui.skippedOpen = false;"
+                   "(async () => { const row = skippedNode(args, 'backlog', '" + SHA + "').c[1]; await row.c[0].p.onclick(); return sent; })()", ["a.md"])
+    assert got == [{"op": "add", "item": {"spec": "a.md", "status": "backlog"}, "sha256": SHA}]
+
+
+def test_a_refresh_that_changes_the_file_redraws_the_backlog_cards():
+    # the entry's data holds the sha, so `patchChildren` builds the card again instead of keeping one that carries the old sha
+    source = Path(__file__).resolve().parent.parent.joinpath("dashboard_ui", "board.js").read_text(encoding="utf-8")
+    assert source.count("sha: data.backlog_sha256") == 2

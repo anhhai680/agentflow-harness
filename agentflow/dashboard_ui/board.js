@@ -313,13 +313,18 @@ const RESP_TITLE_MAX = 200;
 
 const fileSha = () => (ui.board && ui.board.backlog_sha256) || "";
 
+// A write is built from what the page showed, so it carries the sha of the render that showed it: a card's `sha` (set when
+// the Backlog column is drawn), never the one of a later refresh. A refresh that comes while a dialog is open must not
+// let a save past the server's stale-file check.
+const shaOf = (card) => (typeof card.sha === "string" ? card.sha : fileSha());
+
 // A card read from the file whose item is still open: the only kind the page edits and moves.
 const isOpenFileCard = (card) => !!(card && card.kind === "module" && card.item && ["backlog", "ready"].includes(card.item.status));
 
 const sameSet = (a, b) => { const x = a.slice().sort(); const y = b.slice().sort(); return x.length === y.length && x.every((v, i) => v === y[i]); };
 
 // The `edit` body of `form` (what the dialog holds) against `card.item` (what the page read): only the keys that differ.
-function editBody(card, form) {
+function editBody(card, form, sha) {
   const was = card.item || {};
   const fields = {};
   for (const key of ["title", "lane", "status", "spec"]) {
@@ -332,12 +337,12 @@ function editBody(card, form) {
   if (!sameSet(deps, was.depends_on || [])) fields.depends_on = deps;
   const issue = String(form.issue === undefined || form.issue === null ? "" : form.issue).trim();
   if (issue !== (was.issue === null || was.issue === undefined ? "" : String(was.issue))) fields.issue = issue === "" ? null : /^\d+$/.test(issue) ? Number(issue) : issue;
-  return { op: "edit", id: card.id, fields: fields, sha256: fileSha() };
+  return { op: "edit", id: card.id, fields: fields, sha256: sha };
 }
 
-const moveBody = (card, up) => ({ op: "move", id: card.id, direction: up ? "up" : "down", sha256: fileSha() });
+const moveBody = (card, up, sha) => ({ op: "move", id: card.id, direction: up ? "up" : "down", sha256: sha });
 
-const addFromSpecBody = (path) => ({ op: "add", item: { spec: path, status: "backlog" }, sha256: fileSha() });
+const addFromSpecBody = (path, sha) => ({ op: "add", item: { spec: path, status: "backlog" }, sha256: sha });
 
 // One line of at most `RESP_TITLE_MAX` characters, cut with an ellipsis.
 function oneLine(text) {
@@ -373,9 +378,16 @@ async function writeBacklogFile(body, said) {
   return result;
 }
 
-const moveItem = (card, up) => writeBacklogFile(moveBody(card, up), card.label + " moved " + (up ? "up" : "down"));
+const moveItem = (card, up) => writeBacklogFile(moveBody(card, up, shaOf(card)), card.label + " moved " + (up ? "up" : "down"));
 
-const addSpec = (path) => writeBacklogFile(addFromSpecBody(path), "Added " + path + " to backlog.yml as an idea");
+const addSpec = (path, sha) => writeBacklogFile(addFromSpecBody(path, sha), "Added " + path + " to backlog.yml as an idea");
+
+// The Edit dialog's save: the changed keys against the item the dialog showed, with the sha from when it opened.
+async function saveEdit(card, form, sha) {
+  const wanted = editBody(card, form, sha);
+  if (!Object.keys(wanted.fields).length) { toast("Nothing changed"); return true; }
+  return (await writeBacklogFile(wanted, "Saved " + card.id + " in backlog.yml")) !== "failed";  // a stale file closes the dialog: edit again from what the page now shows
+}
 
 function fileButtons(card) {
   const button = (text, label, onclick) => el("button", { type: "button", text: text, "aria-label": label + " " + card.label,
@@ -386,6 +398,7 @@ function fileButtons(card) {
 
 function editDialog(card) {
   const data = ui.board;
+  const sha = shaOf(card);  // of the render that drew this card, whatever a refresh brings while the dialog is open
   const item = card.item;
   const control = (id, label, input) => { input.setAttribute("id", id); return [el("label", { for: id, text: label }), input]; };
   const lanes = Array.from(new Set([...Object.keys(data.lane_phases || {}), item.lane].filter(Boolean)));
@@ -414,9 +427,7 @@ function editDialog(card) {
   dialog("Edit " + card.id, body, async () => {
     const form = { title: inputs.title.value, lane: inputs.lane.value, status: inputs.status.value, issue: inputs.issue.value, spec: inputs.spec.value,
       notes: inputs.notes.value, depends_on: Array.from(inputs.depends_on.selectedOptions).map((o) => o.value) };
-    const wanted = editBody(card, form);
-    if (!Object.keys(wanted.fields).length) { toast("Nothing changed"); return true; }
-    return (await writeBacklogFile(wanted, "Saved " + card.id + " in backlog.yml")) !== "failed";  // a stale file closes the dialog: edit again from what the page now shows
+    return saveEdit(card, form, sha);
   });
 }
 
@@ -457,6 +468,7 @@ function taskFormParts(data, name, inputs) {
 
 function newTaskDialog() {
   const data = ui.board;
+  const sha = fileSha();  // when the form opened: a refresh while it is open does not move it
   const kinds = Object.keys(data.new_task);
   if (!kinds.length) return;
   const radios = kinds.map((name, index) => el("input", { type: "radio", name: "nt-kind", value: name, checked: index === 0 ? "checked" : null }));
@@ -478,7 +490,7 @@ function newTaskDialog() {
     if (addsToFile(data, kind()) && (inputs["nt-module"].value.trim() || inputs["nt-resp"].value.trim())) {
       const form = { module: inputs["nt-module"].value, responsibility: inputs["nt-resp"].value, deps: chosen("nt-deps"),
         issue: wanted.includes("issue") ? inputs["nt-issue"].value : "" };
-      const result = await writeBacklogFile(newModuleBody(form, fileSha()), "Added " + form.module.trim() + " to backlog.yml: press Start when it is ready");
+      const result = await writeBacklogFile(newModuleBody(form, sha), "Added " + form.module.trim() + " to backlog.yml: press Start when it is ready");
       return result !== "failed";  // a stale file closes the dialog: add again from what the page now shows
     }
     const body = { lane: kind(), fields: {}, after: wanted.includes("after") ? chosen("nt-after") : [], to_phase: inputs["nt-stop"] ? inputs["nt-stop"].value || null : null };
@@ -513,11 +525,13 @@ function columnEntries(data, name, shownCards) {
   const count = name === "Backlog" ? data.backlog.length : cards.length;
   const entries = [entry("col-head", { name: name, count: count }, (head) => el("h2", {}, el("span", { text: head.name }), el("span", { text: String(head.count) })))];
   if (name === "Backlog") {
-    entries.push(...data.backlog.map((item) => entry(item.key || item.id, item.planning === "backlog" ? Object.assign({}, item, { armed: armedFor(item) }) : item, backlogNode)));
+    // A card carries the sha of this render, so a node drawn before the file changed is drawn again, never reused.
+    entries.push(...data.backlog.map((item) => entry(item.key || item.id,
+      Object.assign({}, item, { sha: data.backlog_sha256 || "" }, item.planning === "backlog" ? { armed: armedFor(item) } : {}), backlogNode)));
     if (data.done_note) entries.push(entry("done-note", data.done_note, (note) => el("div", { class: "muted gate-bad", text: "Done marks not read: " + note })));
     if ((data.backlog_done || []).length) entries.push(entry("done", data.backlog_done, () => doneNode(data.backlog_done)));
     if ((data.backlog_dropped || []).length) entries.push(entry("dropped", data.backlog_dropped, droppedNode));
-    if ((data.backlog_skipped || []).length) entries.push(entry("skipped", data.backlog_skipped, (names) => skippedNode(names, data.work_source_kind)));
+    if ((data.backlog_skipped || []).length) entries.push(entry("skipped", { names: data.backlog_skipped, sha: data.backlog_sha256 || "" }, (skipped) => skippedNode(skipped.names, data.work_source_kind, skipped.sha)));
   }
   if (name === "Done") {
     const page = doneCards(cards, ui.doneShown, ui.doneAll);
@@ -592,12 +606,12 @@ function doneNode(done) {
 }
 
 // Spec files no item names. A backlog pack calls them "Not on the backlog" and folds them away; other kinds say "Not modules".
-function skippedNode(names, kind) {
+function skippedNode(names, kind, sha) {
   if (kind !== "backlog") return el("div", { class: "muted", text: "Not modules: " + names.join(", ") });
   return el("details", { class: "done-modules", open: ui.skippedOpen ? "true" : null, ontoggle: (ev) => { ui.skippedOpen = ev.target.open; } },
     el("summary", { text: "Not on the backlog (" + names.length + ")" }),
     names.map((name) => el("div", { class: "muted", text: name },
-      el("button", { type: "button", text: "Add", "aria-label": "Add " + name + " to the backlog", onclick: () => addSpec(name) }))));
+      el("button", { type: "button", text: "Add", "aria-label": "Add " + name + " to the backlog", onclick: () => addSpec(name, sha) }))));
 }
 
 // Dropped backlog items: never cards. One line each (id and title as text), folded away; the open state survives the SSE re-render.
