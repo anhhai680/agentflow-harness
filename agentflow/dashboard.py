@@ -13,7 +13,10 @@ Routes:
   narrows it; a bad date is a 400); `GET /api/lessons` (every lesson with its evidence and its target signal before
   and after the runs that carried it); `GET /api/events` (SSE: every run's new events, runs created
   later included; with `?quiet=1` each `agent_turn` becomes an `agent_activity` message, at most one every
-  `QUIET_EVERY_S` per run session, and a newer one replaces a waiting one, so the last turn is never lost).
+  `QUIET_EVERY_S` per run session, and a newer one replaces a waiting one, so the last turn is never lost). It
+  carries the default repository's runs alone, untagged; `/api/repos/<id>/events` carries that repository's, and
+  `/api/events?all=1` (exactly one `all`, valued `1`, on this path only) every live and missing repository's, each
+  message with its `repo` id; a repository that joins an open stream starts at its logs' current end.
 - `GET /api/inbox` (each decision waiting on a person, titled, with its context, blast radius and allowed actions; the
   held and stalled runs to watch; the decisions of the last 30 minutes). A query parameter is ignored.
 - `GET /api/runs/<id>/artifacts`, `/artifact?path=&sha=` (`sha` a revision of `path` or `head`),
@@ -791,8 +794,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, workflow_view(self._ctx.cfg))
         elif path == "/api/agents":
             self._json(200, agents_view(self._ctx.repo, self._ctx.cfg))
-        elif path == "/api/events":
-            self._events(quiet=query.get("quiet") == ["1"])
+        elif path == "/api/events":  # `all=1` merges every repository, on the legacy path only
+            self._events(quiet=query.get("quiet") == ["1"], merged=not self._scoped and query.get("all") == ["1"])
         elif path == "/api/config":
             self._json(200, config_edit.form_fields(self._ctx.cfg.path))
         elif path == "/api/metrics":
@@ -1110,12 +1113,21 @@ class _Handler(BaseHTTPRequestHandler):
         return body
 
     # -- server-sent events
-    def _events(self, quiet: bool = False) -> None:
+    def _events(self, quiet: bool = False, merged: bool = False) -> None:
+        """Stream new events: the legacy path's are the default repository's alone, untagged; a prefixed path's are
+        that repository's, and `merged`'s every live and missing repository's, each message tagged with `repo`.
+        Each pass reads `server.snap` once; a repository that joins starts at its logs' current end, and one whose
+        runs can't be read is skipped for that pass."""
+        tagged = self._scoped or merged
+        # per repository id: the resolved runs directory its offsets were taken in, and the offsets
+        streams: dict[str, tuple[Path, dict[str, int]]] = {}
         # The starting point is fixed before the 200 goes out: a client that acts as soon as it sees the
         # response must get the events it causes, so nothing written after this line counts as old.
-        root = runs_root(self._ctx.repo)
-        offsets = {path.parent.name: self._size(path) for path in self._logs(root)}
-        offsets[BACKLOG_LOG] = self._size(root / "backlog.jsonl")
+        for ctx in self._streamed(self._snap, merged):
+            try:
+                streams[ctx.id] = self._seed(ctx)
+            except Exception:  # tried again on the next pass
+                pass
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self._security_headers(API_CSP)
@@ -1124,21 +1136,21 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(b": connected\n\n")
         self.wfile.flush()
         pinged = time.monotonic()
-        last_sent: dict[tuple[str, str], float] = {}  # quiet only: when each session's activity last went out
-        pending: dict[tuple[str, str], bytes] = {}  # quiet only: the newest activity message still waiting
+        last_sent: dict[tuple[str, str, str], float] = {}  # quiet only: when each session's activity last went out
+        pending: dict[tuple[str, str, str], bytes] = {}  # quiet only: the newest activity message still waiting
         while not self.server.stopping.is_set():
             sent = False
-            for path in self._logs(root):
-                name = path.parent.name
-                for event in self._new_events(path, offsets, name):
-                    if quiet and event.get("type") == "agent_turn":
-                        sent |= self._coalesce(name, event, last_sent, pending)
+            contexts = self._streamed(self.server.snap, merged)
+            for gone in streams.keys() - {ctx.id for ctx in contexts}:
+                del streams[gone]  # if it comes back, it starts again at its logs' end
+            for ctx in contexts:
+                repo = ctx.id if tagged else None
+                for name, event in self._read(ctx, streams):  # reads only: a write error still ends the stream
+                    if quiet and name != BACKLOG_LOG and event.get("type") == "agent_turn":
+                        sent |= self._coalesce(ctx.id, repo, name, event, last_sent, pending)
                         continue
-                    self.wfile.write(b"data: " + _json_bytes({"run_id": name, "event": event}) + b"\n\n")
+                    self.wfile.write(self._message(repo, name, event))
                     sent = True
-            for event in self._new_events(root / "backlog.jsonl", offsets, BACKLOG_LOG):
-                self.wfile.write(b"data: " + _json_bytes({"run_id": BACKLOG_LOG, "event": event}) + b"\n\n")
-                sent = True
             if pending:
                 now = time.monotonic()
                 for key in [k for k in pending if now - last_sent[k] >= QUIET_EVERY_S]:
@@ -1157,15 +1169,67 @@ class _Handler(BaseHTTPRequestHandler):
                 pinged = time.monotonic()
             self.server.stopping.wait(SSE_POLL_S)
 
-    def _coalesce(self, run_id: str, event: dict, last_sent: dict, pending: dict) -> bool:
-        """Turn one `agent_turn` into an `agent_activity` message: send it now when its session has been quiet
-        for `QUIET_EVERY_S`, or keep it (replacing an older waiting one) for the stream loop to send. Returns
-        whether it wrote anything."""
-        key = (run_id, str(event.get("session_id")))
-        message = b"data: " + _json_bytes({"run_id": run_id, "event": {
+    def _streamed(self, snap: Snapshot, merged: bool) -> list[RepoContext]:
+        """The contexts a pass over `snap` streams, in map order: `merged`, every usable and every `missing` one;
+        else this request's context, while it is either (the legacy default is sticky, so its id never moves)."""
+        if merged:
+            candidates = list(snap.repos.values())
+        else:
+            ctx = snap.repos.get(self._ctx.id)
+            candidates = [ctx] if ctx is not None else []
+        return [ctx for ctx in candidates if ctx.state == "missing" or usable(ctx)]
+
+    @staticmethod
+    def _root(ctx: RepoContext) -> Path:
+        """The runs directory to stream for `ctx`: a missing one's is the directory it was built with; a usable
+        one's is what its pack names, which `usable` has just checked is that same directory. May raise."""
+        if ctx.state == "missing" and ctx.runs is not None:
+            return ctx.runs
+        return runs_root(ctx.repo)
+
+    def _seed(self, ctx: RepoContext) -> tuple[Path, dict[str, int]]:
+        """The runs directory to stream for `ctx`, resolved, and its offsets at its logs' current end. May raise."""
+        root = self._root(ctx).resolve()
+        offsets = {path.parent.name: self._size(path) for path in self._logs(root)}
+        offsets[BACKLOG_LOG] = self._size(root / "backlog.jsonl")
+        return root, offsets
+
+    def _read(self, ctx: RepoContext, streams: dict[str, tuple[Path, dict[str, int]]]) -> list[tuple[str, dict]]:
+        """`ctx`'s events since the last pass, as `(run id or BACKLOG_LOG, event)`. A repository not seen before
+        in this stream, or whose runs directory is now another one, is first seeded at its logs' current end, so
+        nothing older is replayed. Its files are untrusted input: anything raised costs it this pass only."""
+        try:
+            root = self._root(ctx).resolve()
+            known = streams.get(ctx.id)
+            if known is None or known[0] != root:
+                streams.pop(ctx.id, None)
+                known = streams[ctx.id] = self._seed(ctx)
+                root = known[0]
+            offsets = known[1]
+            out = [(path.parent.name, event) for path in self._logs(root)
+                   for event in self._new_events(path, offsets, path.parent.name)]
+            out += [(BACKLOG_LOG, event) for event in self._new_events(root / "backlog.jsonl", offsets, BACKLOG_LOG)]
+            return out
+        except Exception:
+            return []
+
+    @staticmethod
+    def _message(repo: str | None, run_id: str, event: dict) -> bytes:
+        """One SSE message; tagged with `repo` unless it is None (the legacy stream's, byte for byte as before)."""
+        body = {"run_id": run_id, "event": event} if repo is None else {"repo": repo, "run_id": run_id, "event": event}
+        return b"data: " + _json_bytes(body) + b"\n\n"
+
+    def _coalesce(self, ctx_id: str, repo: str | None, run_id: str, event: dict, last_sent: dict,
+                  pending: dict) -> bool:
+        """Turn one `agent_turn` into an `agent_activity` message (tagged with `repo` unless it is None): send it
+        now when its session has been quiet for `QUIET_EVERY_S`, or keep it (replacing an older waiting one) for
+        the stream loop to send. A session is keyed by its repository too, so one run id in two repositories never
+        shares a slot. Returns whether it wrote anything."""
+        key = (ctx_id, run_id, str(event.get("session_id")))
+        message = self._message(repo, run_id, {
             "type": "agent_activity", "session_id": event.get("session_id"), "key": event.get("key"),
             "last_tool": event.get("last_tool"), "context_pct": event.get("context_pct"),
-            "ts": event.get("ts")}}) + b"\n\n"
+            "ts": event.get("ts")})
         now = time.monotonic()
         if key not in pending and (key not in last_sent or now - last_sent[key] >= QUIET_EVERY_S):
             self.wfile.write(message)

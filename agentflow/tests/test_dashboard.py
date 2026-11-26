@@ -3365,3 +3365,212 @@ def module_lane_of(cfg) -> str | None:
     from agentflow.module_queue import module_lane
 
     return module_lane(cfg)
+
+
+# --------------------------------------------------------------------------- one stream over every repository (W2)
+
+
+class Stream:
+    """An open event stream on `path` whose messages a thread collects, so a quiet stream never stalls a test."""
+
+    def __init__(self, port: int, path: str) -> None:
+        self.conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        self.conn.request("GET", path, headers={"X-Agentflow-Token": TOKEN})
+        self.response = self.conn.getresponse()
+        assert self.response.status == 200
+        assert self.response.fp.readline() == b": connected\n"  # the starting point is fixed once this arrives
+        self.messages: list[dict] = []
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        try:
+            while line := self.response.fp.readline().decode("utf-8"):
+                if line.startswith("data: "):
+                    self.messages.append(json.loads(line[len("data: "):]))
+        except (OSError, ValueError):
+            pass
+
+    def wait(self, test, seconds: float = 3.0) -> list[dict]:
+        """The messages that pass `test` once there is one, or [] after `seconds`."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            found = [m for m in list(self.messages) if test(m)]
+            if found:
+                return found
+            time.sleep(0.05)
+        return []
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def by(who: str):
+    return lambda message: message["event"].get("by") == who
+
+
+def _open(two, path: str) -> Stream:
+    return Stream(two.dash.port, path)
+
+
+def _a_then_b(two, stream: Stream) -> dict:
+    """Emit an event in A, then one in B, and return B's message once it arrives: A's, were it streamed, comes first."""
+    two.a_run.emit("run_paused", by="in-a")
+    two.b_run.emit("run_paused", by="in-b")
+    (message,) = stream.wait(by("in-b"))
+    return message
+
+
+def test_the_legacy_stream_is_the_default_repositorys_alone_and_untagged(two):
+    assert two.dash.server.default == two.b.id
+    stream = _open(two, "/api/events")
+    try:
+        message = _a_then_b(two, stream)
+        assert set(message) == {"run_id", "event"} and message["run_id"] == two.b_run.id
+        assert not [m for m in stream.messages if by("in-a")(m) or m["run_id"] == two.a_run.id]
+    finally:
+        stream.close()
+
+
+def test_the_all_stream_tags_each_message_with_its_repository(two):
+    stream = _open(two, "/api/events?all=1")
+    try:
+        message = _a_then_b(two, stream)
+        assert message == {"repo": two.b.id, "run_id": two.b_run.id, "event": message["event"]}
+        assert list(message) == ["repo", "run_id", "event"]
+        (from_a,) = stream.wait(by("in-a"))
+        assert from_a["repo"] == two.a.id and from_a["run_id"] == two.a_run.id
+    finally:
+        stream.close()
+    for query in ("all=2", "all=1&all=1", "all=yes"):
+        stream = _open(two, f"/api/events?{query}")
+        try:
+            message = _a_then_b(two, stream)
+            assert set(message) == {"run_id", "event"}, query
+            assert not stream.wait(by("in-a"), seconds=0.1), query
+        finally:
+            stream.close()
+
+
+def test_a_repository_prefixed_stream_carries_only_that_repository(two):
+    stream = _open(two, at(two.b, "events"))
+    try:
+        message = _a_then_b(two, stream)
+        assert message["repo"] == two.b.id and message["run_id"] == two.b_run.id
+        assert not [m for m in stream.messages if by("in-a")(m) or m["repo"] != two.b.id]
+    finally:
+        stream.close()
+
+
+def test_a_prefixed_stream_ignores_all(two):
+    stream = _open(two, at(two.b, "events?all=1"))
+    try:
+        message = _a_then_b(two, stream)
+        assert message["repo"] == two.b.id
+        assert not [m for m in stream.messages if by("in-a")(m) or m["repo"] != two.b.id]
+    finally:
+        stream.close()
+
+
+TWIN = "20261126-0000-twin"
+
+
+def _append(ctx, run_id: str, event: dict) -> None:
+    """Append `event` as one line to `run_id`'s log in `ctx`'s runs directory, creating the run's folder."""
+    folder = runs_root(ctx.repo) / run_id
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event) + "\n")
+
+
+def test_a_run_of_the_same_id_in_two_repositories_does_not_collide_under_quiet(two):
+    for ctx in (two.a, two.b):
+        _append(ctx, TWIN, {"type": "run_started", "ts": "x"})
+    stream = _open(two, "/api/events?all=1&quiet=1")
+    try:
+        for ctx in (two.a, two.b):
+            _append(ctx, TWIN, {"type": "agent_turn", "session_id": "s-1", "key": "plan/plan",
+                                "last_tool": f"Edit-{ctx.name}", "context_pct": 5, "ts": "y"})
+        # a shared key would hold the second one back for QUIET_EVERY_S
+        found = stream.wait(lambda m: len([x for x in stream.messages if x["event"]["type"] == "agent_activity"]) >= 2,
+                            seconds=dashboard.QUIET_EVERY_S * 0.75)
+        assert found
+        activity = [m for m in stream.messages if m["event"]["type"] == "agent_activity"]
+        assert {(m["repo"], m["run_id"], m["event"]["last_tool"]) for m in activity} == {
+            (two.a.id, TWIN, f"Edit-{two.a.name}"), (two.b.id, TWIN, f"Edit-{two.b.name}")}
+        assert not [m for m in stream.messages if m["event"]["type"] == "agent_turn"]
+    finally:
+        stream.close()
+
+
+def publish(server, repos) -> None:
+    """Swap in a snapshot holding `repos`, in order, the way `rescan` does: one assignment."""
+    server.snap = dataclasses.replace(server.snap, repos={ctx.id: ctx for ctx in repos})
+
+
+def _third_repo(tmp_path: Path):
+    root = tmp_path / "third"
+    root.mkdir()
+    run_git(root, "init", "-q", "-b", "main")
+    run_git(root, "config", "user.name", "Test")
+    run_git(root, "config", "user.email", "test@example.com")
+    run_git(root, "config", "commit.gpgsign", "false")
+    (root / ".agentflow").mkdir()
+    (root / ".agentflow" / "config.yaml").write_text(yaml.safe_dump(SPARSE_PACK, sort_keys=False), encoding="utf-8")
+    run_git(root, "add", "-A")
+    run_git(root, "commit", "-q", "-m", "init")
+    return _live_context(root, load_config_of(root))
+
+
+def test_a_repository_that_joins_mid_stream_is_not_replayed(two, tmp_path):
+    server = two.dash.server
+    c = _third_repo(tmp_path)
+    for i in (1, 2, 3):
+        _append(c, TWIN, {"type": "run_paused", "by": f"c-{i}"})
+    stream = _open(two, "/api/events?all=1")
+    try:
+        publish(server, [c, *server.repos.values()])  # first in the map, so a pass reads it before B
+        for marker in ("in-b-1", "in-b-2"):  # the second one's pass began after the swap, so it has seen C
+            two.b_run.emit("run_paused", by=marker)
+            assert stream.wait(by(marker))
+        _append(c, TWIN, {"type": "run_paused", "by": "c-4"})
+        (fourth,) = stream.wait(by("c-4"))
+        assert fourth["repo"] == c.id and fourth["run_id"] == TWIN
+        assert not [m for m in stream.messages if m["event"].get("by") in ("c-1", "c-2", "c-3")]
+    finally:
+        stream.close()
+
+
+def test_a_missing_repository_still_streams_its_runs(two):
+    server = two.dash.server
+    gone = dataclasses.replace(two.a, state="missing")
+    publish(server, [gone, server.repos[two.b.id]])
+    stream = _open(two, "/api/events?all=1")
+    try:
+        two.a_run.emit("run_paused", by="in-a")
+        (message,) = stream.wait(by("in-a"))
+        assert message["repo"] == two.a.id and message["run_id"] == two.a_run.id
+    finally:
+        stream.close()
+
+
+def test_a_repository_that_raises_does_not_end_the_stream(two, monkeypatch):
+    import shutil
+
+    real = dashboard.runs_root
+    stream = _open(two, "/api/events?all=1")
+    try:
+        two.b_run.emit("run_paused", by="b-0")
+        assert stream.wait(by("b-0"))
+        shutil.rmtree(real(two.a.repo))
+        assert repo_context.usable(two.dash.server.repos[two.a.id])  # still live: the stream must cope itself
+        for i, error in enumerate((RuntimeError, ValueError), start=1):
+            def raising(repo, error=error):
+                if Path(repo).resolve() == two.a.repo:
+                    raise error("paths.state_dir cannot be resolved")
+                return real(repo)
+
+            monkeypatch.setattr(dashboard, "runs_root", raising)
+            two.b_run.emit("run_paused", by=f"b-{i}")
+            assert stream.wait(by(f"b-{i}")), error
+    finally:
+        stream.close()
