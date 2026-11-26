@@ -197,8 +197,8 @@ specs).
 - **Hand marks.** With the `backlog` kind, `agentflow backlog done <id>` is `set <id> status=done` and `undone` is
   `set <id> status=ready`, both working-tree edits that you commit. `runs/done_marks.json` is read only by
   `capability_map` and `specs` packs.
-- **`agentflow init`** writes `work_source: {kind: backlog, path: backlog.yml}` and an empty `backlog.yml` for a
-  repository with no specs folder, and offers `import` when it finds one.
+- **`agentflow init`** writes the `backlog` kind and an empty `backlog.yml` for a repository with no specs folder
+  or with a `backlog.yml`, and offers `import` for one with a specs folder.
 - **Deprecation.** Once slice B4 ships, `validate` prints a note (not a warning, so "0 warnings" still holds) on a
   `capability_map` or `specs` pack, pointing to `agentflow backlog import`. The playbook marks both kinds
   deprecated, and 4.0 removes them.
@@ -391,7 +391,7 @@ TDD, with `fake_agent.py` and the fake `gh`. Claims are tested against a real ba
 | **B1** | The file and the `backlog` kind: parse, `validate`, the Board's Backlog column from the file, D5 without claims, D6, D9, `backlog list/add/set/import`, hand marks as `set`, the config keys. Migrate this repository with `import`. | This repository's Board lists every spec in `docs/` and `docs/specs/` as an item or under Not on the backlog, and `validate` prints 0 warnings. |
 | **B2** | The runner's writes (D3), the guard, and the dashboard's Add/Edit/Move/local-only Start (D7). | A run started from a new card ends with a PR whose diff sets the item `done`. |
 | **B3** | Claims (D4): `claims.py`, the start refusal, phase and status advances, release and reopen, remote cards, `doctor`. Before the slice relies on custom refs, the developer pushes and deletes one `refs/agentflow/claims/probe` against this repository's GitHub `origin` by hand, and the plan records the result. | The two-clone race test passes, and a teammate's Board shows your run's phase and status within one refresh. |
-| **B4** | `init`/`detect` write the `backlog` kind, the playbook's Backlog section, issue absorption and **Add to backlog** on synced issues, and the deprecation note. | `test_plug_and_play` passes on the three toy repositories. |
+| **B4** (shipped in 3.12) | `init`/`detect` write the `backlog` kind, the playbook's Backlog section, issue absorption and **Add to backlog** on synced issues, and the deprecation note. | `test_plug_and_play` passes on the three toy repositories. |
 
 ## Success criteria
 

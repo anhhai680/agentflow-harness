@@ -50,6 +50,8 @@ A `git pull` of the checkout does not change the installed tool, and a plain `uv
 
 `pyproject.toml` lists the files under `agentflow/` as `cache-keys`, so uv rebuilds its cached wheel when one changes. If an install still serves stale code, `--reinstall` is the fallback. `bin/agentflow` stays for working on the engine itself: it runs `agentflow/flow.py` straight from the checkout, so an edit takes effect with no reinstall.
 
+In another repository, start with `agentflow init` (section 13), which writes the pack.
+
 Then run these from the repo root of the project you drive.
 
 ```bash
@@ -528,16 +530,20 @@ The engine (`agentflow/`) names no project: everything a repository decides is i
 2. **Run `agentflow init [--starter NAME] [--baseline]`** from the repository, on any branch. It reads the base branch through git, never the working tree (unless the repository has no commit yet), and runs nothing from the repository unless you pass `--baseline`. It:
    - finds the base branch from `origin`, picks the starter from `pyproject.toml`, `package.json` or `go.mod` (`--starter` overrides it), and proposes gates: from the CI workflow steps first (`.github/workflows/*.yml`), then `package.json` scripts, `pyproject.toml` tool sections and `Makefile` targets, else the starter's. A step it can't run the way CI does (an action, an install, a matrix value) is skipped with a note. A step that runs an audit scanner (`pip-audit`, `npm audit`, `pnpm audit`, `yarn audit`, `osv-scanner`, `govulncheck`, `cargo audit`, `bundle audit`, `trivy fs`) becomes `gates.audit`, in no gate set, and `init` writes `vuln.probe: audit`; the command is kept as written, so a `pip-audit` step gets a note to add `--aliases on`.
    - finds `docs/plans`, ADR and spec folders, the repository's own skills and its `CLAUDE.md`/`AGENTS.md`;
-   - when it found a top-level `specs/`, `docs/specs`, `docs/rfcs` or `docs/proposals` folder, also writes a fixed `work_source: {kind: specs}` block and a `dashboard.backlog` block (`module_lane: feature`, plus the New task form's fields), so the Backlog lists one module per spec file in `project.docs.specs` and a new feature card writes a new spec, or, given only an issue number, works on that issue as the module `issue-<N>`. When most files in that folder are named `PREFIX-<module>.md` (a short letters-and-digits prefix, at least two files, more than the plain `<module>.md` ones), it also writes `project.docs.spec_file: "PREFIX-{module}.md"`, so those files are modules and not "Not modules". Without such a folder the pack has neither key. The two blocks are fixed data: nothing from the repository is copied into them. The one piece of repository text in the pack is that prefix, and only a word of up to 16 letters and digits is taken;
+   - writes a fixed `work_source` block and a `dashboard.backlog` block (`module_lane: feature`, plus the New task form's fields), by what the base branch holds:
+     - **no `backlog.yml` and no specs folder** (a top-level `specs/`, `docs/specs`, `docs/rfcs` or `docs/proposals`): `work_source: {kind: backlog, path: backlog.yml}`, and `init` writes an empty `backlog.yml` at the repository root (section 16). `project.docs.specs` stays at its default, `docs`, so the first `agentflow validate` prints one warning for each Markdown file under `docs/` outside `docs/plans`: `<file> is not on the backlog: agentflow backlog add --spec <file>, or list it in backlog.ignore_specs`. That is the backlog kind working as designed (section 16, "Not on the backlog"): add each file that is a backlog item, and list the rest in `backlog.ignore_specs`;
+     - **a regular `backlog.yml` already on the base branch** (the team's own): the `backlog` kind, and nothing is written;
+     - **a specs folder and no `backlog.yml`**: the deprecated `work_source: {kind: specs}`, so the Backlog lists one module per spec file in `project.docs.specs` at once, and a new feature card writes a new spec, or, given only an issue number, works on that issue as the module `issue-<N>`. `init` then prints `agentflow backlog import --dry-run`, the way to move those files into `backlog.yml` (section 16, "Migrating"). When most files in that folder are named `PREFIX-<module>.md` (a short letters-and-digits prefix, at least two files, more than the plain `<module>.md` ones), it also writes `project.docs.spec_file: "PREFIX-{module}.md"`, so those files are modules and not "Not modules". Without a specs folder the pack has neither key.
+     The blocks are fixed data: nothing from the repository is copied into them. The one piece of repository text in the pack is that prefix, and only a word of up to 16 letters and digits is taken;
    - runs `doctor` (step 6) and prints its table;
    - with `--baseline` only: runs each proposed gate once on the base branch in a throwaway worktree in the state dir, and prints a table (gate, command, pass/fail/error, seconds, note). A gate that fails there is written with `baseline: red`, so a run isn't blamed for it, and it leaves the gate sets (if every verify gate is red, they stay, and `init` says runs can't pass verify until you fix them). A missing tool, a timeout or a failed setup is an `error`, never red;
-   - writes `.agentflow/config.yaml` once, with `gates_confirmed: false` and `agents.claude.permission_mode: bypassPermissions` (with a comment saying what it allows), and nothing else in the repository.
+   - writes `.agentflow/config.yaml` once, with `gates_confirmed: false` and `agents.claude.permission_mode: bypassPermissions` (with a comment saying what it allows), and, in the first case above, the empty `backlog.yml`: nothing else in the repository. Both files are written exclusively, never over anything already there and never through a symlink (a note says so, and the pack is still written).
 
    It refuses when the repository already has a pack: edit it, or `rm -rf .agentflow` to start over.
 3. **Read the notes and the gate table.** The gates are a proposal, and the quality bar is yours to decide: fix the commands, add the gates CI doesn't show, and fix or delete a red gate. `agentflow config show --effective gates` shows the gates together with the starter's.
 4. **If you use the bug lane** (on by default), add the `Bash(...)` rule `init` printed to `permissions.allow` in `.claude/settings.json` (shared) or your git-ignored `.claude/settings.local.json`. The bug lane's red/green check runs the regression test only when an allow rule covers it, and `validate` warns until one does.
 5. **Set `gates_confirmed: true`** in the pack. `validate` warns until you do.
-6. **Check:** `agentflow doctor` (agent CLIs and logins, `gh`, Dependabot alert access, dependency review access when `vuln.dependency_review` is on, `origin`, Docker, the state dir, each gate's programs and the vuln probe's), `agentflow validate` (it must print 0 warnings), `agentflow explain feature --module <id>`, and `agentflow run feature --module <id> --dry-run`. Then commit the pack in a PR of its own, so the team reviews the gates and the permission line.
+6. **Check:** `agentflow doctor` (agent CLIs and logins, `gh`, Dependabot alert access, dependency review access when `vuln.dependency_review` is on, `origin`, Docker, the state dir, each gate's programs and the vuln probe's), `agentflow validate` (it must print 0 warnings; in the first case above, it first lists each file under `docs/` that isn't on the backlog), `agentflow explain feature --module <id>`, and `agentflow run feature --module <id> --dry-run`. Then commit the pack in a PR of its own, so the team reviews the gates and the permission line.
 
 **Patching a security alert.** The `vuln` lane turns a Dependabot alert into a patch PR: `agentflow run vuln --alert N`. It needs `vuln.probe` to name an audit gate (the starters set `audit`, and `init` writes it when CI already runs a scanner) and `gh` access to the repository's alerts (`agentflow doctor` checks it). Alerts are grouped by their package, so one run patches every open alert of that package. With `vuln.sync: true` the dashboard shows each package's open alerts as a Backlog card, and Start on it runs `vuln --alert N` for the group. The lane proves the fix with the scanner, not with the model's word:
 - **The probe.** `build/advisory_red` runs the `vuln.probe` gate before any edit, and its output must name the alert's advisory (GHSA or CVE id). A scanner that doesn't see the advisory stops the run, because a fix can't be shown for an alert the pack can't reproduce. After `build/patch` the same gate must run clean, naming none of the ids. The `advisory_cleared` floor obligation is bound to the exact tree `finish` pushes: a later code change, or a clearance read on another tree, makes `finish` probe again before the push. A push after `finish` (a CI fix round's commit, or the merge made when GitHub calls the pull request conflicting) is probed before it goes out, with the same stops, so a fix that pins the package back is never pushed; the PR's `Probe:` line says `cleared` only for a clearance of the head it shows.
@@ -815,3 +821,120 @@ The rules for editing by hand:
 - **A malformed entry is left out of prompts,** and `agentflow validate` names its line as a warning. A retro stops before its session when the file on `project.fork_from` has one, so fix it before the next retro. A duplicate id keeps the first entry. `validate` also warns about an `applies` phase the pack does not have and a `target` outside the vocabulary. It never warns about a passed `review_by`.
 - **To expire a lesson,** delete its entry, or set `review_by` to a past date to keep it in the file for the record. **To renew it,** set a later `review_by`.
 - **Edit the engine's `E-` lessons only in an engine change.** A retro never touches them.
+
+## 16. The backlog
+
+`backlog.yml` is the one committed file that lists every backlog item, and the pack's `work_source` when it says `kind: backlog` (this repository's pack does). The Board shows each item once, in its exact state, and `agentflow backlog list` prints the same states. This section tells you how to use it. Section 14 stays the reference for each key (`work_source`, `backlog.ignore_specs`, `backlog.claims`, `backlog.claim_ref`, `backlog.claim_stale_h`), and section 10 has the command lines. The design and its decisions (D1 to D9) are in `docs/specs/agentflow-backlog-file-proposal.md`.
+
+### The file
+
+```yaml
+# backlog.yml: every backlog item, highest priority first.
+version: 1
+items:
+  - id: backlog-file
+    title: Keep the backlog in backlog.yml
+    lane: feature
+    status: ready
+    spec: docs/specs/agentflow-backlog-file-proposal.md
+    depends_on: [issue-sync]
+    issue: 61
+  - id: flaky-gate-timeout
+    title: The verify gate times out on a cold uv cache
+    status: backlog
+    notes: Seen twice on CI, never locally.
+```
+
+- **Order is priority.** The first open item is the next to start, and `agentflow queue` walks the file top to bottom. `Move up` and `Move down` on the Board swap an item with its nearest open neighbour.
+- **`status` is the planning status, and nobody but a person (or `finish`) changes it:** `backlog` is an idea (the Board's Start asks for a second click, **Confirm start**, and the run makes it `ready`), `ready` may start, `done` is finished, and `dropped` is out (the Board folds it under "Dropped (N)", and `list --all` shows it).
+- **The live phase is never in the file.** `define`, `build` and the other phases come from the run (on your machine) or from its claim on `origin` (on any machine), and the Board puts them together.
+- **`id`** is a module id (kebab-case, unique, at most 64 characters) and is never renamed: runs, branches and claims are named by it. `title` is one line for the Board. The other keys (`lane`, `spec`, `plan`, `depends_on`, `issue`, `notes`) are optional, and §14's `work_source` entry lists what `validate` checks for each. Item text (`title`, `notes`) is shown on the Board and never reaches a command, a branch name or a prompt.
+- **A file that does not parse** leaves the Backlog empty with one error line, and `agentflow validate` names the fault. An unknown key in an item is a warning, so a team may carry a field such as `owner`.
+
+### What the runner writes
+
+Agents in a run can't edit `backlog.yml`: its path is always refused, as `.agentflow/**` is, and a step that touches it stops as a `guard_violation`. The runner writes it itself, only on the run's own branch, as its own commits, so the PR is where the change reaches the team:
+
+| When | The runner's change on the run's branch |
+|---|---|
+| a run starts from an item that is not on `origin/<fork_from>` yet (a New task card, a local-only item) | appends the item's block, as the branch's first commit |
+| a run starts from a `backlog` item | `status: ready`, in the same first commit |
+| `define` writes a spec at a path the item doesn't name | sets `spec:` |
+| `plan` writes a plan | sets `plan:` |
+| `finish`, before the push | `status: done` |
+
+Merging the PR is therefore enough to make the file on `origin/<fork_from>` say the item is done. The runner never commits to the base branch and never touches your working tree. When `finish` brings `origin/<fork_from>` in and `backlog.yml` conflicts, it settles the file itself, and stops the run as `blocked` (naming the item) only when it can't replay its own change. §14's `work_source` entry has the details, including the line-ending rule.
+
+### Claims and the Board
+
+With `backlog.claims` on (the default) and an `origin` remote, starting an item **claims** it: a one-file commit under `refs/agentflow/claims/<id>` (or `refs/heads/agentflow/claims/<id>` with `backlog.claim_ref: branch`), created with a leased push, so of two simultaneous starts exactly one wins. The loser is refused before any run, worktree or branch exists, and the message names the claimant, the run, the phase and the status. Only a start that writes to an item claims it: a module-lane run of an item. A run with no item (a bug run from an issue, a vuln run) claims nothing.
+
+- The runner moves the claim at every phase and status change. Its status is `running`, `waiting` (a stop or an approval waits on a human), `paused` or `stopped`. A done run keeps its claim, `waiting` at the last phase, until its PR merges.
+- **What each Board shows** for an item, first match wins: `dropped` (folded away); `done` (the file says so on `origin/<fork_from>`, or the old done evidence holds, and a claim on a done item is hidden); the phase and status of **a run on this machine**; the phase and status of **a claim on `origin`**, as a read-only card in that phase's column with **Claimed elsewhere**, who holds it, the phase and status and how long ago it moved; `blocked` by a `depends_on` item that isn't done; else `ready` or `backlog`. An unreadable claim (a malformed file on `origin`) shows as **Claim unreadable** in the Backlog column and still blocks a start.
+- **`stale`:** a claim whose phase and status haven't changed for `backlog.claim_stale_h` hours (24 by default) shows a `stale` mark, whatever its status. Nothing frees it by itself: only a person does, with `agentflow backlog release <id>`, which deletes the claim whoever holds it. A live run of that claim here stops at its next change with `claim_lost`.
+- **Release by the claimant.** A run's machine frees its claim when the run ends `failed` or `cancelled`, or is archived, and after the merge, when that machine sees the item `done` on `origin/<fork_from>` (in the CI watch, in its Board's refresh of its own runs, or at `archive`). A Board refresh on any other machine never writes to `origin`.
+- **No claims.** Without an `origin`, or with `backlog.claims: false`, runs start with no claim, and the Board says `claims are off`. Nothing then stops two people starting one item.
+- `agentflow doctor` reads the claims on `origin` (a `claims` check) with one read-only `git ls-remote`.
+
+### Editing it
+
+By hand, like any file: on a branch, through a PR. Or with the commands (each edits your working tree and commits nothing):
+
+```bash
+agentflow backlog list [--all] [--json]       # the items with their state (the first that holds, as the Board shows it); reads origin's claims now
+agentflow backlog add <id> --title "…" [--lane L] [--status S] [--depends-on a,b] [--issue N] [--spec PATH] [--notes "…"]
+agentflow backlog add --spec docs/specs/x.md  # the id from the file name and the title from the first heading
+agentflow backlog set <id> status=ready [key=value …]   # an empty value clears the key
+agentflow backlog done <id>                   # the same as: set <id> status=done
+agentflow backlog undone <id>                 # the same as: set <id> status=ready
+agentflow backlog release <id>                # free the claim on origin (see above)
+```
+
+On the Board, the Backlog column's **New task** form adds an item (its "Add" writes the file; press Start when it is ready), every open card has **Edit** (`title`, `lane`, `status`, `depends_on`, `issue`, `spec`, `notes`), **Move up** and **Move down**, and "Not on the backlog" and a synced issue each have an add button (below). Reopening a `done` item (`set <id> status=ready`, or Edit) also frees its leftover claim when that claim is a finished one (the last phase, with the item `done` on `origin`); any other claim stays, and the command or the page says whose it is.
+
+- **Every page edit goes to your working tree and is never committed.** A card whose item differs from the file on `fork_from` carries a **local: commit to share** badge. Teammates see it after you commit and push the file.
+- **A stale page is refused.** Each edit sends the sha-256 of the file the page read, and a file that changed on disk since is refused (the page asks you to reload).
+- **A local-only item can start.** The run's first commit carries the item's block, and its claim shows the item to the team. Your uncommitted copy stays in your working tree, so before you pull the merged PR, remove that entry (or `git checkout backlog.yml` when nothing else of yours is in the file): git refuses a merge over a file you changed.
+
+### Issues
+
+An item may name `issue: N`, and a run of it does what an `--issue N` run does (the in-progress label, the comment, the PR link; section 8). With `issues.sync_label` set and issue #N synced:
+
+- **The item absorbs the issue's card.** The Board shows one card, the item, with the issue's link, and hides the synced card `issue:N`. Any item that names the issue does this, whatever its status, so a dropped or done item never leaves a second card behind. The issue's in-progress label still marks the item as taken, and the issue's blockers still hold it.
+- **A synced issue that no item names** stays a card, and a module-lane one has an **Add to backlog** button. It appends the item `issue-<N>` (status `backlog`, the issue's title and lane, `issue: N`) to `backlog.yml` in your working tree, and the issue's card is replaced by that item. The button isn't there for an issue in another lane (a bug-lane issue stays a card that starts as it does today), for an issue whose start is in flight, or in a pack that isn't a backlog pack. A second add, or an add after the file changed on disk, is refused.
+
+### Not on the backlog
+
+With the `backlog` kind, every Markdown file under `project.docs.specs` (recursively, symlinks not entered, `project.docs.plans` left out, at most 500 files examined) that no item's `spec:` names is listed in two places: a folded **Not on the backlog (N)** list on the Board, with an **Add** button that appends the item as an idea (`status: backlog`, the id from the file name, the title from its first heading), and one `validate` warning per file:
+
+```
+warning backlog.yml: docs/guide.md is not on the backlog: agentflow backlog add --spec docs/guide.md, or list it in backlog.ignore_specs
+```
+
+Either add the file (`agentflow backlog add --spec <file>`) or list it in `backlog.ignore_specs`, a list of globs relative to `project.docs.specs` (`index.md`, `templates/*`) for the files that aren't backlog items (an index, a template, a retired spec). The warning is by design: a spec nobody listed is a spec nobody will see on the Board.
+
+This shows up on the first `validate` after `agentflow init` in a repository that has Markdown files under `docs/` but no specs folder: `init` picks the `backlog` kind with an empty `backlog.yml`, `project.docs.specs` stays at its default `docs`, and every file there (outside `docs/plans`) is unlisted until you add it or ignore it (section 13).
+
+### Migrating
+
+A pack on `capability_map` or `specs` keeps working: both kinds are **deprecated**, `validate` prints a note on them (not a warning, so `0 warnings` still holds) that points to `agentflow backlog import`, and 4.0 removes them. To move over:
+
+1. `agentflow backlog import --dry-run` prints the file it would write (stdout) and its notes (stderr), and writes nothing. Redirect stdout to read it as a file.
+2. `agentflow backlog import` writes `backlog.yml` (never over an existing one; nothing is committed, and `.agentflow/config.yaml` is not edited) and prints the `work_source` line to switch to. An item with done evidence (a hand mark, a spec header, a ticked plan on origin, a merged branch) gets `status: done`, every other item `ready`, and a card added with the New task form `backlog`; `import` never writes `dropped`. Open items come first (a capability map's row order, or dependency order for `specs`), then spec files no source item covers, then the form cards, then the `done` items alphabetically. It moves `runs/done_marks.json` aside to `runs/done_marks.json.imported`.
+3. Edit `work_source` in `.agentflow/config.yaml` to the line it printed (it is a protected key, so the Settings page won't), run `agentflow validate`, read the file and fix the items it got wrong, and commit `backlog.yml` and the pack change together in a PR.
+
+With the `backlog` kind the old hand marks are gone: `done` and `undone` edit `status`, and `runs/done_marks.json` is read only by `capability_map` and `specs` packs. `agentflow init` in a new repository writes the `backlog` kind from the start (section 13), except where there are spec files to import.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| A run stops as `claim_lost` | its claim on `origin` was released, or is now another run's, and the runner never pushes over it. Section 10 has the three answers (`approve <run> <phase>/claim`, `backlog release <id>`, `cancel`) |
+| A start is refused with "origin refused the claim ref" | the host rejected a push to the custom ref `refs/agentflow/claims/`. Read git's own words in the message: it may be the credentials or a read-only token, and not the host. If the host doesn't take custom refs, set `backlog.claim_ref: branch` (claims then show in the branch list). `backlog.claims: false` starts with no claim. Switch `claim_ref` only while no run holds a claim |
+| A start is refused with "could not reach origin to claim" | the claim is made on `origin`, so the start needs it. Start again when it is reachable, or set `backlog.claims: false`. A claim push that fails *during* a run is not a stop: the run goes on, records `claim_sync_failed`, and the next change catches the claim up |
+| "<id> is claimed by …" on a start, and the claimant is gone | a stale claim is freed by a person: `agentflow backlog release <id>` |
+| A claim is left on an item that is `done` | other Boards hide it. The claimant's machine frees it after the merge (CI watch, its Board's refresh, or `archive`); when that machine is gone, reopen the item (`set <id> status=ready`) or `agentflow backlog release <id>`. A claim that failed to release (say `origin` was unreachable) is tried again on the claimant's next Board refresh or CI watch |
+| `validate`: "<file> is not on the backlog" | add it (`agentflow backlog add --spec <file>`) or list it in `backlog.ignore_specs` (above) |
+| `validate`: "<id> is done by its runs … but the file says …" | `agentflow backlog set <id> status=done`, or `agentflow validate --fix` |
+| The Board refuses an edit of `backlog.yml` with "reload" | the file changed on disk since the page read it. Reload the page and edit again |
+| `queue` doesn't start an item | it starts only `ready` items whose dependencies are done and that have no claim; set `status=ready` (section 9) |
