@@ -107,10 +107,11 @@ def _runs(ctx: RepoContext) -> list[state.Run]:
 
 def counts(ctx: RepoContext) -> dict[str, int]:
     """What `ctx`'s runs need: `waiting` (every inbox item, parked stops included), `active` (a runner is working)
-    and `failed` (failed, or stalled with no runner). Zeros when the context is not live or its runs can't be
-    read; a run that fails on its own costs only its own share."""
+    and `failed` (failed, or stalled with no runner). Zeros when the context is not `usable` (a pack that now names
+    another runs directory would count another repository's runs) or its runs can't be read; a run that fails on
+    its own costs only its own share."""
     out = {"waiting": 0, "active": 0, "failed": 0}
-    if ctx.state != "live":
+    if not usable(ctx):
         return out
     try:
         runs = _runs(ctx)
@@ -133,11 +134,12 @@ def counts(ctx: RepoContext) -> dict[str, int]:
 
 
 def in_flight(ctx: RepoContext) -> bool:
-    """Whether a runner holds a live lock on any run of `ctx.repo`. True when the runs can't be read at all, so a
-    repository is never dropped on a transient error. The lock is checked without loading the run, so a run whose
-    log is corrupt still counts when its runner is alive."""
+    """Whether a runner holds a live lock on any run of `ctx`: in the runs directory it was built with (`ctx.runs`),
+    never the one its pack names now, and in `state.runs_root` only for a context with none. True when the runs
+    can't be read at all, so a repository is never dropped on a transient error. The lock is checked without
+    loading the run, so a run whose log is corrupt still counts when its runner is alive."""
     try:
-        root = state.runs_root(ctx.repo)
+        root = ctx.runs if ctx.runs is not None else state.runs_root(ctx.repo)
         paths = sorted(root.iterdir()) if root.is_dir() else []
     except Exception:
         return True
@@ -214,8 +216,9 @@ def settle_dirs(contexts: list[RepoContext]) -> list[RepoContext]:
 def reconcile(current: dict[str, RepoContext], found: RepoSet,
               busy: Callable[[RepoContext], bool] = in_flight) -> dict[str, RepoContext]:
     """The next map, in `found`'s order: a live repository whose live context is still usable keeps that object;
-    every other found repository is loaded again. A context of `current` that `found` no longer holds follows as a
-    `missing` copy while `busy` says a runner is in it, and is dropped otherwise; nothing else is read for it. The
+    every other found repository is loaded again. A live or missing context of `current` that `found` no longer
+    holds follows as a `missing` copy while `busy` says a runner is in it, and is dropped otherwise (an `error` or
+    `not_set_up` one is dropped without asking); nothing else is read for it. The
     runs-directory rule (`settle_dirs`) is applied over the found and the missing contexts together."""
     built: list[RepoContext] = []
     for ref in found.repos:
@@ -225,7 +228,10 @@ def reconcile(current: dict[str, RepoContext], found: RepoSet,
         else:
             built.append(load_context(ref))
     ids = {ref.id for ref in found.repos}
-    missing = [replace(ctx, state="missing") for key, ctx in current.items() if key not in ids and busy(ctx)]
+    # only a context that was served (live, or already missing) can be kept: a refused or unset-up one never had a
+    # runs directory of its own, so a lock found there (a clone can ship one) keeps nothing
+    missing = [replace(ctx, state="missing") for key, ctx in current.items()
+               if key not in ids and ctx.state in ("live", "missing") and busy(ctx)]
     return {ctx.id: ctx for ctx in settle_dirs(built + missing)}
 
 

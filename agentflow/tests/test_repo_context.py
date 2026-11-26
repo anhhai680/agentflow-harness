@@ -180,6 +180,17 @@ def test_counts_are_zero_when_the_context_is_not_live_or_the_repository_is_gone(
     assert repo_context.counts(dataclasses.replace(ctx, state="error", cfg=None)) == ZERO
 
 
+def test_counts_are_zero_once_the_packs_state_dir_changes(tmp_path):
+    billing = make_repo(tmp_path, "billing")
+    make_runs(billing)
+    repo = make_repo(tmp_path, "alpha")
+    ctx = ctx_of(repo)
+    assert repo_context.counts(ctx_of(billing)) == {"waiting": 1, "active": 1, "failed": 1}
+    with_state_dir(repo, default_dir(billing))  # a pull aims the pack at another repository's runs
+    assert not repo_context.usable(ctx)
+    assert repo_context.counts(ctx) == ZERO
+
+
 def test_counts_are_zero_on_any_exception(tmp_path, monkeypatch):
     repo = make_repo(tmp_path, "alpha")
     make_runs(repo)
@@ -248,6 +259,48 @@ def test_reconcile_keeps_a_vanished_repository_only_while_it_is_busy(tmp_path):
     assert current[ref_of(gone).id].state == "live"  # a copy: the context a request may hold is not changed
     dropped = repo_context.reconcile(kept, found(a), busy=lambda ctx: False)
     assert list(dropped) == [ref_of(a).id]
+
+
+def shipped_live_run(runs: Path, run_id: str = "20260101-0000-shipped") -> Path:
+    """A run a clone could ship: an event log and a lock naming PID 1, which always exists, so it reads as live."""
+    run_dir = runs / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text("", encoding="utf-8")
+    (run_dir / LOCK_NAME).write_text("1", encoding="utf-8")
+    return run_dir
+
+
+def test_reconcile_drops_a_refused_or_unset_context_that_left_whatever_its_locks_say(tmp_path):
+    clone = with_state_dir(make_repo(tmp_path, "clone"), ".state")
+    current = repo_context.reconcile({}, found(clone))
+    refused = current[ref_of(clone).id]
+    assert refused.state == "error" and "inside the repository" in refused.error
+    shipped_live_run(refused.runs)
+    assert repo_context.in_flight(refused) is True  # the shipped lock reads as live ...
+    assert repo_context.reconcile(current, found()) == {}  # ... and still keeps nothing
+    bare = make_repo(tmp_path, "bare", with_pack=False)
+    unset = repo_context.reconcile({}, found(bare))
+    assert repo_context.reconcile(unset, found(), busy=lambda ctx: True) == {}
+
+
+def test_in_flight_reads_the_runs_directory_the_context_was_built_with(tmp_path):
+    repo = make_repo(tmp_path, "alpha")
+    ctx = ctx_of(repo)
+    with_state_dir(repo, tmp_path / "moved")
+    shipped_live_run(tmp_path / "moved" / "runs")
+    assert repo_context.in_flight(ctx) is False  # not the directory the pack names now
+    shipped_live_run(ctx.runs)
+    assert repo_context.in_flight(ctx) is True
+
+    # a repository whose checkout is gone is still seen in its custom directory
+    custom = tmp_path / "custom-state"
+    gone = with_state_dir(make_repo(tmp_path, "gone"), custom)
+    left = ctx_of(gone)
+    shipped_live_run(custom / "runs")
+    shutil.rmtree(gone)
+    assert repo_context.in_flight(left) is True
+    kept = repo_context.reconcile({left.id: left}, found())
+    assert kept[left.id].state == "missing" and kept[left.id].runs == left.runs
 
 
 def test_reconcile_never_reads_a_repository_that_left(tmp_path, monkeypatch):
