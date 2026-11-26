@@ -2772,18 +2772,45 @@ def test_server_repo_cfg_and_config_follow_the_default_and_cfg_can_be_replaced(t
     assert server.repos[two.a.id].cfg is flow_repo.cfg and server.repos[two.a.id] is not server.default_context()
 
 
-def _bound_from_server(func: ast.FunctionDef) -> set[str]:
-    """The local names `func` binds to `self.server` (`server = self.server`)."""
-    names = set()
-    for node in ast.walk(func):
-        if isinstance(node, ast.Assign) and _is_self_server(node.value):
-            names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
-    return names
-
-
 def _is_self_server(node: ast.AST) -> bool:
     return (isinstance(node, ast.Attribute) and node.attr == "server" and isinstance(node.value, ast.Name)
             and node.value.id == "self")
+
+
+def _server_misuses(tree: ast.AST) -> tuple[list[str], list[str]]:
+    """Every use of `self.server` in `tree` that could reach the default repository, and the functions that call
+    `self.server.default_context()`. A `self.server` is allowed only as the object of an attribute other than
+    `repo`, `cfg` and `config`; any other place it appears in (an alias in any form, an argument of
+    `getattr`/`setattr`/`delattr` or of anything else) is a misuse, so no syntax needs listing."""
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    misuses, calls = [], []
+    for func in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+        for node in ast.walk(func):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in ("getattr", "setattr", "delattr")
+                    and node.args and _is_self_server(node.args[0])):
+                misuses.append(f"{func.name}:{node.lineno}: {node.func.id}(self.server, ...)")
+            if not _is_self_server(node):
+                continue
+            parent = parents.get(node)
+            if not (isinstance(parent, ast.Attribute) and parent.value is node
+                    and parent.attr not in ("repo", "cfg", "config")):
+                misuses.append(f"{func.name}:{node.lineno}: {type(parent).__name__}")
+            elif parent.attr == "default_context" and isinstance(parents.get(parent), ast.Call):
+                calls.append(func.name)
+    return misuses, calls
+
+
+SERVER_MISUSES = {  # each form `_server_misuses` must catch
+    "plain alias": "server = self.server\nserver.cfg",
+    "tuple": "ctx, server = self._ctx, self.server\nserver.cfg",
+    "annotated": "s: object = self.server\ns.repo",
+    "walrus": "(s := self.server).cfg",
+    "getattr": "getattr(self.server, 'cfg')",
+    "setattr": "setattr(self.server, 'cfg', None)",
+    "direct": "self.server.config",
+    "argument": "use(self.server)",
+}
 
 
 def test_the_handler_never_reads_the_default_through_the_server():
@@ -2791,28 +2818,17 @@ def test_the_handler_never_reads_the_default_through_the_server():
 
     tree = ast.parse(inspect.getsource(dashboard))
     handler = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_Handler")
-    found, calls = [], []
-    for func in (n for n in handler.body if isinstance(n, ast.FunctionDef)):
-        bound = _bound_from_server(func)
-        for node in ast.walk(func):
-            if isinstance(node, ast.Attribute) and node.attr in ("repo", "cfg", "config"):
-                if _is_self_server(node.value) or (isinstance(node.value, ast.Name) and node.value.id in bound):
-                    found.append(f"{func.name}:{node.lineno}")
-            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "default_context" and (_is_self_server(node.func.value)
-                                                                 or isinstance(node.func.value, ast.Name)
-                                                                 and node.func.value.id in bound)):
-                calls.append(func.name)
-    assert found == []
+    misuses, calls = _server_misuses(handler)
+    assert misuses == []
     assert set(calls) == {"_handle"}  # only the dispatcher picks the context
     assert all(isinstance(getattr(dashboard.DashboardServer, name), property) for name in ("repo", "cfg", "config"))
-    # the walk catches what it is meant to catch
-    sample = ast.parse("def f(self):\n    server = self.server\n    server.cfg\n    self.server.repos\n    self._ctx.cfg\n")
-    func = sample.body[0]
-    bound = _bound_from_server(func)
-    hits = [n for n in ast.walk(func) if isinstance(n, ast.Attribute) and n.attr in ("repo", "cfg", "config")
-            and (_is_self_server(n.value) or isinstance(n.value, ast.Name) and n.value.id in bound)]
-    assert len(hits) == 1
+    # the walk catches what it is meant to catch, and only that
+    for form, body in SERVER_MISUSES.items():
+        sample = ast.parse("def f(self):\n" + "".join(f"    {line}\n" for line in body.splitlines()))
+        assert _server_misuses(sample)[0], form
+    fine = ast.parse("def f(self):\n    self.server.repos\n    self._ctx.cfg\n    self.server.token.encode()\n"
+                     "    self.server.starts.append(1)\n    ctx = self.server.default_context(self._snap)\n")
+    assert _server_misuses(fine) == ([], ["f"])
 
 
 def test_info_numbers():

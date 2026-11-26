@@ -944,7 +944,7 @@ class _Handler(BaseHTTPRequestHandler):
         body = self._body()
         if body is None:
             return
-        ctx, server = self._ctx, self.server
+        ctx = self._ctx
         try:
             if path == "/api/backlog":
                 item = backlog.add(ctx.cfg, ctx.repo, _text(body, "lane", required=True) or "",
@@ -961,7 +961,7 @@ class _Handler(BaseHTTPRequestHandler):
                     raise BadRequest("confirm must be true or false")
                 job = backlog.begin_start(ctx.cfg, ctx.repo, key, confirm=confirm)
                 thread = threading.Thread(target=self._start_worker, args=(job, ctx), daemon=True)
-                server.starts.append(thread)
+                self.server.starts.append(thread)
                 thread.start()
                 self._json(202, {"ok": True, "starting": True, "key": key})
             else:
