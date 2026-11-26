@@ -659,3 +659,24 @@ def test_a_pip_audit_step_without_aliases_keeps_its_command_and_gets_a_note(make
 @pytest.mark.parametrize("run", ["pip-audit --aliases on", "pip-audit -r req.txt --aliases=on", "npm audit"])
 def test_no_aliases_note_when_the_scan_names_them_or_is_no_pip_audit(make, run):
     assert "--aliases" not in notes_text(detect.detect(make(ci(f"- name: Scan\n  run: {run}"))))
+
+
+# --- backlog.yml ----------------------------------------------------------------------------------------------------
+
+def test_a_backlog_file_on_the_base_branch_is_detected(make, tmp_path):
+    assert detect.detect(make({"backlog.yml": "version: 1\nitems: []\n"})).backlog_file is True
+    assert detect.detect(make()).backlog_file is False
+
+    untracked = make()
+    (untracked / "backlog.yml").write_text("version: 1\nitems: []\n", encoding="utf-8")  # the working tree is not read
+    assert detect.detect(untracked).backlog_file is False
+
+    linked = make()
+    (tmp_path / "elsewhere.yml").write_text("version: 1\nitems: []\n", encoding="utf-8")
+    (linked / "backlog.yml").symlink_to(tmp_path / "elsewhere.yml")
+    _git(linked, "add", "-A")
+    _git(linked, "commit", "-q", "-m", "link")
+    assert detect.detect(linked).backlog_file is False  # a symlink is not a regular file
+
+    folder = make({"backlog.yml/readme.txt": "x\n"})
+    assert detect.detect(folder).backlog_file is False  # nor is a directory

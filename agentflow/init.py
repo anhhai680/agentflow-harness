@@ -2,8 +2,10 @@
 
 `init` detects (`detect.detect`, which reads the base branch through git and runs nothing), renders a provisional pack
 into the state dir so `doctor` has a config to check, and writes `.agentflow/config.yaml` exactly once, exclusively
-(`safeio.write_new`): it never overwrites anything, and a pack that appears meanwhile wins. Nothing the repository
-holds runs unless the human passes `--baseline`.
+(`safeio.write_new`): it never overwrites anything, and a pack that appears meanwhile wins. When the pack uses the
+`backlog` kind and the base branch has no `backlog.yml`, it then writes an empty one the same way (a file, folder or
+symlink already there stays as it is, and a note says so; the pack stays either way). Nothing the repository holds
+runs unless the human passes `--baseline`.
 
 The baseline runs the gates in a throwaway worktree of the base branch, under `<state_dir>/baseline-*`, with the
 caller's virtualenv left out of the environment. Only a plain non-zero exit makes a gate `fail` (red); a missing
@@ -32,7 +34,7 @@ from typing import Any, Literal, TextIO
 
 import yaml
 
-from agentflow import detect, doctor, layers, pack, safeio
+from agentflow import backlog_file, detect, doctor, layers, pack, safeio
 from agentflow.config import Config, ConfigError, Gate
 from agentflow.detect import Detected
 from agentflow.gates import GateResult, resolve, run_gates
@@ -151,6 +153,16 @@ def _red_sets(sets: dict[str, list[str]], base: dict, red: frozenset[str]) -> di
     return out
 
 
+def _specs_kind(d: Detected, docs: dict[str, str]) -> bool:
+    """The `specs` work source when the (checked) docs hold a specs folder and no `backlog.yml` is on the base branch."""
+    return "specs" in docs and not d.backlog_file
+
+
+def empty_backlog(d: Detected) -> bool:
+    """Whether `init` should create the empty `backlog.yml`: the pack gets the `backlog` kind and none is there."""
+    return not d.backlog_file and not _specs_kind(d, _checked(d)[2])
+
+
 def pack_data(d: Detected, *, base: dict, red: frozenset[str] = frozenset()) -> dict:
     """The data `render_pack` writes: what the pack states on top of `base` (`base_of(d.starter)`)."""
     gates, sets, docs, _notes = _checked(d)
@@ -164,11 +176,11 @@ def pack_data(d: Detected, *, base: dict, red: frozenset[str] = frozenset()) -> 
         project["docs"] = changed_docs
     if project:
         data["project"] = project
-    if "specs" in docs:  # fixed data only: nothing from the repository is copied into these two keys
-        data["work_source"] = {"kind": "specs"}
-        data["dashboard"] = {"backlog": {"module_lane": "feature",
-                                         "new_task": {"feature": ["new_module", "issue", "after"],
-                                                      "bug": ["issue", "task", "after"]}}}
+    # fixed data only: nothing from the repository is copied into these two keys
+    data["work_source"] = {"kind": "specs"} if _specs_kind(d, docs) else {"kind": "backlog", "path": backlog_file.FILE}
+    data["dashboard"] = {"backlog": {"module_lane": "feature",
+                                     "new_task": {"feature": ["new_module", "issue", "after"],
+                                                  "bug": ["issue", "task", "after"]}}}
     base_gates = base.get("gates") if isinstance(base.get("gates"), dict) else {}
     for name in [*gates, *(n for n in base_gates if n not in gates)]:
         if name in red:
@@ -191,9 +203,12 @@ def render_pack(d: Detected, *, base: dict, red: frozenset[str] = frozenset()) -
               f"# {PERMISSION_COMMENT}\n" + _dump({"agents": data["agents"]})]
     if "project" in data:
         blocks.append("# what differs from the engine defaults\n" + _dump({"project": data["project"]}))
-    if "work_source" in data:
-        blocks.append("# the Backlog: one module per spec file in project.docs.specs; a new feature card writes a new "
-                      "spec\n" + _dump({"work_source": data["work_source"], "dashboard": data["dashboard"]}))
+    if data["work_source"]["kind"] == "specs":
+        comment = "# the Backlog: one module per spec file in project.docs.specs; a new feature card writes a new spec\n"
+    else:
+        comment = ("# the Backlog: backlog.yml lists every item; `agentflow backlog add` appends one, and "
+                   "`agentflow backlog import` builds it from spec files\n")
+    blocks.append(comment + _dump({"work_source": data["work_source"], "dashboard": data["dashboard"]}))
     if "gates" in data:
         comment = f"# {_GATES_FROM.get(d.gate_source, 'detected')}; each gate replaces the starter's gate of its name\n"
         if red:
@@ -628,6 +643,25 @@ def _print_bug_rule(merged: dict, out: TextIO) -> None:
         print("  add a narrow `Bash(<test command> *)` rule for your test command to `permissions.allow`", file=out)
 
 
+def _write_empty_backlog(repo: Path, found: Detected, out: TextIO) -> None:
+    """Create the empty `backlog.yml` when `empty_backlog` says so, exclusively and never through a symlink. A file,
+    folder or symlink already there, or any other failure, leaves the pack as it is and prints a note."""
+    if not empty_backlog(found):
+        return
+    target = repo / backlog_file.FILE
+    try:
+        safeio.write_new(target, backlog_file.render([]))
+    except (FileExistsError, safeio.SymlinkRefused):
+        note = (f"{backlog_file.FILE} was left as it is: something is already there (init never writes over a file "
+                "or through a link)")
+    except OSError as exc:
+        note = f"{backlog_file.FILE} was not written: {_show(exc.strerror or type(exc).__name__)}"
+    else:
+        print(f"wrote {_show(target)}", file=out)
+        return
+    print(f"note: {note}", file=out)
+
+
 def init(repo: Path, *, starter: str | None, run_baseline: bool, out: TextIO) -> int:
     """Detect, check the machine, run the baseline when asked, and write `.agentflow/config.yaml` once.
 
@@ -693,7 +727,9 @@ def init(repo: Path, *, starter: str | None, run_baseline: bool, out: TextIO) ->
         except OSError:
             pass
 
-    print(f"\nwrote {target}\n", file=out)
+    print(f"\nwrote {target}", file=out)
+    _write_empty_backlog(repo, found, out)
+    print("", file=out)
     _print_detection(found, notes, out)
     print("\ndoctor:", file=out)
     print(doctor.render(checks), file=out)
@@ -715,6 +751,13 @@ def init(repo: Path, *, starter: str | None, run_baseline: bool, out: TextIO) ->
     print(f"  1. review `gates` and `gate_sets` in {pack.PACK_DIR}/config.yaml, and the notes above", file=out)
     print("  2. set `gates_confirmed: true` in it", file=out)
     print("  3. agentflow validate", file=out)
-    print("  4. agentflow explain feature --module <id>", file=out)
-    print("  5. agentflow run feature --module <id> --dry-run", file=out)
+    specs = data["work_source"]["kind"] == "specs"
+    if not specs:  # an empty backlog has no item to run yet
+        print('  4. agentflow backlog add <id> --title "…" --status ready   (a run starts from an item)', file=out)
+    step = 4 if specs else 5
+    print(f"  {step}. agentflow explain feature --module <id>", file=out)
+    print(f"  {step + 1}. agentflow run feature --module <id> --dry-run", file=out)
+    if specs:
+        print(f"  agentflow backlog import --dry-run   (writes {backlog_file.FILE} from your spec files; then switch "
+              "work_source)", file=out)
     return 0

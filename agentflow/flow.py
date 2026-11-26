@@ -54,16 +54,17 @@ def _pack_config() -> Path:
 
 def _print_validation(cfg, repo: Path, config_path: Path) -> int:
     """Print every issue `validate` finds and the summary lines; 1 when there is an error, else 0."""
-    from agentflow.config import validate
+    from agentflow.config import deprecation_notes, validate
     from agentflow.guards import settings_coverage
     from agentflow.pack_fix import shown
 
-    issues = validate(cfg, repo) + settings_coverage(cfg, repo)
+    issues = validate(cfg, repo) + settings_coverage(cfg, repo) + deprecation_notes(cfg)
     for issue in issues:  # escaped: a prompt's file name comes from the repository
         print(shown(f"{issue.level} {issue.path}: {issue.message}") + (" (fixable)" if issue.fixable else ""))
     errors = sum(1 for i in issues if i.level == "error")
     if not errors:
-        print(f"ok: {config_path.name} is valid ({len(issues)} warnings)")
+        warnings = sum(1 for i in issues if i.level == "warning")
+        print(f"ok: {config_path.name} is valid ({warnings} warnings)")
     fixable = sum(1 for i in issues if i.fixable)
     if fixable:
         print(f"{fixable} fixable: run agentflow validate --fix")

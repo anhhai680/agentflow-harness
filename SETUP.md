@@ -118,14 +118,14 @@ Machine
   3. Logins you'll run yourself: <! gh auth login | ! claude | none needed>
 
 Repository <repo> (base branch <base>, starter <starter>)
-  4. agentflow init --starter <starter> [--baseline]     → writes .agentflow/config.yaml and nothing else
+  4. agentflow init --starter <starter> [--baseline]     → writes .agentflow/config.yaml, plus an empty backlog.yml when the repository has no specs folder
   5. Add the bug-lane rule "Bash(<test cmd> *)" to <.claude/settings.json | .claude/settings.local.json>
   6. [Codex] add [profiles.agentflow] to ~/.codex/config.toml; set agents.codex.enabled: true
   7. Gates: <show them to you at the end | confirm automatically if the baseline is green>
   8. [Budget] set defaults.run_budget_usd: <N> in ~/.config/agentflow/config.yaml
 
 Check
-  9. agentflow doctor · agentflow validate (0 warnings) · agentflow explain feature --module <id> · agentflow run feature --module <id> --dry-run
+  9. agentflow doctor · agentflow validate (0 warnings, or only the expected "not on the backlog" ones: ask the user) · agentflow explain feature --module <id> · agentflow run feature --module <id> --dry-run
 
 Finish
  10. <Leave the pack uncommitted | branch agentflow-setup, commit, push, open a PR>
@@ -177,7 +177,7 @@ From `<repo>`:
 agentflow init --starter <starter> [--baseline]
 ```
 
-`init` reads the base branch through git, writes `.agentflow/config.yaml` once, and runs `doctor`. With `--baseline` it also runs each gate once in a throwaway worktree. Keep the whole output, because you need three parts of it:
+`init` reads the base branch through git, writes `.agentflow/config.yaml` once (and, for a repository with no specs folder, an empty `backlog.yml`), and runs `doctor`. With `--baseline` it also runs each gate once in a throwaway worktree. Keep the whole output, because you need three parts of it:
 
 - **The `detected:` block and its `notes:`**: the gates, the gate sets, the docs folders and the skills. Any note about a skipped CI step goes into your final report.
 - **The `baseline:` table** (with `--baseline`): a gate that fails on the base branch is written as `baseline: red`. A missing tool, a timeout or a failed setup shows as `error`, which isn't red. If it says *every verify gate fails*, runs can't pass verify until the user fixes them. Report that, and don't hide it.
@@ -237,7 +237,7 @@ Run these from `<repo>`, in this order. Pick a short placeholder module id such 
 
 ```bash
 agentflow doctor                                       # each check prints ok / warn / fail; exit 1 means at least one fail
-agentflow validate                                     # must end with "0 warnings"
+agentflow validate                                     # must end with "0 warnings" (see the exceptions below)
 agentflow explain feature --module setup-check         # which phases and steps would run, with no agent calls
 agentflow run feature --module setup-check --dry-run   # the agent and gate commands; creates nothing
 ```
@@ -245,7 +245,7 @@ agentflow run feature --module setup-check --dry-run   # the agent and gate comm
 How to read the results:
 
 - A `doctor` **fail** must be fixed before you call setup done. A **warn** is acceptable, but list it in the report.
-- A `validate` warning about `gates_confirmed` is expected while the gates wait for the user (Q8 = 1). It's the only warning you may leave, and you must say so. Fix every other warning: the message names the YAML path to change.
+- A `validate` warning about `gates_confirmed` is expected while the gates wait for the user (Q8 = 1). Besides it, only one kind of warning may stay: after `init` wrote the `backlog` kind (no specs folder), the first `validate` prints one `<file> is not on the backlog` warning for each Markdown file under `docs/`. That is expected, and you must not fix it silently: ask the user, file by file, whether it is a backlog item (add it with `agentflow backlog add --spec <file>`) or not (list it in `backlog.ignore_specs`), and say in the report which warnings remain. Fix every other warning: the message names the YAML path to change.
 - A `validate` warning about the bug-lane allow rule means 4.4 didn't take. Check the file and the rule text again.
 
 If the target is `<harness>` itself, you may also run the fast portability gate. It's optional, and the full suite takes 25–60 minutes, so don't start that unless the user asks:
@@ -261,14 +261,14 @@ uv run --no-project --with pyyaml --with pytest pytest agentflow/tests/test_port
 1. **Gates** (if Q8 = 1): show the gates, with their commands and baseline results, as a small table. Ask one question:
    > Are these gates the quality bar you want? 1) Yes, confirm them, 2) change them first (tell me what to change).
 
-   On "yes", set `gates_confirmed: true` and run `agentflow validate` again until it prints 0 warnings. On changes, edit `gates:` and `gate_sets:` in the pack, then validate again.
+   On "yes", set `gates_confirmed: true` and run `agentflow validate` again until it prints 0 warnings (apart from the "not on the backlog" ones the user is still deciding). On changes, edit `gates:` and `gate_sets:` in the pack, then validate again.
 
-2. **Commit** (only if Q11 = 2): create a branch (`git switch -c agentflow-setup`), stage only `.agentflow/config.yaml`, plus the shared `.claude/settings.json` if you changed it, and commit with one imperative sentence. Then push and open a PR with `gh pr create`, so the team can review the gates and the `permission_mode: bypassPermissions` line. Never stage `.claude/settings.local.json`.
+2. **Commit** (only if Q11 = 2): create a branch (`git switch -c agentflow-setup`), stage only `.agentflow/config.yaml` (and `backlog.yml`, when `init` wrote it: left untracked, the first run's first commit creates it on its branch, and `git pull` is refused after that PR merges), plus the shared `.claude/settings.json` if you changed it, and commit with one imperative sentence. Then push and open a PR with `gh pr create`, so the team can review the gates and the `permission_mode: bypassPermissions` line. Never stage `.claude/settings.local.json`.
 
 3. **Report**, in one short message:
    - what you installed, and how (`agentflow` path and version);
    - the files you created or changed, each with its path;
-   - the `doctor` result (any warns), and the fact that `validate` printed 0 warnings;
+   - the `doctor` result (any warns), and whether `validate` printed 0 warnings (name any "not on the backlog" ones still open);
    - the gates, and anything `init` noted or skipped;
    - what's left for the user, if anything: a login, a red gate, uncommitted files;
    - the next commands:

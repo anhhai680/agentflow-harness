@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agentflow import detect, doctor, flow, init, layers, pack
+from agentflow import backlog_file, detect, doctor, flow, init, layers, pack
 from agentflow.config import Gate, load_config
 from conftest import PYTHON_CONFIG, run_git
 
@@ -152,11 +152,12 @@ def no_red(repo: Path) -> bool:
 
 # --- the pack ---------------------------------------------------------------------------------------------------------
 
-def test_init_writes_only_the_pack(toy_repo):
+def test_init_writes_nothing_else(toy_repo):
     code, out = run_init(toy_repo)
     assert code == 0, out
-    assert git_status(toy_repo) == "?? .agentflow/config.yaml\n"
+    assert git_status(toy_repo) == "?? .agentflow/config.yaml\n?? backlog.yml\n"
     shutil.rmtree(toy_repo / ".agentflow")
+    (toy_repo / "backlog.yml").unlink()
     assert git_status(toy_repo) == ""
 
 
@@ -184,6 +185,7 @@ def test_the_written_pack_loads_back_to_the_rendered_data(toy_repo):
         "version": 2, "engine": ">=3,<4", "starter": "python-uv", "gates_confirmed": False,
         "agents": {"claude": {"permission_mode": "bypassPermissions"}},
         "project": {"docs": {"decisions": "docs/adr"}},  # docs/plans is the engine default: not written
+        "work_source": {"kind": "backlog", "path": "backlog.yml"}, "dashboard": BACKLOG_DASHBOARD,
         "gates": {"lint": {"run": "ruff check ."}, "tests": {"run": multi}},
         "gate_sets": {"verify": ["lint", "tests"], "build": ["lint"]},
     }
@@ -248,19 +250,113 @@ def test_a_detected_spec_file_pattern_is_written_beside_the_specs_directory():
     assert yaml.safe_load(init.render_pack(found, base=base)) == data
 
 
-def test_no_specs_directory_means_no_work_source_or_backlog():
+BACKLOG_DASHBOARD = {"backlog": {"module_lane": "feature",
+                                 "new_task": {"feature": ["new_module", "issue", "after"],
+                                              "bug": ["issue", "task", "after"]}}}
+
+
+def test_no_specs_directory_writes_a_backlog_work_source():
     found = _detected(plans="docs/plans")
     base = init.base_of(found.starter)
     data = init.pack_data(found, base=base)
-    assert "work_source" not in data and "dashboard" not in data
+    assert data["work_source"] == {"kind": "backlog", "path": "backlog.yml"}
+    assert data["dashboard"] == BACKLOG_DASHBOARD
     text = init.render_pack(found, base=base)
-    assert "work_source" not in text and "dashboard" not in text
+    assert yaml.safe_load(text) == data
+    assert "backlog.yml lists every item" in text
+    assert init.empty_backlog(found) is True
 
 
-def test_a_specs_directory_that_looks_like_a_reference_adds_no_work_source():
+def test_a_specs_directory_keeps_the_specs_kind():
+    found = _detected(specs="docs/proposals")
+    base = init.base_of(found.starter)
+    data = init.pack_data(found, base=base)
+    assert data["work_source"] == {"kind": "specs"}
+    assert "backlog.yml lists every item" not in init.render_pack(found, base=base)
+    assert init.empty_backlog(found) is False
+
+
+def test_a_backlog_file_on_the_base_branch_wins_over_a_specs_directory():
+    found = dataclasses.replace(_detected(specs="docs/proposals"), backlog_file=True)
+    base = init.base_of(found.starter)
+    data = init.pack_data(found, base=base)
+    assert data["work_source"] == {"kind": "backlog", "path": "backlog.yml"}
+    assert data["dashboard"] == BACKLOG_DASHBOARD
+    assert yaml.safe_load(init.render_pack(found, base=base)) == data
+    assert init.empty_backlog(found) is False
+
+
+def test_init_creates_an_empty_backlog_file(toy_repo):
+    code, out = run_init(toy_repo)
+    assert code == 0, out
+    path = toy_repo / "backlog.yml"
+    assert path.read_text(encoding="utf-8") == backlog_file.render([])
+    assert backlog_file.read(path) == ([], [])
+    assert f"wrote {path}" in out
+    assert written(toy_repo)["work_source"] == {"kind": "backlog", "path": "backlog.yml"}
+    assert out.index("agentflow backlog add <id> --title") < out.index("agentflow explain feature")  # an item first
+
+
+def test_init_leaves_a_backlog_file_that_is_there(toy_repo):
+    (toy_repo / "backlog.yml").write_bytes(b"mine: true\n")
+    code, out = run_init(toy_repo)
+    assert code == 0, out
+    assert (toy_repo / "backlog.yml").read_bytes() == b"mine: true\n"
+    assert pack_file(toy_repo).exists()
+    assert "backlog.yml was left as it is" in out
+
+
+@pytest.mark.parametrize("kind", ["link-out", "dangling", "folder"])
+def test_init_does_not_follow_a_symlinked_backlog_file(toy_repo, tmp_path, kind):
+    path = toy_repo / "backlog.yml"
+    outside = tmp_path / "outside.txt"
+    if kind == "link-out":
+        outside.write_bytes(b"keep me\n")
+        path.symlink_to(outside)
+    elif kind == "dangling":
+        path.symlink_to(tmp_path / "nowhere.txt")
+    else:
+        path.mkdir()
+    code, out = run_init(toy_repo)
+    assert code == 0, out
+    assert pack_file(toy_repo).exists()
+    if kind == "link-out":
+        assert outside.read_bytes() == b"keep me\n"
+    elif kind == "dangling":
+        assert not (tmp_path / "nowhere.txt").exists()
+    else:
+        assert path.is_dir() and not list(path.iterdir())
+    assert "backlog.yml was left as it is" in out
+
+
+def test_init_reports_a_backlog_file_it_could_not_write(toy_repo, monkeypatch):
+    real = init.safeio.write_new
+
+    def refuse(path, text, *args, **kwargs):
+        if Path(path).name == "backlog.yml":
+            raise PermissionError(13, "no way\x1b[31m")
+        return real(path, text, *args, **kwargs)
+
+    monkeypatch.setattr(init.safeio, "write_new", refuse)
+    code, out = run_init(toy_repo)
+    assert code == 0, out
+    assert pack_file(toy_repo).exists() and not (toy_repo / "backlog.yml").exists()
+    assert "backlog.yml was not written" in out and "\x1b" not in out
+
+
+def test_init_offers_import_when_it_finds_specs(toy_repo):
+    set_ci(toy_repo, [{"name": "Tests", "run": "pytest -q"}], files={"docs/proposals/a.md": "# A\n"})
+    code, out = run_init(toy_repo)
+    assert code == 0, out
+    assert not (toy_repo / "backlog.yml").exists()
+    assert "agentflow backlog import --dry-run" in out
+    assert written(toy_repo)["work_source"] == {"kind": "specs"}
+
+
+def test_a_specs_directory_that_looks_like_a_reference_does_not_make_the_specs_kind():
     found = _detected(specs="@specs")  # dropped by `_checked`, so the work source would read the wrong folder
     data = init.pack_data(found, base=init.base_of(found.starter))
-    assert "work_source" not in data and "dashboard" not in data
+    assert data["work_source"] == {"kind": "backlog", "path": "backlog.yml"}
 
 
 def test_a_base_branch_other_than_main_is_written(toy_repo):
@@ -460,7 +556,7 @@ def test_baseline_leaves_no_worktree_even_when_a_gate_times_out(toy_repo, monkey
     assert code == 0, out
     assert statuses(rows) == {"tests": "error"} and "timed out" in rows[-1].note, out
     assert worktrees(toy_repo) == [toy_repo] and leftovers(toy_repo) == []
-    assert git_status(toy_repo) == "?? .agentflow/config.yaml\n"
+    assert git_status(toy_repo) == "?? .agentflow/config.yaml\n?? backlog.yml\n"
 
 
 def test_baseline_cleans_up_its_own_leftover_and_keeps_other_worktrees(toy_repo, tmp_path):

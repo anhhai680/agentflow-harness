@@ -750,8 +750,20 @@ def _alert_holder(group: dict, vuln_runs: list[tuple[Run, dict | None]]) -> Run 
     return held[-1] if held else None
 
 
+def _issue_item(number: str, pic: dict) -> BacklogItem | None:
+    """The item of `backlog.yml` that names `issue: <number>` (the first in file order, whatever its status: a
+    dropped or done item still absorbs its issue's card), or None."""
+    return next((i for i in pic["file_items"].values() if i.issue is not None and str(i.issue) == number), None)
+
+
 def _issue_blocker(number: str, pic: dict) -> str | None:
-    """Why synced issue `number` is not a Backlog card of its own: a run, a card or a module here has it."""
+    """Why synced issue `number` is not a Backlog card of its own: an item of the file, a run, a card or a module
+    here has it."""
+    item = _issue_item(number, pic)
+    if item is not None:
+        if item.status == "dropped":
+            return f"issue #{number} is the dropped item {item.id}"
+        return f"issue #{number} is item {item.id}: start module:{item.id} instead"
     for run in pic["runs"]:
         if str((run.state.get("params") or {}).get("issue") or "") != number:
             continue
@@ -1007,10 +1019,11 @@ def _picture(cfg: Config, repo: Path) -> dict:
     issues = []
     for entry in pic["issues"]:
         record = book.issue_overlay(entry["number"])
+        item = _issue_item(entry["number"], pic)
         issues.append({"number": entry["number"], "blocked_by": entry["blocked_by"],
                        "deps_complete": entry["deps_complete"], "on_board": _issue_blocker(entry["number"], pic) is None,
                        "starting": record is not None and record.status == "starting",
-                       "module": ISSUE_MODULE.format(number=entry["number"])})
+                       "module": item.id if item is not None else ISSUE_MODULE.format(number=entry["number"])})
     pic["view"] = module_queue.dependency_view(
         nodes, entries, book.cards(), merged=merged, runs={r.id: r for r in runs}, noun=work_source.noun(cfg),
         issues=issues,
@@ -1019,7 +1032,11 @@ def _picture(cfg: Config, repo: Path) -> dict:
 
 
 def _module_issue(module: str, pic: dict) -> str | None:
-    """The synced issue whose derived module (`ISSUE_MODULE`) is `module`, or None."""
+    """The synced issue that item `module` of `backlog.yml` names, else the synced issue whose derived module
+    (`ISSUE_MODULE`) is `module`, or None."""
+    item = pic["file_items"].get(module)
+    if item is not None and item.issue is not None and any(i["number"] == str(item.issue) for i in pic["issues"]):
+        return str(item.issue)
     return next((i["number"] for i in pic["issues"] if ISSUE_MODULE.format(number=i["number"]) == module), None)
 
 
@@ -1084,6 +1101,12 @@ def _item_fields(item: BacklogItem) -> dict:
             "issue": item.issue, "spec": item.spec, "notes": item.notes}
 
 
+def _issue_extra(item: BacklogItem, pic: dict) -> dict:
+    """The extra card fields of an item that names a synced issue: its `url`. Empty for any other item."""
+    entry = None if item.issue is None else next((i for i in pic["issues"] if i["number"] == str(item.issue)), None)
+    return {} if entry is None else {"url": entry.get("url") or ""}
+
+
 def snapshot(cfg: Config, repo: Path, now: datetime | None = None) -> dict:
     """The Backlog column for the board: `cards`, the finished modules (`done`, each with its `reason`, and
     `done_note`, the error from reading the hand marks or `""`), the New task form (`new_task`, `lane_phases`,
@@ -1143,10 +1166,12 @@ def snapshot(cfg: Config, repo: Path, now: datetime | None = None) -> dict:
         title = file_item.title or node.id
         card = make(f"module:{node.id}", "module", node.id, title, file_item.lane or lane or "", book.overlay(node.id),
                     deps=list(node.deps), note=entry.get("blocked"), title=title, planning=file_item.status,
-                    startable=startable, local=_is_local(file_item, committed))
+                    startable=startable, local=_is_local(file_item, committed), **_issue_extra(file_item, pic))
         card["item"] = _item_fields(file_item)  # not through `make`, whose `item` is the card's log record
         if not startable:
             card["note"] = NOT_STARTABLE.format(lane=file_item.lane)
+        if "url" in card and str(file_item.issue) in taken and card["status"] != "starting":
+            card["status"], card["note"] = "taken", TAKEN
         cards.append(card)
     for item in book.cards():
         if item.status in ("started", "removed"):
@@ -1169,6 +1194,11 @@ def snapshot(cfg: Config, repo: Path, now: datetime | None = None) -> dict:
                     url=entry.get("url") or "", blocks=blocks)
         if number in taken and card["status"] != "starting":
             card["status"], card["note"] = "taken", TAKEN
+        if work_source.kind(cfg) == "backlog":
+            # not while a start here is in flight, someone else works on it (the label, or a claim on `issue-<N>`):
+            # that run appends `issue-<N>` itself; nor when an item already has that id
+            card["addable"] = (entry["lane"] == lane and card["status"] not in ("starting", "taken")
+                               and module not in remote and module not in pic["file_items"])
         cards.append(card)
     for group in pic["alerts"]:
         lowest = group["alerts"][0]
@@ -1664,6 +1694,50 @@ def add_file_item(cfg: Config, repo: Path, item: dict, sha: str) -> str:
     with _FILE_LOCK:
         _refuse_closing_live(cfg, repo, item_id, {"status": status})
         return backlog_file.append_item(path, new, expect_sha=sha)
+
+
+def add_issue_item(cfg: Config, repo: Path, number: str, sha: str) -> str:
+    """Append the item `issue-<number>` for a synced issue to the backlog file in the work tree (nothing is committed)
+    and return the file's new sha-256. The item is built here from the cache, never from the page: its id is
+    `ISSUE_MODULE`, its title the issue's cached title (cleaned, one line, at most `backlog_file.TITLE_MAX`), its lane
+    the issue's, its status `backlog`. `Refused` when the pack is not `backlog`, the issue is not synced, its lane is
+    not the module lane, an item (any status) already names it or has the id, the issue is taken (the in-progress
+    label) or `issue-<number>` is claimed on `origin`; `Invalid` for a number that is not digits; `backlog_file.Stale` for a stale `sha`."""
+    repo = Path(repo)
+    sha = _sha_arg(sha)
+    if (not isinstance(number, str) or not (number.isascii() and number.isdigit()) or len(number) > 9
+            or int(number) < 1):
+        raise Invalid("number must be the number of a synced issue")
+    if work_source.kind(cfg) != "backlog":
+        raise Refused(NEEDS_BACKLOG.format(noun=work_source.noun(cfg)))
+    path = _backlog_path(cfg, repo)
+    number = str(int(number))
+    item_id = ISSUE_MODULE.format(number=number)
+    with _FILE_LOCK:
+        pic = _picture(cfg, repo)
+        entry = next((i for i in pic["issues"] if i["number"] == number), None)
+        if entry is None:
+            raise Refused(f"issue #{number} is not a synced issue")
+        if entry["lane"] != module_queue.module_lane(cfg):
+            raise Refused(f"issue #{number} is not in the module lane ({entry['lane']}): only a module-lane issue "
+                          "becomes an item")
+        named = _issue_item(number, pic)
+        if named is not None:
+            raise Refused(f"issue #{number} is already the item {named.id}")
+        if item_id in pic["file_items"]:
+            raise Refused(f"an item has the id {item_id} already: it names another issue")
+        blocker = _issue_blocker(number, pic)
+        if blocker is not None:
+            raise Refused(blocker)
+        _refuse_starting_issue(number, pic["book"])
+        _refuse_taken(number, pic)
+        claim = _shown_claims(pic, pic["claims"]).get(item_id)
+        if claim is not None:
+            raise Refused(f"{item_id} is claimed by {claim.by or 'another machine'}: its run appends the item")
+        title = _clean_title(entry.get("title"))[: backlog_file.TITLE_MAX].strip()
+        item = BacklogItem(id=item_id, deps=[], title=title or ISSUE_RESPONSIBILITY.format(number=number),
+                           lane=entry["lane"], status="backlog", spec="", issue=int(number), notes="")
+        return backlog_file.append_item(path, item, expect_sha=sha)
 
 
 def edit_item(cfg: Config, repo: Path, item_id: str, fields: dict, sha: str) -> tuple[str, list[str]]:

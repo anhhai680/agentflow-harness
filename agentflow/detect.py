@@ -23,7 +23,7 @@ from typing import Any
 
 import yaml
 
-from agentflow import layers
+from agentflow import backlog_file, layers
 
 MAX_BYTES = 1024 * 1024  # a larger file is not read
 MAX_STEPS = 500  # a workflow file with more steps (across its jobs) is not read: YAML aliases can repeat a list cheaply
@@ -74,6 +74,7 @@ class Detected:
     agent_docs: list[str] = field(default_factory=list)  # printed only
     notes: list[str] = field(default_factory=list)
     probe: str | None = None  # `AUDIT` when a CI audit step was found: the pack then writes `vuln.probe`
+    backlog_file: bool = False  # a regular `backlog.yml` is at the root of the base branch (read through git)
 
 
 # --- reading the repository -----------------------------------------------------------------------------------------
@@ -137,6 +138,20 @@ class _Source:
         if self.ref is None:
             return self._inside(path) is not None
         return _git(self.repo, "cat-file", "-e", f"{self.ref}:{path}")[0] == 0
+
+    def is_file(self, path: str) -> bool:
+        """Whether `path` is a regular file (not a symlink, a folder or a submodule): from the base branch's tree, or
+        from the working tree when there is no commit yet."""
+        if self.ref is None:
+            real = self._inside(path)
+            try:
+                mode = os.lstat(os.path.join(os.path.realpath(self.repo), path)).st_mode if real else 0
+            except OSError:
+                return False
+            return stat.S_ISREG(mode)
+        code, out = _git(self.repo, "ls-tree", "-z", self.ref, "--", path, limit=MAX_BYTES)
+        entry = out.decode("utf-8", "replace").split("\0", 1)[0]
+        return code == 0 and entry.split(" ", 1)[0] in ("100644", "100755") and entry.endswith(f"\t{path}")
 
     def ls(self, directory: str) -> list[str]:
         """The names (not paths) inside `directory`, sorted; empty when it is missing."""
@@ -683,7 +698,8 @@ def detect(repo: Path, starter: str | None = None) -> Detected:
         base_branch=branch, base_ref=ref, starter=picked, gates=gates, gate_sets=gate_sets, gate_source=source,
         docs=_docs(src, notes),
         skills=[n for n in src.ls(".claude/skills") if src.exists(f".claude/skills/{n}/SKILL.md")],
-        agent_docs=[n for n in ("CLAUDE.md", "AGENTS.md") if src.exists(n)], notes=_capped(notes), probe=probe)
+        agent_docs=[n for n in ("CLAUDE.md", "AGENTS.md") if src.exists(n)], notes=_capped(notes), probe=probe,
+        backlog_file=src.is_file(backlog_file.FILE))
 
 
 def _audit_notes(found: _Gates) -> list[str]:
