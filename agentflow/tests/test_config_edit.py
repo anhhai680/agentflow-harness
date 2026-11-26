@@ -1557,3 +1557,19 @@ def test_a_yaml_tab_text_over_the_byte_cap_is_refused(shipped):
     _, sha = config_edit.read(shipped)
     with pytest.raises(EditError, match=f"at most {layers.MAX_CONFIG_BYTES} bytes"):
         config_edit.propose(shipped, sha, text=SHIPPED + "#" * layers.MAX_CONFIG_BYTES, repo=REPO)
+
+
+def test_the_settings_page_refuses_a_merge_key_chain_quickly(shipped):
+    import time
+
+    from test_layers import merge_chain
+
+    chain = merge_chain(64 * 1024)
+    _, sha = config_edit.read(shipped)
+    started = time.monotonic()
+    proposal = config_edit.propose(shipped, sha, text=SHIPPED + chain, repo=REPO)
+    assert any("merge keys" in issue.message for issue in proposal.errors)
+    shipped.write_text(SHIPPED + chain, encoding="utf-8")
+    with pytest.raises(EditError, match="merge keys"):
+        config_edit.form_fields(shipped)
+    assert time.monotonic() - started < 3

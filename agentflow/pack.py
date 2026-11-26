@@ -100,7 +100,7 @@ def _raw_state_dir(config: Path) -> Any:
     if key not in _STATE_DIR_CACHE:
         try:  # the loader refuses what is unreadable here, with the reason; this reads one key
             text = layers.read_config_text(config)
-            data = yaml.safe_load(text) if text is not None else None
+            data = layers.parse_config(text) if text is not None else None
         except (OSError, yaml.YAMLError, RecursionError, ValueError):
             data = None
         paths = data.get("paths") if isinstance(data, dict) else None
