@@ -2265,6 +2265,17 @@ def test_the_issue_card_says_whether_it_is_addable(bbk, monkeypatch):
     assert cards["issue:7"]["addable"] is True and cards["issue:9"]["addable"] is False
 
 
+def test_an_issue_whose_start_is_in_flight_cannot_be_added(bbk, monkeypatch):
+    _absorbing(bbk, monkeypatch, _issue(7), yml=NO_ISSUE_YML)
+    backlog.begin_start(bbk.cfg, bbk.root, "issue:7")  # recorded `starting`; no run exists yet
+    before = (bbk.root / "backlog.yml").read_bytes()
+    assert bbk.cards()["issue:7"]["status"] == "starting"
+    assert bbk.cards()["issue:7"]["addable"] is False
+    with pytest.raises(Refused, match="#7 is starting"):
+        backlog.add_issue_item(bbk.cfg, bbk.root, "7", _file_sha(bbk))
+    assert (bbk.root / "backlog.yml").read_bytes() == before
+
+
 def test_the_issue_card_of_a_specs_pack_has_no_addable_field(isbk, monkeypatch):
     _list_issues(monkeypatch, _issue(7))
     isbk.refresh()

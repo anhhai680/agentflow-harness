@@ -1189,10 +1189,11 @@ def snapshot(cfg: Config, repo: Path, now: datetime | None = None) -> dict:
         blockers = list(dict.fromkeys(module_queue.issue_key(r) for r in entry["blocked_by"]))
         blocks = [{"key": module_queue.issue_key(r), "label": f"{r['repo']}#{r['number']}" if r["repo"] else f"#{r['number']}"}
                   for r in entry["blocks"]]
-        extra = {"addable": entry["lane"] == lane} if work_source.kind(cfg) == "backlog" else {}
         card = make(f"issue:{number}", "issue", number, f"#{number} · {entry.get('title') or ''}".rstrip(" ·"),
                     entry["lane"], book.issue_overlay(number), module=module, deps=blockers, issue=number,
-                    url=entry.get("url") or "", blocks=blocks, **extra)
+                    url=entry.get("url") or "", blocks=blocks)
+        if work_source.kind(cfg) == "backlog":  # a start in flight appends `issue-<N>` itself: no Add meanwhile
+            card["addable"] = entry["lane"] == lane and card["status"] != "starting"
         if number in taken and card["status"] != "starting":
             card["status"], card["note"] = "taken", TAKEN
         cards.append(card)
@@ -1724,6 +1725,7 @@ def add_issue_item(cfg: Config, repo: Path, number: str, sha: str) -> str:
         blocker = _issue_blocker(number, pic)
         if blocker is not None:
             raise Refused(blocker)
+        _refuse_starting_issue(number, pic["book"])
         title = _clean_title(entry.get("title"))[: backlog_file.TITLE_MAX].strip()
         item = BacklogItem(id=item_id, deps=[], title=title or ISSUE_RESPONSIBILITY.format(number=number),
                            lane=entry["lane"], status="backlog", spec="", issue=int(number), notes="")
