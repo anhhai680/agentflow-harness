@@ -7,7 +7,11 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+- `agentflow init` writes a `backlog` pack and an empty `backlog.yml` for a repository with no specs folder, and uses an existing `backlog.yml` as it is. A repository with a specs folder keeps the `specs` kind, and `init` offers `agentflow backlog import`.
+
 ### Changed
+- `init` now writes `backlog.yml` as well as `.agentflow/config.yaml`, in the one case above; neither is written over anything or through a symlink.
 - `validate` prints a note (not a warning, so `0 warnings` still holds) on a `capability_map` or `specs` work source, pointing to `agentflow backlog import`; both kinds are deprecated and 4.0 removes them.
 
 ## [3.11] - 2026-11-26

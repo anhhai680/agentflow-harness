@@ -1,5 +1,6 @@
 """Plug and play, end to end: `agentflow init` in a repository that has never seen agentflow, then `doctor`,
-`validate`, `explain` and a dry run, with nothing written to the repository but `.agentflow/config.yaml`.
+`validate`, `explain` and a dry run, with nothing written to the repository but `.agentflow/config.yaml` and, for a repository with no specs folder, an
+empty `backlog.yml`.
 
 Each toy repository under `fixtures/repos/` is copied into a tmp git repo on `main`, pushed to a bare `origin` (with
 no `remote set-head`, so the base branch is found the way a fresh clone's would be). A tmp `bin/` first on PATH holds
@@ -37,6 +38,7 @@ EXPECTED = {  # the verify gates' commands each repository's pack ends up with, 
     "docs": ([WHITESPACE], "the docs-only starter"),
 }
 CONFIRM_WARNING = "warning gates_confirmed:"
+INIT_WRITES = "?? .agentflow/config.yaml\n?? backlog.yml"
 PRINTED_RULE = re.compile(r'^  add to `permissions\.allow`: "(Bash\(.+\))"$', re.MULTILINE)
 
 
@@ -134,10 +136,16 @@ def test_init_to_dry_run(kind: str, tmp_path: Path, fakebin: Path) -> None:
     doctor = agentflow(repo, "doctor")
     assert doctor.returncode == 0, _shown(doctor)
 
+    assert git_status(repo) == INIT_WRITES
+    spec = ["--spec", "docs/greet.md"] if kind == "docs" else []  # the item that lists the repository's spec file
+    add = agentflow(repo, "backlog", "add", "greet", "--title", "Greet", "--status", "ready", *spec)  # a backlog pack
+    assert add.returncode == 0, _shown(add)  # needs an item: a `module_lane` run starts from one
+
     add_bug_lane_rule(repo, init.stdout)
     confirm_gates(repo)
     validate = agentflow(repo, "validate")
     assert validate.returncode == 0 and "(0 warnings)" in validate.stdout, _shown(validate)
+    assert git_status(repo) == INIT_WRITES
 
     explain = agentflow(repo, "explain", "feature", "--module", "greet")
     assert explain.returncode == 0, _shown(explain)
@@ -145,8 +153,9 @@ def test_init_to_dry_run(kind: str, tmp_path: Path, fakebin: Path) -> None:
     assert dry_run.returncode == 0, _shown(dry_run)
     assert all(command in dry_run.stdout for command in commands), _shown(dry_run)
 
-    assert git_status(repo) == "?? .agentflow/config.yaml"
+    assert git_status(repo) == INIT_WRITES
     shutil.rmtree(repo / ".agentflow")
+    (repo / "backlog.yml").unlink()
     assert git_status(repo) == ""
 
 
@@ -170,6 +179,8 @@ def test_init_in_a_repository_with_specs_writes_a_specs_backlog(tmp_path: Path, 
     assert validate.returncode == 0, _shown(validate)
     warnings = [line for line in validate.stdout.splitlines() if line.startswith("warning ")]
     assert len(warnings) == 1 and warnings[0].startswith(CONFIRM_WARNING), _shown(validate)
+    assert len([x for x in validate.stdout.splitlines() if x.startswith("note work_source:")]) == 1, _shown(validate)
+    assert not (repo / "backlog.yml").exists()
     confirm_gates(repo)
 
     cards = backlog.snapshot(load_config(pack.pack_config(repo)), repo)["cards"]
@@ -196,6 +207,24 @@ def test_init_then_validate_for_a_starter_in_an_empty_repo(tmp_path: Path, fakeb
     confirm_gates(repo)
     validate = agentflow(repo, "validate")
     assert validate.returncode == 0 and "(0 warnings)" in validate.stdout, _shown(validate)
+    assert git_status(repo) == INIT_WRITES
+
+
+def test_init_in_a_repository_with_a_backlog_file_uses_it(tmp_path: Path, fakebin: Path) -> None:
+    repo = toy("docs", tmp_path)
+    text = ("version: 1\nitems:\n  - id: greet\n    title: Greet\n    status: ready\n")
+    (repo / "backlog.yml").write_text(text, encoding="utf-8")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", "backlog")
+    run_git(repo, "push", "-q", "origin", "main")
+
+    init = agentflow(repo, "init")
+    assert init.returncode == 0, _shown(init)
+    cfg = load_config(pack.pack_config(repo))
+    assert cfg.work_source.kind == "backlog"
+    assert (repo / "backlog.yml").read_text(encoding="utf-8") == text
+    cards = backlog.snapshot(cfg, repo)["cards"]
+    assert [c["id"] for c in cards if c["id"] == "greet"] == ["greet"], cards
     assert git_status(repo) == "?? .agentflow/config.yaml"
 
 
