@@ -750,8 +750,20 @@ def _alert_holder(group: dict, vuln_runs: list[tuple[Run, dict | None]]) -> Run 
     return held[-1] if held else None
 
 
+def _issue_item(number: str, pic: dict) -> BacklogItem | None:
+    """The item of `backlog.yml` that names `issue: <number>` (the first in file order, whatever its status: a
+    dropped or done item still absorbs its issue's card), or None."""
+    return next((i for i in pic["file_items"].values() if i.issue is not None and str(i.issue) == number), None)
+
+
 def _issue_blocker(number: str, pic: dict) -> str | None:
-    """Why synced issue `number` is not a Backlog card of its own: a run, a card or a module here has it."""
+    """Why synced issue `number` is not a Backlog card of its own: an item of the file, a run, a card or a module
+    here has it."""
+    item = _issue_item(number, pic)
+    if item is not None:
+        if item.status == "dropped":
+            return f"issue #{number} is the dropped item {item.id}"
+        return f"issue #{number} is item {item.id}: start module:{item.id} instead"
     for run in pic["runs"]:
         if str((run.state.get("params") or {}).get("issue") or "") != number:
             continue
@@ -1007,10 +1019,11 @@ def _picture(cfg: Config, repo: Path) -> dict:
     issues = []
     for entry in pic["issues"]:
         record = book.issue_overlay(entry["number"])
+        item = _issue_item(entry["number"], pic)
         issues.append({"number": entry["number"], "blocked_by": entry["blocked_by"],
                        "deps_complete": entry["deps_complete"], "on_board": _issue_blocker(entry["number"], pic) is None,
                        "starting": record is not None and record.status == "starting",
-                       "module": ISSUE_MODULE.format(number=entry["number"])})
+                       "module": item.id if item is not None else ISSUE_MODULE.format(number=entry["number"])})
     pic["view"] = module_queue.dependency_view(
         nodes, entries, book.cards(), merged=merged, runs={r.id: r for r in runs}, noun=work_source.noun(cfg),
         issues=issues,
@@ -1019,7 +1032,11 @@ def _picture(cfg: Config, repo: Path) -> dict:
 
 
 def _module_issue(module: str, pic: dict) -> str | None:
-    """The synced issue whose derived module (`ISSUE_MODULE`) is `module`, or None."""
+    """The synced issue that item `module` of `backlog.yml` names, else the synced issue whose derived module
+    (`ISSUE_MODULE`) is `module`, or None."""
+    item = pic["file_items"].get(module)
+    if item is not None and item.issue is not None and any(i["number"] == str(item.issue) for i in pic["issues"]):
+        return str(item.issue)
     return next((i["number"] for i in pic["issues"] if ISSUE_MODULE.format(number=i["number"]) == module), None)
 
 
@@ -1084,6 +1101,12 @@ def _item_fields(item: BacklogItem) -> dict:
             "issue": item.issue, "spec": item.spec, "notes": item.notes}
 
 
+def _issue_extra(item: BacklogItem, pic: dict) -> dict:
+    """The extra card fields of an item that names a synced issue: its `url`. Empty for any other item."""
+    entry = None if item.issue is None else next((i for i in pic["issues"] if i["number"] == str(item.issue)), None)
+    return {} if entry is None else {"url": entry.get("url") or ""}
+
+
 def snapshot(cfg: Config, repo: Path, now: datetime | None = None) -> dict:
     """The Backlog column for the board: `cards`, the finished modules (`done`, each with its `reason`, and
     `done_note`, the error from reading the hand marks or `""`), the New task form (`new_task`, `lane_phases`,
@@ -1143,10 +1166,12 @@ def snapshot(cfg: Config, repo: Path, now: datetime | None = None) -> dict:
         title = file_item.title or node.id
         card = make(f"module:{node.id}", "module", node.id, title, file_item.lane or lane or "", book.overlay(node.id),
                     deps=list(node.deps), note=entry.get("blocked"), title=title, planning=file_item.status,
-                    startable=startable, local=_is_local(file_item, committed))
+                    startable=startable, local=_is_local(file_item, committed), **_issue_extra(file_item, pic))
         card["item"] = _item_fields(file_item)  # not through `make`, whose `item` is the card's log record
         if not startable:
             card["note"] = NOT_STARTABLE.format(lane=file_item.lane)
+        if "url" in card and str(file_item.issue) in taken and card["status"] != "starting":
+            card["status"], card["note"] = "taken", TAKEN
         cards.append(card)
     for item in book.cards():
         if item.status in ("started", "removed"):
