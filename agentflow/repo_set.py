@@ -46,12 +46,24 @@ class NoWorkspace(Exception):
     """The user's settings name no root and no repository."""
 
 
+_UNREADABLE = (OSError, RuntimeError, ValueError)  # what a probe or a resolve of an odd path can raise
+
+
 def _is_checkout(path: Path) -> bool:
     return (path / ".git").exists()  # a folder in a main checkout, a file in a linked worktree
 
 
+def _probe(check, path: Path) -> bool:
+    """`check(path)` (a `Path` test), with a path that cannot be probed counting as a no."""
+    try:
+        return bool(check(path))
+    except _UNREADABLE:
+        return False
+
+
 def _children(root: Path, skipped: list[Skipped], entry: str) -> list[Path]:
-    """The child folders of `root` that look like repositories: not hidden, not a symlink, holding `.git`."""
+    """The child folders of `root` that look like repositories: not hidden, not a symlink, holding `.git`.
+    The listing is read whole, but at most `MAX_CHILDREN` of its names are examined, in name order."""
     try:
         with os.scandir(root) as scan:
             found = sorted(scan, key=lambda e: e.name)
@@ -68,7 +80,7 @@ def _children(root: Path, skipped: list[Skipped], entry: str) -> list[Path]:
                 continue
         except OSError:
             continue
-        if _is_checkout(Path(child.path)):
+        if _probe(_is_checkout, Path(child.path)):  # an unreadable child is not a candidate
             out.append(Path(child.path))
     return out
 
@@ -76,46 +88,73 @@ def _children(root: Path, skipped: list[Skipped], entry: str) -> list[Path]:
 def _excluded(checkout: Path, exclude: tuple[str, ...]) -> bool:
     for entry in exclude:
         if "/" in entry or entry.startswith("~"):
-            if Path(entry).expanduser().resolve() == checkout:
-                return True
+            try:
+                if Path(entry).expanduser().resolve() == checkout:
+                    return True
+            except _UNREADABLE:  # an entry that cannot be resolved matches nothing
+                continue
         elif entry == checkout.name:
             return True
     return False
 
 
+def _main_checkout(candidate: Path) -> Path | None:
+    """The main checkout holding `candidate`, or None when it is not one: git names no checkout (a submodule's
+    `.git` file leads into its superproject's `.git/modules`) or the path cannot be probed."""
+    try:
+        checkout = pack.checkout_root(candidate)
+        return checkout if (checkout / ".git").is_dir() else None
+    except _UNREADABLE:
+        return None
+
+
 def resolve(settings: layers.WorkspaceSettings) -> RepoSet:
     """The repositories of `settings`: each root's child repositories in name order, then the `repos` entries,
-    each as its main checkout and once, with `exclude` applied last."""
+    each as its main checkout and once, with `exclude` applied last. An entry that cannot be read is `Skipped`
+    (a root's unreadable child is simply not a candidate); nothing here raises for one bad path."""
     skipped: list[Skipped] = []
-    candidates: list[Path] = []
+    candidates: list[tuple[Path, str | None]] = []  # the path, and the entry that named it (None for a root's child)
     for entry in settings.roots:
-        root = Path(entry).expanduser()
-        if not root.is_dir():
+        try:
+            root = Path(entry).expanduser()
+            is_folder = root.is_dir()
+        except _UNREADABLE as exc:
+            skipped.append(Skipped(entry, f"cannot be read: {exc}"))
+            continue
+        if not is_folder:
             skipped.append(Skipped(entry, "is not a folder"))
             continue
-        candidates.extend(_children(root, skipped, entry))
+        candidates.extend((child, None) for child in _children(root, skipped, entry))
     for entry in settings.repos:
-        path = Path(entry).expanduser()
-        if path.is_dir() and _is_checkout(path):
-            candidates.append(path)  # named by the developer, so a symlink is followed
+        try:
+            path = Path(entry).expanduser()  # named by the developer, so a symlink is followed
+            named = path.is_dir() and _is_checkout(path)
+        except _UNREADABLE as exc:
+            skipped.append(Skipped(entry, f"cannot be read: {exc}"))
+            continue
+        if named:
+            candidates.append((path, entry))
         else:
             skipped.append(Skipped(entry, "is not a git checkout"))
     seen: set[Path] = set()
     checkouts: list[Path] = []
-    for candidate in candidates:
-        checkout = pack.checkout_root(candidate)
-        if checkout in seen or _excluded(checkout, settings.exclude):
-            seen.add(checkout)
+    for candidate, entry in candidates:
+        checkout = _main_checkout(candidate)
+        if checkout is None:
+            if entry is not None:
+                skipped.append(Skipped(entry, "is not a git checkout"))
             continue
+        drop = checkout in seen or _excluded(checkout, settings.exclude)
         seen.add(checkout)
-        checkouts.append(checkout)
+        if not drop:
+            checkouts.append(checkout)
     shared = Counter(c.name for c in checkouts)
     repos = tuple(
         RepoRef(
             pack.repo_id(c),
             f"{c.name} ({c.parent.name})" if shared[c.name] > 1 else c.name,
             c,
-            "live" if (c / pack.PACK_DIR / "config.yaml").is_file() else "not_set_up",
+            "live" if _probe(Path.is_file, c / pack.PACK_DIR / "config.yaml") else "not_set_up",
         )
         for c in checkouts
     )
