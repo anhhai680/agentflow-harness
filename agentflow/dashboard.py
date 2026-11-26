@@ -65,6 +65,7 @@ Routes:
 - Every other route but `/api/info` reads one repository, the server's default (`DashboardServer.default_context`):
   with none it answers 404 `no repository`. A repository that is not live, or whose pack names another runs directory
   than it was loaded with, answers 409 with the reason, on the legacy routes and under its prefix alike.
+  `/api/events?all=1` is a legacy route too: while the default is not live, or gone, it answers that 409 or 404.
   `/api/info` (and `/api/repos/<id>/info`) answers from the user settings when there is no config.
 
 In the background, `serve` (one repository) and `serve_workspace` (the user's workspace) send due reminders, recheck
