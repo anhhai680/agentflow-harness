@@ -279,6 +279,7 @@ function backlogNode(item) {
   else if (item.startable === false) buttons.push(el("button", { type: "button", class: "primary", text: "Start", disabled: "disabled", title: item.note || "" }));
   if (item.removable) buttons.push(el("button", { type: "button", class: "danger", text: "Remove", onclick: (ev) => { ev.stopPropagation(); removeItem(item); } }));
   if (isOpenFileCard(item)) buttons.push(...fileButtons(item));
+  if (item.kind === "issue" && item.addable) buttons.push(el("button", { type: "button", text: "Add to backlog", onclick: (ev) => { ev.stopPropagation(); addIssue(item); } }));
   const isAlert = item.kind === "alert";
   const sev = isAlert ? severityClass(item.severity) : null;
   const node = el("article", { class: "card backlog " + item.status + (item.failure ? " failed-start" : ""), draggable: canStart ? "true" : null },
@@ -390,6 +391,9 @@ const moveBody = (card, up, sha) => ({ op: "move", id: card.id, direction: up ? 
 
 const addFromSpecBody = (path, sha) => ({ op: "add", item: { spec: path, status: "backlog" }, sha256: sha });
 
+// A synced issue becomes an item: the page sends only the number, the server builds the item from its cache.
+const addIssueBody = (number, sha) => ({ op: "add_issue", number: String(number), sha256: sha });
+
 // One line of at most `RESP_TITLE_MAX` characters, cut with an ellipsis.
 function oneLine(text) {
   const line = String(text || "").replace(/\s+/g, " ").trim();
@@ -429,6 +433,8 @@ async function writeBacklogFile(body, said) {
 const moveItem = (card, up) => writeBacklogFile(moveBody(card, up, shaOf(card)), card.label + " moved " + (up ? "up" : "down"));
 
 const addSpec = (path, sha) => writeBacklogFile(addFromSpecBody(path, sha), "Added " + path + " to backlog.yml as an idea");
+
+const addIssue = (card) => writeBacklogFile(addIssueBody(card.id, shaOf(card)), "Added issue #" + card.id + " to backlog.yml");
 
 // The Edit dialog's save: the changed keys against the item the dialog showed, with the sha from when it opened.
 async function saveEdit(card, form, sha) {

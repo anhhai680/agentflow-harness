@@ -1461,6 +1461,62 @@ def test_add_from_a_spec_derives_id_and_title(kdash):
     assert card["item"]["status"] == "backlog"
 
 
+@pytest.fixture
+def kidash(kdash, monkeypatch, tmp_path):
+    """`kdash` (a `backlog` pack) with the fake `gh` on PATH, `issues.sync_label: agentflow` and issue #7 listed."""
+    gh_bin = Path(__file__).parent / "bin"
+    monkeypatch.setenv("PATH", f"{gh_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(tmp_path / "gh.log"))
+    issue = {"number": 7, "title": "Fix the thing", "labels": [{"name": "agentflow"}],
+             "url": "https://github.com/example/repo/issues/7",
+             "blockedBy": {"nodes": [], "totalCount": 0}, "blocking": {"nodes": [], "totalCount": 0}}
+    monkeypatch.setenv("FAKE_GH_ISSUE_LIST", json.dumps([issue]))
+    kdash.flow.configure({"work_source": {"kind": "backlog", "path": None}, "issues": {"sync_label": "agentflow"}})
+    kdash.server.cfg = kdash.flow.cfg
+    from agentflow.dashboard import refresh_once
+
+    refresh_once(kdash.server)
+    return kdash
+
+
+def test_the_file_endpoint_add_issue_appends_a_synced_issue(kidash):
+    root = kidash.flow.root
+    data = payload(kidash.get("/api/board")[2])
+    assert {c["key"]: c for c in data["backlog"]}["issue:7"]["addable"] is True
+    head = run_git(root, "rev-parse", "HEAD")
+    code, _, raw = kidash.post("/api/backlog/file", {"op": "add_issue", "number": "7", "sha256": data["backlog_sha256"]})
+    answer = payload(raw)
+    assert (code, answer["ok"]) == (200, True) and answer["sha256"] != data["backlog_sha256"]
+    assert run_git(root, "rev-parse", "HEAD") == head and run_git(root, "status", "--porcelain").splitlines() == [" M backlog.yml"]
+    cards = backlog_of(kidash)
+    assert cards["module:issue-7"]["item"]["title"] == "Fix the thing" and "issue:7" not in cards
+    code, _, raw = kidash.post("/api/backlog/file", {"op": "add_issue", "number": "7", "sha256": answer["sha256"]})
+    assert code == 409 and "issue-7" in payload(raw)["error"]  # an item names it now
+
+
+def test_the_file_endpoint_refuses_a_bad_add_issue(kidash):
+    root = kidash.flow.root
+    sha = payload(kidash.get("/api/board")[2])["backlog_sha256"]
+    before = (root / "backlog.yml").read_bytes()
+    code, _, raw = kidash.post("/api/backlog/file", {"op": "add_issue", "number": "7", "sha256": "0" * 64})
+    assert code == 409 and "changed on disk" in payload(raw)["error"]
+    for body in ({"op": "add_issue", "number": 7, "sha256": sha},
+                 {"op": "add_issue", "number": "7", "sha256": sha, "title": "mine"},
+                 {"op": "add_issue", "sha256": sha},
+                 {"op": "add_issue", "number": "7"},
+                 {"op": "add_issue", "number": "7; x", "sha256": sha}):
+        code, _, raw = kidash.post("/api/backlog/file", body)
+        assert code == 400 and payload(raw)["error"], body
+    assert kidash.post("/api/backlog/file", {"op": "add_issue", "number": "99", "sha256": sha})[0] == 409  # not synced
+    assert (root / "backlog.yml").read_bytes() == before
+
+
+def test_add_issue_is_a_409_outside_a_backlog_pack(idash):
+    assert idash.server.cfg.work_source.kind != "backlog"
+    code, _, raw = idash.post("/api/backlog/file", {"op": "add_issue", "number": "12", "sha256": "0" * 64})
+    assert code == 409 and "backlog" in payload(raw)["error"]
+
+
 def test_the_file_endpoint_needs_the_token_and_our_origin(kdash):
     sha = _block_file(kdash)
     body = {"op": "add", "sha256": sha, "item": {"id": "n", "title": "New"}}

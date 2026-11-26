@@ -1189,9 +1189,10 @@ def snapshot(cfg: Config, repo: Path, now: datetime | None = None) -> dict:
         blockers = list(dict.fromkeys(module_queue.issue_key(r) for r in entry["blocked_by"]))
         blocks = [{"key": module_queue.issue_key(r), "label": f"{r['repo']}#{r['number']}" if r["repo"] else f"#{r['number']}"}
                   for r in entry["blocks"]]
+        extra = {"addable": entry["lane"] == lane} if work_source.kind(cfg) == "backlog" else {}
         card = make(f"issue:{number}", "issue", number, f"#{number} · {entry.get('title') or ''}".rstrip(" ·"),
                     entry["lane"], book.issue_overlay(number), module=module, deps=blockers, issue=number,
-                    url=entry.get("url") or "", blocks=blocks)
+                    url=entry.get("url") or "", blocks=blocks, **extra)
         if number in taken and card["status"] != "starting":
             card["status"], card["note"] = "taken", TAKEN
         cards.append(card)
@@ -1689,6 +1690,44 @@ def add_file_item(cfg: Config, repo: Path, item: dict, sha: str) -> str:
     with _FILE_LOCK:
         _refuse_closing_live(cfg, repo, item_id, {"status": status})
         return backlog_file.append_item(path, new, expect_sha=sha)
+
+
+def add_issue_item(cfg: Config, repo: Path, number: str, sha: str) -> str:
+    """Append the item `issue-<number>` for a synced issue to the backlog file in the work tree (nothing is committed)
+    and return the file's new sha-256. The item is built here from the cache, never from the page: its id is
+    `ISSUE_MODULE`, its title the issue's cached title (cleaned, one line, at most `backlog_file.TITLE_MAX`), its lane
+    the issue's, its status `backlog`. `Refused` when the pack is not `backlog`, the issue is not synced, its lane is
+    not the module lane, or an item (any status) already names it or has the id; `Invalid` for a number that is not
+    digits; `backlog_file.Stale` for a stale `sha`."""
+    repo = Path(repo)
+    sha = _sha_arg(sha)
+    if not isinstance(number, str) or not (number.isascii() and number.isdigit()) or int(number) < 1 or len(number) > 9:
+        raise Invalid("number must be the number of a synced issue")
+    if work_source.kind(cfg) != "backlog":
+        raise Refused(NEEDS_BACKLOG.format(noun=work_source.noun(cfg)))
+    path = _backlog_path(cfg, repo)
+    number = str(int(number))
+    item_id = ISSUE_MODULE.format(number=number)
+    with _FILE_LOCK:
+        pic = _picture(cfg, repo)
+        entry = next((i for i in pic["issues"] if i["number"] == number), None)
+        if entry is None:
+            raise Refused(f"issue #{number} is not a synced issue")
+        if entry["lane"] != module_queue.module_lane(cfg):
+            raise Refused(f"issue #{number} is not in the module lane ({entry['lane']}): only a module-lane issue "
+                          "becomes an item")
+        named = _issue_item(number, pic)
+        if named is not None:
+            raise Refused(f"issue #{number} is already the item {named.id}")
+        if item_id in pic["file_items"]:
+            raise Refused(f"an item has the id {item_id} already: it names another issue")
+        blocker = _issue_blocker(number, pic)
+        if blocker is not None:
+            raise Refused(blocker)
+        title = _clean_title(entry.get("title"))[: backlog_file.TITLE_MAX].strip()
+        item = BacklogItem(id=item_id, deps=[], title=title or ISSUE_RESPONSIBILITY.format(number=number),
+                           lane=entry["lane"], status="backlog", spec="", issue=int(number), notes="")
+        return backlog_file.append_item(path, item, expect_sha=sha)
 
 
 def edit_item(cfg: Config, repo: Path, item_id: str, fields: dict, sha: str) -> tuple[str, list[str]]:

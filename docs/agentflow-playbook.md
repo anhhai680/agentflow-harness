@@ -473,7 +473,7 @@ agentflow backlog add <id> --title "…" [--lane L] [--status S] [--depends-on a
 agentflow backlog set <id> status=ready [key=value …]   # edit an item: title, lane, status, spec, plan, depends_on, issue, notes;
                                                     #   an empty value clears the key
 agentflow backlog import [--dry-run]                # write the first backlog.yml from the current work source (section 14)
-                                                    # the Board edits backlog.yml too: Edit and Move up/down on a card, Add on "Not on the backlog"; a card marked
+                                                    # the Board edits backlog.yml too: Edit and Move up/down on a card, Add on "Not on the backlog", Add to backlog on a synced module-lane issue; a card marked
                                                     #   `local` is only in your working tree until you commit the file (section 14)
 agentflow backlog release <id>                      # free the claim on an item on origin, whoever holds it: a teammate's, a stale or an
                                                     #   unreadable one (nothing frees a claim by itself, except its own machine's run ending

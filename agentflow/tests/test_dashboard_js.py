@@ -664,6 +664,43 @@ def test_not_on_the_backlog_entries_have_an_add_button_that_sends_the_spec():
     assert got == [["/api/backlog/file", {"op": "add", "item": {"spec": "docs/specs/x.md", "status": "backlog"}, "sha256": SHA}]]
 
 
+ISSUE_CARD = {**IDEA, "kind": "issue", "key": "issue:7", "id": "7", "label": "#7 · <b>hostile</b>", "addable": True, "sha": SHA}
+CLICKABLE_EL = ("el = (tag, p, ...c) => ({tag, p: p || {}, c: c.flat().filter((x) => x), addEventListener() {}});"
+                "globalThis.Node = Object;")
+
+
+def _add_issue_run(card: dict) -> list:
+    """Draw `card`, click its **Add to backlog** button once if it has one, and return the texts of its buttons and the posts."""
+    return js_async(["board.js"], BOARD + CLICKABLE_EL + "var sent = []; toast = () => {}; refreshAfter = () => {};"
+                    "api = async (url, body) => { sent.push([url, body]); return {ok: true}; };"
+                    """(async () => {
+      const node = backlogNode(args);
+      const moves = node.c.filter((k) => k.p.class === "moves").flatMap((k) => k.c);
+      const add = moves.find((b) => b.p.text === "Add to backlog");
+      if (add) await add.p.onclick({ stopPropagation() {} });
+      return [moves.map((b) => b.p.text), sent];
+    })()""", card)
+
+
+def test_an_addable_issue_card_posts_add_issue_once_with_its_number_and_sha():
+    texts, sent = _add_issue_run(ISSUE_CARD)
+    assert "Add to backlog" in texts
+    assert sent == [["/api/backlog/file", {"op": "add_issue", "number": "7", "sha256": SHA}]]  # the render's sha, not NEW_SHA
+
+
+def test_the_add_issue_button_is_fixed_text_and_only_on_an_addable_issue_card():
+    texts, sent = _add_issue_run({**ISSUE_CARD, "addable": False})
+    assert "Add to backlog" not in texts and sent == []
+    texts, _ = _add_issue_run({k: v for k, v in ISSUE_CARD.items() if k != "addable"})
+    assert "Add to backlog" not in texts
+    texts, _ = _add_issue_run({**IDEA, "addable": True})  # only an issue card has it
+    assert "Add to backlog" not in texts
+    texts, _ = _add_issue_run({**ISSUE_CARD, "label": "Add to backlog"})
+    assert texts.count("Add to backlog") == 1
+    texts, _ = _add_issue_run({**ISSUE_CARD, "label": "<img src=x onerror=alert(1)>"})
+    assert not any("<img" in t for t in texts)
+
+
 NEW_DATA = {"work_source_kind": "backlog", "new_task": {"feature": ["issue", "new_module"], "bug": ["issue", "task"]},
             "modules": ["a", "b"], "lane_phases": {"feature": ["define", "plan"], "bug": ["debug"]}, "after_choices": [{"key": "x", "label": "x"}]}
 

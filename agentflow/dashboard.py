@@ -41,8 +41,10 @@ Routes:
   an alert group when Dependabot closes it). A start re-checks that the card is not blocked and has no
   duplicate (409 with the reason otherwise), answers 202 at once and runs the slow part (`flow.py run --detach`)
   on a worker thread, one start at a time. Nothing starts by itself: only these calls start work.
-- `POST /api/backlog/file` (a `backlog` pack: `op` `add` with `item`, `edit` with `id` and `fields`, or `move` with
-  `id` and `direction`, and always `sha256`, the board's `backlog_sha256`) edits `backlog.yml` in the working tree and
+- `POST /api/backlog/file` (a `backlog` pack: `op` `add` with `item`, `edit` with `id` and `fields`, `move` with
+  `id` and `direction`, or `add_issue` with `number`, a synced module-lane issue's number: the server appends the
+  item `issue-<number>` from its cache, and the page sends nothing else; and always `sha256`, the board's
+  `backlog_sha256`) edits `backlog.yml` in the working tree and
   never commits. It answers 200 `{ok, sha256, notes}` (the file's new sha, and the lines about the claim of a `done`
   item an edit reopened), 409 when the file changed since the page read it or a `done`/`dropped` status meets a
   live run, and 400 for a bad key, value or edit.
@@ -134,7 +136,7 @@ EVENTS_LIMIT_MAX = 500
 ACTION_ROUTE = re.compile(r"^/api/runs/([^/]+)/([a-z]+)$")
 TEXT_MAX = backlog.TEXT_MAX
 BACKLOG_ROUTES = ("/api/backlog", "/api/backlog/start", "/api/backlog/remove", "/api/backlog/file")
-FILE_OPS = {"add": ("item",), "edit": ("id", "fields"), "move": ("id", "direction")}  # each op's keys, with sha256
+FILE_OPS = {"add": ("item",), "edit": ("id", "fields"), "move": ("id", "direction"), "add_issue": ("number",)}  # each op's keys, with sha256
 CONFIG_ROUTES = ("/api/config/preview", "/api/config/save")
 CONFIG_MAX_BODY = config_edit.MAX_TEXT + 64 * 1024  # the YAML tab sends the whole file
 BACKLOG_LOG = "backlog"  # the `run_id` the live stream gives backlog events
@@ -192,6 +194,8 @@ def _file_edit(cfg: Config, repo: Path, body: dict) -> tuple[str, list[str]]:
         raise BadRequest("sha256 must be the backlog_sha256 the board sent")
     if op == "add":
         return backlog.add_file_item(cfg, repo, body["item"], sha), []
+    if op == "add_issue":
+        return backlog.add_issue_item(cfg, repo, _text(body, "number", required=True) or "", sha), []
     item_id = _text(body, "id", required=True) or ""
     if op == "edit":
         return backlog.edit_item(cfg, repo, item_id, body["fields"], sha)

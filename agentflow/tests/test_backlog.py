@@ -2175,6 +2175,102 @@ def test_a_capability_map_pack_is_unchanged(ibk, monkeypatch):
     assert all("url" not in c for c in cards.values() if c["kind"] == "module")
 
 
+# --------------------------------------------------------------------------- Add to backlog on a synced issue
+
+NO_ISSUE_YML = """version: 1
+items:
+  - {id: other, title: Other, status: ready}
+"""
+
+
+def _backlog_items(bbk) -> dict:
+    return {i.id: i for i in backlog.backlog_file.read(bbk.root / "backlog.yml")[0]}
+
+
+def test_add_issue_item_appends_an_item_from_the_cache(bbk, monkeypatch):
+    import hashlib
+
+    _absorbing(bbk, monkeypatch, _issue(7, title="Fix the thing"), yml=NO_ISSUE_YML)
+    assert "issue:7" in bbk.cards()
+    head = run_git(bbk.root, "rev-parse", "HEAD").strip()
+    before = _backlog_items(bbk)
+    new_sha = backlog.add_issue_item(bbk.cfg, bbk.root, "7", _file_sha(bbk))
+    path = bbk.root / "backlog.yml"
+    assert new_sha == hashlib.sha256(path.read_bytes()).hexdigest()
+    items = _backlog_items(bbk)
+    item = items.pop("issue-7")
+    assert (item.title, item.lane, item.status, item.issue) == ("Fix the thing", "feature", "backlog", 7)
+    assert items == before  # nothing else changed
+    assert run_git(bbk.root, "rev-parse", "HEAD").strip() == head
+    assert "backlog.yml" in run_git(bbk.root, "status", "--porcelain")  # in the work tree, not committed
+    bbk.refresh()
+    cards = bbk.cards()
+    assert "module:issue-7" in cards and "issue:7" not in cards
+
+
+@pytest.mark.parametrize("title", ["line one\nline two", "- [x]: {a: b}", "# not a comment", "x" * 500])
+def test_add_issue_item_cuts_a_hostile_title(bbk, monkeypatch, title):
+    _absorbing(bbk, monkeypatch, _issue(7, title=title), yml=NO_ISSUE_YML)
+    problems_before = backlog.backlog_file.read(bbk.root / "backlog.yml")[1]
+    backlog.add_issue_item(bbk.cfg, bbk.root, "7", _file_sha(bbk))
+    items, problems = backlog.backlog_file.read(bbk.root / "backlog.yml")
+    assert problems == problems_before
+    item = {i.id: i for i in items}["issue-7"]
+    assert item.title and "\n" not in item.title and len(item.title) <= backlog.backlog_file.TITLE_MAX
+
+
+def test_add_issue_item_refusals(bbk, monkeypatch):
+    yml = NO_ISSUE_YML + "  - {id: issue-8, title: Taken id, status: ready, issue: 3}\n"
+    _absorbing(bbk, monkeypatch, _issue(7), _issue(8), _issue(9, "Crash", ("agentflow", "bug")), yml=yml)
+    path = bbk.root / "backlog.yml"
+    before = path.read_bytes()
+
+    def add(number, sha=None):
+        return backlog.add_issue_item(bbk.cfg, bbk.root, number, sha or _file_sha(bbk))
+
+    with pytest.raises(Refused, match="issue-8"):
+        add("8")  # an item has the id `issue-8` (it names another issue)
+    with pytest.raises(Refused, match="not in the module lane"):
+        add("9")  # a bug-lane issue
+    with pytest.raises(Refused, match="not a synced issue"):
+        add("99")
+    with pytest.raises(Invalid):
+        add("7; x")
+    with pytest.raises(backlog.backlog_file.Stale):
+        add("7", "0" * 64)
+    assert path.read_bytes() == before
+    add("7")
+    for status in ("backlog", "dropped"):  # an item (any status) names it now
+        backlog.edit_item(bbk.cfg, bbk.root, "issue-7", {"status": status}, _file_sha(bbk))
+        with pytest.raises(Refused, match="issue-7"):
+            add("7")
+
+
+def test_add_issue_item_refuses_an_item_that_names_the_issue(bbk, monkeypatch):
+    _absorbing(bbk, monkeypatch, _issue(7), yml=ABSORB_YML.replace("status: ready, issue: 7", "status: dropped, issue: 7"))
+    with pytest.raises(Refused, match="crm"):
+        backlog.add_issue_item(bbk.cfg, bbk.root, "7", _file_sha(bbk))
+
+
+def test_add_issue_item_needs_a_backlog_pack(isbk, monkeypatch):
+    _list_issues(monkeypatch, _issue(7))
+    isbk.refresh()
+    with pytest.raises(Refused, match="backlog"):
+        backlog.add_issue_item(isbk.cfg, isbk.root, "7", "0" * 64)
+
+
+def test_the_issue_card_says_whether_it_is_addable(bbk, monkeypatch):
+    _absorbing(bbk, monkeypatch, _issue(7), _issue(9, "Crash", ("agentflow", "bug")), yml=NO_ISSUE_YML)
+    cards = bbk.cards()
+    assert cards["issue:7"]["addable"] is True and cards["issue:9"]["addable"] is False
+
+
+def test_the_issue_card_of_a_specs_pack_has_no_addable_field(isbk, monkeypatch):
+    _list_issues(monkeypatch, _issue(7))
+    isbk.refresh()
+    assert "addable" not in isbk.cards()["issue:7"]
+
+
 # --------------------------------------------------------------------------- editing backlog.yml from the page
 
 
