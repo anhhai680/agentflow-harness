@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import dataclasses
 import getpass
 import http.client
 import json
@@ -16,14 +18,15 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import yaml
 
-from agentflow import claims, hitl, pack
+from agentflow import claims, dashboard, hitl, pack, repo_context
 from agentflow.config import RETRO_PIPELINE
 from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
 from agentflow.views import _badge, _strip, lane_phases, step_title
-from conftest import PYTHON_CONFIG, L, add_vuln_lane, awaiting, land_on_origin, run_git, session_with_transcript
+from conftest import PYTHON_CONFIG, SPARSE_PACK, L, add_vuln_lane, awaiting, land_on_origin, run_git, session_with_transcript
 from test_vuln import _alert
 
 TOKEN = "k3y-" + "x" * 40
@@ -2670,3 +2673,209 @@ def test_a_reopening_edit_returns_the_claim_lines_as_notes(kdash, tmp_path):
     assert "released" in answer["notes"][0] and "Test" in answer["notes"][0]
     assert claims.read(flow.cfg, root, "r") is None
     assert "status: ready" in (root / "backlog.yml").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- a map of repository contexts (W2)
+
+
+def _live_context(repo: Path, cfg) -> repo_context.RepoContext:
+    """`repo` as a live workspace context: `cfg`, and the runs directory it has now, frozen."""
+    ctx = repo_context.single_context(repo.resolve(), cfg)
+    return dataclasses.replace(ctx, repo=repo.resolve(), runs=repo_context.runs_dir(ctx))
+
+
+def load_config_of(repo: Path):
+    from agentflow.config import load_config
+
+    return load_config(pack.pack_config(repo))
+
+
+@dataclass
+class Two:
+    dash: Dash
+    a: object  # the flow repository's context
+    b: object  # the sparse repository's context, the default
+    a_run: Run
+    b_run: Run
+
+
+def _serve(server) -> threading.Thread:
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return thread
+
+
+@pytest.fixture
+def two(flow_repo, sparse_repo):
+    """A workspace server over the flow repository (A) and a sparse one (B), B preferred; each has one run."""
+    b_cfg = load_config_of(sparse_repo)
+    a, b = _live_context(flow_repo.root, flow_repo.cfg), _live_context(sparse_repo, b_cfg)
+    a_run = Run.create(flow_repo.cfg, flow_repo.root, "feature", {"module": "alpha"})
+    b_run = Run.create(b_cfg, sparse_repo, "feature", {"module": "beta"})
+    server = dashboard.make_workspace_server([a, b], repo_context.engine_user_settings(), "127.0.0.1", 0, TOKEN, prefer=b.id)
+    thread = _serve(server)
+    yield Two(Dash(server, server.server_address[1], flow_repo), a, b, a_run, b_run)
+    server.close()
+    thread.join(timeout=5)
+
+
+@pytest.fixture
+def empty_dash(flow_repo):
+    server = dashboard.make_workspace_server([], repo_context.engine_user_settings(), "127.0.0.1", 0, TOKEN)
+    thread = _serve(server)
+    yield Dash(server, server.server_address[1], flow_repo)
+    server.close()
+    thread.join(timeout=5)
+
+
+def test_a_workspace_server_over_two_repositories_answers_the_legacy_routes_for_the_default(two):
+    assert two.dash.server.workspace is True and two.dash.server.default == two.b.id
+    assert list(two.dash.server.repos) == [two.a.id, two.b.id]
+    status, _, body = two.dash.get("/api/board")
+    ids = [c["run_id"] for c in payload(body)["cards"]]
+    assert status == 200 and two.b_run.id in ids and two.a_run.id not in ids
+    assert two.dash.get(f"/api/runs/{two.a_run.id}")[0] == 404
+    status, _, body = two.dash.get(f"/api/runs/{two.b_run.id}")
+    assert status == 200 and payload(body)["run_id"] == two.b_run.id
+
+
+def test_the_default_is_the_first_live_context_when_nothing_is_preferred(flow_repo, sparse_repo):
+    bare = dataclasses.replace(_live_context(flow_repo.root, flow_repo.cfg), cfg=None, runs=None, state="not_set_up")
+    live = _live_context(sparse_repo, load_config_of(sparse_repo))
+    server = dashboard.make_workspace_server([bare, live], repo_context.engine_user_settings(), "127.0.0.1", 0, TOKEN)
+    try:
+        assert server.default == live.id and server.default_context() is server.repos[live.id]
+        assert server.live_contexts() == [server.repos[live.id]]
+    finally:
+        server.server_close()
+
+
+def test_with_no_default_a_legacy_route_is_404_and_info_still_answers(empty_dash):
+    assert empty_dash.server.default is None and empty_dash.server.default_context() is None
+    assert empty_dash.server.repo is None and empty_dash.server.cfg is None and empty_dash.server.config is None
+    status, _, body = empty_dash.get("/api/board")
+    assert status == 404 and payload(body)["error"] == "no repository"
+    status, _, body = empty_dash.get("/api/info")
+    assert status == 200 and payload(body) == {"name": "agentflow-harness", "version": pack.ENGINE_VERSION,
+                                                "board_refresh_s": 2.0, "inbox_legacy": False, "done_shown": 10}
+    assert empty_dash.get("/api/workflow")[0] == 404
+    assert empty_dash.post("/api/backlog", {"lane": "feature"})[0] == 404
+    assert empty_dash.get("/api/board", token=None)[0] == 403  # the token is still checked first
+
+
+def test_server_repo_cfg_and_config_follow_the_default_and_cfg_can_be_replaced(two, flow_repo):
+    server, b = two.dash.server, two.dash.server.default_context()
+    assert b.id == two.b.id
+    assert server.repo == b.repo and server.cfg is b.cfg and server.config is b.config
+    server.cfg = flow_repo.cfg
+    assert server.default_context().cfg is flow_repo.cfg and server.cfg is flow_repo.cfg
+    assert server.repos[two.a.id].cfg is flow_repo.cfg and server.repos[two.a.id] is not server.default_context()
+
+
+def _bound_from_server(func: ast.FunctionDef) -> set[str]:
+    """The local names `func` binds to `self.server` (`server = self.server`)."""
+    names = set()
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign) and _is_self_server(node.value):
+            names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    return names
+
+
+def _is_self_server(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr == "server" and isinstance(node.value, ast.Name)
+            and node.value.id == "self")
+
+
+def test_the_handler_never_reads_the_default_through_the_server():
+    import inspect
+
+    tree = ast.parse(inspect.getsource(dashboard))
+    handler = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_Handler")
+    found, calls = [], []
+    for func in (n for n in handler.body if isinstance(n, ast.FunctionDef)):
+        bound = _bound_from_server(func)
+        for node in ast.walk(func):
+            if isinstance(node, ast.Attribute) and node.attr in ("repo", "cfg", "config"):
+                if _is_self_server(node.value) or (isinstance(node.value, ast.Name) and node.value.id in bound):
+                    found.append(f"{func.name}:{node.lineno}")
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "default_context" and (_is_self_server(node.func.value)
+                                                                 or isinstance(node.func.value, ast.Name)
+                                                                 and node.func.value.id in bound)):
+                calls.append(func.name)
+    assert found == []
+    assert set(calls) == {"_handle"}  # only the dispatcher picks the context
+    assert all(isinstance(getattr(dashboard.DashboardServer, name), property) for name in ("repo", "cfg", "config"))
+    # the walk catches what it is meant to catch
+    sample = ast.parse("def f(self):\n    server = self.server\n    server.cfg\n    self.server.repos\n    self._ctx.cfg\n")
+    func = sample.body[0]
+    bound = _bound_from_server(func)
+    hits = [n for n in ast.walk(func) if isinstance(n, ast.Attribute) and n.attr in ("repo", "cfg", "config")
+            and (_is_self_server(n.value) or isinstance(n.value, ast.Name) and n.value.id in bound)]
+    assert len(hits) == 1
+
+
+def test_info_numbers():
+    assert dashboard.info_numbers({"board_refresh_s": 5, "done_shown": 20}) == (5.0, 20)
+    assert isinstance(dashboard.info_numbers({"board_refresh_s": 5})[0], float)
+    assert dashboard.info_numbers({}) == (2.0, 10)
+    assert dashboard.info_numbers({"board_refresh_s": 0.1, "done_shown": 0}) == (2.0, 10)
+    assert dashboard.info_numbers({"board_refresh_s": float("nan"), "done_shown": True}) == (2.0, 10)
+    assert dashboard.info_numbers({"board_refresh_s": "x", "done_shown": 1001}) == (2.0, 10)
+    assert dashboard.info_numbers({"board_refresh_s": 60, "done_shown": 1000}) == (60.0, 1000)
+
+
+def test_a_workspace_server_binds_127_0_0_1_with_a_long_token_only():
+    user = repo_context.engine_user_settings()
+    with pytest.raises(ValueError):
+        dashboard.make_workspace_server([], user, "0.0.0.0", 0, TOKEN)
+    with pytest.raises(ValueError):
+        dashboard.make_workspace_server([], user, "127.0.0.1", 0, "x" * 10)
+
+
+def test_a_default_whose_state_dir_changed_after_load_is_refused(two, sparse_repo, tmp_path):
+    server = two.dash.server
+    assert two.b in server.live_contexts()
+    data = {**SPARSE_PACK, "paths": {"state_dir": str(tmp_path / "moved")}}
+    (sparse_repo / ".agentflow" / "config.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    status, _, body = two.dash.get("/api/board")
+    assert status == 409 and "state directory changed" in payload(body)["error"]
+    assert two.dash.get(f"/api/runs/{two.b_run.id}")[0] == 409
+    assert two.dash.get("/api/info")[0] == 200
+    assert server.default == two.b.id  # the default stays; it does not fall over to A
+    assert server.live_contexts() == [server.repos[two.a.id]]
+
+
+def test_the_default_is_sticky(two):
+    a, b = two.a, two.b
+    repos = {a.id: a, b.id: b}
+    assert dashboard.choose_default(repos, a.id, None) == a.id
+    assert dashboard.choose_default(repos, "elsewhere", None) == a.id
+    unset_a = {a.id: dataclasses.replace(a, state="not_set_up", cfg=None), b.id: b}
+    assert dashboard.choose_default(unset_a, a.id, None) == b.id
+    for state in ("not_set_up", "error", "missing"):
+        changed = {a.id: a, b.id: dataclasses.replace(b, state=state, cfg=None)}
+        assert dashboard.choose_default(changed, a.id, b.id) == b.id
+    assert dashboard.choose_default({a.id: a}, a.id, b.id) == b.id  # B left the map; it stays the default
+    dead = {key: dataclasses.replace(ctx, state="error", cfg=None) for key, ctx in repos.items()}
+    assert dashboard.choose_default(dead, a.id, None) is None
+    assert dashboard.choose_default({}, None, None) is None
+
+    server = two.dash.server
+    server.snap = dataclasses.replace(server.snap, repos={a.id: a, b.id: dataclasses.replace(b, state="not_set_up")})
+    status, _, body = two.dash.get("/api/board")
+    assert status == 409 and payload(body)["error"].startswith(f"{b.name} is not live: ")
+    server.snap = dataclasses.replace(server.snap, repos={a.id: a})
+    status, _, body = two.dash.get("/api/board")
+    assert status == 404 and payload(body)["error"] == "no repository"
+    assert two.dash.get(f"/api/runs/{two.a_run.id}")[0] == 404  # never A's run on the legacy route
+    assert server.default == b.id
+
+
+def test_make_server_wraps_one_repository_exactly_as_before(dash):
+    server = dash.server
+    (ctx,) = server.repos.values()
+    assert ctx.state == "live" and ctx.runs is None and ctx.cfg is dash.flow.cfg
+    assert server.default == ctx.id and server.workspace is False and server.skipped == ()
+    assert server.repo == dash.flow.root.resolve() and server.live_contexts() == [ctx]
+    assert server.user_error is None and server.prefer is None
