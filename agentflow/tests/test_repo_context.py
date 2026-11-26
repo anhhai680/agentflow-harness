@@ -18,7 +18,7 @@ from agentflow.repo_context import RepoContext
 from agentflow.repo_set import RepoRef, RepoSet, Skipped
 from agentflow.state import Run
 from agentflow.tests.conftest import SPARSE_PACK
-from agentflow.tests.test_workspace_cli import make_repo
+from agentflow.tests.test_workspace_cli import make_repo, write_user_file
 
 
 def ref_of(path: Path) -> RepoRef:
@@ -76,7 +76,7 @@ def test_load_context_turns_a_broken_pack_into_an_error(tmp_path, breakage):
     if breakage == "phases":
         write_pack(repo, phases=3)
     elif breakage == "bytes":
-        path.write_bytes(b"\xff")  # a UnicodeDecodeError, which `config` does not catch
+        path.write_bytes(b"\xff")  # not UTF-8 text
     elif breakage == "nosuchuser":
         with_state_dir(repo, "~nosuchuser/x")
     else:
@@ -453,3 +453,128 @@ def test_repos_view(tmp_path):
     assert str(live.resolve()) not in text and str(bare.resolve()) not in text and str(left.resolve()) not in text
     empty = repo_context.repos_view([], [], None, None)
     assert empty == {"repos": [], "skipped": [], "default": None, "user_config_error": None}
+
+
+# --------------------------------------------------------------------------- plan_start
+
+
+def user_text(text: str | bytes) -> Path:
+    target = layers.user_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(text, bytes):
+        target.write_bytes(text)
+    else:
+        target.write_text(text, encoding="utf-8")
+    return target
+
+
+def workspace_of(tmp_path: Path) -> dict[str, Path]:
+    """`ws/alpha` and `ws/beta` (with a pack) and `ws/gamma` (none), each resolved; a user file naming `ws`."""
+    root = tmp_path / "ws"
+    made = {name: make_repo(root, name, with_pack=name != "gamma").resolve() for name in ("alpha", "beta", "gamma")}
+    write_user_file([root])
+    return made
+
+
+def test_plan_start_with_no_workspace_in_a_repository_is_the_single_repository_mode(tmp_path):
+    repo = make_repo(tmp_path, "alpha").resolve()
+    plan = repo_context.plan_start(repo, None)
+    (ctx,) = plan.contexts
+    assert plan.workspace is False and plan.user_error is None and plan.left_out is None and plan.skipped == ()
+    assert ctx.state == "live" and ctx.runs is None and ctx.config is None and ctx.repo == repo
+    assert ctx.cfg.path == repo / ".agentflow" / "config.yaml"
+    assert plan.prefer == ctx.id == pack.repo_id(repo)
+    bare = make_repo(tmp_path, "bare", with_pack=False).resolve()
+    with pytest.raises(pack.PackError, match="no .agentflow/config.yaml"):
+        repo_context.plan_start(bare, None)
+
+
+def test_plan_start_in_a_workspace_repository_serves_the_workspace_and_prefers_it(tmp_path):
+    made = workspace_of(tmp_path)
+    plan = repo_context.plan_start(made["beta"], None)
+    assert plan.workspace is True and plan.user_error is None and plan.left_out is None and plan.skipped == ()
+    assert [(c.name, c.state) for c in plan.contexts] == [("alpha", "live"), ("beta", "live"),
+                                                          ("gamma", "not_set_up")]
+    assert all(c.runs is not None for c in plan.contexts if c.state == "live")
+    assert plan.prefer == pack.repo_id(made["beta"])
+    assert plan.user.workspace.roots == (str(tmp_path / "ws"),) and plan.user.path == layers.user_config_path()
+    (made["beta"] / ".agentflow" / "config.yaml").write_text("phases: [unclosed\n", encoding="utf-8")
+    for start, state_ in ((made["beta"], "error"), (made["gamma"], "not_set_up")):
+        plan = repo_context.plan_start(start, None)
+        ctx = next(c for c in plan.contexts if c.repo == start)
+        assert ctx.state == state_ and plan.prefer == ctx.id == pack.repo_id(start) and plan.left_out is None
+
+
+def test_plan_start_applies_the_shared_runs_directory_rule_from_the_first_request(tmp_path):
+    root = tmp_path / "ws"
+    billing = make_repo(root, "billing")
+    with_state_dir(make_repo(root, "aaa-evil"), default_dir(billing))
+    write_user_file([root])
+    plan = repo_context.plan_start(None, None)
+    by = {c.name: c for c in plan.contexts}
+    assert list(by) == ["aaa-evil", "billing"]
+    assert by["aaa-evil"].state == "error" and "billing" in by["aaa-evil"].error
+    assert by["billing"].state == "live"
+
+
+def test_plan_start_outside_the_workspace_serves_the_workspace_alone(tmp_path):
+    made = workspace_of(tmp_path)
+    other = make_repo(tmp_path, "other").resolve()
+    plan = repo_context.plan_start(other, None)
+    assert plan.workspace is True and plan.prefer is None and plan.left_out == "other"
+    assert [c.repo for c in plan.contexts] == [made["alpha"], made["beta"], made["gamma"]]
+    plan = repo_context.plan_start(None, None)
+    assert plan.workspace is True and plan.prefer is None and plan.left_out is None
+    assert [c.name for c in plan.contexts] == ["alpha", "beta", "gamma"]
+
+
+def test_plan_start_with_no_workspace_and_no_repository_is_the_empty_start():
+    plan = repo_context.plan_start(None, None)
+    assert plan.contexts == [] and plan.workspace is True and plan.prefer is None
+    assert plan.user_error is None and plan.left_out is None and plan.skipped == ()
+
+
+def test_plan_start_carries_a_workspace_that_resolved_to_nothing(tmp_path):
+    write_user_file([tmp_path / "mistyped"])
+    plan = repo_context.plan_start(None, None)
+    assert plan.contexts == [] and plan.workspace is True and plan.user_error is None
+    assert plan.skipped == (Skipped(str(tmp_path / "mistyped"), "is not a folder"),)
+
+
+def test_plan_start_with_config_serves_that_one_repository_and_reads_no_workspace(tmp_path):
+    made = workspace_of(tmp_path)
+    given = made["beta"] / ".agentflow" / "config.yaml"
+    plan = repo_context.plan_start(made["alpha"], given)
+    (ctx,) = plan.contexts
+    assert plan.workspace is False and plan.user_error is None and plan.prefer == ctx.id
+    assert ctx.config == given and ctx.cfg.path == given and ctx.id == pack.repo_id(made["alpha"])
+    assert ctx.repo == made["alpha"] and ctx.runs is None
+    user_text(yaml.safe_dump({"workspace": {"roots": ["relative/root"]}}))  # unusable as a workspace
+    with pytest.raises(layers.LayerError):
+        layers.load_user_settings()
+    (ctx,) = repo_context.plan_start(made["alpha"], given).contexts
+    assert ctx.state == "live" and ctx.config == given
+    with pytest.raises(config.ConfigError, match="not inside a git checkout"):
+        repo_context.plan_start(None, given)
+
+
+@pytest.mark.parametrize("text", [b"\xff", "workspace: [unclosed\n"])
+def test_plan_start_with_an_unusable_user_file(tmp_path, text):
+    target = user_text(text)
+    plan = repo_context.plan_start(None, None)
+    assert plan.contexts == [] and plan.workspace is True and plan.prefer is None
+    assert plan.user_error and str(target) in plan.user_error and "\n" not in plan.user_error
+    assert plan.user == repo_context.engine_user_settings()
+    repo = make_repo(tmp_path, "alpha").resolve()
+    with pytest.raises(config.ConfigError) as err:  # as `load_config` raises today
+        repo_context.plan_start(repo, None)
+    assert str(target) in str(err.value)
+
+
+def test_plan_start_in_a_repository_with_an_unusable_workspace_is_the_single_mode_with_the_error(tmp_path):
+    repo = make_repo(tmp_path, "alpha").resolve()
+    user_text(yaml.safe_dump({"workspace": {"roots": ["relative/root"]}}))  # `load_config` reads it, the workspace not
+    plan = repo_context.plan_start(repo, None)
+    (ctx,) = plan.contexts
+    assert plan.workspace is False and ctx.state == "live" and ctx.runs is None
+    assert plan.user_error and "workspace.roots" in plan.user_error

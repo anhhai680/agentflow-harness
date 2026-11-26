@@ -3492,6 +3492,22 @@ def test_load_config_keeps_its_messages_for_a_self_referencing_or_deep_pack(tmp_
         load_config(path)
 
 
+def test_load_config_refuses_a_pack_or_a_user_file_that_is_not_utf8(tmp_cfg):
+    path = tmp_cfg()
+    good = path.read_bytes()
+    path.write_bytes(b"\xff")
+    with pytest.raises(ConfigError) as err:
+        load_config(path)
+    assert f"{path} is not valid UTF-8 text" in str(err.value)
+    path.write_bytes(good)
+    user = layers.user_config_path()
+    user.parent.mkdir(parents=True, exist_ok=True)
+    user.write_bytes(b"\xff")
+    with pytest.raises(ConfigError) as err:
+        load_config(path)
+    assert f"{user} is not valid UTF-8 text" in str(err.value)
+
+
 def test_load_config_refuses_a_pack_over_the_byte_cap(tmp_cfg):
     path = tmp_cfg()
     path.write_text(path.read_text(encoding="utf-8") + "#" * layers.MAX_CONFIG_BYTES + "\n", encoding="utf-8")

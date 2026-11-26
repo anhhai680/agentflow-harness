@@ -1491,7 +1491,7 @@ def _skills_map(raw: dict) -> dict[str, str]:
 
 
 def _read_yaml(path: Path) -> Any:
-    """`path` parsed. A file that can't be read, is longer than `layers.MAX_CONFIG_BYTES`, isn't YAML or has a
+    """`path` parsed. A file that can't be read, is longer than `layers.MAX_CONFIG_BYTES`, isn't UTF-8 or YAML or has a
     `layers.expansion_problem` is a `ConfigError` naming it, never a traceback."""
     try:
         text = layers.read_config_text(path)
@@ -1500,6 +1500,8 @@ def _read_yaml(path: Path) -> Any:
         loaded = yaml.safe_load(text)
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError("", f"cannot read {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError("", f"{path} is not valid UTF-8 text") from exc
     except RecursionError as exc:
         raise ConfigError("", f"{path} is nested too deeply to read") from exc
     problem = layers.expansion_problem(loaded)

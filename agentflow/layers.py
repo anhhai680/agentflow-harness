@@ -166,8 +166,9 @@ def read_config_text(path: Path) -> str | None:
 
 
 def _read(path: Path, what: str = "layer", *, empty_ok: bool = False) -> dict:
-    """A layer file's mapping. A file that cannot be read, is longer than `MAX_CONFIG_BYTES`, is not YAML, has an
-    `expansion_problem`, or is not a mapping at the top level (an empty one is `{}` when `empty_ok`) is a `LayerError`."""
+    """A layer file's mapping. A file that cannot be read, is longer than `MAX_CONFIG_BYTES`, is not UTF-8 text or
+    not YAML, has an `expansion_problem`, or is not a mapping at the top level (an empty one is `{}` when
+    `empty_ok`) is a `LayerError`."""
     try:
         text = read_config_text(path)
         if text is None:
@@ -175,6 +176,8 @@ def _read(path: Path, what: str = "layer", *, empty_ok: bool = False) -> dict:
         loaded = yaml.safe_load(text)
     except (OSError, yaml.YAMLError) as exc:
         raise LayerError(str(path), f"cannot read the {what} file: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise LayerError(str(path), f"the {what} file is not valid UTF-8 text") from exc
     except RecursionError as exc:
         raise LayerError(str(path), f"the {what} file is nested too deeply to read") from exc
     problem = expansion_problem(loaded)

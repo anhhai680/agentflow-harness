@@ -734,6 +734,19 @@ def test_a_file_over_the_byte_cap_is_refused_before_it_is_parsed(tmp_path):
         layers._read(path)
 
 
+def test_a_file_that_is_not_utf8_is_a_layer_error_naming_it(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b"\xff")
+    with pytest.raises(LayerError, match="not valid UTF-8 text") as err:
+        layers._read(path)
+    assert str(path) in str(err.value)
+    target = write_user_file("")
+    target.write_bytes(b"\xff")
+    with pytest.raises(LayerError, match="not valid UTF-8 text") as err:
+        load_user_settings()
+    assert str(target) in str(err.value)
+
+
 def test_a_merge_key_chain_under_the_byte_cap_parses_quickly(tmp_path):
     """`<<` copies every key of the mapping it merges, so a chain of them costs the square of its length to parse:
     the byte cap is what keeps the largest such file fast."""

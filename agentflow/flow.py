@@ -1099,18 +1099,84 @@ def cmd_attach(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_dashboard(args: argparse.Namespace) -> int:
-    import secrets
-
-    from agentflow.dashboard import serve
+def _user_file_shown() -> str:
+    """The user config file's path, printable, for a line that tells the user to edit it."""
+    from agentflow import layers
+    from agentflow.doctor import printable
 
     try:
-        cfg = _load_cfg(args)
-        repo = _find_repo()
-        port = args.port if args.port is not None else int(cfg.dashboard.get("port", 7788))
-        config = Path(args.config).resolve() if args.config else None
-        serve(repo, cfg, str(cfg.dashboard.get("host", "127.0.0.1")), port, secrets.token_urlsafe(32), config=config)
-    except (_human_errors() + (OSError,)) as exc:
+        return printable(layers.user_config_path())
+    except RuntimeError:  # no home directory
+        return "your user config file"
+
+
+def _dashboard_notes(plan) -> None:
+    """What a workspace dashboard says before it serves: an unusable user file, a start repository that is not live
+    or not in the workspace, and a workspace that holds nothing. Every name, entry and reason is printable."""
+    from agentflow import dashboard
+    from agentflow.doctor import printable
+    from agentflow.repo_context import usable
+
+    if plan.user_error:
+        print(f"warning: {printable(plan.user_error)}")
+    repos = {ctx.id: ctx for ctx in plan.contexts}
+    start = repos.get(plan.prefer) if plan.prefer is not None else None
+    if start is not None and not usable(start):
+        shown = repos.get(dashboard.choose_default(repos, plan.prefer, None) or "")
+        instead = (f"showing {printable(shown.name)} instead" if shown is not None
+                   else "no repository is live to show instead")
+        reason = start.error or dashboard.NOT_LIVE.get(start.state, start.state)
+        print(f"warning: {printable(start.name)} is not live: {printable(reason)}; {instead}")
+    if plan.left_out is not None:
+        print(f"note: {printable(plan.left_out)} is not in your workspace and is not served; add its folder to "
+              f"workspace.roots in {_user_file_shown()}")
+    if plan.contexts or plan.user_error:
+        return
+    if plan.user.workspace.roots or plan.user.workspace.repos:
+        for skip in plan.skipped:
+            print(f"skipped {printable(skip.entry)}: {printable(skip.reason)}")
+        print(f"no repositories found: workspace.roots and workspace.repos in {_user_file_shown()} lead to no "
+              "repository; the dashboard is open without one")
+    else:
+        print(f"no repositories yet: set workspace.roots in {_user_file_shown()}; the dashboard is open without one")
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Serve the repository it starts in (no workspace, or `--config`), or every repository of the user's workspace
+    from any directory."""
+    import errno
+    import secrets
+
+    from agentflow import dashboard
+    from agentflow.config import ConfigError
+    from agentflow.doctor import printable
+    from agentflow.repo_context import plan_start
+
+    try:
+        start: Path | None = _find_repo()
+    except ConfigError:  # not inside a git checkout: a workspace dashboard needs none
+        start = None
+    config = Path(args.config).resolve() if args.config else None
+    token = secrets.token_urlsafe(32)
+    try:
+        plan = plan_start(start, config)
+        if not plan.workspace:
+            if plan.user_error:  # the user file's workspace can't be read; this repository's pack loaded anyway
+                print(f"warning: {printable(plan.user_error)}")
+            cfg = plan.contexts[0].cfg
+            port = args.port if args.port is not None else int(cfg.dashboard.get("port", 7788))
+            dashboard.serve(start, cfg, str(cfg.dashboard.get("host", "127.0.0.1")), port, token, config=config)
+        else:
+            port = args.port if args.port is not None else dashboard.port_of(plan.user.dashboard)
+            _dashboard_notes(plan)
+            dashboard.serve_workspace(plan.contexts, plan.user, str(plan.user.dashboard.get("host", "127.0.0.1")),
+                                      port, token, prefer=plan.prefer, user_error=plan.user_error,
+                                      skipped=plan.skipped)
+    except OSError as exc:
+        hint = "; another dashboard may be running; use --port 0" if exc.errno == errno.EADDRINUSE else ""
+        print(f"error: {exc}{hint}")
+        return 1
+    except _human_errors() as exc:
         print(f"error: {exc}")
         return 1
     return 0

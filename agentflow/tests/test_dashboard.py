@@ -2890,6 +2890,30 @@ def test_info_numbers():
     assert dashboard.info_numbers({"board_refresh_s": 60, "done_shown": 1000}) == (60.0, 1000)
 
 
+def test_port_of():
+    assert dashboard.port_of({"port": 7788}) == 7788 and dashboard.port_of({"port": 0}) == 0
+    assert dashboard.port_of({"port": 65535}) == 65535
+    for block in ({}, {"port": -1}, {"port": 65536}, {"port": True}, {"port": "80"}, {"port": 1.5}, {"port": None}):
+        with pytest.raises(ValueError, match="dashboard.port"):
+            dashboard.port_of(block)
+
+
+def test_info_for_a_server_with_no_default_uses_the_user_settings(flow_repo):
+    for port in (7788, 99999):
+        user = layers.UserSettings(layers.WorkspaceSettings((), (), ()),
+                                   {"port": port, "board_refresh_s": 5, "done_shown": 20}, None)
+        server = dashboard.make_workspace_server([], user, "127.0.0.1", 0, TOKEN)
+        thread = _serve(server)
+        try:
+            status, _, body = Dash(server, server.server_address[1], flow_repo).get("/api/info")
+            info = payload(body)
+            assert status == 200 and server.default is None
+            assert info["board_refresh_s"] == 5.0 and info["done_shown"] == 20 and info["inbox_legacy"] is False
+        finally:
+            server.close()
+            thread.join(timeout=5)
+
+
 def test_a_workspace_server_binds_127_0_0_1_with_a_long_token_only():
     user = repo_context.engine_user_settings()
     with pytest.raises(ValueError):

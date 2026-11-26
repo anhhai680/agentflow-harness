@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import json
 import shlex
+import socket
 from pathlib import Path
 
 import pytest
 import yaml
 
-from agentflow import flow, layers, repo_set, views
+from agentflow import dashboard, flow, layers, pack, repo_set, views
 from agentflow.tests.conftest import SPARSE_PACK, run_git
 
 
@@ -254,3 +255,151 @@ def test_the_no_workspace_message_survives_a_missing_home_directory(tmp_path, mo
     code, out = cli("status", "--all")
     assert code == 1
     assert out == "error: no workspace: set workspace.roots in your user config file\n"
+
+
+# --------------------------------------------------------------------------- agentflow dashboard
+
+
+def write_user(data: dict) -> Path:
+    path = layers.user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def served(monkeypatch):
+    """`dashboard.serve` and `serve_workspace` replaced by recorders of `(which, args, kwargs)`."""
+    calls: list[tuple[str, tuple, dict]] = []
+
+    def serve(*args, **kwargs):
+        calls.append(("serve", args, kwargs))
+
+    def serve_workspace(*args, **kwargs):
+        calls.append(("serve_workspace", args, kwargs))
+
+    monkeypatch.setattr(dashboard, "serve", serve)
+    monkeypatch.setattr(dashboard, "serve_workspace", serve_workspace)
+    return calls
+
+
+def test_dashboard_in_a_repository_with_no_workspace_serves_that_repository_as_before(tmp_path, monkeypatch, cli,
+                                                                                       served):
+    repo = make_repo(tmp_path, "alpha")
+    data = {**SPARSE_PACK, "dashboard": {"port": 7801}}
+    (repo / ".agentflow" / "config.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    monkeypatch.chdir(repo)
+    code, out = cli("dashboard")
+    assert (code, out) == (0, "")
+    ((which, args, kwargs),) = served
+    assert which == "serve" and args[0] == repo.resolve() and args[2:4] == ("127.0.0.1", 7801)
+    assert args[1].path == repo.resolve() / ".agentflow" / "config.yaml" and kwargs == {"config": None}
+    assert len(args[4]) >= 32  # the token
+
+
+def test_dashboard_with_a_workspace_serves_it_from_a_directory_that_is_no_repository(ws, cli, served):
+    root, made = ws
+    write_user({"workspace": {"roots": [str(root)]}, "dashboard": {"port": 7802}})
+    code, out = cli("dashboard")
+    assert (code, out) == (0, "")
+    ((which, args, kwargs),) = served
+    assert which == "serve_workspace"
+    contexts, user = args[0], args[1]
+    assert [(c.repo, c.state) for c in contexts] == [(made["alpha"].resolve(), "live"),
+                                                     (made["beta"].resolve(), "live"),
+                                                     (made["gamma"].resolve(), "not_set_up")]
+    assert args[2:4] == ("127.0.0.1", 7802) and user.workspace.roots == (str(root),)
+    assert kwargs == {"prefer": None, "user_error": None, "skipped": ()}
+    assert "not inside a git checkout" not in out
+
+
+def test_dashboard_warns_when_the_repository_you_start_in_is_not_live(ws, cli, served, monkeypatch):
+    _, made = ws
+    (made["alpha"] / ".agentflow" / "config.yaml").write_text("phases: [unclosed\n", encoding="utf-8")
+    monkeypatch.chdir(made["alpha"])
+    code, out = cli("dashboard")
+    assert code == 0
+    ((which, args, kwargs),) = served
+    alpha = next(c for c in args[0] if c.name == "alpha")
+    assert which == "serve_workspace" and alpha.state == "error"
+    assert out == f"warning: alpha is not live: {alpha.error}; showing beta instead\n"
+    assert kwargs["prefer"] == alpha.id == pack.repo_id(made["alpha"].resolve())
+
+
+def test_dashboard_with_no_workspace_and_no_repository_starts_with_nothing(tmp_path, monkeypatch, cli, served):
+    monkeypatch.chdir(tmp_path)
+    code, out = cli("dashboard")
+    assert code == 0
+    ((which, args, kwargs),) = served
+    assert which == "serve_workspace" and args[0] == [] and kwargs["prefer"] is None
+    assert out == (f"no repositories yet: set workspace.roots in {layers.user_config_path()}; "
+                   "the dashboard is open without one\n")
+
+
+def test_dashboard_says_when_it_serves_nothing_or_not_the_repository_you_are_in(ws, cli, served, monkeypatch,
+                                                                                tmp_path):
+    root, made = ws
+    outsider = make_repo(tmp_path, "out\nside")
+    monkeypatch.chdir(outsider)
+    code, out = cli("dashboard")
+    assert code == 0 and served[-1][0] == "serve_workspace" and served[-1][2]["prefer"] is None
+    assert out == (f"note: out\\nside is not in your workspace and is not served; add its folder to workspace.roots "
+                   f"in {layers.user_config_path()}\n")
+
+    missing = tmp_path / "mistyped"
+    write_user_file([missing])
+    code, out = cli("dashboard")
+    assert code == 0 and served[-1][1][0] == []
+    lines = out.splitlines()
+    assert f"skipped {missing}: is not a folder" in lines
+    assert any(line.startswith("no repositories found: ") for line in lines)
+    assert "no repositories yet" not in out
+
+    write_user_file([root])
+    make_repo(root, "aaa-bare", with_pack=False)
+    monkeypatch.chdir(tmp_path)
+    cli("dashboard")
+    contexts, kwargs = served[-1][1][0], served[-1][2]
+    assert contexts[0].name == "aaa-bare" and contexts[0].state == "not_set_up"
+    repos = {c.id: c for c in contexts}
+    assert dashboard.choose_default(repos, kwargs["prefer"], None) == pack.repo_id(made["alpha"].resolve())
+
+
+def test_dashboard_with_a_bad_user_port_is_an_error(ws, cli, served):
+    root, _ = ws
+    write_user({"workspace": {"roots": [str(root)]}, "dashboard": {"port": 99999}})
+    code, out = cli("dashboard")
+    assert code == 1 and served == []
+    assert out.startswith("error: dashboard.port ") and "99999" in out
+
+
+def test_dashboard_port_in_use_adds_the_hint(ws, cli, monkeypatch):
+    _, made = ws
+
+    def never(*args, **kwargs):
+        raise AssertionError("the busy port was bound")
+
+    monkeypatch.setattr(dashboard, "_bring_up", never)  # a bind that succeeds fails the test instead of serving
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        port = str(busy.getsockname()[1])
+        code, out = cli("dashboard", "--port", port)  # the workspace, from outside it
+        assert code == 1 and out.startswith("error: ")
+        assert out.endswith("another dashboard may be running; use --port 0\n")
+        layers.user_config_path().unlink()
+        monkeypatch.chdir(made["alpha"])
+        code, out = cli("dashboard", "--port", port)  # one repository, as before
+        assert code == 1 and out.startswith("error: ")
+        assert out.endswith("another dashboard may be running; use --port 0\n")
+
+
+def test_dashboard_with_config_ignores_the_workspace(ws, cli, served, monkeypatch):
+    _, made = ws
+    given = made["beta"] / ".agentflow" / "config.yaml"
+    monkeypatch.chdir(made["alpha"])
+    code, out = cli("dashboard", "--config", str(given))
+    assert (code, out) == (0, "")
+    ((which, args, kwargs),) = served
+    assert which == "serve" and args[0] == made["alpha"].resolve()
+    assert kwargs == {"config": given.resolve()} and args[1].path == given.resolve()

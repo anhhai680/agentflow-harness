@@ -5,7 +5,8 @@ repository's `repo`, `cfg` and `config` and never a mix. A scanned repository's 
 its pack, counting its runs and looking for a live runner catch every `Exception` and turn it into an `error`
 context, zero counts or a kept `missing` context, so one broken repository never costs the others their place.
 
-Nothing here starts a server or a thread; the dashboard calls `reconcile` and swaps in what it returns."""
+Nothing here starts a server or a thread; the dashboard calls `reconcile` and swaps in what it returns, and
+`agentflow dashboard` calls `plan_start` to decide what it serves."""
 
 from __future__ import annotations
 
@@ -13,10 +14,10 @@ import copy
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
-from . import hitl, layers, pack, state
-from .config import Config, load_config
+from . import hitl, layers, pack, repo_set, state
+from .config import Config, ConfigError, load_config
 from .events import lock_state
 from .repo_set import RepoRef, RepoSet, Skipped
 
@@ -72,7 +73,7 @@ def load_context(ref: RepoRef) -> RepoContext:
         if runs is None:
             return _failed(ctx, "its state directory (paths.state_dir) cannot be resolved")
         return replace(ctx, cfg=cfg, runs=runs)
-    except Exception as exc:  # a pack that is not UTF-8 raises what `config` does not catch
+    except Exception as exc:  # whatever the pack's files make `load_config` or a path raise
         return _failed(ctx, exc)
 
 
@@ -263,3 +264,61 @@ def engine_user_settings() -> layers.UserSettings:
     dashboard = merged.get("dashboard")
     return layers.UserSettings(layers.WorkspaceSettings((), (), ()),
                                copy.deepcopy(dashboard) if isinstance(dashboard, dict) else {}, None)
+
+
+class StartPlan(NamedTuple):
+    """What `agentflow dashboard` serves, decided before it binds. `workspace` False is the single-repository
+    dashboard of before (`contexts` holds its one context); True serves `contexts` (perhaps none) as a workspace.
+    `prefer` is the start repository's id when it is served; `left_out` is its name when a workspace is served
+    without it; `skipped` is the workspace's skipped entries; `user_error` is why the user file could not be used."""
+
+    contexts: list[RepoContext]
+    prefer: str | None
+    workspace: bool
+    user: layers.UserSettings
+    user_error: str | None
+    skipped: tuple[Skipped, ...] = ()
+    left_out: str | None = None
+
+
+def _single(start: Path, user: layers.UserSettings, user_error: str | None) -> StartPlan:
+    """The one repository `start` with its own pack, loaded as the CLI loads it (`PackError`, `ConfigError`)."""
+    ctx = single_context(start, load_config(pack.pack_config(start)))
+    return StartPlan([ctx], ctx.id, False, user, user_error)
+
+
+def plan_start(start: Path | None, config: Path | None) -> StartPlan:
+    """What a dashboard started in the main checkout `start` (None outside any) serves.
+
+    With `config`, the one repository `start` with that pack, and the user's workspace is not read. Else the user
+    file decides: with no workspace in it, `start` alone as today (and nothing when there is no `start`); with one,
+    every repository it resolves to, through `settle_dirs`, preferring `start` only when it is one of them. A user
+    file that can't be used is `user_error`: with `start`, its pack is loaded as today (and raises as `load_config`
+    does); without, nothing is served. Raises `ConfigError` and `PackError` as the CLI does."""
+    if config is not None:
+        cfg = load_config(config)
+        if start is None:
+            raise ConfigError("", "not inside a git checkout")
+        ctx = single_context(start, cfg, config)
+        return StartPlan([ctx], ctx.id, False, engine_user_settings(), None)
+    try:
+        user = layers.load_user_settings()
+    except layers.LayerError as exc:
+        error = _one_line(exc)
+        if start is None:
+            return StartPlan([], None, True, engine_user_settings(), error)
+        return _single(start, engine_user_settings(), error)
+    if not user.workspace.roots and not user.workspace.repos:
+        if start is None:
+            return StartPlan([], None, True, user, None)
+        return _single(start, user, None)
+    found = repo_set.resolve(user.workspace)
+    contexts = settle_dirs([load_context(ref) for ref in found.repos])
+    prefer = left_out = None
+    if start is not None:
+        root = pack.checkout_root(start)
+        if pack.repo_id(root) in {ctx.id for ctx in contexts}:
+            prefer = pack.repo_id(root)
+        else:
+            left_out = root.name
+    return StartPlan(contexts, prefer, True, user, None, found.skipped, left_out)

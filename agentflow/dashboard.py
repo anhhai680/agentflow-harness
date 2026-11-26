@@ -190,7 +190,7 @@ PAGE_CSP = ("default-src 'none'; script-src 'nonce-{n}'; style-src 'nonce-{n}'; 
             "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 __all__ = ["DashboardServer", "Snapshot", "choose_default", "dashboard_url", "info_numbers", "make_server",
-           "make_workspace_server", "prepare", "refresh_once", "serve"]
+           "make_workspace_server", "port_of", "prepare", "refresh_once", "serve", "serve_workspace"]
 
 
 def dashboard_url(port: int, token: str) -> str:
@@ -420,6 +420,15 @@ def info_numbers(dashboard: dict) -> tuple[float, int]:
     if not isinstance(shown, int) or isinstance(shown, bool) or not 1 <= shown <= 1000:
         shown = DEFAULT_DONE_SHOWN
     return float(refresh), shown
+
+
+def port_of(dashboard: dict) -> int:
+    """The port a `dashboard` block (the user settings') names, for the CLI to bind: a whole number from 0 (a free
+    one) to 65535. Anything else, an absent port included, is a `ValueError` naming `dashboard.port`."""
+    port = dashboard.get("port") if isinstance(dashboard, dict) else None
+    if not isinstance(port, int) or isinstance(port, bool) or not 0 <= port <= 65535:
+        raise ValueError(f"dashboard.port must be a whole number from 0 to 65535 (0 picks a free one), not {port!r}")
+    return port
 
 
 NOT_LIVE = {"not_set_up": "it is not set up (it has no .agentflow/config.yaml)", "missing": "it has left the workspace",
