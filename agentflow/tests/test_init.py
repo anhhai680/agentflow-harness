@@ -294,7 +294,7 @@ def test_init_creates_an_empty_backlog_file(toy_repo):
     assert backlog_file.read(path) == ([], [])
     assert f"wrote {path}" in out
     assert written(toy_repo)["work_source"] == {"kind": "backlog", "path": "backlog.yml"}
-    assert "agentflow backlog add <id> --title" in out
+    assert out.index("agentflow backlog add <id> --title") < out.index("agentflow explain feature")  # an item first
 
 
 def test_init_leaves_a_backlog_file_that_is_there(toy_repo):

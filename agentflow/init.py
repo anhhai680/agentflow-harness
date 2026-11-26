@@ -751,11 +751,13 @@ def init(repo: Path, *, starter: str | None, run_baseline: bool, out: TextIO) ->
     print(f"  1. review `gates` and `gate_sets` in {pack.PACK_DIR}/config.yaml, and the notes above", file=out)
     print("  2. set `gates_confirmed: true` in it", file=out)
     print("  3. agentflow validate", file=out)
-    print("  4. agentflow explain feature --module <id>", file=out)
-    print("  5. agentflow run feature --module <id> --dry-run", file=out)
-    if data["work_source"]["kind"] == "specs":
+    specs = data["work_source"]["kind"] == "specs"
+    if not specs:  # an empty backlog has no item to run yet
+        print('  4. agentflow backlog add <id> --title "…" --status ready   (a run starts from an item)', file=out)
+    step = 4 if specs else 5
+    print(f"  {step}. agentflow explain feature --module <id>", file=out)
+    print(f"  {step + 1}. agentflow run feature --module <id> --dry-run", file=out)
+    if specs:
         print(f"  agentflow backlog import --dry-run   (writes {backlog_file.FILE} from your spec files; then switch "
               "work_source)", file=out)
-    else:
-        print('  agentflow backlog add <id> --title "…" --status ready', file=out)
     return 0

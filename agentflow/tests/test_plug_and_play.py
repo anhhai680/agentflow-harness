@@ -1,6 +1,6 @@
 """Plug and play, end to end: `agentflow init` in a repository that has never seen agentflow, then `doctor`,
-`validate`, `explain` and a dry run, with nothing written to the repository but `.agentflow/config.yaml` and, for a repository with no specs folder, an
-empty `backlog.yml`.
+`validate`, `explain` and a dry run, with nothing written to the repository but `.agentflow/config.yaml` and, for a
+repository with no specs folder, an empty `backlog.yml`.
 
 Each toy repository under `fixtures/repos/` is copied into a tmp git repo on `main`, pushed to a bare `origin` (with
 no `remote set-head`, so the base branch is found the way a fresh clone's would be). A tmp `bin/` first on PATH holds
@@ -39,6 +39,8 @@ EXPECTED = {  # the verify gates' commands each repository's pack ends up with, 
 }
 CONFIRM_WARNING = "warning gates_confirmed:"
 INIT_WRITES = "?? .agentflow/config.yaml\n?? backlog.yml"
+UNLISTED_SPEC = ("warning backlog.yml: docs/greet.md is not on the backlog: agentflow backlog add --spec docs/greet.md, "
+                 "or list it in backlog.ignore_specs")
 PRINTED_RULE = re.compile(r'^  add to `permissions\.allow`: "(Bash\(.+\))"$', re.MULTILINE)
 
 
@@ -137,15 +139,22 @@ def test_init_to_dry_run(kind: str, tmp_path: Path, fakebin: Path) -> None:
     assert doctor.returncode == 0, _shown(doctor)
 
     assert git_status(repo) == INIT_WRITES
-    spec = ["--spec", "docs/greet.md"] if kind == "docs" else []  # the item that lists the repository's spec file
-    add = agentflow(repo, "backlog", "add", "greet", "--title", "Greet", "--status", "ready", *spec)  # a backlog pack
-    assert add.returncode == 0, _shown(add)  # needs an item: a `module_lane` run starts from one
-
     add_bug_lane_rule(repo, init.stdout)
     confirm_gates(repo)
     validate = agentflow(repo, "validate")
-    assert validate.returncode == 0 and "(0 warnings)" in validate.stdout, _shown(validate)
+    assert validate.returncode == 0, _shown(validate)
+    if kind == "docs":  # the toy has docs/greet.md, which the empty backlog does not list yet
+        assert [x for x in validate.stdout.splitlines() if x.startswith("warning ")] == [UNLISTED_SPEC], _shown(validate)
+        assert "(1 warnings)" in validate.stdout, _shown(validate)
+    else:
+        assert "(0 warnings)" in validate.stdout, _shown(validate)
+
+    spec = ["--spec", "docs/greet.md"] if kind == "docs" else []  # the item that lists the repository's spec file
+    add = agentflow(repo, "backlog", "add", "greet", "--title", "Greet", "--status", "ready", *spec)  # a backlog pack
+    assert add.returncode == 0, _shown(add)  # needs an item: a `module_lane` run starts from one
     assert git_status(repo) == INIT_WRITES
+    validate = agentflow(repo, "validate")
+    assert validate.returncode == 0 and "(0 warnings)" in validate.stdout, _shown(validate)
 
     explain = agentflow(repo, "explain", "feature", "--module", "greet")
     assert explain.returncode == 0, _shown(explain)
@@ -224,8 +233,22 @@ def test_init_in_a_repository_with_a_backlog_file_uses_it(tmp_path: Path, fakebi
     assert cfg.work_source.kind == "backlog"
     assert (repo / "backlog.yml").read_text(encoding="utf-8") == text
     cards = backlog.snapshot(cfg, repo)["cards"]
-    assert [c["id"] for c in cards if c["id"] == "greet"] == ["greet"], cards
+    (card,) = [c for c in cards if c["id"] == "greet"]
+    assert card["kind"] == "module" and card["title"] == "Greet", card
     assert git_status(repo) == "?? .agentflow/config.yaml"
+
+
+def test_init_keeps_an_unparseable_backlog_file(tmp_path: Path, fakebin: Path) -> None:
+    repo = toy("docs", tmp_path)
+    (repo / "backlog.yml").write_bytes(b"items: [\n")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", "broken backlog")
+    run_git(repo, "push", "-q", "origin", "main")
+
+    init = agentflow(repo, "init")
+    assert init.returncode == 0, _shown(init)
+    assert load_config(pack.pack_config(repo)).work_source.kind == "backlog"
+    assert (repo / "backlog.yml").read_bytes() == b"items: [\n"
 
 
 def test_security_overlay_covers_the_new_modules() -> None:
