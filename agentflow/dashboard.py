@@ -53,9 +53,16 @@ Routes:
   `config_edit`. A save is refused unless the new config validates, leaves the protected settings as they are and
   starts from the file's current hash (409 otherwise). After a save the dashboard serves the new config at once,
   and a live runner on the pack config picks it up when its next phase starts.
-- Every route but `/api/info` reads one repository, the server's default (`DashboardServer.default_context`): with
-  none it answers 404 `no repository`, and while the default is not live, or its pack names another runs directory
-  than it was loaded with, 409 with the reason. `/api/info` answers from the user settings when there is no config.
+- `GET /api/repos`: every repository the server holds (`repo_context.repos_view`, from one snapshot: its id, name,
+  state, counts and load error, the skipped settings entries, the default's id), with no checkout path in it.
+- `/api/repos/<id>/<rest>` (GET and POST) is the legacy `/api/<rest>` served for the repository `<id>`: the id is
+  percent-decoded and looked up in the server's own map, never joined to a path; one the map does not hold (or an
+  empty one, or one of over `REPO_ID_MAX` characters) is 404 `no such repository` and reads no file, and a `<rest>`
+  of `repos` or `repos/…` is 404.
+- Every other route but `/api/info` reads one repository, the server's default (`DashboardServer.default_context`):
+  with none it answers 404 `no repository`. A repository that is not live, or whose pack names another runs directory
+  than it was loaded with, answers 409 with the reason, on the legacy routes and under its prefix alike.
+  `/api/info` (and `/api/repos/<id>/info`) answers from the user settings when there is no config.
 
 It can approve checkpoints and start agents, so it is locked down:
 - it binds `127.0.0.1` only, and every request but the data-free shell needs the random token printed at
@@ -92,7 +99,7 @@ from datetime import UTC, date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from agentflow import (
     activity,
@@ -152,6 +159,8 @@ CURSOR = re.compile(r"[0-9]{1,15}")
 EVENTS_LIMIT_DEFAULT = 200
 EVENTS_LIMIT_MAX = 500
 ACTION_ROUTE = re.compile(r"^/api/runs/([^/]+)/([a-z]+)$")
+REPOS_ROUTE = re.compile(r"^/api/repos/([^/]*)/(.+)$")  # one repository's copy of a legacy route: `/api/<rest>`
+REPO_ID_MAX = 512  # a decoded repository id: a 255-byte folder name, `-` and 8 hex digits, with room to spare
 TEXT_MAX = backlog.TEXT_MAX
 BACKLOG_ROUTES = ("/api/backlog", "/api/backlog/start", "/api/backlog/remove", "/api/backlog/file")
 FILE_OPS = {"add": ("item",), "edit": ("id", "fields"), "move": ("id", "direction"), "add_issue": ("number",)}  # each op's keys, with sha256
@@ -184,7 +193,8 @@ class BadRequest(Exception):
 
 def _json_bytes(data: Any) -> bytes:
     text = json.dumps(data, ensure_ascii=False, default=str)
-    return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026").encode("utf-8")
+    # a lone surrogate (a file name that was not UTF-8) becomes `?` rather than failing the whole answer
+    return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026").encode("utf-8", errors="replace")
 
 
 def _text(body: dict, name: str, required: bool = False) -> str | None:
@@ -401,7 +411,7 @@ def info_numbers(dashboard: dict) -> tuple[float, int]:
     return float(refresh), shown
 
 
-NOT_LIVE = {"not_set_up": "it has no .agentflow/config.yaml", "missing": "it has left the workspace",
+NOT_LIVE = {"not_set_up": "it is not set up (it has no .agentflow/config.yaml)", "missing": "it has left the workspace",
             "error": "its pack could not be loaded"}
 
 
@@ -609,9 +619,10 @@ def serve(repo: Path, cfg: Config, host: str, port: int, token: str,
 class _Handler(BaseHTTPRequestHandler):
     server: DashboardServer
     # set by `_handle` for each request, from one snapshot: every handler reads its repository through `_ctx` alone
-    # (None only on `/api/info` when there is no default)
+    # (None only on `/api/info` when there is no default); `_scoped` says it came from `/api/repos/<id>/…`
     _snap: Snapshot
     _ctx: RepoContext
+    _scoped: bool
     server_version = "agentflow"
     sys_version = ""
 
@@ -716,19 +727,51 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(403, b"", "text/plain; charset=utf-8")
                 return
             parts = urlsplit(self.path)
-            self._snap = self.server.snap
-            self._ctx = self.server.default_context(self._snap)
-            refused = refusal(self._ctx) if parts.path != "/api/info" else None
+            path = parts.path
+            snap = self._snap = self.server.snap
+            self._scoped = False
+            if path == "/api/repos":
+                if self.command == "GET":
+                    self._json(200, repo_context.repos_view(snap.repos.values(), snap.skipped, snap.default,
+                                                            snap.user_error))
+                else:
+                    self.close_connection = True  # a POST's body is left unread
+                    self._error(404, "not found")
+                return
+            match = REPOS_ROUTE.match(path)
+            if match:
+                ctx, refused = self._scope(snap, match.group(1), match.group(2))
+                path, self._scoped = "/api/" + match.group(2), True
+            else:
+                ctx = self.server.default_context(snap)
+                refused = refusal(ctx) if path != "/api/info" else None
             if refused is not None:
                 self.close_connection = True  # a POST's body is left unread
                 self._error(*refused)
                 return
-            route(parts.path, parse_qs(parts.query))
+            self._ctx = ctx
+            route(path, parse_qs(parts.query))
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
         except Exception:
             sys.stderr.write("dashboard: " + traceback.format_exc().replace(self.server.token, "<token>"))
             self._error(500, "internal error; see the dashboard's terminal")
+
+    @staticmethod
+    def _scope(snap: Snapshot, raw_id: str, rest: str) -> tuple[RepoContext | None, tuple[int, str] | None]:
+        """The context `/api/repos/<raw_id>/<rest>` names in `snap`, and why it can't serve, as `(status, error)`.
+        The id is percent-decoded and only ever looked up in the map, never joined to a path: an empty or overlong
+        one is 404 before the lookup, and one the map does not hold is 404, so an unknown id touches no file. A
+        `rest` that is `repos` again is 404. Every route but `info` answers `refusal`'s 409s."""
+        repo_id = unquote(raw_id)
+        if not repo_id or len(repo_id) > REPO_ID_MAX:
+            return None, (404, "no such repository")
+        ctx = snap.repos.get(repo_id)
+        if ctx is None:
+            return None, (404, "no such repository")
+        if rest == "repos" or rest.startswith("repos/"):
+            return None, (404, "not found")
+        return ctx, (None if rest == "info" else refusal(ctx))
 
     def _get(self, path: str, query: dict) -> None:
         if path == "/api/board":
@@ -1010,10 +1053,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(400, str(exc))
             return
         try:
-            ctx.cfg = load_config(config_path)
+            reloaded = load_config(config_path)
         except ConfigError as exc:  # validated a moment ago; only a concurrent editor gets here
             self._error(500, f"saved, but the dashboard could not reload it: {exc}")
             return
+        # on the context the server holds for this repository now: a rescan may have replaced the request's one
+        ctx.cfg = reloaded
+        current = self.server.snap.repos.get(ctx.id)
+        if current is not None and current is not ctx:
+            current.cfg = reloaded
         self.log_message("config.yaml saved from the Settings page (sha256 %s)", digest[:12])
         self._json(200, {**proposal.as_dict(), "ok": True, "saved": proposal.changed, "sha256": digest})
 

