@@ -15,6 +15,7 @@ import getpass
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -1151,7 +1152,7 @@ def build_parser() -> argparse.ArgumentParser:
     doc = sub.add_parser("doctor", help="check this machine can run the pack: agent CLIs and logins, gh, the remote, "
                                         "Docker, the state dir and each gate's programs")
     doc.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
-    doc.add_argument("--all", action="store_true",
+    doc.add_argument("--all", dest="all_repos", action="store_true",
                      help="run once for every repository of your workspace (`workspace.roots` in your user config)")
     doc.set_defaults(func=cmd_doctor)
 
@@ -1175,19 +1176,19 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("run", nargs="?", help="a run id (or a part of it that matches one run)")
     status.add_argument("--watch", action="store_true", help="a live board in the terminal (Ctrl-C ends it)")
     status.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
-    status.add_argument("--all", action="store_true",
+    status.add_argument("--all", dest="all_repos", action="store_true",
                         help="run once for every repository of your workspace (`workspace.roots` in your user config)")
     status.set_defaults(func=cmd_status)
 
     agents = sub.add_parser("agents", help="every agent process running now, across runs")
     agents.add_argument("--watch", action="store_true", help="refresh on every new event (Ctrl-C ends it)")
     agents.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
-    agents.add_argument("--all", action="store_true",
+    agents.add_argument("--all", dest="all_repos", action="store_true",
                         help="run once for every repository of your workspace (`workspace.roots` in your user config)")
     agents.set_defaults(func=cmd_agents)
 
     inbox = sub.add_parser("inbox", help="every run waiting on a human, with its questions")
-    inbox.add_argument("--all", action="store_true",
+    inbox.add_argument("--all", dest="all_repos", action="store_true",
                        help="run once for every repository of your workspace (`workspace.roots` in your user config)")
     inbox.set_defaults(func=cmd_inbox)
 
@@ -1264,7 +1265,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     nxt = sub.add_parser("next", help="the lane, stage and next skill for the repo as it stands now")
     nxt.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
-    nxt.add_argument("--all", action="store_true",
+    nxt.add_argument("--all", dest="all_repos", action="store_true",
                      help="run once for every repository of your workspace (`workspace.roots` in your user config)")
     nxt.set_defaults(func=cmd_next)
 
@@ -1430,13 +1431,13 @@ def _run_all(args: argparse.Namespace) -> int:
     for n, repo in enumerate(found.repos):
         if n:
             print()
-        print(f"== {printable(repo.name)} (-C {printable(repo.path)}) ==")
+        print(f"== {printable(repo.name)} (-C {shlex.quote(printable(repo.path))}) ==")
         if repo.state != "live":
             print("not set up: no .agentflow/config.yaml here (run agentflow init in it)")
             continue
         try:
             os.chdir(repo.path)
-            if args.func(argparse.Namespace(**{**vars(args), "all": False})):
+            if args.func(argparse.Namespace(**{**vars(args), "all_repos": False})):
                 failed = True
         except Exception as exc:  # one repository's failure is one line, never the end of the others
             print(f"error: {printable(repo.name)}: {type(exc).__name__}: {printable(exc)}")
@@ -1479,16 +1480,14 @@ def cmd_workspace_list(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if getattr(args, "all", False):
-        return _run_all(args)
-    if args.chdir:
+    if args.chdir and not getattr(args, "all_repos", False):
         try:
             os.chdir(args.chdir)
         except OSError as exc:
             print(f"error: -C {args.chdir}: {exc.strerror or exc}")
             return 1
     try:
-        return args.func(args)
+        return _run_all(args) if getattr(args, "all_repos", False) else args.func(args)
     except Exception as exc:  # anything the commands do not turn into a message themselves
         traceback.print_exc(file=sys.stderr)
         print(f"error: the runner stopped on an unexpected {type(exc).__name__}: {exc}. A run it was working on "

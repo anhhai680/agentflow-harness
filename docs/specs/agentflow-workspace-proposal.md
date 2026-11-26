@@ -136,14 +136,16 @@ show the error on the Settings page, so a bad personal file never locks the deve
 ### 3. The CLI
 
 - **`-C <path>`** is a top-level option (`agentflow -C ~/code/billing status`): the directory `_find_repo()` starts
-  from, instead of `Path.cwd()`. The default is unchanged. An unreadable path, or one in no checkout, is the same
-  `not inside a git checkout` error as today.
+  from, instead of `Path.cwd()`. The default is unchanged. An unreadable or missing path is
+  `error: -C <path>: <reason>`; a path that exists but is in no checkout reaches the command, which gives today's
+  `not inside a git checkout` error.
 - **`--all`** on `status`, `inbox`, `agents`, `next` and `doctor` runs the command once per workspace
   repository, in workspace order, from inside that repository (the command's own code is not changed, so its output
   is exactly what it prints today). Each repository's output follows a heading, `== <name> (-C <path>) ==`, which also
   gives the option to put in front of any command the output suggests. A repository with no pack prints
   `not set up` under its heading. A repository whose pack fails to load prints its own `error:` line and the loop goes
-  on; the exit code is 1 when any failed. They work from any directory. With no workspace configured `--all` stops with
+  on; the exit code is 1 when any failed. Only a command that loads the pack reports it (`agents`, `next`, `doctor`):
+  `status` and `inbox` read runs and never load the pack, as today. They work from any directory. With no workspace configured `--all` stops with
   `no workspace: set workspace.roots in ~/.config/agentflow/config.yaml`. `--all` with `-C` is refused.
 - The view functions already take `(repo, cfg)` (`views.agents_view`, `hitl.inbox_items`, `state.list_runs`), so
   `--all` is a loop, not a change to them.
@@ -151,8 +153,9 @@ show the error on the Settings page, so a bad personal file never locks the deve
   set up, missing), what was skipped and why. There is no `workspace add|scan|remove`: the workspace is changed in the
   config file or on the Settings page.
 - **Write commands stay single-repository**: `run`, `resume`, `queue`, `answer`, `approve`, `reject`, `cancel`,
-  `retry` take `-C` but not `--all`; run ids are unique only inside one repository. `inbox --all` prints, for each
-  waiting item, the exact `-C <path>` command that answers it.
+  `retry` take `-C` but not `--all`; run ids are unique only inside one repository. A repository's heading carries
+  the `-C <path>` option (shell-quoted, so it can be pasted) to put in front of the `agentflow answer`, `approve` or
+  `reject` command its output suggests.
 
 ### 4. The dashboard
 
@@ -411,9 +414,9 @@ single-repository behaviour is already pinned by the existing tests. W3 and W4 a
 1. `agentflow -C <path> <cmd>` gives the same result as `cd <path> && agentflow <cmd>` for every command, including
    from inside a linked worktree.
 2. With `workspace.roots` set to a folder of three repositories, one with a waiting question, `agentflow inbox --all`
-   run from a directory that is no repository lists the question under its repository with the exact command that
-   answers it. `status --all` and `agents --all` list every repository's runs. A broken pack in one repository is one
-   `error:` line under its heading and exit code 1.
+   run from a directory that is no repository lists the question under its repository's heading, which gives the `-C`
+   option that makes the suggested command run there. `status --all` and `agents --all` list every repository's runs. A broken pack in one repository is one
+   `error:` line under its heading (for the commands that load the pack) and exit code 1.
 3. `agentflow dashboard` run from outside any repository serves the three repositories from one port and one token. The
    page has a switcher with a waiting-items badge per repository. Switching repositories pauses nothing. Approving an
    item from the All-repositories Inbox changes only that item's run, in its own repository.
@@ -481,3 +484,17 @@ dashboard starts in that is outside the workspace is not added.
 When this is approved (edit the status line from `Status: proposed` to `approved`), plan slice W1 with `writing-plans`
 into `docs/plans/YYYY-MM-DD-agentflow-harness-workspace-w1.md`, with `security-and-hardening`, because W1 changes
 `layers.py`, which triggers the security overlay.
+
+## Before W2 starts
+
+Found by the W1 whole-branch review; each must be settled in W2's plan, because W2 lets the dashboard start runs from
+the resolved map.
+
+- **A root's child may resolve outside the root.** A child whose `.git` is a file (a linked worktree) resolves to its
+  main checkout, which can be anywhere on the machine, and then joins the workspace. That is harmless for read-only
+  views. Before the dashboard starts runs from the map, decide whether a root's child may resolve to a checkout outside
+  its root (recommendation: no, drop it with a `Skipped` line that says so).
+- **`UserSettings.dashboard` is unvalidated** beyond what `check_user` and `validate` already do. W2 reads `port`,
+  `board_refresh_s` and `done_shown` from it and must range-check them as `validate` does.
+- **A git-refused root child is dropped silently** (a submodule, a `--separate-git-dir` repository). `workspace list`
+  cannot say why a repository is missing; W2 or W3 should give it a `Skipped` line.

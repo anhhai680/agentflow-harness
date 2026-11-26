@@ -4,12 +4,13 @@ repository of the user's workspace, so a single repository's output stays what i
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 import pytest
 import yaml
 
-from agentflow import flow, layers, views
+from agentflow import flow, layers, repo_set, views
 from agentflow.tests.conftest import SPARSE_PACK, run_git
 
 
@@ -53,7 +54,7 @@ def cli(capsys):
 
 
 def heading(repo: Path) -> str:
-    return f"== {repo.name} (-C {repo.resolve()}) =="
+    return f"== {repo.name} (-C {shlex.quote(str(repo.resolve()))}) =="
 
 
 def test_dash_c_runs_the_command_in_that_repository(ws, cli, monkeypatch):
@@ -157,13 +158,13 @@ def test_inbox_all_and_next_all_and_doctor_all_run_per_repository(ws, cli):
 def test_a_folder_name_with_a_newline_is_printed_escaped(tmp_path, monkeypatch, cli):
     root = tmp_path / "ws"
     root.mkdir()
-    evil = make_repo(root, "evil\nname")
+    make_repo(root, "evil\nname")
     write_user_file([root])
     monkeypatch.chdir(tmp_path)
     code, out = cli("status", "--all")
     assert code == 0
     line = next(ln for ln in out.splitlines() if ln.startswith("== evil"))
-    assert "evil\\nname" in line and str(evil.resolve()).replace("\n", "\\n") in line
+    assert "evil\\nname" in line and "evil\\nname" in line.split("(-C ", 1)[1]
     assert "name (-C" not in out.replace(line, "")  # the heading is one line
 
 
@@ -201,3 +202,55 @@ def test_config_show_effective_reports_the_workspace_layer(ws, cli):
     code, out = cli("-C", str(made["alpha"]), "config", "show", "--effective", "workspace")
     assert code == 0
     assert f'workspace.roots: ["{root}"]  [user]' in out
+
+
+def test_a_repository_path_with_a_space_is_quoted_in_the_heading(tmp_path, monkeypatch, cli):
+    root = tmp_path / "my ws"
+    root.mkdir()
+    spaced = make_repo(root, "my repo")
+    write_user_file([root])
+    monkeypatch.chdir(tmp_path)
+    code, out = cli("status", "--all")
+    assert code == 0
+    line = next(ln for ln in out.splitlines() if ln.startswith("== my repo"))
+    assert f"(-C {shlex.quote(str(spaced.resolve()))})" in line
+    assert shlex.split(line.split("(-C ", 1)[1].removesuffix(") =="))[0] == str(spaced.resolve())
+
+
+@pytest.mark.parametrize("argv", [("metrics", "--all"), ("backlog", "list", "--all")])
+@pytest.mark.parametrize("configured", [False, True])
+def test_metrics_and_backlog_all_flags_are_not_the_workspace_flag(ws, cli, monkeypatch, argv, configured):
+    """`metrics --all` (every run) and `backlog list --all` (dropped items) predate the workspace and keep meaning
+    what they did: no heading, no fan-out, and the same output with a workspace configured or not."""
+    _, made = ws
+    monkeypatch.chdir(made["alpha"])
+    layers.user_config_path().unlink()
+    bare = cli(*argv)
+    if configured:
+        write_user_file([made["alpha"].parent])
+        assert cli(*argv) == bare
+    code, out = bare
+    assert "no workspace" not in out and "==" not in out and "not set up" not in out
+
+
+def test_a_setup_failure_in_all_is_the_standard_error_not_a_traceback(ws, cli, monkeypatch):
+    def boom():
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(repo_set, "from_user_config", boom)
+    code, out = cli("status", "--all")
+    assert code == 1
+    assert out.startswith("error: the runner stopped on an unexpected RuntimeError: Could not determine home")
+
+
+def test_the_no_workspace_message_survives_a_missing_home_directory(tmp_path, monkeypatch, cli):
+    def no_home():
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(layers, "user_config_path", no_home)
+    monkeypatch.setattr(layers, "load_user_settings",
+                        lambda: layers.UserSettings(layers.WorkspaceSettings((), (), ()), {}, None))
+    code, out = cli("status", "--all")
+    assert code == 1
+    assert out == "error: no workspace: set workspace.roots in your user config file\n"

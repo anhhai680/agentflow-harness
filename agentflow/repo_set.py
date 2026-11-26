@@ -166,5 +166,9 @@ def from_user_config() -> RepoSet:
     file is unusable."""
     settings = layers.load_user_settings().workspace
     if not settings.roots and not settings.repos:
-        raise NoWorkspace(f"no workspace: set workspace.roots in {layers.user_config_path()}")
+        try:
+            where = str(layers.user_config_path())
+        except RuntimeError:  # no home directory
+            where = "your user config file"
+        raise NoWorkspace(f"no workspace: set workspace.roots in {where}")
     return resolve(settings)
