@@ -45,7 +45,7 @@ from agentflow.vuln import SEVERITIES as VULN_SEVERITIES
 
 __all__ = ["Conflict", "EditError", "Proposal", "Refused", "form_fields", "propose", "read", "save"]
 
-MAX_TEXT = 512 * 1024
+MAX_TEXT = layers.MAX_CONFIG_BYTES
 MERGE_TAG = "tag:yaml.org,2002:merge"
 AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices", "cache_ttl", "lean", "user_settings", "read_only_roles",
                   "max_turns_by_role", "session_budget_usd", "bash_output_chars")  # what a page may change in an `agents.<name>` block
@@ -107,6 +107,8 @@ def read(path: Path) -> tuple[str, str]:
     path = Path(path)
     if path.is_symlink():
         raise EditError(f"{path} is a symlink; the dashboard edits only a regular file")
+    if path.stat().st_size > MAX_TEXT:
+        raise EditError(f"{path.name} is larger than {MAX_TEXT} bytes; fix it in git")
     text = path.read_text(encoding="utf-8")
     return text, sha256(text)
 
@@ -280,13 +282,9 @@ def _layers(path: Path, text: str) -> _Layers:
     pack that does not load at all falls back to the file alone, as the form was before the layers."""
     project = yaml.safe_load(text) or {}
     project = project if isinstance(project, dict) else {}
-    try:  # every walk below copies each alias out: refuse a file whose aliases expand without bound first
-        too_big = layers.expanded_size(project) > layers.MAX_EXPANDED_NODES
-    except RecursionError:  # an anchor that refers to itself, or nesting deeper than any walk here can follow
-        too_big = True
-    if too_big:
-        raise EditError(f"{path.name} expands to more than {layers.MAX_EXPANDED_NODES} values (nested aliases) or "
-                        "nests too deep; fix it in git")
+    problem = layers.expansion_problem(project)  # every walk below copies each alias out: refuse an unbounded file
+    if problem:
+        raise EditError(f"{path.name} {problem}; fix it in git")
     comments = _comments(text)
     try:
         cfg = load_config(path)
@@ -553,6 +551,9 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
         return [Issue("error", "", f"not valid YAML: {exc}")]
     if not isinstance(parsed, dict):
         return [Issue("error", "", "the file must hold a mapping at the top level")]
+    problem = layers.expansion_problem(parsed)  # before any load or comparison: each one copies every alias out
+    if problem:
+        return [Issue("error", "", f"config.yaml {problem}")]
     fd, temp = tempfile.mkstemp(prefix=".config-check-", suffix=".yaml", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

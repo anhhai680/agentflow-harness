@@ -1532,3 +1532,28 @@ def test_a_yaml_tab_text_of_nested_aliases_is_refused_quickly(shipped):
     proposal = config_edit.propose(shipped, sha, text=SHIPPED + _mapping_bomb(), repo=REPO)
     assert time.monotonic() - started < 2
     assert any("nested aliases" in issue.message for issue in proposal.errors)
+
+
+def test_a_yaml_tab_edit_of_a_pack_whose_protected_key_holds_a_bomb_is_refused_quickly(shipped):
+    """Both the file on disk and the new text hold the same 9**10-value bomb under a protected key: the check must
+    refuse the text before it compares the two, value by value."""
+    import time
+
+    lines = ["a0: &a0 [x, x, x, x, x, x, x, x, x]"]
+    lines += [f"a{i}: &a{i} [{', '.join([f'*a{i - 1}'] * 9)}]" for i in range(1, 10)]
+    bomb = SHIPPED + "\n".join(lines) + "\nworkspace: *a9\n"
+    shipped.write_text(bomb, encoding="utf-8")
+    _, sha = config_edit.read(shipped)
+    started = time.monotonic()
+    proposal = config_edit.propose(shipped, sha, text=bomb.replace("step_timeout_min: 45", "step_timeout_min: 60"),
+                                   repo=REPO)
+    assert time.monotonic() - started < 2
+    assert any("nested aliases" in issue.message for issue in proposal.errors)
+
+
+def test_a_yaml_tab_text_over_the_byte_cap_is_refused(shipped):
+    from agentflow import layers
+
+    _, sha = config_edit.read(shipped)
+    with pytest.raises(EditError, match=f"at most {layers.MAX_CONFIG_BYTES} bytes"):
+        config_edit.propose(shipped, sha, text=SHIPPED + "#" * layers.MAX_CONFIG_BYTES, repo=REPO)

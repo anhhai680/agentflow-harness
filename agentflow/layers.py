@@ -96,59 +96,90 @@ def base_layers(starter: object) -> list[Layer]:
     return stack
 
 
-MAX_DEPTH = 64  # a layer file nested deeper than this is refused: no layer needs it, and every pass recurses
-
-
-def _no_cycle(node: Any, path: Path, ancestors: set[int], done: set[int], depth: int = 0) -> None:
-    """Refuse a value that contains itself (a YAML anchor used inside its own node) or nests past `MAX_DEPTH`;
-    each shared node (an anchor used twice) is walked once."""
-    if not isinstance(node, (dict, list)) or id(node) in done:
-        return
-    if id(node) in ancestors:
-        raise LayerError(str(path), "holds a YAML anchor that refers to itself")
-    if depth > MAX_DEPTH:
-        raise LayerError(str(path), f"is nested more than {MAX_DEPTH} levels deep")
-    ancestors.add(id(node))
-    for child in node.values() if isinstance(node, dict) else node:
-        _no_cycle(child, path, ancestors, done, depth + 1)
-    ancestors.discard(id(node))
-    done.add(id(node))
-
-
+MAX_DEPTH = 64  # a config file nested deeper than this is refused: no config needs it, and every pass recurses
 MAX_EXPANDED_NODES = 100_000  # a file whose aliases expand past this many values is refused (the shipped ones hold < 1000)
+MAX_CONFIG_BYTES = 128 * 1024  # a config file longer than this is not parsed (the shipped ones are under 32 KiB)
+
+
+class _Refused(ValueError):
+    """A value `expansion_problem` refuses; its text completes "<file> …"."""
+
+
+def _measure(node: Any, depth: int, memo: dict[int, tuple[int, int]], open_: set[int]) -> tuple[int, int]:
+    """`(size, height)` of `node` with every alias copied out: its value count (a mapping's keys are not counted) and
+    how many container levels lie below it. A shared node is walked once and its result reused at every use, and its
+    height is checked again at the depth of each use, so nine anchored lists of nine references each cost 81 steps,
+    and a chain of shallow anchors is measured at the depth it really reaches. The recursion never goes deeper than
+    `MAX_DEPTH + 1` containers."""
+    if not isinstance(node, (dict, list)):
+        return 1, 0
+    key = id(node)
+    if key in open_:
+        raise _Refused("holds a YAML anchor that refers to itself")
+    if key not in memo:
+        if depth > MAX_DEPTH:
+            raise _Refused(f"is nested more than {MAX_DEPTH} levels deep")
+        open_.add(key)
+        size, height = 1, 0
+        for child in node.values() if isinstance(node, dict) else node:
+            child_size, child_height = _measure(child, depth + 1, memo, open_)
+            size += child_size
+            height = max(height, child_height + 1)
+        open_.discard(key)
+        memo[key] = (size, height)
+    size, height = memo[key]
+    if depth + height > MAX_DEPTH:
+        raise _Refused(f"is nested more than {MAX_DEPTH} levels deep")
+    return size, height
 
 
 def expanded_size(node: Any) -> int:
     """How many values `node` holds once every YAML alias is copied out: 1 for a scalar, 1 plus its children's sizes
-    for a mapping (its values; keys are not counted) or a list. A shared node is computed once and counted once per
-    use, so nine anchored lists of nine references each cost 81 steps, not 9**9. Call it only on a value
-    `_no_cycle` accepted: that bounds the depth of the recursion and rules out a node that contains itself."""
-    memo: dict[int, int] = {}
+    for a mapping (its values; keys are not counted) or a list. Raises `ValueError` for a value that contains itself
+    or nests past `MAX_DEPTH` (`expansion_problem` says which)."""
+    return _measure(node, 0, {}, set())[0]
 
-    def size(value: Any) -> int:
-        if not isinstance(value, (dict, list)):
-            return 1
-        key = id(value)
-        if key not in memo:
-            memo[key] = 1 + sum(size(child) for child in (value.values() if isinstance(value, dict) else value))
-        return memo[key]
 
-    return size(node)
+def expansion_problem(node: Any) -> str | None:
+    """Why a parsed config file is refused, as the end of a sentence that starts with the file's name, or None: it
+    holds a value that contains itself (an anchor used inside its own node), nests past `MAX_DEPTH` (counted through
+    every alias), or expands past `MAX_EXPANDED_NODES` values. Every later pass copies aliases out and recurses, so
+    this is checked on each config file right after it is parsed."""
+    try:
+        size, _ = _measure(node, 0, {}, set())
+    except _Refused as refused:
+        return str(refused)
+    if size > MAX_EXPANDED_NODES:
+        return f"expands to more than {MAX_EXPANDED_NODES} values (nested aliases)"
+    return None
+
+
+def read_config_text(path: Path) -> str | None:
+    """The text of the config file at `path`, or None when it is longer than `MAX_CONFIG_BYTES` (it is never parsed:
+    a chain of YAML merge keys costs the square of its length to parse). Raises `OSError` as opening it does and
+    `UnicodeDecodeError` for text that is not UTF-8."""
+    with path.open("rb") as handle:
+        data = handle.read(MAX_CONFIG_BYTES + 1)
+    if len(data) > MAX_CONFIG_BYTES:
+        return None
+    return data.decode("utf-8")
 
 
 def _read(path: Path, what: str = "layer", *, empty_ok: bool = False) -> dict:
-    """A layer file's mapping. A file that cannot be read, is not YAML, holds a value that contains itself, nests
-    too deep or expands past `MAX_EXPANDED_NODES` values, or is not a mapping at the top level (an empty one is `{}` when `empty_ok`) is a `LayerError`."""
+    """A layer file's mapping. A file that cannot be read, is longer than `MAX_CONFIG_BYTES`, is not YAML, has an
+    `expansion_problem`, or is not a mapping at the top level (an empty one is `{}` when `empty_ok`) is a `LayerError`."""
     try:
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-        _no_cycle(loaded, path, set(), set())
-        too_big = expanded_size(loaded) > MAX_EXPANDED_NODES
+        text = read_config_text(path)
+        if text is None:
+            raise LayerError(str(path), f"is larger than {MAX_CONFIG_BYTES} bytes")
+        loaded = yaml.safe_load(text)
     except (OSError, yaml.YAMLError) as exc:
         raise LayerError(str(path), f"cannot read the {what} file: {exc}") from exc
     except RecursionError as exc:
         raise LayerError(str(path), f"the {what} file is nested too deeply to read") from exc
-    if too_big:
-        raise LayerError(str(path), f"expands to more than {MAX_EXPANDED_NODES} values (nested aliases)")
+    problem = expansion_problem(loaded)
+    if problem:
+        raise LayerError(str(path), problem)
     if loaded is None and empty_ok:
         return {}
     if not isinstance(loaded, dict):

@@ -3458,3 +3458,43 @@ def test_load_config_refuses_nested_aliases(tmp_cfg):
     with pytest.raises(layers.LayerError) as err:
         layers.load_user_settings()
     assert str(user) in str(err.value) and "nested aliases" in str(err.value)
+
+
+def test_load_config_refuses_an_at_reference_bomb(tmp_cfg):
+    import time
+
+    lines = ["x0: [a, a, a, a, a, a, a, a, a]"]
+    lines += [f"x{i}: [{', '.join([repr('@x' + str(i - 1))] * 9)}]" for i in range(1, 8)]
+    path = tmp_cfg()
+    path.write_text(path.read_text(encoding="utf-8") + "\n".join(lines) + "\n", encoding="utf-8")
+    started = time.monotonic()
+    with pytest.raises(ConfigError, match="@ references"):
+        load_config(path)
+    assert time.monotonic() - started < 2
+
+
+def test_load_config_refuses_an_at_reference_chain_past_the_depth_bound(tmp_cfg):
+    lines = ["y0: [x]"] + [f"y{i}: ['@y{i - 1}']" for i in range(1, 80)]
+    path = tmp_cfg()
+    path.write_text(path.read_text(encoding="utf-8") + "\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="levels deep"):
+        load_config(path)
+
+
+def test_load_config_keeps_its_messages_for_a_self_referencing_or_deep_pack(tmp_cfg):
+    path = tmp_cfg()
+    base = path.read_text(encoding="utf-8")
+    path.write_text(base + "zz: &z {b: *z}\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="refers to itself"):
+        load_config(path)
+    path.write_text(base + "zz: " + "[" * 70 + "x" + "]" * 70 + "\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="nested more than 64 levels deep"):
+        load_config(path)
+
+
+def test_load_config_refuses_a_pack_over_the_byte_cap(tmp_cfg):
+    path = tmp_cfg()
+    path.write_text(path.read_text(encoding="utf-8") + "#" * layers.MAX_CONFIG_BYTES + "\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as err:
+        load_config(path)
+    assert str(path) in str(err.value) and f"larger than {layers.MAX_CONFIG_BYTES} bytes" in str(err.value)

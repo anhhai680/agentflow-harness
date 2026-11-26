@@ -664,10 +664,17 @@ def test_expanded_size_counts_each_use_of_a_shared_node():
 
 
 def test_the_budget_boundary(tmp_path):
+    """An anchored list of 999 scalars (1000 values) used 98 times, plus `m` scalars: 1 (the top mapping) + 1000 (`a`)
+    + 1 (`k`) + 98 * 1000 + m values, so m = 998 is exactly the budget."""
+    def doc(m: int) -> str:
+        return (f"a: &a [{', '.join(['x'] * 999)}]\n"
+                f"k: [{', '.join(['*a'] * 98 + ['x'] * m)}]\n")
+
+    assert layers.MAX_EXPANDED_NODES == 100_000
     path = tmp_path / "config.yaml"
-    path.write_text(yaml.safe_dump({"k": ["x"] * (layers.MAX_EXPANDED_NODES - 2)}), encoding="utf-8")
-    assert len(layers._read(path)["k"]) == layers.MAX_EXPANDED_NODES - 2  # mapping + list + scalars == the budget
-    path.write_text(yaml.safe_dump({"k": ["x"] * (layers.MAX_EXPANDED_NODES - 1)}), encoding="utf-8")
+    path.write_text(doc(998), encoding="utf-8")
+    assert len(layers._read(path)["k"]) == 98 + 998
+    path.write_text(doc(999), encoding="utf-8")
     with pytest.raises(LayerError, match="nested aliases"):
         layers._read(path)
     assert layers.expanded_size({"k" * 10_000: 1, "j" * 10_000: 2}) == 3  # keys are not counted
@@ -693,3 +700,49 @@ def test_a_user_file_of_nested_aliases_is_refused_by_load_user_settings():
     with pytest.raises(LayerError) as err:
         load_user_settings()
     assert str(target) in str(err.value) and "nested aliases" in str(err.value)
+
+
+def _write(tmp_path, text: str):
+    path = tmp_path / "config.yaml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_an_anchor_that_refers_to_itself_and_deep_nesting_keep_their_messages(tmp_path):
+    with pytest.raises(LayerError, match="refers to itself"):
+        layers._read(_write(tmp_path, "a: &a {b: *a}\n"))
+    with pytest.raises(LayerError, match=f"nested more than {layers.MAX_DEPTH} levels deep"):
+        layers._read(_write(tmp_path, "a: " + "[" * 70 + "x" + "]" * 70 + "\n"))
+    assert layers._read(_write(tmp_path, "a: " + "[" * 60 + "x" + "]" * 60 + "\n"))
+
+
+def test_shared_anchors_are_measured_at_the_depth_they_reach(tmp_path):
+    """Two 40-deep anchored lists, the second ending in an alias of the first: 80 levels once the alias is followed,
+    though each anchor alone is shallow (the walk used to skip a node it had already seen)."""
+    text = "a0: &a0 " + "[" * 40 + "x" + "]" * 40 + "\n" + "a1: &a1 " + "[" * 40 + "*a0" + "]" * 40 + "\n"
+    with pytest.raises(LayerError, match=f"nested more than {layers.MAX_DEPTH} levels deep"):
+        layers._read(_write(tmp_path, text))
+
+
+def test_a_file_over_the_byte_cap_is_refused_before_it_is_parsed(tmp_path):
+    body = "k: v\n"
+    pad = layers.MAX_CONFIG_BYTES - len(body)
+    path = _write(tmp_path, "#" * (pad - 1) + "\n" + body)
+    assert layers._read(path) == {"k": "v"}  # exactly the cap
+    path = _write(tmp_path, "#" * pad + "\n" + body)
+    with pytest.raises(LayerError, match=f"larger than {layers.MAX_CONFIG_BYTES} bytes"):
+        layers._read(path)
+
+
+def test_a_merge_key_chain_under_the_byte_cap_parses_quickly(tmp_path):
+    """`<<` copies every key of the mapping it merges, so a chain of them costs the square of its length to parse:
+    the byte cap is what keeps the largest such file fast."""
+    lines, n = [], 0
+    while sum(len(line) + 1 for line in lines) < layers.MAX_CONFIG_BYTES - 64:
+        lines.append(f"a{n}: &a{n} {{<<: *a{n - 1}, k{n}: x}}" if n else "a0: &a0 {k0: x}")
+        n += 1
+    path = _write(tmp_path, "\n".join(lines[:-1]) + "\n")
+    started = time.monotonic()
+    with pytest.raises(LayerError):
+        layers._read(path)
+    assert time.monotonic() - started < 5
