@@ -13,7 +13,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 - The playbook has a Backlog section (§16).
 - `agentflow init` writes a `backlog` pack and an empty `backlog.yml` for a repository with no specs folder, and uses an existing `backlog.yml` as it is. A repository with a specs folder keeps the `specs` kind, and `init` offers `agentflow backlog import`.
 - In a backlog pack, an item that names `issue: N` shows once on the Board, with the issue's link, and hides issue #N's synced card; the issue's in-progress label still marks the item as taken, and the issue's blockers still hold it.
-- A synced GitHub issue that no item names has an **Add to backlog** button in a backlog pack's Board: it appends the item `issue-<N>` (status `backlog`, the issue's title and lane) to `backlog.yml` in your working tree. Only module-lane issues have it.
+- A synced GitHub issue that no item names has an **Add to backlog** button in a backlog pack's Board: it appends the item `issue-<N>` (status `backlog`, the issue's title and lane) to `backlog.yml` in your working tree. Only module-lane issues have it, and the button is not offered while the issue's start is in flight, while it is taken (in-progress label) or claimed on `origin`, or when an item already has the id `issue-<N>`.
 
 ### Changed
 - `init` now writes `backlog.yml` as well as `.agentflow/config.yaml`, in the one case above; neither is written over anything or through a symlink.

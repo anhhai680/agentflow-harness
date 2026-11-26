@@ -197,8 +197,8 @@ specs).
 - **Hand marks.** With the `backlog` kind, `agentflow backlog done <id>` is `set <id> status=done` and `undone` is
   `set <id> status=ready`, both working-tree edits that you commit. `runs/done_marks.json` is read only by
   `capability_map` and `specs` packs.
-- **`agentflow init`** writes the `backlog` kind and an empty `backlog.yml` for a repository with no specs folder
-  or with a `backlog.yml`, and offers `import` for one with a specs folder.
+- **`agentflow init`** writes the `backlog` kind (and, when there is none, an empty `backlog.yml`) for a repository
+  with no specs folder or with a `backlog.yml`, and offers `import` for one with a specs folder.
 - **Deprecation.** Once slice B4 ships, `validate` prints a note (not a warning, so "0 warnings" still holds) on a
   `capability_map` or `specs` pack, pointing to `agentflow backlog import`. The playbook marks both kinds
   deprecated, and 4.0 removes them.

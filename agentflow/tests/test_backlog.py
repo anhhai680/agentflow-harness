@@ -2265,6 +2265,29 @@ def test_the_issue_card_says_whether_it_is_addable(bbk, monkeypatch):
     assert cards["issue:7"]["addable"] is True and cards["issue:9"]["addable"] is False
 
 
+def test_a_taken_issue_cannot_be_added(bbk, monkeypatch):
+    _absorbing(bbk, monkeypatch, _issue(7, labels=("agentflow", "agentflow:in-progress")), yml=NO_ISSUE_YML)
+    before = (bbk.root / "backlog.yml").read_bytes()
+    card = bbk.cards()["issue:7"]
+    assert card["status"] == "taken" and card["addable"] is False
+    with pytest.raises(Refused, match="#7 carries the in-progress label"):
+        backlog.add_issue_item(bbk.cfg, bbk.root, "7", _file_sha(bbk))
+    assert (bbk.root / "backlog.yml").read_bytes() == before
+
+
+def test_a_dropped_item_with_the_derived_id_makes_the_issue_not_addable(bbk, monkeypatch):
+    yml = NO_ISSUE_YML + "  - {id: issue-7, title: Old, status: dropped, issue: 3}\n"
+    _absorbing(bbk, monkeypatch, _issue(7), yml=yml)
+    assert bbk.cards()["issue:7"]["addable"] is False
+    with pytest.raises(Refused, match="issue-7"):
+        backlog.add_issue_item(bbk.cfg, bbk.root, "7", _file_sha(bbk))
+
+
+def test_the_number_is_checked_for_length_before_it_is_converted(bbk):
+    with pytest.raises(Invalid):
+        backlog.add_issue_item(bbk.cfg, bbk.root, "9" * 5000, _file_sha(bbk))
+
+
 def test_an_issue_whose_start_is_in_flight_cannot_be_added(bbk, monkeypatch):
     _absorbing(bbk, monkeypatch, _issue(7), yml=NO_ISSUE_YML)
     backlog.begin_start(bbk.cfg, bbk.root, "issue:7")  # recorded `starting`; no run exists yet
@@ -2628,6 +2651,24 @@ def test_begin_start_refuses_a_cached_claim(cb):
     log = runs_root(cb.root) / backlog.LOG_NAME
     assert not log.is_file() or "item_starting" not in log.read_text(encoding="utf-8")
     assert backlog.begin_start(cb.cfg, cb.root, "module:a").params == {"module": "a"}  # a claim on b holds only b
+
+
+def test_an_issue_claimed_elsewhere_cannot_be_added(cb, monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", f"{GH_BIN}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_LOG", str(tmp_path / "gh.log"))
+    cb.fr.configure({"work_source": {"kind": "backlog", "path": None}, "backlog": {"claims": True}, **SYNC})
+    _list_issues(monkeypatch, _issue(7))
+    cb.claim("issue-7", phase="define", status="waiting")  # a teammate started issue:7
+    backlog.refresh(cb.cfg, cb.root)
+    snap = cb.snap()
+    card = {c["key"]: c for c in snap["cards"]}["issue:7"]
+    assert "issue-7" in {c["id"] for c in snap["remote_claims"]} and card["addable"] is False
+    before = (cb.root / "backlog.yml").read_bytes()
+    import hashlib
+
+    with pytest.raises(Refused, match="issue-7 is claimed by Other"):
+        backlog.add_issue_item(cb.cfg, cb.root, "7", hashlib.sha256(before).hexdigest())
+    assert (cb.root / "backlog.yml").read_bytes() == before
 
 
 def test_refresh_keeps_old_claims_when_origin_is_unreachable(cb):
