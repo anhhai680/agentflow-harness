@@ -3513,8 +3513,12 @@ class _Validator:
             path = f"workspace.{key}"
             origin = layers.origin_of(self.cfg.layer_origins, path)
             if origin is not None and (origin == "project" or origin.startswith("starter")):
+                try:
+                    where = f"({layers.user_config_path()})"
+                except RuntimeError:  # no home directory to name
+                    where = "file"
                 self.add("warning", path, "is a personal setting and is ignored in a pack; set it in your user "
-                         f"config ({layers.user_config_path()})")
+                         f"config {where}")
 
     def backlog(self, block: Any) -> None:
         """`dashboard.backlog`: which lane runs a map module, each lane's New task fields, a new module's row."""

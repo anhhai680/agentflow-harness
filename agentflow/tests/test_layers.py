@@ -542,6 +542,7 @@ def test_workspace_settings_reads_three_lists():
 @pytest.mark.parametrize("block", [
     {"roots": "/a"}, {"roots": [1]}, {"roots": [""]}, {"roots": ["rel/path"]}, {"roots": ["~otheruser/x"]},
     {"repos": ["./x"]}, {"exclude": [""]}, {"exclude": ["~other"]}, {"exclude": ["rel/path"]},
+    {"roots": ["/a\x00b"]}, {"repos": ["/a\nb"]}, {"exclude": ["x\ny"]}, {"roots": ["/a\x1b[2Jb"]},
     {"roots": ["/a"] * (layers.MAX_WORKSPACE_ENTRIES + 1)}, {"unknown": []}, ["/a"],
 ])
 def test_workspace_settings_refuses_a_bad_shape(block):
@@ -582,3 +583,49 @@ def test_load_user_settings_refuses_what_check_user_refuses():
     with pytest.raises(LayerError) as err:
         load_user_settings()
     assert str(target) in str(err.value) and "workspace.roots" in str(err.value)
+
+
+@pytest.mark.parametrize("text", [
+    "workspace: &w {roots: [/a], x: *w}\n",
+    "&t {workspace: {roots: [/a]}, dashboard: *t}\n",
+    "usage: " + "[" * 5000 + "]" * 5000 + "\n",
+    "usage: " + "[" * 100 + "]" * 100 + "\n",
+])
+def test_load_user_settings_refuses_a_hostile_yaml_file(text):
+    target = write_user_file(text)
+    with pytest.raises(LayerError) as err:
+        load_user_settings()
+    assert str(target) in str(err.value)
+
+
+def test_load_user_settings_says_when_the_user_file_cannot_be_read(monkeypatch):
+    target = write_user_file("")
+    real = Path.exists
+
+    def boom(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError("denied")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", boom)
+    with pytest.raises(LayerError, match="cannot read") as err:
+        load_user_settings()
+    assert str(target) in str(err.value)
+
+
+def test_load_user_settings_without_a_home_directory_has_no_user_file(monkeypatch):
+    def nohome():
+        raise RuntimeError("no home")
+
+    monkeypatch.setattr(layers, "user_config_path", nohome)
+    got = load_user_settings()
+    assert got.path is None and got.workspace == WorkspaceSettings((), (), ())
+
+
+def test_an_agent_only_a_pack_defines_is_fine_for_the_user_level_loader():
+    target = write_user_file("agents:\n  mypackagent:\n    models: {build: x}\n")
+    assert load_user_settings().path == target
+    data = yaml.safe_load(target.read_text(encoding="utf-8"))
+    with pytest.raises(LayerError, match="no agent `mypackagent`"):
+        check_user(data, {}, target)
+    check_user(data, {}, target, any_agent=True)

@@ -96,13 +96,39 @@ def base_layers(starter: object) -> list[Layer]:
     return stack
 
 
-def _read(path: Path) -> dict:
+MAX_DEPTH = 64  # a layer file nested deeper than this is refused: no layer needs it, and every pass recurses
+
+
+def _no_cycle(node: Any, path: Path, ancestors: set[int], done: set[int], depth: int = 0) -> None:
+    """Refuse a value that contains itself (a YAML anchor used inside its own node) or nests past `MAX_DEPTH`;
+    each shared node (an anchor used twice) is walked once."""
+    if not isinstance(node, (dict, list)) or id(node) in done:
+        return
+    if id(node) in ancestors:
+        raise LayerError(str(path), "holds a YAML anchor that refers to itself")
+    if depth > MAX_DEPTH:
+        raise LayerError(str(path), f"is nested more than {MAX_DEPTH} levels deep")
+    ancestors.add(id(node))
+    for child in node.values() if isinstance(node, dict) else node:
+        _no_cycle(child, path, ancestors, done, depth + 1)
+    ancestors.discard(id(node))
+    done.add(id(node))
+
+
+def _read(path: Path, what: str = "layer", *, empty_ok: bool = False) -> dict:
+    """A layer file's mapping. A file that cannot be read, is not YAML, holds a value that contains itself or nests
+    too deep, or is not a mapping at the top level (an empty one is `{}` when `empty_ok`) is a `LayerError`."""
     try:
         loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        _no_cycle(loaded, path, set(), set())
     except (OSError, yaml.YAMLError) as exc:
-        raise LayerError(str(path), f"cannot read the layer file: {exc}") from exc
+        raise LayerError(str(path), f"cannot read the {what} file: {exc}") from exc
+    except RecursionError as exc:
+        raise LayerError(str(path), f"the {what} file is nested too deeply to read") from exc
+    if loaded is None and empty_ok:
+        return {}
     if not isinstance(loaded, dict):
-        raise LayerError(str(path), "a layer file must hold a mapping at the top level")
+        raise LayerError(str(path), f"a {what} file must hold a mapping at the top level")
     return loaded
 
 
@@ -229,8 +255,9 @@ def _text_keys(data: Any, path: Path, prefix: Key = ()) -> None:
         _text_keys(value, path, (*prefix, key))
 
 
-def check_user(data: dict, lower: dict, path: Path) -> None:
-    """Refuse a user file that holds anything but `USER_KEYS`, or names an agent the layers below don't define."""
+def check_user(data: dict, lower: dict, path: Path, *, any_agent: bool = False) -> None:
+    """Refuse a user file that holds anything but `USER_KEYS`, or names an agent the layers below don't define
+    (`any_agent` skips that check: a caller with no pack cannot know the agents a pack defines)."""
     if not isinstance(data, dict):
         raise LayerError(str(path), "a user config file is a mapping of personal settings")
     _text_keys(data, path)
@@ -245,7 +272,7 @@ def check_user(data: dict, lower: dict, path: Path) -> None:
             raise LayerError(where, _NOT_PERSONAL)
         node: Any = lower
         for segment, key in zip(segments, leaf):
-            if segment == "*" and not (isinstance(node, dict) and key in node):
+            if segment == "*" and not any_agent and not (isinstance(node, dict) and key in node):
                 raise LayerError(where, f"no agent `{key}` in the pack")
             node = node.get(key) if isinstance(node, dict) else None
 
@@ -305,6 +332,8 @@ def workspace_settings(block: object) -> WorkspaceSettings:
         for entry in value:
             if not isinstance(entry, str) or not entry:
                 raise LayerError(where, "every entry is non-empty text")
+            if not entry.isprintable():
+                raise LayerError(where, f"{entry!r} holds a control character")
             if (key != "exclude" or "/" in entry or entry.startswith("~")) and not _path_shaped(entry):
                 raise LayerError(where, f"{entry!r} must be an absolute path or start with ~/ (never `~user` or relative)")
         lists[key] = tuple(value)
@@ -320,15 +349,20 @@ def load_user_settings() -> UserSettings:
     stack = base_layers(None)
     merged, _ = merge(stack)
     path: Path | None = None
+    found = False
     try:
         candidate = user_config_path()
-        found = candidate.exists()
-    except (RuntimeError, OSError):  # no home directory, or a parent that cannot be read: there is no user file
-        found = False
+    except RuntimeError:  # no home directory to look in: there is no user file
+        pass
+    else:
+        try:
+            found = candidate.exists()
+        except OSError as exc:  # an unreadable parent directory: say which file
+            raise LayerError(str(candidate), f"cannot read the user config file: {exc}") from exc
     if found:
         path = candidate
-        data = _read_user(path)
-        check_user(data, merged, path)
+        data = _read(path, "user config", empty_ok=True)
+        check_user(data, merged, path, any_agent=True)
         merged, _ = merge([*stack, Layer("user", data, path)])
     try:
         workspace = workspace_settings(merged.get("workspace"))
@@ -336,16 +370,3 @@ def load_user_settings() -> UserSettings:
         raise LayerError(f"{path}: {exc.path}" if path else exc.path, exc.message) from exc
     dashboard = merged.get("dashboard")
     return UserSettings(workspace, copy.deepcopy(dashboard) if isinstance(dashboard, dict) else {}, path)
-
-
-def _read_user(path: Path) -> dict:
-    """The user file's data; an empty file is `{}`, and anything unreadable or not a mapping is a `LayerError`."""
-    try:
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
-        raise LayerError(str(path), f"cannot read the user config file: {exc}") from exc
-    if loaded is None:
-        return {}
-    if not isinstance(loaded, dict):
-        raise LayerError(str(path), "a user config file is a mapping of personal settings")
-    return loaded

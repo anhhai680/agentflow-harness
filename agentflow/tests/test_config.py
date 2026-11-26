@@ -41,6 +41,19 @@ def test_a_pack_that_sets_workspace_gets_a_warning_and_a_user_value_does_not(tmp
     assert [i for i in issues_for(tmp_cfg, {}) if i.path.startswith("workspace")] == []
 
 
+def test_the_workspace_warning_survives_a_missing_home_directory(tmp_cfg, monkeypatch):
+    path = tmp_cfg({"workspace": {"roots": ["/x"]}})
+    cfg = load_config(path)
+
+    def nohome():
+        raise RuntimeError("no home")
+
+    monkeypatch.setattr(layers, "user_config_path", nohome)
+    found = validate(cfg, path.parent.parent)
+    warning = next(i for i in found if i.path == "workspace.roots")
+    assert warning.level == "warning" and "your user config file" in warning.message
+
+
 def test_a_malformed_workspace_block_is_an_error(tmp_cfg):
     found = issues_for(tmp_cfg, {"workspace": {"roots": ["rel"]}})
     assert errors(found) == [("error", "workspace.roots")]
