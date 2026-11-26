@@ -1138,6 +1138,7 @@ def build_parser() -> argparse.ArgumentParser:
     from agentflow.config import ROUTE_PROFILES
 
     parser = argparse.ArgumentParser(prog="agentflow", description="Run the repo's agent workflow, from idea to ship.")
+    parser.add_argument("-C", dest="chdir", metavar="PATH", help="run as if started in PATH (like `git -C`)")
     sub = parser.add_subparsers(dest="command", required=True)
     ini = sub.add_parser("init", help="write a sparse pack for this repository from what it holds (base branch, "
                                       "starter, gates, docs); runs no gate unless you pass --baseline")
@@ -1150,6 +1151,8 @@ def build_parser() -> argparse.ArgumentParser:
     doc = sub.add_parser("doctor", help="check this machine can run the pack: agent CLIs and logins, gh, the remote, "
                                         "Docker, the state dir and each gate's programs")
     doc.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+    doc.add_argument("--all", action="store_true",
+                     help="run once for every repository of your workspace (`workspace.roots` in your user config)")
     doc.set_defaults(func=cmd_doctor)
 
     check = sub.add_parser("validate", help="check config.yaml: skills, prompts, conditions, references")
@@ -1172,14 +1175,20 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("run", nargs="?", help="a run id (or a part of it that matches one run)")
     status.add_argument("--watch", action="store_true", help="a live board in the terminal (Ctrl-C ends it)")
     status.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+    status.add_argument("--all", action="store_true",
+                        help="run once for every repository of your workspace (`workspace.roots` in your user config)")
     status.set_defaults(func=cmd_status)
 
     agents = sub.add_parser("agents", help="every agent process running now, across runs")
     agents.add_argument("--watch", action="store_true", help="refresh on every new event (Ctrl-C ends it)")
     agents.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+    agents.add_argument("--all", action="store_true",
+                        help="run once for every repository of your workspace (`workspace.roots` in your user config)")
     agents.set_defaults(func=cmd_agents)
 
     inbox = sub.add_parser("inbox", help="every run waiting on a human, with its questions")
+    inbox.add_argument("--all", action="store_true",
+                       help="run once for every repository of your workspace (`workspace.roots` in your user config)")
     inbox.set_defaults(func=cmd_inbox)
 
     ans = sub.add_parser("answer", help="answer the questions a run is waiting on")
@@ -1255,6 +1264,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     nxt = sub.add_parser("next", help="the lane, stage and next skill for the repo as it stands now")
     nxt.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+    nxt.add_argument("--all", action="store_true",
+                     help="run once for every repository of your workspace (`workspace.roots` in your user config)")
     nxt.set_defaults(func=cmd_next)
 
     blg = sub.add_parser("backlog", help="the Backlog: mark a module finished by hand, or list and edit backlog.yml")
@@ -1378,11 +1389,104 @@ def build_parser() -> argparse.ArgumentParser:
     das.add_argument("--port", type=int, help="the port (default: dashboard.port; 0 picks a free one)")
     das.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
     das.set_defaults(func=cmd_dashboard)
+
+    wks = sub.add_parser("workspace", help="the repositories of your workspace (`workspace` in your user config)")
+    wks_sub = wks.add_subparsers(dest="workspace_command", required=True)
+    wks_list = wks_sub.add_parser("list", help="the roots, each repository found there and what was skipped")
+    wks_list.add_argument("--json", action="store_true", help="print the repositories and the skipped entries as JSON")
+    wks_list.set_defaults(func=cmd_workspace_list)
     return parser
+
+
+def _workspace_or_error():
+    """The user's `RepoSet`, or None after printing why there is none."""
+    from agentflow import layers, repo_set
+
+    try:
+        return repo_set.from_user_config()
+    except (repo_set.NoWorkspace, layers.LayerError) as exc:
+        print(f"error: {exc}")
+        return None
+
+
+def _run_all(args: argparse.Namespace) -> int:
+    """`--all`: the command's own function, once in each live repository of the workspace. It is not a refactor of
+    any command: the working directory is the repository, and a command that fails prints its own error and counts
+    toward the exit code without stopping the others."""
+    from agentflow.doctor import printable
+
+    for given, why in ((args.chdir, "-C: it runs in each repository of your workspace"),
+                       (getattr(args, "config", None), "--config: each repository uses its own pack"),
+                       (getattr(args, "watch", False), "--watch: a live view shows one repository"),
+                       (getattr(args, "run", None), "a run id: a run belongs to one repository")):
+        if given:
+            print(f"error: --all cannot be combined with {why}")
+            return 1
+    found = _workspace_or_error()
+    if found is None:
+        return 1
+    start = Path.cwd()
+    failed = False
+    for n, repo in enumerate(found.repos):
+        if n:
+            print()
+        print(f"== {printable(repo.name)} (-C {printable(repo.path)}) ==")
+        if repo.state != "live":
+            print("not set up: no .agentflow/config.yaml here (run agentflow init in it)")
+            continue
+        try:
+            os.chdir(repo.path)
+            if args.func(argparse.Namespace(**{**vars(args), "all": False})):
+                failed = True
+        except Exception as exc:  # one repository's failure is one line, never the end of the others
+            print(f"error: {printable(repo.name)}: {type(exc).__name__}: {printable(exc)}")
+            failed = True
+        finally:
+            os.chdir(start)
+    if found.skipped:
+        print()
+    for skip in found.skipped:
+        print(f"skipped {printable(skip.entry)}: {printable(skip.reason)}")
+    return 1 if failed else 0
+
+
+def cmd_workspace_list(args: argparse.Namespace) -> int:
+    """The roots, every repository found (live, or not set up) and each entry that was skipped."""
+    from agentflow.doctor import printable
+
+    found = _workspace_or_error()
+    if found is None:
+        return 1
+    if args.json:
+        print(json.dumps({
+            "repos": [{"id": r.id, "name": r.name, "path": str(r.path), "state": r.state} for r in found.repos],
+            "skipped": [{"entry": s.entry, "reason": s.reason} for s in found.skipped],
+        }, ensure_ascii=False, indent=2))
+        return 0
+    for label, entries in (("roots", found.settings.roots), ("repos", found.settings.repos),
+                           ("exclude", found.settings.exclude)):
+        if entries:
+            print(f"{label}:")
+            for entry in entries:
+                print(f"  {printable(entry)}")
+    rows = [[printable(r.name), "live" if r.state == "live" else "not set up", printable(r.path)] for r in found.repos]
+    if rows:
+        print("\n".join(_table(rows)))
+    for skip in found.skipped:
+        print(f"skipped {printable(skip.entry)}: {printable(skip.reason)}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if getattr(args, "all", False):
+        return _run_all(args)
+    if args.chdir:
+        try:
+            os.chdir(args.chdir)
+        except OSError as exc:
+            print(f"error: -C {args.chdir}: {exc.strerror or exc}")
+            return 1
     try:
         return args.func(args)
     except Exception as exc:  # anything the commands do not turn into a message themselves
