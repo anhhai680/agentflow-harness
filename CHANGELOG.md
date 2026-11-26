@@ -7,6 +7,9 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Changed
+- `workspace list` and `--all` now report a root's child that git refuses, whose main checkout is outside the root, or whose path is not valid UTF-8, instead of dropping it silently.
+
 ## [3.14] - 2026-11-26
 
 ### Fixed
