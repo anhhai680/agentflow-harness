@@ -796,3 +796,39 @@ def test_the_baseline_names_its_log_folder_when_a_gate_fails_or_errs(toy_repo):
     code, out = run_init(toy_repo, baseline=True)
     assert code == 0, out
     assert f"logs: {pack.state_dir(toy_repo) / 'baseline-logs'}" in out
+
+
+def _workspace_file(workspace: dict) -> Path:
+    path = layers.user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump({"workspace": workspace}), encoding="utf-8")
+    return path
+
+
+def test_init_notes_a_repository_outside_the_workspace(toy_repo, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "other").mkdir(parents=True)
+    run_git(elsewhere / "other", "init", "-q", "-b", "main")
+    path = _workspace_file({"roots": [str(elsewhere)]})
+    code, output = run_init(toy_repo)
+    assert code == 0
+    notes = [line for line in output.splitlines() if line.startswith("note:")]
+    assert len(notes) == 1
+    assert "workspace.roots" in notes[0] and str(path) in notes[0]
+    assert output.rstrip("\n").endswith(notes[0])
+
+
+def test_init_has_no_workspace_note_inside_the_workspace_or_without_one(toy_repo, tmp_path):
+    _, plain = run_init(toy_repo)
+    assert "workspace" not in plain.split("next steps:")[1]
+    (toy_repo / ".agentflow" / "config.yaml").unlink()
+    _workspace_file({"roots": [str(toy_repo.parent)]})
+    _, inside = run_init(toy_repo)
+    assert "note: this repository is not in your workspace" not in inside
+
+
+def test_init_has_no_workspace_note_when_the_user_file_does_not_load(toy_repo):
+    _workspace_file({"roots": "not a list"})
+    code, output = run_init(toy_repo)
+    assert code == 0
+    assert "not in your workspace" not in output

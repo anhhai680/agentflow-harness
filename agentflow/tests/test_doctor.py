@@ -9,9 +9,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from agentflow import keepawake
-from agentflow import doctor, flow
+from agentflow import doctor, flow, layers
 from agentflow.config import load_config
 from agentflow.doctor import Check, gate_programs, render, run_checks
 
@@ -603,3 +604,58 @@ def test_claude_config_dir_follows_the_environment(monkeypatch, tmp_path):
     assert doctor.claude_config_dir() == tmp_path / "c"
     monkeypatch.delenv("CLAUDE_CONFIG_DIR")
     assert doctor.claude_config_dir() == Path.home() / ".claude"
+
+
+def _workspace_file(workspace) -> Path:
+    path = layers.user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump({"workspace": workspace}), encoding="utf-8")
+    return path
+
+
+def _workspace_repo(parent: Path, name: str, with_pack: bool = True) -> Path:
+    path = parent / name
+    path.mkdir(parents=True)
+    _git(path, "init", "-q", "-b", "main")
+    if with_pack:
+        (path / ".agentflow").mkdir()
+        (path / ".agentflow" / "config.yaml").write_text("version: 1\n", encoding="utf-8")
+    return path
+
+
+def test_doctor_has_no_workspace_check_without_a_workspace(tmp_cfg, repo):
+    assert "workspace" not in _checks(tmp_cfg, repo)
+
+
+def test_doctor_workspace_check_is_ok_when_every_repository_is_live(tmp_cfg, repo, tmp_path):
+    root = tmp_path / "ws"
+    _workspace_repo(root, "a")
+    _workspace_repo(root, "b")
+    _workspace_file({"roots": [str(root)]})
+    check = _checks(tmp_cfg, repo)["workspace"]
+    assert check.status == "ok"
+    assert "2 repositories" in check.detail
+
+
+def test_doctor_workspace_check_warns_on_a_skipped_entry_or_a_repository_not_set_up(tmp_cfg, repo, tmp_path):
+    root = tmp_path / "ws"
+    _workspace_repo(root, "a")
+    _workspace_repo(root, "bare", with_pack=False)
+    _workspace_repo(root, "odd\nname", with_pack=False)
+    missing = tmp_path / "missing"
+    path = _workspace_file({"roots": [str(root)], "repos": [str(missing)]})
+    check = _checks(tmp_cfg, repo)["workspace"]
+    assert check.status == "warn"
+    assert f"{missing}: is not a git checkout" in check.detail
+    assert "bare" in check.detail
+    assert "odd\\nname" in check.detail and "\n" not in check.detail
+    assert f"edit workspace.* in {path}" in check.fix
+    assert "agentflow init" in check.fix
+
+
+def test_doctor_workspace_check_warns_when_the_user_file_does_not_load(tmp_cfg, repo):
+    path = _workspace_file({"roots": "not a list"})
+    check = _checks(tmp_cfg, repo)["workspace"]
+    assert check.status == "warn"
+    assert "workspace" in check.detail
+    assert str(path) in check.detail
