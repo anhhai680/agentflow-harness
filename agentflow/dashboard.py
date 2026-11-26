@@ -67,6 +67,12 @@ Routes:
   than it was loaded with, answers 409 with the reason, on the legacy routes and under its prefix alike.
   `/api/info` (and `/api/repos/<id>/info`) answers from the user settings when there is no config.
 
+In the background, `serve` (one repository) and `serve_workspace` (the user's workspace) send due reminders, recheck
+environment stops and refresh Backlog in each usable repository in turn, one at a time, every minute; a failure in one
+is logged with its name (when there are several) and never stops another's. A workspace dashboard also rescans every
+`RESCAN_EVERY_S` (`DashboardServer.rescan`): it reads the user file again and publishes the next snapshot in one
+assignment. Interrupted card starts are settled once, at start-up, in the repositories usable then.
+
 It can approve checkpoints and start agents, so it is locked down:
 - it binds `127.0.0.1` only, and every request but the data-free shell needs the random token printed at
   start (the `X-Agentflow-Token` header, or `?token=`, which the event stream uses because `EventSource`
@@ -97,7 +103,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -116,6 +122,7 @@ from agentflow import (
     pack,
     preflight,
     repo_context,
+    repo_set,
 )
 from agentflow.artifacts import (
     SHA,
@@ -176,6 +183,7 @@ SSE_PING_S = 15.0
 QUIET_EVERY_S = 2.0  # the least gap between two `agent_activity` messages of one session on a quiet stream
 QUIET_FORGET_S = 300.0  # a session's last send is forgotten after this long, so a long stream keeps no history
 REMIND_EVERY_S = 60.0
+RESCAN_EVERY_S = 60.0  # how often a workspace dashboard reads the user file again and rescans its repositories
 BY = "dashboard"
 API_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 PAGE_CSP = ("default-src 'none'; script-src 'nonce-{n}'; style-src 'nonce-{n}'; connect-src 'self'; img-src data:; "
@@ -444,6 +452,9 @@ class DashboardServer(ThreadingHTTPServer):
         self.prefer = prefer
         self.workspace = workspace  # serving the user's workspace, not the one repository it was started in
         self.snap = Snapshot(repos, choose_default(repos, prefer, None), tuple(skipped), user, user_error)
+        # held by `rescan` from reading `snap` to publishing the next one, and by a Settings save's reload-and-store,
+        # so neither is lost to the other; never taken by a request for anything else
+        self._scan_lock = threading.Lock()
         self.token = token
         self.spawn = spawn
         self.spawn_run = spawn_run or module_queue.spawn_run
@@ -508,6 +519,29 @@ class DashboardServer(ThreadingHTTPServer):
         ctx = self.default_context()
         return ctx.config if ctx is not None else None
 
+    def rescan(self) -> None:
+        """Read the user file again, resolve its workspace and publish the next snapshot in one assignment: a live
+        context that is still usable is kept by identity, the others are loaded again, and the default stays put
+        (`choose_default`). An unusable user file keeps the map and reports the file (`user_error`); anything else
+        that goes wrong keeps the old snapshot and is logged. A single-repository server never rescans. Never
+        raises."""
+        if not self.workspace:
+            return
+        with self._scan_lock:
+            try:
+                snap = self.snap
+                try:
+                    settings = layers.load_user_settings()
+                except layers.LayerError as exc:
+                    self.snap = replace(snap, user_error=" ".join(str(exc).split())[:repo_context.ERROR_MAX])
+                    return
+                found = repo_set.resolve(settings.workspace)
+                repos = repo_context.reconcile(snap.repos, found)
+                self.snap = Snapshot(repos, choose_default(repos, self.prefer, snap.default), found.skipped,
+                                     settings, None)
+            except Exception as exc:
+                sys.stderr.write(f"dashboard: rescan failed: {doctor.printable(exc)}\n")
+
     def close(self) -> None:
         """Stop serving (from another thread than `serve_forever`) and end open event streams."""
         self.stopping.set()
@@ -545,44 +579,62 @@ def make_workspace_server(contexts: list[RepoContext], user: layers.UserSettings
                            prefer=prefer, user_error=user_error, skipped=tuple(skipped), workspace=True)
 
 
-def _usable_default(server: DashboardServer) -> RepoContext | None:
-    ctx = server.default_context()
-    return ctx if ctx is not None and usable(ctx) else None
+def _label(snap: Snapshot, ctx: RepoContext) -> str:
+    """What starts a background line about `ctx`: its name, printable, when `snap` holds several repositories, and
+    nothing when it holds one, so a single-repository terminal reads as before."""
+    return f"{doctor.printable(ctx.name)}: " if len(snap.repos) > 1 else ""
+
+
+def _say(snap: Snapshot, ctx: RepoContext, text: str) -> None:
+    sys.stderr.write(f"dashboard: {_label(snap, ctx)}{text}\n")
+
+
+def _remind(server: DashboardServer, snap: Snapshot, ctx: RepoContext) -> None:
+    """Due reminders and environment rechecks in `ctx`; a failure is logged with the repository's name."""
+    try:
+        hitl.remind_due(ctx.cfg, ctx.repo)
+    except Exception as exc:  # its files are untrusted input: one repository never stops the others
+        _say(snap, ctx, f"reminders failed: {doctor.printable(exc)}")
+    try:
+        preflight.recheck_waiting(ctx.cfg, ctx.repo, spawn=server.spawn,
+                                  log=lambda line: _say(snap, ctx, doctor.printable(line)))
+    except Exception as exc:
+        _say(snap, ctx, f"rechecks failed: {doctor.printable(exc)}")
+
+
+def remind_once(server: DashboardServer) -> None:
+    """One pass of the reminder loop over one snapshot: `_remind` in each usable repository in turn (checked just
+    before its turn), stopping between repositories once the server is stopping."""
+    snap = server.snap
+    for ctx in snap.repos.values():
+        if server.stopping.is_set():
+            return
+        if usable(ctx):
+            _remind(server, snap, ctx)
 
 
 def _remind_loop(server: DashboardServer) -> None:
     while not server.stopping.is_set():
-        ctx = _usable_default(server)
-        if ctx is not None:
-            try:
-                hitl.remind_due(ctx.cfg, ctx.repo)
-            except (OSError, ValueError, EventError) as exc:
-                sys.stderr.write(f"dashboard: reminders failed: {exc}\n")
-            preflight.recheck_waiting(ctx.cfg, ctx.repo, spawn=server.spawn,  # never raises
-                                      log=lambda line: sys.stderr.write(f"dashboard: {line}\n"))
+        remind_once(server)
         server.stopping.wait(REMIND_EVERY_S)
 
 
-def prepare(server: DashboardServer) -> list[str]:
-    """What runs once when the dashboard comes up: a start that was interrupted (the last dashboard died between
-    recording it and its outcome) becomes a failure for a person to check. It is never repeated."""
-    ctx = _usable_default(server)
-    if ctx is None:
+def prepare(server: DashboardServer, ctx: RepoContext | None = None) -> list[str]:
+    """What runs once when the dashboard comes up, for `ctx` (the default repository when None) while it is usable:
+    a start that was interrupted (the last dashboard died between recording it and its outcome) becomes a failure for
+    a person to check. It is never repeated, and never run for a repository that joins later. May raise."""
+    snap = server.snap
+    ctx = ctx if ctx is not None else server.default_context(snap)
+    if ctx is None or not usable(ctx):
         return []
     settled = backlog.settle_interrupted(ctx.repo)
     for item_id in settled:
-        sys.stderr.write(f"dashboard: card {item_id} was starting when the last dashboard stopped; "
-                         "it is marked failed (check before pressing Start again)\n")
+        _say(snap, ctx, f"card {doctor.printable(item_id)} was starting when the last dashboard stopped; "
+                        "it is marked failed (check before pressing Start again)")
     return settled
 
 
-def refresh_once(server: DashboardServer) -> None:
-    """One round of keeping Backlog current: base branch, map assessment, merge state, synced issues. It starts
-    nothing. A pack with no `dashboard.backlog` block only syncs its issues (when `issues.sync_label` is set) and its
-    Dependabot alerts (when `vuln.sync` is on)."""
-    ctx = _usable_default(server)
-    if ctx is None:
-        return
+def _refresh(snap: Snapshot, ctx: RepoContext) -> None:
     try:
         if module_queue.backlog_settings(ctx.cfg):
             backlog.refresh(ctx.cfg, ctx.repo)
@@ -591,25 +643,63 @@ def refresh_once(server: DashboardServer) -> None:
                 backlog.sync_issues(ctx.cfg, ctx.repo)
             if backlog._alerts_on(ctx.cfg):
                 backlog.sync_alerts(ctx.cfg, ctx.repo)
-    except Exception as exc:  # a failed round must not end the loop; the next one tries again
-        sys.stderr.write(f"dashboard: backlog refresh failed: {exc}\n")
+    except Exception as exc:  # a failed round must not end the loop or stop another repository; the next one tries again
+        _say(snap, ctx, f"backlog refresh failed: {doctor.printable(exc)}")
+
+
+def refresh_once(server: DashboardServer, ctx: RepoContext | None = None) -> None:
+    """One round of keeping Backlog current in `ctx` (the default repository when None) while it is usable: base
+    branch, map assessment, merge state, synced issues. It starts nothing. A pack with no `dashboard.backlog` block
+    only syncs its issues (when `issues.sync_label` is set) and its Dependabot alerts (when `vuln.sync` is on).
+    Never raises: a failure is logged."""
+    snap = server.snap
+    ctx = ctx if ctx is not None else server.default_context(snap)
+    if ctx is not None and usable(ctx):
+        _refresh(snap, ctx)
+
+
+def refresh_round(server: DashboardServer) -> None:
+    """One pass of the refresh loop over one snapshot: each usable repository in turn, one at a time (checked just
+    before its turn), stopping between repositories once the server is stopping."""
+    snap = server.snap
+    for ctx in snap.repos.values():
+        if server.stopping.is_set():
+            return
+        if usable(ctx):
+            _refresh(snap, ctx)
 
 
 def _refresh_loop(server: DashboardServer) -> None:
     while not server.stopping.is_set():
-        refresh_once(server)
+        refresh_round(server)
         server.stopping.wait(REFRESH_EVERY_S)
 
 
-def serve(repo: Path, cfg: Config, host: str, port: int, token: str,
-          announce: Callable[[str], object] = print, config: Path | None = None) -> None:
-    """Serve the dashboard until Ctrl-C, sending due reminders and refreshing Backlog every minute."""
-    server = make_server(repo, cfg, host, port, token, config=config)
-    prepare(server)
-    announce(f"agentflow dashboard: {dashboard_url(server.server_address[1], token)}\n"
+def _rescan_loop(server: DashboardServer) -> None:
+    """A workspace dashboard's rescan, every `RESCAN_EVERY_S`; a pass that raises costs that pass only."""
+    while not server.stopping.wait(RESCAN_EVERY_S):
+        try:
+            server.rescan()
+        except Exception as exc:  # `rescan` never raises; this keeps the thread alive if it ever does
+            sys.stderr.write(f"dashboard: rescan failed: {doctor.printable(exc)}\n")
+
+
+def _bring_up(server: DashboardServer, announce: Callable[[str], object], covers: str = "") -> None:
+    """Bring `server` up and serve until Ctrl-C: settle the interrupted starts of every repository usable now
+    (`prepare`, each on its own), print the URL (with `covers` after it, when given), start the reminder and refresh
+    loops (and, for a workspace, the rescan loop), and serve."""
+    snap = server.snap
+    for ctx in server.live_contexts(snap):
+        try:
+            prepare(server, ctx)
+        except Exception as exc:  # its files are untrusted input: the dashboard still comes up
+            _say(snap, ctx, f"prepare failed: {doctor.printable(exc)}")
+    announce(f"agentflow dashboard: {dashboard_url(server.server_address[1], server.token)}\n{covers}"
              "Keep this URL private: the token lets anyone with it approve checkpoints. Ctrl-C stops the server.")
     threading.Thread(target=_remind_loop, args=(server,), daemon=True).start()
     threading.Thread(target=_refresh_loop, args=(server,), daemon=True).start()  # a Settings save may turn sync on
+    if server.workspace:
+        threading.Thread(target=_rescan_loop, args=(server,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -617,6 +707,29 @@ def serve(repo: Path, cfg: Config, host: str, port: int, token: str,
     finally:
         server.stopping.set()
         server.server_close()
+
+
+def serve(repo: Path, cfg: Config, host: str, port: int, token: str,
+          announce: Callable[[str], object] = print, config: Path | None = None) -> None:
+    """Serve the one repository `repo` until Ctrl-C, sending due reminders and refreshing Backlog every minute."""
+    _bring_up(make_server(repo, cfg, host, port, token, config=config), announce)
+
+
+def serve_workspace(contexts: list[RepoContext], user: layers.UserSettings, host: str, port: int, token: str, *,
+                    prefer: str | None = None, user_error: str | None = None, skipped: tuple[Skipped, ...] = (),
+                    announce: Callable[[str], object] = print) -> None:
+    """Serve every repository of the workspace until Ctrl-C: reminders and Backlog refreshes in each usable one, and
+    a rescan every `RESCAN_EVERY_S`."""
+    server = make_workspace_server(contexts, user, host, port, token, prefer=prefer, user_error=user_error,
+                                   skipped=skipped)
+    snap = server.snap
+    count = len(snap.repos)
+    shown = server.default_context(snap)
+    page = (f"the page shows {doctor.printable(shown.name)}" if shown is not None
+            else "the page shows none of them until one is set up")
+    covers = (f"It covers {count} {'repository' if count == 1 else 'repositories'} of your workspace; {page}. "
+              "The token reaches all of them.\n")
+    _bring_up(server, announce, covers)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1055,16 +1168,23 @@ class _Handler(BaseHTTPRequestHandler):
         except config_edit.EditError as exc:
             self._error(400, str(exc))
             return
-        try:
-            reloaded = load_config(config_path)
-        except ConfigError as exc:  # validated a moment ago; only a concurrent editor gets here
-            self._error(500, f"saved, but the dashboard could not reload it: {exc}")
+        # The reload and the store hold the rescan's lock, so a rescan publishes either before the store (which then
+        # lands on the context it published) or after it (and was built from contexts that already hold it).
+        with self.server._scan_lock:
+            try:
+                reloaded = load_config(config_path)
+            except ConfigError as exc:  # validated a moment ago; only a concurrent editor gets here
+                reloaded, failure = None, exc
+            else:
+                # on the context the server holds for this repository now, when it is still live: a rescan may have
+                # replaced the request's one
+                ctx.cfg = reloaded
+                current = self.server.snap.repos.get(ctx.id)
+                if current is not None and current is not ctx and current.state == "live":
+                    current.cfg = reloaded
+        if reloaded is None:
+            self._error(500, f"saved, but the dashboard could not reload it: {failure}")
             return
-        # on the context the server holds for this repository now: a rescan may have replaced the request's one
-        ctx.cfg = reloaded
-        current = self.server.snap.repos.get(ctx.id)
-        if current is not None and current is not ctx:
-            current.cfg = reloaded
         self.log_message("config.yaml saved from the Settings page (sha256 %s)", digest[:12])
         self._json(200, {**proposal.as_dict(), "ok": True, "saved": proposal.changed, "sha256": digest})
 
