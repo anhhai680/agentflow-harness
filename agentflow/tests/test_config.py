@@ -25,6 +25,38 @@ def errors(issues: list[Issue]) -> list[tuple[str, str]]:
     return [(i.level, i.path) for i in issues if i.level == "error"]
 
 
+def _write_user_file(data: dict) -> Path:
+    target = layers.user_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return target
+
+
+def test_a_pack_that_sets_workspace_gets_a_warning_and_a_user_value_does_not(tmp_cfg):
+    found = issues_for(tmp_cfg, {"workspace": {"roots": ["/x"]}})
+    assert [(i.level, i.path) for i in found if i.path.startswith("workspace")] == [("warning", "workspace.roots")]
+    assert "user config" in next(i for i in found if i.path == "workspace.roots").message
+    assert errors(found) == []
+    _write_user_file({"workspace": {"roots": ["/x"]}})
+    assert [i for i in issues_for(tmp_cfg, {}) if i.path.startswith("workspace")] == []
+
+
+def test_a_malformed_workspace_block_is_an_error(tmp_cfg):
+    found = issues_for(tmp_cfg, {"workspace": {"roots": ["rel"]}})
+    assert errors(found) == [("error", "workspace.roots")]
+
+
+def test_user_dashboard_keys_are_still_range_checked(tmp_cfg):
+    _write_user_file({"dashboard": {"board_refresh_s": 0.1}})
+    assert ("error", "dashboard.board_refresh_s") in errors(issues_for(tmp_cfg, {}))
+
+
+def test_load_config_accepts_the_workspace_key_from_the_user_file(tmp_cfg):
+    _write_user_file({"workspace": {"roots": ["/x"]}})
+    path = tmp_cfg({})
+    assert load_config(path).merged["workspace"]["roots"] == ["/x"]
+
+
 def phase_step(data: dict, phase: str, step_id: str) -> dict:
     return next(s for s in data["phases"][phase]["steps"] if s["id"] == step_id)
 

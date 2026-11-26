@@ -3502,6 +3502,20 @@ class _Validator:
         if "backlog" in self.cfg.dashboard:
             self.backlog(self.cfg.dashboard["backlog"])
 
+    def workspace(self) -> None:
+        """`workspace`: personal lists of repositories. The shape is checked wherever the block came from; a pack
+        that sets one gets a warning, because only the user file is read for it."""
+        try:
+            layers.workspace_settings(self.cfg.merged.get("workspace"))
+        except layers.LayerError as exc:
+            self.error(exc.path, exc.message)
+        for key in layers.WORKSPACE_KEYS:
+            path = f"workspace.{key}"
+            origin = layers.origin_of(self.cfg.layer_origins, path)
+            if origin is not None and (origin == "project" or origin.startswith("starter")):
+                self.add("warning", path, "is a personal setting and is ignored in a pack; set it in your user "
+                         f"config ({layers.user_config_path()})")
+
     def backlog(self, block: Any) -> None:
         """`dashboard.backlog`: which lane runs a map module, each lane's New task fields, a new module's row."""
         path = "dashboard.backlog"
@@ -3685,6 +3699,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.route()
     v.overlays()
     v.dashboard()
+    v.workspace()
     v.templates()
     v.brief_overrides()
     v.prompt_drift()
