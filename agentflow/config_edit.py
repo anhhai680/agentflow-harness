@@ -280,11 +280,11 @@ _RANK = {"engine": 0, "project": 2, "user": 3}  # a starter (`starter:<name>`) s
 def _layers(path: Path, text: str) -> _Layers:
     """The layered view of the pack at `path`, whose text is `text`. A user file the pack refuses is left out; a
     pack that does not load at all falls back to the file alone, as the form was before the layers."""
-    project = yaml.safe_load(text) or {}
+    try:  # every walk below copies each alias out: refuse an unbounded file before any of them
+        project = layers.parse_config(text) or {}
+    except layers.ConfigRefused as refused:
+        raise EditError(f"{path.name} {refused}; fix it in git") from refused
     project = project if isinstance(project, dict) else {}
-    problem = layers.expansion_problem(project)  # every walk below copies each alias out: refuse an unbounded file
-    if problem:
-        raise EditError(f"{path.name} {problem}; fix it in git")
     comments = _comments(text)
     try:
         cfg = load_config(path)
@@ -545,15 +545,14 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
     break for a teammate and for CI. When no pair loads (the file on disk loads neither way, or only the way the
     new text does not), the protected settings are held as written: a broken file can be repaired here, but not
     by changing a protected setting."""
-    try:
-        parsed = yaml.safe_load(new_text)
+    try:  # refused before any load or comparison: each one copies every alias out
+        parsed = layers.parse_config(new_text)
+    except layers.ConfigRefused as refused:
+        return [Issue("error", "", f"config.yaml {refused}")]
     except yaml.YAMLError as exc:
         return [Issue("error", "", f"not valid YAML: {exc}")]
     if not isinstance(parsed, dict):
         return [Issue("error", "", "the file must hold a mapping at the top level")]
-    problem = layers.expansion_problem(parsed)  # before any load or comparison: each one copies every alias out
-    if problem:
-        return [Issue("error", "", f"config.yaml {problem}")]
     fd, temp = tempfile.mkstemp(prefix=".config-check-", suffix=".yaml", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -601,8 +600,9 @@ def _written_changes(path: Path, parsed: dict) -> list[str]:
     """The protected settings `parsed` changes compared with the file on disk, both as written (no layers, no
     `@` resolution)."""
     try:
-        old = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
+        text = layers.read_config_text(path)
+        old = layers.parse_config(text) if text is not None else None
+    except (OSError, yaml.YAMLError, RecursionError, ValueError):  # unreadable, refused or not YAML: nothing to hold
         return []
     return _protected_changes(old if isinstance(old, dict) else {}, parsed)
 

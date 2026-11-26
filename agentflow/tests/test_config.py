@@ -3514,3 +3514,18 @@ def test_load_config_refuses_a_pack_over_the_byte_cap(tmp_cfg):
     with pytest.raises(ConfigError) as err:
         load_config(path)
     assert str(path) in str(err.value) and f"larger than {layers.MAX_CONFIG_BYTES} bytes" in str(err.value)
+
+
+def test_load_config_refuses_a_merge_key_chain_quickly(tmp_cfg):
+    import time
+
+    from test_layers import merge_chain
+
+    path = tmp_cfg()
+    base = path.read_text(encoding="utf-8")
+    path.write_text(base + merge_chain(layers.MAX_CONFIG_BYTES - len(base.encode("utf-8"))), encoding="utf-8")
+    started = time.monotonic()
+    with pytest.raises(ConfigError) as err:
+        load_config(path)
+    assert time.monotonic() - started < 2
+    assert str(path) in str(err.value) and "merge keys" in str(err.value)

@@ -101,8 +101,8 @@ MAX_EXPANDED_NODES = 100_000  # a file whose aliases expand past this many value
 MAX_CONFIG_BYTES = 128 * 1024  # a config file longer than this is not parsed (the shipped ones are under 32 KiB)
 
 
-class _Refused(ValueError):
-    """A value `expansion_problem` refuses; its text completes "<file> …"."""
+class ConfigRefused(ValueError):
+    """A config file `parse_config` refuses; its text completes a sentence that starts with the file's name."""
 
 
 def _measure(node: Any, depth: int, memo: dict[int, tuple[int, int]], open_: set[int]) -> tuple[int, int]:
@@ -115,10 +115,10 @@ def _measure(node: Any, depth: int, memo: dict[int, tuple[int, int]], open_: set
         return 1, 0
     key = id(node)
     if key in open_:
-        raise _Refused("holds a YAML anchor that refers to itself")
+        raise ConfigRefused("holds a YAML anchor that refers to itself")
     if key not in memo:
         if depth > MAX_DEPTH:
-            raise _Refused(f"is nested more than {MAX_DEPTH} levels deep")
+            raise ConfigRefused(f"is nested more than {MAX_DEPTH} levels deep")
         open_.add(key)
         size, height = 1, 0
         for child in node.values() if isinstance(node, dict) else node:
@@ -129,7 +129,7 @@ def _measure(node: Any, depth: int, memo: dict[int, tuple[int, int]], open_: set
         memo[key] = (size, height)
     size, height = memo[key]
     if depth + height > MAX_DEPTH:
-        raise _Refused(f"is nested more than {MAX_DEPTH} levels deep")
+        raise ConfigRefused(f"is nested more than {MAX_DEPTH} levels deep")
     return size, height
 
 
@@ -147,16 +147,92 @@ def expansion_problem(node: Any) -> str | None:
     this is checked on each config file right after it is parsed."""
     try:
         size, _ = _measure(node, 0, {}, set())
-    except _Refused as refused:
+    except ConfigRefused as refused:
         return str(refused)
     if size > MAX_EXPANDED_NODES:
         return f"expands to more than {MAX_EXPANDED_NODES} values (nested aliases)"
     return None
 
 
+_MERGE_TAG = "tag:yaml.org,2002:merge"
+
+
+def _merged_entries(root: yaml.Node) -> int:
+    """An upper bound on the mapping entries PyYAML's constructor builds for the composed document `root`: each
+    mapping's own entries plus, for each `<<` merge key, the entries of every mapping it merges (after their own
+    merges, counted again for each use), summed over every mapping node once. One pass over the node graph, with no
+    recursion; the count stops just past `MAX_EXPANDED_NODES`. A merge that reaches its own mapping is refused."""
+    cap = MAX_EXPANDED_NODES + 1
+    mappings: list[yaml.MappingNode] = []
+    seen: set[int] = set()
+    stack: list[yaml.Node] = [root]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, yaml.MappingNode):
+            mappings.append(node)
+            for key, value in node.value:
+                stack.extend((key, value))
+        elif isinstance(node, yaml.SequenceNode):
+            stack.extend(node.value)
+
+    def sources(node: yaml.MappingNode) -> list[yaml.MappingNode]:
+        found = []
+        for key, value in node.value:
+            if key.tag == _MERGE_TAG:
+                merged = value.value if isinstance(value, yaml.SequenceNode) else [value]
+                found.extend(source for source in merged if isinstance(source, yaml.MappingNode))
+        return found
+
+    sizes: dict[int, int] = {}
+    total = 0
+    for start in mappings:
+        work: list[tuple[yaml.MappingNode, bool]] = [(start, False)]
+        open_: set[int] = set()
+        while work:
+            node, finished = work.pop()
+            key = id(node)
+            if key in sizes:
+                continue
+            if finished:
+                own = sum(1 for k, _ in node.value if k.tag != _MERGE_TAG)
+                sizes[key] = min(cap, own + sum(sizes[id(source)] for source in sources(node)))
+                open_.discard(key)
+                continue
+            if key in open_:  # popped again before it finished: a merge it holds leads back to it
+                raise ConfigRefused("holds a YAML merge key (<<) that merges itself")
+            open_.add(key)
+            work.append((node, True))
+            work.extend((source, False) for source in sources(node) if id(source) not in sizes)
+        total = min(cap, total + sizes[id(start)])
+    return total
+
+
+def parse_config(text: str) -> Any:
+    """`text` parsed as one YAML document, for a config file. It is composed first (one pass) and refused with
+    `ConfigRefused` before it is built when its merge keys would build more than `MAX_EXPANDED_NODES` entries (a
+    chain of `<<` costs the square of its length to build), and after it is built when it has an
+    `expansion_problem`. Raises `yaml.YAMLError` for text that is not YAML."""
+    loader = yaml.SafeLoader(text)
+    try:
+        node = loader.get_single_node()
+        if node is None:
+            return None
+        if _merged_entries(node) > MAX_EXPANDED_NODES:
+            raise ConfigRefused(f"expands to more than {MAX_EXPANDED_NODES} values (merge keys)")
+        data = loader.construct_document(node)
+    finally:
+        loader.dispose()
+    problem = expansion_problem(data)
+    if problem:
+        raise ConfigRefused(problem)
+    return data
+
+
 def read_config_text(path: Path) -> str | None:
-    """The text of the config file at `path`, or None when it is longer than `MAX_CONFIG_BYTES` (it is never parsed:
-    a chain of YAML merge keys costs the square of its length to parse). Raises `OSError` as opening it does and
+    """The text of the config file at `path`, or None when it is longer than `MAX_CONFIG_BYTES` (it is never parsed). Raises `OSError` as opening it does and
     `UnicodeDecodeError` for text that is not UTF-8."""
     with path.open("rb") as handle:
         data = handle.read(MAX_CONFIG_BYTES + 1)
@@ -167,22 +243,21 @@ def read_config_text(path: Path) -> str | None:
 
 def _read(path: Path, what: str = "layer", *, empty_ok: bool = False) -> dict:
     """A layer file's mapping. A file that cannot be read, is longer than `MAX_CONFIG_BYTES`, is not UTF-8 text or
-    not YAML, has an `expansion_problem`, or is not a mapping at the top level (an empty one is `{}` when
+    not YAML, is refused by `parse_config`, or is not a mapping at the top level (an empty one is `{}` when
     `empty_ok`) is a `LayerError`."""
     try:
         text = read_config_text(path)
         if text is None:
             raise LayerError(str(path), f"is larger than {MAX_CONFIG_BYTES} bytes")
-        loaded = yaml.safe_load(text)
+        loaded = parse_config(text)
+    except ConfigRefused as refused:
+        raise LayerError(str(path), str(refused)) from refused
     except (OSError, yaml.YAMLError) as exc:
         raise LayerError(str(path), f"cannot read the {what} file: {exc}") from exc
     except UnicodeDecodeError as exc:
         raise LayerError(str(path), f"the {what} file is not valid UTF-8 text") from exc
     except RecursionError as exc:
         raise LayerError(str(path), f"the {what} file is nested too deeply to read") from exc
-    problem = expansion_problem(loaded)
-    if problem:
-        raise LayerError(str(path), problem)
     if loaded is None and empty_ok:
         return {}
     if not isinstance(loaded, dict):

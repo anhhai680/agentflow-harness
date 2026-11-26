@@ -747,15 +747,38 @@ def test_a_file_that_is_not_utf8_is_a_layer_error_naming_it(tmp_path):
     assert str(target) in str(err.value)
 
 
-def test_a_merge_key_chain_under_the_byte_cap_parses_quickly(tmp_path):
-    """`<<` copies every key of the mapping it merges, so a chain of them costs the square of its length to parse:
-    the byte cap is what keeps the largest such file fast."""
+def merge_chain(budget: int = layers.MAX_CONFIG_BYTES) -> str:
+    """A chain of anchored mappings, each merging (`<<`) the one before and adding a key, as long as fits in `budget`
+    bytes: building mapping n copies n entries, so the whole file costs the square of its length to construct."""
     lines, n = [], 0
-    while sum(len(line) + 1 for line in lines) < layers.MAX_CONFIG_BYTES - 64:
+    while sum(len(line) + 1 for line in lines) < budget - 64:
         lines.append(f"a{n}: &a{n} {{<<: *a{n - 1}, k{n}: x}}" if n else "a0: &a0 {k0: x}")
         n += 1
-    path = _write(tmp_path, "\n".join(lines[:-1]) + "\n")
+    return "\n".join(lines[:-1]) + "\n"
+
+
+def test_a_merge_key_chain_is_refused_before_it_is_built(tmp_path):
+    """The file is under the byte cap; its merges would build millions of entries. It is refused from the composed
+    node graph, which costs one pass, before PyYAML's constructor flattens a single merge."""
+    path = _write(tmp_path, merge_chain())
     started = time.monotonic()
-    with pytest.raises(LayerError):
+    with pytest.raises(LayerError, match="merge keys"):
         layers._read(path)
-    assert time.monotonic() - started < 5
+    assert time.monotonic() - started < 2
+
+
+def test_a_merge_key_that_merges_itself_is_refused(tmp_path):
+    with pytest.raises(LayerError, match="merges itself"):
+        layers._read(_write(tmp_path, "a: &a {<<: *a, k: x}\n"))
+    with pytest.raises(LayerError, match="merges itself"):
+        layers._read(_write(tmp_path, "b: &b {k: y}\na: &a {<<: [*b, *a], k: x}\n"))  # through a merge list
+
+
+def test_ordinary_merge_keys_still_load(tmp_path):
+    loaded = layers._read(_write(tmp_path,
+        "base: &base {run: pytest, timeout: 5}\n"
+        "gates:\n  unit: {<<: *base, name: unit}\n  lint: {<<: [*base], run: ruff}\n"))
+    assert loaded["gates"]["unit"] == {"run": "pytest", "timeout": 5, "name": "unit"}
+    assert loaded["gates"]["lint"] == {"run": "ruff", "timeout": 5}
+    assert layers.parse_config("") is None
+    assert layers.parse_config("k: v\n") == {"k": "v"}

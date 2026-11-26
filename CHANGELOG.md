@@ -28,7 +28,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 ## [3.14] - 2026-11-26
 
 ### Fixed
-- A config file that would make the loader run for minutes is refused with a load error naming it: one longer than 128 KiB, one whose nested YAML aliases or `@` references expand to more than 100,000 values, and one nested more than 64 levels deep through its aliases (the CLI and the dashboard read the same loader, and the dashboard's Settings page refuses such a pack too).
+- A config file that would make the loader run for minutes is refused with a load error naming it: one longer than 128 KiB, one whose nested YAML aliases, `@` references or `<<` merge keys expand to more than 100,000 values (merge keys are counted before the file is built), and one nested more than 64 levels deep through its aliases (the CLI and the dashboard read the same loader, and the dashboard's Settings page refuses such a pack too).
 
 ## [3.13] - 2026-11-26
 
