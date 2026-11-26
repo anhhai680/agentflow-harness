@@ -256,7 +256,7 @@ class ConfigError(Exception):
 
 @dataclass
 class Issue:
-    level: Literal["error", "warning"]
+    level: Literal["error", "warning", "note"]  # a note is shown by `validate` and never counted as a warning
     path: str
     message: str
     fixable: bool = False  # `agentflow validate --fix` repairs it
@@ -3633,6 +3633,21 @@ def validate_usage(cfg: Config) -> list[Issue]:
     v = _Validator(cfg, Path("."))
     v.usage()
     return v.issues
+
+
+WORK_SOURCE_DEPRECATED = (
+    "the `{kind}` work source is deprecated and 4.0 removes it; run `agentflow backlog import --dry-run` to see "
+    "the `backlog` file that would replace it (playbook §16)"
+)
+
+
+def deprecation_notes(cfg: Config) -> list[Issue]:
+    """The notes `validate` prints beside its issues: a `capability_map` or `specs` work source is deprecated. A note
+    is not a warning, so it never changes the `0 warnings` figure."""
+    ws = cfg.work_source
+    if ws is None or ws.kind not in ("capability_map", "specs"):
+        return []
+    return [Issue("note", "work_source", WORK_SOURCE_DEPRECATED.format(kind=ws.kind))]
 
 
 def validate(cfg: Config, repo: Path) -> list[Issue]:

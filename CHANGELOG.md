@@ -7,6 +7,9 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Changed
+- `validate` prints a note (not a warning, so `0 warnings` still holds) on a `capability_map` or `specs` work source, pointing to `agentflow backlog import`; both kinds are deprecated and 4.0 removes them.
+
 ## [3.11] - 2026-11-26
 
 ### Added
