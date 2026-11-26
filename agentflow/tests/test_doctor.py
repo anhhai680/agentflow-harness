@@ -316,6 +316,67 @@ def test_no_origin_remote_fails(tmp_cfg, repo):
     assert check.status == "fail" and "origin" in check.fix
 
 
+def _backlog_patch(**backlog):
+    return _patch(work_source={"kind": "backlog", "path": None}, **({"backlog": backlog} if backlog else {}))
+
+
+def _bare_origin(repo: Path, tmp_path: Path, *items: str) -> Path:
+    """Point `repo`'s origin at a new bare repository holding a claim ref for each of `items`."""
+    bare = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", str(bare))
+    _git(repo, "-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false",
+         "commit", "-q", "--allow-empty", "-m", "c")
+    _git(repo, "remote", "set-url", "origin", str(bare))
+    for item in items:
+        _git(repo, "push", "-q", "origin", f"HEAD:refs/agentflow/claims/{item}")
+    return bare
+
+
+def _recording(monkeypatch) -> list[list[str]]:
+    real, seen = doctor.run_bounded, []
+
+    def record(argv, cwd, env=None):
+        seen.append(list(argv))
+        return real(argv, cwd, env)
+
+    monkeypatch.setattr(doctor, "run_bounded", record)
+    return seen
+
+
+def test_doctor_reads_claims_with_one_ls_remote(tmp_cfg, repo, tmp_path, monkeypatch):
+    _bare_origin(repo, tmp_path, "a", "b")
+    seen = _recording(monkeypatch)
+    check = _checks(tmp_cfg, repo, _backlog_patch())["claims"]
+    assert check.status == "ok" and "2" in check.detail
+    git = [argv for argv in seen if argv[0] == "git"]
+    assert [argv[1:3] for argv in git] == [["remote", "get-url"], ["ls-remote", "--refs"]]
+    assert git[1][-2:] == ["origin", "refs/agentflow/claims/*"]
+
+
+def test_doctor_reads_claims_on_the_branch_form(tmp_cfg, repo, tmp_path, monkeypatch):
+    bare = _bare_origin(repo, tmp_path)
+    _git(repo, "push", "-q", "origin", "HEAD:refs/heads/agentflow/claims/a")
+    seen = _recording(monkeypatch)
+    check = _checks(tmp_cfg, repo, _backlog_patch(claim_ref="branch"))["claims"]
+    assert check.status == "ok" and "1" in check.detail and bare.exists()
+    assert [argv for argv in seen if argv[1:2] == ["ls-remote"]][0][-1] == "refs/heads/agentflow/claims/*"
+
+
+def test_doctor_fails_on_an_unreachable_origin(tmp_cfg, repo, tmp_path):
+    _git(repo, "remote", "set-url", "origin", str(tmp_path / "nowhere.git"))
+    check = _checks(tmp_cfg, repo, _backlog_patch())["claims"]
+    assert check.status == "fail" and "nowhere.git" in check.detail
+    assert "backlog.claims" in check.fix
+
+
+def test_doctor_skips_claims_when_off_or_not_backlog(tmp_cfg, repo, tmp_path):
+    _bare_origin(repo, tmp_path, "a")
+    assert "claims" not in _checks(tmp_cfg, repo)  # not a backlog pack
+    assert "claims" not in _checks(tmp_cfg, repo, _backlog_patch(claims=False))
+    _git(repo, "remote", "remove", "origin")
+    assert "claims" not in _checks(tmp_cfg, repo, _backlog_patch())  # no origin: the remote check says so
+
+
 def test_docker_is_checked_only_when_a_gate_runs_it(tmp_cfg, repo, monkeypatch):
     monkeypatch.setenv("FAKE_DOCKER_DOWN", "1")
     assert "docker" not in _checks(tmp_cfg, repo, _patch(gates={"build": {"run": "echo docker"}}))

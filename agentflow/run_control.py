@@ -21,6 +21,9 @@ Each action records one event with who took it, through `Run.emit`, and the runn
   (`hitl.demote_promoted`), so the run goes on with the retried task.
 - `attach` opens the waiting step's Claude Code session interactively in the run's worktree.
 
+After `pause`, `resume`, `cancel` and `archive` record their event, the run's claim on its backlog item follows
+(`claim_sync.sync_quietly`, outside the run's lock): paused, running again, or released. It never fails the action.
+
 `spawn_resume` starts `flow.py resume <run>` in the background (new session, stdin closed, output in the
 run's `runner.log`), the way `--detach` and the dashboard continue a run. A dashboard phase approval starts
 nothing: the phase rests as ready until a human continues it or marks it done (D13, amended by D16).
@@ -83,7 +86,14 @@ def _refuse_retro(run: Run) -> None:
 # --------------------------------------------------------------------------- pause and resume
 
 
-def pause(run: Run, by: str) -> None:
+def _sync_claim(run: Run, cfg: Config | None) -> None:
+    """The run's claim follows the event just recorded; `cfg` None loads the run's own config, only for a claim."""
+    from agentflow import claim_sync  # here: it imports the pipeline's modules, which import this one
+
+    claim_sync.sync_quietly(cfg, run)
+
+
+def pause(run: Run, by: str, cfg: Config | None = None) -> None:
     """Stop the run before its next step; a live agent finishes the step it is on."""
     with run.locked():
         _refuse_terminal(run, "pause")
@@ -91,9 +101,10 @@ def pause(run: Run, by: str) -> None:
             raise ControlError(f"{run.id} is already paused; `agentflow resume {run.id}` continues it")
         _refuse_ready(run, "pause")
         run.emit("run_paused", by=by)
+    _sync_claim(run, cfg)
 
 
-def resume(run: Run, by: str) -> bool:
+def resume(run: Run, by: str, cfg: Config | None = None) -> bool:
     """Record who resumed a paused or ready run (`run_resumed`); True if it was. The caller starts the runner."""
     with run.locked():
         _refuse_terminal(run, "resume")
@@ -101,7 +112,8 @@ def resume(run: Run, by: str) -> bool:
         if run.state["status"] not in ("paused", "ready"):
             return False
         run.emit("run_resumed", by=by)
-        return True
+    _sync_claim(run, cfg)
+    return True
 
 
 def _refuse_ready(run: Run, action: str) -> None:
@@ -136,10 +148,10 @@ def mark_done(run: Run, by: str) -> None:
         run.emit("run_marked_done", by=by, phase=ready["phase"])
 
 
-def archive(run: Run, by: str) -> None:
+def archive(run: Run, by: str, cfg: Config | None = None) -> None:
     """File a finished run away as old data (`run_archived`), so its card leaves the phase it stopped in, and delete
     its shelf refs (`refs/agentflow/shelf/<run id>/`): kept until now, past `finish`, so shelved work stays
-    recoverable."""
+    recoverable. A claim the run still holds on its backlog item is released."""
     with run.locked():
         status = run.state["status"]
         if status not in TERMINAL:
@@ -147,6 +159,7 @@ def archive(run: Run, by: str) -> None:
         if run.state.get("archived"):
             raise ControlError(f"{run.id} is already archived")
         run.emit("run_archived", by=by)
+    _sync_claim(run, cfg)
     drop_shelves(run.repo, run.id)
     # outside the lock, so a gh call never holds it: the second try for a link or a release that failed earlier
     link(run)
@@ -287,7 +300,10 @@ def cancel(run: Run, by: str, cfg: Config | None = None, grace_s: float = KILL_G
         signalled += [pid for pid in late if _signal(pid, signal.SIGTERM)]
         _settle(run, signalled, commands, grace_s)
     finally:
-        release(run)  # last, outside the lock: a slow gh call never delays stopping the agents
+        try:
+            _sync_claim(run, cfg)  # the claim is released after the agents are stopped, and it never raises
+        finally:
+            release(run)  # last, outside the lock: a slow gh call never delays stopping the agents
     return verified + late
 
 

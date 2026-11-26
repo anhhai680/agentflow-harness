@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agentflow import finished, gitops, governor, pack, slots, sources, work_source
+from agentflow import claims, finished, gitops, governor, pack, slots, sources, work_source
 from agentflow.backlog_file import BacklogItem
 from agentflow.conditions import Ctx, evaluate, make_ctx
 from agentflow.gitops import uncommitted_paths
@@ -655,6 +655,7 @@ class Assessment:
     blocked: dict[str, str]
     occupied: int
     prior: dict[str, dict]
+    claims_error: str = ""  # why the claims on `origin` could not be read; nothing starts then
 
 
 def _report(entry: dict, reason: str, prior: dict[str, dict], say: Callable[[str], None]) -> None:
@@ -663,14 +664,37 @@ def _report(entry: dict, reason: str, prior: dict[str, dict], say: Callable[[str
         say(f"queue: {entry['id']} blocked \u2014 {reason}")
 
 
-def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = None) -> Assessment:
+def _claimed(held: claims.Claim) -> str:
+    """Why a claimed item does not start here: who holds it, from validated fields only."""
+    if held.unreadable:
+        return f"claimed on origin by an unreadable claim ({claims.one_line(held.unreadable)})"
+    return f"claimed by {held.by} ({held.phase}, {held.status})"
+
+
+def _claim_entry(held: claims.Claim) -> dict:
+    return {"by": held.by, "run": held.run, "phase": held.phase, "status": held.status, "updated": held.updated,
+            "unreadable": held.unreadable}
+
+
+def assess_modules(
+    cfg: Config, repo: Path, log: Callable[[str], None] | None = None,
+    remote: tuple[dict[str, claims.Claim] | None, str] | None = None,
+) -> Assessment:
     """Read the work source and every module's run, write `runs/queue.json`, and start nothing.
 
     A module that cannot move without a person is reported through `log` as `queue: <id> blocked - <reason>`,
     once per change of reason; the reason is kept in `queue.json`, so a later tick or process stays quiet
     about it. A dependent says it is waiting on the module that is stuck.
+
+    In a `backlog` pack with claims on, the claims on `origin` are read once (`claims.survey`), or taken from
+    `remote` (what the caller just read). A module with no run here that still holds it (`issue_run_holds`) and a
+    claim that is not its run's own gets `entry["claim"]` and the problem `claimed by <by> (<phase>, <status>)`, so
+    it does not start and its dependents wait; it holds no slot here. A failed read sets `Assessment.claims_error`.
     """
     repo = Path(repo)
+    held, note = claims.survey(cfg, repo) if remote is None else remote
+    claims_error = note if held is None else ""
+    held = held or {}
     say = log or (lambda _message: None)
     nodes = work_source.items(cfg, repo)
     prior = {m["id"]: m for m in QueueState.load(repo).modules}
@@ -684,8 +708,16 @@ def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = 
     if marks[1]:
         notes.append(f"queue: {marks[1]}; until then origin evidence marks no module newly done")
     for node in nodes:
-        entry, holds, problem = _assess(cfg, repo, node, runs.get(node.id), prior.get(node.id, {}), notes,
-                                        view, known, marks)
+        run = runs.get(node.id)
+        entry, holds, problem = _assess(cfg, repo, node, run, prior.get(node.id, {}), notes, view, known, marks)
+        # a claim elsewhere counts unless a run here still holds the item (a failed, cancelled or archived one gave it
+        # up) or the claim is that run's own
+        claim = held.get(node.id) if entry["status"] != "done" else None
+        if claim is not None and run is not None and (issue_run_holds(run) or claim.run == run.id):
+            claim = None
+        if claim is not None:
+            entry["claim"] = _claim_entry(claim)
+            problem = _claimed(claim)
         entries.append(entry)
         problems[node.id] = _map_problem(node, graph, noun) or problem
         occupied += holds
@@ -696,7 +728,7 @@ def assess_modules(cfg: Config, repo: Path, log: Callable[[str], None] | None = 
         if entry["id"] in blocked:
             _report(entry, blocked[entry["id"]], prior, say)
     QueueState(entries).save(repo)
-    return Assessment(nodes, entries, problems, blocked, occupied, prior)
+    return Assessment(nodes, entries, problems, blocked, occupied, prior, claims_error)
 
 
 def queue_tick(
@@ -706,10 +738,12 @@ def queue_tick(
     """Start the ready modules in map order while fewer than `max_parallel` runs are live; return their ids.
 
     With a `hold` reason (`usage_hold`) nothing starts, but the assessment, the state writes and the reports still run.
+    In a `backlog` pack with claims on, a claimed item never starts, and when the claims on `origin` can't be read
+    nothing starts (it says why): a start there would claim the item, and could not.
 
     A module that cannot move without a person (a failed or cancelled run, a merge state `gh` could not
-    give, an unknown dependency, a dependency cycle, a start that failed) is reported through `log`; see
-    `assess_modules`.
+    give, an unknown dependency, a dependency cycle, a start that failed, a claim on `origin`) is reported through
+    `log`; see `assess_modules`.
     """
     if max_parallel < 1:
         raise ValueError(f"max_parallel must be at least 1, got {max_parallel}")
@@ -717,6 +751,9 @@ def queue_tick(
     say = log or (lambda _message: None)
     found = assess_modules(cfg, repo, log=log)
     entries, blocked, occupied = found.entries, found.blocked, found.occupied
+    if found.claims_error:
+        say(f"queue: {found.claims_error}; no item starts until origin can be read")
+        hold = hold or found.claims_error
     state = QueueState(entries)
     done = {e["id"] for e in entries if e["status"] == "done"}
     started: list[str] = []
@@ -807,7 +844,8 @@ _ABANDONED = ("failed", "cancelled")  # a run that will never open or merge a pu
 
 def issue_run_holds(run: Run) -> bool:
     """Whether an issue's run here still holds the issue after GitHub closed it: one that is live, stopped on an
-    error (it can be resumed) or `done` with its pull request open. A failed, cancelled or archived run does not."""
+    error (it can be resumed) or `done` with its pull request open. A failed, cancelled or archived run does not. The
+    same rule decides whether a module's run here still holds a backlog item against a claim on `origin` (D5)."""
     return not run.state.get("archived") and run.state["status"] not in _ABANDONED
 
 

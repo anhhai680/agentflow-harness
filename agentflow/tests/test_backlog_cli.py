@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from agentflow import backlog, finished
+from conftest import land_on_origin, run_git
+from test_claims import run_git_input
+
+from agentflow import backlog, claims, finished
 from agentflow.flow import main
+from agentflow.pipeline import RunOptions, start
 from agentflow.state import Run, runs_root
 
 YML = """version: 1
@@ -81,9 +87,27 @@ def test_list_json_prints_the_view(bf, capsys):
     assert printed == backlog.backlog_view(bf.cfg, bf.root)
     assert [p["id"] for p in printed] == ["a", "b", "i", "z"]
     first = printed[0]
-    assert set(first) == {"id", "title", "lane", "status", "state", "detail"}
+    assert set(first) == {"id", "title", "lane", "status", "state", "detail", "claim"}
     assert (first["state"], first["detail"], first["status"]) == ("done", finished.FILE_SAYS, "done")
     assert printed[3]["state"] == "dropped"
+
+
+def test_list_shows_a_claim_on_origin_live_and_warns_when_origin_is_gone(bf, tmp_path, capsys):
+    from test_claims import OTHER, second_clone
+
+    claims.create(bf.cfg, second_clone(bf, tmp_path), "i", run=OTHER, lane="feature", phase="plan", status="waiting")
+    assert main(["backlog", "list"]) == 0  # no Board refresh: `list` reads origin itself
+    out = capsys.readouterr().out.splitlines()
+    assert out == ["a  done  Alpha", "b  ready  Bee", f"i  plan  An idea  claimed by Other (waiting, run {OTHER})"]
+    assert main(["backlog", "list", "--json"]) == 0
+    claim = {v["id"]: v for v in json.loads(capsys.readouterr().out)}["i"]["claim"]
+    assert (claim["by"], claim["run"], claim["phase"], claim["status"], claim["stale"]) == (
+        "Other", OTHER, "plan", "waiting", False)
+    shutil.move(str(bf.origin), str(bf.origin.with_name("gone.git")))
+    assert main(["backlog", "list"]) == 0
+    printed = capsys.readouterr()
+    assert printed.out.splitlines() == ["a  done  Alpha", "b  ready  Bee", "i  backlog  An idea"]
+    assert printed.err.startswith("warning: could not read claims on origin: ")
 
 
 def test_the_view_shows_the_phase_of_a_local_run(bf):
@@ -291,3 +315,173 @@ def test_validate_fix_sets_done_on_items_their_runs_finished(bf, capsys):
 
 def test_fix_done_is_nothing_outside_a_backlog_pack(flow_repo):
     assert backlog.fix_done(flow_repo.cfg, flow_repo.root, dry_run=False) == []
+
+
+# --------------------------------------------------------------------------- release and reopen (claims)
+
+
+def _claim(bf, item: str, phase: str, status: str = "running"):
+    return claims.create(bf.cfg, bf.root, item, run="20261125-0900-feature-" + item, lane="feature", phase=phase,
+                         status=status)
+
+
+def _forge(bf, tmp_path: Path, item: str) -> str:
+    """A claim commit holding no `claim.json` pushed to `item`'s claim ref; its sha."""
+    blob = run_git_input(bf.root, "{}\n", "hash-object", "-w", "--stdin").strip()
+    tree = run_git_input(bf.root, f"100644 blob {blob}\tother.json\n", "mktree").strip()
+    sha = run_git(bf.root, "commit-tree", tree, "-m", "forged").strip()
+    run_git(bf.root, "push", "-q", "origin", f"{sha}:{claims.ref(bf.cfg, item)}")
+    return sha
+
+
+def _on_origin(bf, item: str) -> bool:
+    return claims.ref(bf.cfg, item) in run_git(bf.origin, "for-each-ref", "--format=%(refname)").split()
+
+
+def test_release_frees_any_claim_including_a_stale_one(bf, tmp_path, capsys, monkeypatch):
+    old = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with monkeypatch.context() as patched:
+        patched.setattr(claims, "_now", lambda: old)
+        _claim(bf, "b", "plan", "waiting")
+    _forge(bf, tmp_path, "i")
+    assert _on_origin(bf, "b") and _on_origin(bf, "i")
+    assert main(["backlog", "release", "b"]) == 0
+    out = capsys.readouterr().out
+    assert "Test" in out and "plan" in out and old in out and not _on_origin(bf, "b")
+    assert main(["backlog", "release", "i"]) == 0
+    out = capsys.readouterr().out
+    assert "unreadable" in out and not _on_origin(bf, "i")
+    for item in ("b", "i"):
+        assert main(["backlog", "release", item]) == 0
+        assert capsys.readouterr().out.strip() == f"no claim on {item}"
+    assert main(["backlog", "release", "../x"]) == 1
+    assert capsys.readouterr().out.startswith("error: ")
+
+
+def test_release_prints_every_claim_field_on_one_line(bf, monkeypatch):
+    odd = claims.Claim(item="b", run="r\x1b[2J", lane="feature", phase="plan\n", status="running\r", by="Test",
+                       started="x", updated="2026-01-01\n00:00:00+00:00", sha="a" * 40)
+    monkeypatch.setattr(claims, "release_item", lambda cfg, repo, item_id: odd)
+    lines = backlog.release_item(bf.cfg, bf.root, "b")
+    assert lines and all(line.isprintable() for line in lines), lines
+
+
+def test_release_names_a_live_local_run(flow_repo, capsys):
+    from test_claim_runs import ClaimFlow
+
+    cflow = ClaimFlow(flow_repo)
+    flow_repo.install_pack()
+    run = start(cflow.cfg, flow_repo.root, "feature", {"module": "b"}, RunOptions())
+    assert claims.read(cflow.cfg, flow_repo.root, "b") is not None
+    assert main(["backlog", "release", "b"]) == 0
+    out = capsys.readouterr().out
+    assert f"run {run.id}" in out and "claim_lost" in out and "Test" in out
+    assert claims.read(cflow.cfg, flow_repo.root, "b") is None
+    assert main(["backlog", "release", "b"]) == 0
+    assert capsys.readouterr().out.strip() == "no claim on b"
+
+
+def _release_lines(capsys, item: str = "b") -> str:
+    assert main(["backlog", "release", item]) == 0
+    return capsys.readouterr().out
+
+
+def test_release_names_only_a_run_that_still_holds_the_claim(flow_repo, tmp_path, capsys):
+    from test_claim_runs import ClaimFlow
+
+    cflow = ClaimFlow(flow_repo)
+    flow_repo.install_pack()
+    cfg, root = cflow.cfg, flow_repo.root
+
+    # a run that already lost the claim to another claimant is not named
+    lost = start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    lost.emit("claim_lost", item="b", why="taken")
+    assert lost.refresh()["claim"]["lost"] is True
+    out = _release_lines(capsys)
+    assert "released the claim of Test" in out and "holds this claim" not in out and "claim_lost" not in out
+
+    # a finished run has no next change: it is named, and not as one that will stop
+    done = start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    done.emit("run_finished")
+    assert done.refresh()["status"] == "done"
+    out = _release_lines(capsys)
+    assert f"run {done.id} (done)" in out and "no more changes" in out and "claim_lost" not in out
+    assert "holds this claim here:" not in out
+
+    # a run whose own row is an older, superseded claim is not named for another machine's claim
+    old = start(cfg, root, "feature", {"module": "i"}, RunOptions())
+    assert main(["backlog", "release", "i"]) == 0
+    capsys.readouterr()
+    other = cflow.clone(tmp_path)
+    claims.create(cfg, other, "i", run="20261125-1000-feature-i", lane="feature", phase="plan")
+    out = _release_lines(capsys, "i")
+    assert "released the claim of Other" in out and "holds this claim" not in out and "claim_lost" not in out
+    assert old.refresh()["claim"]["released"] is False
+
+    # a live run that holds it is still named, with what happens to it
+    live = start(cfg, root, "feature", {"module": "b"}, RunOptions())
+    out = _release_lines(capsys)
+    assert f"run {live.id} holds this claim here" in out and "its next change stops it with claim_lost" in out
+
+
+def _finish(bf, tmp_path: Path, claim_phase: str) -> None:
+    """`a` (done in the file) holds a claim at `claim_phase`, and its file on origin says `done`."""
+    _claim(bf, "a", claim_phase, "waiting")
+    land_on_origin(bf, tmp_path, {"backlog.yml": YML})
+
+
+def test_reopen_releases_only_a_finished_claim(bf, tmp_path, capsys, monkeypatch):
+    last = list(bf.cfg.phases)[-1]
+    _finish(bf, tmp_path, last)
+    assert main(["backlog", "set", "a", "status=ready"]) == 0
+    out = capsys.readouterr().out
+    assert "a: set status" in out and "released" in out and "Test" in out
+    assert items(bf)["a"].status == "ready" and not _on_origin(bf, "a")
+
+    # a claim that is not at the last phase stays, and the output says so
+    write(bf.root, "backlog.yml", YML)
+    _claim(bf, "a", "build", "running")
+    assert main(["backlog", "set", "a", "status=backlog"]) == 0
+    out = capsys.readouterr().out
+    assert "left claim of Test (build, running)" in out and _on_origin(bf, "a")
+    assert items(bf)["a"].status == "backlog"
+
+    # a claim at the last phase of an item origin does not have as done stays too
+    write(bf.root, "backlog.yml", YML)
+    claims.release(bf.cfg, bf.root, claims.read(bf.cfg, bf.root, "a"))
+    land_on_origin(bf, tmp_path, {"backlog.yml": YML.replace("title: Alpha\n    status: done",
+                                                             "title: Alpha\n    status: ready")})
+    _claim(bf, "a", last, "waiting")
+    assert main(["backlog", "set", "a", "status=ready"]) == 0
+    assert f"left claim of Test ({last}, waiting)" in capsys.readouterr().out and _on_origin(bf, "a")
+
+    # an item that was not done never calls origin
+    calls: list[tuple] = []
+    real = claims._run
+    monkeypatch.setattr(claims, "_run", lambda *a, **k: calls.append(a) or real(*a, **k))
+    monkeypatch.setattr(backlog, "fetch_remote_branch", lambda *a, **k: calls.append(a) or True)
+    assert main(["backlog", "set", "b", "status=backlog"]) == 0
+    assert main(["backlog", "undone", "b"]) == 0
+    assert calls == []
+    capsys.readouterr()
+    assert backlog.release_on_reopen(bf.cfg, bf.root, "b", "ready") == [] and calls == []
+
+
+def test_reopen_with_origin_down_still_edits_the_file(bf, tmp_path, capsys):
+    _finish(bf, tmp_path, list(bf.cfg.phases)[-1])
+    moved = tmp_path / "moved.git"
+    shutil.move(bf.origin, moved)
+    try:
+        assert main(["backlog", "set", "a", "status=ready"]) == 0
+    finally:
+        shutil.move(moved, bf.origin)
+    out = capsys.readouterr().out
+    assert items(bf)["a"].status == "ready"
+    assert "a: set status" in out and "could not read the claim" in out
+    assert all(len(line) <= 400 for line in out.splitlines()) and _on_origin(bf, "a")
+
+
+def test_a_remote_text_in_a_reopen_line_is_one_short_line(bf, tmp_path, monkeypatch):
+    monkeypatch.setattr(claims, "read", lambda *a, **k: (_ for _ in ()).throw(claims.Unreachable("x\ny" + "z" * 900)))
+    [line] = backlog.release_on_reopen(bf.cfg, bf.root, "a", "done")
+    assert "\n" not in line and len(line) <= 420 and "could not read the claim" in line

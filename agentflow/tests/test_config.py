@@ -1719,6 +1719,13 @@ def test_governor_is_a_reserved_step_id(tmp_cfg):
     assert any(i.level == "error" and "step id 'governor' is reserved" in i.message for i in found)
 
 
+def test_claim_is_a_reserved_step_id(tmp_cfg):
+    def patch(data):
+        phase_step(data, "build", "build")["id"] = "claim"
+    found = issues_for(tmp_cfg, patch)
+    assert any(i.level == "error" and "step id 'claim' is reserved" in i.message for i in found)
+
+
 @pytest.mark.parametrize("block, path, message", [
     ({"governor": "sometimes"}, "usage.governor", 'governor must be "on", "observe" or "off"'),
     ({"five_hour_soft": 0.95}, "usage.five_hour_soft", "five_hour_soft must be above 0 and below five_hour_hard"),
@@ -3352,6 +3359,28 @@ def test_a_symlink_loop_in_the_work_source_path_is_an_error_not_a_crash(tmp_cfg,
 
 def test_ignore_specs_accepts_a_list_of_globs(tmp_cfg, tmp_path):
     found = _blg(tmp_cfg, tmp_path, "version: 1\nitems: []\n", {"backlog": {"ignore_specs": ["README.md", "*/index.md"]}})
+    assert not [e for e in found if e[1].startswith("backlog")]
+
+
+def test_backlog_claim_keys_default_and_load(tmp_cfg):
+    policy = load_config(tmp_cfg(None)).backlog
+    assert (policy.claims, policy.claim_ref, policy.claim_stale_h) == (True, "refs", 24)
+    block = {"backlog": {"claims": False, "claim_ref": "branch", "claim_stale_h": 48}}
+    policy = load_config(tmp_cfg(block)).backlog
+    assert (policy.claims, policy.claim_ref, policy.claim_stale_h) == (False, "branch", 48)
+
+
+@pytest.mark.parametrize("key, value", [
+    ("claims", "yes"), ("claim_ref", "tag"), ("claim_stale_h", 0), ("claim_stale_h", 721),
+    ("claim_stale_h", True), ("claim_stale_h", "24"),
+])
+def test_validate_refuses_bad_claim_keys(tmp_cfg, tmp_path, key, value):
+    found = _blg(tmp_cfg, tmp_path, "version: 1\nitems: []\n", {"backlog": {key: value}})
+    assert [(level, where) for level, where, _ in found if where.startswith("backlog")] == [("error", f"backlog.{key}")]
+
+
+def test_a_claim_ref_of_branch_with_claims_off_is_no_error(tmp_cfg, tmp_path):
+    found = _blg(tmp_cfg, tmp_path, "version: 1\nitems: []\n", {"backlog": {"claims": False, "claim_ref": "branch"}})
     assert not [e for e in found if e[1].startswith("backlog")]
 
 

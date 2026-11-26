@@ -39,14 +39,24 @@ ci_gh = test_conformance.ci_gh
 
 class BacklogFlow:
     """`flow_repo` as a `backlog` pack with a committed `backlog.yml` (item `b` is ready, item `a` is done, item `i` is
-    an idea, `status: backlog`)."""
+    an idea, `status: backlog`). Its `backlog:` block is `POLICY`: claims off here, so these runs write no claim ref
+    to the fixture's `origin` (`test_claim_runs.ClaimFlow` turns them on)."""
+
+    POLICY: dict = {"claims": False}
 
     def __init__(self, flow_repo) -> None:
         self.repo = flow_repo
-        flow_repo.configure({"work_source": {"kind": "backlog", "path": None}})
+        self.configure()
         (flow_repo.root / "backlog.yml").write_text(BACKLOG_YML, encoding="utf-8")
         run_git(flow_repo.root, "add", "-A")
         run_git(flow_repo.root, "commit", "-q", "-m", "backlog")
+
+    def configure(self, patch: dict | None = None):
+        """The backlog pack with `POLICY`, and `patch` deep-merged on top."""
+        from conftest import deep_merge
+
+        base = {"work_source": {"kind": "backlog", "path": None}, "backlog": dict(self.POLICY)}
+        return self.repo.configure(deep_merge(base, patch or {}))
 
     @property
     def cfg(self):
@@ -437,7 +447,8 @@ def test_a_spec_the_item_already_names_writes_nothing(bflow):
 def test_a_reconcile_step_that_rewrites_the_same_spec_writes_nothing(bflow):
     from conftest import with_doubt
 
-    bflow.repo.configure({"work_source": {"kind": "backlog", "path": None}}, autopilot=True, edit=with_doubt)
+    bflow.repo.configure({"work_source": {"kind": "backlog", "path": None}, "backlog": {"claims": False}}, autopilot=True,
+                         edit=with_doubt)
     high = {"severity": "high", "file": SPEC, "line": 3, "text": "Thiếu trường hợp rollback"}
     pending = SPEC_TEXT.replace("**Status: approved**", "**Status: proposed** (pending approval)")
     bflow.script(**{
@@ -485,12 +496,13 @@ PLAN_TEXT = "# Plan: b\n\n### Task 1: One\n\n**Depends on:** none\n\n- [ ] **Ste
 NOTED = BACKLOG_YML.replace("    status: ready\n", "    status: ready\n    notes: Seen by a teammate\n")
 
 
-def _whole(bflow, module: str = "b", new_module: dict | None = None, **acts: list[dict]):
+def _whole(bflow, module: str = "b", new_module: dict | None = None, claims: bool = False, **acts: list[dict]):
     """A `feature` run of item `module` (`b`) with the workflow as shipped and the `ok` gate, started and not advanced;
-    its define and plan steps write the spec and the plan."""
+    its define and plan steps write the spec and the plan. `claims` turns `backlog.claims` on."""
     from test_ci import PIPE
 
-    bflow.repo.configure({**PIPE, "work_source": {"kind": "backlog", "path": None}}, autopilot=True)
+    bflow.repo.configure({**PIPE, "work_source": {"kind": "backlog", "path": None}, "backlog": {"claims": claims}},
+                         autopilot=True)
     run = start(bflow.cfg, bflow.repo.root, "feature", {"module": module}, RunOptions(new_module=new_module))
     values = conditions.make_ctx(bflow.cfg, bflow.repo.root, "feature", run.state["params"], run).values
     plan = values["plan_target"]
@@ -758,7 +770,7 @@ def test_a_run_from_a_new_card_ends_with_a_pr_whose_diff_sets_done(bflow, ci_gh)
 
     from test_ci import PIPE
 
-    bflow.repo.configure({**PIPE, "work_source": {"kind": "backlog", "path": None},
+    bflow.repo.configure({**PIPE, "work_source": {"kind": "backlog", "path": None}, "backlog": {"claims": False},
                           "dashboard": {"backlog": {"module_lane": "feature"}}}, autopilot=True)
     repo, started = bflow.repo.root, []
     path = repo / "backlog.yml"

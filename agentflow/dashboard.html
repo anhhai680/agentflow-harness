@@ -71,12 +71,14 @@ button.done-more { width: 100%; font-size: 12px; margin-bottom: 8px; }
 .done-modules summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .card.backlog.parallel { border-left-color: var(--ok); }  /* the green of .gate-ok */
 .card.backlog.blocked, .card.backlog.taken, .card.backlog.no_fix, .card.backlog.in_progress { border-left-color: var(--muted); }
+.card.claim { cursor: default; }
+.badge.stale-mark { color: var(--warn); border: 1px solid var(--warn); }
 .card.backlog.starting { border-left-color: var(--warn); }
 .card.backlog.failed-start { border-left-color: var(--bad); }
 .badge.p { color: var(--ok); border: 1px solid var(--ok); font-weight: 700; }
 .badge.lock { color: var(--muted); border: 1px solid var(--line); }
 .badge.ready-mark { border: 1px solid var(--line); }
-#sync-note, #backlog-note, #issues-note, #alerts-note, #retro-due { margin-bottom: 8px; }
+#sync-note, #backlog-note, #claims-note, #issues-note, #alerts-note, #retro-due { margin-bottom: 8px; }
 .card a { color: var(--accent); font-size: 12px; }
 .moves { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .moves button { font-size: 12px; padding: 2px 8px; }
@@ -342,6 +344,7 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
   <section id="board-view">
     <div id="sync-note" class="muted" role="status" hidden></div>
     <div id="backlog-note" class="muted" role="status" hidden></div>
+    <div id="claims-note" class="muted" role="status" hidden></div>
     <div id="issues-note" class="muted" role="status" hidden></div>
     <div id="alerts-note" class="muted" role="status" hidden></div>
     <div id="retro-due" class="muted" role="status" hidden></div>

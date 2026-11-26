@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal
 
-from agentflow import backlog_file, finished, intake, module_queue, sources, vuln, work_source
+from agentflow import backlog_file, claim_sync, claims, finished, intake, module_queue, sources, vuln, work_source
 from agentflow.backlog_file import BacklogItem
 from agentflow.conditions import first_phase_with_work, make_ctx
 from agentflow.config import check_lane
@@ -437,7 +437,7 @@ def _state_path(repo: Path) -> Path:
 def _load_state(repo: Path) -> dict:
     try:
         data = json.loads(_state_path(repo).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -863,6 +863,106 @@ def _file_note(problems: list[backlog_file.Problem]) -> str:
 NOT_STARTABLE = "runs in {lane}: only dashboard.backlog.module_lane items start from the Board"
 
 
+# --------------------------------------------------------------------------- other machines' claims (D5)
+
+
+def _cached_claims(cfg: Config, state: dict) -> dict[str, claims.Claim]:
+    """The claims the last `refresh` read from `origin` (`state["claims"]`), each checked again (`claims.restore`):
+    the state file is on disk, so an entry that is not a claim this pack can read is left out. `{}` outside a
+    `backlog` pack or with `backlog.claims` off. Reads no git."""
+    if work_source.kind(cfg) != "backlog" or not cfg.backlog.claims:
+        return {}
+    cached = state.get("claims")
+    if not isinstance(cached, dict):
+        return {}
+    found: dict[str, claims.Claim] = {}
+    for item_id, record in list(cached.items())[:claims.LIST_MAX]:
+        held = claims.restore(cfg, item_id, record)
+        if held is not None:
+            found[item_id] = held
+    return found
+
+
+def _claims_note(cfg: Config, state: dict) -> str:
+    """The Board's claims note: the last `refresh`'s, as one capped line; `claims are off` at once when
+    `backlog.claims` is false; `""` outside a `backlog` pack."""
+    if work_source.kind(cfg) != "backlog":
+        return ""
+    if not cfg.backlog.claims:
+        return claims.OFF.format(why="backlog.claims is false")
+    note = state.get("claims_note")
+    return claims.one_line(note, NOTE_MAX) if isinstance(note, str) else ""
+
+
+def _own_claim(item_id: str, held: claims.Claim, runs: list[Run]) -> bool:
+    """`held` is the claim of a run here: a run of `item_id` whose id is the claim's."""
+    return bool(held.run) and any(
+        r.id == held.run and str((r.state.get("params") or {}).get("module")) == item_id for r in runs)
+
+
+def _origin_done(state: dict) -> set[str]:
+    """The items `done` in the file at `origin/<fork_from>` as the last `refresh` recorded them (`origin_done`), each
+    a module id. The state file is on disk: anything else in it is ignored."""
+    found = state.get("origin_done")
+    if not isinstance(found, list):
+        return set()
+    return {i for i in found[:claims.LIST_MAX] if isinstance(i, str) and sources.MODULE_ID.fullmatch(i)}
+
+
+def _shown_claims(pic: dict, held: dict[str, claims.Claim]) -> dict[str, claims.Claim]:
+    """The claims of `held` that decide their item's state (D5), for the Board and `backlog list` alike: not on a
+    `dropped` item, not on a `done` one (the file here says so, the file at `origin/<fork_from>` does as the last
+    `refresh` read it, or the done evidence does), not on an item whose run here still holds it
+    (`module_queue.issue_run_holds`: the run's own phase wins), and not the claim of a run here. A failed, cancelled
+    or archived run here gave the item up, so another machine's claim on it is shown."""
+    by_entry = {e["id"]: e for e in pic["entries"]}
+    runs = {r.id: r for r in pic["runs"]}
+    done_on_origin = _origin_done(pic["state"])
+    shown: dict[str, claims.Claim] = {}
+    for item_id, claim in held.items():
+        file_item = pic["file_items"].get(item_id)
+        entry = by_entry.get(item_id)
+        if file_item is not None and file_item.status in ("dropped", "done"):
+            continue
+        if item_id in done_on_origin or (entry is not None and entry["status"] == "done"):
+            continue
+        local = runs.get(entry.get("run_id")) if entry is not None else None
+        if local is not None and module_queue.issue_run_holds(local):
+            continue
+        if _own_claim(item_id, claim, pic["runs"]):
+            continue
+        shown[item_id] = claim
+    order = {item_id: i for i, item_id in enumerate(pic["file_items"])}
+    return {i: shown[i] for i in sorted(shown, key=lambda i: (order.get(i, len(order)), i))}
+
+
+def _claim_fields(cfg: Config, held: claims.Claim, now: datetime) -> dict:
+    """What a person sees of a claim: validated fields only, its age in seconds (None when unreadable) and
+    whether it is stale (`backlog.claim_stale_h`)."""
+    age = claims.age_s(held, now)
+    return {"phase": held.phase, "status": held.status, "by": held.by, "run": held.run, "updated": held.updated,
+            "age_s": None if age is None else round(age), "stale": claims.is_stale(held, cfg.backlog.claim_stale_h, now),
+            "unreadable": claims.one_line(held.unreadable)}
+
+
+def _remote_card(cfg: Config, item_id: str, held: claims.Claim, pic: dict, lane: str | None, now: datetime) -> dict:
+    """The Board's read-only card of another machine's claim: in the claim's phase column, or `Backlog` when the
+    claim is unreadable."""
+    file_item = pic["file_items"].get(item_id)
+    title = (file_item.title if file_item is not None else "") or item_id
+    item_lane = held.lane or (file_item.lane if file_item is not None else "") or lane or ""
+    return {"key": f"claim:{item_id}", "id": item_id, "title": _one_line(title, TITLE_MAX), "lane": item_lane,
+            "column": "Backlog" if held.unreadable else held.phase, **_claim_fields(cfg, held, now)}
+
+
+def _claim_detail(fields: dict) -> str:
+    """`backlog list`'s words for a claim on `origin`."""
+    if fields["unreadable"]:
+        return f"unreadable claim on origin: {fields['unreadable']}"
+    stale = ", stale" if fields["stale"] else ""
+    return f"claimed by {fields['by']} ({fields['status']}, run {fields['run']}{stale})"
+
+
 def _startable(item: BacklogItem | None, lane: str | None) -> bool:
     """Whether a backlog item belongs to the module lane (an item with no `lane:` does)."""
     return item is None or not item.lane or item.lane == lane
@@ -893,6 +993,7 @@ def _picture(cfg: Config, repo: Path) -> dict:
     state = _load_state(repo)
     merged = {k: v for k, v in (state.get("merged") or {}).items() if isinstance(k, str)}
     pic = {"runs": runs, "nodes": nodes, "entries": entries, "book": book, "state": state,
+           "claims": _cached_claims(cfg, state),
            "issues": _synced(cfg, state), "file_items": {i.id: i for i in file_items},
            "dropped": [{"id": i.id, "title": i.title} for i in file_items if i.status == "dropped"],
            "file_note": _file_note(problems), "backlog_sha256": digest}
@@ -983,16 +1084,21 @@ def _item_fields(item: BacklogItem) -> dict:
             "issue": item.issue, "spec": item.spec, "notes": item.notes}
 
 
-def snapshot(cfg: Config, repo: Path) -> dict:
+def snapshot(cfg: Config, repo: Path, now: datetime | None = None) -> dict:
     """The Backlog column for the board: `cards`, the finished modules (`done`, each with its `reason`, and
     `done_note`, the error from reading the hand marks or `""`), the New task form (`new_task`, `lane_phases`,
     `after_choices`) and the last base-branch sync note. In a `backlog` pack, `backlog_sha256` is the sha-256 of the
     file's bytes the cards were read from (`""` when it was not read), and each file card carries `item` (its
-    `EDIT_KEYS` fields) and `local` (`_is_local`). It runs no git and no `gh`."""
+    `EDIT_KEYS` fields) and `local` (`_is_local`). `remote_claims` are the other machines' claims the last `refresh`
+    cached that decide their item's state (`_shown_claims`), one read-only card each (`_remote_card`); such an item
+    has no card in `cards`. `claims_note` says why there are none to show, or that `origin` could not be read. It
+    runs no git and no `gh`."""
     repo = Path(repo)
+    now = now or datetime.now(UTC)
     pic = _picture(cfg, repo)
     view, book, lane = pic["view"], pic["book"], module_queue.module_lane(cfg)
     cards: list[dict] = []
+    remote = _shown_claims(pic, pic["claims"])
 
     def make(key: str, kind: str, ident: str, label: str, item_lane: str, item: Item | None,
              module: str | None = None, **extra: Any) -> dict:
@@ -1026,7 +1132,7 @@ def snapshot(cfg: Config, repo: Path) -> dict:
     taken = {i["number"] for i in pic["issues"] if i.get("in_progress") and i["number"] not in live_issues}
     for node in pic["nodes"]:
         entry = by_entry[node.id]
-        if entry["status"] != "backlog":
+        if entry["status"] != "backlog" or node.id in remote:  # a claim elsewhere is its own card (D5)
             continue
         file_item = pic["file_items"].get(node.id)
         if file_item is None:
@@ -1103,6 +1209,8 @@ def snapshot(cfg: Config, repo: Path) -> dict:
         "sync_note": pic["state"].get("sync_note") or "",
         "issues_note": pic["state"].get("issues_note") or "" if cfg.issues.sync_label else "",
         "alerts_note": pic["state"].get("alerts_note") or "" if _alerts_on(cfg) else "",
+        "remote_claims": [_remote_card(cfg, i, c, pic, lane, now) for i, c in remote.items()],
+        "claims_note": _claims_note(cfg, pic["state"]),
     }
 
 
@@ -1166,27 +1274,36 @@ NEEDS_BACKLOG = "this needs work_source kind backlog (it is {noun} here)"
 SET_KEYS = tuple(k for k in backlog_file.KEYS if k != "id")
 
 
-def backlog_view(cfg: Config, repo: Path) -> list[dict]:
+def backlog_view(cfg: Config, repo: Path, held: dict[str, claims.Claim] | None = None) -> list[dict]:
     """One dict per item of the backlog file, in file order, for `agentflow backlog list`: `id`, `title`, `lane`,
-    `status` (the file's), `state` and `detail`. `state` is the first that holds: `dropped`, `done` (`detail` is
-    the reason), the phase of the item's local run (`detail` is the run id), `blocked` (`detail` names the items
-    it waits for), else the file's `ready` or `backlog`. A claim on `origin` is not read here."""
+    `status` (the file's), `state`, `detail` and `claim`. `state` is the first that holds (D5): `dropped`, `done`
+    (`detail` is the reason), the phase of the item's local run (`detail` is the run id), the phase of a claim on
+    `origin` (`detail` names the claimant; `claim` holds its fields, else None), `blocked` (`detail` names the items
+    it waits for), else the file's `ready` or `backlog`. A claim on an item the file lacks is one more row, with
+    `status` "". The claims are `held`, or, when None, read from `origin` now (none when it can't be read)."""
     repo = Path(repo)
     if work_source.kind(cfg) != "backlog":
         return []
+    if held is None:
+        held = claims.survey(cfg, repo)[0] or {}
+    now = datetime.now(UTC)
     pic = _picture(cfg, repo)
+    remote = _shown_claims(pic, held)
     by_entry = {e["id"]: e for e in pic["entries"]}
     runs = {r.id: r for r in pic["runs"]}
     out = []
     for item in pic["file_items"].values():
         entry = by_entry.get(item.id)
-        state, detail = item.status, ""
+        state, detail, claim = item.status, "", None
         if item.status == "dropped":
             state = "dropped"
         elif entry is not None and entry["status"] == "done":
             state, detail = "done", entry.get("done_reason") or finished.MERGED
         elif item.status == "done":
             state, detail = "done", finished.FILE_SAYS
+        elif item.id in remote:  # `_shown_claims` left out a claim a run here still holds the item against
+            claim = _claim_fields(cfg, remote[item.id], now)
+            state, detail = claim["phase"] or "claimed", _claim_detail(claim)
         elif entry is not None and entry.get("run_id") in runs:
             state, detail = str(runs[entry["run_id"]].state.get("phase") or "running"), entry["run_id"]
         else:
@@ -1194,7 +1311,12 @@ def backlog_view(cfg: Config, repo: Path) -> list[dict]:
             if waiting:
                 state, detail = "blocked", ", ".join(waiting)
         out.append({"id": item.id, "title": item.title, "lane": item.lane, "status": item.status,
-                    "state": state, "detail": detail})
+                    "state": state, "detail": detail, "claim": claim})
+    for item_id, found in remote.items():
+        if item_id not in pic["file_items"]:
+            claim = _claim_fields(cfg, found, now)
+            out.append({"id": item_id, "title": item_id, "lane": found.lane, "status": "",
+                        "state": claim["phase"] or "claimed", "detail": _claim_detail(claim), "claim": claim})
     return out
 
 
@@ -1243,8 +1365,12 @@ def set_item(cfg: Config, repo: Path, item_id: str, pairs: list[str]) -> list[st
             fields[key] = value
     if not fields:
         raise Invalid("nothing to set: give key=value pairs")
+    was = _status_of(cfg, repo, item_id)
     backlog_file.set_fields(path, item_id, fields)
-    return [f"{item_id}: set {', '.join(fields)} in {path.name} (not committed)"]
+    lines = [f"{item_id}: set {', '.join(fields)} in {path.name} (not committed)"]
+    if fields.get("status") in REOPENED:
+        lines += release_on_reopen(cfg, repo, item_id, was)
+    return lines
 
 
 def set_status(cfg: Config, repo: Path, item_id: str, status: str) -> list[str]:
@@ -1254,8 +1380,98 @@ def set_status(cfg: Config, repo: Path, item_id: str, status: str) -> list[str]:
     path = _backlog_path(cfg, repo)
     if status == "done":
         _refuse_live(cfg, repo, item_id)
+    was = _status_of(cfg, repo, item_id)
     backlog_file.set_fields(path, item_id, {"status": status})
-    return [f"{item_id}: status set to {status} in {path.name} (not committed)"]
+    lines = [f"{item_id}: status set to {status} in {path.name} (not committed)"]
+    if status in REOPENED:
+        lines += release_on_reopen(cfg, repo, item_id, was)
+    return lines
+
+
+# --------------------------------------------------------------------------- claims: a person frees one
+
+REOPENED = ("ready", "backlog")  # the statuses a `done` item is reopened to
+
+
+def _status_of(cfg: Config, repo: Path, item_id: str) -> str:
+    """The status of `item_id` in the backlog file in the working tree now, or "" when it is not there."""
+    try:
+        found = work_source.item(cfg, Path(repo), item_id)
+    except Exception:  # the edit that follows says what is wrong with the file
+        return ""
+    return found.status if found is not None else ""
+
+
+def _by(held: claims.Claim) -> str:
+    """Who holds `held`, for a line a person reads: only validated fields, one line, cut short."""
+    return claim_sync._cut(f"{held.by} ({held.phase}, {held.status})")
+
+
+def release_item(cfg: Config, repo: Path, item_id: str) -> list[str]:
+    """`backlog release <id>`: free the claim on `item_id` on `origin`, whoever holds it and however old it is (an
+    unreadable one too). The lines to print: the claimant, and, when a run of this clone holds that claim (its
+    `state["claim"]` names the item, is unreleased and not lost, and is this run's or this sha's), that a live run's
+    next change to the claim stops it with `claim_lost` (a finished run makes none);
+    `no claim on <id>` when there was none. `Invalid` outside a `backlog` pack, `ValueError` for a bad id and
+    `Refused` when `origin` can't be reached or another claim took the ref meanwhile."""
+    repo = Path(repo)
+    _backlog_path(cfg, repo)
+    try:
+        freed = claims.release_item(cfg, repo, item_id)
+    except claims.ClaimError as exc:
+        raise Refused(f"could not free the claim on {item_id}: {claim_sync._cut(exc)}") from exc
+    if freed is None:
+        return [f"no claim on {item_id}"]
+    if freed.unreadable:
+        lines = [f"{item_id}: released an unreadable claim ({claim_sync._cut(freed.unreadable)})"]
+    else:
+        by, run_id, phase, status, updated = (claim_sync._cut(getattr(freed, key))
+                                              for key in ("by", "run", "phase", "status", "updated"))
+        lines = [f"{item_id}: released the claim of {by} (run {run_id}, {phase}, {status}, updated {updated})"]
+    for run in list_runs(repo):
+        try:
+            row = run.refresh().get("claim")
+        except Exception:  # one unreadable run is not a reason to look at no other
+            continue
+        if (not isinstance(row, dict) or row.get("item") != item_id or row.get("released") or row.get("lost")
+                or not (run.id == freed.run or row.get("sha") == freed.sha)):
+            continue  # not this claim, or one the run already lost or let go
+        if run.state["status"] in TERMINAL:
+            lines.append(f"run {run.id} ({run.state['status']}) holds this claim here but makes no more changes "
+                         "to it")
+        else:
+            lines.append(f"run {run.id} holds this claim here: its next change stops it with claim_lost")
+    return lines
+
+
+def release_on_reopen(cfg: Config, repo: Path, item_id: str, was: str) -> list[str]:
+    """After an item that was `done` (`was`) becomes `ready` or `backlog`: free its claim when the claim is a finished
+    one, the claim of the pack's last phase on an item that is `done` in the file at `origin/<fork_from>`. Any other
+    claim stays, and the line says whose it is (`left claim of <by> (<phase>, <status>)`). The lines to print; `[]`
+    when there is no claim or the item was not `done` (origin is not asked then). Never raises: a claim that can't be
+    read or freed is a line."""
+    if was != "done":
+        return []
+    repo = Path(repo)
+    try:
+        if not claims.enabled(cfg, repo):
+            return []
+        held = claims.read(cfg, repo, item_id)
+    except Exception as exc:
+        return [f"{item_id}: could not read the claim on origin ({claim_sync._cut(exc)}); it was left as it is"]
+    if held is None:
+        return []
+    try:
+        if held.unreadable:
+            return [f"{item_id}: left an unreadable claim ({claim_sync._cut(held.unreadable)}): "
+                    f"agentflow backlog release {item_id} frees it"]
+        fetch_remote_branch(repo, cfg.project.fork_from)
+        if held.phase == list(cfg.phases)[-1] and item_id in claim_sync._merged_ids(cfg, repo):
+            claims.release(cfg, repo, held)
+            return [f"{item_id}: released the finished claim of {_by(held)}"]
+        return [f"{item_id}: left claim of {_by(held)}; agentflow backlog release {item_id} frees it"]
+    except Exception as exc:
+        return [f"{item_id}: could not free the claim of {_by(held)} ({claim_sync._cut(exc)}); it was left"]
 
 
 def _spec_file(repo: Path, spec: str) -> str:
@@ -1450,9 +1666,10 @@ def add_file_item(cfg: Config, repo: Path, item: dict, sha: str) -> str:
         return backlog_file.append_item(path, new, expect_sha=sha)
 
 
-def edit_item(cfg: Config, repo: Path, item_id: str, fields: dict, sha: str) -> str:
+def edit_item(cfg: Config, repo: Path, item_id: str, fields: dict, sha: str) -> tuple[str, list[str]]:
     """Set `fields` (`EDIT_KEYS` only) of the item `item_id` in the work tree's backlog file (nothing is committed)
-    and return the file's new sha-256. The errors are those of `add_file_item`."""
+    and return the file's new sha-256, and the lines `release_on_reopen` has when a `done` item became `ready` or
+    `backlog`. The errors are those of `add_file_item`."""
     repo = Path(repo)
     path = _backlog_path(cfg, repo)
     sha = _sha_arg(sha)
@@ -1463,7 +1680,10 @@ def edit_item(cfg: Config, repo: Path, item_id: str, fields: dict, sha: str) -> 
         raise Invalid("nothing to set: send the fields to change")
     with _FILE_LOCK:
         _refuse_closing_live(cfg, repo, item_id, checked)
-        return backlog_file.set_fields(path, item_id, checked, expect_sha=sha)
+        was = _status_of(cfg, repo, item_id)
+        new_sha = backlog_file.set_fields(path, item_id, checked, expect_sha=sha)
+    notes = release_on_reopen(cfg, repo, item_id, was) if checked.get("status") in REOPENED else []
+    return new_sha, notes  # the claim is freed outside the lock: it waits on the network
 
 
 def move(cfg: Config, repo: Path, item_id: str, direction: Literal["up", "down"], sha: str) -> str:
@@ -1606,6 +1826,10 @@ def begin_start(cfg: Config, repo: Path, key: str, confirm: bool = False) -> Sta
             if item_lane == lane and "module" not in params:  # an issue-only card in the module lane
                 extra, new_module = _issue_run_params(cfg, item_lane, str(params["issue"]), pic)
                 params.update(extra)
+        module = params.get("module")
+        held = pic["claims"].get(module) if isinstance(module, str) else None
+        if held is not None and not _own_claim(module, held, pic["runs"]):  # the fast path: the start's claim decides
+            raise Refused(claims.one_line(claims.describe(held), NOTE_MAX))
         info = pic["view"].get(key)
         if info and info["blocked_by"]:
             raise Refused(f"{_label_of(key, pic)} is blocked: runs after "
@@ -1693,7 +1917,10 @@ def settle_interrupted(repo: Path) -> list[str]:
 
 def refresh(cfg: Config, repo: Path) -> dict:
     """Bring the base branch up to date, re-assess the map modules and re-check what cards run after. In a `backlog`
-    pack it records the items of the file at the `fork_from` tip (`committed_items`), for the cards' `local` badge.
+    pack it records the items of the file at the `fork_from` tip (`committed_items`), for the cards' `local` badge,
+    and, after releasing this clone's merged claims, caches every claim on `origin` (`claims`, `claims_note`; when
+    `origin` can't be read, the note says so and the claims read last time stay) and the items `done` in the file at
+    `origin/<fork_from>` (`origin_done`), whose claims the Board hides.
 
     It only refreshes what the cards show and never starts anything. It skips the assessment when
     `agentflow queue` holds the queue lock."""
@@ -1703,20 +1930,30 @@ def refresh(cfg: Config, repo: Path) -> dict:
     note = sync_branch(repo, cfg.project.fork_from) if module_queue.backlog_settings(cfg).get("sync_base", False) else ""
     # origin/<fork_from> is where a merged plan lands; fetching it never touches a local branch or the work tree
     fetch_remote_branch(repo, cfg.project.fork_from)
+    claim_sync.release_merged(cfg, repo)  # this clone's own merged runs only; it pushes nothing for any other
+    # then every claim on origin, for the Board to show (it reads and fetches; it never pushes)
+    held, claims_note = claims.survey(cfg, repo, _cached_claims(cfg, _load_state(repo)))
     skipped = False
     try:
         with module_queue.queue_lock(repo):
             if _map_nodes(cfg, repo):
-                module_queue.assess_modules(cfg, repo)
+                module_queue.assess_modules(cfg, repo, remote=(held, claims_note))
             merged = _recheck_after(cfg, repo)
     except module_queue.QueueBusy:
         skipped, merged = True, None
-    changes: dict[str, Any] = {"sync_note": note, "at": datetime.now(UTC).isoformat(timespec="seconds")}
+    changes: dict[str, Any] = {"sync_note": note, "at": datetime.now(UTC).isoformat(timespec="seconds"),
+                               "claims_note": claims_note}
+    if held is not None:  # origin could not be read: the claims read last time stay
+        changes["claims"] = {item_id: dataclasses.asdict(found) for item_id, found in held.items()}
     if merged is not None:
         changes["merged"] = merged
     if work_source.kind(cfg) == "backlog":  # what the Board's `local` badge compares with: the commit a run forks from
         tip = commit_at(repo, cfg.project.fork_from)
         changes["committed_items"] = {i.id: _committed(i) for i in work_source.items_at(cfg, repo, tip)} if tip else {}
+        # the items done on origin, which hide a claim left on them (D5) before this checkout pulls the merge
+        remote_tip = commit_at(repo, f"refs/remotes/origin/{cfg.project.fork_from}")
+        changes["origin_done"] = sorted(
+            i.id for i in (work_source.items_at(cfg, repo, remote_tip) if remote_tip else []) if i.status == "done")
     _save_state(repo, **changes)
     return {"note": note, "skipped": skipped, "issues_note": issues_note, "alerts_note": alerts_note}
 

@@ -43,8 +43,9 @@ Routes:
   on a worker thread, one start at a time. Nothing starts by itself: only these calls start work.
 - `POST /api/backlog/file` (a `backlog` pack: `op` `add` with `item`, `edit` with `id` and `fields`, or `move` with
   `id` and `direction`, and always `sha256`, the board's `backlog_sha256`) edits `backlog.yml` in the working tree and
-  never commits. It answers 200 `{ok, sha256}` (the file's new sha), 409 when the file changed since the page read it
-  or a `done`/`dropped` status meets a live run, and 400 for a bad key, value or edit.
+  never commits. It answers 200 `{ok, sha256, notes}` (the file's new sha, and the lines about the claim of a `done`
+  item an edit reopened), 409 when the file changed since the page read it or a `done`/`dropped` status meets a
+  live run, and 400 for a bad key, value or edit.
 - `GET /api/config` (the Settings page: the config's text, hash and form fields), `POST /api/config/preview` and
   `POST /api/config/save` with `base_sha256` and either `changes` (the form) or `text` (the YAML tab); see
   `config_edit`. A save is refused unless the new config validates, leaves the protected settings as they are and
@@ -174,8 +175,9 @@ def _text(body: dict, name: str, required: bool = False) -> str | None:
     return value
 
 
-def _file_edit(cfg: Config, repo: Path, body: dict) -> str:
-    """`POST /api/backlog/file`: one page edit of the backlog file in the working tree; the file's new sha-256.
+def _file_edit(cfg: Config, repo: Path, body: dict) -> tuple[str, list[str]]:
+    """`POST /api/backlog/file`: one page edit of the backlog file in the working tree; the file's new sha-256 and the
+    lines to show (`notes`: what happened to the claim of a `done` item that was reopened).
     `BadRequest` for a body that is not one op with exactly its keys; the rest is `backlog`'s to check."""
     op = body.get("op")
     if not isinstance(op, str) or op not in FILE_OPS:
@@ -189,14 +191,14 @@ def _file_edit(cfg: Config, repo: Path, body: dict) -> str:
     if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
         raise BadRequest("sha256 must be the backlog_sha256 the board sent")
     if op == "add":
-        return backlog.add_file_item(cfg, repo, body["item"], sha)
+        return backlog.add_file_item(cfg, repo, body["item"], sha), []
     item_id = _text(body, "id", required=True) or ""
     if op == "edit":
         return backlog.edit_item(cfg, repo, item_id, body["fields"], sha)
     direction = body["direction"]
     if direction not in ("up", "down"):
         raise BadRequest("direction must be up or down")
-    return backlog.move(cfg, repo, item_id, direction, sha)
+    return backlog.move(cfg, repo, item_id, direction, sha), []
 
 
 # --------------------------------------------------------------------------- actions
@@ -776,7 +778,8 @@ class _Handler(BaseHTTPRequestHandler):
                                    _text(body, "to_phase"))
                 self._json(200, {"ok": True, "key": f"card:{item.id}", "id": item.id})
             elif path == "/api/backlog/file":
-                self._json(200, {"ok": True, "sha256": _file_edit(server.cfg, server.repo, body)})
+                new_sha, notes = _file_edit(server.cfg, server.repo, body)
+                self._json(200, {"ok": True, "sha256": new_sha, "notes": notes})
             elif path == "/api/backlog/start":
                 key = self._start_key(body)
                 confirm = body.get("confirm", False)

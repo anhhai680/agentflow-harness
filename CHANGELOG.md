@@ -7,6 +7,22 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.11] - 2026-11-26
+
+### Added
+- In a backlog pack with an `origin` remote, starting an item claims it on `origin` (a one-file commit under `refs/agentflow/claims/<id>`, written with a leased push), and every phase and status change of its run moves the claim. A second start of a claimed item, by you or a teammate, is refused before any run, worktree or branch exists, and the message names the claimant. A start whose `origin` can't be reached is refused too, naming `backlog.claims: false`.
+- `backlog.claims` (default `true`), `backlog.claim_ref` (`refs` or `branch`, for a host that refuses custom refs) and `backlog.claim_stale_h` (hours, default 24) set how items are claimed.
+- `agentflow backlog release <id>` frees the claim on an item, whoever holds it (a stale or unreadable claim too). It works with `backlog.claims: false`.
+- The Board draws other machines' claims as read-only cards in their phase column (who holds it, the phase and status, and a stale mark), and `agentflow backlog list` and `agentflow queue` show them, so `queue` starts no item a teammate claimed. A claim on an item that is `done` on `origin` is hidden.
+- A run whose claim was freed or taken stops with `claim_lost`, naming the new claimant, and never pushes over it. A person settles it: `approve` claims the item again when it is free, `backlog release` frees the other claim, `cancel` ends the run. A failed push to an unreachable `origin` records `claim_sync_failed` and the run goes on.
+- A claim is released when its run ends `failed` or `cancelled`, or is archived, and after a merge: the machine that ran an item frees its claim when it sees the item `done` on `origin/<fork_from>` (in the CI watch, the Board's refresh of its own runs, or `archive`). Reopening a `done` item (`backlog set`, or the Board's Edit) frees its leftover claim.
+- `agentflow doctor` checks the claims on `origin` (a `claims` check, with one read-only `git ls-remote`, only with `backlog.claims` in a backlog pack).
+
+### Changed
+- `claim` is a reserved step id (the stop of a lost claim is `<phase>/claim`), and the Board's Edit of `backlog.yml` answers with `notes` about the claim of a reopened item.
+- A claim push that `origin` refuses is tried once more before the start is refused, and the refusal shows git's own message; it suggests `backlog.claim_ref: branch` only as a maybe (credentials or read-only access refuse a push too), and never to a pack already on `branch`.
+- When the release of a `failed`, `cancelled` or archived run's claim fails (say `origin` was unreachable), the claimant's next Board refresh or CI watch tries it again, so the item doesn't stay claimed.
+
 ## [3.10] - 2026-11-25
 
 ### Added

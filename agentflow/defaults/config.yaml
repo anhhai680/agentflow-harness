@@ -73,7 +73,12 @@ slots:
   count: 1        # live runs that each get their own {slot} (0 … count-1) in defaults.env and gate commands; 1 = off, at most 16
 
 backlog:
-  ignore_specs: []   # with work_source kind backlog: globs, relative to project.docs.specs, of spec files that are not backlog items
+  ignore_specs: []     # with work_source kind backlog: globs, relative to project.docs.specs, of spec files that are not backlog items
+  claims: true         # with work_source kind backlog and an origin: starting an item claims it on origin, so a teammate's start is refused
+  claim_ref: refs      # refs: refs/agentflow/claims/<id> (no branch listing); branch: refs/heads/agentflow/claims/<id> (visible in a branch list)
+                       # switch it only while no run holds a claim: a held claim stays on the old ref, and its run stops with claim_lost
+                       # (switch back and `agentflow backlog release <id>` frees it)
+  claim_stale_h: 24    # hours without a phase or status change after which other Boards show a claim as stale (1-720)
 
 queue:
   human_slot: 1   # with slots on, `agentflow queue` leaves this many slots free for a run you start by hand

@@ -38,8 +38,8 @@ from agentflow.state import Run
 CHANGES = ("added", "ready", "spec", "plan", "done")
 _ATTR = {"depends_on": "deps"}  # a backlog key -> its `BacklogItem` attribute, where they differ
 
-__all__ = ["CHANGES", "StartWrite", "after_output", "applies", "bring_in", "first_commit", "mark_done", "plan_start",
-           "replay", "write"]
+__all__ = ["CHANGES", "StartWrite", "after_output", "applies", "applies_to", "bring_in", "first_commit", "mark_done",
+           "plan_start", "replay", "write"]
 
 
 @dataclass(frozen=True)
@@ -57,10 +57,15 @@ class StartWrite:
 def applies(cfg: Config, run: Run, item: BacklogItem | None) -> bool:
     """Whether `run` writes to the backlog file: a `backlog` pack, and a run with a `module` param whose lane is the
     item's lane, or `module_queue.module_lane` when the item names none (or is None)."""
-    if backlog_path(cfg.work_source) is None or not run.state["params"].get("module"):
+    return applies_to(cfg, run.state["pipeline"], run.state["params"], item)
+
+
+def applies_to(cfg: Config, pipeline: str, params: dict, item: BacklogItem | None) -> bool:
+    """`applies` for a run of `pipeline` with `params` that does not exist yet (a start deciding what it claims)."""
+    if backlog_path(cfg.work_source) is None or not params.get("module"):
         return False
     lane = (item.lane if item is not None else "") or module_queue.module_lane(cfg)
-    return bool(lane) and run.state["pipeline"] == lane
+    return bool(lane) and pipeline == lane
 
 
 def _fields(before: BacklogItem | None, after: BacklogItem) -> dict[str, object]:

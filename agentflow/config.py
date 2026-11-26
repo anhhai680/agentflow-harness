@@ -223,7 +223,8 @@ CONFORMANCE_FAILED = "conformance_failed"  # the audit at `finish` found an obli
 RECONCILE_CHANGED = "reconcile_changed_conditions"  # a reconcile edit changed which steps of its phase run
 NEVER_RESOLVED = ("budget_exceeded", "phase_approval", "checkpoint", "condition", "max_rounds", "agent_unavailable",
                   CONFORMANCE_FAILED, RECONCILE_CHANGED, "preflight_failed", "environment",
-                  "new_advisory", "dependency_review_failed")  # a person accepts a head the dependency review stopped
+                  "new_advisory", "dependency_review_failed",  # a person accepts a head the dependency review stopped
+                  "claim_lost")  # a person decides whose claim the backlog item is
 PREFLIGHT_KEYS = ("enabled",)
 WATCHDOG_KEYS = ("no_progress_min", "read_only_idle_min")
 PARALLEL_KEYS = ("max_subagents", "serial_paths")
@@ -239,6 +240,7 @@ WATCHDOG_MAX_MIN = 1440  # `watchdog.no_progress_min` above a day is a typo, not
 USAGE_KEYS = ("governor", "five_hour_soft", "five_hour_hard", "seven_day_soft", "finish_first")
 USAGE_GOVERNORS = ("on", "observe", "off")
 GOVERNOR_STEP_ID = "governor"  # the usage governor's owner is `<phase>/governor`: no step's id
+CLAIM_STEP_ID = "claim"  # a lost backlog claim's stop is `<phase>/claim` (`claim_sync`): no step's id
 GATE_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # a gate's `group` or `resource`
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -273,6 +275,16 @@ REQUIRED_DOCS = ("specs", "plans")  # `project.docs` keys every pack sets; `idea
 # `backlog`: one item per entry of the YAML backlog file at `path` (default `backlog.yml`, `backlog_file.py`)
 WORK_SOURCE_KINDS = ("capability_map", "specs", "backlog")
 DEFAULT_BACKLOG_FILE = "backlog.yml"
+BACKLOG_POLICY_KEYS = ("ignore_specs", "claims", "claim_ref", "claim_stale_h")
+CLAIM_REFS = ("refs", "branch")
+CLAIM_STALE_H_MAX = 720
+
+
+def _is_int(value: object) -> bool:
+    """A whole number, which is never a bool (`true` is an `int` in Python)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 SKILLS_MAP_KEYS = ("decide", "define", "design_doc", "plan", "build", "build_small", "build_wave", "verify", "ship",
                    "review", "debug", "review_feedback", "doubt", "patch")  # review_feedback: the skill sent with blocking findings
 
@@ -301,9 +313,12 @@ class WorkSource:
 
 @dataclass
 class BacklogPolicy:
-    """`backlog:`: how the backlog file's work source lists the spec files no item names."""
+    """`backlog:`: how the backlog file's work source lists the spec files no item names, and how its items are claimed."""
 
     ignore_specs: tuple[str, ...] = ()  # globs, relative to `project.docs.specs`, of spec files that are not backlog items
+    claims: bool = True  # starting an item claims it on `origin`
+    claim_ref: Literal["refs", "branch"] = "refs"  # a claim is `refs/agentflow/claims/<id>` or `refs/heads/agentflow/claims/<id>`
+    claim_stale_h: int = 24  # hours without a change after which other Boards show a claim as stale
 
 
 @dataclass
@@ -1449,7 +1464,15 @@ def _backlog_policy(raw: dict) -> BacklogPolicy:
     block = _optional(raw, "backlog", "", dict, {})
     ignore = block.get("ignore_specs")
     globs = tuple(g for g in ignore if isinstance(g, str)) if isinstance(ignore, list) else ()
-    return BacklogPolicy(ignore_specs=globs)
+    defaults = BacklogPolicy()
+    claims = block.get("claims")
+    ref = block.get("claim_ref")
+    stale = block.get("claim_stale_h")
+    return BacklogPolicy(
+        ignore_specs=globs,
+        claims=claims if isinstance(claims, bool) else defaults.claims,
+        claim_ref=ref if ref in CLAIM_REFS else defaults.claim_ref,
+        claim_stale_h=stale if _is_int(stale) and 1 <= stale <= CLAIM_STALE_H_MAX else defaults.claim_stale_h)
 
 
 def _skills_map(raw: dict) -> dict[str, str]:
@@ -1933,6 +1956,9 @@ class _Validator:
             elif step.id == GOVERNOR_STEP_ID:
                 self.error(_join(step.path, "id"), f"step id '{step.id}' is reserved: the runner's usage governor "
                                                    f"uses `<phase>/{GOVERNOR_STEP_ID}`")
+            elif step.id == CLAIM_STEP_ID:
+                self.error(_join(step.path, "id"), f"step id '{step.id}' is reserved: the stop of a lost backlog "
+                                                   f"claim uses `<phase>/{CLAIM_STEP_ID}`")
             seen.add(step.id)
             if step.review is not None:
                 self.unique_ids([step.review], seen)
@@ -2401,8 +2427,17 @@ class _Validator:
             self.error("backlog", "must be a mapping")
             return
         for key in block:
-            if key != "ignore_specs":
-                self.error(f"backlog.{key}", "unknown key; known: ignore_specs")
+            if key not in BACKLOG_POLICY_KEYS:
+                self.error(f"backlog.{key}", f"unknown key; known: {', '.join(BACKLOG_POLICY_KEYS)}")
+        claims = block.get("claims")
+        if claims is not None and not isinstance(claims, bool):
+            self.error("backlog.claims", "must be true or false")
+        ref = block.get("claim_ref")
+        if ref is not None and ref not in CLAIM_REFS:
+            self.error("backlog.claim_ref", f"must be one of: {', '.join(CLAIM_REFS)}")
+        stale = block.get("claim_stale_h")
+        if stale is not None and not (_is_int(stale) and 1 <= stale <= CLAIM_STALE_H_MAX):
+            self.error("backlog.claim_stale_h", f"must be a whole number of hours, 1 to {CLAIM_STALE_H_MAX}")
         globs = block.get("ignore_specs")
         if globs is None:
             return

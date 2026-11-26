@@ -17,13 +17,13 @@ from pathlib import Path
 
 import pytest
 
-from agentflow import hitl, pack
+from agentflow import claims, hitl, pack
 from agentflow.config import RETRO_PIPELINE
 from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
 from agentflow.views import _badge, _strip, lane_phases, step_title
-from conftest import PYTHON_CONFIG, L, add_vuln_lane, awaiting, run_git, session_with_transcript
+from conftest import PYTHON_CONFIG, L, add_vuln_lane, awaiting, land_on_origin, run_git, session_with_transcript
 from test_vuln import _alert
 
 TOKEN = "k3y-" + "x" * 40
@@ -2591,3 +2591,26 @@ def test_the_cli_board_text_marks_a_no_fix_and_an_in_progress_alert_card(adash):
     assert _backlog_text(cards["alert:40"]).endswith(" (no fix yet)")
     assert _backlog_text({**cards["alert:42"], "status": "in_progress"}).endswith(" (in progress)")
     assert f"{cards['alert:40']['label']} (no fix yet)" in board_table(data)
+
+
+def test_a_reopening_edit_returns_the_claim_lines_as_notes(kdash, tmp_path):
+    sha = _block_file(kdash)
+    root, flow = kdash.flow.root, kdash.flow
+    code, _, raw = kdash.post("/api/backlog/file", {"op": "edit", "sha256": sha, "id": "r",
+                                                    "fields": {"title": "Renamed"}})
+    assert code == 200 and payload(raw)["notes"] == []
+    sha = payload(raw)["sha256"]
+    code, _, raw = kdash.post("/api/backlog/file", {"op": "edit", "sha256": sha, "id": "r",
+                                                    "fields": {"status": "done"}})
+    assert code == 200 and payload(raw)["notes"] == []  # closing an item is not a reopening
+    sha = payload(raw)["sha256"]
+    land_on_origin(flow, tmp_path, {"backlog.yml": (root / "backlog.yml").read_text(encoding="utf-8")})
+    claims.create(flow.cfg, root, "r", run="20261125-0900-feature-r", lane="feature", phase=list(flow.cfg.phases)[-1],
+                  status="waiting")
+    code, _, raw = kdash.post("/api/backlog/file", {"op": "edit", "sha256": sha, "id": "r",
+                                                    "fields": {"status": "ready"}})
+    answer = payload(raw)
+    assert code == 200 and answer["ok"] is True and len(answer["notes"]) == 1
+    assert "released" in answer["notes"][0] and "Test" in answer["notes"][0]
+    assert claims.read(flow.cfg, root, "r") is None
+    assert "status: ready" in (root / "backlog.yml").read_text(encoding="utf-8")

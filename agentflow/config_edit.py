@@ -37,7 +37,8 @@ from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from agentflow import layers
 from agentflow.config import (
-    CACHE_TTLS, KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ROUTE_MODES, ConfigError, Issue, load_config, validate,
+    CACHE_TTLS, CLAIM_REFS, CLAIM_STALE_H_MAX, KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ROUTE_MODES, ConfigError, Issue,
+    load_config, validate,
 )
 from agentflow.layers import PHASE_FREE_KEYS
 from agentflow.vuln import SEVERITIES as VULN_SEVERITIES
@@ -244,6 +245,9 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("dashboard", "backlog", "lane_labels"), "Lane labels", {"kind": "map", "value_kind": "text"}),
         (("backlog", "ignore_specs"), "Spec files that are not backlog items (globs under the specs folder)",
          {"kind": "list"}),
+        (("backlog", "claims"), "Claim an item on origin when a run starts it", {"kind": "bool"}),
+        (("backlog", "claim_ref"), "Where a claim lives on origin", {"kind": "enum", "options": list(CLAIM_REFS)}),
+        (("backlog", "claim_stale_h"), "Show a claim as stale after (h)", {"kind": "int", "min": 1, "max": CLAIM_STALE_H_MAX}),
     ]),
 ]
 
