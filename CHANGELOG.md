@@ -19,10 +19,11 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 ### Changed
 - `workspace list` and `--all` now report a root's child that git refuses, whose main checkout is outside the root, or whose path is not valid UTF-8, instead of dropping it silently.
 - A single-repository `agentflow dashboard` prints a `warning:` line when your user file's `workspace` block can't be read, and still serves the repository.
-- A workspace dashboard shows a repository whose `paths.state_dir` is inside its own checkout, or points at another repository's state, as `error` and does not serve it; the CLI and a single-repository dashboard are unaffected.
+- A workspace dashboard shows a repository whose `paths.state_dir` is inside the repository's own checkout, another workspace repository's checkout or a workspace root, or points at another repository's state, as `error` and does not serve it; the CLI and a single-repository dashboard are unaffected.
 
 ### Fixed
 - A user config file or a pack that is not valid UTF-8 is now a load error naming the file, for the CLI and the dashboard alike.
+- `agentflow dashboard` with a port outside 0 to 65535 (from `--port`, the user file or the pack) prints `error: dashboard.port …` and exits 1 instead of a traceback.
 
 ## [3.14] - 2026-11-26
 

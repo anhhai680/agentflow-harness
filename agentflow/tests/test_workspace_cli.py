@@ -373,6 +373,31 @@ def test_dashboard_with_a_bad_user_port_is_an_error(ws, cli, served):
     assert out.startswith("error: dashboard.port ") and "99999" in out
 
 
+@pytest.mark.parametrize("port", ["99999", "-1", "65536"])
+def test_dashboard_port_flag_out_of_range_is_an_error_in_both_modes(ws, cli, served, monkeypatch, port):
+    _, made = ws
+    code, out = cli("dashboard", f"--port={port}")  # the workspace, from outside it
+    assert code == 1 and served == []
+    assert out.startswith("error: dashboard.port ") and port in out
+    layers.user_config_path().unlink()
+    monkeypatch.chdir(made["alpha"])
+    code, out = cli("dashboard", f"--port={port}")  # one repository, as before
+    assert code == 1 and served == []
+    assert out.startswith("error: dashboard.port ") and port in out
+
+
+def test_dashboard_pack_port_out_of_range_is_an_error(tmp_path, monkeypatch, cli, served):
+    repo = make_repo(tmp_path, "alpha")
+    data = {**SPARSE_PACK, "dashboard": {"port": 70000}}
+    (repo / ".agentflow" / "config.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    monkeypatch.chdir(repo)
+    code, out = cli("dashboard")
+    assert code == 1 and served == []
+    assert out.startswith("error: dashboard.port ") and "70000" in out
+    code, out = cli("dashboard", "--port", "0")  # the flag still wins over the pack
+    assert code == 0 and served[-1][1][3] == 0
+
+
 def test_dashboard_port_in_use_adds_the_hint(ws, cli, monkeypatch):
     _, made = ws
 

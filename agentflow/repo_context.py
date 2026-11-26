@@ -172,7 +172,8 @@ def _inside(path: Path, folder: Path | None) -> bool:
     return folder is not None and path.is_relative_to(folder)
 
 
-def _refusal(ctx: RepoContext, holders: dict[Path, list[RepoContext]], state_root: Path | None) -> str | None:
+def _refusal(ctx: RepoContext, holders: dict[Path, list[RepoContext]], state_root: Path | None,
+             checkouts: list[tuple[RepoContext, Path | None]], roots: tuple[Path, ...]) -> str | None:
     """Why the live workspace context `ctx` may not use its runs directory, or None when it may."""
     if ctx.runs is None:
         return "its state directory (paths.state_dir) cannot be resolved"
@@ -184,21 +185,32 @@ def _refusal(ctx: RepoContext, holders: dict[Path, list[RepoContext]], state_roo
             return f"its state directory is shared with {', '.join(others)}"
         if owner is not ctx:
             return f"its state directory belongs to {owner.name}"
-    if _inside(ctx.runs, _resolved(ctx.repo)):
+    own = _resolved(ctx.repo)
+    if _inside(ctx.runs, own):
         return "its state directory is inside the repository"
+    for other, checkout in checkouts:
+        if other is not ctx and checkout != own and _inside(ctx.runs, checkout):
+            return f"its state directory is inside {other.name}'s checkout"
     if state_root is None:
         return "the agentflow state folder cannot be resolved"
-    if _inside(ctx.runs, state_root) and ctx.runs != _own_default(ctx):
-        return "its state directory is in the agentflow state folder but is not this repository's own"
+    if _inside(ctx.runs, state_root):
+        if ctx.runs != _own_default(ctx):
+            return "its state directory is in the agentflow state folder but is not this repository's own"
+        return None  # its own default, which the user's state folder holds even when a root holds that folder
+    root = next((r for r in roots if _inside(ctx.runs, r)), None)
+    if root is not None:
+        return f"its state directory is inside the workspace root {root}"
     return None
 
 
-def settle_dirs(contexts: list[RepoContext]) -> list[RepoContext]:
+def settle_dirs(contexts: list[RepoContext], roots: Iterable[Path] = ()) -> list[RepoContext]:
     """`contexts` in the same order, each live one that may not use its runs directory replaced by an `error` copy
     (a context is never changed in place). A directory several contexts hold stays with the one whose default it
     is, and with none when it is nobody's default; `missing` contexts hold theirs but are never refused here. A
-    live context's directory may not lie inside its own checkout, nor in the agentflow state folder unless it is
-    its own default there. Order-independent."""
+    live context's directory may not lie inside its own checkout, inside the checkout of any other context given
+    (in any state), inside one of the resolved workspace `roots`, nor in the agentflow state folder unless it is
+    its own default there (which a root may hold). A clone can ship a state directory; every folder a workspace
+    reads repositories from is one. Order-independent."""
     holders: dict[Path, list[RepoContext]] = {}
     for ctx in contexts:
         if ctx.state in ("live", "missing") and ctx.runs is not None:
@@ -207,9 +219,11 @@ def settle_dirs(contexts: list[RepoContext]) -> list[RepoContext]:
         state_root = _resolved(pack.user_state_root())
     except Exception:
         state_root = None
+    checkouts = [(ctx, _resolved(ctx.repo)) for ctx in contexts]
+    roots = tuple(roots)
     out = []
     for ctx in contexts:
-        reason = _refusal(ctx, holders, state_root) if ctx.state == "live" else None
+        reason = _refusal(ctx, holders, state_root, checkouts, roots) if ctx.state == "live" else None
         out.append(ctx if reason is None else _failed(ctx, reason))
     return out
 
@@ -220,7 +234,8 @@ def reconcile(current: dict[str, RepoContext], found: RepoSet,
     every other found repository is loaded again. A live or missing context of `current` that `found` no longer
     holds follows as a `missing` copy while `busy` says a runner is in it, and is dropped otherwise (an `error` or
     `not_set_up` one is dropped without asking); nothing else is read for it. The
-    runs-directory rule (`settle_dirs`) is applied over the found and the missing contexts together."""
+    runs-directory rule (`settle_dirs`) is applied over the found and the missing contexts together, with the
+    roots `found` was resolved from."""
     built: list[RepoContext] = []
     for ref in found.repos:
         old = current.get(ref.id)
@@ -233,13 +248,14 @@ def reconcile(current: dict[str, RepoContext], found: RepoSet,
     # runs directory of its own, so a lock found there (a clone can ship one) keeps nothing
     missing = [replace(ctx, state="missing") for key, ctx in current.items()
                if key not in ids and ctx.state in ("live", "missing") and busy(ctx)]
-    return {ctx.id: ctx for ctx in settle_dirs(built + missing)}
+    return {ctx.id: ctx for ctx in settle_dirs(built + missing, repo_set.root_folders(found.settings))}
 
 
 def repos_view(contexts: Iterable[RepoContext], skipped: Iterable[Skipped], default: str | None,
                user_error: str | None) -> dict:
-    """The `/api/repos` body. No checkout path is in it: a `skipped` entry is the setting as written, and an
-    `error` text may name a file, both for the token holder."""
+    """The `/api/repos` body. No context's checkout path is a field of it; a `skipped` entry is the setting as
+    written, and a skipped reason (a root child's main checkout outside that root) or an `error` text may name a
+    path, both for the token holder."""
     rows = []
     for ctx in contexts:
         live = ctx.state == "live" and ctx.cfg is not None
@@ -313,7 +329,7 @@ def plan_start(start: Path | None, config: Path | None) -> StartPlan:
             return StartPlan([], None, True, user, None)
         return _single(start, user, None)
     found = repo_set.resolve(user.workspace)
-    contexts = settle_dirs([load_context(ref) for ref in found.repos])
+    contexts = settle_dirs([load_context(ref) for ref in found.repos], repo_set.root_folders(user.workspace))
     prefer = left_out = None
     if start is not None:
         root = pack.checkout_root(start)

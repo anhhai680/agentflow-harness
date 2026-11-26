@@ -1164,10 +1164,12 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             if plan.user_error:  # the user file's workspace can't be read; this repository's pack loaded anyway
                 print(f"warning: {printable(plan.user_error)}")
             cfg = plan.contexts[0].cfg
-            port = args.port if args.port is not None else int(cfg.dashboard.get("port", 7788))
+            # the flag or the pack's port, range-checked: a port past 65535 would reach the bind as an OverflowError
+            port = dashboard.port_of({"port": args.port if args.port is not None
+                                      else int(cfg.dashboard.get("port", 7788))})
             dashboard.serve(start, cfg, str(cfg.dashboard.get("host", "127.0.0.1")), port, token, config=config)
         else:
-            port = args.port if args.port is not None else dashboard.port_of(plan.user.dashboard)
+            port = dashboard.port_of({"port": args.port} if args.port is not None else plan.user.dashboard)
             _dashboard_notes(plan)
             dashboard.serve_workspace(plan.contexts, plan.user, str(plan.user.dashboard.get("host", "127.0.0.1")),
                                       port, token, prefer=plan.prefer, user_error=plan.user_error,

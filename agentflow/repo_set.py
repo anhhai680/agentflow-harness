@@ -121,6 +121,20 @@ def _main_checkout(candidate: Path) -> Path | None:
         return None
 
 
+def root_folders(settings: layers.WorkspaceSettings) -> tuple[Path, ...]:
+    """The `roots` of `settings` that are folders, each resolved as `resolve` resolves it; one that can't be read
+    or isn't a folder is left out. Never raises."""
+    out: list[Path] = []
+    for entry in settings.roots:
+        try:
+            root = Path(entry).expanduser()
+            if root.is_dir():
+                out.append(root.resolve())
+        except _UNREADABLE:
+            continue
+    return tuple(out)
+
+
 def resolve(settings: layers.WorkspaceSettings) -> RepoSet:
     """The repositories of `settings`: each root's child repositories in name order, then the `repos` entries,
     each as its main checkout and once, with `exclude` applied last. An entry that cannot be read is `Skipped`

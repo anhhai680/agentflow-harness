@@ -399,6 +399,73 @@ def test_a_runs_directory_inside_its_own_checkout_is_an_error_for_a_workspace_co
     assert single.state == "live" and single.runs is None and repo_context.usable(single)
 
 
+def found_in(root: Path, *paths: Path, exclude: tuple[str, ...] = ()) -> RepoSet:
+    """`paths` as a workspace whose settings name the root `root`."""
+    return RepoSet(layers.WorkspaceSettings((str(root),), (), exclude), tuple(ref_of(p) for p in paths), ())
+
+
+def test_a_runs_directory_inside_another_workspace_checkout_is_an_error(tmp_path):
+    root = tmp_path / "ws"
+    beta = make_repo(root, "beta")
+    alpha = make_repo(root, "alpha")
+    for value in ("../beta/shipped-state", beta / "shipped-state"):
+        with_state_dir(alpha, value)
+        for order in ((alpha, beta), (beta, alpha)):
+            settled = {c.name: c for c in repo_context.settle_dirs([ctx_of(p) for p in order])}
+            assert settled["beta"].state == "live"
+            assert settled["alpha"].state == "error"
+            assert "its state directory is inside beta's checkout" in settled["alpha"].error
+        result = repo_context.reconcile({}, found(alpha, beta))
+        assert [c.state for c in result.values()] == ["error", "live"]
+    # the other checkout counts in any state: one with no pack, and one that left while busy
+    bare = make_repo(root, "bare", with_pack=False)
+    with_state_dir(alpha, bare / "shipped-state")
+    settled = repo_context.settle_dirs([ctx_of(alpha), ctx_of(bare)])
+    assert [c.state for c in settled] == ["error", "not_set_up"] and "bare's checkout" in settled[0].error
+    leaver = make_repo(tmp_path, "leaver")
+    with_state_dir(alpha, leaver / "shipped-state")
+    current = repo_context.reconcile({}, found(leaver))
+    result = repo_context.reconcile(current, found(alpha), busy=lambda ctx: True)
+    assert result[ref_of(leaver).id].state == "missing"
+    assert result[ref_of(alpha).id].state == "error" and "leaver's checkout" in result[ref_of(alpha).id].error
+
+
+def test_a_runs_directory_under_a_workspace_root_is_an_error(tmp_path):
+    root = tmp_path / "ws"
+    alpha = make_repo(root, "alpha")
+    beta = make_repo(root, "beta")
+    plain = root / "plain"
+    plain.mkdir()
+    for target in (beta / "shipped-state", plain / "shipped-state", root / "shipped-state"):
+        with_state_dir(alpha, target)
+        # beta is not a context: excluded, or never a repository at all
+        (ctx,) = repo_context.settle_dirs([ctx_of(alpha)], roots=(root.resolve(),))
+        assert ctx.state == "error"
+        assert f"its state directory is inside the workspace root {root.resolve()}" in ctx.error
+        result = repo_context.reconcile({}, found_in(root, alpha, exclude=("beta",)))
+        assert result[ref_of(alpha).id].state == "error" and "workspace root" in result[ref_of(alpha).id].error
+    # a root that can't be resolved is skipped, not a refusal of every repository
+    with_state_dir(alpha, tmp_path / "elsewhere-state")
+    for settings_root in (tmp_path / "nowhere", "~nosuchuser/ws"):
+        result = repo_context.reconcile({}, found_in(settings_root, alpha))
+        assert result[ref_of(alpha).id].state == "live"
+
+
+def test_a_runs_directory_outside_every_root_and_checkout_stays_live(tmp_path):
+    root = tmp_path / "ws"
+    alpha = with_state_dir(make_repo(root, "alpha"), tmp_path / "elsewhere-state")
+    beta = make_repo(root, "beta")  # its own default under the user state root
+    result = repo_context.reconcile({}, found_in(root, alpha, beta))
+    assert [c.state for c in result.values()] == ["live", "live"]
+    # the user state root may itself lie under a root (`roots: [~]` with the default `~/.local/state`): a
+    # repository's own default there stays live
+    assert pack.user_state_root().resolve().is_relative_to(tmp_path.resolve())
+    result = repo_context.reconcile({}, found_in(tmp_path, beta))
+    assert [c.state for c in result.values()] == ["live"]
+    with_state_dir(beta, default_dir(beta))
+    assert repo_context.settle_dirs([ctx_of(beta)], roots=(tmp_path.resolve(),))[0].state == "live"
+
+
 def test_usable_is_false_once_the_packs_state_dir_changes(tmp_path):
     repo = make_repo(tmp_path, "alpha")
     ctx = ctx_of(repo)
@@ -515,6 +582,21 @@ def test_plan_start_applies_the_shared_runs_directory_rule_from_the_first_reques
     assert list(by) == ["aaa-evil", "billing"]
     assert by["aaa-evil"].state == "error" and "billing" in by["aaa-evil"].error
     assert by["billing"].state == "live"
+
+
+def test_plan_start_refuses_a_state_directory_in_another_checkout_or_under_a_root(tmp_path):
+    root = tmp_path / "ws"
+    make_repo(root, "beta")
+    with_state_dir(make_repo(root, "alpha"), "../beta/shipped-state")
+    excluded = make_repo(root, "excluded")
+    with_state_dir(make_repo(root, "gamma"), excluded / "shipped-state")
+    user_text(yaml.safe_dump({"workspace": {"roots": [str(root)], "exclude": ["excluded"]}}))
+    plan = repo_context.plan_start(None, None)
+    by = {c.name: c for c in plan.contexts}
+    assert list(by) == ["alpha", "beta", "gamma"]
+    assert by["alpha"].state == "error" and "beta's checkout" in by["alpha"].error
+    assert by["beta"].state == "live"
+    assert by["gamma"].state == "error" and "workspace root" in by["gamma"].error
 
 
 def test_plan_start_outside_the_workspace_serves_the_workspace_alone(tmp_path):
