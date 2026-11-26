@@ -115,16 +115,40 @@ def _no_cycle(node: Any, path: Path, ancestors: set[int], done: set[int], depth:
     done.add(id(node))
 
 
+MAX_EXPANDED_NODES = 100_000  # a file whose aliases expand past this many values is refused (the shipped ones hold < 1000)
+
+
+def expanded_size(node: Any) -> int:
+    """How many values `node` holds once every YAML alias is copied out: 1 for a scalar, 1 plus its children's sizes
+    for a mapping (its values; keys are not counted) or a list. A shared node is computed once and counted once per
+    use, so nine anchored lists of nine references each cost 81 steps, not 9**9. Call it only on a value
+    `_no_cycle` accepted: that bounds the depth of the recursion and rules out a node that contains itself."""
+    memo: dict[int, int] = {}
+
+    def size(value: Any) -> int:
+        if not isinstance(value, (dict, list)):
+            return 1
+        key = id(value)
+        if key not in memo:
+            memo[key] = 1 + sum(size(child) for child in (value.values() if isinstance(value, dict) else value))
+        return memo[key]
+
+    return size(node)
+
+
 def _read(path: Path, what: str = "layer", *, empty_ok: bool = False) -> dict:
-    """A layer file's mapping. A file that cannot be read, is not YAML, holds a value that contains itself or nests
-    too deep, or is not a mapping at the top level (an empty one is `{}` when `empty_ok`) is a `LayerError`."""
+    """A layer file's mapping. A file that cannot be read, is not YAML, holds a value that contains itself, nests
+    too deep or expands past `MAX_EXPANDED_NODES` values, or is not a mapping at the top level (an empty one is `{}` when `empty_ok`) is a `LayerError`."""
     try:
         loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
         _no_cycle(loaded, path, set(), set())
+        too_big = expanded_size(loaded) > MAX_EXPANDED_NODES
     except (OSError, yaml.YAMLError) as exc:
         raise LayerError(str(path), f"cannot read the {what} file: {exc}") from exc
     except RecursionError as exc:
         raise LayerError(str(path), f"the {what} file is nested too deeply to read") from exc
+    if too_big:
+        raise LayerError(str(path), f"expands to more than {MAX_EXPANDED_NODES} values (nested aliases)")
     if loaded is None and empty_ok:
         return {}
     if not isinstance(loaded, dict):

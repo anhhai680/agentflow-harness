@@ -280,6 +280,13 @@ def _layers(path: Path, text: str) -> _Layers:
     pack that does not load at all falls back to the file alone, as the form was before the layers."""
     project = yaml.safe_load(text) or {}
     project = project if isinstance(project, dict) else {}
+    try:  # every walk below copies each alias out: refuse a file whose aliases expand without bound first
+        too_big = layers.expanded_size(project) > layers.MAX_EXPANDED_NODES
+    except RecursionError:  # an anchor that refers to itself, or nesting deeper than any walk here can follow
+        too_big = True
+    if too_big:
+        raise EditError(f"{path.name} expands to more than {layers.MAX_EXPANDED_NODES} values (nested aliases) or "
+                        "nests too deep; fix it in git")
     comments = _comments(text)
     try:
         cfg = load_config(path)

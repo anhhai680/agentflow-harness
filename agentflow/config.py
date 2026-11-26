@@ -1500,15 +1500,18 @@ def _no_cycle(node: Any, path: Path, ancestors: set[int], done: set[int], depth:
 
 
 def _read_yaml(path: Path) -> Any:
-    """`path` parsed. A file that can't be read, isn't YAML or holds a value that contains itself is a `ConfigError`
-    naming it, never a traceback."""
+    """`path` parsed. A file that can't be read, isn't YAML, holds a value that contains itself or expands past
+    `layers.MAX_EXPANDED_NODES` values is a `ConfigError` naming it, never a traceback."""
     try:
         loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
         _no_cycle(loaded, path, set(), set())
+        too_big = layers.expanded_size(loaded) > layers.MAX_EXPANDED_NODES
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError("", f"cannot read {path}: {exc}") from exc
     except RecursionError as exc:
         raise ConfigError("", f"{path} is nested too deeply to read") from exc
+    if too_big:
+        raise ConfigError("", f"{path} expands to more than {layers.MAX_EXPANDED_NODES} values (nested aliases)")
     return loaded
 
 

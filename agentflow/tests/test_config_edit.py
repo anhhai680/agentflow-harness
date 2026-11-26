@@ -1501,3 +1501,34 @@ def test_the_settings_form_saves_the_claim_keys(sparse_repo):
 def test_the_settings_form_refuses_a_bad_claim_value(sparse_repo, key, value):
     with pytest.raises(EditError):
         _sparse_form(_sparse(sparse_repo), (["backlog", key], value))
+
+
+def _mapping_bomb() -> str:
+    """Nine anchored mappings, each holding nine references to the one before: 9**9 values once expanded. Mappings,
+    because the Settings page's walks (`leaf_keys`, the line comments) follow mappings."""
+    keys = [f"k{n}" for n in range(9)]
+    lines = ["b0: &b0 {" + ", ".join(f"{k}: x" for k in keys) + "}"]
+    lines += [f"b{i}: &b{i} {{" + ", ".join(f"{k}: *b{i - 1}" for k in keys) + "}" for i in range(1, 9)]
+    return "\n".join(lines) + "\n"
+
+
+def test_the_settings_page_refuses_a_pack_of_nested_aliases_quickly(shipped):
+    import time
+
+    shipped.write_text(SHIPPED + _mapping_bomb(), encoding="utf-8")
+    started = time.monotonic()
+    with pytest.raises(EditError, match="nested aliases"):
+        config_edit.form_fields(shipped)
+    with pytest.raises(EditError, match="nested aliases"):
+        form(shipped, (["defaults", "step_timeout_min"], 60))
+    assert time.monotonic() - started < 2
+
+
+def test_a_yaml_tab_text_of_nested_aliases_is_refused_quickly(shipped):
+    import time
+
+    _, sha = config_edit.read(shipped)
+    started = time.monotonic()
+    proposal = config_edit.propose(shipped, sha, text=SHIPPED + _mapping_bomb(), repo=REPO)
+    assert time.monotonic() - started < 2
+    assert any("nested aliases" in issue.message for issue in proposal.errors)

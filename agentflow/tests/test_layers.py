@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from pathlib import Path
 
 import pytest
@@ -629,3 +630,66 @@ def test_an_agent_only_a_pack_defines_is_fine_for_the_user_level_loader():
     with pytest.raises(LayerError, match="no agent `mypackagent`"):
         check_user(data, {}, target)
     check_user(data, {}, target, any_agent=True)
+
+
+def nested_alias_bomb(levels: int = 9, width: int = 9) -> str:
+    """`levels` anchored lists, each holding `width` references to the one before: `width ** levels` values once
+    every alias is copied out, a few hundred bytes on disk."""
+    lines = [f"a0: &a0 [{', '.join(['x'] * width)}]"]
+    for i in range(1, levels):
+        lines.append(f"a{i}: &a{i} [{', '.join([f'*a{i - 1}'] * width)}]")
+    return "\n".join(lines) + "\n"
+
+
+def test_a_pack_of_nested_aliases_is_refused_quickly(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(nested_alias_bomb(), encoding="utf-8")
+    started = time.monotonic()
+    with pytest.raises(LayerError) as err:
+        layers._read(path)
+    assert time.monotonic() - started < 2
+    assert str(path) in str(err.value) and "nested aliases" in str(err.value)
+
+
+def test_expanded_size_counts_each_use_of_a_shared_node():
+    assert layers.expanded_size("x") == 1
+    assert layers.expanded_size(None) == 1
+    assert layers.expanded_size({"a": [1, 2], "b": [1, 2]}) == 7  # the mapping, two lists, four scalars
+    shared = list(range(10))
+    assert layers.expanded_size({"a": shared, "b": shared, "c": shared}) == 1 + 3 * (1 + 10)
+    loaded = yaml.safe_load(nested_alias_bomb(levels=3, width=3))
+    assert loaded["a2"][0] is loaded["a1"]  # one shared node, used three times
+    # a0: 1+3; a1: 1+3*4 = 13; a2: 1+3*13 = 40; the top mapping: 1+4+13+40
+    assert layers.expanded_size(loaded) == 58
+
+
+def test_the_budget_boundary(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({"k": ["x"] * (layers.MAX_EXPANDED_NODES - 2)}), encoding="utf-8")
+    assert len(layers._read(path)["k"]) == layers.MAX_EXPANDED_NODES - 2  # mapping + list + scalars == the budget
+    path.write_text(yaml.safe_dump({"k": ["x"] * (layers.MAX_EXPANDED_NODES - 1)}), encoding="utf-8")
+    with pytest.raises(LayerError, match="nested aliases"):
+        layers._read(path)
+    assert layers.expanded_size({"k" * 10_000: 1, "j" * 10_000: 2}) == 3  # keys are not counted
+
+
+def test_an_ordinary_anchored_pack_still_loads(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "gates: &g {unit: {run: pytest}, lint: {run: ruff}}\n"
+        "gate_sets: {build: *g, verify: *g, review: *g, ship: *g}\n",
+        encoding="utf-8",
+    )
+    assert layers._read(path)["gate_sets"]["ship"]["unit"] == {"run": "pytest"}
+    assert layers.base_layers(None)[0].data
+    for name in layers.starter_names():
+        assert layers.base_layers(name)[1].data is not None
+
+
+def test_a_user_file_of_nested_aliases_is_refused_by_load_user_settings():
+    target = layers.user_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(nested_alias_bomb(), encoding="utf-8")
+    with pytest.raises(LayerError) as err:
+        load_user_settings()
+    assert str(target) in str(err.value) and "nested aliases" in str(err.value)

@@ -3433,3 +3433,28 @@ def test_backlog_checks_only_run_for_a_backlog_pack(tmp_cfg, tmp_path):
     (tmp_path / "backlog.yml").write_text("version: 2\n", encoding="utf-8")
     baseline = [(i.level, i.path) for i in validate(load_config(tmp_cfg(None)), tmp_path)]
     assert not [p for _, p in baseline if p.startswith("backlog")]
+
+
+def _nested_alias_bomb() -> str:
+    lines = ["a0: &a0 [x, x, x, x, x, x, x, x, x]"]
+    lines += [f"a{i}: &a{i} [{', '.join([f'*a{i - 1}'] * 9)}]" for i in range(1, 9)]
+    return "\n".join(lines) + "\n"
+
+
+def test_load_config_refuses_nested_aliases(tmp_cfg):
+    import time
+
+    path = tmp_cfg()
+    path.write_text(path.read_text(encoding="utf-8") + _nested_alias_bomb(), encoding="utf-8")
+    started = time.monotonic()
+    with pytest.raises(ConfigError) as err:
+        load_config(path)
+    assert time.monotonic() - started < 2
+    assert str(path) in str(err.value) and "nested aliases" in str(err.value)
+    user = _user_file(_nested_alias_bomb())
+    with pytest.raises(ConfigError) as err:
+        load_config(PYTHON_CONFIG)
+    assert str(user) in str(err.value) and "nested aliases" in str(err.value)
+    with pytest.raises(layers.LayerError) as err:
+        layers.load_user_settings()
+    assert str(user) in str(err.value) and "nested aliases" in str(err.value)
