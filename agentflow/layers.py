@@ -25,7 +25,10 @@ PHASE_FREE_KEYS = ("needs_approval", "resolve", "model", "agent")  # the rest of
 USER_KEYS = (  # dotted patterns of the settings that are personal; `*` matches exactly one segment
     "agents.*.models", "agents.claude.user_settings", "defaults.run_budget_usd", "defaults.run_budget_hard_usd",
     "defaults.task_budget_usd", "hitl.notify", "hitl.remind_after_h", "dashboard.port", "usage.*",
+    "workspace.roots", "workspace.repos", "workspace.exclude", "dashboard.board_refresh_s", "dashboard.done_shown",
 )
+MAX_WORKSPACE_ENTRIES = 256  # per list of `workspace`: a hand-written file never nears it, a hostile one is cut off
+WORKSPACE_KEYS = ("roots", "repos", "exclude")
 _WHOLE_ENTRIES = (("record_step",), ("resolve_step",))  # replaced whole, like each entry of `conditions`/`gates`
 _WHOLE_PARENTS = ("conditions", "gates", "policy.obligations")  # dotted: each entry below one is replaced whole
 _WHOLE_PARENT_KEYS = tuple(tuple(dotted.split(".")) for dotted in _WHOLE_PARENTS)
@@ -93,13 +96,39 @@ def base_layers(starter: object) -> list[Layer]:
     return stack
 
 
-def _read(path: Path) -> dict:
+MAX_DEPTH = 64  # a layer file nested deeper than this is refused: no layer needs it, and every pass recurses
+
+
+def _no_cycle(node: Any, path: Path, ancestors: set[int], done: set[int], depth: int = 0) -> None:
+    """Refuse a value that contains itself (a YAML anchor used inside its own node) or nests past `MAX_DEPTH`;
+    each shared node (an anchor used twice) is walked once."""
+    if not isinstance(node, (dict, list)) or id(node) in done:
+        return
+    if id(node) in ancestors:
+        raise LayerError(str(path), "holds a YAML anchor that refers to itself")
+    if depth > MAX_DEPTH:
+        raise LayerError(str(path), f"is nested more than {MAX_DEPTH} levels deep")
+    ancestors.add(id(node))
+    for child in node.values() if isinstance(node, dict) else node:
+        _no_cycle(child, path, ancestors, done, depth + 1)
+    ancestors.discard(id(node))
+    done.add(id(node))
+
+
+def _read(path: Path, what: str = "layer", *, empty_ok: bool = False) -> dict:
+    """A layer file's mapping. A file that cannot be read, is not YAML, holds a value that contains itself or nests
+    too deep, or is not a mapping at the top level (an empty one is `{}` when `empty_ok`) is a `LayerError`."""
     try:
         loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        _no_cycle(loaded, path, set(), set())
     except (OSError, yaml.YAMLError) as exc:
-        raise LayerError(str(path), f"cannot read the layer file: {exc}") from exc
+        raise LayerError(str(path), f"cannot read the {what} file: {exc}") from exc
+    except RecursionError as exc:
+        raise LayerError(str(path), f"the {what} file is nested too deeply to read") from exc
+    if loaded is None and empty_ok:
+        return {}
     if not isinstance(loaded, dict):
-        raise LayerError(str(path), "a layer file must hold a mapping at the top level")
+        raise LayerError(str(path), f"a {what} file must hold a mapping at the top level")
     return loaded
 
 
@@ -226,8 +255,9 @@ def _text_keys(data: Any, path: Path, prefix: Key = ()) -> None:
         _text_keys(value, path, (*prefix, key))
 
 
-def check_user(data: dict, lower: dict, path: Path) -> None:
-    """Refuse a user file that holds anything but `USER_KEYS`, or names an agent the layers below don't define."""
+def check_user(data: dict, lower: dict, path: Path, *, any_agent: bool = False) -> None:
+    """Refuse a user file that holds anything but `USER_KEYS`, or names an agent the layers below don't define
+    (`any_agent` skips that check: a caller with no pack cannot know the agents a pack defines)."""
     if not isinstance(data, dict):
         raise LayerError(str(path), "a user config file is a mapping of personal settings")
     _text_keys(data, path)
@@ -242,7 +272,7 @@ def check_user(data: dict, lower: dict, path: Path) -> None:
             raise LayerError(where, _NOT_PERSONAL)
         node: Any = lower
         for segment, key in zip(segments, leaf):
-            if segment == "*" and not (isinstance(node, dict) and key in node):
+            if segment == "*" and not any_agent and not (isinstance(node, dict) and key in node):
                 raise LayerError(where, f"no agent `{key}` in the pack")
             node = node.get(key) if isinstance(node, dict) else None
 
@@ -255,3 +285,88 @@ def origin_of(origins: dict[Key, str], dotted: str) -> str | None:
         if parts[: len(key)] == key and (best is None or len(key) > len(best)):
             best = key
     return origins[best] if best is not None else None
+
+
+class WorkspaceSettings(NamedTuple):
+    roots: tuple[str, ...]  # folders whose child repositories belong to the workspace
+    repos: tuple[str, ...]  # single repositories
+    exclude: tuple[str, ...]  # a path, or a bare folder name, to leave out
+
+
+class UserSettings(NamedTuple):
+    workspace: WorkspaceSettings
+    dashboard: dict  # the merged `dashboard` block: host, port, and board_refresh_s / done_shown when set
+    path: Path | None  # the user file, when it exists
+
+
+def _path_shaped(entry: str) -> bool:
+    """`/...`, `~` or `~/...`: never relative and never `~user`."""
+    return entry.startswith("/") or entry == "~" or entry.startswith("~/")
+
+
+def workspace_settings(block: object) -> WorkspaceSettings:
+    """The `workspace` block as three tuples of entries; None (no block) is all empty.
+
+    Every entry is checked here once, so a reader can take the shape as given: text that is not empty, at most
+    `MAX_WORKSPACE_ENTRIES` per list. A `roots` or `repos` entry, and an `exclude` entry that holds a `/` or starts
+    with `~`, is an absolute path or one under the home directory (`~`, `~/...`); an `exclude` entry with neither is
+    a bare folder name. A `LayerError` names `workspace.<key>`."""
+    if block is None:
+        return WorkspaceSettings((), (), ())
+    if not isinstance(block, dict):
+        raise LayerError("workspace", "must be a mapping of roots, repos and exclude")
+    for key in block:
+        if key not in WORKSPACE_KEYS:
+            raise LayerError(f"workspace.{key}", f"unknown key; known: {', '.join(WORKSPACE_KEYS)}")
+    lists: dict[str, tuple[str, ...]] = {}
+    for key in WORKSPACE_KEYS:
+        where = f"workspace.{key}"
+        value = block.get(key)
+        if value is None:
+            lists[key] = ()
+            continue
+        if not isinstance(value, list):
+            raise LayerError(where, "must be a list of paths")
+        if len(value) > MAX_WORKSPACE_ENTRIES:
+            raise LayerError(where, f"holds {len(value)} entries; at most {MAX_WORKSPACE_ENTRIES}")
+        for entry in value:
+            if not isinstance(entry, str) or not entry:
+                raise LayerError(where, "every entry is non-empty text")
+            if not entry.isprintable():
+                raise LayerError(where, f"{entry!r} holds a control character")
+            if (key != "exclude" or "/" in entry or entry.startswith("~")) and not _path_shaped(entry):
+                raise LayerError(where, f"{entry!r} must be an absolute path or start with ~/ (never `~user` or relative)")
+        lists[key] = tuple(value)
+    return WorkspaceSettings(lists["roots"], lists["repos"], lists["exclude"])
+
+
+def load_user_settings() -> UserSettings:
+    """The user's personal settings alone: the engine defaults plus the user file, with no pack.
+
+    The file is checked (`check_user`) against the engine layer and its `workspace` block is shaped by
+    `workspace_settings`; a `LayerError` for either names the file. No home directory, or no file, means the engine
+    defaults and `path` None."""
+    stack = base_layers(None)
+    merged, _ = merge(stack)
+    path: Path | None = None
+    found = False
+    try:
+        candidate = user_config_path()
+    except RuntimeError:  # no home directory to look in: there is no user file
+        pass
+    else:
+        try:
+            found = candidate.exists()
+        except OSError as exc:  # an unreadable parent directory: say which file
+            raise LayerError(str(candidate), f"cannot read the user config file: {exc}") from exc
+    if found:
+        path = candidate
+        data = _read(path, "user config", empty_ok=True)
+        check_user(data, merged, path, any_agent=True)
+        merged, _ = merge([*stack, Layer("user", data, path)])
+    try:
+        workspace = workspace_settings(merged.get("workspace"))
+    except LayerError as exc:
+        raise LayerError(f"{path}: {exc.path}" if path else exc.path, exc.message) from exc
+    dashboard = merged.get("dashboard")
+    return UserSettings(workspace, copy.deepcopy(dashboard) if isinstance(dashboard, dict) else {}, path)

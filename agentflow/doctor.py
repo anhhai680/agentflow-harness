@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from agentflow import claims, keepawake, layers, pack, run_env, safeio
+from agentflow import claims, keepawake, layers, pack, repo_set, run_env, safeio
 from agentflow.config import Config, ConfigError, load_config
 from agentflow.vuln import REVIEW_API
 
@@ -289,6 +289,31 @@ def _state_dir_check(repo: Path) -> Check:
     return Check("state dir", "ok", f"{directory} is writable")
 
 
+def _user_file() -> str:
+    try:
+        return str(layers.user_config_path())
+    except RuntimeError:  # no home directory
+        return "the user config file"
+
+
+def _workspace_check() -> Check | None:
+    """The workspace the user's settings name, or None when they name none."""
+    where = printable(_user_file())
+    try:
+        found = repo_set.from_user_config()
+    except repo_set.NoWorkspace:
+        return None
+    except layers.LayerError as exc:
+        return Check("workspace", "warn", printable(exc), f"fix workspace.* in {where}")
+    not_set_up = [r.name for r in found.repos if r.state != "live"]
+    if not found.skipped and not not_set_up:
+        return Check("workspace", "ok", f"{len(found.repos)} repositories")
+    parts = [f"{printable(s.entry)}: {printable(s.reason)}" for s in found.skipped]
+    parts += [f"{printable(name)}: not set up" for name in not_set_up]
+    return Check("workspace", "warn", f"{len(found.repos)} repositories; " + "; ".join(parts),
+                 f"edit workspace.* in {where}, or run agentflow init in a repository that is not set up")
+
+
 MAX_LISTED_NAMES = 12
 
 
@@ -413,7 +438,7 @@ def _gate_checks(cfg: Config) -> tuple[list[Check], bool]:
 
 
 def run_checks(cfg: Config, repo: Path) -> list[Check]:
-    """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), Dependabot alerts (when the pack can run the vuln lane), the dependency review API (with `vuln.dependency_review`), the remote, the claims on it (a `backlog` pack with `backlog.claims`), Docker (when a gate runs it), the state dir, keeping the
+    """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), Dependabot alerts (when the pack can run the vuln lane), the dependency review API (with `vuln.dependency_review`), the remote, the claims on it (a `backlog` pack with `backlog.claims`), Docker (when a gate runs it), the state dir, the workspace (when the user's settings name one), keeping the
     machine awake, the inherited environment, the gates and the vuln probe."""
     gate_checks, uses_docker = _gate_checks(cfg)
     checks = [*_agent_checks(cfg, repo)]
@@ -432,6 +457,8 @@ def run_checks(cfg: Config, repo: Path) -> list[Check]:
     if uses_docker:
         checks.append(docker_check(repo))
     checks.append(_state_dir_check(repo))
+    if (workspace := _workspace_check()) is not None:
+        checks.append(workspace)
     checks.append(_keepawake_check())
     checks.append(_environment_check(cfg))
     return [*checks, *gate_checks]

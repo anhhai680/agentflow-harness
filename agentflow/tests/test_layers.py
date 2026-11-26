@@ -9,7 +9,10 @@ import pytest
 import yaml
 
 from agentflow import layers
-from agentflow.layers import Layer, LayerError, check_user, merge, origin_of, owns_workflow
+from agentflow.layers import (
+    Layer, LayerError, WorkspaceSettings, check_user, load_user_settings, merge, origin_of, owns_workflow,
+    workspace_settings,
+)
 
 USER_FILE = Path("/home/dev/.config/agentflow/config.yaml")
 
@@ -519,3 +522,110 @@ def test_starter_docs_only_has_no_alert_source_and_no_probe():
     assert merged["vuln"]["source"] == ""
     assert merged["vuln"]["probe"] == ""
     assert "audit" not in merged["gates"]
+
+
+def test_the_workspace_and_dashboard_keys_are_personal_settings():
+    user = {"workspace": {"roots": ["/a"], "repos": ["~/b"], "exclude": ["x"]},
+            "dashboard": {"board_refresh_s": 5, "done_shown": 20}}
+    check_user(user, {}, USER_FILE)
+    with pytest.raises(LayerError, match="not a personal setting"):
+        check_user({"workspace": {"nope": []}}, {}, USER_FILE)
+
+
+def test_workspace_settings_reads_three_lists():
+    got = workspace_settings({"roots": ["/a", "~/b"], "repos": ["~"], "exclude": ["tmp", "/c"]})
+    assert got == WorkspaceSettings(("/a", "~/b"), ("~",), ("tmp", "/c"))
+    assert workspace_settings(None) == WorkspaceSettings((), (), ())
+    assert workspace_settings({"exclude": ["bare-name"]}).exclude == ("bare-name",)
+
+
+@pytest.mark.parametrize("block", [
+    {"roots": "/a"}, {"roots": [1]}, {"roots": [""]}, {"roots": ["rel/path"]}, {"roots": ["~otheruser/x"]},
+    {"repos": ["./x"]}, {"exclude": [""]}, {"exclude": ["~other"]}, {"exclude": ["rel/path"]},
+    {"roots": ["/a\x00b"]}, {"repos": ["/a\nb"]}, {"exclude": ["x\ny"]}, {"roots": ["/a\x1b[2Jb"]},
+    {"roots": ["/a"] * (layers.MAX_WORKSPACE_ENTRIES + 1)}, {"unknown": []}, ["/a"],
+])
+def test_workspace_settings_refuses_a_bad_shape(block):
+    with pytest.raises(LayerError) as err:
+        workspace_settings(block)
+    assert err.value.path.startswith("workspace")
+
+
+def write_user_file(text: str) -> Path:
+    target = layers.user_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    return target
+
+
+def test_load_user_settings_reads_the_user_file_and_not_a_pack():
+    nothing = load_user_settings()
+    assert nothing.workspace == WorkspaceSettings((), (), ()) and nothing.path is None
+    assert nothing.dashboard["port"] == 7788
+    target = write_user_file("workspace:\n  roots: [/a, ~/b]\ndashboard:\n  board_refresh_s: 5\n")
+    got = load_user_settings()
+    assert got.workspace.roots == ("/a", "~/b") and got.workspace.repos == ()
+    assert got.dashboard["port"] == 7788 and got.dashboard["board_refresh_s"] == 5
+    assert got.path == target
+    write_user_file("")
+    assert load_user_settings().workspace == WorkspaceSettings((), (), ())
+
+
+def test_load_user_settings_refuses_what_check_user_refuses():
+    target = write_user_file("gates:\n  unit: {run: x}\n")
+    with pytest.raises(LayerError, match="not a personal setting") as err:
+        load_user_settings()
+    assert str(target) in str(err.value)
+    write_user_file("- a\n- b\n")
+    with pytest.raises(LayerError):
+        load_user_settings()
+    target = write_user_file("workspace:\n  roots: [rel]\n")
+    with pytest.raises(LayerError) as err:
+        load_user_settings()
+    assert str(target) in str(err.value) and "workspace.roots" in str(err.value)
+
+
+@pytest.mark.parametrize("text", [
+    "workspace: &w {roots: [/a], x: *w}\n",
+    "&t {workspace: {roots: [/a]}, dashboard: *t}\n",
+    "usage: " + "[" * 5000 + "]" * 5000 + "\n",
+    "usage: " + "[" * 100 + "]" * 100 + "\n",
+])
+def test_load_user_settings_refuses_a_hostile_yaml_file(text):
+    target = write_user_file(text)
+    with pytest.raises(LayerError) as err:
+        load_user_settings()
+    assert str(target) in str(err.value)
+
+
+def test_load_user_settings_says_when_the_user_file_cannot_be_read(monkeypatch):
+    target = write_user_file("")
+    real = Path.exists
+
+    def boom(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError("denied")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", boom)
+    with pytest.raises(LayerError, match="cannot read") as err:
+        load_user_settings()
+    assert str(target) in str(err.value)
+
+
+def test_load_user_settings_without_a_home_directory_has_no_user_file(monkeypatch):
+    def nohome():
+        raise RuntimeError("no home")
+
+    monkeypatch.setattr(layers, "user_config_path", nohome)
+    got = load_user_settings()
+    assert got.path is None and got.workspace == WorkspaceSettings((), (), ())
+
+
+def test_an_agent_only_a_pack_defines_is_fine_for_the_user_level_loader():
+    target = write_user_file("agents:\n  mypackagent:\n    models: {build: x}\n")
+    assert load_user_settings().path == target
+    data = yaml.safe_load(target.read_text(encoding="utf-8"))
+    with pytest.raises(LayerError, match="no agent `mypackagent`"):
+        check_user(data, {}, target)
+    check_user(data, {}, target, any_agent=True)

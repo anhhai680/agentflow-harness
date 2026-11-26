@@ -391,6 +391,24 @@ def test_policy_is_protected(shipped):
             config_edit.propose(shipped, sha, text=SHIPPED + added, repo=REPO)
 
 
+def test_workspace_is_protected(shipped):
+    assert "workspace" in config_edit.PROTECTED
+    assert "workspace" in config_edit.form_fields(shipped)["protected"]
+    _, sha = config_edit.read(shipped)
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=SHIPPED + 'workspace: {roots: ["/x"]}\n', repo=REPO)
+
+
+def test_a_dashboard_field_the_user_file_sets_is_read_only(shipped):
+    from agentflow import layers
+
+    target = layers.user_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(yaml.safe_dump({"dashboard": {"done_shown": 20}}), encoding="utf-8")
+    fields = {tuple(f["key"]): f for s in config_edit.form_fields(shipped)["sections"] for f in s["fields"]}
+    assert "user config" in fields[("dashboard", "done_shown")]["readonly"]
+
+
 def test_the_inherited_environment_settings_are_protected(shipped):
     _, sha = config_edit.read(shipped)
     old = '    POSTGRES_HOST_PORT: "55432"\n'

@@ -72,3 +72,8 @@ items:
     status: done
     spec: docs/specs/agentflow-vuln-fix-proposal.md
     plan: docs/plans/2026-11-24-agentflow-harness-vuln-v3.md
+  - id: workspace
+    plan: docs/plans/2026-11-26-agentflow-harness-workspace-w1.md
+    title: "Proposal: a user-level dashboard and CLI that work on several repositories of a workspace at once"
+    status: ready
+    spec: docs/specs/agentflow-workspace-proposal.md

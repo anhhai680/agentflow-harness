@@ -34,7 +34,7 @@ from typing import Any, Literal, TextIO
 
 import yaml
 
-from agentflow import backlog_file, detect, doctor, layers, pack, safeio
+from agentflow import backlog_file, detect, doctor, layers, pack, repo_set, safeio
 from agentflow.config import Config, ConfigError, Gate
 from agentflow.detect import Detected
 from agentflow.gates import GateResult, resolve, run_gates
@@ -662,6 +662,17 @@ def _write_empty_backlog(repo: Path, found: Detected, out: TextIO) -> None:
     print(f"note: {note}", file=out)
 
 
+def _workspace_note(repo: Path, out: TextIO) -> None:
+    """Say so when the user's workspace is configured and does not hold `repo`. Reads only; never raises."""
+    try:
+        held = {r.path for r in repo_set.from_user_config().repos}
+        if pack.checkout_root(repo) not in held:
+            print("note: this repository is not in your workspace; add its folder to workspace.roots in "
+                  f"{doctor.printable(layers.user_config_path())} to include it in --all views", file=out)
+    except (repo_set.NoWorkspace, layers.LayerError, OSError, RuntimeError, ValueError):
+        pass
+
+
 def init(repo: Path, *, starter: str | None, run_baseline: bool, out: TextIO) -> int:
     """Detect, check the machine, run the baseline when asked, and write `.agentflow/config.yaml` once.
 
@@ -760,4 +771,5 @@ def init(repo: Path, *, starter: str | None, run_baseline: bool, out: TextIO) ->
     if specs:
         print(f"  agentflow backlog import --dry-run   (writes {backlog_file.FILE} from your spec files; then switch "
               "work_source)", file=out)
+    _workspace_note(repo, out)
     return 0
