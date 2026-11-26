@@ -7,6 +7,16 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.13] - 2026-11-26
+
+### Added
+- `workspace.roots`, `workspace.repos` and `workspace.exclude` in your user config file name the repositories of your workspace: the git repositories directly under each root, the repositories you list, minus the exclusions. A pack that sets one gets a `validate` warning and the value is ignored, and the Settings page can't change them. `dashboard.board_refresh_s` and `dashboard.done_shown` are now personal keys too, so your user file may set them.
+- `agentflow -C PATH <command>` runs a command as if started in `PATH`.
+- `agentflow status`, `inbox`, `agents`, `next` and `doctor` take `--all`, which runs the command once in each repository of your workspace under a `== <name> (-C <path>) ==` heading, and prints `not set up` for a repository with no pack. `--all` is refused with `-C`, `--config`, `--watch` or a run argument, and the commands that write stay single-repository.
+- `agentflow workspace list [--json]` shows the roots, each repository found (live or not set up) and each entry it skipped.
+- `agentflow doctor` has a `workspace` check, shown only when your user file names a workspace, and `agentflow init` prints a note when the repository is not in it.
+- The playbook has a section on several repositories (§17).
+
 ## [3.12] - 2026-11-26
 
 ### Added
