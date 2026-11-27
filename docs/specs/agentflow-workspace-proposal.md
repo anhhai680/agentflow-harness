@@ -381,7 +381,7 @@ No test calls a real model or GitHub (the fake agent and fake `gh` stay). New te
   failing is logged and the others refresh; a rescan adds a new repository and retires a missing one only after its
   runs end; the server starts outside a repository, and with no workspace opens with the empty state; a
   one-repository server serves the legacy routes exactly as before.
-- **Dashboard, W3** (done in 3.16): the legacy `/api/inbox` and `/api/agents` return each item with `repo` when several are live, and
+- **Dashboard, W3** (done in 3.16): the legacy `/api/inbox` and `/api/agents` return each item with `repo` when the server holds more than one repository (whatever their states), and
   the page's stream is `/api/events?all=1`.
 - **Settings** (`test_config_edit.py`): a `workspace.*` save lands in the user file and not in any pack; a project field
   lands in the pack; `hitl.notify`, `agents.*.user_settings`, `dashboard.host` and any `_PROTECTED_KEYS` key sent to

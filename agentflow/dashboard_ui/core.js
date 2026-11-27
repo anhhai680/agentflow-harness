@@ -22,7 +22,7 @@ const ui = { view: "board", peek: null, run: null, board: null, agents: null, wo
   // (its index in `order`, the cards as shown, and its key), the grouping, the cards kept after a decision made elsewhere
   // (`gone`) and the answers this page sent itself (`sent`)
   inbox: { view: null, drafts: new Map(), armed: null, armedAt: 0, focus: 0, focusKey: null, order: [], group: "run", ids: new Map(),
-    busy: new Set(), gone: new Map(), sent: new Set() }, inboxLegacy: false,
+    busy: new Set(), gone: new Map(), sent: new Set(), failed: "" }, inboxLegacy: false,
   // the workspace (`repos.js`): the selected repository's id on a page of several, else null (a page of one sends the
   // legacy, unprefixed requests); the last `/api/repos` body; whether it lists more than one repository; and whether
   // the Inbox and Agents show every repository

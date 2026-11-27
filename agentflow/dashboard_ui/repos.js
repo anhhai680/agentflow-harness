@@ -65,6 +65,43 @@ const viewErrorLines = (errors) => (Array.isArray(errors) ? errors : []).map((e)
 // route, null); otherwise the selected one (undefined), which is tagged when the server holds several.
 const viewRepo = () => (ui.multi && ui.allRepos ? null : undefined);
 
+// ---- one refresh round: each fetch settles on its own
+
+// `jobs` is `{board, agents, workflow, inbox}`, each a promise or null (not asked). Every asked one is awaited on its own, so
+// one that fails (a broken selected repository's Board) never hides what the others brought: `{name: {v} | {e}}`.
+async function settleRound(jobs) {
+  const got = {};
+  await Promise.all(Object.keys(jobs).map(async (name) => {
+    if (!jobs[name]) return;
+    try { got[name] = { v: await jobs[name] }; } catch (err) { got[name] = { e: err }; }
+  }));
+  return got;
+}
+
+// Draw what a round brought. `draw` has one function per part (`board`, `agents`, `workflow`, `inbox`) and `fail(name, err)`.
+// With `partial` (a page of several, whose Inbox and Agents are other repositories' views) each part that succeeded is
+// drawn and only the ones that failed are marked dirty again. Without it (a page of one) a failure is the whole round's,
+// as it always was: nothing is drawn, everything that was asked is marked dirty and the Board's error is the one shown.
+// The Workflow is fetched again by its own absence, so it is never marked dirty.
+function drawRound(got, dirty, draw, partial) {
+  const names = ["board", "agents", "workflow", "inbox"].filter((n) => got[n]);
+  const bad = names.filter((n) => got[n].e !== undefined);
+  if (!partial && bad.length) {
+    for (const n of names) if (n !== "workflow") dirty[n] = true;
+    draw.fail("board", got[bad[0]].e);
+    return;
+  }
+  for (const n of names) {
+    try {
+      if (got[n].e !== undefined) throw got[n].e;
+      draw[n](got[n].v);
+    } catch (err) {
+      if (n !== "workflow") dirty[n] = true;
+      draw.fail(n, err);
+    }
+  }
+}
+
 // ---- the selection, kept for the tab
 
 function storedRepo() {
@@ -101,7 +138,11 @@ async function loadRepos() {
   } else if (ui.repo === null) {
     // a page that just became one of several takes the default, which is what the legacy routes were showing
     const pick = pickRepo(view, parseRoute(location.hash).repo, first || wasMulti ? storedRepo() : null);
-    if (pick !== null && (first || (!wasMulti && pick === view.default))) { ui.repo = pick; storeRepo(pick); }  // what is shown already is its
+    if (pick !== null && (first || (!wasMulti && pick === view.default))) {
+      ui.repo = pick;  // what is shown already is its
+      storeRepo(pick);
+      if (!first) { dirty.inbox = true; dirty.agents = true; boardRefresh(); }  // the Inbox and Agents drawn untagged are fetched again, tagged
+    }
     else if (pick !== null) { applyRepo(pick); reset = true; }
   }
   document.title = tabTitle(view);
@@ -130,6 +171,7 @@ function setAllRepos(on) {
   ui.allRepos = !!on;
   disarmInbox();
   ui.inbox.view = null;
+  ui.inbox.failed = "";
   ui.inbox.gone.clear();
   ui.inbox.sent.clear();
   ui.agents = null;
@@ -190,10 +232,15 @@ function applyRepo(id) {
   ui.comments.clear();  // keyed by run id, path and sha: another repository's run of the same id is another run
   lastActivity.clear();
   ui.inbox.view = null;
+  ui.inbox.failed = "";
   ui.inbox.gone.clear();
   ui.inbox.armed = null;
   disarmBacklog();  // an idea armed in the old repository never starts the new one's idea of the same key
   closePeek();
+  // a dialog opened in the old repository acts on `ui.repo` when its OK is pressed: it is closed, and its pending answer
+  // (dialog() checks `dlg.open`) closes nothing and only floats its message
+  const dlg = $("dlg");
+  if (dlg && dlg.open) dlg.close();
   settings.request++;  // a /api/config answer still out is the old repository's: it is dropped
   settings.data = null;
   settings.edits.clear();

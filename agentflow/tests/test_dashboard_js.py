@@ -1160,3 +1160,90 @@ def test_the_agents_table_leads_with_the_repository_only_when_asked():
       return [heads(agentTable(args, false, true)), heads(agentTable(args, false, false)), heads(agentTable(args, false))]; })()""", rows)
     assert got[0][0] == "Repository" and got[0][1] == "Session" and len(got[0]) == len(got[1]) + 1
     assert got[1] == got[2] and got[1][0] == "Session"
+
+
+# ---- the final fix wave: a broken Board never freezes the merged Inbox and Agents; a switch closes a modal; a rescan refetches tagged
+def test_a_failing_board_does_not_stop_the_merged_inbox_from_drawing():  # Review Focus 4
+    got = js_async(["repos.js"], """(async () => {
+      const dirty = {board: false, agents: false, inbox: false}, drawn = [], failed = [];
+      const draw = {board: (v) => drawn.push("board"), inbox: (v) => drawn.push("inbox:" + v.items.length), agents: (v) => drawn.push("agents"),
+                    workflow: (v) => drawn.push("workflow"), fail: (name, err) => failed.push(name + ":" + err.message)};
+      const conflict = () => { const e = new Error("pack broke on line 3"); e.status = 409; return Promise.reject(e); };
+      const got = await settleRound({board: conflict(), agents: Promise.resolve({live: []}), workflow: conflict(), inbox: Promise.resolve({items: [1]})});
+      drawRound(got, dirty, draw, true);
+      return [drawn, failed, dirty]; })()""", None)
+    assert got == [["agents", "inbox:1"], ["board:pack broke on line 3", "workflow:pack broke on line 3"],
+                   {"board": True, "agents": False, "inbox": False}]
+
+
+def test_a_page_of_one_keeps_a_failed_round_whole():
+    got = js_async(["repos.js"], """(async () => {
+      const dirty = {board: false, agents: false, inbox: false}, drawn = [], failed = [];
+      const draw = {board: () => drawn.push("board"), inbox: () => drawn.push("inbox"), agents: () => drawn.push("agents"),
+                    workflow: () => drawn.push("workflow"), fail: (name, err) => failed.push(name + ":" + err.message)};
+      const got = await settleRound({board: Promise.resolve({}), agents: Promise.reject(new Error("HTTP 500")), workflow: null, inbox: Promise.resolve({})});
+      drawRound(got, dirty, draw, false);
+      return [drawn, failed, dirty]; })()""", None)
+    assert got == [[], ["board:HTTP 500"], {"board": True, "agents": True, "inbox": True}]  # nothing drawn, all asked marked again
+
+
+def test_a_part_that_throws_while_drawing_is_that_parts_failure_only():
+    got = js(["repos.js"], """(() => {
+      const dirty = {board: false, agents: false, inbox: false}, drawn = [], failed = [];
+      const draw = {board: () => { throw new Error("bad card"); }, inbox: () => drawn.push("inbox"), agents: () => {}, workflow: () => {},
+                    fail: (name, err) => failed.push(name + ":" + err.message)};
+      drawRound({board: {v: {}}, inbox: {v: {}}}, dirty, draw, true);
+      return [drawn, failed, dirty]; })()""", None)
+    assert got == [["inbox"], ["board:bad card"], {"board": True, "agents": False, "inbox": False}]
+
+
+APPLY_STUBS = """var settings = {request: 0, data: null, edits: new Map(), yamlDirty: false}, lastActivity = new Map(), dirty = {runs: new Set()};
+  var closed = [], els = {dlg: {open: true, close() { this.open = false; closed.push("dlg"); }}, columns: {replaceChildren() {}},
+    needs: {replaceChildren() {}}, summary: {}};
+  document.getElementById = (id) => els[id] || null;
+  closePeek = () => {}; disarmBacklog = () => {}; renderRepos = () => {}; loadInfo = () => {}; boardRefresh = () => {};"""
+
+
+def test_a_repository_switch_closes_an_open_dialog():
+    got = js([PAGE_STUB, "core.js", "repos.js"], APPLY_STUBS + """
+      (() => {
+        ui.repo = "a"; applyRepo("b"); const first = [els.dlg.open, closed.length];
+        els.dlg.open = false; applyRepo("a");  // a closed dialog is left alone
+        return [first, closed.length]; })()""", None)
+    assert got == [[False, 1], 1]
+
+
+def test_a_dialogs_answer_after_a_switch_closes_nothing_and_still_floats_its_message():
+    got = js_async([PAGE_STUB, "core.js", "dialogs.js"], """(async () => {
+      const made = {};
+      const node = (id) => ({id: id, textContent: "", hidden: false, open: false, classList: {toggle() {}}, replaceChildren() {}, replaceWith(n) { made[id] = n; },
+        cloneNode() { const c = node(id); c.handlers = {}; c.addEventListener = (t, f) => { c.handlers[t] = f; }; return c; },
+        showModal() { this.open = true; }, close() { this.open = false; }});
+      for (const id of ["dlg", "dlg-title", "dlg-body", "dlg-ok", "dlg-cancel", "dlg-msg"]) made[id] = node(id);
+      document.getElementById = (id) => made[id];
+      var floated = [], closes = 0, release;
+      toast = (t) => floated.push(t);
+      const dlg = made.dlg; const realClose = dlg.close; dlg.close = function () { closes++; realClose.call(this); };
+      dialog("t", [], () => new Promise((resolve) => { release = resolve; }), "OK");
+      const click = made["dlg-ok"].handlers.click();  // OK pressed: the action is in flight
+      dlg.close();  // the repository switch closes the dialog
+      dialogSaid = "recorded elsewhere";  // what the in-flight action said meanwhile
+      release(true);
+      await click;
+      return [dlg.open, closes, floated]; })()""", None)
+    assert got == [False, 1, ["recorded elsewhere"]]  # the late answer closed nothing again and threw nothing
+
+
+def test_a_rescan_that_adds_a_second_repository_refetches_the_inbox_tagged():
+    got = js_async([PAGE_STUB, "core.js", "repos.js"], """var dirty = {inbox: false, agents: false, board: false, runs: new Set()}, refreshed = 0;
+    (async () => {
+      parseRoute = () => ({repo: null}); setInboxBadge = () => {}; renderRepos = () => {}; renderAllChips = () => {}; routeHash = () => "#/inbox";
+      boardRefresh = () => { refreshed++; };
+      const one = {repos: [{id: "a", name: "a", state: "live", waiting: 0}], skipped: [], default: "a"};
+      const two = {repos: [{id: "a", name: "a", state: "live", waiting: 0}, {id: "b", name: "b", state: "live", waiting: 0}], skipped: [], default: "a"};
+      var answer = one; api = async () => answer;
+      await loadRepos();  // the page's first answer: nothing to refetch
+      const first = [dirty.inbox, dirty.agents, refreshed];
+      answer = two; await loadRepos();
+      return [first, [dirty.inbox, dirty.agents, refreshed], ui.repo, ui.multi]; })()""", None)
+    assert got == [[False, False, 0], [True, True, 1], "a", True]

@@ -517,6 +517,7 @@ function inboxEntries(view, shown) {
       entries.push(entry("item:" + key, { item: card, armed: ui.inbox.armed === key, armedConstraint: ui.inbox.armed === INBOX_ARM_CONSTRAINT + key, error: draft.error, rejecting: draft.reject.open }, (d) => inboxCard(d.item)));
     }
   }
+  if (ui.inbox.failed) entries.push(entry("failed", ui.inbox.failed, (text) => el("p", { class: "muted i-error", role: "status", text: text })));
   // a repository whose read failed: one line of text, and the other repositories' cards are drawn as usual
   viewErrorLines(view.errors).forEach((line, at) => entries.push(entry("error:" + at, line, (text) => el("p", { class: "muted i-error", role: "status", text: text }))));
   if (!shown.flat.length) entries.push(entry("empty", "empty", () => el("p", { class: "muted", text: "Nothing is waiting on you." })));
@@ -618,6 +619,14 @@ function inboxArmLive(armed, live, view) {
   if (armed === INBOX_ARM_ALL) return ui.inbox.group === "kind" && armedApprovals(view.items, inboxArmedAll).length >= 2;
   if (armed.startsWith(INBOX_ARM_CONSTRAINT)) return live.has(armed.slice(INBOX_ARM_CONSTRAINT.length));
   return live.has(armed);
+}
+
+// The Inbox could not be fetched: its own view says so (the cards already drawn stay, the way they were), and the next
+// successful render takes the line away.
+function inboxFailed(text) {
+  ui.inbox.failed = text;
+  if (!ui.inbox.view) ui.inbox.view = { items: [], watch: [], recent: [], errors: [] };
+  redrawInbox();
 }
 
 function renderInbox(view) {

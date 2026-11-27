@@ -19,24 +19,26 @@ async function refreshBoardNow() {
   dirty.inbox = false;
   if (wantAgents) dirty.agents = false;
   if (!wantBoard && !wantAgents && !wantWorkflow && !wantInbox) return;
-  try {
-    const [boardData, agentsData, workflow, inboxData] = await Promise.all([wantBoard ? api("/api/board") : null,
-      wantAgents ? api("/api/agents", undefined, which) : null, wantWorkflow ? api("/api/workflow") : null, wantInbox ? api("/api/inbox", undefined, which) : null]);
-    if (ui.repo !== repo || viewRepo() !== which) return;  // applyRepo and setAllRepos marked everything for the new round
-    if (boardData) { renderBoard(boardData); if (!ui.multi) setInboxBadge(boardData.needs_human.length); }  // several: loadRepos counts every one
-    if (inboxData) renderInbox(inboxData);
-    if (agentsData) renderAgents(agentsData);
-    if (workflow) { ui.workflow = workflow; renderWorkflow(); }
-    if (wantBoard && ui.view === "metrics") loadMetrics();
-    if (wantBoard && ui.view === "lessons") loadLessons();
-  } catch (err) {
-    if (ui.repo !== repo) return;
-    if (wantBoard) dirty.board = true;  // the next round tries again
-    if (wantAgents) dirty.agents = true;
-    if (wantInbox) dirty.inbox = true;
-    $("summary").textContent = "Could not load: " + err.message;
-  }
+  const got = await settleRound({ board: wantBoard ? api("/api/board") : null, agents: wantAgents ? api("/api/agents", undefined, which) : null,
+    workflow: wantWorkflow ? api("/api/workflow") : null, inbox: wantInbox ? api("/api/inbox", undefined, which) : null });
+  if (ui.repo !== repo || viewRepo() !== which) return;  // applyRepo and setAllRepos marked everything for the new round
+  drawRound(got, dirty, roundDraw, ui.multi);  // a failed part is marked again alone; the others are drawn
 }
+
+// How each part of a round is drawn, and where a failure of each shows: the Board's and the Workflow's in the summary
+// line, the Inbox's and the Agents' in their own views (so one broken repository never blanks another's).
+const roundDraw = {
+  board: (data) => { renderBoard(data); if (!ui.multi) setInboxBadge(data.needs_human.length); if (ui.view === "metrics") loadMetrics(); if (ui.view === "lessons") loadLessons(); },  // several: loadRepos counts every one
+  inbox: (data) => { ui.inbox.failed = ""; renderInbox(data); },
+  agents: (data) => renderAgents(data),
+  workflow: (data) => { ui.workflow = data; renderWorkflow(); },
+  fail: (name, err) => {
+    const text = "Could not load: " + err.message;
+    if (name === "inbox") inboxFailed(text);
+    else if (name === "agents") $("agents-summary").textContent = text;
+    else $("summary").textContent = text;
+  },
+};
 
 // Only the open run and the peeked run are refetched, and only when an event of theirs arrived.
 async function refreshRunsNow() {
