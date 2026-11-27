@@ -22,7 +22,11 @@ const ui = { view: "board", peek: null, run: null, board: null, agents: null, wo
   // (its index in `order`, the cards as shown, and its key), the grouping, the cards kept after a decision made elsewhere
   // (`gone`) and the answers this page sent itself (`sent`)
   inbox: { view: null, drafts: new Map(), armed: null, armedAt: 0, focus: 0, focusKey: null, order: [], group: "run", ids: new Map(),
-    busy: new Set(), gone: new Map(), sent: new Set() }, inboxLegacy: false };
+    busy: new Set(), gone: new Map(), sent: new Set() }, inboxLegacy: false,
+  // the workspace (`repos.js`): the selected repository's id on a page of several, else null (a page of one sends the
+  // legacy, unprefixed requests); the last `/api/repos` body; whether it lists more than one repository; and whether
+  // the Inbox and Agents show every repository
+  repo: null, repos: null, multi: false, allRepos: true };
 const $ = (id) => document.getElementById(id);
 const workLabel = (lane) => (ui.board && ui.board.lane_labels[lane]) || lane;  // a lane with no label, or an old run's, shows its name
 
@@ -166,14 +170,23 @@ function toast(text) {
   setTimeout(() => box.classList.remove("show"), 2600);
 }
 
-async function api(path, body) {
+// `/api/<rest>` as the repository `repo` serves it (`/api/repos/<id>/<rest>`) when `repo` is a string, else as it is.
+// Only an id `/api/repos` listed is ever passed here, and it is always encoded: it never becomes a path.
+const repoPath = (path, repo) => (typeof repo === "string" && path.startsWith("/api/") ? "/api/repos/" + encodeURIComponent(repo) + path.slice(4) : path);
+
+// A run's identity on the page: two repositories may hold the same run id, so a page of several keys it by both.
+const runKey = (repo, runId) => (repo ? repo + "\0" + runId : runId);
+
+// `repo` undefined sends to the selected repository (`ui.repo`, none on a page of one); null sends the path as it is,
+// for a workspace route (`/api/repos`, the merged Inbox and Agents); a string sends to that repository.
+async function api(path, body, repo) {
   const options = { headers: { "X-Agentflow-Token": TOKEN }, cache: "no-store" };
   if (body !== undefined) {
     options.method = "POST";
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
   }
-  const response = await fetch(path, options);
+  const response = await fetch(repoPath(path, repo === undefined ? ui.repo : repo), options);
   const text = await response.text();
   let data = {};
   try { data = text ? JSON.parse(text) : {}; } catch (err) { data = { error: "unreadable response" }; }
@@ -194,10 +207,11 @@ function actionToast(action, result) {
   return action + " recorded" + (result.resumed ? "; the run resumes in the background" : "");
 }
 
-async function act(runId, action, body) {
+// `repo` is the repository the run is in: undefined for the selected one (see `api`).
+async function act(runId, action, body, repo) {
   try {
-    toast(actionToast(action, await api(runPath(runId) + "/" + action, body || {})));
-    refreshAfter(runId);
+    toast(actionToast(action, await api(runPath(runId) + "/" + action, body || {}, repo)));
+    refreshAfter(runId, repo);
     return true;
   } catch (err) {
     toast(action + " failed: " + err.message);

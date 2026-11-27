@@ -160,7 +160,7 @@ from agentflow.workspace_view import merged_agents, merged_inbox, tagged_agents,
 PAGE = Path(__file__).resolve().with_name("dashboard.html")
 UI_DIR = Path(__file__).resolve().with_name("dashboard_ui")
 # in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
-UI_SCRIPTS = ("core.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js",
+UI_SCRIPTS = ("core.js", "repos.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js",
               "sessions.js", "inbox.js", "activity.js", "workflow.js", "agents.js", "tokens.js", "metrics.js", "lessons.js", "settings.js", "main.js")
 UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024

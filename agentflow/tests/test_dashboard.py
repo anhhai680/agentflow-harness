@@ -482,6 +482,36 @@ def test_tokens_loads_before_the_metrics_tab_and_reads_no_dom():
     assert "document" not in tokens and "innerHTML" not in tokens
 
 
+def test_the_page_loads_repos_js_after_core_js(dash):
+    assert UI_SCRIPTS[0] == "core.js" and UI_SCRIPTS[1] == "repos.js"
+    status, headers, body = dash.get("/ui/repos.js", token=None)
+    assert status == 200 and b"function pickRepo" in body
+    shell = dash.get("/", token=None)[2].decode("utf-8")
+    assert 'id="repos"' in shell and '<nav id="repos" hidden aria-label="Repositories">' in shell
+    assert shell.index("<h1>agentflow</h1>") < shell.index('id="repos"') < shell.index('id="version"')
+
+
+def test_the_page_streams_every_repository():
+    main = (UI_DIR / "main.js").read_text(encoding="utf-8")
+    assert "/api/events?all=1&quiet=1&token=" in main and "/api/events?quiet=1&token=" not in main
+
+
+def test_repos_js_draws_repository_text_as_text():
+    repos = (UI_DIR / "repos.js").read_text(encoding="utf-8")
+    assert "innerHTML" not in repos and "textContent" in repos
+    assert "aria-pressed" in repos and "NO_REPO_TEXT" in repos
+
+
+def test_no_ui_script_writes_a_hash_route_by_hand():
+    # every link and jump goes through routeHash, so it carries the selected repository's prefix
+    for name in UI_SCRIPTS:
+        if name == "run.js":
+            continue
+        source = (UI_DIR / name).read_text(encoding="utf-8")
+        code = "\n".join(line.split("//")[0] for line in source.splitlines())
+        assert not re.findall(r'"#/[a-z]+[/"?]', code), name
+
+
 def test_markdown_loads_before_the_run_page():
     assert UI_SCRIPTS.index("markdown.js") < UI_SCRIPTS.index("run.js")
     assert UI_SCRIPTS.index("markdown.js") == UI_SCRIPTS.index("dialogs.js") + 1
@@ -1092,7 +1122,7 @@ def test_the_drawer_is_a_peek_with_an_open_run_button():
 
 def test_the_page_listens_quietly_and_refreshes_in_buckets():
     source = page_source()
-    assert "/api/events?quiet=1&token=" in source
+    assert "/api/events?all=1&quiet=1&token=" in source
     on_message = source[source.index("stream.onmessage"):source.index("\n", source.index("stream.onmessage"))]
     assert "onStreamMessage" in on_message and "scheduleRefresh" not in source
     assert "agent_activity" in source and "patchActivity(" in source and "board_refresh_s" in source

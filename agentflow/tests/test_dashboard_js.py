@@ -887,3 +887,126 @@ def test_a_saved_edit_shows_the_notes_the_server_sent_as_text():
     got = js_async(["board.js"], WRITE_STUBS + """api = async () => ({ok: true, notes: ["claim of crm freed", "<b>x</b>"]});
       (async () => { await writeBacklogFile({}, 'Saved'); return said; })()""", None)
     assert got == ["Saved. claim of crm freed. <b>x</b>"]
+
+
+# ---- the repository switcher (W3): the path prefix, the route's repository, the selection, the chips and the title
+PAGE_STUB = str(Path(__file__).parent / "fixtures" / "js" / "_page_stub.js")
+REPOS = {"repos": [{"id": "api-1a2b3c4d", "name": "api", "state": "live", "waiting": 2, "active": 1, "failed": 0, "error": None},
+                   {"id": "web-5e6f7a8b", "name": "web", "state": "live", "waiting": 0, "active": 0, "failed": 0, "error": None},
+                   {"id": "docs-9c0d1e2f", "name": "docs", "state": "not_set_up", "waiting": 0, "active": 0, "failed": 0, "error": None},
+                   {"id": "lib-0a1b2c3d", "name": "lib", "state": "error", "waiting": 0, "active": 0, "failed": 0, "error": "bad pack"}],
+         "skipped": [], "default": "web-5e6f7a8b"}
+
+
+def test_repo_path_prefixes_only_with_a_repository():
+    assert js([PAGE_STUB, "core.js"], "repoPath('/api/board', 'api-1a2b3c4d')", None) == "/api/repos/api-1a2b3c4d/board"
+    assert js([PAGE_STUB, "core.js"], "repoPath('/api/runs/r/approve', 'a/../b')", None) == "/api/repos/a%2F..%2Fb/runs/r/approve"
+    assert js([PAGE_STUB, "core.js"], "[repoPath('/api/board', null), repoPath('/api/board', undefined)]", None) == ["/api/board"] * 2
+
+
+def test_a_run_is_keyed_by_its_repository_on_a_page_of_several():
+    assert js([PAGE_STUB, "core.js"], "[runKey('a', 'r1'), runKey(null, 'r1'), runKey(undefined, 'r1')]", None) == \
+        ["a\u0000r1", "r1", "r1"]
+    assert js([PAGE_STUB, "core.js"], "[ui.repo, ui.repos, ui.multi, ui.allRepos]", None) == [None, None, False, True]
+
+
+def test_api_sends_to_the_selected_repository_unless_told_otherwise():
+    got = js_async([PAGE_STUB, "core.js"], """var asked = [];
+      fetch = async (path) => { asked.push(path); return {ok: true, status: 200, text: async () => "{}"}; };
+      (async () => {
+        await api('/api/board'); ui.repo = 'web-5e6f7a8b'; await api('/api/board'); await api('/api/repos', undefined, null);
+        await api('/api/runs/r/approve', {}, 'api-1a2b3c4d'); return asked; })()""", None)
+    assert got == ["/api/board", "/api/repos/web-5e6f7a8b/board", "/api/repos", "/api/repos/api-1a2b3c4d/runs/r/approve"]
+
+
+def test_an_action_posts_to_its_own_repository_and_refreshes_only_its_own_run():
+    got = js_async([PAGE_STUB, "core.js"], """var asked = [], after = [];
+      fetch = async (path) => { asked.push(path); return {ok: true, status: 200, text: async () => "{}"}; };
+      toast = () => {}; refreshAfter = (runId, repo) => after.push([runId, repo === undefined ? "-" : repo]);
+      ui.repo = 'web-5e6f7a8b';
+      (async () => { await act('r1', 'pause'); await act('r1', 'pause', {}, 'api-1a2b3c4d'); return [asked, after]; })()""", None)
+    assert got == [["/api/repos/web-5e6f7a8b/runs/r1/pause", "/api/repos/api-1a2b3c4d/runs/r1/pause"],
+                   [["r1", "-"], ["r1", "api-1a2b3c4d"]]]
+
+
+def test_a_one_repository_view_shows_no_switcher():
+    one = {"repos": REPOS["repos"][:1], "skipped": [], "default": "api-1a2b3c4d"}
+    assert js(["repos.js"], "[isMulti(args.one), isMulti({repos: []}), isMulti(null), isMulti(args.all)]",
+              {"one": one, "all": REPOS}) == [False, False, False, True]
+
+
+def test_a_route_carries_its_repository_both_ways():
+    parse = lambda h: js([VIEWS_STUB, "run.js"], "parseRoute(args)", h)  # noqa: E731
+    back = lambda h: js([VIEWS_STUB, "run.js"], "routeHash(parseRoute(args))", h)  # noqa: E731
+    run = parse("#/repo/api-1a2b3c4d/run/20261127-1200-x/plan")
+    assert run["repo"] == "api-1a2b3c4d" and run["view"] == "run" and run["tab"] == "plan" and run["run"] == "20261127-1200-x"
+    assert back("#/repo/api-1a2b3c4d/run/20261127-1200-x/plan") == "#/repo/api-1a2b3c4d/run/20261127-1200-x/plan"
+    board = parse("#/repo/api-1a2b3c4d/board?lane=bug")
+    assert board["repo"] == "api-1a2b3c4d" and board["view"] == "board" and board["query"]["lane"] == "bug"
+    assert back("#/repo/api-1a2b3c4d/board?lane=bug") == "#/repo/api-1a2b3c4d/board?lane=bug"
+    assert back("#/repo/a%2F..%2Fb/inbox") == "#/repo/a%2F..%2Fb/inbox" and parse("#/repo/a%2F..%2Fb/inbox")["repo"] == "a/../b"
+    assert parse("#/board")["repo"] is None and parse("#/run/r1/gates")["repo"] is None
+    assert js([VIEWS_STUB, "run.js"], "routeHash({view: 'inbox', repo: null})", None) == "#/inbox"
+    for empty in ("#/repo/", "#/repo//board", "#/repo"):
+        got = parse(empty)
+        assert got["view"] == "board" and got["repo"] is None, empty
+    assert parse("#/repo/%zz/board")["view"] == "board" and parse("#/repo/%zz/board")["repo"] is None  # a malformed %
+    # a route with no `repo` key takes the page's selection; with no `ui` (this test) that is none
+    assert js([VIEWS_STUB, "run.js"], "routeHash({view: 'run', run: 'r1', tab: 'gates'})", None) == "#/run/r1/gates"
+    assert js([VIEWS_STUB, "run.js"], "ui = {repo: 'web-5e6f7a8b'}; routeHash({view: 'run', run: 'r1', tab: 'gates'})", None) == \
+        "#/repo/web-5e6f7a8b/run/r1/gates"
+    assert js([VIEWS_STUB, "run.js"], "ui = {repo: 'web-5e6f7a8b'}; routeHash({view: 'board', query: {lane: 'bug'}, repo: null})", None) == \
+        "#/board?lane=bug"
+
+
+def test_the_selection_takes_the_hash_then_the_session_then_the_default():
+    pick = lambda h, s, view=REPOS: js(["repos.js"], "pickRepo(args.view, args.h, args.s)", {"view": view, "h": h, "s": s})  # noqa: E731
+    assert pick("api-1a2b3c4d", "web-5e6f7a8b") == "api-1a2b3c4d"
+    for bad in ("docs-9c0d1e2f", "lib-0a1b2c3d", "nope", "../../etc", "", None):
+        assert pick(bad, "api-1a2b3c4d") == "api-1a2b3c4d", bad
+    assert pick(None, "docs-9c0d1e2f") == "web-5e6f7a8b"
+    assert pick(None, None, {**REPOS, "default": "docs-9c0d1e2f"}) == "api-1a2b3c4d"  # then the first live row
+    assert pick(None, None, {**REPOS, "default": None}) == "api-1a2b3c4d"
+    assert pick("api-1a2b3c4d", None, {"repos": REPOS["repos"][2:], "skipped": [], "default": None}) is None
+    assert pick("api-1a2b3c4d", None, None) is None
+
+
+def test_a_routed_repository_keeps_the_selection_unless_the_hash_names_a_live_one():
+    route = lambda h, cur, s=None: js(["repos.js"], "routeRepo(args.view, args.h, args.cur, args.s)",  # noqa: E731
+                                      {"view": REPOS, "h": h, "cur": cur, "s": s})
+    assert route("api-1a2b3c4d", "web-5e6f7a8b") == "api-1a2b3c4d"
+    assert route("nope", "web-5e6f7a8b") == "web-5e6f7a8b" and route(None, "web-5e6f7a8b") == "web-5e6f7a8b"
+    assert route("nope", "lib-0a1b2c3d") == "lib-0a1b2c3d"  # the selected repository broke: the selection stays
+    assert route(None, None, "api-1a2b3c4d") == "api-1a2b3c4d" and route(None, None, "docs-9c0d1e2f") == "web-5e6f7a8b"
+
+
+def test_chips_put_not_set_up_last_and_disable_what_is_not_live():
+    chips = js(["repos.js"], "chipModel(args, 'api-1a2b3c4d')", REPOS)
+    assert [c["name"] for c in chips] == ["api", "web", "lib", "docs"]
+    by = {c["name"]: c for c in chips}
+    assert [by[n]["disabled"] for n in ("api", "web", "lib", "docs")] == [False, False, True, True]
+    assert by["lib"]["note"] == "bad pack" and by["api"]["waiting"] == 2 and by["docs"]["state"] == "not_set_up"
+    assert [c["selected"] for c in chips] == [True, False, False, False] and by["web"]["id"] == "web-5e6f7a8b"
+    assert js(["repos.js"], "chipModel(null, null)", None) == []
+
+
+def test_the_tab_title_names_the_repository_or_counts_them():
+    assert js(["repos.js"], "tabTitle(args)", REPOS) == "agentflow · 4 repositories"
+    assert js(["repos.js"], "tabTitle(args)", {"repos": REPOS["repos"][:1], "skipped": [], "default": None}) == "agentflow · api"
+    assert js(["repos.js"], "[tabTitle({repos: []}), tabTitle(null)]", None) == ["agentflow", "agentflow"]
+
+
+def test_a_message_of_another_repository_is_not_the_pages_own():
+    assert js(["repos.js"], "[streamOwn({repo: 'a'}, true, 'b'), streamOwn({repo: 'a'}, true, 'a'), streamOwn({repo: 'a'}, false, null)]",
+              None) == [False, True, True]
+    assert js(["repos.js"], "[streamOwn({}, true, 'a'), streamOwn({}, false, null)]", None) == [False, True]
+
+
+def test_waiting_total_sums_every_row():
+    assert js(["repos.js"], "waitingTotal(args)", REPOS) == 2
+    assert js(["repos.js"], "[waitingTotal(null), waitingTotal({repos: [{waiting: null}, {}]})]", None) == [0, 0]
+
+
+def test_a_repository_name_comes_from_the_list_else_the_id():
+    assert js(["repos.js"], "ui = {repos: args}; [repoName('lib-0a1b2c3d'), repoName('nope')]", REPOS) == ["lib", "nope"]
+    assert js(["repos.js"], "ui = {repos: null}; repoName('x')", None) == "x"

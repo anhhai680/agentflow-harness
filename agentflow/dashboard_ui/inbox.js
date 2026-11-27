@@ -451,7 +451,7 @@ function inboxWatchRow(w) {
   const since = Date.parse(w.since || "");
   const when = Number.isNaN(since) ? "" : " · " + ago(Math.max(0, (Date.now() - since) / 1000));
   return el("div", { class: "muted i-watch" },
-    el("a", { href: "#/run/" + encodeURIComponent(w.run_id) + "/overview", text: w.run_label || w.run_id }),
+    el("a", { href: routeHash({ view: "run", run: w.run_id, tab: "overview" }), text: w.run_label || w.run_id }),
     " · " + w.reason + (w.text ? " · " + w.text : "") + when);
 }
 

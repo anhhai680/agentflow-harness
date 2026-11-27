@@ -735,7 +735,7 @@ function renderBoard(data) {
   $("needs-title").hidden = !ui.inboxLegacy;
   const waiting = data.needs_human.length;
   const inbox = waiting === 0 ? el("p", { class: "muted", text: "Nothing is waiting on you." })
-    : el("p", {}, el("a", { href: "#/inbox", text: inboxPlural(waiting, "decision waits", "decisions wait") + " in the Inbox" }));
+    : el("p", {}, el("a", { href: routeHash({ view: "inbox" }), text: inboxPlural(waiting, "decision waits", "decisions wait") + " in the Inbox" }));
   // the old list stays behind `dashboard.inbox_legacy`; otherwise one line points to the Inbox tab
   $("needs").replaceChildren(...(ui.inboxLegacy ? (waiting ? data.needs_human.map(needNode) : [inbox]) : [inbox]));
 }
