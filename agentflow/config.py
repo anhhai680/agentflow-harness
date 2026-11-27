@@ -862,25 +862,35 @@ def _lookup(root: dict, dotted: str, at: str) -> Any:
     return node
 
 
-def _resolve(node: Any, path: str, root: dict, stack: tuple[str, ...], origins: dict[str, str]) -> Any:
+def _resolve(node: Any, path: str, root: dict, stack: tuple[str, ...], origins: dict[str, str],
+             budget: list[int] | None = None, depth: int = 0) -> Any:
     """Return `node` with every `"@a.b.c"` string replaced by a copy of what it names.
 
     `origins` maps the path of each reference to the path it finally points at, so steps
-    pulled in through a reference keep the YAML path of where they are defined.
+    pulled in through a reference keep the YAML path of where they are defined. Each reference is a fresh copy, so
+    `budget` (one count shared by the whole pass) refuses a result past `layers.MAX_EXPANDED_NODES` values, and one
+    nested past `layers.MAX_DEPTH` is refused too: references that name references cost that much to copy out.
     """
+    if budget is None:
+        budget = [layers.MAX_EXPANDED_NODES]
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise ConfigError("", f"the config expands to more than {layers.MAX_EXPANDED_NODES} values through @ references")
+    if depth > layers.MAX_DEPTH:
+        raise ConfigError(path, f"is nested more than {layers.MAX_DEPTH} levels deep through @ references")
     if isinstance(node, str) and node.startswith("@"):
         target = node[1:]
         if target in stack:
             chain = " -> ".join((*stack, target))
             raise ConfigError(path, f"reference cycle: {chain}")
         value = _lookup(root, target, path)
-        resolved = _resolve(value, target, root, (*stack, target), origins)
+        resolved = _resolve(value, target, root, (*stack, target), origins, budget, depth)
         origins[path] = origins.get(target, target)
         return resolved
     if isinstance(node, dict):
-        return {k: _resolve(v, _join(path, str(k)), root, stack, origins) for k, v in node.items()}
+        return {k: _resolve(v, _join(path, str(k)), root, stack, origins, budget, depth + 1) for k, v in node.items()}
     if isinstance(node, list):
-        return [_resolve(v, f"{path}[{i}]", root, stack, origins) for i, v in enumerate(node)]
+        return [_resolve(v, f"{path}[{i}]", root, stack, origins, budget, depth + 1) for i, v in enumerate(node)]
     return node
 
 
@@ -1480,33 +1490,20 @@ def _skills_map(raw: dict) -> dict[str, str]:
     return {str(k): str(v) for k, v in _optional(block, "map", "skills", dict, {}).items()}
 
 
-MAX_DEPTH = 64  # a config file nested deeper than this is refused: no pack needs it, and every pass below recurses
-
-
-def _no_cycle(node: Any, path: Path, ancestors: set[int], done: set[int], depth: int = 0) -> None:
-    """Refuse a value that contains itself (a YAML anchor used inside its own node) or nests past `MAX_DEPTH`;
-    each shared node (an anchor used twice) is walked once."""
-    if not isinstance(node, (dict, list)) or id(node) in done:
-        return
-    if id(node) in ancestors:
-        raise ConfigError("", f"{path} holds a YAML anchor that refers to itself")
-    if depth > MAX_DEPTH:
-        raise ConfigError("", f"{path} is nested more than {MAX_DEPTH} levels deep")
-    ancestors.add(id(node))
-    for child in node.values() if isinstance(node, dict) else node:
-        _no_cycle(child, path, ancestors, done, depth + 1)
-    ancestors.discard(id(node))
-    done.add(id(node))
-
-
 def _read_yaml(path: Path) -> Any:
-    """`path` parsed. A file that can't be read, isn't YAML or holds a value that contains itself is a `ConfigError`
-    naming it, never a traceback."""
+    """`path` parsed. A file that can't be read, is longer than `layers.MAX_CONFIG_BYTES`, isn't UTF-8 or YAML or is
+    refused by `layers.parse_config` is a `ConfigError` naming it, never a traceback."""
     try:
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-        _no_cycle(loaded, path, set(), set())
+        text = layers.read_config_text(path)
+        if text is None:
+            raise ConfigError("", f"{path} is larger than {layers.MAX_CONFIG_BYTES} bytes")
+        loaded = layers.parse_config(text)
+    except layers.ConfigRefused as refused:
+        raise ConfigError("", f"{path} {refused}") from refused
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError("", f"cannot read {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError("", f"{path} is not valid UTF-8 text") from exc
     except RecursionError as exc:
         raise ConfigError("", f"{path} is nested too deeply to read") from exc
     return loaded

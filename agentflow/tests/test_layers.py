@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from pathlib import Path
 
 import pytest
@@ -629,3 +630,155 @@ def test_an_agent_only_a_pack_defines_is_fine_for_the_user_level_loader():
     with pytest.raises(LayerError, match="no agent `mypackagent`"):
         check_user(data, {}, target)
     check_user(data, {}, target, any_agent=True)
+
+
+def nested_alias_bomb(levels: int = 9, width: int = 9) -> str:
+    """`levels` anchored lists, each holding `width` references to the one before: `width ** levels` values once
+    every alias is copied out, a few hundred bytes on disk."""
+    lines = [f"a0: &a0 [{', '.join(['x'] * width)}]"]
+    for i in range(1, levels):
+        lines.append(f"a{i}: &a{i} [{', '.join([f'*a{i - 1}'] * width)}]")
+    return "\n".join(lines) + "\n"
+
+
+def test_a_pack_of_nested_aliases_is_refused_quickly(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(nested_alias_bomb(), encoding="utf-8")
+    started = time.monotonic()
+    with pytest.raises(LayerError) as err:
+        layers._read(path)
+    assert time.monotonic() - started < 2
+    assert str(path) in str(err.value) and "nested aliases" in str(err.value)
+
+
+def test_expanded_size_counts_each_use_of_a_shared_node():
+    assert layers.expanded_size("x") == 1
+    assert layers.expanded_size(None) == 1
+    assert layers.expanded_size({"a": [1, 2], "b": [1, 2]}) == 7  # the mapping, two lists, four scalars
+    shared = list(range(10))
+    assert layers.expanded_size({"a": shared, "b": shared, "c": shared}) == 1 + 3 * (1 + 10)
+    loaded = yaml.safe_load(nested_alias_bomb(levels=3, width=3))
+    assert loaded["a2"][0] is loaded["a1"]  # one shared node, used three times
+    # a0: 1+3; a1: 1+3*4 = 13; a2: 1+3*13 = 40; the top mapping: 1+4+13+40
+    assert layers.expanded_size(loaded) == 58
+
+
+def test_the_budget_boundary(tmp_path):
+    """An anchored list of 999 scalars (1000 values) used 98 times, plus `m` scalars: 1 (the top mapping) + 1000 (`a`)
+    + 1 (`k`) + 98 * 1000 + m values, so m = 998 is exactly the budget."""
+    def doc(m: int) -> str:
+        return (f"a: &a [{', '.join(['x'] * 999)}]\n"
+                f"k: [{', '.join(['*a'] * 98 + ['x'] * m)}]\n")
+
+    assert layers.MAX_EXPANDED_NODES == 100_000
+    path = tmp_path / "config.yaml"
+    path.write_text(doc(998), encoding="utf-8")
+    assert len(layers._read(path)["k"]) == 98 + 998
+    path.write_text(doc(999), encoding="utf-8")
+    with pytest.raises(LayerError, match="nested aliases"):
+        layers._read(path)
+    assert layers.expanded_size({"k" * 10_000: 1, "j" * 10_000: 2}) == 3  # keys are not counted
+
+
+def test_an_ordinary_anchored_pack_still_loads(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "gates: &g {unit: {run: pytest}, lint: {run: ruff}}\n"
+        "gate_sets: {build: *g, verify: *g, review: *g, ship: *g}\n",
+        encoding="utf-8",
+    )
+    assert layers._read(path)["gate_sets"]["ship"]["unit"] == {"run": "pytest"}
+    assert layers.base_layers(None)[0].data
+    for name in layers.starter_names():
+        assert layers.base_layers(name)[1].data is not None
+
+
+def test_a_user_file_of_nested_aliases_is_refused_by_load_user_settings():
+    target = layers.user_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(nested_alias_bomb(), encoding="utf-8")
+    with pytest.raises(LayerError) as err:
+        load_user_settings()
+    assert str(target) in str(err.value) and "nested aliases" in str(err.value)
+
+
+def _write(tmp_path, text: str):
+    path = tmp_path / "config.yaml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_an_anchor_that_refers_to_itself_and_deep_nesting_keep_their_messages(tmp_path):
+    with pytest.raises(LayerError, match="refers to itself"):
+        layers._read(_write(tmp_path, "a: &a {b: *a}\n"))
+    with pytest.raises(LayerError, match=f"nested more than {layers.MAX_DEPTH} levels deep"):
+        layers._read(_write(tmp_path, "a: " + "[" * 70 + "x" + "]" * 70 + "\n"))
+    assert layers._read(_write(tmp_path, "a: " + "[" * 60 + "x" + "]" * 60 + "\n"))
+
+
+def test_shared_anchors_are_measured_at_the_depth_they_reach(tmp_path):
+    """Two 40-deep anchored lists, the second ending in an alias of the first: 80 levels once the alias is followed,
+    though each anchor alone is shallow (the walk used to skip a node it had already seen)."""
+    text = "a0: &a0 " + "[" * 40 + "x" + "]" * 40 + "\n" + "a1: &a1 " + "[" * 40 + "*a0" + "]" * 40 + "\n"
+    with pytest.raises(LayerError, match=f"nested more than {layers.MAX_DEPTH} levels deep"):
+        layers._read(_write(tmp_path, text))
+
+
+def test_a_file_over_the_byte_cap_is_refused_before_it_is_parsed(tmp_path):
+    body = "k: v\n"
+    pad = layers.MAX_CONFIG_BYTES - len(body)
+    path = _write(tmp_path, "#" * (pad - 1) + "\n" + body)
+    assert layers._read(path) == {"k": "v"}  # exactly the cap
+    path = _write(tmp_path, "#" * pad + "\n" + body)
+    with pytest.raises(LayerError, match=f"larger than {layers.MAX_CONFIG_BYTES} bytes"):
+        layers._read(path)
+
+
+def test_a_file_that_is_not_utf8_is_a_layer_error_naming_it(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b"\xff")
+    with pytest.raises(LayerError, match="not valid UTF-8 text") as err:
+        layers._read(path)
+    assert str(path) in str(err.value)
+    target = write_user_file("")
+    target.write_bytes(b"\xff")
+    with pytest.raises(LayerError, match="not valid UTF-8 text") as err:
+        load_user_settings()
+    assert str(target) in str(err.value)
+
+
+def merge_chain(budget: int = layers.MAX_CONFIG_BYTES) -> str:
+    """A chain of anchored mappings, each merging (`<<`) the one before and adding a key, as long as fits in `budget`
+    bytes: building mapping n copies n entries, so the whole file costs the square of its length to construct."""
+    lines, n = [], 0
+    while sum(len(line) + 1 for line in lines) < budget - 64:
+        lines.append(f"a{n}: &a{n} {{<<: *a{n - 1}, k{n}: x}}" if n else "a0: &a0 {k0: x}")
+        n += 1
+    return "\n".join(lines[:-1]) + "\n"
+
+
+def test_a_merge_key_chain_is_refused_before_it_is_built(tmp_path):
+    """The file is under the byte cap; its merges would build millions of entries. It is refused from the composed
+    node graph, which costs one pass, before PyYAML's constructor flattens a single merge."""
+    path = _write(tmp_path, merge_chain())
+    started = time.monotonic()
+    with pytest.raises(LayerError, match="merge keys"):
+        layers._read(path)
+    assert time.monotonic() - started < 2
+
+
+def test_a_merge_key_that_merges_itself_is_refused(tmp_path):
+    with pytest.raises(LayerError, match="merges itself"):
+        layers._read(_write(tmp_path, "a: &a {<<: *a, k: x}\n"))
+    with pytest.raises(LayerError, match="merges itself"):
+        layers._read(_write(tmp_path, "b: &b {k: y}\na: &a {<<: [*b, *a], k: x}\n"))  # through a merge list
+
+
+def test_ordinary_merge_keys_still_load(tmp_path):
+    loaded = layers._read(_write(tmp_path,
+        "base: &base {run: pytest, timeout: 5}\n"
+        "gates:\n  unit: {<<: *base, name: unit}\n  lint: {<<: [*base], run: ruff}\n"))
+    assert loaded["gates"]["unit"] == {"run": "pytest", "timeout": 5, "name": "unit"}
+    assert loaded["gates"]["lint"] == {"run": "ruff", "timeout": 5}
+    assert layers.parse_config("") is None
+    assert layers.parse_config("k: v\n") == {"k": "v"}

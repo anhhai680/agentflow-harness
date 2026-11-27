@@ -17,12 +17,14 @@ from typing import Any
 
 import yaml
 
+from agentflow import layers
+
 ENGINE_PROMPTS: Path = Path(__file__).parent / "prompts"
 ENGINE_SKILLS: Path = Path(__file__).resolve().parent / "skills"  # the generic stage skills the engine bundles
 SKILL_NAME = re.compile(r"(?!-)[\w.:-]+")  # a skill's directory name: the character set of `lanes.SKILL_LINE`, no leading `-`
 PACK_DIR = ".agentflow"
 PACK_VERSION = 2  # the pack format this engine reads (`version:`)
-ENGINE_VERSION = "3.13"  # what a pack's `engine:` range is checked against
+ENGINE_VERSION = "3.15"  # what a pack's `engine:` range is checked against
 ENGINE_FORBIDDEN = (".agentflow/**",)  # forbidden paths every pack gets, whatever it lists itself
 STATE_HOME = "~/.local/state"  # where the default state dir goes when `XDG_STATE_HOME` is unset
 ENGINE_LESSONS: Path = Path(__file__).resolve().parent / "lessons.md"  # the engine's own lessons, for any project
@@ -96,9 +98,10 @@ def _raw_state_dir(config: Path) -> Any:
         return None
     key = (str(config), st.st_mtime_ns, st.st_size)
     if key not in _STATE_DIR_CACHE:
-        try:
-            data = yaml.safe_load(config.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
+        try:  # the loader refuses what is unreadable here, with the reason; this reads one key
+            text = layers.read_config_text(config)
+            data = layers.parse_config(text) if text is not None else None
+        except (OSError, yaml.YAMLError, RecursionError, ValueError):
             data = None
         paths = data.get("paths") if isinstance(data, dict) else None
         _STATE_DIR_CACHE[key] = paths.get("state_dir") if isinstance(paths, dict) else None

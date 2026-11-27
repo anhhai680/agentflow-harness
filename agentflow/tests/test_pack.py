@@ -550,3 +550,25 @@ def test_validate_refuses_an_unknown_expectation(tmp_cfg):
     path = tmp_cfg(patch)
     issues = validate(load_config(path), path.parent.parent)
     assert any(i.level == "error" and i.path.endswith(".expect") for i in issues)
+
+
+def test_raw_state_dir_reads_nothing_from_a_hostile_pack(tmp_path):
+    from agentflow import layers
+
+    config = tmp_path / "config.yaml"
+    config.write_text("paths: " + "[" * 5000 + "]" * 5000 + "\n", encoding="utf-8")
+    assert pack._raw_state_dir(config) is None  # nested past what the parser can follow: no traceback
+    config.write_text("paths: {state_dir: /x}\n" + "#" * layers.MAX_CONFIG_BYTES + "\n", encoding="utf-8")
+    assert pack._raw_state_dir(config) is None  # over the byte cap: not parsed
+
+
+def test_raw_state_dir_does_not_build_a_merge_key_chain(tmp_path):
+    import time
+
+    from test_layers import merge_chain
+
+    config = tmp_path / "config.yaml"
+    config.write_text("paths: {state_dir: /x}\n" + merge_chain(), encoding="utf-8")
+    started = time.monotonic()
+    assert pack._raw_state_dir(config) is None
+    assert time.monotonic() - started < 2

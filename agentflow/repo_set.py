@@ -98,6 +98,19 @@ def _excluded(checkout: Path, exclude: tuple[str, ...]) -> bool:
     return False
 
 
+def _is_utf8(path: Path) -> bool:
+    try:
+        str(path).encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _label(path: Path) -> str:
+    """A folder's name for a reason line, with any byte that is not UTF-8 replaced."""
+    return path.name.encode("utf-8", "replace").decode("utf-8")
+
+
 def _main_checkout(candidate: Path) -> Path | None:
     """The main checkout holding `candidate`, or None when it is not one: git names no checkout (a submodule's
     `.git` file leads into its superproject's `.git/modules`) or the path cannot be probed."""
@@ -108,23 +121,40 @@ def _main_checkout(candidate: Path) -> Path | None:
         return None
 
 
+def root_folders(settings: layers.WorkspaceSettings) -> tuple[Path, ...]:
+    """The `roots` of `settings` that are folders, each resolved as `resolve` resolves it; one that can't be read
+    or isn't a folder is left out. Never raises."""
+    out: list[Path] = []
+    for entry in settings.roots:
+        try:
+            root = Path(entry).expanduser()
+            if root.is_dir():
+                out.append(root.resolve())
+        except _UNREADABLE:
+            continue
+    return tuple(out)
+
+
 def resolve(settings: layers.WorkspaceSettings) -> RepoSet:
     """The repositories of `settings`: each root's child repositories in name order, then the `repos` entries,
     each as its main checkout and once, with `exclude` applied last. An entry that cannot be read is `Skipped`
     (a root's unreadable child is simply not a candidate); nothing here raises for one bad path."""
     skipped: list[Skipped] = []
-    candidates: list[tuple[Path, str | None]] = []  # the path, and the entry that named it (None for a root's child)
+    # the path; the `repos` entry that named it (None for a root's child); and for a root's child, its root
+    # (resolved) with the root entry as written
+    candidates: list[tuple[Path, str | None, tuple[Path, str] | None]] = []
     for entry in settings.roots:
         try:
             root = Path(entry).expanduser()
             is_folder = root.is_dir()
+            resolved_root = root.resolve() if is_folder else root
         except _UNREADABLE as exc:
             skipped.append(Skipped(entry, f"cannot be read: {exc}"))
             continue
         if not is_folder:
             skipped.append(Skipped(entry, "is not a folder"))
             continue
-        candidates.extend((child, None) for child in _children(root, skipped, entry))
+        candidates.extend((child, None, (resolved_root, entry)) for child in _children(root, skipped, entry))
     for entry in settings.repos:
         try:
             path = Path(entry).expanduser()  # named by the developer, so a symlink is followed
@@ -133,16 +163,26 @@ def resolve(settings: layers.WorkspaceSettings) -> RepoSet:
             skipped.append(Skipped(entry, f"cannot be read: {exc}"))
             continue
         if named:
-            candidates.append((path, entry))
+            candidates.append((path, entry, None))
         else:
             skipped.append(Skipped(entry, "is not a git checkout"))
     seen: set[Path] = set()
     checkouts: list[Path] = []
-    for candidate, entry in candidates:
+    for candidate, entry, from_root in candidates:
         checkout = _main_checkout(candidate)
         if checkout is None:
             if entry is not None:
                 skipped.append(Skipped(entry, "is not a git checkout"))
+            elif from_root is not None:
+                skipped.append(Skipped(
+                    from_root[1], f"{_label(candidate)}: not a standalone git checkout (a submodule, or git refused it)"))
+            continue
+        if not _is_utf8(checkout):  # such a name can't be put in JSON or addressed in a URL
+            skipped.append(Skipped(entry or from_root[1], f"{_label(candidate)}: its path is not valid UTF-8"))
+            continue
+        if from_root is not None and checkout.parent != from_root[0]:
+            skipped.append(Skipped(
+                from_root[1], f"{_label(candidate)}: its main checkout {checkout} is outside this root"))
             continue
         drop = checkout in seen or _excluded(checkout, settings.exclude)
         seen.add(checkout)

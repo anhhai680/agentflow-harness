@@ -3433,3 +3433,99 @@ def test_backlog_checks_only_run_for_a_backlog_pack(tmp_cfg, tmp_path):
     (tmp_path / "backlog.yml").write_text("version: 2\n", encoding="utf-8")
     baseline = [(i.level, i.path) for i in validate(load_config(tmp_cfg(None)), tmp_path)]
     assert not [p for _, p in baseline if p.startswith("backlog")]
+
+
+def _nested_alias_bomb() -> str:
+    lines = ["a0: &a0 [x, x, x, x, x, x, x, x, x]"]
+    lines += [f"a{i}: &a{i} [{', '.join([f'*a{i - 1}'] * 9)}]" for i in range(1, 9)]
+    return "\n".join(lines) + "\n"
+
+
+def test_load_config_refuses_nested_aliases(tmp_cfg):
+    import time
+
+    path = tmp_cfg()
+    path.write_text(path.read_text(encoding="utf-8") + _nested_alias_bomb(), encoding="utf-8")
+    started = time.monotonic()
+    with pytest.raises(ConfigError) as err:
+        load_config(path)
+    assert time.monotonic() - started < 2
+    assert str(path) in str(err.value) and "nested aliases" in str(err.value)
+    user = _user_file(_nested_alias_bomb())
+    with pytest.raises(ConfigError) as err:
+        load_config(PYTHON_CONFIG)
+    assert str(user) in str(err.value) and "nested aliases" in str(err.value)
+    with pytest.raises(layers.LayerError) as err:
+        layers.load_user_settings()
+    assert str(user) in str(err.value) and "nested aliases" in str(err.value)
+
+
+def test_load_config_refuses_an_at_reference_bomb(tmp_cfg):
+    import time
+
+    lines = ["x0: [a, a, a, a, a, a, a, a, a]"]
+    lines += [f"x{i}: [{', '.join([repr('@x' + str(i - 1))] * 9)}]" for i in range(1, 8)]
+    path = tmp_cfg()
+    path.write_text(path.read_text(encoding="utf-8") + "\n".join(lines) + "\n", encoding="utf-8")
+    started = time.monotonic()
+    with pytest.raises(ConfigError, match="@ references"):
+        load_config(path)
+    assert time.monotonic() - started < 2
+
+
+def test_load_config_refuses_an_at_reference_chain_past_the_depth_bound(tmp_cfg):
+    lines = ["y0: [x]"] + [f"y{i}: ['@y{i - 1}']" for i in range(1, 80)]
+    path = tmp_cfg()
+    path.write_text(path.read_text(encoding="utf-8") + "\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="levels deep"):
+        load_config(path)
+
+
+def test_load_config_keeps_its_messages_for_a_self_referencing_or_deep_pack(tmp_cfg):
+    path = tmp_cfg()
+    base = path.read_text(encoding="utf-8")
+    path.write_text(base + "zz: &z {b: *z}\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="refers to itself"):
+        load_config(path)
+    path.write_text(base + "zz: " + "[" * 70 + "x" + "]" * 70 + "\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="nested more than 64 levels deep"):
+        load_config(path)
+
+
+def test_load_config_refuses_a_pack_or_a_user_file_that_is_not_utf8(tmp_cfg):
+    path = tmp_cfg()
+    good = path.read_bytes()
+    path.write_bytes(b"\xff")
+    with pytest.raises(ConfigError) as err:
+        load_config(path)
+    assert f"{path} is not valid UTF-8 text" in str(err.value)
+    path.write_bytes(good)
+    user = layers.user_config_path()
+    user.parent.mkdir(parents=True, exist_ok=True)
+    user.write_bytes(b"\xff")
+    with pytest.raises(ConfigError) as err:
+        load_config(path)
+    assert f"{user} is not valid UTF-8 text" in str(err.value)
+
+
+def test_load_config_refuses_a_pack_over_the_byte_cap(tmp_cfg):
+    path = tmp_cfg()
+    path.write_text(path.read_text(encoding="utf-8") + "#" * layers.MAX_CONFIG_BYTES + "\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as err:
+        load_config(path)
+    assert str(path) in str(err.value) and f"larger than {layers.MAX_CONFIG_BYTES} bytes" in str(err.value)
+
+
+def test_load_config_refuses_a_merge_key_chain_quickly(tmp_cfg):
+    import time
+
+    from test_layers import merge_chain
+
+    path = tmp_cfg()
+    base = path.read_text(encoding="utf-8")
+    path.write_text(base + merge_chain(layers.MAX_CONFIG_BYTES - len(base.encode("utf-8"))), encoding="utf-8")
+    started = time.monotonic()
+    with pytest.raises(ConfigError) as err:
+        load_config(path)
+    assert time.monotonic() - started < 2
+    assert str(path) in str(err.value) and "merge keys" in str(err.value)

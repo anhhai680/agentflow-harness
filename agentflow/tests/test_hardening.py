@@ -410,7 +410,7 @@ def test_dashboard_ignores_a_run_id_with_a_trailing_newline(flow_repo):
 
     run = flow_repo.new_run()
     handler = object.__new__(dashboard._Handler)
-    handler.server = SimpleNamespace(repo=flow_repo.root)
+    handler._ctx = SimpleNamespace(repo=flow_repo.root)
     assert handler._run(run.id) is not None
     assert handler._run(run.id + "\n") is None
 

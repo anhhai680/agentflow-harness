@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -84,8 +85,40 @@ def test_a_linked_worktree_collapses_into_its_main_checkout(tmp_path):
     commit(outer)
     run_git(outer, "worktree", "add", "-q", str(root / "wt-out"), "-b", "wt-out")
     result = resolve(settings([root]))
-    assert [r.path for r in result.repos] == [main.resolve(), outer.resolve()]
-    assert names(result) == ["main-in", "main-out"]
+    assert [r.path for r in result.repos] == [main.resolve()]
+    assert names(result) == ["main-in"]
+    assert len(result.skipped) == 1
+    line = result.skipped[0]
+    assert line.entry == str(root)
+    assert line.reason.startswith("wt-out:")
+    assert "outside this root" in line.reason
+
+
+def test_a_root_reached_through_a_symlink_keeps_its_children(tmp_path):
+    root = tmp_path / "root"
+    make_repo(root, "a")
+    make_repo(root, "b")
+    link = tmp_path / "link"
+    link.symlink_to(root, target_is_directory=True)
+    result = resolve(settings([link]))
+    assert names(result) == ["a", "b"]
+    assert result.skipped == ()
+
+
+def test_a_folder_whose_name_is_not_valid_utf8_is_skipped(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    make_repo(root, "bad")
+    make_repo(root, "good")
+    real = repo_set._main_checkout
+    monkeypatch.setattr(
+        repo_set, "_main_checkout",
+        lambda p: Path(os.fsdecode(b"/x/bad\xff")) if Path(p).name == "bad" else real(p))
+    result = resolve(settings([root]))
+    assert names(result) == ["good"]
+    assert len(result.skipped) == 1
+    assert result.skipped[0].entry == str(root)
+    assert result.skipped[0].reason.startswith("bad:")
+    assert "not valid UTF-8" in result.skipped[0].reason
 
 
 def test_repos_entries_join_and_are_deduplicated(tmp_path):
@@ -252,6 +285,10 @@ def test_a_submodule_is_not_a_checkout(tmp_path, monkeypatch):
     monkeypatch.setattr(pack, "checkout_root", lambda p: bogus if Path(p).name == "sub" else real(p))
     named = resolve(settings([root], repos=[sub]))
     assert names(named) == ["ok", "sup"]
-    assert [s.entry for s in named.skipped] == [str(sub)]
-    assert named.skipped[0].reason == "is not a git checkout"
-    assert resolve(settings([root])).skipped == ()
+    assert [s.entry for s in named.skipped] == [str(root), str(sub)]
+    assert named.skipped[0].reason.startswith("sub:")
+    assert "not a standalone git checkout" in named.skipped[0].reason
+    assert named.skipped[1].reason == "is not a git checkout"
+    only_root = resolve(settings([root])).skipped
+    assert [s.entry for s in only_root] == [str(root)]
+    assert only_root[0].reason.startswith("sub:")

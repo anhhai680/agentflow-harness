@@ -45,7 +45,7 @@ from agentflow.vuln import SEVERITIES as VULN_SEVERITIES
 
 __all__ = ["Conflict", "EditError", "Proposal", "Refused", "form_fields", "propose", "read", "save"]
 
-MAX_TEXT = 512 * 1024
+MAX_TEXT = layers.MAX_CONFIG_BYTES
 MERGE_TAG = "tag:yaml.org,2002:merge"
 AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices", "cache_ttl", "lean", "user_settings", "read_only_roles",
                   "max_turns_by_role", "session_budget_usd", "bash_output_chars")  # what a page may change in an `agents.<name>` block
@@ -107,6 +107,8 @@ def read(path: Path) -> tuple[str, str]:
     path = Path(path)
     if path.is_symlink():
         raise EditError(f"{path} is a symlink; the dashboard edits only a regular file")
+    if path.stat().st_size > MAX_TEXT:
+        raise EditError(f"{path.name} is larger than {MAX_TEXT} bytes; fix it in git")
     text = path.read_text(encoding="utf-8")
     return text, sha256(text)
 
@@ -278,7 +280,10 @@ _RANK = {"engine": 0, "project": 2, "user": 3}  # a starter (`starter:<name>`) s
 def _layers(path: Path, text: str) -> _Layers:
     """The layered view of the pack at `path`, whose text is `text`. A user file the pack refuses is left out; a
     pack that does not load at all falls back to the file alone, as the form was before the layers."""
-    project = yaml.safe_load(text) or {}
+    try:  # every walk below copies each alias out: refuse an unbounded file before any of them
+        project = layers.parse_config(text) or {}
+    except layers.ConfigRefused as refused:
+        raise EditError(f"{path.name} {refused}; fix it in git") from refused
     project = project if isinstance(project, dict) else {}
     comments = _comments(text)
     try:
@@ -540,8 +545,10 @@ def _check(path: Path, new_text: str, repo: Path) -> list[Issue]:
     break for a teammate and for CI. When no pair loads (the file on disk loads neither way, or only the way the
     new text does not), the protected settings are held as written: a broken file can be repaired here, but not
     by changing a protected setting."""
-    try:
-        parsed = yaml.safe_load(new_text)
+    try:  # refused before any load or comparison: each one copies every alias out
+        parsed = layers.parse_config(new_text)
+    except layers.ConfigRefused as refused:
+        return [Issue("error", "", f"config.yaml {refused}")]
     except yaml.YAMLError as exc:
         return [Issue("error", "", f"not valid YAML: {exc}")]
     if not isinstance(parsed, dict):
@@ -593,8 +600,9 @@ def _written_changes(path: Path, parsed: dict) -> list[str]:
     """The protected settings `parsed` changes compared with the file on disk, both as written (no layers, no
     `@` resolution)."""
     try:
-        old = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
+        text = layers.read_config_text(path)
+        old = layers.parse_config(text) if text is not None else None
+    except (OSError, yaml.YAMLError, RecursionError, ValueError):  # unreadable, refused or not YAML: nothing to hold
         return []
     return _protected_changes(old if isinstance(old, dict) else {}, parsed)
 
