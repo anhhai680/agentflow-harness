@@ -65,9 +65,11 @@ Routes:
   and `POST /api/user-config/save` with `base_sha256` and `changes` (form changes only: a body with `text` is a 400).
   They need no repository and are 404 under `/api/repos/<id>/`. The file written is always
   `layers.user_config_path()`, never a request value, and the check runs against every live repository's pack
-  (`config_edit.propose_user`), so an edit that breaks one is a 400 naming it; 409 when the file changed since the
-  page read it. A save answers `{ok, sha256, restart, rescanned}`: every live repository's config is loaded again
-  (`DashboardServer.user_saved`), a workspace dashboard rescans at once on a `workspace.*` change, and `restart`
+  (`config_edit.propose_user`: it must load there, and pass `validate` wherever it passed), so an edit that breaks
+  one is a 400 naming it; 409 when the file changed since the page read it. A save answers
+  `{ok, sha256, restart, rescanned}`: every live repository's config is loaded again
+  (`DashboardServer.user_saved`), a workspace dashboard rescans at once on a `workspace.*` change, or when the user
+  file did not load or a repository was in `error` before the save (the save may have mended either), and `restart`
   lists what needs a restart (`dashboard.port`, and `workspace.*` on a server that does not rescan).
 - `GET /api/repos`: every repository the server holds (`repo_context.repos_view`, from one snapshot: its id, name,
   state, counts and load error, the skipped settings entries, the default's id), with no checkout path in it.
@@ -590,11 +592,15 @@ class DashboardServer(ThreadingHTTPServer):
         """After Your settings saved the user file: load every live context's config again (stored on the context
         the current snapshot holds, as a pack save stores it) and the snapshot's `user`, under `_scan_lock`, so a
         rescan publishes either before (and this lands on what it published) or after (and it read the new file).
-        Then a workspace server with a `workspace.*` key in `keys` rescans at once. True when it rescanned. A
+        Then a workspace server rescans at once when `keys` holds a `workspace.*` key, or when the snapshot before
+        the save had a user file that did not load (`user_error`) or a repository in `error`: the save may have
+        mended either, and the page lists the repositories again right after it. True when it rescanned. A
         context whose reload fails is logged with its name and keeps its config. Never raises."""
+        mend = False
         with self._scan_lock:
             try:
                 snap = self.snap
+                mend = snap.user_error is not None or any(ctx.state == "error" for ctx in snap.repos.values())
                 for ctx in self.live_contexts(snap):
                     try:
                         ctx.cfg = load_config(Path(ctx.cfg.path))
@@ -609,7 +615,7 @@ class DashboardServer(ThreadingHTTPServer):
                     self.snap = replace(snap, user=settings, user_error=None)
             except Exception as exc:
                 sys.stderr.write(f"dashboard: reload after a user config save failed: {doctor.printable(exc)}\n")
-        if not (self.workspace and any(key.startswith("workspace.") for key in keys)):
+        if not (self.workspace and (mend or any(key.startswith("workspace.") for key in keys))):
             return False
         self.rescan()
         return True
@@ -1302,7 +1308,7 @@ class _Handler(BaseHTTPRequestHandler):
         if "text" in body or not isinstance(base, str) or not isinstance(changes, list):
             self._error(400, "send base_sha256 and changes (your user config takes form changes only)")
             return
-        packs = [(ctx.name, Path(ctx.cfg.path)) for ctx in self.server.live_contexts(self._snap)]
+        packs = [(ctx.name, Path(ctx.cfg.path), ctx.repo) for ctx in self.server.live_contexts(self._snap)]
         try:
             proposal = config_edit.propose_user(base, changes, packs)
             if path == "/api/user-config/preview":

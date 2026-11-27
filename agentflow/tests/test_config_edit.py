@@ -1772,6 +1772,59 @@ def test_a_user_edit_that_breaks_a_live_pack_is_an_error_naming_it(tmp_path):
     assert not _user_propose((["agents", "claude", "models"], {"build": "opus"}), packs=[("A", a), ("B", b)]).errors
 
 
+def _refused_naming(proposal: config_edit.Proposal, name: str, key: str) -> str:
+    """The one error a user edit gets in the live pack `name`, at `key`; it never names the temporary file."""
+    assert len(proposal.errors) == 1, proposal.errors
+    issue = proposal.errors[0]
+    said = f"{issue.path}: {issue.message}"
+    assert issue.path == key and issue.message.startswith(f"{name}: ") and ".config-check-" not in said, said
+    return said
+
+
+def test_a_user_soft_budget_over_the_hard_limit_fails_validate_and_is_refused_naming_the_repository(sparse_repo):
+    from agentflow.config import validate
+
+    pack_path = sparse_repo / ".agentflow" / "config.yaml"
+    p = _user_file({"dashboard": {"done_shown": 20}})
+    before = p.read_bytes()
+    assert not [i for i in validate(load_config(pack_path), sparse_repo) if i.level == "error"]
+    packs = [("billing", pack_path, sparse_repo)]
+    proposal = _user_propose((["defaults", "run_budget_usd"], 100), packs=packs)
+    assert "below run_budget_usd" in _refused_naming(proposal, "billing", "defaults.run_budget_hard_usd")
+    with pytest.raises(EditError):
+        config_edit.save_user(proposal)
+    assert p.read_bytes() == before
+    assert not [f for f in p.parent.iterdir() if f.name.startswith(".config-")]
+    assert not _user_propose((["defaults", "run_budget_usd"], 100), (["defaults", "run_budget_hard_usd"], 150),
+                             packs=packs).errors
+
+
+def test_a_user_five_hour_soft_over_the_hard_mark_fails_validate_and_is_refused_naming_the_repository(sparse_repo):
+    pack_path = sparse_repo / ".agentflow" / "config.yaml"
+    p = _user_file({"dashboard": {"done_shown": 20}})
+    before = p.read_bytes()
+    packs = [("billing", pack_path, sparse_repo)]
+    proposal = _user_propose((["usage", "five_hour_soft"], 0.95), packs=packs)
+    assert "below five_hour_hard" in _refused_naming(proposal, "billing", "usage.five_hour_soft")
+    with pytest.raises(EditError):
+        config_edit.save_user(proposal)
+    assert p.read_bytes() == before
+    assert not _user_propose((["usage", "five_hour_soft"], 0.95), (["usage", "five_hour_hard"], 0.98),
+                             packs=packs).errors
+
+
+def test_a_validate_error_a_live_pack_already_has_blocks_nothing_but_a_new_one_still_does(sparse_repo):
+    from conftest import SPARSE_PACK
+
+    pack_path = sparse_repo / ".agentflow" / "config.yaml"
+    pack_path.write_text(yaml.safe_dump({**SPARSE_PACK, "defaults": {"run_budget_hard_usd": 10}}),
+                         encoding="utf-8")  # below the engine's soft budget: validate fails here today
+    _user_file({"dashboard": {"done_shown": 20}})
+    packs = [("billing", pack_path, sparse_repo)]
+    assert not _user_propose((["defaults", "run_budget_usd"], 30), packs=packs).errors  # the same error, reworded
+    _refused_naming(_user_propose((["usage", "five_hour_soft"], 0.95), packs=packs), "billing", "usage.five_hour_soft")
+
+
 def test_the_pack_form_says_each_field_saves_to_the_pack(sparse_repo):
     path = _sparse(sparse_repo)
     assert all(f["target"] == "project" for f in _fields(path).values())

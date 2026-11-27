@@ -4489,3 +4489,50 @@ def test_a_user_save_and_a_rescan_never_lose_each_other(wsd, monkeypatch):
     assert server.snap.user.dashboard["done_shown"] == 9
     assert server.repos[wsd.id("a")].cfg.dashboard["done_shown"] == 9
     assert payload(wsd.dash.get("/api/info")[2])["done_shown"] == 9
+
+
+def test_a_user_edit_that_fails_validate_in_a_live_repository_is_refused_naming_it(two):
+    status, data = user_save(two.dash, (["defaults", "run_budget_usd"], 100))  # above the engine's hard limit
+    assert status == 400, data
+    assert data["error"] == "the change does not validate"
+    named = [i for i in data["issues"] if i["level"] == "error" and i["path"] == "defaults.run_budget_hard_usd"
+             and i["message"].startswith(f"{two.b.name}:")]
+    assert named, data["issues"]
+    assert ".config-check-" not in json.dumps(data)
+    assert not os.path.lexists(layers.user_config_path())
+    status, data = user_save(two.dash, (["defaults", "run_budget_usd"], 100), (["defaults", "run_budget_hard_usd"], 150))
+    assert status == 200, data
+
+
+def test_a_user_save_that_mends_a_broken_user_file_rescans_without_a_workspace_key(ws_root):
+    server = dashboard.make_workspace_server([], repo_context.engine_user_settings(), "127.0.0.1", 0, TOKEN,
+                                             user_error="the user config did not load")  # fixed by hand since
+    thread = _serve(server)
+    try:
+        dash = Dash(server, server.server_address[1], None)
+        status, data = user_save(dash, (["dashboard", "done_shown"], 20))
+        assert status == 200, data
+        assert data["rescanned"] is True
+        assert server.snap.user_error is None and ws_root / "a" in [ctx.repo for ctx in server.live_contexts()]
+    finally:
+        server.close()
+        thread.join(timeout=5)
+
+
+def test_a_user_save_that_mends_a_repository_in_error_rescans_without_a_workspace_key(tmp_path):
+    root = tmp_path / "ws"
+    a = ws_repo(root, "a")
+    write_sparse_pack(a, agents={**SPARSE_PACK["agents"], "codex": None})
+    path = write_workspace(roots=[root])
+    path.write_text(path.read_text(encoding="utf-8") + "agents: {codex: {models: {build: x}}}\n", encoding="utf-8")
+    server = workspace_server()
+    thread = _serve(server)
+    try:
+        assert server.repos[id_of(a)].state == "error"  # its pack has no codex for the user file's models
+        dash = Dash(server, server.server_address[1], None)
+        status, data = user_save(dash, (["agents", "codex", "models"], None))
+        assert status == 200, data
+        assert data["rescanned"] is True and server.repos[id_of(a)].state == "live"
+    finally:
+        server.close()
+        thread.join(timeout=5)

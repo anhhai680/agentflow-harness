@@ -26,7 +26,8 @@ the engine decides again. The same text edits keep the file's comments and ancho
 a stale base, and the rest of the file is held: once every allow-listed key is taken out, the old and the new text
 parse to the same data. A new `workspace.roots` entry must be a folder that exists. The candidate text must load as
 the user file (`layers.load_user_settings`) and with every live repository's pack that loads with the file on disk
-(`load_config(..., user_file=...)`), and an error names that repository. A symlink, a hardlink, anything that is
+(`load_config(..., user_file=...)`), and there `validate` must find no error at a key that had none with the file on
+disk; an error names that repository. A symlink, a hardlink, anything that is
 not a regular file, or a symlinked `agentflow` folder is never read through or written: the form shows why, read
 only. A new file is created private (`0o600`), in a folder made by `safeio.ensure_dir`.
 """
@@ -42,7 +43,7 @@ import os
 import stat
 import tempfile
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -52,8 +53,8 @@ from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from agentflow import layers, safeio
 from agentflow.config import (
-    CACHE_TTLS, CLAIM_REFS, CLAIM_STALE_H_MAX, KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ROUTE_MODES, ConfigError, Issue,
-    load_config, validate,
+    CACHE_TTLS, CLAIM_REFS, CLAIM_STALE_H_MAX, KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ROUTE_MODES, Config, ConfigError,
+    Issue, load_config, validate,
 )
 from agentflow.layers import PHASE_FREE_KEYS
 from agentflow.vuln import SEVERITIES as VULN_SEVERITIES
@@ -1167,16 +1168,21 @@ def _without_user_fields(data: dict) -> dict:
     return out
 
 
-def propose_user(base_sha256: str, changes: list, packs: Sequence[tuple[str, Path]] = (),
-                 path: Path | None = None) -> Proposal:
+UserPacks = Sequence[tuple[str, Path] | tuple[str, Path, Path]]
+
+
+def propose_user(base_sha256: str, changes: list, packs: UserPacks = (), path: Path | None = None) -> Proposal:
     """The user-file text a save would write, with what stops it; raises `Conflict`, `Refused`, `EditError`.
 
-    `packs` is `(repository name, pack config path)` per live repository. In order: the base must be the file's
+    `packs` is `(repository name, pack config path, checkout)` per live repository; without the checkout it is the
+    folder that holds the pack's `.agentflow/`. In order: the base must be the file's
     current hash; every change key must be in `USER_FIELD_KEYS` (else `Refused`, whatever the value); each value
     must fit its field, a `workspace.*` list must have the shape `layers.workspace_settings` takes, and a
     `workspace.roots` entry the file does not list yet must be a folder that exists; the edit must leave the rest of
     the file as it was (else `Refused`). Then the candidate must load as the user file, and with each pack that
-    loads with the file on disk; an issue names that repository, and the real file, never the temporary one."""
+    loads with the file on disk, and there `validate` must find no error at a key that had none with the file on disk
+    (as a run's reload and `agentflow validate` would see it); an issue names that repository, and the real file,
+    never the temporary one."""
     path = _user_path(path)
     current, digest, _ = read_user(path)
     if base_sha256 != digest:
@@ -1223,7 +1229,7 @@ def propose_user(base_sha256: str, changes: list, packs: Sequence[tuple[str, Pat
     return Proposal(digest, new_text, diff, issues)
 
 
-def _check_user_text(path: Path, new_text: str, packs: Sequence[tuple[str, Path]]) -> list[Issue]:
+def _check_user_text(path: Path, new_text: str, packs: UserPacks) -> list[Issue]:
     """Load `new_text` as the user file, from a temporary file beside it (or in a private temporary folder while the
     file's folder does not exist yet: a preview creates nothing)."""
     if path.parent.is_dir() and not path.parent.is_symlink():
@@ -1232,7 +1238,7 @@ def _check_user_text(path: Path, new_text: str, packs: Sequence[tuple[str, Path]
         return _check_candidate(path, new_text, packs, Path(scratch))
 
 
-def _check_candidate(path: Path, new_text: str, packs: Sequence[tuple[str, Path]], folder: Path) -> list[Issue]:
+def _check_candidate(path: Path, new_text: str, packs: UserPacks, folder: Path) -> list[Issue]:
     fd, temp = tempfile.mkstemp(prefix=".config-check-", suffix=".yaml", dir=folder)
     names = sorted({temp, os.path.realpath(temp)}, key=len, reverse=True)
 
@@ -1249,19 +1255,39 @@ def _check_candidate(path: Path, new_text: str, packs: Sequence[tuple[str, Path]
             layers.load_user_settings(Path(temp))
         except layers.LayerError as exc:
             issues.append(Issue("error", said(exc.path), said(exc.message)))
-        for name, pack_path in packs:
+        for entry in packs:
+            name, pack_path = entry[0], Path(entry[1])
+            repo = Path(entry[2]) if len(entry) > 2 else pack_path.parent.parent
             try:
-                load_config(pack_path, user_file=path)
+                now = load_config(pack_path, user_file=path)
             except (ConfigError, OSError):  # already broken with the file on disk: it blocks nothing
                 continue
             try:
-                load_config(pack_path, user_file=Path(temp))
+                cfg = load_config(pack_path, user_file=Path(temp))
             except (ConfigError, OSError) as exc:
                 where, message = (exc.path, exc.message) if isinstance(exc, ConfigError) else ("", str(exc))
                 issues.append(Issue("error", said(where), f"{name}: {said(message)}"))
+                continue
+            issues += [Issue("error", said(i.path), f"{name}: {said(i.message)}")
+                       for i in _new_validate_errors(now, cfg, repo, said)]
     finally:
         Path(temp).unlink(missing_ok=True)
     return issues
+
+
+def _new_validate_errors(now: Config, cfg: Config, repo: Path, said: Callable[[str], str]) -> list[Issue]:
+    """The errors `validate` finds in `cfg` (the pack with the candidate user file) at a key where it finds none in
+    `now` (the pack with the file on disk). A key keeps its error when only the message's values move (a soft budget
+    raised past a hard limit that was already below it), and a pack `validate` can't check today blocks nothing."""
+    try:
+        before = {said(i.path) or said(i.message) for i in validate(now, repo) if i.level == "error"}
+    except Exception:  # validate itself fails on the pack as it is: like a pack that does not load, it blocks nothing
+        return []
+    try:
+        after = [i for i in validate(cfg, repo) if i.level == "error"]
+    except Exception as exc:  # it fails only with the candidate: that is new
+        return [Issue("error", "", said(f"validate failed with your new settings: {exc}"))]
+    return [i for i in after if (said(i.path) or said(i.message)) not in before]
 
 
 def save_user(proposal: Proposal, path: Path | None = None) -> str:
