@@ -1080,6 +1080,56 @@ def test_an_unchanged_digest_is_not_sent_again(repo, run, cfg, macos_calls):
         "1 item needs you; 1 run progressing")
 
 
+def write_user_file(text: str) -> None:
+    from agentflow import layers
+
+    path = layers.user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def name_a_workspace(tmp_path) -> None:
+    import yaml
+
+    write_user_file(yaml.safe_dump({"workspace": {"roots": [str(tmp_path)]}}))
+
+
+def test_the_default_title_names_the_repository_when_a_workspace_is_set(tmp_path, repo, run, cfg, macos_calls):
+    name_a_workspace(tmp_path)
+    untitled = dataclasses.replace(cfg, hitl={**cfg.hitl, "notify": [{"type": "macos"}]})  # the fixture pack spells the title out
+    hitl.notify_run(untitled, run, "m")
+    assert f'with title "agentflow \u00b7 {repo.name}: {run.id} needs you"' in macos_calls[0][2]
+
+
+def test_the_digest_title_names_the_repository_too(tmp_path, repo, run, cfg, macos_calls):
+    name_a_workspace(tmp_path)
+    hitl.notify_run(_digest_cfg(cfg), run, "m")
+    assert f'with title "agentflow \u00b7 {repo.name}"' in macos_calls[0][2]
+
+
+def test_a_configured_title_is_kept_as_written_in_a_workspace(tmp_path, run, cfg, macos_calls):
+    name_a_workspace(tmp_path)
+    mine = dataclasses.replace(cfg, hitl={**cfg.hitl, "notify": [{"type": "macos", "title": "mine {run}"}]})
+    hitl.notify_run(mine, run, "m")
+    assert f'with title "mine {run.id}"' in macos_calls[0][2]
+
+
+def test_an_unreadable_user_file_keeps_the_plain_title(run, cfg, macos_calls):
+    write_user_file(": : :")
+    untitled = dataclasses.replace(cfg, hitl={**cfg.hitl, "notify": [{"type": "macos"}]})
+    hitl.notify_run(untitled, run, "m")
+    assert f'with title "agentflow: {run.id} needs you"' in macos_calls[0][2]
+    assert hitl._repo_label(run.repo) is None
+
+
+def test_a_folder_name_with_quotes_cannot_break_the_notification_command(tmp_path, cfg, macos_calls):
+    name_a_workspace(tmp_path)
+    label = hitl._repo_label(Path('/w/my "x"\nrepo'))
+    assert label == 'my "x" repo'
+    hitl.notify(cfg, f"agentflow \u00b7 {label}", "m")
+    assert 'with title "agentflow \u00b7 my \\"x\\" repo"' in macos_calls[0][2]
+
+
 def test_a_runner_note_never_reaches_the_digest(repo, run, cfg, macos_calls):
     on = _digest_cfg(cfg)
     hitl.notify_run(on, run, "needs you")

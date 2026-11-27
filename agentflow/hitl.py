@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import pack, safeio
+from . import layers, pack, safeio
 from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RECONCILE_CHANGED, RETRO_PIPELINE, Config, for_lane
 from .events import nfc, parse_iso
 from .park import radius_line
@@ -427,18 +427,39 @@ def notify_run(cfg: Config, run: Run, message: str) -> None:
         return
     if _digest_unchanged(path, text):
         return
-    notify(cfg, DIGEST_TITLE, text, run=run)
+    notify(cfg, _with_repo(DIGEST_TITLE, run.repo), text, run=run)
     try:
         safeio.write_text(path, text)
     except (OSError, ValueError) as exc:
         _log_failure(run, "digest", f"could not keep the digest sent: {exc}")
 
 
+def _repo_label(repo: Path) -> str | None:
+    """The repository's folder name when the user file names a workspace (`roots` or `repos`), else None: with one
+    repository the title stays plain. An unreadable user file is no workspace, so this never raises."""
+    try:
+        workspace = layers.load_user_settings().workspace
+    except (layers.LayerError, OSError, ValueError):
+        return None
+    if not (workspace.roots or workspace.repos):
+        return None
+    return _one_line(repo.name) or None
+
+
+def _with_repo(title: str, repo: Path) -> str:
+    """`title` with ` · <folder>` after its first word, for a workspace; `title` itself otherwise."""
+    label = _repo_label(repo)
+    if label is None:
+        return title
+    head, sep, tail = title.partition(":")
+    return f"{head} \u00b7 {label}{sep}{tail}"
+
+
 def _title_for(cfg: Config, run: Run) -> str:
     for entry in cfg.hitl.get("notify", []):
         if isinstance(entry, dict) and entry.get("type") == "macos" and entry.get("title"):
-            return str(entry["title"]).replace("{run}", run.id)
-    return DEFAULT_TITLE.replace("{run}", run.id)
+            return str(entry["title"]).replace("{run}", run.id)  # a title the user wrote is kept as written
+    return _with_repo(DEFAULT_TITLE.replace("{run}", run.id), run.repo)
 
 
 # --------------------------------------------------------------------------- stopping for a human
