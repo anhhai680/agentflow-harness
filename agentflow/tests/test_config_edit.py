@@ -399,6 +399,14 @@ def test_workspace_is_protected(shipped):
         config_edit.propose(shipped, sha, text=SHIPPED + 'workspace: {roots: ["/x"]}\n', repo=REPO)
 
 
+def test_the_pack_form_cannot_set_the_cap(shipped):
+    _, sha = config_edit.read(shipped)
+    with pytest.raises(Refused):  # the form has no such field
+        config_edit.propose(shipped, sha, changes=[{"key": ["workspace", "max_active_runs"], "value": 2}], repo=REPO)
+    with pytest.raises(Refused, match="protected"):
+        config_edit.propose(shipped, sha, text=SHIPPED + "workspace: {max_active_runs: 2}\n", repo=REPO)
+
+
 def test_a_dashboard_field_the_user_file_sets_is_read_only(shipped):
     from agentflow import layers
 
@@ -1607,9 +1615,26 @@ def test_the_user_form_holds_the_allow_list_and_nothing_else():
         protected = [p for p in config_edit._PROTECTED_KEYS if key[:len(p.split("."))] == tuple(p.split("."))]
         assert protected in ([], ["workspace"]), (key, protected)
         assert item["target"] == "user" and item["optional"] is True
-        if key[0] == "workspace":
+        if key[0] == "workspace" and key[1] in layers.WORKSPACE_LISTS:
             assert item["lines"] is True
     assert {key for key in fields if key[0] == "agents"} == {("agents", "claude", "models"), ("agents", "codex", "models")}
+
+
+def test_the_cap_and_the_digest_save_to_the_user_file():
+    from agentflow import layers
+
+    fields = _user_fields()
+    assert fields[("workspace", "max_active_runs")]["kind"] == "int"
+    assert (fields[("workspace", "max_active_runs")]["min"], fields[("workspace", "max_active_runs")]["max"]) == (1, 64)
+    assert fields[("workspace", "digest")]["kind"] == "bool"
+    _user_save((["workspace", "max_active_runs"], 3), (["workspace", "digest"], True))
+    path = layers.user_config_path()
+    assert yaml.safe_load(path.read_text(encoding="utf-8")) == {"workspace": {"max_active_runs": 3, "digest": True}}
+    for bad in (0, 65, True, "3"):
+        with pytest.raises(config_edit.EditError):
+            _user_propose((["workspace", "max_active_runs"], bad))
+    _user_save((["workspace", "max_active_runs"], None))
+    assert yaml.safe_load(path.read_text(encoding="utf-8")) == {"workspace": {"digest": True}}
 
 
 def test_a_missing_user_file_is_an_empty_form_and_the_first_save_creates_it_private(tmp_path):

@@ -973,6 +973,13 @@ _USER_SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str | None, dic
         (("workspace", "repos"), "Single repositories (absolute or ~/ paths)", _LINES),
         (("workspace", "exclude"), "Leave out (a path, or a bare folder name)", _LINES),
     ]),
+    ("Across repositories", "Machine-wide, read by each run when it needs them; no restart.", [
+        (("workspace", "max_active_runs"),
+         "Most runs working at once on this machine: agent sessions and gates (empty = no cap)",
+         {"kind": "int", "min": 1, "max": layers.MAX_ACTIVE_RUNS}),
+        (("workspace", "digest"),
+         "One notification line over every repository (replaces each repository's digest)", {"kind": "bool"}),
+    ]),
     ("Dashboard", "The page reads these at once; a new port needs a dashboard restart.", [
         (("dashboard", "port"), None, None),
         (("dashboard", "board_refresh_s"), None, None),

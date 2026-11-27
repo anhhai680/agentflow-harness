@@ -4448,6 +4448,20 @@ def test_a_user_edit_that_breaks_a_live_repository_is_refused_naming_it(two):
     assert not [f for f in path.parent.iterdir() if f.name.startswith(".config-")]
 
 
+def test_a_cap_or_digest_change_needs_no_restart_and_no_rescan(two, dash, tmp_path):
+    status, data = user_save(two.dash, (["workspace", "max_active_runs"], 2), (["workspace", "digest"], True))
+    assert status == 200, data
+    assert data["restart"] == [] and data["rescanned"] is False
+    saved = yaml.safe_load(layers.user_config_path().read_text(encoding="utf-8"))
+    assert saved == {"workspace": {"max_active_runs": 2, "digest": True}}
+    status, data = user_save(two.dash, (["workspace", "roots"], [str(tmp_path)]), base=data["sha256"])
+    assert status == 200, data
+    assert data["rescanned"] is True
+    status, data = user_save(dash, (["workspace", "max_active_runs"], 2), (["workspace", "digest"], True))
+    assert status == 200, data
+    assert data["restart"] == [] and data["rescanned"] is False
+
+
 def test_a_port_or_a_workspace_change_on_a_single_repository_server_asks_for_a_restart(dash, tmp_path):
     before = dict(dash.server.repos)
     status, data = user_save(dash, (["dashboard", "port"], 7799), (["workspace", "roots"], [str(tmp_path)]))

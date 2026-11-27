@@ -529,8 +529,30 @@ def test_the_workspace_and_dashboard_keys_are_personal_settings():
     user = {"workspace": {"roots": ["/a"], "repos": ["~/b"], "exclude": ["x"]},
             "dashboard": {"board_refresh_s": 5, "done_shown": 20}}
     check_user(user, {}, USER_FILE)
+    check_user({"workspace": {"max_active_runs": 3, "digest": True}}, {}, USER_FILE)
     with pytest.raises(LayerError, match="not a personal setting"):
         check_user({"workspace": {"nope": []}}, {}, USER_FILE)
+
+
+def test_workspace_settings_reads_the_cap_and_the_digest():
+    got = workspace_settings({"max_active_runs": 3, "digest": True})
+    assert (got.max_active_runs, got.digest, got.roots) == (3, True, ())
+    assert workspace_settings(None) == WorkspaceSettings((), (), (), None, False)
+    assert workspace_settings({"max_active_runs": None, "digest": None}) == WorkspaceSettings((), (), (), None, False)
+    assert workspace_settings({"max_active_runs": 64}).max_active_runs == 64
+    assert workspace_settings({"max_active_runs": 1}).max_active_runs == 1
+
+
+@pytest.mark.parametrize("block, path", [
+    ({"max_active_runs": 0}, "workspace.max_active_runs"), ({"max_active_runs": 65}, "workspace.max_active_runs"),
+    ({"max_active_runs": -1}, "workspace.max_active_runs"), ({"max_active_runs": True}, "workspace.max_active_runs"),
+    ({"max_active_runs": False}, "workspace.max_active_runs"), ({"max_active_runs": "3"}, "workspace.max_active_runs"),
+    ({"max_active_runs": 2.0}, "workspace.max_active_runs"), ({"max_active_runs": [3]}, "workspace.max_active_runs"),
+    ({"digest": "yes"}, "workspace.digest"), ({"digest": 1}, "workspace.digest"), ({"digest": []}, "workspace.digest")])
+def test_workspace_settings_refuses_a_bad_cap_or_digest(block, path):
+    with pytest.raises(LayerError) as err:
+        workspace_settings(block)
+    assert err.value.path == path
 
 
 def test_workspace_settings_reads_three_lists():

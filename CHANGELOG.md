@@ -7,6 +7,12 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+- Two personal keys for the user file, `workspace.max_active_runs` (a whole number from 1 to 64, or absent for no cap) and `workspace.digest` (true or false, default false). Only the user file is read for them: a pack that sets one gets a `validate` warning and the value is ignored. Your settings has a new Across repositories section with both. Nothing reads them yet.
+
+### Changed
+- A `workspace.*` save from Your settings rescans the workspace, or asks for a restart on a single-repository dashboard, only for `roots`, `repos` and `exclude`. The restart note on the page goes only on the Workspace section.
+
 ## [3.17] - 2026-11-27
 
 ### Added

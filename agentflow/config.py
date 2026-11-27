@@ -3502,8 +3502,9 @@ class _Validator:
             self.backlog(self.cfg.dashboard["backlog"])
 
     def workspace(self) -> None:
-        """`workspace`: personal lists of repositories. The shape is checked wherever the block came from; a pack
-        that sets one gets a warning, because only the user file is read for it."""
+        """`workspace`: personal lists of repositories, the run cap and the merged digest. The shape is checked
+        wherever the block came from; a pack that sets any key (`layers.WORKSPACE_KEYS`) gets a warning, because only
+        the user file is read for it."""
         try:
             layers.workspace_settings(self.cfg.merged.get("workspace"))
         except layers.LayerError as exc:
