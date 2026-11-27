@@ -782,3 +782,30 @@ def test_ordinary_merge_keys_still_load(tmp_path):
     assert loaded["gates"]["lint"] == {"run": "ruff", "timeout": 5}
     assert layers.parse_config("") is None
     assert layers.parse_config("k: v\n") == {"k": "v"}
+
+
+def test_load_user_settings_reads_the_file_it_is_given(tmp_path):
+    write_user_file("workspace:\n  roots: [/elsewhere]\n")
+    cand = tmp_path / "cand.yaml"
+    cand.write_text(f"workspace:\n  roots: [{tmp_path}]\n", encoding="utf-8")
+    got = load_user_settings(cand)
+    assert got.workspace.roots == (str(tmp_path),) and got.path == cand
+    assert load_user_settings().workspace.roots == ("/elsewhere",)  # the real user file is untouched
+    missing = load_user_settings(tmp_path / "missing.yaml")
+    assert missing.path is None and missing.workspace == WorkspaceSettings((), (), ())
+
+
+def test_load_config_reads_the_user_file_it_is_given(sparse_repo, tmp_path):
+    from agentflow import pack
+    from agentflow.config import ConfigError, load_config
+
+    path = pack.pack_config(sparse_repo)
+    cand = tmp_path / "cand.yaml"
+    cand.write_text("defaults: {run_budget_usd: 7}\n", encoding="utf-8")
+    assert load_config(path, user_file=cand).defaults.run_budget_usd == 7
+    assert load_config(path).defaults.run_budget_usd != 7  # the user file it is not given is not read
+    assert load_config(path, user=False, user_file=cand).defaults.run_budget_usd != 7
+    cand.write_text("gates: {}\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as err:
+        load_config(path, user_file=cand)
+    assert str(cand) in str(err.value)

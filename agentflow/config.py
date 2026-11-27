@@ -1516,9 +1516,10 @@ def _read_mapping(path: Path) -> dict:
     return loaded
 
 
-def _merge_layers(project: dict, path: Path, user: bool) -> tuple[dict, dict, Path | None]:
+def _merge_layers(project: dict, path: Path, user: bool,
+                  user_file: Path | None = None) -> tuple[dict, dict, Path | None]:
     """`(merged, origins, user file or None)` for the stack engine defaults -> the starter the pack names (if any)
-    -> the pack -> the user's own file.
+    -> the pack -> the user's own file (`user_file` when given, else `layers.user_config_path()`).
 
     The user file is read only when `user` is true and it exists, and it is checked (`layers.check_user`) against
     the merged layers below it before it is merged: it never reaches `merge` unchecked."""
@@ -1528,7 +1529,7 @@ def _merge_layers(project: dict, path: Path, user: bool) -> tuple[dict, dict, Pa
         if not user:
             return merged, origins, None
         try:
-            user_path = layers.user_config_path()
+            user_path = Path(user_file) if user_file is not None else layers.user_config_path()
         except RuntimeError:  # no home directory to look in: there is no user file
             return merged, origins, None
         try:
@@ -1546,20 +1547,21 @@ def _merge_layers(project: dict, path: Path, user: bool) -> tuple[dict, dict, Pa
     return merged, origins, user_path
 
 
-def load_config(path: Path, *, layered: bool = True, user: bool = True) -> Config:
+def load_config(path: Path, *, layered: bool = True, user: bool = True, user_file: Path | None = None) -> Config:
     """Merge the layers, resolve `@` references and build the dataclasses.
 
     The layers are the engine defaults (`agentflow/defaults/config.yaml`), the starter the pack names with `starter:`
     (`agentflow/starters/<name>/config.yaml`), the pack at `path` and the user's own file
     (`layers.user_config_path`), bottom-up. `version` and `engine` are checked on the pack file alone.
     `layered=False` loads the pack file alone, as before the layers; `user=False` leaves the user file unread.
-    An error at a key the user file set names that file."""
+    `user_file` reads that file as the user file instead (the Settings page checks a candidate text this way); it
+    is ignored when `user` is false. An error at a key the user file set names that file."""
     path = Path(path)
     project = _read_mapping(path)
     _check_format(project)
     user_path: Path | None = None
     if layered:
-        merged, origins, user_path = _merge_layers(project, path, user)
+        merged, origins, user_path = _merge_layers(project, path, user, user_file)
     else:
         merged, origins = copy.deepcopy(project), {key: "project" for key in layers.leaf_keys(project)}
     try:

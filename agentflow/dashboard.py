@@ -60,6 +60,17 @@ Routes:
   `config_edit`. A save is refused unless the new config validates, leaves the protected settings as they are and
   starts from the file's current hash (409 otherwise). After a save the dashboard serves the new config at once,
   and a live runner on the pack config picks it up when its next phase starts.
+- `GET /api/user-config` (Your settings: the user file's path, hash and allow-listed fields, `config_edit.
+  user_form_fields`, plus `rescans`, whether a workspace change takes effect at once), `POST /api/user-config/preview`
+  and `POST /api/user-config/save` with `base_sha256` and `changes` (form changes only: a body with `text` is a 400).
+  They need no repository and are 404 under `/api/repos/<id>/`. The file written is always
+  `layers.user_config_path()`, never a request value, and the check runs against every live repository's pack
+  (`config_edit.propose_user`: it must load there, and pass `validate` wherever it passed), so an edit that breaks
+  one is a 400 naming it; 409 when the file changed since the page read it. A save answers
+  `{ok, sha256, restart, rescanned}`: every live repository's config is loaded again
+  (`DashboardServer.user_saved`), a workspace dashboard rescans at once on a `workspace.*` change, or when the user
+  file did not load or a repository was in `error` before the save (the save may have mended either), and `restart`
+  lists what needs a restart (`dashboard.port`, and `workspace.*` on a server that does not rescan).
 - `GET /api/repos`: every repository the server holds (`repo_context.repos_view`, from one snapshot: its id, name,
   state, counts and load error, the skipped settings entries, the default's id), with no checkout path in it.
   The counts are cached for `repo_context.COUNTS_TTL_S` seconds per context object (`DashboardServer.counts`).
@@ -109,7 +120,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -161,7 +172,8 @@ PAGE = Path(__file__).resolve().with_name("dashboard.html")
 UI_DIR = Path(__file__).resolve().with_name("dashboard_ui")
 # in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
 UI_SCRIPTS = ("core.js", "repos.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js",
-              "sessions.js", "inbox.js", "activity.js", "workflow.js", "agents.js", "tokens.js", "metrics.js", "lessons.js", "settings.js", "main.js")
+              "sessions.js", "inbox.js", "activity.js", "workflow.js", "agents.js", "tokens.js", "metrics.js", "lessons.js", "settings.js",
+              "user_settings.js", "main.js")
 UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024
 DEFAULT_DONE_SHOWN = 10  # how many Done cards the Board draws before "Show all"
@@ -184,6 +196,8 @@ BACKLOG_ROUTES = ("/api/backlog", "/api/backlog/start", "/api/backlog/remove", "
 FILE_OPS = {"add": ("item",), "edit": ("id", "fields"), "move": ("id", "direction"), "add_issue": ("number",)}  # each op's keys, with sha256
 CONFIG_ROUTES = ("/api/config/preview", "/api/config/save")
 CONFIG_MAX_BODY = config_edit.MAX_TEXT + 64 * 1024  # the YAML tab sends the whole file
+USER_ROUTES = ("/api/user-config", "/api/user-config/preview", "/api/user-config/save")  # Your settings: no repository
+RESTART_KEYS = ("dashboard.port",)  # a user-file key the running server reads only at start-up
 BACKLOG_LOG = "backlog"  # the `run_id` the live stream gives backlog events
 REFRESH_EVERY_S = 60.0
 SSE_POLL_S = 0.25
@@ -574,6 +588,38 @@ class DashboardServer(ThreadingHTTPServer):
             except Exception as exc:
                 sys.stderr.write(f"dashboard: rescan failed: {doctor.printable(exc)}\n")
 
+    def user_saved(self, keys: Collection[str]) -> bool:
+        """After Your settings saved the user file: load every live context's config again (stored on the context
+        the current snapshot holds, as a pack save stores it) and the snapshot's `user`, under `_scan_lock`, so a
+        rescan publishes either before (and this lands on what it published) or after (and it read the new file).
+        Then a workspace server rescans at once when `keys` holds a `workspace.*` key, or when the snapshot before
+        the save had a user file that did not load (`user_error`) or a repository in `error`: the save may have
+        mended either, and the page lists the repositories again right after it. True when it rescanned. A
+        context whose reload fails is logged with its name and keeps its config. Never raises."""
+        mend = False
+        with self._scan_lock:
+            try:
+                snap = self.snap
+                mend = snap.user_error is not None or any(ctx.state == "error" for ctx in snap.repos.values())
+                for ctx in self.live_contexts(snap):
+                    try:
+                        ctx.cfg = load_config(Path(ctx.cfg.path))
+                    except Exception as exc:  # validated a moment ago; a concurrent editor gets here
+                        sys.stderr.write(f"dashboard: {doctor.printable(ctx.name)}: could not reload its config "
+                                         f"after a user config save: {doctor.printable(exc)}\n")
+                try:
+                    settings = layers.load_user_settings()
+                except layers.LayerError as exc:
+                    sys.stderr.write(f"dashboard: could not reload the user config: {doctor.printable(exc)}\n")
+                else:
+                    self.snap = replace(snap, user=settings, user_error=None)
+            except Exception as exc:
+                sys.stderr.write(f"dashboard: reload after a user config save failed: {doctor.printable(exc)}\n")
+        if not (self.workspace and (mend or any(key.startswith("workspace.") for key in keys))):
+            return False
+        self.rescan()
+        return True
+
     def close(self) -> None:
         """Stop serving (from another thread than `serve_forever`) and end open event streams."""
         self.stopping.set()
@@ -887,6 +933,16 @@ class _Handler(BaseHTTPRequestHandler):
                     self.close_connection = True  # a POST's body is left unread
                     self._error(404, "not found")
                 return
+            if path in USER_ROUTES:  # Your settings: the user file, whatever repositories the server holds
+                self._ctx = None
+                if self.command == "GET" and path == USER_ROUTES[0]:
+                    self._json(200, {**config_edit.user_form_fields(), "rescans": self.server.workspace})
+                elif self.command == "POST" and path != USER_ROUTES[0]:
+                    self._user_config_post(path)
+                else:
+                    self.close_connection = True  # a POST's body is left unread
+                    self._error(404, "not found")
+                return
             match = REPOS_ROUTE.match(path)
             if match:
                 ctx, refused = self._scope(snap, match.group(1), match.group(2))
@@ -913,14 +969,15 @@ class _Handler(BaseHTTPRequestHandler):
         """The context `/api/repos/<raw_id>/<rest>` names in `snap`, and why it can't serve, as `(status, error)`.
         The id is percent-decoded and only ever looked up in the map, never joined to a path: an empty or overlong
         one is 404 before the lookup, and one the map does not hold is 404, so an unknown id touches no file. A
-        `rest` that is `repos` again is 404. Every route but `info` answers `refusal`'s 409s."""
+        `rest` that is `repos` or `user-config` (no repository's route) is 404. Every route but `info` answers
+        `refusal`'s 409s."""
         repo_id = unquote(raw_id)
         if not repo_id or len(repo_id) > REPO_ID_MAX:
             return None, (404, "no such repository")
         ctx = snap.repos.get(repo_id)
         if ctx is None:
             return None, (404, "no such repository")
-        if rest == "repos" or rest.startswith("repos/"):
+        if any(rest == name or rest.startswith(name + "/") for name in ("repos", "user-config")):
             return None, (404, "not found")
         return ctx, (None if rest == "info" else refusal(ctx))
 
@@ -1239,6 +1296,45 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self.log_message("config.yaml saved from the Settings page (sha256 %s)", digest[:12])
         self._json(200, {**proposal.as_dict(), "ok": True, "saved": proposal.changed, "sha256": digest})
+
+    def _user_config_post(self, path: str) -> None:
+        """Preview or save a Your settings change. The file is always the default user file (no request value is a
+        path), the check runs against every live repository's pack, and a save is proposed and written in this one
+        request, so only text the server checked is ever written."""
+        body = self._body()
+        if body is None:
+            return
+        base, changes = body.get("base_sha256"), body.get("changes")
+        if "text" in body or not isinstance(base, str) or not isinstance(changes, list):
+            self._error(400, "send base_sha256 and changes (your user config takes form changes only)")
+            return
+        packs = [(ctx.name, Path(ctx.cfg.path), ctx.repo) for ctx in self.server.live_contexts(self._snap)]
+        try:
+            proposal = config_edit.propose_user(base, changes, packs)
+            if path == "/api/user-config/preview":
+                self._json(200, proposal.as_dict())
+                return
+            if proposal.errors:
+                self._json(400, {**proposal.as_dict(), "error": "the change does not validate"})
+                return
+            digest = config_edit.save_user(proposal) if proposal.changed else proposal.base_sha256
+        except config_edit.Conflict as exc:
+            self._error(409, str(exc))
+            return
+        except config_edit.EditError as exc:
+            self._error(400, str(exc))
+            return
+        keys = [".".join(change["key"]) for change in changes]
+        restart: list[str] = []
+        rescanned = False
+        if proposal.changed:
+            for key in keys:
+                if key not in restart and (key in RESTART_KEYS or (key.startswith("workspace.")
+                                                                   and not self.server.workspace)):
+                    restart.append(key)
+            rescanned = self.server.user_saved(keys)
+            self.log_message("user config saved from the Settings page (sha256 %s)", digest[:12])
+        self._json(200, {"ok": True, "sha256": digest, "restart": restart, "rescanned": rescanned})
 
     @staticmethod
     def _start_key(body: dict) -> str:

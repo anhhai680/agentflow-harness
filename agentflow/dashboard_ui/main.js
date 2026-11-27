@@ -141,7 +141,10 @@ function show(view) {
   $("run-view").hidden = view !== "run";
   if (view === "run") return;
   try { localStorage.setItem("agentflow-view", view); } catch (err) { console.warn("agentflow: local storage unavailable", err); }
-  if (view === "settings" && TOKEN && !settings.edits.size && !settings.yamlDirty) loadSettings();  // unsaved edits stay
+  if (view === "settings" && TOKEN) {  // unsaved edits stay, each form's own
+    if (!userSettings.edits.size) loadUserSettings();
+    if (!settings.edits.size && !settings.yamlDirty) showRepoSettings();
+  }
   if (view === "metrics") loadMetrics();
   if (view === "lessons" && TOKEN) loadLessons();
   if (view === "agents" && TOKEN) boardRefresh();  // the Agents table is fetched while it is shown
@@ -224,6 +227,10 @@ async function loadInfo() {
 
 if (TOKEN) {
   loadRepos().then(() => {  // the selection first: every request after it goes to the repository shown
+    if (emptyStart(ui.repos)) {  // no repository yet: Settings, to add the folder that holds them
+      history.replaceState(null, "", routeHash({ view: "settings", repo: null }));
+      userSettings.focusRoots = true;
+    }
     route();
     loadInfo();
     boardRefresh();

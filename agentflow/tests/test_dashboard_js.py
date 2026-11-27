@@ -1247,3 +1247,178 @@ def test_a_rescan_that_adds_a_second_repository_refetches_the_inbox_tagged():
       answer = two; await loadRepos();
       return [first, [dirty.inbox, dirty.agents, refreshed], ui.repo, ui.multi]; })()""", None)
     assert got == [[False, False, 0], [True, True, 1], "a", True]
+
+
+# ---- two-level Settings: Your settings, the save badges and the empty start (W4)
+USER_UI = [DOM_STUB, "repos.js", "settings.js", "user_settings.js"]
+FORM_STUB = str(Path(__file__).parent / "fixtures" / "js" / "_form_stub.js")
+USER_FORM = [FORM_STUB, "repos.js", "settings.js", "user_settings.js"]
+# An element that keeps its listeners, so a test can type into a field and read the edit it makes.
+REC_EL = ("el = (tag, p, ...c) => { const n = {tag, p: p || {}, c: c.flat().filter((x) => x), on: {}, classList: {toggle() {}},"
+          " addEventListener(t, f) { n.on[t] = f; }}; return n; }; globalThis.Node = Object;"
+          "var updated = 0; var scope = {edits: new Map(), rows: new Map(), update: () => { updated++; }};")
+
+
+def test_each_settings_field_says_where_it_saves():
+    assert js([DOM_STUB, "settings.js"], "saveBadge({target: 'user'}, 'billing')", None) == "saves to: your user config"
+    assert js([DOM_STUB, "settings.js"], "saveBadge({target: 'project'}, 'billing')", None) == "saves to: billing"
+
+
+def test_a_lines_field_sends_one_entry_per_line():
+    assert js([DOM_STUB, "settings.js"], "linesValue(args)", " ~/a \n\n/b\n") == ["~/a", "/b"]
+    assert js([DOM_STUB, "settings.js"], "linesValue(args)", "") == []
+
+
+def test_an_empty_workspace_starts_on_settings():
+    got = js(USER_UI, "[emptyStart({repos: []}), emptyStart({repos: [{id: 'a'}]}), emptyStart(null), emptyStart({})]", None)
+    assert got == [True, False, False, False]
+
+
+def test_a_user_save_says_what_needs_a_restart():
+    port = js(USER_UI, "userSaveNote({restart: ['dashboard.port'], rescanned: false})", None)
+    assert "dashboard.port" in port and "restart" in port
+    assert "scanned" in js(USER_UI, "userSaveNote({restart: [], rescanned: true})", None)
+    assert js(USER_UI, "userSaveNote({restart: [], rescanned: false})", None) == "Saved to your user config"
+
+
+def test_unsaved_user_edits_never_hold_up_a_repository_switch():
+    got = js(USER_UI, """ui = {repos: null, repo: 'a'}; userSettings.edits.set('k', {key: ['dashboard', 'port'], value: 1});
+      confirm = () => { throw new Error('asked'); }; [settingsMayLeave(), userSettings.edits.size, settings.edits.size]""", None)
+    assert got == [True, 1, 0]
+
+
+def test_a_lines_field_is_a_textarea_that_sends_its_lines_to_its_own_scope():
+    field = {"key": ["workspace", "roots"], "label": "Roots", "kind": "list", "lines": True, "value": ["~/a"], "present": True,
+             "source": "user", "optional": True, "target": "user"}
+    got = js(USER_UI, REC_EL + """const row = fieldRow(args, scope); const box = row.c[1];
+      box.value = " ~/a \\n\\n/b\\n"; box.on.input(); const sent = [...scope.edits.values()];
+      box.value = "~/a"; box.on.input(); const back = scope.edits.size;
+      box.value = ""; box.on.input();
+      [box.tag, box.p.class, box.p.id, sent, back, [...scope.edits.values()], settings.edits.size, updated]""", field)
+    assert got[:3] == ["textarea", "lines", "ucfg-workspace-roots"]
+    assert got[3] == [{"key": ["workspace", "roots"], "value": ["~/a", "/b"]}]
+    assert got[4] == 0  # back to the value it had: no edit
+    assert got[5] == [{"key": ["workspace", "roots"], "value": None}]  # cleared: your value is deleted
+    assert got[6:] == [0, 3]  # the repository form's edits are untouched
+
+
+def test_a_cleared_user_field_the_file_does_not_set_is_not_sent():
+    field = {"key": ["workspace", "roots"], "label": "Roots", "kind": "list", "lines": True, "value": [], "present": False,
+             "source": "engine", "optional": True, "target": "user"}
+    got = js(USER_UI, REC_EL + """const box = fieldRow(args, scope).c[1];
+      box.value = "\\n  \\n"; box.on.input(); const blank = scope.edits.size;
+      const port = fieldRow({key: ['dashboard', 'port'], label: 'Port', kind: 'int', value: 8765, present: false, source: 'engine',
+                             optional: true, target: 'user'}, scope).c[1];
+      port.value = ""; port.on.input(); [blank, scope.edits.size, updated]""", field)
+    assert got == [0, 0, 2]
+
+
+def test_a_field_row_names_where_it_saves_and_points_a_user_set_field_to_your_settings():
+    ro = "set in your user config (/home/u/.config/agentflow/config.yaml), which overrides the pack"
+    field = {"key": ["dashboard", "port"], "label": "Port", "kind": "int", "value": 9000, "source": "user", "target": "project",
+             "readonly": ro, "hint": "change it under Your settings"}
+    texts = js(USER_UI, REC_EL + """ui = {repos: {repos: [{id: 'billing-1a2b', name: 'billing', state: 'live'}]}, repo: null, multi: false};
+      const row = fieldRow(args, scope);
+      const all = []; const walk = (n) => { if (n.p && n.p.text !== undefined) all.push(n.p.text); (n.c || []).forEach(walk); }; walk(row);
+      [all, row.c[1].p.id, row.c[1].p.disabled]""", field)
+    assert texts[1] == "cfg-dashboard-port" and texts[2] is True
+    assert "saves to: billing" in texts[0]
+    assert texts[0].index(ro) < texts[0].index("change it under Your settings")  # the hint follows the read-only note
+    user = js(USER_UI, REC_EL + "ui = {repos: null, repo: null}; fieldRow(args, scope).c.map((n) => n.p.text)",
+              {**field, "target": "user", "readonly": None, "hint": None})
+    assert "saves to: your user config" in user
+
+
+def test_a_user_config_that_cannot_be_edited_renders_every_field_disabled():
+    data = {"path": "/u/config.yaml", "sha256": "0" * 64, "exists": True, "editable": False, "error": "it is a symlink; fix it by hand",
+            "rescans": True, "sections": [{"title": "Workspace", "note": "n", "fields": [
+                {"key": ["workspace", "roots"], "label": "Roots", "kind": "list", "lines": True, "value": [], "present": False,
+                 "source": "engine", "optional": True, "target": "user"},
+                {"key": ["dashboard", "port"], "label": "Port", "kind": "int", "value": 8765, "present": False,
+                 "source": "engine", "optional": True, "target": "user"}]}]}
+    got = js(USER_FORM, REC_EL + """ui = {repos: {repos: [{id: 'a'}]}, repo: null};
+      userSettings.data = args; renderUserSettings();
+      const inputs = nodes['user-form'].kids[0].c.slice(2).map((row) => row.c[1]);
+      [inputs.map((i) => i.p.disabled), nodes['user-status'].textContent, nodes['user-review'].disabled, nodes['user-path'].textContent]""",
+             data)
+    assert got[0] == [True, True]
+    assert "it is a symlink; fix it by hand" in got[1]
+    assert got[2] is True and got[3] == "/u/config.yaml"
+
+
+def test_a_user_save_reloads_the_form_and_the_repositories_and_wakes_an_empty_page():
+    got = js_async(USER_FORM, """var asked = [], toasts = [], calls = [], ok = null;
+      ui = {repos: {repos: []}, multi: false, repo: null, workflow: {x: 1}, view: 'board'};
+      toast = (t) => toasts.push(t); diffNode = () => null; dialog = (title, body, onOk) => { ok = onOk; };
+      el = () => ({}); renderUserSettings = () => calls.push('render');
+      loadRepos = async () => { calls.push('repos'); ui.repos = {repos: [{id: 'a', state: 'live'}]}; };
+      loadInfo = () => calls.push('info'); boardRefresh = () => calls.push('board');
+      api = async (path, body, repo) => { asked.push([path, repo === null]);
+        if (path.endsWith('/preview')) return {changed: true, ok: true, diff: '', issues: []};
+        if (path.endsWith('/save')) return {ok: true, sha256: 'b', restart: [], rescanned: true};
+        return {sha256: 'b', editable: true, sections: []}; };
+      (async () => {
+        userSettings.data = {sha256: 'a', editable: true, sections: []};
+        userSettings.edits.set('k', {key: ['workspace', 'roots'], value: ['~/code']});
+        await reviewUserSettings(); const done = await ok();
+        return [done, asked, toasts, calls, ui.workflow, userSettings.edits.size]; })()""", None)
+    done, asked, toasts, calls, workflow, edits = got
+    assert done is True and workflow is None and edits == 0
+    assert asked == [["/api/user-config/preview", True], ["/api/user-config/save", True], ["/api/user-config", True]]
+    assert toasts == ["Saved to your user config; the workspace was scanned again"]
+    assert calls == ["render", "repos", "info", "board"]  # none to some: the page wakes up
+
+
+def test_an_empty_start_asks_for_a_folder_and_hides_the_repository_form():
+    data = {"path": "/u/config.yaml", "sha256": "0" * 64, "exists": False, "editable": True, "error": None, "rescans": True,
+            "sections": [{"title": "Workspace", "note": "n", "fields": [
+                {"key": ["workspace", "roots"], "label": "Roots", "kind": "list", "lines": True, "value": [], "present": False,
+                 "source": "engine", "optional": True, "target": "user"}]}]}
+    got = js(USER_FORM, REC_EL + """var asked = []; api = async (path) => { asked.push(path); return {}; };
+      ui = {repos: {repos: []}, multi: false, repo: null}; userSettings.focusRoots = true;
+      userSettings.data = args; renderUserSettings(); showRepoSettings();
+      const empty = [nodes['user-prompt'].hidden, !!nodes['ucfg-workspace-roots'].focused, userSettings.focusRoots,
+                     nodes['settings-repo'].hidden, asked.length];
+      ui.repos = {repos: [{id: 'billing-1a2b', name: 'billing', state: 'live'}]}; renderUserSettings(); showRepoSettings();
+      [empty, [nodes['user-prompt'].hidden, nodes['settings-repo'].hidden, nodes['settings-repo-title'].textContent, asked]]""", data)
+    assert got[0] == [False, True, False, True, 0]  # no repository: the prompt, the cursor in the roots, no /api/config
+    assert got[1] == [True, False, "Repository: billing", ["/api/config"]]
+
+
+def test_the_folder_prompt_goes_once_a_save_lists_a_repository():
+    got = js_async(USER_FORM, REC_EL + """var ok = null;
+      ui = {repos: {repos: []}, multi: false, repo: null, workflow: null, view: 'board'};
+      toast = () => {}; diffNode = () => null; dialog = (title, body, onOk) => { ok = onOk; };
+      loadRepos = async () => { ui.repos = {repos: [{id: 'a', name: 'a', state: 'live'}]}; };
+      loadInfo = () => {}; boardRefresh = () => {};
+      api = async (path) => path.endsWith('/preview') ? {changed: true, ok: true, diff: '', issues: []}
+        : path.endsWith('/save') ? {ok: true, sha256: 'b', restart: [], rescanned: true}
+        : {sha256: 'b', exists: true, editable: true, error: null, rescans: true, sections: []};
+      (async () => {
+        userSettings.data = {sha256: 'a', exists: false, editable: true, error: null, rescans: true, sections: []};
+        renderUserSettings(); const before = nodes['user-prompt'].hidden;
+        userSettings.edits.set('k', {key: ['workspace', 'roots'], value: ['~/code']});
+        await reviewUserSettings(); await ok();
+        return [before, nodes['user-prompt'].hidden]; })()""", None)
+    assert got == [False, True]  # asked for a folder; gone once the save listed its repository
+
+
+# An element tree a map field can add rows to and remove them from, with the props (`onclick` among them) kept on `p`.
+TREE_EL = ("el = (tag, p, ...c) => { const n = {tag, p: p || {}, value: (p || {}).value, children: [], on: {}, classList: {toggle() {}},"
+           " addEventListener(t, f) { n.on[t] = f; }, append(x) { x.parent = n; n.children.push(x); },"
+           " remove() { const s = n.parent.children; s.splice(s.indexOf(n), 1); },"
+           " querySelectorAll() { return n.children.filter((x) => x.tag === 'input'); }};"
+           " c.flat().filter((x) => x).forEach((x) => n.append(x)); return n; }; globalThis.Node = Object;"
+           "var scope = {edits: new Map(), rows: new Map(), update: () => {}};"
+           "const emptied = (field) => { scope.edits.clear(); const rows = mapInput(field, 'id', scope).children[0];"
+           " [...rows.children].forEach((row) => row.children[2].p.onclick()); return [...scope.edits.values()]; };")
+
+
+def test_removing_every_row_of_a_user_models_map_deletes_your_key():
+    field = {"key": ["agents", "codex", "models"], "label": "Models", "kind": "map", "value_kind": "text",
+             "value": {"build": "x", "plan": "y"}, "optional": True}
+    got = js(USER_UI, TREE_EL + """[emptied({...args, target: 'user', present: true}),
+      emptied({...args, target: 'user', present: false}), emptied({...args, target: 'project', present: true})]""", field)
+    assert got[0] == [{"key": ["agents", "codex", "models"], "value": None}]  # your key is deleted, and its empty parents
+    assert got[1] == []  # your file does not set it: there is nothing to delete
+    assert got[2] == [{"key": ["agents", "codex", "models"], "value": {}}]  # the pack form is as before

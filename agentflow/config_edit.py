@@ -17,17 +17,33 @@ back to exactly the intended data, so a text edit that went wrong is refused ins
 Every proposal carries the SHA-256 of the text it was made from (`base_sha256`). A save whose base is not the
 file's current content is refused (`Conflict`), so two tabs, or a tab and an editor, never overwrite each other.
 The file is replaced atomically (a temporary file in the same folder, then `os.replace`), never through a symlink.
+
+The user's own file (`layers.user_config_path()`) has a second, narrower way in: `user_form_fields`,
+`propose_user` and `save_user`, for the page's Your settings. It takes form changes only (no whole text), and only
+to the personal keys of `USER_FIELD_KEYS`; `hitl.notify` (it runs commands), `agents.*.user_settings` (it widens
+what an agent reads) and `dashboard.host` are never on it. Clearing a field (`null`) removes the key, so the pack or
+the engine decides again. The same text edits keep the file's comments and anchors, the same SHA-256 check refuses
+a stale base, and the rest of the file is held: once every allow-listed key is taken out, the old and the new text
+parse to the same data. A new `workspace.roots` entry must be a folder that exists. The candidate text must load as
+the user file (`layers.load_user_settings`) and with every live repository's pack that loads with the file on disk
+(`load_config(..., user_file=...)`), and there `validate` must find no error at a key that had none with the file on
+disk; an error names that repository. A symlink, a hardlink, anything that is
+not a regular file, or a symlinked `agentflow` folder is never read through or written: the form shows why, read
+only. A new file is created private (`0o600`), in a folder made by `safeio.ensure_dir`.
 """
 
 from __future__ import annotations
 
 import copy
 import difflib
+import errno
 import hashlib
 import math
 import os
+import stat
 import tempfile
 import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -35,18 +51,20 @@ from typing import Any
 import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
-from agentflow import layers
+from agentflow import layers, safeio
 from agentflow.config import (
-    CACHE_TTLS, CLAIM_REFS, CLAIM_STALE_H_MAX, KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ROUTE_MODES, ConfigError, Issue,
-    load_config, validate,
+    CACHE_TTLS, CLAIM_REFS, CLAIM_STALE_H_MAX, KNOWN_EFFORT_LEVELS, QUESTION_KINDS, ROUTE_MODES, Config, ConfigError,
+    Issue, load_config, validate,
 )
 from agentflow.layers import PHASE_FREE_KEYS
 from agentflow.vuln import SEVERITIES as VULN_SEVERITIES
 
-__all__ = ["Conflict", "EditError", "Proposal", "Refused", "form_fields", "propose", "read", "save"]
+__all__ = ["USER_FIELD_KEYS", "Conflict", "EditError", "Proposal", "Refused", "form_fields", "propose",
+           "propose_user", "read", "read_user", "save", "save_user", "user_form_fields"]
 
 MAX_TEXT = layers.MAX_CONFIG_BYTES
 MERGE_TAG = "tag:yaml.org,2002:merge"
+_NULL_TAG = "tag:yaml.org,2002:null"
 AGENT_FREE_KEYS = ("enabled", "models", "max_turns", "prices", "cache_ttl", "lean", "user_settings", "read_only_roles",
                   "max_turns_by_role", "session_budget_usd", "bash_output_chars")  # what a page may change in an `agents.<name>` block
 _PROTECTED_KEYS = (  # top-level blocks and dotted keys: commands, fences, and paths or refs the runner reads or writes
@@ -408,6 +426,7 @@ def form_fields(path: Path) -> dict:
                 item["help"] = f"{item['help'].rstrip('.')}. {_INHERITED_ENTRY}" if item["help"] else _INHERITED_ENTRY
             if not item.get("readonly") and isinstance(value, str) and value.startswith("@"):
                 item["readonly"] = "a reference to another key; change it in the YAML tab"
+            item["target"] = "project"
             fields.append(item)
         if fields:
             sections.append({**section, "fields": fields})
@@ -429,6 +448,8 @@ def _field_index(lay: _Layers) -> dict[tuple[str, ...], dict]:
             key = tuple(fdef["key"])
             if "user" in _under(lay.origins, key):
                 fdef["readonly"] = f"set in your user config ({lay.user_path}), which overrides the pack"
+                if key in USER_FIELD_KEYS:
+                    fdef["hint"] = "change it under Your settings"
             index[key] = fdef
     return index
 
@@ -648,16 +669,26 @@ def _protected_changes(old: dict, new: dict) -> list[str]:
 # --------------------------------------------------------------------------- form changes as text edits
 
 
-def _apply_form(text: str, changes: Any, path: Path) -> str:
-    """`text` (the pack at `path`) with the form's `changes` written into it. A field is checked against the layered
-    config, and only what the pack itself must state is written: a mapping's entries that differ from the layers
-    below it, or that the pack already states."""
+def _changes_list(changes: Any) -> list:
     if not isinstance(changes, list) or not changes:
         raise EditError("changes must be a non-empty list")
+    return changes
+
+
+def _apply_form(text: str, changes: Any, path: Path) -> str:
+    """`text` (the pack at `path`) with the form's `changes` written into it (`_apply_changes`)."""
+    _changes_list(changes)
     lay = _layers(path, text)
-    raw = lay.project
-    index = _field_index(lay)
-    expected = copy.deepcopy(raw)
+    return _apply_changes(text, changes, lay, _field_index(lay))
+
+
+def _apply_changes(text: str, changes: Any, lay: _Layers, index: dict[tuple[str, ...], dict]) -> str:
+    """`text` (the file `lay.project` was parsed from) with the form's `changes` written into it. A key must be in
+    `index` and its value must fit that field. A field is checked against the layered config, and only what the file
+    itself must state is written: a mapping's entries that differ from the layers below it, or that the file already
+    states. The new text must parse back to exactly the intended data."""
+    _changes_list(changes)
+    expected = copy.deepcopy(lay.project)
     for change in changes:
         if not isinstance(change, dict) or set(change) != {"key", "value"}:
             raise EditError("each change is an object with exactly key and value")
@@ -674,7 +705,7 @@ def _apply_form(text: str, changes: Any, path: Path) -> str:
         if problem:
             raise EditError(problem)
         value = change["value"]
-        if fdef["kind"] == "map":
+        if fdef["kind"] == "map" and value is not None:
             value = _own_entries(lay, tuple(key), value)
             if value is None:  # every entry is what the layers below already say: nothing to write
                 continue
@@ -684,7 +715,7 @@ def _apply_form(text: str, changes: Any, path: Path) -> str:
         else:
             text = _set_deep(text, tuple(key), value)
             _put(expected, tuple(key), value)
-    if yaml.safe_load(text) != expected:
+    if (yaml.safe_load(text) or {}) != expected:
         raise EditError("the change could not be made while keeping the file's layout; make it in the YAML tab")
     return text
 
@@ -705,7 +736,9 @@ def _own_entries(lay: _Layers, key: tuple[str, ...], value: dict) -> dict | None
 
 def _put(data: dict, key: tuple[str, ...], value: Any) -> None:
     for part in key[:-1]:
-        data = data.setdefault(part, {})
+        if data.get(part) is None:  # a missing parent, or a null one (`workspace:` with only comments under it)
+            data[part] = {}
+        data = data[part]
     data[key[-1]] = copy.deepcopy(value)
 
 
@@ -802,8 +835,18 @@ def _line_end(text: str, index: int) -> int:
 
 
 def _edit(text: str, key: tuple[str, ...], value: Any) -> str:
-    """One text edit: replace, add (with any missing parents) or delete (`_DELETE`) the value at `key`."""
+    """One text edit: replace, add (with any missing parents) or delete (`_DELETE`) the value at `key`. A document
+    with no node (empty, or comments only) takes the key on a new line at its end, and a parent whose value is null
+    (a key with nothing, or only comments, under it) takes the rest of the key as a flow mapping."""
     root = yaml.compose(text, Loader=yaml.SafeLoader)
+    if root is None:
+        if value is _DELETE:
+            return text
+        nested: Any = value
+        for inner in reversed(key[1:]):
+            nested = {inner: nested}
+        lead = "" if not text or text.endswith("\n") else "\n"
+        return f"{text}{lead}{_render(key[0])}: {_render(nested)}\n"
     if not isinstance(root, MappingNode):
         raise EditError("the file must hold a mapping at the top level")
     shared = _shared_nodes(root)
@@ -817,28 +860,43 @@ def _edit(text: str, key: tuple[str, ...], value: Any) -> str:
             if value is _DELETE:
                 return text
             rest = key[depth + 1:]
-            nested: Any = value
+            nested = value
             for inner in reversed(rest):
                 nested = {inner: nested}
             return _add(text, node, part, nested)
-        index, _, vnode = found
+        index, knode, vnode = found
         if last:
             if id(vnode) in shared:
                 raise EditError(f"{'.'.join(key)} is anchored and used elsewhere; change it in the YAML tab")
             if value is _DELETE:
                 return _delete(text, node, index)
-            return _replace(text, vnode, value)
+            return _replace(text, vnode, value, knode)
         if not isinstance(vnode, MappingNode):
             if value is _DELETE:
                 return text
+            if isinstance(vnode, ScalarNode) and vnode.tag == _NULL_TAG and id(vnode) not in shared:
+                nested = value
+                for inner in reversed(key[depth + 1:]):
+                    nested = {inner: nested}
+                return _replace(text, vnode, nested)
             raise EditError(f"{'.'.join(key[:depth + 1])} is not a mapping")
         node = vnode
     return text
 
 
-def _replace(text: str, node: Node, value: Any) -> str:
+def _replace(text: str, node: Node, value: Any, key: Node | None = None) -> str:
     start, end = node.start_mark.index, _last_end(node)
-    return text[:start] + _render(value) + text[end:]
+    if (key is not None and isinstance(node, (MappingNode, SequenceNode)) and not node.flow_style
+            and node.start_mark.line > key.end_mark.line and node.start_mark.column <= key.start_mark.column):
+        # A block value no deeper than its key (`roots:` then `- a` in the key's column, as PyYAML writes a list):
+        # a one-line value can't stand where its first entry did, so it goes right after the key's colon, and the
+        # comments between the two lines stay.
+        colon = text.find(":", key.end_mark.index, start)
+        if colon == -1:
+            raise EditError("cannot find the colon after a key")
+        return text[:colon + 1] + " " + _render(value) + text[colon + 1:_line_start(text, start) - 1] + text[end:]
+    gap = " " if isinstance(node, ScalarNode) and start == end else ""  # an implicit null, right after its colon
+    return text[:start] + gap + _render(value) + text[end:]
 
 
 def _add(text: str, mapping: MappingNode, key: str, value: Any) -> str:
@@ -901,3 +959,360 @@ def _comments(text: str) -> dict[tuple[str, ...], str]:
 
     walk(root, ())
     return out
+
+
+# --------------------------------------------------------------------------- the user file: Your settings
+
+_LINES = {"kind": "list", "lines": True}  # one entry per line on the page
+_MODELS = {"kind": "map", "value_kind": "text"}
+# (title, note, rows). A row with no label and no extra takes both from the pack form's `_SECTIONS`, so a key the
+# pack form already has is defined once. These rows are the allow-list (`USER_FIELD_KEYS`): nothing else is written.
+_USER_SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str | None, dict | None]]]] = [
+    ("Workspace", "The folders whose repositories the dashboard lists; a change takes effect at once.", [
+        (("workspace", "roots"), "Folders that hold repositories (absolute or ~/ paths)", _LINES),
+        (("workspace", "repos"), "Single repositories (absolute or ~/ paths)", _LINES),
+        (("workspace", "exclude"), "Leave out (a path, or a bare folder name)", _LINES),
+    ]),
+    ("Dashboard", "The page reads these at once; a new port needs a dashboard restart.", [
+        (("dashboard", "port"), None, None),
+        (("dashboard", "board_refresh_s"), None, None),
+        (("dashboard", "done_shown"), None, None),
+    ]),
+    ("Budgets", "Your own budgets, over every repository's; they are set when a run starts.", [
+        (("defaults", "run_budget_usd"), None, None),
+        (("defaults", "run_budget_hard_usd"), None, None),
+        (("defaults", "task_budget_usd"), None, None),
+    ]),
+    ("Usage window", "When runs stop starting new work because the plan's usage window is nearly spent; the soft mark "
+                     "is your headroom.", [
+        (("usage", "governor"), None, None),
+        (("usage", "five_hour_soft"), None, None),
+        (("usage", "five_hour_hard"), None, None),
+        (("usage", "seven_day_soft"), None, None),
+        (("usage", "finish_first"), None, None),
+    ]),
+    ("Reminders", "When a run that waits on you reminds you again.", [
+        (("hitl", "remind_after_h"), None, None),
+    ]),
+    ("Models", "Your model for each role, by agent; a role you leave out keeps the pack's or the engine's.", [
+        (("agents", "claude", "models"), "claude: model by role", _MODELS),
+        (("agents", "codex", "models"), "codex: model by role", _MODELS),
+    ]),
+]
+USER_FIELD_KEYS: tuple[tuple[str, ...], ...] = tuple(key for _, _, rows in _USER_SECTIONS for key, _, _ in rows)
+_PACK_FIELDS = {key: (label, extra) for _, _, rows in _SECTIONS for key, label, extra in rows}
+_USER_CONFLICT = "your user config changed since the page loaded it; reload the Settings page and redo the change"
+
+
+def _user_catalog() -> list[dict]:
+    """Your settings' sections, each with its fields' definitions (no values yet)."""
+    sections = []
+    for title, note, rows in _USER_SECTIONS:
+        fields = []
+        for key, label, extra in rows:
+            if label is None or extra is None:
+                label, extra = _PACK_FIELDS[key]
+            fields.append({"key": list(key), "label": label, **extra, "optional": True, "target": "user"})
+        sections.append({"title": title, "note": note, "fields": fields})
+    return sections
+
+
+def _user_path(path: Path | None) -> Path:
+    if path is not None:
+        return Path(path)
+    try:
+        return layers.user_config_path()
+    except RuntimeError as exc:  # no home directory to hold the file
+        raise EditError("there is no home directory to hold your user config") from exc
+
+
+def read_user(path: Path) -> tuple[str, str, bool]:
+    """`(text, sha256, exists)` of the user file; a missing one is `("", sha256(""), False)`. It is opened without
+    following a symlink, and a symlink (at the file or its `agentflow` folder), a hardlink, anything that is not a
+    regular file, a file over `MAX_TEXT` bytes or text that is not UTF-8 is an `EditError`: the page never reads
+    through, or writes, any of them."""
+    path = Path(path)
+    fix = "the dashboard edits only a regular file in a real folder; fix it by hand"
+    if path.parent.is_symlink():
+        raise EditError(f"{path.parent} is a symlink; {fix}")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return "", sha256(""), False
+    except OSError as exc:
+        if exc.errno == errno.ELOOP or path.is_symlink():
+            raise EditError(f"{path} is a symlink; {fix}") from exc
+        raise EditError(f"cannot read {path}: {exc.strerror or exc}") from exc
+    try:  # checked on the raw descriptor: wrapping a folder's in a file object fails before any check
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise EditError(f"{path} is not a regular file; {fix}")
+        if info.st_nlink > 1:
+            raise EditError(f"{path} has another name (a hardlink); {fix}")
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        data = handle.read(MAX_TEXT + 1)
+    if len(data) > MAX_TEXT:
+        raise EditError(f"{path} is larger than {MAX_TEXT} bytes; fix it by hand")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise EditError(f"{path} is not UTF-8 text; fix it by hand") from exc
+    return text, sha256(text), True
+
+
+def _parse_user(text: str, path: Path) -> dict:
+    """The user file's text as a mapping (an empty file is `{}`); `EditError` when it is not one."""
+    try:
+        parsed = layers.parse_config(text)
+    except layers.ConfigRefused as refused:
+        raise EditError(f"{path} {refused}; fix it by hand") from refused
+    except yaml.YAMLError as exc:
+        raise EditError(f"{path} is not valid YAML; fix it by hand: {exc}") from exc
+    except RecursionError as exc:
+        raise EditError(f"{path} is nested too deeply to read; fix it by hand") from exc
+    if parsed is None:
+        return {}
+    if not isinstance(parsed, dict):
+        raise EditError(f"{path} must hold a mapping at the top level; fix it by hand")
+    return parsed
+
+
+def _user_layers(path: Path, text: str, data: dict) -> tuple[_Layers, str | None]:
+    """The user file over the engine defaults (no pack, and no `check_user`, so a file that does not load still
+    shows its values): `project` is the file, `below` the engine. A file `merge` refuses shows the engine's values,
+    and the second item says why."""
+    stack = layers.base_layers(None)
+    below, below_origins = layers.merge(stack)
+    comments: dict[tuple[str, ...], str] = {}
+    for layer in stack:
+        comments.update(_comments(layer.path.read_text(encoding="utf-8")))
+    comments.update(_comments(text))
+    problem = None
+    try:
+        merged, origins = layers.merge([*stack, layers.Layer("user", data, path)])
+    except layers.LayerError as exc:
+        merged, origins, problem = below, below_origins, f"{path}: {exc}"
+    return _Layers(data, merged, origins, below, path, comments), problem
+
+
+def user_form_fields(path: Path | None = None) -> dict:
+    """What Your settings shows: the user file's path, hash and whether it exists, and the allow-listed fields with
+    their effective values (the engine defaults under the file). Never raises for a bad file: a file the page can't
+    edit (a symlink, a hardlink, not YAML ...) is `editable` False with `error` saying why and every field read only;
+    a mapping that does not load is editable, with the load error, so it can be fixed here."""
+    where: Path | None = None
+    text, digest, exists, editable, error = "", sha256(""), False, True, None
+    data: dict = {}
+    try:
+        where = _user_path(path)
+        text, digest, exists = read_user(where)
+        data = _parse_user(text, where)
+    except EditError as exc:
+        editable, error, data = False, str(exc), {}
+        exists = exists or (where is not None and os.path.lexists(where))
+    if editable and where is not None:
+        try:
+            layers.load_user_settings(where)
+        except layers.LayerError as exc:
+            error = str(exc)
+    lay, problem = _user_layers(where or Path("config.yaml"), text if editable else "", data)
+    error = error or problem
+    sections = []
+    for section in _user_catalog():
+        fields = []
+        for fdef in section["fields"]:
+            key = tuple(fdef["key"])
+            present = _get(data, key)[0]
+            item = {**fdef, "value": _get(lay.merged, key)[1], "present": present,
+                    "source": "user" if present else "engine", "help": lay.comments.get(key, "")}
+            if not editable:
+                item["readonly"] = error
+            fields.append(item)
+        sections.append({**section, "fields": fields})
+    return {"path": str(where) if where is not None else "", "sha256": digest, "exists": exists,
+            "editable": editable, "error": error, "sections": sections}
+
+
+def _is_folder(entry: str) -> bool:
+    """One `stat`: `entry` (`~` expanded) is a folder that exists. Nothing in it is listed or read."""
+    try:
+        return Path(entry).expanduser().is_dir()
+    except (OSError, RuntimeError):
+        return False
+
+
+def _prune_empty(text: str, key: tuple[str, ...]) -> str:
+    """`text` with each parent of `key` that a removal left an empty mapping removed too, deepest first: a user file
+    may hold personal settings and nothing else, so `agents: {claude: {}}` would not load."""
+    for depth in range(len(key) - 1, 0, -1):
+        present, parent = _get(yaml.safe_load(text) or {}, key[:depth])
+        if not present or parent != {}:
+            break
+        text = _edit(text, key[:depth], _DELETE)
+    return text
+
+
+def _without_user_fields(data: dict) -> dict:
+    """`data` with every allow-listed leaf taken out, and each parent on the way that is left empty or null."""
+    out = copy.deepcopy(data)
+    for key in USER_FIELD_KEYS:
+        _drop(out, key)
+        for depth in range(len(key) - 1, 0, -1):
+            present, parent = _get(out, key[:depth])
+            if not present or not (parent is None or parent == {}):
+                break
+            _drop(out, key[:depth])
+    return out
+
+
+UserPacks = Sequence[tuple[str, Path] | tuple[str, Path, Path]]
+
+
+def propose_user(base_sha256: str, changes: list, packs: UserPacks = (), path: Path | None = None) -> Proposal:
+    """The user-file text a save would write, with what stops it; raises `Conflict`, `Refused`, `EditError`.
+
+    `packs` is `(repository name, pack config path, checkout)` per live repository; without the checkout it is the
+    folder that holds the pack's `.agentflow/`. In order: the base must be the file's
+    current hash; every change key must be in `USER_FIELD_KEYS` (else `Refused`, whatever the value); each value
+    must fit its field, a `workspace.*` list must have the shape `layers.workspace_settings` takes, and a
+    `workspace.roots` entry the file does not list yet must be a folder that exists; the edit must leave the rest of
+    the file as it was (else `Refused`). Then the candidate must load as the user file, and with each pack that
+    loads with the file on disk, and there `validate` must find no error at a key that had none with the file on disk
+    (as a run's reload and `agentflow validate` would see it); an issue names that repository, and the real file,
+    never the temporary one."""
+    path = _user_path(path)
+    current, digest, _ = read_user(path)
+    if base_sha256 != digest:
+        raise Conflict(_USER_CONFLICT)
+    _changes_list(changes)
+    allowed = set(USER_FIELD_KEYS)
+    for change in changes:
+        if not isinstance(change, dict) or set(change) != {"key", "value"}:
+            raise EditError("each change is an object with exactly key and value")
+        key = change["key"]
+        if not isinstance(key, list) or not all(isinstance(k, str) for k in key) or tuple(key) not in allowed:
+            raise Refused(f"{key!r} is not a personal setting this page can change; edit your user config by hand")
+    data = _parse_user(current, path)
+    lay, _ = _user_layers(path, current, data)
+    index = {tuple(f["key"]): f for section in _user_catalog() for f in section["fields"]}
+    _, listed = _get(data, ("workspace", "roots"))
+    listed = listed if isinstance(listed, list) else []
+    for change in changes:
+        key, value = tuple(change["key"]), change["value"]
+        problem = _check_value(index[key], value)
+        if problem:
+            raise EditError(problem)
+        if key[0] != "workspace":
+            continue
+        try:
+            layers.workspace_settings({key[1]: value})
+        except layers.LayerError as exc:
+            raise EditError(str(exc)) from exc
+        if key[1] == "roots":
+            for entry in value or ():
+                if entry not in listed and not _is_folder(entry):
+                    raise EditError(f"workspace.roots: {entry!r} is not a folder")
+    new_text = _apply_changes(current, changes, lay, index)
+    for change in changes:
+        if change["value"] is None:
+            new_text = _prune_empty(new_text, tuple(change["key"]))
+    if len(new_text.encode("utf-8")) > MAX_TEXT:
+        raise EditError(f"your user config would be larger than {MAX_TEXT} bytes")
+    if _without_user_fields(data) != _without_user_fields(_parse_user(new_text, path)):
+        raise Refused("the change would touch more of your user config than its personal settings; edit it by hand")
+    issues = _check_user_text(path, new_text, packs)
+    diff = "".join(difflib.unified_diff(current.splitlines(keepends=True), new_text.splitlines(keepends=True),
+                                        "config.yaml", "config.yaml (new)"))
+    return Proposal(digest, new_text, diff, issues)
+
+
+def _check_user_text(path: Path, new_text: str, packs: UserPacks) -> list[Issue]:
+    """Load `new_text` as the user file, from a temporary file beside it (or in a private temporary folder while the
+    file's folder does not exist yet: a preview creates nothing)."""
+    if path.parent.is_dir() and not path.parent.is_symlink():
+        return _check_candidate(path, new_text, packs, path.parent)
+    with tempfile.TemporaryDirectory(prefix="agentflow-user-check-") as scratch:
+        return _check_candidate(path, new_text, packs, Path(scratch))
+
+
+def _check_candidate(path: Path, new_text: str, packs: UserPacks, folder: Path) -> list[Issue]:
+    fd, temp = tempfile.mkstemp(prefix=".config-check-", suffix=".yaml", dir=folder)
+    names = sorted({temp, os.path.realpath(temp)}, key=len, reverse=True)
+
+    def said(text: str) -> str:  # the real file's path wherever a message names the temporary one
+        for name in names:
+            text = text.replace(name, str(path))
+        return text
+
+    issues: list[Issue] = []
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(new_text)
+        try:
+            layers.load_user_settings(Path(temp))
+        except layers.LayerError as exc:
+            issues.append(Issue("error", said(exc.path), said(exc.message)))
+        for entry in packs:
+            name, pack_path = entry[0], Path(entry[1])
+            repo = Path(entry[2]) if len(entry) > 2 else pack_path.parent.parent
+            try:
+                now = load_config(pack_path, user_file=path)
+            except (ConfigError, OSError):  # already broken with the file on disk: it blocks nothing
+                continue
+            try:
+                cfg = load_config(pack_path, user_file=Path(temp))
+            except (ConfigError, OSError) as exc:
+                where, message = (exc.path, exc.message) if isinstance(exc, ConfigError) else ("", str(exc))
+                issues.append(Issue("error", said(where), f"{name}: {said(message)}"))
+                continue
+            issues += [Issue("error", said(i.path), f"{name}: {said(i.message)}")
+                       for i in _new_validate_errors(now, cfg, repo, said)]
+    finally:
+        Path(temp).unlink(missing_ok=True)
+    return issues
+
+
+def _new_validate_errors(now: Config, cfg: Config, repo: Path, said: Callable[[str], str]) -> list[Issue]:
+    """The errors `validate` finds in `cfg` (the pack with the candidate user file) at a key where it finds none in
+    `now` (the pack with the file on disk). A key keeps its error when only the message's values move (a soft budget
+    raised past a hard limit that was already below it), and a pack `validate` can't check today blocks nothing."""
+    try:
+        before = {said(i.path) or said(i.message) for i in validate(now, repo) if i.level == "error"}
+    except Exception:  # validate itself fails on the pack as it is: like a pack that does not load, it blocks nothing
+        return []
+    try:
+        after = [i for i in validate(cfg, repo) if i.level == "error"]
+    except Exception as exc:  # it fails only with the candidate: that is new
+        return [Issue("error", "", said(f"validate failed with your new settings: {exc}"))]
+    return [i for i in after if (said(i.path) or said(i.message)) not in before]
+
+
+def save_user(proposal: Proposal, path: Path | None = None) -> str:
+    """Write a checked user-file proposal; the new SHA-256. Raises `Conflict` if the file changed meanwhile and
+    `EditError` for a proposal with errors or a file (or folder) `read_user` refuses. A new file is `0o600`, in a
+    folder `safeio.ensure_dir` makes (refusing a symlink); an existing one keeps its mode."""
+    if proposal.errors:
+        raise EditError("the change does not load: " + "; ".join(f"{i.path}: {i.message}" for i in proposal.errors))
+    path = _user_path(path)
+    with _LOCK:
+        _, digest, exists = read_user(path)
+        if digest != proposal.base_sha256:
+            raise Conflict(_USER_CONFLICT)
+        mode = stat.S_IMODE(os.lstat(path).st_mode) if exists else safeio.FILE_MODE
+        try:
+            folder = safeio.ensure_dir(path.parent)
+        except OSError as exc:  # `SymlinkRefused` among them
+            raise EditError(f"cannot write your user config in {path.parent}: {exc.strerror or exc}") from exc
+        fd, temp = tempfile.mkstemp(prefix=".config-", suffix=".yaml.tmp", dir=folder)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(proposal.text)
+            os.chmod(temp, mode)
+            os.replace(temp, path)
+        except BaseException:
+            Path(temp).unlink(missing_ok=True)
+            raise
+    return sha256(proposal.text)

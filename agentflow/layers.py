@@ -473,18 +473,19 @@ def workspace_settings(block: object) -> WorkspaceSettings:
     return WorkspaceSettings(lists["roots"], lists["repos"], lists["exclude"])
 
 
-def load_user_settings() -> UserSettings:
+def load_user_settings(path: Path | None = None) -> UserSettings:
     """The user's personal settings alone: the engine defaults plus the user file, with no pack.
 
-    The file is checked (`check_user`) against the engine layer and its `workspace` block is shaped by
-    `workspace_settings`; a `LayerError` for either names the file. No home directory, or no file, means the engine
-    defaults and `path` None."""
+    `path` given, that file is read as the user file (the Settings page checks a candidate text this way) instead of
+    `user_config_path()`. The file is checked (`check_user`) against the engine layer and its `workspace` block is
+    shaped by `workspace_settings`; a `LayerError` for either names the file. No home directory, or no file, means
+    the engine defaults and `path` None."""
     stack = base_layers(None)
     merged, _ = merge(stack)
-    path: Path | None = None
+    given, path = path, None
     found = False
     try:
-        candidate = user_config_path()
+        candidate = Path(given) if given is not None else user_config_path()
     except RuntimeError:  # no home directory to look in: there is no user file
         pass
     else:

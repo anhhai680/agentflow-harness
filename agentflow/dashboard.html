@@ -182,6 +182,12 @@ dialog .row > * { flex: 1; }
 .set-field input[type=text], .set-field input[type=number], .set-field select { width: 100%; min-width: 0; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
 .set-field input[type=checkbox] { justify-self: start; width: 18px; height: 18px; }
 .set-key { font: 11px ui-monospace, Menlo, monospace; color: var(--muted); overflow-wrap: anywhere; }
+.set-scope + .set-scope { margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--line); }
+.set-title { margin: 0 0 8px; font-size: 16px; overflow-wrap: anywhere; }
+.set-prompt { background: var(--panel); border: 1px solid var(--accent); border-left-width: 4px; border-radius: 8px; padding: 8px 12px; margin: 0 0 12px; }
+.set-field > .save-badge { grid-column: 1 / -1; justify-self: start; font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 0 6px; }
+.set-field > .set-hint { color: var(--accent); }
+.set-field textarea.lines { grid-column: 1 / -1; width: 100%; min-width: 0; min-height: 4.5em; resize: vertical; font: 12px/1.45 ui-monospace, Menlo, monospace; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
 .map-rows { display: flex; flex-direction: column; gap: 4px; }
 .map-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 4px; }
 .map-row input { width: 100%; min-width: 0; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
@@ -423,22 +429,40 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
     <div id="run-body"></div>
   </section>
   <section id="settings-view" hidden>
-    <div class="set-bar">
-      <button id="set-mode-form" type="button" aria-pressed="true">Form</button>
-      <button id="set-mode-yaml" type="button" aria-pressed="false">YAML</button>
-      <span id="settings-status" class="muted grow" role="status">loading…</span>
-      <button id="set-reload" type="button">Reload</button>
-      <button id="set-discard" type="button" disabled>Discard</button>
-      <button id="set-review" type="button" class="primary" disabled>Review and save</button>
+    <div id="user-settings" class="set-scope">
+      <h2 class="set-title">Your settings</h2>
+      <div class="set-bar">
+        <span id="user-status" class="muted grow" role="status">loading…</span>
+        <button id="user-reload" type="button">Reload</button>
+        <button id="user-discard" type="button" disabled>Discard</button>
+        <button id="user-review" type="button" class="primary" disabled>Review and save</button>
+      </div>
+      <div class="set-note muted">
+        Your own settings, for every repository and over each one's pack. Saving writes <code id="user-path"></code> once it loads with every
+        repository; comments and layout stay as they are. Only these fields are written: edit anything else in the file by hand.
+      </div>
+      <p id="user-prompt" class="set-prompt" role="note" hidden>Add the folder that holds your repositories, one path per line, like ~/code, then Review and save.</p>
+      <div id="user-form" class="set-grid"></div>
     </div>
-    <div class="set-note muted">
-      Saving writes <code id="settings-path"></code> after <code>agentflow validate</code>'s checks pass. Comments and layout stay as they are.
-      The dashboard uses the new config at once. A running run picks it up when its next phase starts, and new runs start with it.
-      Commit the change like any other edit.
-      <span id="settings-protected"></span>
+    <div id="settings-repo" class="set-scope">
+      <h2 id="settings-repo-title" class="set-title">This repository</h2>
+      <div class="set-bar">
+        <button id="set-mode-form" type="button" aria-pressed="true">Form</button>
+        <button id="set-mode-yaml" type="button" aria-pressed="false">YAML</button>
+        <span id="settings-status" class="muted grow" role="status">loading…</span>
+        <button id="set-reload" type="button">Reload</button>
+        <button id="set-discard" type="button" disabled>Discard</button>
+        <button id="set-review" type="button" class="primary" disabled>Review and save</button>
+      </div>
+      <div class="set-note muted">
+        Saving writes <code id="settings-path"></code> after <code>agentflow validate</code>'s checks pass. Comments and layout stay as they are.
+        The dashboard uses the new config at once. A running run picks it up when its next phase starts, and new runs start with it.
+        Commit the change like any other edit.
+        <span id="settings-protected"></span>
+      </div>
+      <div id="settings-form" class="set-grid"></div>
+      <div id="settings-text" hidden><textarea id="settings-yaml" spellcheck="false" aria-label="config.yaml"></textarea></div>
     </div>
-    <div id="settings-form" class="set-grid"></div>
-    <div id="settings-text" hidden><textarea id="settings-yaml" spellcheck="false" aria-label="config.yaml"></textarea></div>
   </section>
 </main>
 <aside id="drawer" hidden aria-label="Run peek"></aside>

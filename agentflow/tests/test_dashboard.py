@@ -476,6 +476,17 @@ def test_every_ui_file_is_listed():
     assert UI_SCRIPTS[0] == "core.js" and UI_SCRIPTS[-1] == "main.js"
 
 
+def test_the_page_shell_loads_user_settings_after_settings(dash):
+    body = dash.get("/", token=None)[2].decode("utf-8")
+    tags = re.findall(r'<script nonce="[^"]+" src="/ui/([a-z_]+\.js)"></script>', body)
+    assert tags[tags.index("settings.js") + 1] == "user_settings.js"
+    for node in ('id="user-settings"', 'id="user-path"', 'id="user-status"', 'id="user-prompt"', 'id="user-form"',
+                 'id="user-reload"', 'id="user-discard"', 'id="user-review"', 'id="settings-repo"'):
+        assert node in body, node
+    assert body.index('id="user-settings"') < body.index('id="settings-repo"') < body.index('id="set-review"')
+    assert "Your settings" in body
+
+
 def test_tokens_loads_before_the_metrics_tab_and_reads_no_dom():
     assert UI_SCRIPTS.index("tokens.js") + 1 == UI_SCRIPTS.index("metrics.js")
     tokens = (UI_DIR / "tokens.js").read_text(encoding="utf-8")
@@ -4318,3 +4329,210 @@ def test_api_repos_counts_are_cached_between_requests(two, monkeypatch):
     for _ in range(3):
         assert two.dash.get("/api/repos")[0] == 200
     assert sorted(calls) == sorted([two.a.id, two.b.id])  # read once each, not three times
+
+
+# --------------------------------------------------------------------------- Your settings: /api/user-config (W4)
+
+
+def user_get(dash) -> dict:
+    status, _, body = dash.get("/api/user-config")
+    assert status == 200, body
+    return payload(body)
+
+
+def user_save(dash, *changes: tuple[list, object], base: str | None = None, route: str = "save") -> tuple[int, dict]:
+    """POST `changes` (`(key, value)` pairs) to `/api/user-config/<route>`, from the file's current hash unless
+    `base` is given."""
+    sha = base if base is not None else user_get(dash)["sha256"]
+    status, _, body = dash.post(f"/api/user-config/{route}",
+                                {"base_sha256": sha, "changes": [{"key": k, "value": v} for k, v in changes]})
+    return status, payload(body)
+
+
+def test_the_user_settings_answer_with_no_repository(empty_dash):
+    data = user_get(empty_dash)
+    assert data["sections"][0]["title"].startswith("Workspace")
+    assert data["rescans"] is True and data["exists"] is False
+
+
+def test_adding_a_root_on_an_empty_dashboard_writes_only_the_user_file_and_the_repository_appears(empty_dash,
+                                                                                               tmp_path):
+    a = ws_repo(tmp_path / "ws", "a")
+    pack_before = (a / ".agentflow" / "config.yaml").read_bytes()
+    status, data = user_save(empty_dash, (["workspace", "roots"], [str(tmp_path / "ws")]))
+    assert status == 200, data
+    assert data["ok"] is True and data["rescanned"] is True and data["restart"] == []
+    rows = {row["id"]: row for row in payload(empty_dash.get("/api/repos")[2])["repos"]}
+    assert rows[id_of(a)]["state"] == "live"
+    saved = yaml.safe_load(layers.user_config_path().read_text(encoding="utf-8"))
+    assert saved == {"workspace": {"roots": [str(tmp_path / "ws")]}}
+    assert data["sha256"] == hashlib.sha256(layers.user_config_path().read_bytes()).hexdigest()
+    assert (a / ".agentflow" / "config.yaml").read_bytes() == pack_before
+
+
+@pytest.mark.parametrize("key", [["hitl", "notify"], ["agents", "claude", "user_settings"], ["dashboard", "host"],
+                                 ["gates", "unit"], ["guardrails", "forbidden_paths"]])
+def test_the_page_can_never_write_notify_user_settings_host_or_a_protected_key(dash, key):
+    for route in ("save", "preview"):
+        status, data = user_save(dash, (key, {"run": "touch /tmp/x"}), route=route)
+        assert status == 400, (route, data)
+        assert "not a personal setting" in data["error"]
+    assert not os.path.lexists(layers.user_config_path())
+
+
+def test_a_user_config_text_body_or_stale_sha_is_refused(dash):
+    sha = user_get(dash)["sha256"]
+    for route in ("save", "preview"):
+        status, _, body = dash.post(f"/api/user-config/{route}", {"base_sha256": sha, "text": "dashboard: {}\n"})
+        assert status == 400, body
+        status, _, body = dash.post(f"/api/user-config/{route}", {"base_sha256": sha, "text": "x", "changes": []})
+        assert status == 400, body
+        assert dash.post(f"/api/user-config/{route}", {"changes": []})[0] == 400
+        assert dash.post(f"/api/user-config/{route}", {"base_sha256": sha, "changes": {}})[0] == 400
+        status, data = user_save(dash, (["dashboard", "done_shown"], 20), base="0" * 64, route=route)
+        assert status == 409, data
+    assert not os.path.lexists(layers.user_config_path())
+
+
+def test_the_user_config_routes_answer_only_their_own_method(dash):
+    status, _, _ = dash.post("/api/user-config", {})
+    assert status == 404
+    assert dash.get("/api/user-config/save")[0] == 404
+    assert dash.get("/api/user-config/preview")[0] == 404
+    assert dash.get("/api/user-config", token=None)[0] == 403  # the token is still checked first
+    assert dash.post("/api/user-config/save", {}, token=None)[0] == 403
+
+
+def test_user_config_is_not_a_repository_route(two):
+    a = two.a.id
+    status, _, body = two.dash.get(f"/api/repos/{a}/user-config")
+    assert status == 404 and payload(body)["error"] == "not found"
+    status, _, body = two.dash.post(f"/api/repos/{a}/user-config/save",
+                                    {"base_sha256": hashlib.sha256(b"").hexdigest(),
+                                     "changes": [{"key": ["dashboard", "done_shown"], "value": 20}]})
+    assert status == 404 and payload(body)["error"] == "not found"
+    assert two.dash.get(f"/api/repos/{a}/user-config/preview")[0] == 404
+    assert not os.path.lexists(layers.user_config_path())
+
+
+def test_a_user_save_reloads_every_repository_and_the_page_info(two):
+    server = two.dash.server
+    status, data = user_save(two.dash, (["defaults", "run_budget_usd"], 7))
+    assert status == 200, data
+    assert data["rescanned"] is False and data["restart"] == []
+    status, data = user_save(two.dash, (["dashboard", "done_shown"], 25), base=data["sha256"])
+    assert status == 200, data
+    for ctx_id in (two.a.id, two.b.id):
+        assert server.repos[ctx_id].cfg.defaults.run_budget_usd == 7
+    assert payload(two.dash.get("/api/info")[2])["done_shown"] == 25
+    assert server.snap.user.dashboard["done_shown"] == 25 and server.snap.user_error is None
+
+
+def test_a_user_edit_that_breaks_a_live_repository_is_refused_naming_it(two):
+    b_pack = pack.pack_config(two.b.repo)
+    b_pack.write_text(yaml.safe_dump({**SPARSE_PACK, "agents": {**SPARSE_PACK["agents"], "codex": None}}),
+                      encoding="utf-8")
+    two.b.cfg = load_config_of(two.b.repo)
+    assert "codex" not in two.b.cfg.agents
+    status, data = user_save(two.dash, (["dashboard", "done_shown"], 20))
+    assert status == 200, data
+    path = layers.user_config_path()
+    before = path.read_bytes()
+    status, data = user_save(two.dash, (["agents", "codex", "models"], {"build": "x"}))
+    assert status == 400, data
+    assert data["error"] == "the change does not validate"
+    named = [i for i in data["issues"] if i["level"] == "error" and i["message"].startswith(f"{two.b.name}:")]
+    assert named, data["issues"]
+    assert ".config-check-" not in json.dumps(data)
+    assert path.read_bytes() == before
+    assert not [f for f in path.parent.iterdir() if f.name.startswith(".config-")]
+
+
+def test_a_port_or_a_workspace_change_on_a_single_repository_server_asks_for_a_restart(dash, tmp_path):
+    before = dict(dash.server.repos)
+    status, data = user_save(dash, (["dashboard", "port"], 7799), (["workspace", "roots"], [str(tmp_path)]))
+    assert status == 200, data
+    assert data["restart"] == ["dashboard.port", "workspace.roots"] and data["rescanned"] is False
+    assert dash.server.repos == before
+    assert all(dash.server.repos[key] is ctx for key, ctx in before.items())
+    assert user_get(dash)["rescans"] is False
+
+
+def test_a_user_save_and_a_rescan_never_lose_each_other(wsd, monkeypatch):
+    server = wsd.server
+    saved, answers = threading.Event(), []
+    real_save, real_reconcile = config_edit.save_user, repo_context.reconcile
+    sha = user_get(wsd.dash)["sha256"]
+
+    def save_user(*args, **kwargs):
+        out = real_save(*args, **kwargs)
+        saved.set()
+        return out
+
+    def reconcile(current, found, **kwargs):
+        built = real_reconcile(current, found, **kwargs)
+        # the rescan read the user file before this point; a save lands before the scan publishes
+        poster = threading.Thread(target=lambda: answers.append(user_save(wsd.dash, (["dashboard", "done_shown"], 9),
+                                                                          base=sha)), daemon=True)
+        poster.start()
+        saved.wait(5)
+        poster.join(timeout=0.5)  # a save that does not wait for the scan stores its settings here
+        return built
+
+    monkeypatch.setattr(config_edit, "save_user", save_user)
+    monkeypatch.setattr(repo_context, "reconcile", reconcile)
+    server.rescan()
+    deadline = time.monotonic() + 5
+    while not answers and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert answers and answers[0][0] == 200, answers
+    assert server.snap.user.dashboard["done_shown"] == 9
+    assert server.repos[wsd.id("a")].cfg.dashboard["done_shown"] == 9
+    assert payload(wsd.dash.get("/api/info")[2])["done_shown"] == 9
+
+
+def test_a_user_edit_that_fails_validate_in_a_live_repository_is_refused_naming_it(two):
+    status, data = user_save(two.dash, (["defaults", "run_budget_usd"], 100))  # above the engine's hard limit
+    assert status == 400, data
+    assert data["error"] == "the change does not validate"
+    named = [i for i in data["issues"] if i["level"] == "error" and i["path"] == "defaults.run_budget_hard_usd"
+             and i["message"].startswith(f"{two.b.name}:")]
+    assert named, data["issues"]
+    assert ".config-check-" not in json.dumps(data)
+    assert not os.path.lexists(layers.user_config_path())
+    status, data = user_save(two.dash, (["defaults", "run_budget_usd"], 100), (["defaults", "run_budget_hard_usd"], 150))
+    assert status == 200, data
+
+
+def test_a_user_save_that_mends_a_broken_user_file_rescans_without_a_workspace_key(ws_root):
+    server = dashboard.make_workspace_server([], repo_context.engine_user_settings(), "127.0.0.1", 0, TOKEN,
+                                             user_error="the user config did not load")  # fixed by hand since
+    thread = _serve(server)
+    try:
+        dash = Dash(server, server.server_address[1], None)
+        status, data = user_save(dash, (["dashboard", "done_shown"], 20))
+        assert status == 200, data
+        assert data["rescanned"] is True
+        assert server.snap.user_error is None and ws_root / "a" in [ctx.repo for ctx in server.live_contexts()]
+    finally:
+        server.close()
+        thread.join(timeout=5)
+
+
+def test_a_user_save_that_mends_a_repository_in_error_rescans_without_a_workspace_key(tmp_path):
+    root = tmp_path / "ws"
+    a = ws_repo(root, "a")
+    write_sparse_pack(a, agents={**SPARSE_PACK["agents"], "codex": None})
+    path = write_workspace(roots=[root])
+    path.write_text(path.read_text(encoding="utf-8") + "agents: {codex: {models: {build: x}}}\n", encoding="utf-8")
+    server = workspace_server()
+    thread = _serve(server)
+    try:
+        assert server.repos[id_of(a)].state == "error"  # its pack has no codex for the user file's models
+        dash = Dash(server, server.server_address[1], None)
+        status, data = user_save(dash, (["agents", "codex", "models"], None))
+        assert status == 200, data
+        assert data["rescanned"] is True and server.repos[id_of(a)].state == "live"
+    finally:
+        server.close()
+        thread.join(timeout=5)
