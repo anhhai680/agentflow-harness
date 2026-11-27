@@ -259,8 +259,15 @@ The Settings page gets two scopes and routes each field by what it is:
 - **The write path to the user file is new and is the one security-critical piece.** It reuses `config_edit`'s
   machinery (comments and anchors kept, a sha256 conflict check, an atomic write) with these limits: only the user
   file, `layers.user_config_path()`; only keys on a fixed allow-list; the new text is loaded through
-  `load_user_settings()` and the whole stack before it is written, and a text that would not load is refused; symlinks
-  and hardlinks refused through `safeio`; a `workspace.roots` entry must be an absolute or `~` path that exists.
+  `load_user_settings()` and the whole stack before it is written, and a text that would not load is refused; in every
+  live repository whose pack loads with the file on disk, the new text must also load and pass `validate` wherever
+  it passed before (an error at a key that had none is refused and names the repository, so a save never breaks a
+  live run's reload or `agentflow validate`; a repository that already fails blocks nothing); a symlink, a hardlink or
+  anything that is not a regular file is refused by `config_edit.read_user` (opened with `O_NOFOLLOW`, then `fstat`
+  and `st_nlink` on the descriptor), and the folder is made by `safeio.ensure_dir`, which refuses a symlinked one;
+  every `workspace.*` entry keeps the shape `layers.workspace_settings` takes (`/…`, `~` or `~/…`), and only a
+  `workspace.roots` entry the file does not list yet must be a folder that exists (one already listed may have gone
+  away, and a save of another field still works).
 - A change to `workspace.*` re-runs the rescan at once. A change to `dashboard.port` takes effect on restart, and the
   page says so.
 
@@ -309,7 +316,9 @@ repository, so these rules are stated and tested:
   low-risk personal keys (`config_edit.USER_FIELD_KEYS`); `hitl.notify` (it runs commands), `agents.*.user_settings`
   (it widens what an agent reads), `dashboard.host` and every key in `_PROTECTED_KEYS` can never be set through the
   page. The one exception is `workspace.*`: it is in `_PROTECTED_KEYS` to keep it out of a *pack*, and it is the
-  allow-list's own for the user file. A key outside the allow-list is a 400, whatever the body says. The existing same-site check and token apply unchanged.
+  allow-list's own for the user file. A key outside the allow-list is a 400, whatever the body says. The user-file
+  path is never weaker than the pack's: a save must load with, and pass `validate` in, every live repository where
+  it passed before. The existing same-site check and token apply unchanged.
 - **One token for all repositories means a leaked token reaches all of them**, where today it reaches one. The token
   stays 128 bits, 127.0.0.1 only, never logged. The start-up note says how many repositories it covers. This is the
   one real widening of the blast radius, accepted for the productivity gain.

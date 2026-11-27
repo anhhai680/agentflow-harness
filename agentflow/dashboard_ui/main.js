@@ -227,7 +227,7 @@ async function loadInfo() {
 
 if (TOKEN) {
   loadRepos().then(() => {  // the selection first: every request after it goes to the repository shown
-    if (emptyStart(ui.repos)) {  // no repository and no workspace yet: Settings, to add the folder that holds them
+    if (emptyStart(ui.repos)) {  // no repository yet: Settings, to add the folder that holds them
       history.replaceState(null, "", routeHash({ view: "settings", repo: null }));
       userSettings.focusRoots = true;
     }
