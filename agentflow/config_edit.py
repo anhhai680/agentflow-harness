@@ -1042,12 +1042,16 @@ def read_user(path: Path) -> tuple[str, str, bool]:
         if exc.errno == errno.ELOOP or path.is_symlink():
             raise EditError(f"{path} is a symlink; {fix}") from exc
         raise EditError(f"cannot read {path}: {exc.strerror or exc}") from exc
-    with os.fdopen(fd, "rb") as handle:
-        info = os.fstat(handle.fileno())
+    try:  # checked on the raw descriptor: wrapping a folder's in a file object fails before any check
+        info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise EditError(f"{path} is not a regular file; {fix}")
         if info.st_nlink > 1:
             raise EditError(f"{path} has another name (a hardlink); {fix}")
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as handle:
         data = handle.read(MAX_TEXT + 1)
     if len(data) > MAX_TEXT:
         raise EditError(f"{path} is larger than {MAX_TEXT} bytes; fix it by hand")

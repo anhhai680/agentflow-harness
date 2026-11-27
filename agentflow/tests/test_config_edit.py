@@ -1707,8 +1707,17 @@ def test_a_symlinked_or_hardlinked_user_file_is_shown_read_only_and_never_writte
         config_edit.propose_user(config_edit.sha256(real.read_text(encoding="utf-8")),
                                  [{"key": ["dashboard", "done_shown"], "value": 30}])
     assert real.read_text(encoding="utf-8") == "dashboard: {done_shown: 20}\n"
-    # a symlinked `agentflow` folder: the save refuses it and the link's target is untouched
+    # a folder at the file's path: not a regular file, shown read only, and no descriptor is left open
     p.unlink()
+    p.mkdir()
+    fds = len(os.listdir("/dev/fd"))
+    data = config_edit.user_form_fields()
+    assert data["editable"] is False and "not a regular file" in data["error"]
+    with pytest.raises(EditError, match="not a regular file"):
+        config_edit.read_user(p)
+    assert len(os.listdir("/dev/fd")) == fds
+    p.rmdir()
+    # a symlinked `agentflow` folder: the save refuses it and the link's target is untouched
     p.parent.rmdir()
     target = tmp_path / "elsewhere"
     target.mkdir()
