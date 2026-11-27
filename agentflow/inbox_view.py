@@ -27,7 +27,7 @@ from agentflow.pack import PackError
 from agentflow.plan_view import run_plan
 from agentflow.run_control import available_actions
 from agentflow.run_files import _head
-from agentflow.state import TERMINAL, Run, display_status, list_runs
+from agentflow.state import OPEN_HOLDS, TERMINAL, Run, display_status, list_runs
 from agentflow.views import _label, step_title
 
 RECENT_S = 30 * 60
@@ -207,7 +207,7 @@ def _watch(run: Run, events: list[dict]) -> dict | None:
     hold = run.state.get("hold")
     if hold:
         since = next((e.get("ts") for e in reversed(events) if e.get("type") == "run_held"), None)
-        until = f" until {hold.get('until')}" if hold.get("until") else ""
+        until = f" until {hold.get('until')}" if hold.get("until") and hold.get("reason") not in OPEN_HOLDS else ""
         return {"reason": "held", "since": since, "text": f"{hold.get('reason') or 'held'}{until}"}
     if display_status(run) == "stalled":
         since = events[-1].get("ts") if events else None

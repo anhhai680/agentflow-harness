@@ -42,7 +42,7 @@ from agentflow.hitl import inbox_items
 from agentflow.metrics import BUCKETS, aggregate, run_metrics
 from agentflow.run_control import available_actions
 from agentflow.signals import aggregate_signals, run_signals
-from agentflow.state import TERMINAL, Run, cost_added, display_status, list_runs, runs_root
+from agentflow.state import OPEN_HOLDS, TERMINAL, Run, cost_added, display_status, list_runs, runs_root
 
 ARROWS = {"up": "↑", "down": "↓"}
 BADGES = {"waiting_human": "waiting human", "awaiting_approval": "awaiting approval"}
@@ -290,6 +290,8 @@ def _badge(state: dict, status: str, column: str) -> str:
         return "waiting for CI"
     hold = state.get("hold")
     if status == "held" and hold:
+        if hold["reason"] in OPEN_HOLDS:  # no end time to show
+            return f"held ({hold['reason']})"
         until = parse_iso(hold["until"])
         return f"held until {until.astimezone().strftime('%H:%M') if until else '?'} ({hold['reason']})"
     return BADGES.get(status, status)

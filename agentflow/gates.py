@@ -13,7 +13,9 @@ gates with no `group` form one group of their own, so a set with no `group` runs
 with no thread. A gate with a `resource` holds that name's lock while its command runs, on every path, so two gates
 sharing one never overlap, in a run or across the runs of the repository (a file lock in the state dir's `locks/`);
 the seconds it waited are `GateResult.waited_s`, kept out of `duration_s`. The results keep the set's order. However
-`run_gates` is left, every gate's process group is killed.
+`run_gates` is left, every gate's process group is killed. Inside an `advance` turn a set with at least one gate holds a
+machine-wide `run_cap` slot (`workspace.max_active_runs`) while it runs; a pause or cancel during its wait for one
+lets the set run once without it.
 
 Doc checks (`run_doc_checks`) are the design lane's built-in gates, named in a step's `checks:`. They
 read `git diff` from a base commit to the working tree as it is now (committed, staged, unstaged and
@@ -63,7 +65,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
-from agentflow import pack, run_env, safeio
+from agentflow import pack, run_cap, run_env, safeio
 from agentflow.config import GATE_LABEL, Config, Gate, unquoted_paths_word
 from agentflow.guards import HARDENED, path_matches, snapshot
 
@@ -422,12 +424,26 @@ def run_gates(cfg: Config, names: str | list[str], cwd: Path, log_dir: Path, *,
 
     At `tier="affected"` a gate with `affected` runs that command on the paths of `changed` it takes (`_tiered`), and
     its result has `tier="affected"`; a gate without one runs its `run`, at the full tier.
+
+    Inside an `advance` turn a set that resolves to at least one gate holds a `run_cap` slot while it runs; past the
+    cap it waits, and a pause or cancel during the wait lets this one set run without a slot.
     """
     cwd, log_dir = Path(cwd), Path(log_dir)
     if env_base is None:
         env_base = run_env.base(cfg)
-    timeout = cfg.defaults.gate_timeout_min
     gates = _resolve(cfg, names)
+    if not gates:  # a set with no gate is no work: it takes no slot
+        return []
+    turn = run_cap.current()
+    phase = (turn.run.state.get("phase") if turn is not None else None) or "run"
+    with run_cap.working(f"{phase}/{run_cap.CAP_STEP}", stop_on_halt=False):  # a pause ends the wait: the set runs
+        return _run_resolved(cfg, gates, cwd, log_dir, env_base, tier, changed)
+
+
+def _run_resolved(cfg: Config, gates: list[Gate], cwd: Path, log_dir: Path, env_base: Mapping[str, str], tier: str,
+                  changed: Sequence[str]) -> list[GateResult]:
+    """`run_gates`' work on the gates its names resolved to."""
+    timeout = cfg.defaults.gate_timeout_min
     jobs = [_tiered(g, tier, changed, cwd) for g in gates]
     groups: dict[str | None, list[int]] = {}
     for i, gate in enumerate(gates):
