@@ -85,7 +85,10 @@ function mapInput(field, id, scope) {
       const value = mapValue(v, field.value_kind);
       if (value !== undefined) out[k.value.trim()] = value;
     }
-    setEdit(field, out, scope);
+    // Every row removed in Your settings deletes your key (and the parents it empties): an empty map would stay in
+    // your file, and one for an agent a pack lacks keeps that repository from loading.
+    const empty = field.target === "user" && Object.keys(out).length === 0;
+    setEdit(field, empty ? null : out, scope);
   };
   const addRow = (key, value) => {
     const k = el("input", { type: "text", value: key, "aria-label": field.label + ": name", placeholder: "name", disabled: !!field.readonly });

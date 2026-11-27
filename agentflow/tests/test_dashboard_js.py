@@ -1401,3 +1401,24 @@ def test_the_folder_prompt_goes_once_a_save_lists_a_repository():
         await reviewUserSettings(); await ok();
         return [before, nodes['user-prompt'].hidden]; })()""", None)
     assert got == [False, True]  # asked for a folder; gone once the save listed its repository
+
+
+# An element tree a map field can add rows to and remove them from, with the props (`onclick` among them) kept on `p`.
+TREE_EL = ("el = (tag, p, ...c) => { const n = {tag, p: p || {}, value: (p || {}).value, children: [], on: {}, classList: {toggle() {}},"
+           " addEventListener(t, f) { n.on[t] = f; }, append(x) { x.parent = n; n.children.push(x); },"
+           " remove() { const s = n.parent.children; s.splice(s.indexOf(n), 1); },"
+           " querySelectorAll() { return n.children.filter((x) => x.tag === 'input'); }};"
+           " c.flat().filter((x) => x).forEach((x) => n.append(x)); return n; }; globalThis.Node = Object;"
+           "var scope = {edits: new Map(), rows: new Map(), update: () => {}};"
+           "const emptied = (field) => { scope.edits.clear(); const rows = mapInput(field, 'id', scope).children[0];"
+           " [...rows.children].forEach((row) => row.children[2].p.onclick()); return [...scope.edits.values()]; };")
+
+
+def test_removing_every_row_of_a_user_models_map_deletes_your_key():
+    field = {"key": ["agents", "codex", "models"], "label": "Models", "kind": "map", "value_kind": "text",
+             "value": {"build": "x", "plan": "y"}, "optional": True}
+    got = js(USER_UI, TREE_EL + """[emptied({...args, target: 'user', present: true}),
+      emptied({...args, target: 'user', present: false}), emptied({...args, target: 'project', present: true})]""", field)
+    assert got[0] == [{"key": ["agents", "codex", "models"], "value": None}]  # your key is deleted, and its empty parents
+    assert got[1] == []  # your file does not set it: there is nothing to delete
+    assert got[2] == [{"key": ["agents", "codex", "models"], "value": {}}]  # the pack form is as before
