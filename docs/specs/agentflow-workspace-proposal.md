@@ -278,7 +278,7 @@ built in the runner's process, which does not know which repositories are live, 
 `git rev-parse` per child on every notification; the user file is already read, so it decides. A `title` set in
 `hitl.notify` is kept as written and gets no label.
 `hitl.digest` stays **per repository**: `digest_text` counts one repository's runs and writes one file under that
-repository's state dir. A merged digest is conditional (W5).
+repository's state dir, unless `workspace.digest` merges it (W5, section 9).
 
 ### 7. Concurrency across repositories
 
@@ -287,7 +287,7 @@ repository's state dir. A merged digest is conditional (W5).
 | Run state, worktrees, workspaces, claims, lessons | per repository (`<state>/<repo-id>/`, that repository's refs on `origin`) | unchanged; they cannot collide |
 | Claude usage windows (5 h / 7 d) | machine-wide per account (`usage_window.json`, waiter ranking in `governor.py`) | unchanged; already correct across repositories |
 | Agent CLI process, `caffeinate` | one per run | unchanged |
-| CPU, memory, Docker, local ports used by gates | not governed | no cap for now; W5 adds `workspace.max_active_runs` only if real use shows the problem |
+| CPU, memory, Docker, local ports used by gates | not governed | `workspace.max_active_runs` (W5, section 9): a run past the cap is held until a slot frees |
 | `gh` API rate limit | one process per repository | the dashboard refreshes one repository at a time (4.2) |
 
 ### 8. Doctor and validation
@@ -299,6 +299,101 @@ repository's state dir. A merged digest is conditional (W5).
   a pack that sets one warns (ignored in a pack); `dashboard.board_refresh_s` and `done_shown` keep the ranges the
   page enforces today (0.5–60 seconds, an integer 1–1000).
 - `agentflow init`, in a repository outside the workspace, prints one line: add its folder to `workspace.roots`.
+
+### 9. Run cap and merged digest (W5, settled 2026-11-27)
+
+The developer asked for W5 on 2026-11-27 and settled its three open points: build both, hold at the cap rather than
+refuse, and switch the merged digest on with a user key.
+
+Two more personal keys, user file only (`layers.USER_KEYS`, a `validate` warning in a pack, as for the other
+`workspace.*` keys), both editable on Your settings (`config_edit.USER_FIELD_KEYS`):
+
+```yaml
+workspace:
+  max_active_runs: 3   # at most this many runs advance at once on this machine; unset = no cap (1–64)
+  digest: true         # every notification is one line over every workspace repository (default false)
+```
+
+**The cap.** A run is *active* only while its runner runs an **agent session** or a **gate set** for it. That
+covers a step's session (fresh or resumed), a sizer or triage session, and every gate set: a step's gates, preflight,
+conformance, sync and the CI fix loop. The developer chose this scope on 2026-11-27, after a doubt review showed that a
+per-phase slot let refine rounds, ship work, preflight and triage run uncapped. A run holds nothing while it waits on a
+person, an approval or CI, is paused or done, or is between two pieces of work.
+
+Each piece of work holds one of `max_active_runs` slots: an exclusive, non-blocking `flock` on
+`<user_state_root()>/run_cap/<n>.lock`. It is taken under a short mutex, `run_cap/cap.lock`, and given back when the
+piece of work ends. The process dying drops it, so a crash leaves nothing to clean up. The slot comes from the turn
+`advance` runs, and only `advance` sets that turn up. So `agentflow init`'s baseline gates and the retro pipeline
+never take a slot.
+
+A run that finds the cap full is **held, never refused**:
+- It emits `run_held` with reason `run cap`, key `<phase>/run_cap` and `until` set to when the hold began. That reason
+  is in `state.OPEN_HOLDS`, so the board badge, `agentflow status` and the inbox show no "until" for it.
+- It sends a notification and checks again every 10 seconds. It goes on (`run_hold_ended`) when a slot frees or the
+  cap is removed or raised.
+- Before an agent session, whether fresh or a resume inside a step's fix loop, a pause or cancel during the wait
+  stops the step.
+- Before a gate set, a pause or cancel ends the wait and that one gate set runs without a slot. The runner then stops
+  at its next check, as a pause always lets the current step finish.
+
+A gate set that resolves to no gate takes nothing. A run can lose its slot between two steps to a waiting run, and
+then waits before its next one.
+
+The cap is read from the user file at each take. Counting covers every held lock, whatever its number, so a cap
+lowered under busy runs admits no new work until the excess has drained. The cap is machine-wide, whether or not a
+repository is in the workspace. It is a scheduling aid, not a security boundary: a lock folder or file that can't be
+used (a symlink, a hardlink, not a regular file, an `OSError`, a mutex not taken within 2 seconds) lets that piece of
+work go on uncapped, as the usage governor fails open. The runner says so once per process on stderr.
+
+Waiters are not ranked: the first check after a slot frees wins. Speculation (off by default) is capped like any
+other work. A cap wait counts in the metrics' `hold` bucket. Accepted costs:
+- The usage window is not checked again after a cap wait. A session it refuses backs off as an outage does.
+- A cancel during a gate set's wait still runs that set.
+- A runner that dies frees its slot while the agent or gate processes it started may run on.
+- "Machine-wide" means one `XDG_STATE_HOME`.
+
+**The merged digest.** With `workspace.digest: true`, `notify_run` sends one line over every repository instead of
+the run's message, whatever the run's pack says in `hitl.digest`. The repositories are:
+- **The run's own**, always read as `digest_text` reads it today (its `pack.state_dir`). When its runs can't be read,
+  the plain message is sent and `notify_failed` is logged.
+- **Every other live workspace repository** (`repo_set.from_user_config()`, one entry per `pack.repo_id`, the run's
+  own left out). Each is read **read-only**, from its **default** state dir (`<user_state_root()>/<repo-id>`) only:
+  each run's `runs/<id>/state.json`, through `safeio`, capped in size, and never through `Run.load`, which would lock
+  and rewrite another repository's runs. To tell whether it uses that default, the runner reads
+  that repository's `.agentflow/config.yaml` and nothing else of its checkout:
+  - It reads the file through `safeio`, with its size capped.
+  - It refuses a symlinked `.agentflow` folder, and a symlink, FIFO or device at the file.
+
+  A pack that sets `paths.state_dir`, or that can't be read that way, makes the repository *not counted*. The value is
+  never followed, because a clone can ship one (the rule a workspace dashboard applies, section 4). Inside the default
+  dir, a `runs/<id>` that is a symlink is skipped. Any other failure counting a repository, such as a file that can't
+  be read or a `state.json` of an unexpected shape, makes it not counted. A `state.json` is that runner's own cache, so it can trail a runner that died
+  mid-write by one event, which is accepted.
+
+Each run counts the way `inbox_items` counts it (its wait, its parked stops, its status), through one pure function
+shared with `digest_text`.
+
+The line has an exact form, for example
+`3 items need you (2 hold a run): billing 2, web 1; 1 run progressing in 3 repositories; 1 not counted`:
+- `digest_text`'s counts, summed.
+- When anything needs you, up to three `<name> <items>` labels (most items first, then by name), and `+<n> more` past
+  three.
+- `in <k> repositor(y|ies)`, where `k` is the repositories counted.
+- `; <u> not counted` when `u > 0`.
+
+The line is cut to the notification length (240 characters) before it is compared and kept. It is titled `agentflow`
+with no repository label, and is sent only when it differs from the last line delivered, kept in
+`<user_state_root()>/workspace_digest.txt`. It is kept only when at least one of the run's notifiers delivered it, so a
+pack with no working notifier never marks a line as sent for the others. Building it resolves the workspace (a
+`git rev-parse` per root child) and reads every other repository's `state.json` files on each notification;
+notifications are rare enough that this is accepted.
+
+With `workspace.digest` unset or `false`, and with a user file that can't be read, `hitl.digest` works per repository
+exactly as before. A bad value in either key makes the user file fail to load, like a bad value in any other personal
+key. Your settings refuses such a value and keeps a file that has one editable.
+
+Neither key needs a dashboard restart or a rescan: a run reads them when it needs them. Only `workspace.roots`, `repos`
+and `exclude` rescan a workspace dashboard or need a restart of a single-repository one.
 
 ## Security
 
@@ -417,7 +512,8 @@ No test calls a real model or GitHub (the fake agent and fake `gh` stay). New te
   slice done; bump the version and the changelog in each PR.
 - **Ask first:** the run cap and merged digest (W5); the login service; any widening of the user-level allow-list;
   any change to `pack.py` or `config_trust.py` (security overlay).
-- **Never:** let a run read or write a repository other than its own; accept a path from an HTTP request; let the page
+- **Never:** let a run read or write a repository other than its own (the one exception: a merged digest reads another
+  repository's pack file and default state dir read-only, never the rest of its checkout, section 9); accept a path from an HTTP request; let the page
   write `hitl.notify`, `agents.*.user_settings` or `dashboard.host`; write `workspace.*` into a pack; run anything
   inside a scanned repository; add a third-party dependency; change the golden `explain` files.
 
@@ -429,7 +525,7 @@ No test calls a real model or GitHub (the fake agent and fake `gh` stay). New te
 | **W2 — one server, many repositories** | `RepoContext`, the map and rescan, `/api/repos`, the `/api/repos/<id>/…` prefix, tagged SSE, staggered refresh, `dashboard` startable anywhere. The page still shows the default repository, so the legacy API and UI stay compatible. | W1 |
 | **W3 — the page** | `repos.js` (switcher, badges, not-set-up group), cross-repository Inbox and Agents, the merged `/api/inbox` and `/api/agents` (each item with `repo`) and the page's switch to `/api/events?all=1`, the `core.js` prefix, the repository name in notification titles and the tab title. | W2 |
 | **W4 — two-level Settings** | the User section, field routing with save-target badges, `/api/user-config` and its guarded write, the empty-state onboarding. *(security overlay: `config_edit.py` write path)* | W2 |
-| **W5 — cap and digest (conditional)** | `workspace.max_active_runs` held with a lock under `user_state_root()`, and a merged digest; built only if real use shows the need. | W2 |
+| **W5 — cap and digest (conditional)** | `workspace.max_active_runs` held with a lock under `user_state_root()`, and a merged digest behind `workspace.digest` (section 9, asked for and settled 2026-11-27). | W2 |
 
 W1 is useful on its own (scripts, `-C`, a cross-repository `inbox` from any directory). W2 is a refactor whose
 single-repository behaviour is already pinned by the existing tests. W3 and W4 are independent of each other.
