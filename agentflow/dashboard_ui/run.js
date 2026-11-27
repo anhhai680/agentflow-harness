@@ -3,7 +3,9 @@
 // ------------------------------------------------------------------ the Run page and its routes
 
 // Every view has a URL: `#/<view>` for a header tab, `#/run/<id>[/<tab>[/<sub>]]` for one run. A reload or Back
-// lands where the reader was. `sub` names a phase, `decision` or a file the tab opens and scrolls to.
+// lands where the reader was. `sub` names a phase, `decision` or a file the tab opens and scrolls to. On a page of
+// several repositories each route starts with the selected one, `#/repo/<id>/…`: `repo` in a route is its decoded id,
+// or null with no prefix (a page of one, or an old link).
 
 const RUN_TABS = ["overview", "spec", "plan", "agents", "activity", "gates", "files"];
 const RUN_TAB_LABEL = { overview: "Overview", spec: "Spec", plan: "Plan", agents: "Agents", activity: "Activity", gates: "Gates", files: "Files" };
@@ -21,25 +23,42 @@ function boardQuery(search) {
 }
 
 function parseRoute(hash) {
-  const board = { view: "board", run: null, tab: null, sub: null, query: boardQuery("") };
+  const board = { view: "board", run: null, tab: null, sub: null, query: boardQuery(""), repo: null };
   if (!/^#\//.test(hash || "")) return board;
   const mark = hash.indexOf("?");
   const search = mark < 0 ? "" : hash.slice(mark + 1);
   let parts;
   try { parts = (mark < 0 ? hash : hash.slice(0, mark)).slice(2).split("/").map(decodeURIComponent); } catch (err) { return board; }  // a malformed % escape
+  let repo = null;
+  if (parts[0] === "repo") {
+    if (!parts[1]) return board;  // `#/repo/` or `#/repo//board`: no repository named, the Board
+    repo = parts[1];
+    parts = parts.slice(2);
+  }
   if (parts[0] === "run" && parts[1]) {
     const known = RUN_TABS.includes(parts[2]);
-    return { view: "run", run: parts[1], tab: known ? parts[2] : "overview", sub: known && parts[3] ? parts[3] : null };
+    return { view: "run", run: parts[1], tab: known ? parts[2] : "overview", sub: known && parts[3] ? parts[3] : null, repo: repo };
   }
   if (parts.length === 1 && VIEWS.includes(parts[0])) {
-    const route = { view: parts[0], run: null, tab: null, sub: null };
+    const route = { view: parts[0], run: null, tab: null, sub: null, repo: repo };
     if (parts[0] === "board") route.query = boardQuery(search);
     return route;
   }
-  return board;
+  return Object.assign(board, { repo: repo });
 }
 
+// The page's selected repository; none in a node test that loads this file without core.js.
+const currentRepo = () => (typeof ui === "object" && ui ? ui.repo : null);
+
+// The hash of `route`, under `#/repo/<id>` when its `repo` is a non-empty string. A route with no `repo` key takes
+// the page's selection, so every link drawn on a page of several stays in its repository.
 function routeHash(route) {
+  const repo = Object.prototype.hasOwnProperty.call(route, "repo") ? route.repo : currentRepo();
+  const hash = viewHash(route);
+  return typeof repo === "string" && repo !== "" ? "#/repo/" + encodeURIComponent(repo) + hash.slice(1) : hash;
+}
+
+function viewHash(route) {
   if (route.view === "board" || !route.view) {
     const query = route.query || {};
     const params = new URLSearchParams();
@@ -56,9 +75,12 @@ function routeHash(route) {
   return "#/run/" + parts.map(encodeURIComponent).join("/");
 }
 
-// Go to a run's page. Already there: only scroll to `sub` again, since the hash does not change.
-function goRun(id, tab, sub) {
-  const hash = routeHash({ view: "run", run: id, tab: tab || "overview", sub: sub || null });
+// Go to a run's page (in `repo`, else the selected repository). Already there: only scroll to `sub` again, since the
+// hash does not change.
+function goRun(id, tab, sub, repo) {
+  const route = { view: "run", run: id, tab: tab || "overview", sub: sub || null };
+  if (repo !== undefined) route.repo = repo;
+  const hash = routeHash(route);
   if (location.hash === hash) scrollToSub($("run-body"), sub);
   else location.hash = hash;
 }
@@ -157,7 +179,7 @@ function runHeadNodes(detail) {
   const facts = [spend, detail.metrics ? dur(detail.metrics.wall_s) + " wall" : "", f.branch ? "branch " + f.branch : ""].filter(Boolean).join(" · ");
   return [
     el("div", { class: "run-title" },
-      el("a", { href: "#/board", text: "← Board" }),
+      el("a", { href: routeHash({ view: "board" }), text: "← Board" }),
       el("h2", { text: detail.label }),
       el("span", { class: "badge", text: workLabel(detail.lane) }),
       el("span", { class: "badge " + (STATUS_CLASS[detail.status] || "muted"), text: String(detail.status).replace("_", " ") })),
@@ -260,7 +282,7 @@ function renderRun(detail) {
 }
 
 function renderRunNote(text) {
-  $("run-head").replaceChildren(el("div", { class: "run-title" }, el("a", { href: "#/board", text: "← Board" }), el("h2", { text: text })));
+  $("run-head").replaceChildren(el("div", { class: "run-title" }, el("a", { href: routeHash({ view: "board" }), text: "← Board" }), el("h2", { text: text })));
   $("run-banner").hidden = true;
   for (const part of ["run-banner", "run-rail", "run-actions", "run-tabs", "run-body"]) $(part).replaceChildren();
 }

@@ -8,6 +8,9 @@ const dirty = { board: true, agents: true, inbox: false, runs: new Set() };
 let boardRefreshMs = 2000;  // `/api/info`'s board_refresh_s, once it answers
 
 async function refreshBoardNow() {
+  if (nothingToShow(ui.repos, ui.multi, ui.repo)) { $("summary").textContent = NO_REPO_TEXT; return; }  // the flags stay for when one comes
+  const repo = ui.repo;  // a switch while the fetches run makes what they bring another repository's
+  const which = viewRepo();  // the Inbox and Agents: every repository (null) or the selected one, as of this round
   const wantBoard = dirty.board;
   const wantAgents = ui.view === "agents" || dirty.agents;
   const wantWorkflow = !ui.workflow;  // fetched once, and again after Settings saves the config
@@ -16,22 +19,26 @@ async function refreshBoardNow() {
   dirty.inbox = false;
   if (wantAgents) dirty.agents = false;
   if (!wantBoard && !wantAgents && !wantWorkflow && !wantInbox) return;
-  try {
-    const [boardData, agentsData, workflow, inboxData] = await Promise.all([wantBoard ? api("/api/board") : null,
-      wantAgents ? api("/api/agents") : null, wantWorkflow ? api("/api/workflow") : null, wantInbox ? api("/api/inbox") : null]);
-    if (boardData) { renderBoard(boardData); setInboxBadge(boardData.needs_human.length); }
-    if (inboxData) renderInbox(inboxData);
-    if (agentsData) renderAgents(agentsData);
-    if (workflow) { ui.workflow = workflow; renderWorkflow(); }
-    if (wantBoard && ui.view === "metrics") loadMetrics();
-    if (wantBoard && ui.view === "lessons") loadLessons();
-  } catch (err) {
-    if (wantBoard) dirty.board = true;  // the next round tries again
-    if (wantAgents) dirty.agents = true;
-    if (wantInbox) dirty.inbox = true;
-    $("summary").textContent = "Could not load: " + err.message;
-  }
+  const got = await settleRound({ board: wantBoard ? api("/api/board") : null, agents: wantAgents ? api("/api/agents", undefined, which) : null,
+    workflow: wantWorkflow ? api("/api/workflow") : null, inbox: wantInbox ? api("/api/inbox", undefined, which) : null });
+  if (ui.repo !== repo || viewRepo() !== which) return;  // applyRepo and setAllRepos marked everything for the new round
+  drawRound(got, dirty, roundDraw, ui.multi);  // a failed part is marked again alone; the others are drawn
 }
+
+// How each part of a round is drawn, and where a failure of each shows: the Board's and the Workflow's in the summary
+// line, the Inbox's and the Agents' in their own views (so one broken repository never blanks another's).
+const roundDraw = {
+  board: (data) => { renderBoard(data); if (!ui.multi) setInboxBadge(data.needs_human.length); if (ui.view === "metrics") loadMetrics(); if (ui.view === "lessons") loadLessons(); },  // several: loadRepos counts every one
+  inbox: (data) => { ui.inbox.failed = ""; renderInbox(data); },
+  agents: (data) => renderAgents(data),
+  workflow: (data) => { ui.workflow = data; renderWorkflow(); },
+  fail: (name, err) => {
+    const text = "Could not load: " + err.message;
+    if (name === "inbox") inboxFailed(text);
+    else if (name === "agents") $("agents-summary").textContent = text;
+    else $("summary").textContent = text;
+  },
+};
 
 // Only the open run and the peeked run are refetched, and only when an event of theirs arrived.
 async function refreshRunsNow() {
@@ -51,18 +58,31 @@ async function refreshRunsNow() {
 
 const boardRefresh = throttle(refreshBoardNow, () => boardRefreshMs);
 const runRefresh = throttle(refreshRunsNow, () => boardRefreshMs);
+const repoRefresh = throttle(loadRepos, () => boardRefreshMs);  // the chips' counts, on a page of several
 
-// After the page's own action: what it changed is fetched in the next round.
-function refreshAfter(runId) {
+// After the page's own action: what it changed is fetched in the next round. `repo` is the run's repository
+// (undefined: the selected one); a run of another repository is not the open run or the peek, whatever its id.
+function refreshAfter(runId, repo) {
   dirty.board = true;
-  if (runId) dirty.runs.add(runId);
+  if (runId && streamOwn({ repo: repo === undefined ? ui.repo : repo }, ui.multi, ui.repo)) dirty.runs.add(runId);
   boardRefresh();
   runRefresh();
 }
 
-// One SSE message, `{run_id, event}`. An agent's activity patches its card's line in place and rebuilds nothing;
-// anything else marks the Board and that run (one the page has not seen, or `backlog`, too) for the next round.
+// One SSE message, `{repo, run_id, event}`. An agent's activity patches its card's line in place and rebuilds nothing;
+// anything else marks the Board and that run (one the page has not seen, or `backlog`, too) for the next round. On a
+// page of several, a message of another repository only refreshes the chips and an Inbox or Agents that show every
+// repository: never the selected repository's cards, open run or peek, even when a run id matches.
 function onStreamMessage(msg) {
+  if (ui.multi) repoRefresh();
+  if (!streamOwn(msg, ui.multi, ui.repo)) {
+    if (ui.allRepos && (ui.view === "inbox" || ui.view === "agents")) {
+      if (ui.view === "inbox") dirty.inbox = true;
+      else dirty.agents = true;
+      boardRefresh();
+    }
+    return;
+  }
   const runId = msg && msg.run_id !== undefined && msg.run_id !== null ? String(msg.run_id) : "";
   const event = (msg && msg.event) || {};
   if (event.type === "agent_activity") {
@@ -85,7 +105,7 @@ function streamMessage(data) {
 let backoff = 1000;
 let stream = null;
 function connect() {
-  stream = new EventSource("/api/events?quiet=1&token=" + encodeURIComponent(TOKEN));
+  stream = new EventSource("/api/events?all=1&quiet=1&token=" + encodeURIComponent(TOKEN));  // every repository's, tagged
   stream.onopen = () => {
     backoff = 1000;
     $("live").textContent = "live";
@@ -128,9 +148,27 @@ function show(view) {
   if (view === "inbox" && TOKEN) { dirty.inbox = true; boardRefresh(); }  // so is the Inbox
 }
 
-// The hash is the page's place: a tab's `#/<view>` or a run's `#/run/<id>/<tab>`, so a reload and Back keep it.
+// The hash is the page's place: a tab's `#/<view>` or a run's `#/run/<id>/<tab>`, so a reload and Back keep it. On a
+// page of several it starts with the repository (`#/repo/<id>/…`). A hash naming no live repository is never sent: it
+// is rewritten under the repository the page shows, and a run of a repository it named that way goes to the Board.
 function route() {
-  const where = parseRoute(location.hash);
+  if (TOKEN && !reposTried) return;  // the first route waits for /api/repos, so nothing is fetched for an unchecked id
+  let where = parseRoute(location.hash);
+  const want = ui.multi ? routeRepo(ui.repos, where.repo, ui.repo, storedRepo()) : null;
+  if (where.repo !== want) {
+    const only = !ui.multi && ui.repos && ui.repos.repos.length === 1 ? ui.repos.repos[0].id : null;
+    const keepRun = where.repo === null || where.repo === only;  // an unprefixed hash is the shown repository's
+    const fixed = where.view === "run" && !keepRun ? { view: "board", repo: want } : Object.assign({}, where, { repo: want });
+    history.replaceState(null, "", routeHash(fixed));
+    where = parseRoute(location.hash);
+  }
+  if (want !== ui.repo) {
+    if (!settingsMayLeave()) {  // kept: the address goes back to what the page shows
+      history.replaceState(null, "", routeHash(shownRoute()));
+      return;
+    }
+    applyRepo(want);
+  }
   closePeek();
   if (where.view === "run") {
     openRun(where.run, where.tab, where.sub);
@@ -144,10 +182,18 @@ function route() {
   show(where.view);
 }
 
+// The route of what the page shows now, in the selected repository.
+function shownRoute() {
+  if (ui.view === "run" && ui.run) return { view: "run", run: ui.run.id, tab: ui.run.tab, sub: ui.run.sub };
+  return { view: ui.view, query: ui.boardQuery };
+}
+
 restoreMetricsChoice();
 for (const name of VIEWS) $("tab-" + name).addEventListener("click", () => {
+  const hash = routeHash({ view: name });  // under the selected repository's prefix on a page of several
   if (location.hash === "#/" + name) route();  // the same hash fires no hashchange: a click on the open tab reloads it
-  else location.hash = "#/" + name;
+  else if (location.hash === hash) route();
+  else location.hash = hash;
 });
 $("new-task").addEventListener("click", newTaskDialog);
 initInbox();
@@ -157,7 +203,7 @@ window.addEventListener("hashchange", route);
 if (!location.hash) {  // a first visit, or the #token= the boot removed: the tab this browser showed last
   let saved = null;
   try { saved = localStorage.getItem("agentflow-view"); } catch (err) { console.warn("agentflow: local storage unavailable", err); }
-  history.replaceState(null, "", "#/" + (VIEWS.includes(saved) ? saved : "board"));
+  history.replaceState(null, "", routeHash({ view: VIEWS.includes(saved) ? saved : "board", repo: null }));  // route() adds the repository
 }
 route();
 async function loadInfo() {
@@ -177,9 +223,12 @@ async function loadInfo() {
 }
 
 if (TOKEN) {
-  loadInfo();
-  boardRefresh();
-  connect();
+  loadRepos().then(() => {  // the selection first: every request after it goes to the repository shown
+    route();
+    loadInfo();
+    boardRefresh();
+    connect();
+  });
   setInterval(() => {  // ages and idle markers move on even without new events; Settings may change the refresh
     dirty.board = true;
     if (ui.run) dirty.runs.add(ui.run.id);
@@ -187,6 +236,7 @@ if (TOKEN) {
     boardRefresh();
     runRefresh();
     loadInfo();
+    repoRefresh();
   }, 30000);
 } else {
   $("summary").textContent = "No token: open the URL printed by `agentflow dashboard` (it ends in #token=...).";

@@ -887,3 +887,363 @@ def test_a_saved_edit_shows_the_notes_the_server_sent_as_text():
     got = js_async(["board.js"], WRITE_STUBS + """api = async () => ({ok: true, notes: ["claim of crm freed", "<b>x</b>"]});
       (async () => { await writeBacklogFile({}, 'Saved'); return said; })()""", None)
     assert got == ["Saved. claim of crm freed. <b>x</b>"]
+
+
+# ---- the repository switcher (W3): the path prefix, the route's repository, the selection, the chips and the title
+PAGE_STUB = str(Path(__file__).parent / "fixtures" / "js" / "_page_stub.js")
+REPOS = {"repos": [{"id": "api-1a2b3c4d", "name": "api", "state": "live", "waiting": 2, "active": 1, "failed": 0, "error": None},
+                   {"id": "web-5e6f7a8b", "name": "web", "state": "live", "waiting": 0, "active": 0, "failed": 0, "error": None},
+                   {"id": "docs-9c0d1e2f", "name": "docs", "state": "not_set_up", "waiting": 0, "active": 0, "failed": 0, "error": None},
+                   {"id": "lib-0a1b2c3d", "name": "lib", "state": "error", "waiting": 0, "active": 0, "failed": 0, "error": "bad pack"}],
+         "skipped": [], "default": "web-5e6f7a8b"}
+
+
+def test_repo_path_prefixes_only_with_a_repository():
+    assert js([PAGE_STUB, "core.js"], "repoPath('/api/board', 'api-1a2b3c4d')", None) == "/api/repos/api-1a2b3c4d/board"
+    assert js([PAGE_STUB, "core.js"], "repoPath('/api/runs/r/approve', 'a/../b')", None) == "/api/repos/a%2F..%2Fb/runs/r/approve"
+    assert js([PAGE_STUB, "core.js"], "[repoPath('/api/board', null), repoPath('/api/board', undefined)]", None) == ["/api/board"] * 2
+
+
+def test_a_run_is_keyed_by_its_repository_on_a_page_of_several():
+    assert js([PAGE_STUB, "core.js"], "[runKey('a', 'r1'), runKey(null, 'r1'), runKey(undefined, 'r1')]", None) == \
+        ["a\u0000r1", "r1", "r1"]
+    assert js([PAGE_STUB, "core.js"], "[ui.repo, ui.repos, ui.multi, ui.allRepos]", None) == [None, None, False, True]
+
+
+def test_api_sends_to_the_selected_repository_unless_told_otherwise():
+    got = js_async([PAGE_STUB, "core.js"], """var asked = [];
+      fetch = async (path) => { asked.push(path); return {ok: true, status: 200, text: async () => "{}"}; };
+      (async () => {
+        await api('/api/board'); ui.repo = 'web-5e6f7a8b'; await api('/api/board'); await api('/api/repos', undefined, null);
+        await api('/api/runs/r/approve', {}, 'api-1a2b3c4d'); return asked; })()""", None)
+    assert got == ["/api/board", "/api/repos/web-5e6f7a8b/board", "/api/repos", "/api/repos/api-1a2b3c4d/runs/r/approve"]
+
+
+def test_an_action_posts_to_its_own_repository_and_refreshes_only_its_own_run():
+    got = js_async([PAGE_STUB, "core.js"], """var asked = [], after = [];
+      fetch = async (path) => { asked.push(path); return {ok: true, status: 200, text: async () => "{}"}; };
+      toast = () => {}; refreshAfter = (runId, repo) => after.push([runId, repo === undefined ? "-" : repo]);
+      ui.repo = 'web-5e6f7a8b';
+      (async () => { await act('r1', 'pause'); await act('r1', 'pause', {}, 'api-1a2b3c4d'); return [asked, after]; })()""", None)
+    assert got == [["/api/repos/web-5e6f7a8b/runs/r1/pause", "/api/repos/api-1a2b3c4d/runs/r1/pause"],
+                   [["r1", "-"], ["r1", "api-1a2b3c4d"]]]
+
+
+def test_a_one_repository_view_shows_no_switcher():
+    one = {"repos": REPOS["repos"][:1], "skipped": [], "default": "api-1a2b3c4d"}
+    assert js(["repos.js"], "[isMulti(args.one), isMulti({repos: []}), isMulti(null), isMulti(args.all)]",
+              {"one": one, "all": REPOS}) == [False, False, False, True]
+
+
+def test_a_route_carries_its_repository_both_ways():
+    parse = lambda h: js([VIEWS_STUB, "run.js"], "parseRoute(args)", h)  # noqa: E731
+    back = lambda h: js([VIEWS_STUB, "run.js"], "routeHash(parseRoute(args))", h)  # noqa: E731
+    run = parse("#/repo/api-1a2b3c4d/run/20261127-1200-x/plan")
+    assert run["repo"] == "api-1a2b3c4d" and run["view"] == "run" and run["tab"] == "plan" and run["run"] == "20261127-1200-x"
+    assert back("#/repo/api-1a2b3c4d/run/20261127-1200-x/plan") == "#/repo/api-1a2b3c4d/run/20261127-1200-x/plan"
+    board = parse("#/repo/api-1a2b3c4d/board?lane=bug")
+    assert board["repo"] == "api-1a2b3c4d" and board["view"] == "board" and board["query"]["lane"] == "bug"
+    assert back("#/repo/api-1a2b3c4d/board?lane=bug") == "#/repo/api-1a2b3c4d/board?lane=bug"
+    assert back("#/repo/a%2F..%2Fb/inbox") == "#/repo/a%2F..%2Fb/inbox" and parse("#/repo/a%2F..%2Fb/inbox")["repo"] == "a/../b"
+    assert parse("#/board")["repo"] is None and parse("#/run/r1/gates")["repo"] is None
+    assert js([VIEWS_STUB, "run.js"], "routeHash({view: 'inbox', repo: null})", None) == "#/inbox"
+    for empty in ("#/repo/", "#/repo//board", "#/repo"):
+        got = parse(empty)
+        assert got["view"] == "board" and got["repo"] is None, empty
+    assert parse("#/repo/%zz/board")["view"] == "board" and parse("#/repo/%zz/board")["repo"] is None  # a malformed %
+    # a route with no `repo` key takes the page's selection; with no `ui` (this test) that is none
+    assert js([VIEWS_STUB, "run.js"], "routeHash({view: 'run', run: 'r1', tab: 'gates'})", None) == "#/run/r1/gates"
+    assert js([VIEWS_STUB, "run.js"], "ui = {repo: 'web-5e6f7a8b'}; routeHash({view: 'run', run: 'r1', tab: 'gates'})", None) == \
+        "#/repo/web-5e6f7a8b/run/r1/gates"
+    assert js([VIEWS_STUB, "run.js"], "ui = {repo: 'web-5e6f7a8b'}; routeHash({view: 'board', query: {lane: 'bug'}, repo: null})", None) == \
+        "#/board?lane=bug"
+
+
+def test_the_selection_takes_the_hash_then_the_session_then_the_default():
+    pick = lambda h, s, view=REPOS: js(["repos.js"], "pickRepo(args.view, args.h, args.s)", {"view": view, "h": h, "s": s})  # noqa: E731
+    assert pick("api-1a2b3c4d", "web-5e6f7a8b") == "api-1a2b3c4d"
+    for bad in ("docs-9c0d1e2f", "lib-0a1b2c3d", "nope", "../../etc", "", None):
+        assert pick(bad, "api-1a2b3c4d") == "api-1a2b3c4d", bad
+    assert pick(None, "docs-9c0d1e2f") == "web-5e6f7a8b"
+    assert pick(None, None, {**REPOS, "default": "docs-9c0d1e2f"}) == "api-1a2b3c4d"  # then the first live row
+    assert pick(None, None, {**REPOS, "default": None}) == "api-1a2b3c4d"
+    assert pick("api-1a2b3c4d", None, {"repos": REPOS["repos"][2:], "skipped": [], "default": None}) is None
+    assert pick("api-1a2b3c4d", None, None) is None
+
+
+def test_a_routed_repository_keeps_the_selection_unless_the_hash_names_a_live_one():
+    route = lambda h, cur, s=None: js(["repos.js"], "routeRepo(args.view, args.h, args.cur, args.s)",  # noqa: E731
+                                      {"view": REPOS, "h": h, "cur": cur, "s": s})
+    assert route("api-1a2b3c4d", "web-5e6f7a8b") == "api-1a2b3c4d"
+    assert route("nope", "web-5e6f7a8b") == "web-5e6f7a8b" and route(None, "web-5e6f7a8b") == "web-5e6f7a8b"
+    assert route("nope", "lib-0a1b2c3d") == "lib-0a1b2c3d"  # the selected repository broke: the selection stays
+    assert route(None, None, "api-1a2b3c4d") == "api-1a2b3c4d" and route(None, None, "docs-9c0d1e2f") == "web-5e6f7a8b"
+
+
+def test_chips_put_not_set_up_last_and_disable_what_is_not_live():
+    chips = js(["repos.js"], "chipModel(args, 'api-1a2b3c4d')", REPOS)
+    assert [c["name"] for c in chips] == ["api", "web", "lib", "docs"]
+    by = {c["name"]: c for c in chips}
+    assert [by[n]["disabled"] for n in ("api", "web", "lib", "docs")] == [False, False, True, True]
+    assert by["lib"]["note"] == "bad pack" and by["api"]["waiting"] == 2 and by["docs"]["state"] == "not_set_up"
+    assert [c["selected"] for c in chips] == [True, False, False, False] and by["web"]["id"] == "web-5e6f7a8b"
+    assert js(["repos.js"], "chipModel(null, null)", None) == []
+
+
+def test_the_tab_title_names_the_repository_or_counts_them():
+    assert js(["repos.js"], "tabTitle(args)", REPOS) == "agentflow · 4 repositories"
+    assert js(["repos.js"], "tabTitle(args)", {"repos": REPOS["repos"][:1], "skipped": [], "default": None}) == "agentflow · api"
+    assert js(["repos.js"], "[tabTitle({repos: []}), tabTitle(null)]", None) == ["agentflow", "agentflow"]
+
+
+def test_a_message_of_another_repository_is_not_the_pages_own():
+    assert js(["repos.js"], "[streamOwn({repo: 'a'}, true, 'b'), streamOwn({repo: 'a'}, true, 'a'), streamOwn({repo: 'a'}, false, null)]",
+              None) == [False, True, True]
+    assert js(["repos.js"], "[streamOwn({}, true, 'a'), streamOwn({}, false, null)]", None) == [False, True]
+
+
+def test_waiting_total_sums_every_row():
+    assert js(["repos.js"], "waitingTotal(args)", REPOS) == 2
+    assert js(["repos.js"], "[waitingTotal(null), waitingTotal({repos: [{waiting: null}, {}]})]", None) == [0, 0]
+
+
+def test_a_repository_name_comes_from_the_list_else_the_id():
+    assert js(["repos.js"], "ui = {repos: args}; [repoName('lib-0a1b2c3d'), repoName('nope')]", REPOS) == ["lib", "nope"]
+    assert js(["repos.js"], "ui = {repos: null}; repoName('x')", None) == "x"
+
+
+def test_only_an_empty_list_or_no_selection_shows_no_repository():
+    broken = {**REPOS["repos"][3]}
+    cases = [({"repos": []}, False, None), ({"repos": [broken]}, False, None), ({"repos": REPOS["repos"][:1]}, False, None),
+             (REPOS, True, None), (REPOS, True, "lib-0a1b2c3d"), (REPOS, True, "api-1a2b3c4d"), (None, False, None)]
+    got = js(["repos.js"], "args.map(([view, multi, repo]) => nothingToShow(view, multi, repo))", cases)
+    # a page of one whose repository is broken asks the legacy route and shows its reason, as before
+    assert got == [True, False, False, True, False, False, False]
+
+
+def test_leaving_a_repository_asks_before_dropping_unsaved_settings():
+    stubs = ("ui = {repos: null, repo: 'a'}; var asked = []; settings = {edits: new Map([['k', 1]]), yamlDirty: false};"
+             "confirm = (text) => { asked.push(text); return answer; };")
+    no = js(["repos.js"], stubs + "var answer = false; [settingsMayLeave(), settings.edits.size, asked]", None)
+    assert no == [False, 1, ["Discard the unsaved Settings changes in a?"]]
+    yes = js(["repos.js"], stubs + "var answer = true; [settingsMayLeave(), settings.edits.size, settingsMayLeave(), asked.length]", None)
+    assert yes == [True, 0, True, 1]  # once let go, the route that follows does not ask again
+    clean = js(["repos.js"], stubs + "settings.edits.clear(); var answer = false; [settingsMayLeave(), asked.length]", None)
+    assert clean == [True, 0]
+
+
+def test_a_late_config_answer_of_another_load_is_dropped():
+    got = js_async([DOM_STUB, "settings.js"], """var rendered = [], answers = {};
+      api = (path) => new Promise((resolve) => { answers[Object.keys(answers).length] = resolve; });
+      renderSettings = () => rendered.push(settings.data.name);
+      (async () => {
+        const first = loadSettings(); const second = loadSettings();
+        answers[1]({name: 'new'}); await second; answers[0]({name: 'old'}); await first;
+        const third = loadSettings(); settings.request++; answers[2]({name: 'switched away'}); await third;
+        return [rendered, settings.data.name]; })()""", None)
+    assert got == [["new"], "new"]
+
+
+# ---- the All-repositories Inbox and Agents: each item acts on its own repository (Review Focus 1 and 5)
+def test_items_of_two_repositories_with_one_run_id_have_two_keys():
+    pair = {"a": {"repo": "a", "run_id": "r", "key": "k"}, "b": {"repo": "b", "run_id": "r", "key": "k"},
+            "none": {"run_id": "r", "key": "k"}}
+    got = js([PAGE_STUB, "core.js", "inbox.js"], "[inboxItemKey(args.a), inboxItemKey(args.b), inboxItemKey(args.none)]", pair)
+    assert got[0] != got[1] and got[2] == "r\u0000k"
+    assert js(["inbox.js"], "[inboxItemKey(args.a), inboxItemKey(args.none)]", pair) == [got[0], "r\u0000k"]  # no core.js: same keys
+
+
+def test_items_group_by_repository_and_run():
+    items = [{"repo": "a", "run_id": "r", "run_label": "x", "group": "stop", "key": "1"},
+             {"repo": "b", "run_id": "r", "run_label": "x", "group": "stop", "key": "1"},
+             {"repo": "a", "run_id": "r", "run_label": "x", "group": "question", "key": "2"}]
+    got = js([PAGE_STUB, "core.js", "inbox.js"], "groupItems(args, 'run').map(g => [g.repo, g.items.map(i => i.key)])", items)
+    assert got == [["a", ["1", "2"]], ["b", ["1"]]]
+    keys = js([PAGE_STUB, "core.js", "inbox.js"], "groupItems(args, 'run').map(g => g.key)", items)
+    assert keys[0] != keys[1]
+
+
+def test_gone_text_reads_only_its_own_repositorys_recent():
+    item = {"repo": "a", "run_id": "r", "kind": "blocked", "key": "build/x"}
+    other = {"repo": "b", "run_id": "r", "key": "build/x", "phase": "build", "action": "approved", "by": "dashboard",
+             "ts": "2026-11-16T14:00:00+00:00"}
+    mine = {**other, "repo": "a"}
+    pick = "goneText(args.item, args.recent)"
+    assert js(["inbox.js"], pick, {"item": item, "recent": [other]}) == "No longer waiting on you"
+    assert js(["inbox.js"], pick, {"item": item, "recent": [other, mine]}).startswith("Approved from the dashboard at ")
+    untagged = {"run_id": "r", "kind": "blocked", "key": "build/x"}
+    assert js(["inbox.js"], pick, {"item": untagged, "recent": [{**other, "repo": None}]}).startswith("Approved from the dashboard")
+
+
+SEND_STUBS = """var recorded = []; toast = () => {}; refreshAfter = () => {};
+  fetch = async (path) => { recorded.push(path); return {ok: true, status: 200, text: async () => '{"ok": true}'}; };"""
+
+
+def test_an_inbox_action_posts_to_the_items_repository_not_the_selected_one():  # spec Testing strategy; Review Focus 1
+    item = {"run_id": "20261127-1200-same", "key": "plan_approved", "kind": "phase_approval", "phase": "plan"}
+    got = js_async([PAGE_STUB, "core.js", "inbox.js"], SEND_STUBS + """(async () => {
+      ui.repo = "b"; ui.multi = true;
+      await inboxSend({repo: "a", ...args}, "approve", {target: "plan"});
+      return recorded; })()""", item)
+    assert got == ["/api/repos/a/runs/20261127-1200-same/approve"]
+    one = js_async([PAGE_STUB, "core.js", "inbox.js"], SEND_STUBS + """(async () => {
+      ui.repo = null; ui.multi = false;
+      await inboxSend(args, "approve", {target: "plan"});
+      return recorded; })()""", item)
+    assert one == ["/api/runs/20261127-1200-same/approve"]
+    refused = js_async([PAGE_STUB, "core.js", "inbox.js"], SEND_STUBS + """(async () => {
+      ui.repo = "b"; ui.multi = true;
+      const sent = await inboxSend(args, "approve", {target: "plan"});
+      return [sent, recorded, inboxDraft(args).error]; })()""", item)
+    assert refused == [False, [], "This card names no repository; reload the page."]
+
+
+def test_typing_and_arming_one_card_never_touch_the_other_with_the_same_run_and_key():
+    item = {"run_id": "r", "key": "k", "kind": "blocked", "approve_note": "optional", "actions": ["approve"]}
+    got = js([PAGE_STUB, "core.js", "inbox.js"], """(() => {
+      const a = {repo: "a", ...args}, b = {repo: "b", ...args};
+      inboxDraft(a).note = "only for a"; ui.inbox.armed = inboxItemKey(a);
+      return [inboxDraft(b).note, ui.inbox.armed === inboxItemKey(b), inboxDraft(a).note, ui.inbox.drafts.size]; })()""", item)
+    assert got == ["", False, "only for a", 2]
+
+
+def test_approve_all_posts_each_approval_to_its_own_repository():
+    got = js_async(["inbox.js"], """(async () => {
+      var sent = [];
+      setTimeout = () => 0; clearTimeout = () => {};
+      renderInbox = () => {};
+      act = async (run, action, body, repo) => { sent.push(run + ":" + repo); return true; };
+      viewedList = () => [];
+      ui = {multi: true, repo: "c", inbox: {view: {items: args}, armed: null, armedAt: 0, drafts: new Map(), busy: new Set(),
+                    sent: new Set()}};
+      approveAllItems(); approveAllItems();
+      for (let i = 0; i < 50; i++) await null;
+      return sent;
+    })()""", [approval("r1", repo="a"), approval("r2", phase="plan", repo="b")])
+    assert got == ["r1:a", "r2:b"]
+
+
+def test_a_phase_approval_carries_what_its_own_repository_showed():
+    item = {"repo": "a", "run_id": "r", "kind": "phase_approval", "phase": "plan", "key": "plan_approved", "approve_note": "none"}
+    got = js(["inbox.js"], "(viewedList = (id, repo) => [{path: id, sha: 'abcdef1', repo: repo}], approvePayload(args, {note: ''}))", item)
+    assert got["body"]["viewed"] == [{"path": "r", "sha": "abcdef1", "repo": "a"}]
+
+
+def test_agents_of_two_repositories_with_one_run_id_are_two_groups():
+    rows = [{"repo": "a", "run_id": "r", "module": "x", "idle": False, "age_s": 5},
+            {"repo": "b", "run_id": "r", "module": "x", "idle": False, "age_s": 9},
+            {"repo": "a", "run_id": "r", "module": "x", "idle": True, "age_s": 1}]
+    got = js([PAGE_STUB, "core.js", "agents.js"], "agentsByRun(args).map(g => [g.repo, g.rows.map(r => r.age_s)])", rows)
+    assert got == [["a", [1, 5]], ["b", [9]]]
+
+
+def test_the_header_inbox_count_is_only_set_from_a_view_on_a_page_of_one():
+    assert js(["inbox.js"], "[inboxBadgeCount({items: [1, 2]}, false), inboxBadgeCount({items: [1, 2]}, true)]", None) == [2, None]
+
+
+def test_a_repositorys_failed_read_is_a_line_of_text_naming_it():
+    errors = [{"repo": "a", "error": "events.jsonl: bad line 3"}, {"repo": "gone", "error": "<b>x</b>"}]
+    got = js([PAGE_STUB, "core.js", "repos.js"], """(() => {
+      ui.repos = {repos: [{id: "a", name: "api", state: "live"}]};
+      return [viewErrorLines(args), viewErrorLines(undefined), viewErrorLines([])]; })()""", errors)
+    assert got == [["api: events.jsonl: bad line 3", "gone: <b>x</b>"], [], []]
+
+
+def test_the_agents_table_leads_with_the_repository_only_when_asked():
+    rows = [{"repo": "a", "run_id": "r", "module": "m", "idle": False, "age_s": 5, "place": "build", "subagents": []}]
+    got = js([PAGE_STUB, "core.js", "repos.js", "agents.js"], """(() => {
+      routeHash = () => "#"; goRun = () => {}; SESSIONS_TAB = "sessions";
+      el = (tag, attrs, ...kids) => ({tag: tag, attrs: attrs || {}, kids: kids.flat(Infinity)});
+      ui.repos = {repos: [{id: "a", name: "api", state: "live"}]};
+      const text = (n) => (n && typeof n === "object" ? (n.attrs && n.attrs.text) || "" : "") + (n && n.kids ? n.kids.map(text).join("|") : "");
+      const heads = (t) => t.kids[0].kids[0].kids.map(text);
+      return [heads(agentTable(args, false, true)), heads(agentTable(args, false, false)), heads(agentTable(args, false))]; })()""", rows)
+    assert got[0][0] == "Repository" and got[0][1] == "Session" and len(got[0]) == len(got[1]) + 1
+    assert got[1] == got[2] and got[1][0] == "Session"
+
+
+# ---- the final fix wave: a broken Board never freezes the merged Inbox and Agents; a switch closes a modal; a rescan refetches tagged
+def test_a_failing_board_does_not_stop_the_merged_inbox_from_drawing():  # Review Focus 4
+    got = js_async(["repos.js"], """(async () => {
+      const dirty = {board: false, agents: false, inbox: false}, drawn = [], failed = [];
+      const draw = {board: (v) => drawn.push("board"), inbox: (v) => drawn.push("inbox:" + v.items.length), agents: (v) => drawn.push("agents"),
+                    workflow: (v) => drawn.push("workflow"), fail: (name, err) => failed.push(name + ":" + err.message)};
+      const conflict = () => { const e = new Error("pack broke on line 3"); e.status = 409; return Promise.reject(e); };
+      const got = await settleRound({board: conflict(), agents: Promise.resolve({live: []}), workflow: conflict(), inbox: Promise.resolve({items: [1]})});
+      drawRound(got, dirty, draw, true);
+      return [drawn, failed, dirty]; })()""", None)
+    assert got == [["agents", "inbox:1"], ["board:pack broke on line 3", "workflow:pack broke on line 3"],
+                   {"board": True, "agents": False, "inbox": False}]
+
+
+def test_a_page_of_one_keeps_a_failed_round_whole():
+    got = js_async(["repos.js"], """(async () => {
+      const dirty = {board: false, agents: false, inbox: false}, drawn = [], failed = [];
+      const draw = {board: () => drawn.push("board"), inbox: () => drawn.push("inbox"), agents: () => drawn.push("agents"),
+                    workflow: () => drawn.push("workflow"), fail: (name, err) => failed.push(name + ":" + err.message)};
+      const got = await settleRound({board: Promise.resolve({}), agents: Promise.reject(new Error("HTTP 500")), workflow: null, inbox: Promise.resolve({})});
+      drawRound(got, dirty, draw, false);
+      return [drawn, failed, dirty]; })()""", None)
+    assert got == [[], ["board:HTTP 500"], {"board": True, "agents": True, "inbox": True}]  # nothing drawn, all asked marked again
+
+
+def test_a_part_that_throws_while_drawing_is_that_parts_failure_only():
+    got = js(["repos.js"], """(() => {
+      const dirty = {board: false, agents: false, inbox: false}, drawn = [], failed = [];
+      const draw = {board: () => { throw new Error("bad card"); }, inbox: () => drawn.push("inbox"), agents: () => {}, workflow: () => {},
+                    fail: (name, err) => failed.push(name + ":" + err.message)};
+      drawRound({board: {v: {}}, inbox: {v: {}}}, dirty, draw, true);
+      return [drawn, failed, dirty]; })()""", None)
+    assert got == [["inbox"], ["board:bad card"], {"board": True, "agents": False, "inbox": False}]
+
+
+APPLY_STUBS = """var settings = {request: 0, data: null, edits: new Map(), yamlDirty: false}, lastActivity = new Map(), dirty = {runs: new Set()};
+  var closed = [], els = {dlg: {open: true, close() { this.open = false; closed.push("dlg"); }}, columns: {replaceChildren() {}},
+    needs: {replaceChildren() {}}, summary: {}};
+  document.getElementById = (id) => els[id] || null;
+  closePeek = () => {}; disarmBacklog = () => {}; renderRepos = () => {}; loadInfo = () => {}; boardRefresh = () => {};"""
+
+
+def test_a_repository_switch_closes_an_open_dialog():
+    got = js([PAGE_STUB, "core.js", "repos.js"], APPLY_STUBS + """
+      (() => {
+        ui.repo = "a"; applyRepo("b"); const first = [els.dlg.open, closed.length];
+        els.dlg.open = false; applyRepo("a");  // a closed dialog is left alone
+        return [first, closed.length]; })()""", None)
+    assert got == [[False, 1], 1]
+
+
+def test_a_dialogs_answer_after_a_switch_closes_nothing_and_still_floats_its_message():
+    got = js_async([PAGE_STUB, "core.js", "dialogs.js"], """(async () => {
+      const made = {};
+      const node = (id) => ({id: id, textContent: "", hidden: false, open: false, classList: {toggle() {}}, replaceChildren() {}, replaceWith(n) { made[id] = n; },
+        cloneNode() { const c = node(id); c.handlers = {}; c.addEventListener = (t, f) => { c.handlers[t] = f; }; return c; },
+        showModal() { this.open = true; }, close() { this.open = false; }});
+      for (const id of ["dlg", "dlg-title", "dlg-body", "dlg-ok", "dlg-cancel", "dlg-msg"]) made[id] = node(id);
+      document.getElementById = (id) => made[id];
+      var floated = [], closes = 0, release;
+      toast = (t) => floated.push(t);
+      const dlg = made.dlg; const realClose = dlg.close; dlg.close = function () { closes++; realClose.call(this); };
+      dialog("t", [], () => new Promise((resolve) => { release = resolve; }), "OK");
+      const click = made["dlg-ok"].handlers.click();  // OK pressed: the action is in flight
+      dlg.close();  // the repository switch closes the dialog
+      dialogSaid = "recorded elsewhere";  // what the in-flight action said meanwhile
+      release(true);
+      await click;
+      return [dlg.open, closes, floated]; })()""", None)
+    assert got == [False, 1, ["recorded elsewhere"]]  # the late answer closed nothing again and threw nothing
+
+
+def test_a_rescan_that_adds_a_second_repository_refetches_the_inbox_tagged():
+    got = js_async([PAGE_STUB, "core.js", "repos.js"], """var dirty = {inbox: false, agents: false, board: false, runs: new Set()}, refreshed = 0;
+    (async () => {
+      parseRoute = () => ({repo: null}); setInboxBadge = () => {}; renderRepos = () => {}; renderAllChips = () => {}; routeHash = () => "#/inbox";
+      boardRefresh = () => { refreshed++; };
+      const one = {repos: [{id: "a", name: "a", state: "live", waiting: 0}], skipped: [], default: "a"};
+      const two = {repos: [{id: "a", name: "a", state: "live", waiting: 0}, {id: "b", name: "b", state: "live", waiting: 0}], skipped: [], default: "a"};
+      var answer = one; api = async () => answer;
+      await loadRepos();  // the page's first answer: nothing to refetch
+      const first = [dirty.inbox, dirty.agents, refreshed];
+      answer = two; await loadRepos();
+      return [first, [dirty.inbox, dirty.agents, refreshed], ui.repo, ui.multi]; })()""", None)
+    assert got == [[False, False, 0], [True, True, 1], "a", True]

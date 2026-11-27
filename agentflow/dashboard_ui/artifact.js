@@ -199,16 +199,21 @@ function commentsFor(runId, path, sha) {
 const commentPairs = (map) => Array.from(map.entries());
 const countComments = (map) => commentPairs(map).filter((c) => c[1].trim()).length;
 
-function recordViewed(runId, path, sha) {
-  let seen = ui.viewed.get(runId);
-  if (!seen) { seen = new Map(); ui.viewed.set(runId, seen); }
+// Both are keyed by core.js's `runKey`: the same run id in another repository is another run. `repo` undefined is the
+// selected one. A node test may load this file without core.js, where a run is its id alone.
+const viewedKey = (runId, repo) => (typeof runKey === "function" ? runKey(repo === undefined ? ui.repo : repo, runId) : runId);
+
+function recordViewed(runId, path, sha, repo) {
+  const run = viewedKey(runId, repo);
+  let seen = ui.viewed.get(run);
+  if (!seen) { seen = new Map(); ui.viewed.set(run, seen); }
   const key = path + "\0" + sha;
   if (!seen.has(key)) seen.set(key, { path: path, sha: sha });
 }
 
 // What `approve` sends as `viewed`: only what the server accepts (a sha of 7-64 hex digits, a path of 1-1024 characters, at most 100).
-function viewedList(runId) {
-  const seen = ui.viewed.get(runId);
+function viewedList(runId, repo) {
+  const seen = ui.viewed.get(viewedKey(runId, repo));
   if (!seen) return [];
   const ok = (v) => /^[0-9a-f]{7,64}$/.test(v.sha) && v.path.length >= 1 && v.path.length <= 1024;
   return Array.from(seen.values()).filter(ok).slice(-VIEWED_CAP).map((v) => ({ path: v.path, sha: v.sha }));

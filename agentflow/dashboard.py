@@ -18,7 +18,11 @@ Routes:
   `/api/events?all=1` (exactly one `all`, valued `1`, on this path only) every live and missing repository's, each
   message with its `repo` id; a repository that joins an open stream starts at its logs' current end.
 - `GET /api/inbox` (each decision waiting on a person, titled, with its context, blast radius and allowed actions; the
-  held and stalled runs to watch; the decisions of the last 30 minutes). A query parameter is ignored.
+  held and stalled runs to watch; the decisions of the last 30 minutes). A query parameter is ignored. On a server
+  that holds several repositories (`several`), `/api/inbox` and `/api/agents` are workspace routes: they merge every
+  usable repository's view (`workspace_view`: each row has its `repo`, a repository that fails is a line of `errors`,
+  and the others still answer) and need no default repository; `/api/repos/<id>/inbox` and `/agents` then tag their
+  rows with `repo` too. With one repository both stay as they were, untagged.
 - `GET /api/runs/<id>/artifacts`, `/artifact?path=&sha=` (`sha` a revision of `path` or `head`),
   `/artifact/diff?path=&from=&to=` and `/findings`: the run's spec, plan and other committed files, read from git
   and capped at `dashboard.artifact_max_kb`; a path outside the run's artifact list is a 404.
@@ -58,6 +62,7 @@ Routes:
   and a live runner on the pack config picks it up when its next phase starts.
 - `GET /api/repos`: every repository the server holds (`repo_context.repos_view`, from one snapshot: its id, name,
   state, counts and load error, the skipped settings entries, the default's id), with no checkout path in it.
+  The counts are cached for `repo_context.COUNTS_TTL_S` seconds per context object (`DashboardServer.counts`).
 - `/api/repos/<id>/<rest>` (GET and POST) is the legacy `/api/<rest>` served for the repository `<id>`: the id is
   percent-decoded and looked up in the server's own map, never joined to a path; one the map does not hold (or an
   empty one, or one of over `REPO_ID_MAX` characters) is 404 `no such repository` and reads no file, and a `<rest>`
@@ -65,7 +70,8 @@ Routes:
 - Every other route but `/api/info` reads one repository, the server's default (`DashboardServer.default_context`):
   with none it answers 404 `no repository`. A repository that is not live, or whose pack names another runs directory
   than it was loaded with, answers 409 with the reason, on the legacy routes and under its prefix alike.
-  `/api/events?all=1` is a legacy route too: while the default is not live, or gone, it answers that 409 or 404.
+  `/api/events?all=1` needs no default either (and neither do `/api/inbox` and `/api/agents` with several
+  repositories): they answer while the default is not live, or gone, and with no repository at all for the stream.
   `/api/info` (and `/api/repos/<id>/info`) answers from the user settings when there is no config.
 
 In the background, `serve` (one repository) and `serve_workspace` (the user's workspace) send due reminders, recheck
@@ -140,7 +146,7 @@ from agentflow.config import Config, ConfigError, _finite, for_lane, load_config
 from agentflow.events import EventError, lock_state
 from agentflow.inbox_view import inbox_view
 from agentflow.plan_view import run_plan
-from agentflow.repo_context import RepoContext, usable
+from agentflow.repo_context import CountCache, RepoContext, usable
 from agentflow.repo_set import Skipped
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
 from agentflow.run_files import list_files, read_file
@@ -149,11 +155,12 @@ from agentflow.sessions import run_sessions
 from agentflow.state import Run, runs_root, speculating
 from agentflow.transcripts import transcript_page
 from agentflow.views import agents_view, board, lessons_view, metrics_view, run_detail, workflow_view
+from agentflow.workspace_view import merged_agents, merged_inbox, tagged_agents, tagged_inbox
 
 PAGE = Path(__file__).resolve().with_name("dashboard.html")
 UI_DIR = Path(__file__).resolve().with_name("dashboard_ui")
 # in load order: core.js first (the token, `$`, `el`, `api`), main.js last (the boot)
-UI_SCRIPTS = ("core.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js",
+UI_SCRIPTS = ("core.js", "repos.js", "dialogs.js", "markdown.js", "board.js", "drawer.js", "run.js", "artifact.js", "plan.js", "files.js",
               "sessions.js", "inbox.js", "activity.js", "workflow.js", "agents.js", "tokens.js", "metrics.js", "lessons.js", "settings.js", "main.js")
 UI_ROUTE = re.compile(r"^/ui/([a-z_]+\.js)$")
 MAX_BODY = 64 * 1024
@@ -450,6 +457,20 @@ def refusal(ctx: RepoContext | None) -> tuple[int, str] | None:
     return None
 
 
+def several(snap: Snapshot) -> bool:
+    """Whether `snap` holds more than one repository, whatever their states: then the legacy Inbox, Agents and
+    stream views are merged and tagged. The page tests the same thing on `/api/repos`'s list."""
+    return len(snap.repos) > 1
+
+
+def workspace_route(path: str, query: dict, snap: Snapshot) -> bool:
+    """Whether the unprefixed `path` answers for every repository, so it needs no default: the merged stream
+    (`/api/events?all=1`, exactly one `all`, valued `1`), and the legacy Inbox and Agents while `snap` holds several."""
+    if path == "/api/events":
+        return query.get("all") == ["1"]
+    return path in ("/api/inbox", "/api/agents") and several(snap)
+
+
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -465,6 +486,7 @@ class DashboardServer(ThreadingHTTPServer):
         # held by `rescan` from reading `snap` to publishing the next one, and by a Settings save's reload-and-store,
         # so neither is lost to the other; never taken by a request for anything else
         self._scan_lock = threading.Lock()
+        self.counts = CountCache()  # what `/api/repos` reads, so a page that polls it does not recount every run
         self.token = token
         self.spawn = spawn
         self.spawn_run = spawn_run or module_queue.spawn_run
@@ -745,9 +767,10 @@ def serve_workspace(contexts: list[RepoContext], user: layers.UserSettings, host
 class _Handler(BaseHTTPRequestHandler):
     server: DashboardServer
     # set by `_handle` for each request, from one snapshot: every handler reads its repository through `_ctx` alone
-    # (None only on `/api/info` when there is no default); `_scoped` says it came from `/api/repos/<id>/…`
+    # (None on `/api/info` when there is no default, and on a workspace route, which reads every repository);
+    # `_scoped` says it came from `/api/repos/<id>/…`
     _snap: Snapshot
-    _ctx: RepoContext
+    _ctx: RepoContext | None
     _scoped: bool
     server_version = "agentflow"
     sys_version = ""
@@ -859,7 +882,7 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/repos":
                 if self.command == "GET":
                     self._json(200, repo_context.repos_view(snap.repos.values(), snap.skipped, snap.default,
-                                                            snap.user_error))
+                                                            snap.user_error, count=self.server.counts.get))
                 else:
                     self.close_connection = True  # a POST's body is left unread
                     self._error(404, "not found")
@@ -868,6 +891,8 @@ class _Handler(BaseHTTPRequestHandler):
             if match:
                 ctx, refused = self._scope(snap, match.group(1), match.group(2))
                 path, self._scoped = "/api/" + match.group(2), True
+            elif self.command == "GET" and workspace_route(path, parse_qs(parts.query), snap):
+                ctx, refused = None, None  # every usable repository answers, so the default's state is no matter
             else:
                 ctx = self.server.default_context(snap)
                 refused = refusal(ctx) if path != "/api/info" else None
@@ -899,6 +924,23 @@ class _Handler(BaseHTTPRequestHandler):
             return None, (404, "not found")
         return ctx, (None if rest == "info" else refusal(ctx))
 
+    def _inbox(self) -> dict:
+        """The Inbox: every usable repository's, merged, on the legacy path of a server that holds several
+        (`_ctx` is None then); one repository's, tagged with its id, under a prefix of such a server; else the
+        legacy view as it always was."""
+        now = datetime.now(UTC)
+        if self._ctx is None:
+            return merged_inbox(self.server.live_contexts(self._snap), now)
+        view = inbox_view(self._ctx.repo, self._ctx.cfg, now)
+        return tagged_inbox(view, self._ctx.id) if self._scoped and several(self._snap) else view
+
+    def _agents(self) -> dict:
+        """The agents, served as `_inbox` serves the Inbox."""
+        if self._ctx is None:
+            return merged_agents(self.server.live_contexts(self._snap), datetime.now(UTC))
+        view = agents_view(self._ctx.repo, self._ctx.cfg)
+        return tagged_agents(view, self._ctx.id) if self._scoped and several(self._snap) else view
+
     def _get(self, path: str, query: dict) -> None:
         if path == "/api/board":
             lane = (query.get("lane") or [None])[0]
@@ -916,7 +958,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/workflow":
             self._json(200, workflow_view(self._ctx.cfg))
         elif path == "/api/agents":
-            self._json(200, agents_view(self._ctx.repo, self._ctx.cfg))
+            self._json(200, self._agents())
         elif path == "/api/events":  # `all=1` merges every repository, on the legacy path only
             self._events(quiet=query.get("quiet") == ["1"], merged=not self._scoped and query.get("all") == ["1"])
         elif path == "/api/config":
@@ -928,7 +970,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/lessons":
             self._json(200, lessons_view(self._ctx.repo, self._ctx.cfg))
         elif path == "/api/inbox":
-            self._json(200, inbox_view(self._ctx.repo, self._ctx.cfg, datetime.now(UTC)))
+            self._json(200, self._inbox())
         elif match := TRANSCRIPT_ROUTE.match(path):
             self._transcript_get(match.group(1), match.group(2), query)
         elif match := ARTIFACT_ROUTE.match(path):

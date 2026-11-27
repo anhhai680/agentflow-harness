@@ -25,6 +25,15 @@
 body { margin: 0; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
 header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
 header h1 { font-size: 16px; margin: 0 8px 0 0; }
+/* The repository switcher: one chip per repository on a page of several; the ones not set up are greyed and last */
+#repos { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.repo-chip { font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--chip); color: inherit; cursor: pointer; }
+.repo-chip[aria-pressed=true] { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+.repo-chip:disabled { cursor: not-allowed; color: var(--muted); }
+.repo-chip[data-state=error] { border-style: dashed; color: var(--bad); }
+.repo-chip.greyed { opacity: 0.55; }
+.repo-chip[aria-pressed=true]:disabled { background: var(--chip); color: var(--bad); border: 2px solid var(--bad); }  /* the selected one broke: it stays, and says so */
+.repo-badge { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; background: var(--warn); color: var(--bg); font-weight: 600; }
 #summary { flex: 1 1 260px; min-width: 0; color: var(--muted); }
 /* A usage note is a sentence: give it its own full-width line under the header's controls, not a share of the first row */
 #usage-note { order: 1; flex: 1 1 100%; border-radius: 6px; }
@@ -318,6 +327,7 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
 <body>
 <header>
   <h1>agentflow</h1>
+  <nav id="repos" hidden aria-label="Repositories"></nav>
   <span id="version" class="pill" hidden></span>
   <span id="usage" class="pill" hidden></span><span id="usage-note" class="pill usage-note" hidden></span>
   <div id="summary">loading…</div>
@@ -337,6 +347,7 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
       <span class="muted">Group by</span>
       <button id="inbox-group-run" type="button" aria-pressed="true">Run</button>
       <button id="inbox-group-kind" type="button" aria-pressed="false">Kind</button>
+      <button id="inbox-all" type="button" aria-pressed="true" hidden>All repositories</button>
     </div>
     <p id="inbox-hint" class="muted">j/k move · o open · a approve (press twice) · r request changes</p>
     <div id="inbox-list"></div>
@@ -366,6 +377,7 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
     <div id="workflow-human"></div>
   </section>
   <section id="agents-view" hidden>
+    <div class="moves"><button id="agents-all" type="button" aria-pressed="true" hidden>All repositories</button></div>
     <p id="agents-summary"></p>
     <div id="agents-live"></div>
     <h2 class="lane" id="exited-title"></h2>

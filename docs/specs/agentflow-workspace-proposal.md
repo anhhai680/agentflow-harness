@@ -206,16 +206,16 @@ logged with its name and never stops the others. A rescan (1) adds or retires co
 |---|---|
 | `/api/repos` | the workspace: `id`, `name`, `state`, pack version and counts `waiting`, `active`, `failed`; plus the skipped entries |
 | `/api/repos/<id>/…` | every route the legacy API serves, with that repository's context |
-| `/api/inbox`, `/api/agents` (legacy paths) | one repository: unchanged. Several: every repository's items, each with a `repo` field (from W3; in W2 they are the default repository's, untagged, and `/api/repos/<id>/inbox` and `/api/repos/<id>/agents` serve each repository's) |
+| `/api/inbox`, `/api/agents` (legacy paths) | one repository: unchanged and untagged. When the server holds more than one repository (whatever their states), they merge every usable repository's items, each with a `repo` field, and need no default: they answer while the default is broken or gone. In W2 they were the default repository's, untagged. `/api/repos/<id>/inbox` and `/api/repos/<id>/agents` serve one repository's, tagged with `repo` in the same case |
 | every other legacy `/api/...` path | resolves to `default`; with no `default`, 404 |
 | `/api/user-config` (GET, POST) | the user-level settings form and its save (section 5) |
-| `/api/events` | one SSE stream; each message gains `repo`. In W2 the legacy `/api/events` is the default repository's stream, untagged, `/api/repos/<id>/events` is one repository's, tagged, and the merged, tagged stream is `/api/events?all=1`; W3 moves the page to it |
+| `/api/events` | one SSE stream; each message gains `repo`. In W2 the legacy `/api/events` is the default repository's stream, untagged, `/api/repos/<id>/events` is one repository's, tagged, and the merged, tagged stream is `/api/events?all=1`; W3 moved the page to it, and it needs no default |
 
 `<id>` is looked up in the server's own map, **never** turned into a path. A request can reach only a repository the
 last rescan named. A run id is resolved under that repository's `runs/` root by the existing `_run` check (regex, no
 symlink, parent equals the root), so a run id of A sent to B is a 404.
 
-Until W3 moves the page, `/api/inbox`, `/api/agents` and `/api/events` (the legacy paths) stay the default
+Until W3 moved the page, `/api/inbox`, `/api/agents` and `/api/events` (the legacy paths) stayed the default
 repository's, byte for byte: the W2 page would show another repository's inbox rows that its actions cannot reach,
 and would refresh the wrong card for a run id that two repositories share. The merged, tagged stream is
 `/api/events?all=1` from W2.
@@ -223,7 +223,8 @@ and would refresh the wrong card for a run id that two repositories share. The m
 #### 4.4 The page
 
 - A **repository switcher** in the header: a chip per repository with a badge for the items waiting on a person in it,
-  and a greyed "not set up" group. The selection is kept in `location.hash` (`#repo=<id>`) and `sessionStorage`. It
+  and a greyed "not set up" group. The selection is kept in `location.hash`, as a `#/repo/<id>/…` prefix on every route (`#/repo/<id>/board`), and in
+  `sessionStorage`. It
   only changes what the page shows; nothing is paused.
 - **Board, Workflow, Metrics, Lessons, run drawers**: per repository. `core.js`'s request helper prefixes paths with
   `/api/repos/<id>`.
@@ -232,8 +233,9 @@ and would refresh the wrong card for a run id that two repositories share. The m
   selected one.
 - **SSE**: one `EventSource`. Every event updates its repository's badge; the page renders only the selected
   repository's runs.
-- With one repository there is no switcher and no extra column. The tab title and `/api/info` `name` name the
-  repository, or `N repositories`.
+- With one repository there is no switcher and no extra column. The tab title names the repository (`agentflow · <name>`)
+  or counts them (`agentflow · <n> repositories`); it comes from `/api/repos`, and `/api/info`'s `name` stays the harness
+  name.
 
 ### 5. Two-level Settings
 
@@ -260,7 +262,10 @@ The Settings page gets two scopes and routes each field by what it is:
 
 ### 6. Notifications
 
-The default notification title gains the repository name (`agentflow · billing`) when more than one repository is live.
+The default notification title gains the repository name (`agentflow · billing`) when the user file names a workspace (`roots` or `repos`). The title is
+built in the runner's process, which does not know which repositories are live, and finding out would cost a
+`git rev-parse` per child on every notification; the user file is already read, so it decides. A `title` set in
+`hitl.notify` is kept as written and gets no label.
 `hitl.digest` stays **per repository**: `digest_text` counts one repository's runs and writes one file under that
 repository's state dir. A merged digest is conditional (W5).
 
@@ -376,7 +381,7 @@ No test calls a real model or GitHub (the fake agent and fake `gh` stay). New te
   failing is logged and the others refresh; a rescan adds a new repository and retires a missing one only after its
   runs end; the server starts outside a repository, and with no workspace opens with the empty state; a
   one-repository server serves the legacy routes exactly as before.
-- **Dashboard, W3**: the legacy `/api/inbox` and `/api/agents` return each item with `repo` when several are live, and
+- **Dashboard, W3** (done in 3.16): the legacy `/api/inbox` and `/api/agents` return each item with `repo` when the server holds more than one repository (whatever their states), and
   the page's stream is `/api/events?all=1`.
 - **Settings** (`test_config_edit.py`): a `workspace.*` save lands in the user file and not in any pack; a project field
   lands in the pack; `hitl.notify`, `agents.*.user_settings`, `dashboard.host` and any `_PROTECTED_KEYS` key sent to
@@ -384,7 +389,7 @@ No test calls a real model or GitHub (the fake agent and fake `gh` stay). New te
   is refused; a text that would not load is refused.
 - **Guard and trust**: a repository that forbids a path is enforced under the shared server; the Settings form edits
   only its own pack and still refuses a protected change.
-- **`test_dashboard_js.py`**: the switcher renders from `/api/repos`, the selection survives a reload, an action on an
+- **`test_dashboard_js.py`** (the W3 cases done in 3.16): the switcher renders from `/api/repos`, the selection survives a reload, an action on an
   inbox row posts to that row's repository, a one-repository page shows no switcher, and each Settings field shows its
   save target.
 - **`test_portability.py`** must still pass: the engine names no project.

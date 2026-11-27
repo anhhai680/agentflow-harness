@@ -9,11 +9,31 @@ const INBOX_KINDS = [["approval", "Approvals"], ["question", "Questions"], ["sto
 const INBOX_ARM_ALL = "approve-all";  // the armed key of a group header's "Approve all N"
 const INBOX_ARM_CONSTRAINT = "constraint\0";  // the armed key of a card's "Approve the constraint" is this plus the item key
 const INBOX_NONE = "No longer waiting on you";
+const INBOX_NO_REPO = "This card names no repository; reload the page.";
 const INBOX_SEVERITIES = ["critical", "high", "medium", "low", "unrated"];
 
 // ------------------------------------------------------------------ pure helpers
 
-const inboxItemKey = (item) => item.run_id + "\0" + item.key;
+// A run's identity: two repositories may hold the same run id, so an item of a page of several is keyed by both. A file
+// of pure helpers may be loaded without core.js, which holds `runKey`.
+const inboxRunKey = (repo, runId) => (typeof runKey === "function" ? runKey(repo, runId) : repo ? repo + "\0" + runId : runId);
+
+const inboxItemKey = (item) => inboxRunKey(item.repo, item.run_id) + "\0" + item.key;
+
+// The repository an action on `item` posts to: the item's own, whatever is selected. A page of one has no repository to
+// name (null: the unprefixed request); an item of a page of several that names none is refused (false), and nothing is
+// sent: the action never falls back to the selected or the default repository.
+function inboxRepo(item, multi) {
+  if (item && typeof item.repo === "string" && item.repo !== "") return item.repo;
+  return multi ? false : null;
+}
+
+// The header badge counts one repository's items on a page of one; on a page of several it is the workspace's total
+// (set from /api/repos), which no view of one or all repositories may overwrite: null leaves it alone.
+const inboxBadgeCount = (view, multi) => (multi ? null : view.items.length);
+
+// The repository's name in front of a label, on a page of several.
+const inboxWhere = (repo) => (typeof ui === "object" && ui && ui.multi && repo ? repoName(repo) : "");
 
 // What a decision's target is: the phase for a phase approval, else the item's key.
 const inboxTarget = (item) => (item.kind === "phase_approval" ? item.phase : item.key);
@@ -48,7 +68,7 @@ function approvePayload(item, form) {
   const body = { target: inboxTarget(item) };
   if (item.approve_note !== "none" && note) body.note = note;
   if (item.kind === "phase_approval") {
-    const viewed = typeof viewedList === "function" ? viewedList(item.run_id) : [];
+    const viewed = typeof viewedList === "function" ? viewedList(item.run_id, item.repo) : [];
     if (viewed.length) body.viewed = viewed;
   }
   return { ok: true, body: body };
@@ -91,7 +111,8 @@ function findingsText(findings) {
 
 const inboxPlural = (n, one, many) => n + " " + (n === 1 ? one : many);
 
-// Items (oldest first, as given) as `[{key, label, items}]`. By run: one group per run, in the order of its oldest item.
+// Items (oldest first, as given) as `[{key, label, items}]`. By run: one group per run (of one repository: a run group
+// carries its `repo`), in the order of its oldest item.
 // By kind: Approvals, Questions and Stops in that order, an empty one dropped.
 function groupItems(items, by) {
   const groups = [];
@@ -105,10 +126,11 @@ function groupItems(items, by) {
   }
   const byRun = new Map();
   for (const item of items) {
-    let group = byRun.get(item.run_id);
+    const id = inboxRunKey(item.repo, item.run_id);
+    let group = byRun.get(id);
     if (!group) {
-      group = { key: item.run_id, label: item.run_label || item.run_id, items: [] };
-      byRun.set(item.run_id, group);
+      group = { key: id, repo: item.repo, label: item.run_label || item.run_id, items: [] };
+      byRun.set(id, group);
       groups.push(group);
     }
     group.items.push(item);
@@ -125,7 +147,7 @@ function goneText(item, recent) {
   let best = null;
   let bestAt = -Infinity;
   for (const r of recent || []) {
-    if (r.run_id !== item.run_id) continue;
+    if (r.run_id !== item.run_id || (r.repo || "") !== (item.repo || "")) continue;  // another repository's run of the same id
     const same = phaseApproval ? r.phase === item.phase && (r.key === null || r.key === undefined || r.key === item.phase) : r.key === item.key;
     if (!same) continue;
     const at = Date.parse(r.ts || "");
@@ -208,11 +230,13 @@ const inboxForgets = (action) => action !== "answer";
 
 // Run a decision's action once at a time. A success forgets the draft (see inboxForgets); the refresh that follows drops the card.
 async function inboxSend(item, action, body) {
+  const repo = inboxRepo(item, ui.multi);
+  if (repo === false) { inboxRefuse(item, INBOX_NO_REPO); return false; }
   const key = inboxItemKey(item);
   if (ui.inbox.busy.has(key)) return false;
   ui.inbox.busy.add(key);
   try {
-    const ok = await act(item.run_id, action, body);
+    const ok = await act(item.run_id, action, body, repo);
     if (ok) {
       if (inboxForgets(action)) ui.inbox.drafts.delete(key);
       else ui.inbox.sent.add(key);  // when the answered item leaves the view its card goes with it: this page decided it
@@ -332,7 +356,7 @@ function inboxArtifacts(item) {
     return el("div", { class: "i-art" },
       el("span", { text: a.path + " · " + inboxPlural(count, "revision", "revisions") }),
       isArtifactTab(a.kind)
-        ? el("button", { type: "button", text: "Read the " + a.kind, onclick: () => goRun(item.run_id, a.kind, a.path) })
+        ? el("button", { type: "button", text: "Read the " + a.kind, onclick: () => goRun(item.run_id, a.kind, a.path, item.repo) })
         : null);
   });
   if (item.kind === "phase_approval") {
@@ -407,7 +431,7 @@ function inboxCard(item) {
   const blocks = blast && (blast.blocks || []).length ? inboxPlural(blast.blocks.length, "task", "tasks") : "";
   const head = el("div", { class: "i-head" },
     el("h3", { class: "i-title", text: item.title }),
-    el("div", { class: "sub", text: [item.run_label, item.phase, ago(item.age_s)].filter((p) => p).join(" · ") }),
+    el("div", { class: "sub", text: [inboxWhere(item.repo), item.run_label, item.phase, ago(item.age_s)].filter((p) => p).join(" · ") }),
     blocks ? el("span", { class: "badge", text: "blocks " + blocks }) : null);
   const facts = item.facts || [];
   const body = el("div", { class: "i-body" },
@@ -439,7 +463,7 @@ function inboxCard(item) {
   if (actions.includes("answer")) buttons.push(el("button", { type: "button", class: "primary", text: "Answer", "data-field": "answer", onclick: () => answerItem(item) }));
   if (actions.includes("reject")) buttons.push(el("button", { type: "button", text: "Request changes…", "data-field": "reject-toggle", "aria-pressed": draft.reject.open ? "true" : "false",
     onclick: () => toggleReject(item) }));
-  buttons.push(el("button", { type: "button", text: "Open run", onclick: () => goRun(item.run_id, "overview", "decision") }));
+  buttons.push(el("button", { type: "button", text: "Open run", onclick: () => goRun(item.run_id, "overview", "decision", item.repo) }));
   return card(armed || armedConstraint ? " armed" : "", head, body, forms, draft.error ? el("div", { class: "gate-bad", role: "alert", text: draft.error }) : null,
     armed ? el("div", { class: "i-armed", role: "status", text: "Press a again to approve" }) : null,
     armedConstraint ? el("div", { class: "i-armed", role: "status", text: "Press again to lift the constraint: the runner commits it with your name in the trailer." }) : null,
@@ -451,7 +475,8 @@ function inboxWatchRow(w) {
   const since = Date.parse(w.since || "");
   const when = Number.isNaN(since) ? "" : " · " + ago(Math.max(0, (Date.now() - since) / 1000));
   return el("div", { class: "muted i-watch" },
-    el("a", { href: "#/run/" + encodeURIComponent(w.run_id) + "/overview", text: w.run_label || w.run_id }),
+    inboxWhere(w.repo) ? inboxWhere(w.repo) + " · " : null,
+    el("a", { href: routeHash({ view: "run", run: w.run_id, tab: "overview", repo: w.repo }), text: w.run_label || w.run_id }),
     " · " + w.reason + (w.text ? " · " + w.text : "") + when);
 }
 
@@ -472,7 +497,7 @@ function inboxGroupHead(d) {
   const button = d.batch >= 2
     ? el("button", { type: "button", text: d.armed ? "Confirm approve all " + d.batch : "Approve all " + d.batch, "data-field": "approve-all", onclick: approveAllItems })
     : null;
-  return el("h2", { class: "lane" }, d.label, button ? " " : null, button);
+  return el("h2", { class: "lane" }, d.where ? d.where + " · " + d.label : d.label, button ? " " : null, button);
 }
 
 // The items of the view as patchChildren entries: a heading and the cards of each group, then the Watch group.
@@ -483,7 +508,7 @@ function inboxEntries(view, shown) {
     const armedAll = approvals && ui.inbox.armed === INBOX_ARM_ALL;
     // armed, the count is what the confirming press sends: the approvals shown when it armed
     const batch = !approvals ? 0 : armedAll ? armedApprovals(group.items, inboxArmedAll).length : batchApprovals(group.items).length;
-    entries.push(entry("group:" + ui.inbox.group + ":" + group.key, { label: group.label, batch: batch, armed: batch > 0 && armedAll }, inboxGroupHead));
+    entries.push(entry("group:" + ui.inbox.group + ":" + group.key, { label: group.label, where: inboxWhere(group.repo), batch: batch, armed: batch > 0 && armedAll }, inboxGroupHead));
     for (const item of group.items) {
       const key = inboxItemKey(item);
       const draft = inboxDraft(item);
@@ -492,10 +517,13 @@ function inboxEntries(view, shown) {
       entries.push(entry("item:" + key, { item: card, armed: ui.inbox.armed === key, armedConstraint: ui.inbox.armed === INBOX_ARM_CONSTRAINT + key, error: draft.error, rejecting: draft.reject.open }, (d) => inboxCard(d.item)));
     }
   }
+  if (ui.inbox.failed) entries.push(entry("failed", ui.inbox.failed, (text) => el("p", { class: "muted i-error", role: "status", text: text })));
+  // a repository whose read failed: one line of text, and the other repositories' cards are drawn as usual
+  viewErrorLines(view.errors).forEach((line, at) => entries.push(entry("error:" + at, line, (text) => el("p", { class: "muted i-error", role: "status", text: text }))));
   if (!shown.flat.length) entries.push(entry("empty", "empty", () => el("p", { class: "muted", text: "Nothing is waiting on you." })));
   if ((view.watch || []).length) {
     entries.push(entry("watch-head", "Watch", () => el("h2", { class: "lane", text: "Watch" })));
-    entries.push(...view.watch.map((w) => entry("watch:" + w.run_id, w, inboxWatchRow)));
+    entries.push(...view.watch.map((w) => entry("watch:" + inboxRunKey(w.repo, w.run_id), w, inboxWatchRow)));
   }
   return entries;
 }
@@ -593,10 +621,19 @@ function inboxArmLive(armed, live, view) {
   return live.has(armed);
 }
 
+// The Inbox could not be fetched: its own view says so (the cards already drawn stay, the way they were), and the next
+// successful render takes the line away.
+function inboxFailed(text) {
+  ui.inbox.failed = text;
+  if (!ui.inbox.view) ui.inbox.view = { items: [], watch: [], recent: [], errors: [] };
+  redrawInbox();
+}
+
 function renderInbox(view) {
   const prev = ui.inbox.view;
   ui.inbox.view = view;
-  setInboxBadge(view.items.length);
+  const count = inboxBadgeCount(view, ui.multi);
+  if (count !== null) setInboxBadge(count);
   const live = inboxKeepGone(view, prev);
   const shown = inboxShown(view);
   if (ui.inbox.armed !== null && !inboxArmLive(ui.inbox.armed, live, view)) ui.inbox.armed = null;
@@ -635,7 +672,7 @@ function inboxKey(ev) {
     if (node && typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "nearest" });
   } else if (ev.key === "o" && card) {
     ev.preventDefault();
-    goRun(card.run_id, "overview", "decision");
+    goRun(card.run_id, "overview", "decision", card.repo);
   } else if (ev.key === "r" && item && (item.actions || []).includes("reject")) {
     ev.preventDefault();  // or the `r` would be typed into the box this opens
     inboxDraft(item).reject.open = true;
@@ -663,9 +700,10 @@ function setInboxKeys(on) {
 function initInbox() {
   $("inbox-group-run").addEventListener("click", () => setInboxGroup("run"));
   $("inbox-group-kind").addEventListener("click", () => setInboxGroup("kind"));
+  for (const id of ["inbox-all", "agents-all"]) $(id).addEventListener("click", () => setAllRepos(!ui.allRepos));
   setInboxGroupButtons();
 }
 
 async function loadInbox() {
-  renderInbox(await api("/api/inbox"));
+  renderInbox(await api("/api/inbox", undefined, viewRepo()));
 }
