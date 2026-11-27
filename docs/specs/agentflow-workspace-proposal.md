@@ -131,7 +131,10 @@ Add `load_user_settings()` (in `layers.py` or a thin function next to it): the e
 by the existing `layers.merge`, returning a small typed `UserSettings` with `workspace` and the process-level
 `dashboard` values (`port`, `board_refresh_s`, `done_shown`). It is read-only, rejects what `validate_user_file` already
 rejects, and never loads a pack. A user file that fails to load makes the dashboard start with the engine defaults and
-show the error on the Settings page, so a bad personal file never locks the developer out of the page that fixes it.
+show the error on the Settings page. When the file parses as a YAML mapping, the page's Your settings section stays
+editable and shows the error, so a bad entry (a relative `workspace.roots` path, say) is fixed from the page. When
+the file is a folder, a symlink, a hardlink, not UTF-8 or not YAML, the section shows the reason with every field read
+only, and the file is fixed by hand (W4).
 
 ### 3. The CLI
 
@@ -208,7 +211,7 @@ logged with its name and never stops the others. A rescan (1) adds or retires co
 | `/api/repos/<id>/…` | every route the legacy API serves, with that repository's context |
 | `/api/inbox`, `/api/agents` (legacy paths) | one repository: unchanged and untagged. When the server holds more than one repository (whatever their states), they merge every usable repository's items, each with a `repo` field, and need no default: they answer while the default is broken or gone. In W2 they were the default repository's, untagged. `/api/repos/<id>/inbox` and `/api/repos/<id>/agents` serve one repository's, tagged with `repo` in the same case |
 | every other legacy `/api/...` path | resolves to `default`; with no `default`, 404 |
-| `/api/user-config` (GET, POST) | the user-level settings form and its save (section 5) |
+| `/api/user-config` (GET), `/api/user-config/preview` and `/api/user-config/save` (POST) | the user-level settings form, and its preview and save (section 5). They need no repository, as `/api/repos`, and are 404 under `/api/repos/<id>/`. They take form changes only (a body with `text` is a 400). A save answers `{ok, sha256, restart, rescanned}`; `restart` lists the saved keys that need a restart |
 | `/api/events` | one SSE stream; each message gains `repo`. In W2 the legacy `/api/events` is the default repository's stream, untagged, `/api/repos/<id>/events` is one repository's, tagged, and the merged, tagged stream is `/api/events?all=1`; W3 moved the page to it, and it needs no default |
 
 `<id>` is looked up in the server's own map, **never** turned into a path. A request can reach only a repository the
@@ -244,14 +247,15 @@ The Settings page gets two scopes and routes each field by what it is:
 | Field | Saves to |
 |---|---|
 | `workspace.*`, `dashboard.port`, `dashboard.board_refresh_s`, `dashboard.done_shown` | the **user file** |
-| the other personal keys the page already has fields for (budgets, `agents.*.models`, `hitl.remind_after_h`) | the **user file** |
+| the other personal keys the page already has fields for (budgets, `agents.claude.models` and `agents.codex.models`, `hitl.remind_after_h`, the `usage.*` keys) | the **user file**, from the Your settings section. The repository's form keeps these fields too, and they save to the **pack** (a pack states its team's defaults); a field the user file sets is read-only there and points to Your settings |
 | every other key | the **selected repository's** `.agentflow/config.yaml`, as today |
 | `hitl.notify`, `agents.*.user_settings`, `dashboard.host`, everything in `_PROTECTED_KEYS` | **not editable on the page** (by hand only) |
 
-- A **User** section is visible whenever the page is open, including with no repository, and each field shows a badge,
-  `saves to: your user config` or `saves to: <repo>`. A field whose value the user file sets, which is read-only in a
-  repository's form today, becomes editable at user level (the personal-value rule: the page never writes a personal
-  value into a pack, and now has a place to write it instead).
+- A **Your settings** section is visible whenever the page is open, including with no repository, and each field shows
+  a badge, `saves to: your user config` or `saves to: <repo>`. A field whose value the user file sets, which is
+  read-only in a repository's form, is editable in Your settings (the personal-value rule: the page never writes a
+  personal value into a pack that the user file already sets, and now has a place to write it instead). The
+  repository's form keeps its note and adds a line, "change it under Your settings".
 - **The write path to the user file is new and is the one security-critical piece.** It reuses `config_edit`'s
   machinery (comments and anchors kept, a sha256 conflict check, an atomic write) with these limits: only the user
   file, `layers.user_config_path()`; only keys on a fixed allow-list; the new text is loaded through
@@ -302,9 +306,10 @@ repository, so these rules are stated and tested:
 - **The repository's Settings form edits that repository's `.agentflow/config.yaml` only**, through `config_edit` with
   that context's `cfg.path`. `.agentflow/**` stays forbidden to every agent in every repository.
 - **The user-file write (section 5) is the new write surface.** It is limited to one file and an allow-list of
-  low-risk personal keys; `hitl.notify` (it runs commands), `agents.*.user_settings` (it widens what an agent reads),
-  `dashboard.host` and every key in `_PROTECTED_KEYS` can never be set through the page. A key outside the allow-list
-  is a 400, whatever the body says. The existing same-site check and token apply unchanged.
+  low-risk personal keys (`config_edit.USER_FIELD_KEYS`); `hitl.notify` (it runs commands), `agents.*.user_settings`
+  (it widens what an agent reads), `dashboard.host` and every key in `_PROTECTED_KEYS` can never be set through the
+  page. The one exception is `workspace.*`: it is in `_PROTECTED_KEYS` to keep it out of a *pack*, and it is the
+  allow-list's own for the user file. A key outside the allow-list is a 400, whatever the body says. The existing same-site check and token apply unchanged.
 - **One token for all repositories means a leaked token reaches all of them**, where today it reaches one. The token
   stays 128 bits, 127.0.0.1 only, never logged. The start-up note says how many repositories it covers. This is the
   one real widening of the blast radius, accepted for the productivity gain.
@@ -383,7 +388,7 @@ No test calls a real model or GitHub (the fake agent and fake `gh` stay). New te
   one-repository server serves the legacy routes exactly as before.
 - **Dashboard, W3** (done in 3.16): the legacy `/api/inbox` and `/api/agents` return each item with `repo` when the server holds more than one repository (whatever their states), and
   the page's stream is `/api/events?all=1`.
-- **Settings** (`test_config_edit.py`): a `workspace.*` save lands in the user file and not in any pack; a project field
+- **Settings** (`test_config_edit.py`, done in 3.17): a `workspace.*` save lands in the user file and not in any pack; a project field
   lands in the pack; `hitl.notify`, `agents.*.user_settings`, `dashboard.host` and any `_PROTECTED_KEYS` key sent to
   `/api/user-config` are 400 and change nothing; a stale sha256 is a conflict; comments survive; a symlinked user file
   is refused; a text that would not load is refused.
