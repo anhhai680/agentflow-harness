@@ -1174,6 +1174,297 @@ def test_the_engine_default_has_the_digest_off():
     assert raw["hitl"]["digest"] is False
 
 
+# ------------------------------------------------------------------ the merged digest (W5)
+
+
+def _merged_workspace(tmp_path, names=("alpha", "beta"), digest=True) -> dict[str, Path]:
+    """`ws/<name>` repositories, each with a sparse pack, and a user file naming `ws` with `workspace.digest`."""
+    import yaml
+
+    from agentflow.tests.test_workspace_cli import make_repo
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    made = {name: make_repo(ws, name) for name in names}
+    write_user_file(yaml.safe_dump({"workspace": {"roots": [str(ws)], "digest": digest}}))
+    return made
+
+
+def _held(cfg, repo, module) -> Run:
+    """A run of `repo` stopped on a needs_human wait, raised quietly: an item that holds its run."""
+    held = Run.create(cfg, repo, "feature", {"module": module})
+    raise_hitl(cfg, held, "needs_human", "plan/plan", "needs a TTL", [dataclasses.replace(one_question(), kind="boundary")],
+               notify=False)
+    return held
+
+
+def _kept_line() -> Path:
+    return pack.user_state_root() / "workspace_digest.txt"
+
+
+def test_counts_of_states_matches_the_inbox(repo, run, cfg, macos_calls):
+    from agentflow.state import list_runs
+
+    park(cfg, run, PA)  # a parked item: its run still progresses
+    _held(cfg, repo, "billing")
+    Run.create(cfg, repo, "feature", {"module": "search"}).emit("run_finished")
+    runs = list_runs(repo)
+    items = inbox_items(repo, runs)
+    counts = hitl.counts_of_states(r.state for r in runs)
+    assert counts == hitl.DigestCounts(len(items), sum(1 for i in items if i["kind"] != "parked"),
+                                       sum(1 for r in runs if r.state["status"] in hitl.PROGRESSING))
+    assert counts == hitl.DigestCounts(2, 1, 1)
+    assert hitl.digest_counts(repo) == counts
+    assert hitl.digest_text(repo) == hitl.digest_line(counts) == "2 items need you (1 holds a run); 1 run progressing"
+
+
+def test_the_workspace_digest_counts_every_repository(tmp_path, cfg, macos_calls):
+    made = _merged_workspace(tmp_path)
+    alpha, beta = made["alpha"], made["beta"]
+    mine = Run.create(cfg, alpha, "feature", {"module": "crm"})
+    assert hitl.workspace_digest_text(alpha) == "Nothing needs you; 1 run progressing in 2 repositories"
+    park(cfg, mine, PA)
+    _held(cfg, beta, "billing")
+    _held(cfg, beta, "search")
+    assert hitl.workspace_digest_text(alpha) == (
+        "3 items need you (2 hold a run): beta 2, alpha 1; 1 run progressing in 2 repositories")
+
+
+def test_no_workspace_counts_the_run_s_own_repository_only(repo, run, cfg, macos_calls):
+    write_user_file("workspace:\n  digest: true\n")
+    assert hitl.workspace_digest_text(repo) == "Nothing needs you; 1 run progressing in 1 repository"
+
+
+def test_another_repository_is_read_without_load_lock_or_write(tmp_path, cfg, macos_calls, monkeypatch):
+    made = _merged_workspace(tmp_path)
+    alpha, beta = made["alpha"], made["beta"]
+    Run.create(cfg, alpha, "feature", {"module": "crm"})
+    _held(cfg, beta, "billing")
+    beta_state = pack.state_dir(beta)
+    seen = sorted(beta_state.rglob("*"))
+    before = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in seen if p.is_file()}
+    beta_root = pack.checkout_root(beta)
+    real_load = Run.load.__func__
+
+    def load(cls, repo, run_id):
+        if pack.checkout_root(repo) == beta_root:
+            raise AssertionError("another repository's run was loaded")
+        return real_load(cls, repo, run_id)
+
+    monkeypatch.setattr(Run, "load", classmethod(load))
+    assert hitl.workspace_digest_text(alpha) == (
+        "1 item needs you (1 holds a run): beta 1; 1 run progressing in 2 repositories")
+    after = sorted(beta_state.rglob("*"))
+    assert after == seen  # no lock file, no new file
+    assert {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in after if p.is_file()} == before
+
+
+def test_more_than_three_repositories_with_items_are_summed_up(tmp_path, cfg, macos_calls):
+    made = _merged_workspace(tmp_path, names=("a", "b", "c", "d", "e"))
+    for name, path in made.items():
+        _held(cfg, path, name)
+    assert hitl.workspace_digest_text(made["a"]) == (
+        "5 items need you (5 hold a run): a 1, b 1, c 1, +2 more; 0 runs progressing in 5 repositories")
+
+
+def test_the_run_s_own_repository_counts_when_it_is_outside_the_workspace(tmp_path, repo, run, cfg, macos_calls):
+    made = _merged_workspace(tmp_path)
+    park(cfg, run, PA)
+    _held(cfg, made["beta"], "billing")
+    assert hitl.workspace_digest_text(repo) == (
+        f"2 items need you (1 holds a run): beta 1, {repo.name} 1; 1 run progressing in 3 repositories")
+
+
+def _plant_state_dir(tmp_path, beta, held):
+    """Beta's pack points `paths.state_dir` at a folder holding a copy of its runs: none of it may be read."""
+    import shutil
+
+    import yaml
+
+    from agentflow.tests.conftest import SPARSE_PACK
+
+    elsewhere = tmp_path / "elsewhere"
+    shutil.copytree(held.dir, elsewhere / "runs" / held.id)
+    (beta / ".agentflow" / "config.yaml").write_text(
+        yaml.safe_dump({**SPARSE_PACK, "paths": {"state_dir": str(elsewhere)}}), encoding="utf-8")
+    return elsewhere
+
+
+def _spoil_state(text):
+    def spoil(tmp_path, beta, held):
+        held.state_path.write_bytes(text() if callable(text) else text)
+    return spoil
+
+
+def _no_waiting(tmp_path, beta, held):
+    state = json.loads(held.state_path.read_text(encoding="utf-8"))
+    del state["waiting"]
+    held.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _symlinked_pack(tmp_path, beta, held):
+    import shutil
+
+    real = tmp_path / "real-pack"
+    shutil.move(beta / ".agentflow", real)
+    (beta / ".agentflow").symlink_to(real, target_is_directory=True)
+
+
+def _fifo_pack(tmp_path, beta, held):
+    import os
+
+    config = beta / ".agentflow" / "config.yaml"
+    config.unlink()
+    os.mkfifo(config)
+
+
+@pytest.mark.parametrize("spoil", [
+    _plant_state_dir,
+    _spoil_state(b"{not json"),
+    _spoil_state(lambda: b"{}" + b" " * hitl.STATE_MAX_BYTES),  # valid JSON, but too large to be read
+    _spoil_state(b"[]"),
+    _no_waiting,
+    _symlinked_pack,
+    _fifo_pack,
+], ids=["own_state_dir", "not_json", "too_large", "a_list", "no_waiting", "symlinked_pack", "fifo_pack"])
+def test_a_repository_with_its_own_state_dir_or_a_bad_state_file_is_not_counted(tmp_path, cfg, macos_calls,
+                                                                                 monkeypatch, spoil):
+    import signal
+
+    from agentflow import repo_set, safeio
+
+    made = _merged_workspace(tmp_path)
+    alpha, beta = made["alpha"], made["beta"]
+    Run.create(cfg, alpha, "feature", {"module": "crm"})
+    held = _held(cfg, beta, "billing")
+    planted = spoil(tmp_path, beta, held)
+    real_set = repo_set.from_user_config
+
+    def all_live():  # a pack swapped for a FIFO after the scan found a regular file there
+        found = real_set()
+        return dataclasses.replace(found, repos=tuple(dataclasses.replace(r, state="live") for r in found.repos))
+
+    monkeypatch.setattr(repo_set, "from_user_config", all_live)
+    read: list[Path] = []
+    real_read = safeio.read_bytes
+
+    def recording(path, limit):
+        read.append(Path(path))
+        return real_read(path, limit)
+
+    monkeypatch.setattr(safeio, "read_bytes", recording)
+
+    def hung(signum, frame):
+        raise AssertionError("the digest blocked on a file")
+
+    previous = signal.signal(signal.SIGALRM, hung)
+    signal.alarm(10)
+    try:
+        line = hitl.workspace_digest_text(alpha)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+    assert line == "Nothing needs you; 1 run progressing in 1 repository; 1 not counted"
+    if planted is not None:
+        assert not [p for p in read if p.is_relative_to(planted)]
+
+
+def test_a_symlinked_run_of_another_repository_is_skipped(tmp_path, cfg, macos_calls):
+    import shutil
+
+    made = _merged_workspace(tmp_path)
+    alpha, beta = made["alpha"], made["beta"]
+    Run.create(cfg, alpha, "feature", {"module": "crm"})
+    held = _held(cfg, beta, "billing")
+    away = tmp_path / "away" / held.id
+    shutil.move(held.dir, away)
+    held.dir.symlink_to(away, target_is_directory=True)
+    assert hitl.workspace_digest_text(alpha) == "Nothing needs you; 1 run progressing in 2 repositories"
+
+
+def test_a_long_line_is_cut_and_kept_whole(tmp_path, cfg, macos_calls):
+    made = _merged_workspace(tmp_path, names=tuple(letter * 90 for letter in "abcd"))
+    for path in made.values():
+        _held(cfg, path, "billing")
+    own = made["a" * 90]
+    run = Run.create(cfg, own, "feature", {"module": "crm"})
+    line = hitl.workspace_digest_text(own)
+    assert 0 < len(line) <= hitl.MESSAGE_MAX and line.startswith("4 items need you (4 hold a run): " + "a" * 90 + " 1, ")
+    hitl.notify_run(cfg, run, "x")
+    hitl.notify_run(cfg, run, "y")
+    assert len(macos_calls) == 1
+    assert _kept_line().read_text(encoding="utf-8") == line
+
+
+def test_workspace_digest_on_sends_the_merged_line_whatever_the_pack_says(tmp_path, repo, run, cfg, macos_calls):
+    _merged_workspace(tmp_path)
+    assert cfg.hitl.get("digest") is not True
+    hitl.notify_run(cfg, run, "blocked: something specific")
+    (call,) = macos_calls
+    assert call[2].endswith('with title "agentflow"')
+    assert "Nothing needs you; 1 run progressing in 3 repositories" in call[2] and "something specific" not in call[2]
+    assert _kept_line().read_text(encoding="utf-8") == "Nothing needs you; 1 run progressing in 3 repositories"
+    hitl.notify_run(cfg, run, "blocked: something else")
+    assert len(macos_calls) == 1  # the same line again sends nothing
+    assert not (pack.state_dir(repo) / "notify_digest.txt").exists()
+
+
+def test_notify_counts_the_entries_that_delivered(cfg, macos_calls, monkeypatch):
+    monkeypatch.delenv("AGENTFLOW_TEST_NO_HOOK", raising=False)
+    two = dataclasses.replace(cfg, hitl={**cfg.hitl, "notify": [
+        {"type": "macos"}, {"type": "webhook", "url_env": "AGENTFLOW_TEST_NO_HOOK"}, {"type": "macos", "enabled": False}]})
+    assert notify(two, "t", "m") == 1
+    assert notify(dataclasses.replace(cfg, hitl={**cfg.hitl, "notify": []}), "t", "m") == 0
+
+
+def test_a_line_no_notifier_delivered_is_not_kept(tmp_path, repo, run, cfg, macos_calls):
+    _merged_workspace(tmp_path)
+    silent = dataclasses.replace(cfg, hitl={**cfg.hitl, "notify": [{"type": "macos", "enabled": False}]})
+    hitl.notify_run(silent, run, "x")
+    assert macos_calls == [] and not _kept_line().exists()
+    hitl.notify_run(cfg, run, "x")
+    assert len(macos_calls) == 1 and "in 3 repositories" in macos_calls[0][2]
+
+
+def test_a_merged_digest_that_cannot_be_built_sends_the_plain_message(tmp_path, repo, run, cfg, macos_calls, monkeypatch):
+    _merged_workspace(tmp_path)
+
+    def broken(repo):
+        raise RuntimeError("this repository's runs are unreadable")
+
+    monkeypatch.setattr(hitl, "workspace_digest_text", broken)
+    hitl.notify_run(cfg, run, "blocked: something specific")  # never raises
+    assert len(macos_calls) == 1 and "blocked: something specific" in macos_calls[0][2]
+    (failed,) = [e for e in run.events.read() if e["type"] == "notify_failed"]
+    assert failed["notifier"] == "digest" and "unreadable" in failed["error"]
+    assert not _kept_line().exists()
+
+
+def test_the_run_s_own_unreadable_runs_raise_out_of_the_merged_digest(tmp_path, repo, run, cfg, monkeypatch):
+    _merged_workspace(tmp_path)
+
+    def broken(repo):
+        raise RuntimeError("unreadable")
+
+    monkeypatch.setattr(hitl, "list_runs", broken)
+    with pytest.raises(RuntimeError, match="unreadable"):
+        hitl.workspace_digest_text(repo)
+
+
+@pytest.mark.parametrize("user_file", ["digest_off", "unreadable"])
+def test_digest_off_or_an_unreadable_user_file_keeps_the_per_repository_digest(tmp_path, repo, run, cfg, macos_calls,
+                                                                              user_file):
+    if user_file == "digest_off":
+        _merged_workspace(tmp_path, digest=False)
+    else:
+        write_user_file(": : :")
+    hitl.notify_run(_digest_cfg(cfg), run, "x")
+    assert len(macos_calls) == 1 and "Nothing needs you; 1 run progressing" in macos_calls[0][2]
+    assert "repositor" not in macos_calls[0][2]
+    assert (pack.state_dir(repo) / "notify_digest.txt").read_text(encoding="utf-8") == "Nothing needs you; 1 run progressing"
+    assert not _kept_line().exists()
+
+
 def test_claim_lost_names_the_three_ways_on(run, cfg):
     text = hitl._how_to_go_on(run, "claim_lost", "build/build", False, cfg)
     assert f"agentflow approve {run.id} build/build" in text and "claims" in text

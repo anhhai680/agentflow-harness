@@ -525,7 +525,7 @@ No test calls a real model or GitHub (the fake agent and fake `gh` stay). New te
 | **W2 — one server, many repositories** | `RepoContext`, the map and rescan, `/api/repos`, the `/api/repos/<id>/…` prefix, tagged SSE, staggered refresh, `dashboard` startable anywhere. The page still shows the default repository, so the legacy API and UI stay compatible. | W1 |
 | **W3 — the page** | `repos.js` (switcher, badges, not-set-up group), cross-repository Inbox and Agents, the merged `/api/inbox` and `/api/agents` (each item with `repo`) and the page's switch to `/api/events?all=1`, the `core.js` prefix, the repository name in notification titles and the tab title. | W2 |
 | **W4 — two-level Settings** | the User section, field routing with save-target badges, `/api/user-config` and its guarded write, the empty-state onboarding. *(security overlay: `config_edit.py` write path)* | W2 |
-| **W5 — cap and digest (conditional)** | `workspace.max_active_runs` held with a lock under `user_state_root()`, and a merged digest behind `workspace.digest` (section 9, asked for and settled 2026-11-27). | W2 |
+| **W5 — cap and digest (conditional)** | `workspace.max_active_runs` held with a lock under `user_state_root()`, and a merged digest behind `workspace.digest` (section 9, asked for and settled 2026-11-27). Built in 3.18. | W2 |
 
 W1 is useful on its own (scripts, `-C`, a cross-repository `inbox` from any directory). W2 is a refactor whose
 single-repository behaviour is already pinned by the existing tests. W3 and W4 are independent of each other.
