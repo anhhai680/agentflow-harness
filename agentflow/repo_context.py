@@ -11,6 +11,8 @@ Nothing here starts a server or a thread; the dashboard calls `reconcile` and sw
 from __future__ import annotations
 
 import copy
+import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -25,6 +27,7 @@ State = Literal["live", "not_set_up", "missing", "error"]
 
 ERROR_MAX = 300  # an error text is cut to one line of at most this many characters
 ACTIVE = ("running", "refining", "held")  # the `display_status` values of a run that is working
+COUNTS_TTL_S = 5.0  # how long `CountCache` reuses a repository's counts
 
 
 @dataclass
@@ -132,6 +135,29 @@ def counts(ctx: RepoContext) -> dict[str, int]:
         except Exception:
             continue
     return out
+
+
+class CountCache:
+    """`counts` per context, reused for `ttl` seconds. It remembers the context object it counted, so a rescan that
+    replaces a context (same id, new object) is counted afresh; a lock keeps its table whole across request threads."""
+
+    def __init__(self, ttl: float = COUNTS_TTL_S, clock: Callable[[], float] = time.monotonic) -> None:
+        self.ttl = ttl
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._held: dict[str, tuple[RepoContext, float, dict[str, int]]] = {}
+
+    def get(self, ctx: RepoContext) -> dict[str, int]:
+        """`counts(ctx)`, as counted at most `ttl` seconds ago for this very object. A caller's copy, never the table's."""
+        now = self.clock()
+        with self._lock:
+            held = self._held.get(ctx.id)
+            if held is not None and held[0] is ctx and now - held[1] < self.ttl:
+                return dict(held[2])
+        fresh = counts(ctx)  # outside the lock: reading runs is slow, and another repository's request must not wait
+        with self._lock:
+            self._held[ctx.id] = (ctx, now, fresh)
+        return dict(fresh)
 
 
 def in_flight(ctx: RepoContext) -> bool:
@@ -252,17 +278,18 @@ def reconcile(current: dict[str, RepoContext], found: RepoSet,
 
 
 def repos_view(contexts: Iterable[RepoContext], skipped: Iterable[Skipped], default: str | None,
-               user_error: str | None) -> dict:
+               user_error: str | None, count: Callable[[RepoContext], dict] | None = None) -> dict:
     """The `/api/repos` body. No context's checkout path is a field of it; a `skipped` entry is the setting as
     written, and a skipped reason (a root child's main checkout outside that root) or an `error` text may name a
-    path, both for the token holder."""
+    path, both for the token holder. `count` gives each context's counts (`counts` by default, read when called)."""
+    count = count or counts
     rows = []
     for ctx in contexts:
         live = ctx.state == "live" and ctx.cfg is not None
         rows.append({
             "id": ctx.id, "name": ctx.name, "state": ctx.state,
             "pack_version": ctx.cfg.version if live else None,
-            **counts(ctx),
+            **count(ctx),
             "error": ctx.error if ctx.state == "error" else None,
         })
     return {

@@ -7,6 +7,13 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+- With several repositories, `/api/inbox` and `/api/agents` merge every usable repository's decisions and agents into one view, each row tagged with its `repo` id, oldest decision first; a repository whose runs can't be read is a line of `errors` and the others still answer.
+
+### Changed
+- `/api/events?all=1`, and `/api/inbox` and `/api/agents` on a server that holds several repositories, need no default repository: they answer while the default is broken or gone. With one repository the legacy routes are unchanged and untagged.
+- `/api/repos/<id>/inbox` and `/api/repos/<id>/agents` rows carry `repo` when the server holds several repositories, and `/api/repos` counts are cached for 5 seconds per repository.
+
 ## [3.15] - 2026-11-26
 
 ### Added

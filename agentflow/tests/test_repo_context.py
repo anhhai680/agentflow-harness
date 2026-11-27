@@ -660,3 +660,40 @@ def test_plan_start_in_a_repository_with_an_unusable_workspace_is_the_single_mod
     (ctx,) = plan.contexts
     assert plan.workspace is False and ctx.state == "live" and ctx.runs is None
     assert plan.user_error and "workspace.roots" in plan.user_error
+
+
+# --------------------------------------------------------------------------- the cached counts (W3)
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_counts_are_read_once_per_ttl_and_a_new_context_object_reads_again(tmp_path, monkeypatch):
+    calls: list[str] = []
+
+    def fake(ctx):
+        calls.append(ctx.id)
+        return {"waiting": len(calls), "active": 0, "failed": 0}
+
+    monkeypatch.setattr(repo_context, "counts", fake)
+    clock = Clock()
+    cache = repo_context.CountCache(ttl=5.0, clock=clock)
+    ctx = RepoContext("one", "one", tmp_path)
+    assert cache.get(ctx) == {"waiting": 1, "active": 0, "failed": 0}
+    clock.now += 4.9
+    assert cache.get(ctx) == {"waiting": 1, "active": 0, "failed": 0} and len(calls) == 1
+    clock.now += 0.2  # past the TTL
+    assert cache.get(ctx)["waiting"] == 2 and len(calls) == 2
+    assert cache.get(dataclasses.replace(ctx))["waiting"] == 3 and len(calls) == 3  # a rescan's new object
+    assert repo_context.COUNTS_TTL_S == 5.0
+
+
+def test_repos_view_takes_its_counts_from_the_callable_it_is_given(tmp_path):
+    ctx = RepoContext("one", "one", tmp_path, cfg=None, state="not_set_up")
+    view = repo_context.repos_view([ctx], [], None, None, count=lambda c: {"waiting": 7, "active": 1, "failed": 2})
+    assert (view["repos"][0]["waiting"], view["repos"][0]["active"], view["repos"][0]["failed"]) == (7, 1, 2)

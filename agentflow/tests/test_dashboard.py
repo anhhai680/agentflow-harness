@@ -3019,6 +3019,9 @@ def _freeze_clock(monkeypatch) -> None:
     monkeypatch.setattr(dashboard, "datetime", Frozen)
 
 
+MERGED_LISTS = {"inbox": ("items", "watch"), "agents": ("live", "exited")}  # the legacy routes that merge (W3)
+
+
 def _get_scoped(two, route: str, monkeypatch) -> None:
     """Each repository's answer under its prefix, asked while the other is the default, is the one the legacy route
     gives while it is the default; the two answers differ; and a run of one repository is no run under the other."""
@@ -3037,7 +3040,14 @@ def _get_scoped(two, route: str, monkeypatch) -> None:
         server.snap = dataclasses.replace(server.snap, default=other.id)  # and the prefix must not follow it
         scoped = two.dash.get(at(this, rest))
         answers[this.id] = payload(scoped[2])
-        assert scoped[0] < 500 and (scoped[0], answers[this.id]) == (legacy[0], payload(legacy[2])), rest
+        if route in MERGED_LISTS:  # the legacy answer merges every repository, tagged: this one's are the prefix's
+            merged = payload(legacy[2])
+            assert scoped[0] == legacy[0] == 200, rest
+            for key in MERGED_LISTS[route]:
+                assert [r for r in merged[key] if r["repo"] == this.id] == answers[this.id][key], (rest, key)
+                assert all(r["repo"] == this.id for r in answers[this.id][key]), (rest, key)
+        else:
+            assert scoped[0] < 500 and (scoped[0], answers[this.id]) == (legacy[0], payload(legacy[2])), rest
         if "{run}" in route:
             status, _, body = two.dash.get(at(other, rest))
             assert status == 404 and payload(body)["error"] == "no such run", rest
@@ -4158,3 +4168,115 @@ def test_serve_workspace_announces_how_many_repositories_it_covers(ws_root, monk
                         r"Ctrl-C stops the server\.", first)
     assert last == "dashboard stopped"
     assert started == ["_remind_loop", "_refresh_loop"]  # one repository: no rescan
+
+
+# --------------------------------------------------------------------------- merged and tagged views (W3)
+
+
+def _all_rows(body: dict, *keys: str) -> list[dict]:
+    return [row for key in keys for row in body[key]]
+
+
+def test_with_several_repositories_the_legacy_inbox_merges_every_one_tagged(two):
+    status, _, raw = two.dash.get("/api/inbox")
+    body = payload(raw)
+    assert status == 200 and body["errors"] == []
+    assert set(body) == {"items", "watch", "recent", "counts", "errors"}
+    ours = [i for i in body["items"] if i["run_id"] == two.a_run.id]
+    assert len(ours) == 1 and ours[0]["repo"] == two.a.id
+    rows = _all_rows(body, "items", "watch", "recent")
+    assert rows and all(row["repo"] in {two.a.id, two.b.id} for row in rows)
+    assert body["counts"]["approval"] >= 1
+
+
+def test_with_several_repositories_the_legacy_agents_merge_every_one(two):
+    from agentflow import workspace_view
+
+    status, _, raw = two.dash.get("/api/agents")
+    body = payload(raw)
+    expect = workspace_view.merged_agents([two.a, two.b], datetime.now(dashboard.UTC))
+    assert status == 200 and set(body) == set(expect)
+    assert all(row["repo"] in {two.a.id, two.b.id} for row in _all_rows(body, "live", "exited"))
+    assert body["errors"] == []
+
+
+def test_scoped_inbox_and_agents_rows_carry_their_repo(two):
+    status, _, raw = two.dash.get(at(two.a, "inbox"))
+    body = payload(raw)
+    assert status == 200 and body["items"] and "errors" not in body
+    assert all(row["repo"] == two.a.id for row in _all_rows(body, "items", "watch", "recent"))
+    status, _, raw = two.dash.get(at(two.b, "agents"))
+    assert status == 200 and all(row["repo"] == two.b.id for row in _all_rows(payload(raw), "live", "exited"))
+
+
+def test_the_workspace_routes_need_no_default(two, tmp_path):
+    _b_pack(two, paths={"state_dir": str(tmp_path / "elsewhere")})  # B, the default, now names another runs directory
+    assert two.dash.get("/api/board")[0] == 409
+    status, _, raw = two.dash.get("/api/inbox")
+    assert status == 200 and [i["run_id"] for i in payload(raw)["items"]] == [two.a_run.id]
+    assert two.dash.get("/api/agents")[0] == 200
+    stream = _open(two, "/api/events?all=1")
+    try:
+        two.a_run.emit("run_paused", by="in-a")
+        (message,) = stream.wait(by("in-a"))
+        assert message["repo"] == two.a.id
+    finally:
+        stream.close()
+
+
+def test_the_merged_stream_opens_with_no_repository(empty_dash):
+    conn = http.client.HTTPConnection("127.0.0.1", empty_dash.port, timeout=5)
+    try:
+        conn.request("GET", "/api/events?all=1", headers={"X-Agentflow-Token": TOKEN})
+        response = conn.getresponse()
+        assert response.status == 200 and response.getheader("Content-Type").startswith("text/event-stream")
+        assert response.fp.readline() == b": connected\n"
+    finally:
+        conn.close()
+    status, _, raw = empty_dash.get("/api/inbox")  # no contexts: not several, so the default's refusal answers
+    assert status == 404 and payload(raw)["error"] == "no repository"
+    assert empty_dash.get("/api/agents")[0] == 404
+
+
+def _untagged(body: dict) -> None:
+    assert "errors" not in body
+    for row in _all_rows(body, *(k for k in ("items", "watch", "recent", "live", "exited") if k in body)):
+        assert "repo" not in row
+
+
+def test_a_one_repository_server_keeps_the_legacy_inbox_and_agents_untagged(dash, flow_repo):
+    awaiting(flow_repo, "alpha")
+    inbox = payload(dash.get("/api/inbox")[2])
+    assert inbox["items"]
+    _untagged(inbox)
+    _untagged(payload(dash.get("/api/agents")[2]))
+    only = repo_context.single_context(flow_repo.root, flow_repo.cfg)
+    server = dashboard.make_workspace_server([only], repo_context.engine_user_settings(), "127.0.0.1", 0, TOKEN)
+    thread = _serve(server)
+    try:
+        one = Dash(server, server.server_address[1], flow_repo)
+        _untagged(payload(one.get("/api/inbox")[2]))
+        _untagged(payload(one.get("/api/agents")[2]))
+        assert payload(one.get("/api/inbox")[2])["items"]
+        assert dashboard.several(server.snap) is False
+    finally:
+        server.close()
+        thread.join(timeout=5)
+
+
+def test_several_counts_every_context_whatever_its_state(two):
+    snap = two.dash.server.snap
+    assert dashboard.several(snap) is True
+    only = dataclasses.replace(snap, repos={two.a.id: two.a})
+    assert dashboard.several(only) is False
+    bare = dataclasses.replace(two.b, cfg=None, runs=None, state="not_set_up")
+    assert dashboard.several(dataclasses.replace(snap, repos={two.a.id: two.a, two.b.id: bare})) is True
+
+
+def test_api_repos_counts_are_cached_between_requests(two, monkeypatch):
+    calls: list[str] = []
+    real = repo_context.counts
+    monkeypatch.setattr(repo_context, "counts", lambda ctx: calls.append(ctx.id) or real(ctx))
+    for _ in range(3):
+        assert two.dash.get("/api/repos")[0] == 200
+    assert sorted(calls) == sorted([two.a.id, two.b.id])  # read once each, not three times
