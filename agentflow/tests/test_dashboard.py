@@ -476,6 +476,17 @@ def test_every_ui_file_is_listed():
     assert UI_SCRIPTS[0] == "core.js" and UI_SCRIPTS[-1] == "main.js"
 
 
+def test_the_page_shell_loads_user_settings_after_settings(dash):
+    body = dash.get("/", token=None)[2].decode("utf-8")
+    tags = re.findall(r'<script nonce="[^"]+" src="/ui/([a-z_]+\.js)"></script>', body)
+    assert tags[tags.index("settings.js") + 1] == "user_settings.js"
+    for node in ('id="user-settings"', 'id="user-path"', 'id="user-status"', 'id="user-prompt"', 'id="user-form"',
+                 'id="user-reload"', 'id="user-discard"', 'id="user-review"', 'id="settings-repo"'):
+        assert node in body, node
+    assert body.index('id="user-settings"') < body.index('id="settings-repo"') < body.index('id="set-review"')
+    assert "Your settings" in body
+
+
 def test_tokens_loads_before_the_metrics_tab_and_reads_no_dom():
     assert UI_SCRIPTS.index("tokens.js") + 1 == UI_SCRIPTS.index("metrics.js")
     tokens = (UI_DIR / "tokens.js").read_text(encoding="utf-8")

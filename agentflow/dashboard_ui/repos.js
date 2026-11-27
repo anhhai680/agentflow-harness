@@ -8,7 +8,7 @@
 // only ever selects an id `/api/repos` lists as live; any other id (a stale bookmark, a typed one) is never sent.
 // The pure helpers come first and touch no DOM, so a node test loads this file alone.
 
-const NO_REPO_TEXT = "No repository to show: add a folder to workspace.roots in your user config, or start agentflow dashboard inside a repository.";
+const NO_REPO_TEXT = "No repository to show yet: add a folder under Settings → Your settings → Workspace, or start agentflow dashboard inside a repository.";
 const REPO_KEY = "agentflow-repo";  // the tab's selection, in sessionStorage: a reload keeps it, another tab has its own
 const REPO_NOTE = { not_set_up: "not set up: run agentflow init in it", missing: "missing: no longer in the workspace, its runs still show" };
 
