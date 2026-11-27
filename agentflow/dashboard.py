@@ -13,7 +13,10 @@ Routes:
   narrows it; a bad date is a 400); `GET /api/lessons` (every lesson with its evidence and its target signal before
   and after the runs that carried it); `GET /api/events` (SSE: every run's new events, runs created
   later included; with `?quiet=1` each `agent_turn` becomes an `agent_activity` message, at most one every
-  `QUIET_EVERY_S` per run session, and a newer one replaces a waiting one, so the last turn is never lost).
+  `QUIET_EVERY_S` per run session, and a newer one replaces a waiting one, so the last turn is never lost). It
+  carries the default repository's runs alone, untagged; `/api/repos/<id>/events` carries that repository's, and
+  `/api/events?all=1` (exactly one `all`, valued `1`, on this path only) every live and missing repository's, each
+  message with its `repo` id; a repository that joins an open stream starts at its logs' current end.
 - `GET /api/inbox` (each decision waiting on a person, titled, with its context, blast radius and allowed actions; the
   held and stalled runs to watch; the decisions of the last 30 minutes). A query parameter is ignored.
 - `GET /api/runs/<id>/artifacts`, `/artifact?path=&sha=` (`sha` a revision of `path` or `head`),
@@ -53,6 +56,23 @@ Routes:
   `config_edit`. A save is refused unless the new config validates, leaves the protected settings as they are and
   starts from the file's current hash (409 otherwise). After a save the dashboard serves the new config at once,
   and a live runner on the pack config picks it up when its next phase starts.
+- `GET /api/repos`: every repository the server holds (`repo_context.repos_view`, from one snapshot: its id, name,
+  state, counts and load error, the skipped settings entries, the default's id), with no checkout path in it.
+- `/api/repos/<id>/<rest>` (GET and POST) is the legacy `/api/<rest>` served for the repository `<id>`: the id is
+  percent-decoded and looked up in the server's own map, never joined to a path; one the map does not hold (or an
+  empty one, or one of over `REPO_ID_MAX` characters) is 404 `no such repository` and reads no file, and a `<rest>`
+  of `repos` or `repos/…` is 404.
+- Every other route but `/api/info` reads one repository, the server's default (`DashboardServer.default_context`):
+  with none it answers 404 `no repository`. A repository that is not live, or whose pack names another runs directory
+  than it was loaded with, answers 409 with the reason, on the legacy routes and under its prefix alike.
+  `/api/events?all=1` is a legacy route too: while the default is not live, or gone, it answers that 409 or 404.
+  `/api/info` (and `/api/repos/<id>/info`) answers from the user settings when there is no config.
+
+In the background, `serve` (one repository) and `serve_workspace` (the user's workspace) send due reminders, recheck
+environment stops and refresh Backlog in each usable repository in turn, one at a time, every minute; a failure in one
+is logged with its name (when there are several) and never stops another's. A workspace dashboard also rescans every
+`RESCAN_EVERY_S` (`DashboardServer.rescan`): it reads the user file again and publishes the next snapshot in one
+assignment. Interrupted card starts are settled once, at start-up, in the repositories usable then.
 
 It can approve checkpoints and start agents, so it is locked down:
 - it binds `127.0.0.1` only, and every request but the data-free shell needs the random token printed at
@@ -84,13 +104,27 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
-from agentflow import activity, backlog, backlog_file, config_edit, hitl, module_queue, pack, preflight
+from agentflow import (
+    activity,
+    backlog,
+    backlog_file,
+    config_edit,
+    doctor,
+    hitl,
+    layers,
+    module_queue,
+    pack,
+    preflight,
+    repo_context,
+    repo_set,
+)
 from agentflow.artifacts import (
     SHA,
     NotFound,
@@ -106,6 +140,8 @@ from agentflow.config import Config, ConfigError, _finite, for_lane, load_config
 from agentflow.events import EventError, lock_state
 from agentflow.inbox_view import inbox_view
 from agentflow.plan_view import run_plan
+from agentflow.repo_context import RepoContext, usable
+from agentflow.repo_set import Skipped
 from agentflow.run_control import ControlError, cancel, mark_done, pause, resume, retry, spawn_resume
 from agentflow.run_files import list_files, read_file
 from agentflow.scorecard import scorecard_view
@@ -134,6 +170,8 @@ CURSOR = re.compile(r"[0-9]{1,15}")
 EVENTS_LIMIT_DEFAULT = 200
 EVENTS_LIMIT_MAX = 500
 ACTION_ROUTE = re.compile(r"^/api/runs/([^/]+)/([a-z]+)$")
+REPOS_ROUTE = re.compile(r"^/api/repos/([^/]*)/(.+)$")  # one repository's copy of a legacy route: `/api/<rest>`
+REPO_ID_MAX = 512  # a decoded repository id: a 255-byte folder name, `-` and 8 hex digits, with room to spare
 TEXT_MAX = backlog.TEXT_MAX
 BACKLOG_ROUTES = ("/api/backlog", "/api/backlog/start", "/api/backlog/remove", "/api/backlog/file")
 FILE_OPS = {"add": ("item",), "edit": ("id", "fields"), "move": ("id", "direction"), "add_issue": ("number",)}  # each op's keys, with sha256
@@ -146,12 +184,14 @@ SSE_PING_S = 15.0
 QUIET_EVERY_S = 2.0  # the least gap between two `agent_activity` messages of one session on a quiet stream
 QUIET_FORGET_S = 300.0  # a session's last send is forgotten after this long, so a long stream keeps no history
 REMIND_EVERY_S = 60.0
+RESCAN_EVERY_S = 60.0  # how often a workspace dashboard reads the user file again and rescans its repositories
 BY = "dashboard"
 API_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 PAGE_CSP = ("default-src 'none'; script-src 'nonce-{n}'; style-src 'nonce-{n}'; connect-src 'self'; img-src data:; "
             "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
-__all__ = ["DashboardServer", "dashboard_url", "make_server", "prepare", "refresh_once", "serve"]
+__all__ = ["DashboardServer", "Snapshot", "choose_default", "dashboard_url", "info_numbers", "make_server",
+           "make_workspace_server", "port_of", "prepare", "refresh_once", "serve", "serve_workspace"]
 
 
 def dashboard_url(port: int, token: str) -> str:
@@ -165,7 +205,8 @@ class BadRequest(Exception):
 
 def _json_bytes(data: Any) -> bytes:
     text = json.dumps(data, ensure_ascii=False, default=str)
-    return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026").encode("utf-8")
+    # a lone surrogate (a file name that was not UTF-8) becomes `?` rather than failing the whole answer
+    return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026").encode("utf-8", errors="replace")
 
 
 def _text(body: dict, name: str, required: bool = False) -> str | None:
@@ -346,24 +387,170 @@ CONFLICTS = (hitl.NotWaiting, ControlError, EventError)
 # --------------------------------------------------------------------------- server
 
 
+@dataclass(frozen=True)
+class Snapshot:
+    """What the server serves, replaced whole in one assignment: a request reads `server.snap` once and uses only
+    that, so it never sees half of a rescan."""
+
+    repos: dict[str, RepoContext]  # never mutated after the snapshot is published
+    default: str | None
+    skipped: tuple[Skipped, ...]
+    user: layers.UserSettings
+    user_error: str | None
+
+
+def choose_default(repos: dict[str, RepoContext], prefer: str | None, current: str | None) -> str | None:
+    """The default repository's id. Sticky: `current`, once there is one, whatever its state or whether `repos`
+    still holds it (the page names no repository, so a silent switch would send an action meant for one repository
+    to another). Else `prefer` when it is usable, else the first usable context, else None."""
+    if current is not None:
+        return current
+    if prefer is not None and prefer in repos and usable(repos[prefer]):
+        return prefer
+    return next((key for key, ctx in repos.items() if usable(ctx)), None)
+
+
+def info_numbers(dashboard: dict) -> tuple[float, int]:
+    """`/api/info`'s `(board_refresh_s, done_shown)` from a `dashboard` block; a value that is absent or out of
+    range (a hand-edited file) becomes its default, so it never reaches the page. Never raises."""
+    settings = dashboard if isinstance(dashboard, dict) else {}
+    refresh = settings.get("board_refresh_s", DEFAULT_BOARD_REFRESH_S)
+    if not _finite(refresh) or not 0.5 <= refresh <= 60:
+        refresh = DEFAULT_BOARD_REFRESH_S
+    shown = settings.get("done_shown", DEFAULT_DONE_SHOWN)
+    if not isinstance(shown, int) or isinstance(shown, bool) or not 1 <= shown <= 1000:
+        shown = DEFAULT_DONE_SHOWN
+    return float(refresh), shown
+
+
+def port_of(dashboard: dict) -> int:
+    """The port a `dashboard` block (the user settings') names, for the CLI to bind: a whole number from 0 (a free
+    one) to 65535. Anything else, an absent port included, is a `ValueError` naming `dashboard.port`."""
+    port = dashboard.get("port") if isinstance(dashboard, dict) else None
+    if not isinstance(port, int) or isinstance(port, bool) or not 0 <= port <= 65535:
+        raise ValueError(f"dashboard.port must be a whole number from 0 to 65535 (0 picks a free one), not {port!r}")
+    return port
+
+
+NOT_LIVE = {"not_set_up": "it is not set up (it has no .agentflow/config.yaml)", "missing": "it has left the workspace",
+            "error": "its pack could not be loaded"}
+
+
+def refusal(ctx: RepoContext | None) -> tuple[int, str] | None:
+    """Why a route that needs a repository can't use `ctx`, as `(status, error)`, or None when it can: 404 with no
+    repository, 409 when it is not live, and 409 when its pack names another runs directory than it was built
+    with (a rescan rebuilds it)."""
+    if ctx is None:
+        return 404, "no repository"
+    name = doctor.printable(ctx.name)
+    if ctx.state != "live":
+        return 409, f"{name} is not live: {doctor.printable(ctx.error or NOT_LIVE.get(ctx.state, ctx.state))}"
+    if not usable(ctx):
+        return 409, f"{name}: its state directory changed; waiting for the next rescan"
+    return None
+
+
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], repo: Path, cfg: Config, token: str,
-                 spawn: Callable[[Run], object], spawn_run: Callable[..., str] | None = None,
-                 config: Path | None = None) -> None:
+    def __init__(self, address: tuple[str, int], contexts: list[RepoContext], token: str,
+                 spawn: Callable[[Run], object], spawn_run: Callable[..., str] | None = None, *,
+                 user: layers.UserSettings, prefer: str | None = None, user_error: str | None = None,
+                 skipped: tuple[Skipped, ...] = (), workspace: bool = False) -> None:
         super().__init__(address, _Handler)
-        self.repo = repo
-        self.cfg = cfg
+        repos = {ctx.id: ctx for ctx in contexts}
+        self.prefer = prefer
+        self.workspace = workspace  # serving the user's workspace, not the one repository it was started in
+        self.snap = Snapshot(repos, choose_default(repos, prefer, None), tuple(skipped), user, user_error)
+        # held by `rescan` from reading `snap` to publishing the next one, and by a Settings save's reload-and-store,
+        # so neither is lost to the other; never taken by a request for anything else
+        self._scan_lock = threading.Lock()
         self.token = token
         self.spawn = spawn
         self.spawn_run = spawn_run or module_queue.spawn_run
-        self.config = config  # the config.yaml this dashboard was started with, passed on to the runs it starts
         self.starts: list[threading.Thread] = []
         self.stopping = threading.Event()
         port = self.server_address[1]
         self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         self.origins = {f"http://{host}" for host in self.hosts}
+
+    # -- the current snapshot, read-only
+    @property
+    def repos(self) -> dict[str, RepoContext]:
+        return self.snap.repos
+
+    @property
+    def default(self) -> str | None:
+        return self.snap.default
+
+    @property
+    def skipped(self) -> tuple[Skipped, ...]:
+        return self.snap.skipped
+
+    @property
+    def user(self) -> layers.UserSettings:
+        return self.snap.user
+
+    @property
+    def user_error(self) -> str | None:
+        return self.snap.user_error
+
+    def default_context(self, snap: Snapshot | None = None) -> RepoContext | None:
+        """The default repository's context in `snap` (the current snapshot by default), whatever its state; None
+        when there is no default or it has left the map."""
+        snap = snap or self.snap
+        return snap.repos.get(snap.default) if snap.default is not None else None
+
+    def live_contexts(self, snap: Snapshot | None = None) -> list[RepoContext]:
+        """The contexts a request or a background pass may use (`repo_context.usable`), in map order."""
+        return [ctx for ctx in (snap or self.snap).repos.values() if usable(ctx)]
+
+    # -- the default context's checkout, config and `--config` file, for callers outside the handler
+    @property
+    def repo(self) -> Path | None:
+        ctx = self.default_context()
+        return ctx.repo if ctx is not None else None
+
+    @property
+    def cfg(self) -> Config | None:
+        ctx = self.default_context()
+        return ctx.cfg if ctx is not None else None
+
+    @cfg.setter
+    def cfg(self, value: Config) -> None:
+        ctx = self.default_context()
+        if ctx is None:
+            raise AttributeError("the dashboard has no default repository")
+        ctx.cfg = value
+
+    @property
+    def config(self) -> Path | None:
+        """The config.yaml this dashboard was started with, passed on to the runs it starts."""
+        ctx = self.default_context()
+        return ctx.config if ctx is not None else None
+
+    def rescan(self) -> None:
+        """Read the user file again, resolve its workspace and publish the next snapshot in one assignment: a live
+        context that is still usable is kept by identity, the others are loaded again, and the default stays put
+        (`choose_default`). An unusable user file keeps the map and reports the file (`user_error`); anything else
+        that goes wrong keeps the old snapshot and is logged. A single-repository server never rescans. Never
+        raises."""
+        if not self.workspace:
+            return
+        with self._scan_lock:
+            try:
+                snap = self.snap
+                try:
+                    settings = layers.load_user_settings()
+                except layers.LayerError as exc:
+                    self.snap = replace(snap, user_error=" ".join(str(exc).split())[:repo_context.ERROR_MAX])
+                    return
+                found = repo_set.resolve(settings.workspace)
+                repos = repo_context.reconcile(snap.repos, found)
+                self.snap = Snapshot(repos, choose_default(repos, self.prefer, snap.default), found.skipped,
+                                     settings, None)
+            except Exception as exc:
+                sys.stderr.write(f"dashboard: rescan failed: {doctor.printable(exc)}\n")
 
     def close(self) -> None:
         """Stop serving (from another thread than `serve_forever`) and end open event streams."""
@@ -372,69 +559,157 @@ class DashboardServer(ThreadingHTTPServer):
         self.server_close()
 
 
-def make_server(repo: Path, cfg: Config, host: str, port: int, token: str,
-                spawn: Callable[[Run], object] | None = None, spawn_run: Callable[..., str] | None = None,
-                config: Path | None = None) -> DashboardServer:
-    """A dashboard server bound to `host:port` (port 0 picks a free one); not yet serving."""
+def _checked_bind(host: str, token: str) -> None:
+    """Refuse a host other than 127.0.0.1 and a token of under 128 bits."""
     if host != "127.0.0.1":
         raise ValueError(f"the dashboard binds 127.0.0.1 only, not {host!r}")
     if len(token) < MIN_TOKEN_CHARS:
         raise ValueError("the dashboard token must carry at least 128 bits")
-    return DashboardServer((host, port), Path(repo).resolve(), cfg, token, spawn or spawn_resume, spawn_run, config)
+
+
+def make_server(repo: Path, cfg: Config, host: str, port: int, token: str,
+                spawn: Callable[[Run], object] | None = None, spawn_run: Callable[..., str] | None = None,
+                config: Path | None = None) -> DashboardServer:
+    """A dashboard server for the one repository `repo`, bound to `host:port` (port 0 picks a free one); not yet
+    serving."""
+    _checked_bind(host, token)
+    ctx = repo_context.single_context(Path(repo).resolve(), cfg, config)
+    return DashboardServer((host, port), [ctx], token, spawn or spawn_resume, spawn_run,
+                           user=repo_context.engine_user_settings())
+
+
+def make_workspace_server(contexts: list[RepoContext], user: layers.UserSettings, host: str, port: int, token: str,
+                          *, prefer: str | None = None, user_error: str | None = None,
+                          skipped: tuple[Skipped, ...] = (), spawn: Callable[[Run], object] | None = None,
+                          spawn_run: Callable[..., str] | None = None) -> DashboardServer:
+    """A dashboard server for every repository of the workspace, `contexts` in order, bound to `host:port`; its
+    default is `prefer` when that is usable, else the first usable context. Not yet serving."""
+    _checked_bind(host, token)
+    return DashboardServer((host, port), list(contexts), token, spawn or spawn_resume, spawn_run, user=user,
+                           prefer=prefer, user_error=user_error, skipped=tuple(skipped), workspace=True)
+
+
+def _label(snap: Snapshot, ctx: RepoContext) -> str:
+    """What starts a background line about `ctx`: its name, printable, when `snap` holds several repositories, and
+    nothing when it holds one, so a single-repository terminal reads as before."""
+    return f"{doctor.printable(ctx.name)}: " if len(snap.repos) > 1 else ""
+
+
+def _say(snap: Snapshot, ctx: RepoContext, text: str) -> None:
+    sys.stderr.write(f"dashboard: {_label(snap, ctx)}{text}\n")
+
+
+def _remind(server: DashboardServer, snap: Snapshot, ctx: RepoContext) -> None:
+    """Due reminders and environment rechecks in `ctx`; a failure is logged with the repository's name."""
+    try:
+        hitl.remind_due(ctx.cfg, ctx.repo)
+    except Exception as exc:  # its files are untrusted input: one repository never stops the others
+        _say(snap, ctx, f"reminders failed: {doctor.printable(exc)}")
+    try:
+        preflight.recheck_waiting(ctx.cfg, ctx.repo, spawn=server.spawn,
+                                  log=lambda line: _say(snap, ctx, doctor.printable(line)))
+    except Exception as exc:
+        _say(snap, ctx, f"rechecks failed: {doctor.printable(exc)}")
+
+
+def remind_once(server: DashboardServer) -> None:
+    """One pass of the reminder loop over one snapshot: `_remind` in each usable repository in turn (checked just
+    before its turn), stopping between repositories once the server is stopping."""
+    snap = server.snap
+    for ctx in snap.repos.values():
+        if server.stopping.is_set():
+            return
+        if usable(ctx):
+            _remind(server, snap, ctx)
 
 
 def _remind_loop(server: DashboardServer) -> None:
     while not server.stopping.is_set():
-        try:
-            hitl.remind_due(server.cfg, server.repo)
-        except (OSError, ValueError, EventError) as exc:
-            sys.stderr.write(f"dashboard: reminders failed: {exc}\n")
-        preflight.recheck_waiting(server.cfg, server.repo, spawn=server.spawn,  # never raises
-                                  log=lambda line: sys.stderr.write(f"dashboard: {line}\n"))
+        remind_once(server)
         server.stopping.wait(REMIND_EVERY_S)
 
 
-def prepare(server: DashboardServer) -> list[str]:
-    """What runs once when the dashboard comes up: a start that was interrupted (the last dashboard died between
-    recording it and its outcome) becomes a failure for a person to check. It is never repeated."""
-    settled = backlog.settle_interrupted(server.repo)
+def prepare(server: DashboardServer, ctx: RepoContext | None = None) -> list[str]:
+    """What runs once when the dashboard comes up, for `ctx` (the default repository when None) while it is usable:
+    a start that was interrupted (the last dashboard died between recording it and its outcome) becomes a failure for
+    a person to check. It is never repeated, and never run for a repository that joins later. May raise."""
+    snap = server.snap
+    ctx = ctx if ctx is not None else server.default_context(snap)
+    if ctx is None or not usable(ctx):
+        return []
+    settled = backlog.settle_interrupted(ctx.repo)
     for item_id in settled:
-        sys.stderr.write(f"dashboard: card {item_id} was starting when the last dashboard stopped; "
-                         "it is marked failed (check before pressing Start again)\n")
+        _say(snap, ctx, f"card {doctor.printable(item_id)} was starting when the last dashboard stopped; "
+                        "it is marked failed (check before pressing Start again)")
     return settled
 
 
-def refresh_once(server: DashboardServer) -> None:
-    """One round of keeping Backlog current: base branch, map assessment, merge state, synced issues. It starts
-    nothing. A pack with no `dashboard.backlog` block only syncs its issues (when `issues.sync_label` is set) and its
-    Dependabot alerts (when `vuln.sync` is on)."""
+def _refresh(snap: Snapshot, ctx: RepoContext) -> None:
     try:
-        if module_queue.backlog_settings(server.cfg):
-            backlog.refresh(server.cfg, server.repo)
+        if module_queue.backlog_settings(ctx.cfg):
+            backlog.refresh(ctx.cfg, ctx.repo)
         else:
-            if server.cfg.issues.sync_label:
-                backlog.sync_issues(server.cfg, server.repo)
-            if backlog._alerts_on(server.cfg):
-                backlog.sync_alerts(server.cfg, server.repo)
-    except Exception as exc:  # a failed round must not end the loop; the next one tries again
-        sys.stderr.write(f"dashboard: backlog refresh failed: {exc}\n")
+            if ctx.cfg.issues.sync_label:
+                backlog.sync_issues(ctx.cfg, ctx.repo)
+            if backlog._alerts_on(ctx.cfg):
+                backlog.sync_alerts(ctx.cfg, ctx.repo)
+    except Exception as exc:  # a failed round must not end the loop or stop another repository; the next one tries again
+        _say(snap, ctx, f"backlog refresh failed: {doctor.printable(exc)}")
+
+
+def refresh_once(server: DashboardServer, ctx: RepoContext | None = None) -> None:
+    """One round of keeping Backlog current in `ctx` (the default repository when None) while it is usable: base
+    branch, map assessment, merge state, synced issues. It starts nothing. A pack with no `dashboard.backlog` block
+    only syncs its issues (when `issues.sync_label` is set) and its Dependabot alerts (when `vuln.sync` is on).
+    Never raises: a failure is logged."""
+    snap = server.snap
+    ctx = ctx if ctx is not None else server.default_context(snap)
+    if ctx is not None and usable(ctx):
+        _refresh(snap, ctx)
+
+
+def refresh_round(server: DashboardServer) -> None:
+    """One pass of the refresh loop over one snapshot: each usable repository in turn, one at a time (checked just
+    before its turn), stopping between repositories once the server is stopping."""
+    snap = server.snap
+    for ctx in snap.repos.values():
+        if server.stopping.is_set():
+            return
+        if usable(ctx):
+            _refresh(snap, ctx)
 
 
 def _refresh_loop(server: DashboardServer) -> None:
     while not server.stopping.is_set():
-        refresh_once(server)
+        refresh_round(server)
         server.stopping.wait(REFRESH_EVERY_S)
 
 
-def serve(repo: Path, cfg: Config, host: str, port: int, token: str,
-          announce: Callable[[str], object] = print, config: Path | None = None) -> None:
-    """Serve the dashboard until Ctrl-C, sending due reminders and refreshing Backlog every minute."""
-    server = make_server(repo, cfg, host, port, token, config=config)
-    prepare(server)
-    announce(f"agentflow dashboard: {dashboard_url(server.server_address[1], token)}\n"
+def _rescan_loop(server: DashboardServer) -> None:
+    """A workspace dashboard's rescan, every `RESCAN_EVERY_S`; a pass that raises costs that pass only."""
+    while not server.stopping.wait(RESCAN_EVERY_S):
+        try:
+            server.rescan()
+        except Exception as exc:  # `rescan` never raises; this keeps the thread alive if it ever does
+            sys.stderr.write(f"dashboard: rescan failed: {doctor.printable(exc)}\n")
+
+
+def _bring_up(server: DashboardServer, announce: Callable[[str], object], covers: str = "") -> None:
+    """Bring `server` up and serve until Ctrl-C: settle the interrupted starts of every repository usable now
+    (`prepare`, each on its own), print the URL (with `covers` after it, when given), start the reminder and refresh
+    loops (and, for a workspace, the rescan loop), and serve."""
+    snap = server.snap
+    for ctx in server.live_contexts(snap):
+        try:
+            prepare(server, ctx)
+        except Exception as exc:  # its files are untrusted input: the dashboard still comes up
+            _say(snap, ctx, f"prepare failed: {doctor.printable(exc)}")
+    announce(f"agentflow dashboard: {dashboard_url(server.server_address[1], server.token)}\n{covers}"
              "Keep this URL private: the token lets anyone with it approve checkpoints. Ctrl-C stops the server.")
     threading.Thread(target=_remind_loop, args=(server,), daemon=True).start()
     threading.Thread(target=_refresh_loop, args=(server,), daemon=True).start()  # a Settings save may turn sync on
+    if server.workspace:
+        threading.Thread(target=_rescan_loop, args=(server,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -444,8 +719,36 @@ def serve(repo: Path, cfg: Config, host: str, port: int, token: str,
         server.server_close()
 
 
+def serve(repo: Path, cfg: Config, host: str, port: int, token: str,
+          announce: Callable[[str], object] = print, config: Path | None = None) -> None:
+    """Serve the one repository `repo` until Ctrl-C, sending due reminders and refreshing Backlog every minute."""
+    _bring_up(make_server(repo, cfg, host, port, token, config=config), announce)
+
+
+def serve_workspace(contexts: list[RepoContext], user: layers.UserSettings, host: str, port: int, token: str, *,
+                    prefer: str | None = None, user_error: str | None = None, skipped: tuple[Skipped, ...] = (),
+                    announce: Callable[[str], object] = print) -> None:
+    """Serve every repository of the workspace until Ctrl-C: reminders and Backlog refreshes in each usable one, and
+    a rescan every `RESCAN_EVERY_S`."""
+    server = make_workspace_server(contexts, user, host, port, token, prefer=prefer, user_error=user_error,
+                                   skipped=skipped)
+    snap = server.snap
+    count = len(snap.repos)
+    shown = server.default_context(snap)
+    page = (f"the page shows {doctor.printable(shown.name)}" if shown is not None
+            else "the page shows none of them until one is set up")
+    covers = (f"It covers {count} {'repository' if count == 1 else 'repositories'} of your workspace; {page}. "
+              "The token reaches all of them.\n")
+    _bring_up(server, announce, covers)
+
+
 class _Handler(BaseHTTPRequestHandler):
     server: DashboardServer
+    # set by `_handle` for each request, from one snapshot: every handler reads its repository through `_ctx` alone
+    # (None only on `/api/info` when there is no default); `_scoped` says it came from `/api/repos/<id>/…`
+    _snap: Snapshot
+    _ctx: RepoContext
+    _scoped: bool
     server_version = "agentflow"
     sys_version = ""
 
@@ -516,11 +819,11 @@ class _Handler(BaseHTTPRequestHandler):
         """The run named exactly `text`, or None (no partial matches, nothing outside the runs root)."""
         if len(text) > RUN_ID_MAX or not RUN_ID.fullmatch(text):
             return None
-        root = runs_root(self.server.repo).resolve()
+        root = runs_root(self._ctx.repo).resolve()
         folder = root / text
         if folder.is_symlink() or not (folder / "events.jsonl").is_file() or folder.resolve().parent != root:
             return None
-        return Run.load(self.server.repo, text)
+        return Run.load(self._ctx.repo, text)
 
     # -- dispatch
     def do_GET(self) -> None:
@@ -550,46 +853,82 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(403, b"", "text/plain; charset=utf-8")
                 return
             parts = urlsplit(self.path)
-            route(parts.path, parse_qs(parts.query))
+            path = parts.path
+            snap = self._snap = self.server.snap
+            self._scoped = False
+            if path == "/api/repos":
+                if self.command == "GET":
+                    self._json(200, repo_context.repos_view(snap.repos.values(), snap.skipped, snap.default,
+                                                            snap.user_error))
+                else:
+                    self.close_connection = True  # a POST's body is left unread
+                    self._error(404, "not found")
+                return
+            match = REPOS_ROUTE.match(path)
+            if match:
+                ctx, refused = self._scope(snap, match.group(1), match.group(2))
+                path, self._scoped = "/api/" + match.group(2), True
+            else:
+                ctx = self.server.default_context(snap)
+                refused = refusal(ctx) if path != "/api/info" else None
+            if refused is not None:
+                self.close_connection = True  # a POST's body is left unread
+                self._error(*refused)
+                return
+            self._ctx = ctx
+            route(path, parse_qs(parts.query))
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
         except Exception:
             sys.stderr.write("dashboard: " + traceback.format_exc().replace(self.server.token, "<token>"))
             self._error(500, "internal error; see the dashboard's terminal")
 
+    @staticmethod
+    def _scope(snap: Snapshot, raw_id: str, rest: str) -> tuple[RepoContext | None, tuple[int, str] | None]:
+        """The context `/api/repos/<raw_id>/<rest>` names in `snap`, and why it can't serve, as `(status, error)`.
+        The id is percent-decoded and only ever looked up in the map, never joined to a path: an empty or overlong
+        one is 404 before the lookup, and one the map does not hold is 404, so an unknown id touches no file. A
+        `rest` that is `repos` again is 404. Every route but `info` answers `refusal`'s 409s."""
+        repo_id = unquote(raw_id)
+        if not repo_id or len(repo_id) > REPO_ID_MAX:
+            return None, (404, "no such repository")
+        ctx = snap.repos.get(repo_id)
+        if ctx is None:
+            return None, (404, "no such repository")
+        if rest == "repos" or rest.startswith("repos/"):
+            return None, (404, "not found")
+        return ctx, (None if rest == "info" else refusal(ctx))
+
     def _get(self, path: str, query: dict) -> None:
         if path == "/api/board":
             lane = (query.get("lane") or [None])[0]
-            if lane is not None and lane not in self.server.cfg.lanes:
+            if lane is not None and lane not in self._ctx.cfg.lanes:
                 self._error(404, f"unknown lane {lane!r}")
                 return
-            self._json(200, board(self.server.repo, self.server.cfg, lane))
-        elif path == "/api/info":
-            refresh = self.server.cfg.dashboard.get("board_refresh_s", DEFAULT_BOARD_REFRESH_S)
-            if not _finite(refresh) or not 0.5 <= refresh <= 60:  # a hand-edited value never reaches the page
-                refresh = DEFAULT_BOARD_REFRESH_S
-            shown = self.server.cfg.dashboard.get("done_shown", DEFAULT_DONE_SHOWN)
-            if not isinstance(shown, int) or isinstance(shown, bool) or not 1 <= shown <= 1000:
-                shown = DEFAULT_DONE_SHOWN
+            self._json(200, board(self._ctx.repo, self._ctx.cfg, lane))
+        elif path == "/api/info":  # needs no repository: the user settings answer when there is no config
+            ctx = self._ctx
+            settings = ctx.cfg.dashboard if ctx is not None and ctx.cfg is not None else self._snap.user.dashboard
+            refresh, shown = info_numbers(settings)
             self._json(200, {"name": "agentflow-harness", "version": pack.ENGINE_VERSION,
-                             "board_refresh_s": float(refresh), "done_shown": shown,
-                             "inbox_legacy": self.server.cfg.dashboard.get("inbox_legacy") is True})
+                             "board_refresh_s": refresh, "done_shown": shown,
+                             "inbox_legacy": isinstance(settings, dict) and settings.get("inbox_legacy") is True})
         elif path == "/api/workflow":
-            self._json(200, workflow_view(self.server.cfg))
+            self._json(200, workflow_view(self._ctx.cfg))
         elif path == "/api/agents":
-            self._json(200, agents_view(self.server.repo, self.server.cfg))
-        elif path == "/api/events":
-            self._events(quiet=query.get("quiet") == ["1"])
+            self._json(200, agents_view(self._ctx.repo, self._ctx.cfg))
+        elif path == "/api/events":  # `all=1` merges every repository, on the legacy path only
+            self._events(quiet=query.get("quiet") == ["1"], merged=not self._scoped and query.get("all") == ["1"])
         elif path == "/api/config":
-            self._json(200, config_edit.form_fields(self.server.cfg.path))
+            self._json(200, config_edit.form_fields(self._ctx.cfg.path))
         elif path == "/api/metrics":
             self._metrics(query)
         elif path == "/api/scorecard":
             self._scorecard(query)
         elif path == "/api/lessons":
-            self._json(200, lessons_view(self.server.repo, self.server.cfg))
+            self._json(200, lessons_view(self._ctx.repo, self._ctx.cfg))
         elif path == "/api/inbox":
-            self._json(200, inbox_view(self.server.repo, self.server.cfg, datetime.now(UTC)))
+            self._json(200, inbox_view(self._ctx.repo, self._ctx.cfg, datetime.now(UTC)))
         elif match := TRANSCRIPT_ROUTE.match(path):
             self._transcript_get(match.group(1), match.group(2), query)
         elif match := ARTIFACT_ROUTE.match(path):
@@ -599,7 +938,7 @@ class _Handler(BaseHTTPRequestHandler):
             if run is None:
                 self._error(404, "no such run")
                 return
-            self._json(200, run_detail(run, self.server.cfg, raw=(query.get("raw") or [""])[0] == "1"))
+            self._json(200, run_detail(run, self._ctx.cfg, raw=(query.get("raw") or [""])[0] == "1"))
         else:
             self._error(404, "not found")
 
@@ -615,7 +954,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(400, "after must be a non-negative whole number, sent once")
             return
         try:
-            result = transcript_page(run, session, int(values[0]), artifact_max_bytes(self.server.cfg))
+            result = transcript_page(run, session, int(values[0]), artifact_max_bytes(self._ctx.cfg))
         except NotFound as exc:
             self._error(404, str(exc))
             return
@@ -644,7 +983,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._error(400, f"send exactly one {name}")
                 return
             args.append(values[0])
-        repo, cfg = self.server.repo, self.server.cfg
+        repo, cfg = self._ctx.repo, self._ctx.cfg
         try:
             if what == "artifacts":
                 result: Any = run_artifacts(run, repo)
@@ -701,13 +1040,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _metrics(self, query: dict) -> None:
         lane = (query.get("lane") or [None])[0] or None
-        if lane is not None and lane not in self.server.cfg.lanes:
+        if lane is not None and lane not in self._ctx.cfg.lanes:
             self._error(404, f"unknown lane {lane!r}")
             return
         try:
             days = {name: date.fromisoformat(v) if (v := (query.get(name) or [""])[0]) else None
                     for name in ("from", "to")}
-            view = metrics_view(self.server.repo, self.server.cfg, lane, days["from"], days["to"],
+            view = metrics_view(self._ctx.repo, self._ctx.cfg, lane, days["from"], days["to"],
                                 all_time=(query.get("all") or [""])[0] in ("1", "true"))
         except ValueError as exc:
             self._error(400, f"bad date range: {exc}")
@@ -716,7 +1055,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _scorecard(self, query: dict) -> None:
         lane = (query.get("lane") or [None])[0] or None
-        if lane is not None and lane not in self.server.cfg.lanes:
+        if lane is not None and lane not in self._ctx.cfg.lanes:
             self._error(404, f"unknown lane {lane!r}")
             return
         try:
@@ -727,8 +1066,8 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._error(400, f"bad date range: {exc}")
             return
-        full_suite = tuple(self.server.cfg.gate_sets.get("verify") or ())
-        self._json(200, scorecard_view(self.server.repo, lane, days["from"], days["to"], datetime.now(UTC),
+        full_suite = tuple(self._ctx.cfg.gate_sets.get("verify") or ())
+        self._json(200, scorecard_view(self._ctx.repo, lane, days["from"], days["to"], datetime.now(UTC),
                                        full_suite=full_suite))
 
     def _page(self) -> None:
@@ -755,7 +1094,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             action = match.group(2)
             if action == "approve":
-                result, go_on = _approve(run, body, self.server.cfg, self.server.repo)
+                result, go_on = _approve(run, body, self._ctx.cfg, self._ctx.repo)
             else:
                 result, go_on = ACTIONS[action](run, body)
         except CONFLICTS as exc:
@@ -774,30 +1113,30 @@ class _Handler(BaseHTTPRequestHandler):
         body = self._body()
         if body is None:
             return
-        server = self.server
+        ctx = self._ctx
         try:
             if path == "/api/backlog":
-                item = backlog.add(server.cfg, server.repo, _text(body, "lane", required=True) or "",
+                item = backlog.add(ctx.cfg, ctx.repo, _text(body, "lane", required=True) or "",
                                    body.get("fields") if "fields" in body else {}, body.get("after") or [],
                                    _text(body, "to_phase"))
                 self._json(200, {"ok": True, "key": f"card:{item.id}", "id": item.id})
             elif path == "/api/backlog/file":
-                new_sha, notes = _file_edit(server.cfg, server.repo, body)
+                new_sha, notes = _file_edit(ctx.cfg, ctx.repo, body)
                 self._json(200, {"ok": True, "sha256": new_sha, "notes": notes})
             elif path == "/api/backlog/start":
                 key = self._start_key(body)
                 confirm = body.get("confirm", False)
                 if not isinstance(confirm, bool):
                     raise BadRequest("confirm must be true or false")
-                job = backlog.begin_start(server.cfg, server.repo, key, confirm=confirm)
-                thread = threading.Thread(target=self._start_worker, args=(job,), daemon=True)
-                server.starts.append(thread)
+                job = backlog.begin_start(ctx.cfg, ctx.repo, key, confirm=confirm)
+                thread = threading.Thread(target=self._start_worker, args=(job, ctx), daemon=True)
+                self.server.starts.append(thread)
                 thread.start()
                 self._json(202, {"ok": True, "starting": True, "key": key})
             else:
                 kind, name = backlog.parse_key(_text(body, "item", required=True))
                 if kind == "issue":
-                    label = server.cfg.issues.sync_label
+                    label = ctx.cfg.issues.sync_label
                     raise backlog.Refused(f"issue #{name} leaves Backlog when it is closed on GitHub"
                                           if label == backlog.ALL_ISSUES else
                                           f"issue #{name} leaves Backlog when it is closed or loses the "
@@ -806,8 +1145,8 @@ class _Handler(BaseHTTPRequestHandler):
                     raise backlog.Refused(f"alert #{name} leaves Backlog when Dependabot closes it, or when "
                                           "vuln.sync is turned off")
                 if kind != "card":
-                    raise backlog.Refused(backlog.unremovable(server.cfg))
-                backlog.remove(server.cfg, server.repo, name)
+                    raise backlog.Refused(backlog.unremovable(ctx.cfg))
+                backlog.remove(ctx.cfg, ctx.repo, name)
                 self._json(200, {"ok": True})
         except (backlog.Refused, backlog_file.Stale) as exc:
             self._error(409, str(exc))
@@ -818,14 +1157,14 @@ class _Handler(BaseHTTPRequestHandler):
         body = self._body(CONFIG_MAX_BODY)
         if body is None:
             return
-        server = self.server
+        ctx = self._ctx
         base, changes, text = body.get("base_sha256"), body.get("changes"), body.get("text")
         if not isinstance(base, str) or (changes is None) == (text is None):
             self._error(400, "send base_sha256 and either changes or text")
             return
-        config_path = Path(server.cfg.path)
+        config_path = Path(ctx.cfg.path)
         try:
-            proposal = config_edit.propose(config_path, base, changes=changes, text=text, repo=server.repo)
+            proposal = config_edit.propose(config_path, base, changes=changes, text=text, repo=ctx.repo)
             if path == "/api/config/preview":
                 self._json(200, proposal.as_dict())
                 return
@@ -839,10 +1178,22 @@ class _Handler(BaseHTTPRequestHandler):
         except config_edit.EditError as exc:
             self._error(400, str(exc))
             return
-        try:
-            server.cfg = load_config(config_path)
-        except ConfigError as exc:  # validated a moment ago; only a concurrent editor gets here
-            self._error(500, f"saved, but the dashboard could not reload it: {exc}")
+        # The reload and the store hold the rescan's lock, so a rescan publishes either before the store (which then
+        # lands on the context it published) or after it (and was built from contexts that already hold it).
+        with self.server._scan_lock:
+            try:
+                reloaded = load_config(config_path)
+            except ConfigError as exc:  # validated a moment ago; only a concurrent editor gets here
+                reloaded, failure = None, exc
+            else:
+                # on the context the server holds for this repository now, when it is still live: a rescan may have
+                # replaced the request's one
+                ctx.cfg = reloaded
+                current = self.server.snap.repos.get(ctx.id)
+                if current is not None and current is not ctx and current.state == "live":
+                    current.cfg = reloaded
+        if reloaded is None:
+            self._error(500, f"saved, but the dashboard could not reload it: {failure}")
             return
         self.log_message("config.yaml saved from the Settings page (sha256 %s)", digest[:12])
         self._json(200, {**proposal.as_dict(), "ok": True, "saved": proposal.changed, "sha256": digest})
@@ -854,12 +1205,13 @@ class _Handler(BaseHTTPRequestHandler):
             raise BadRequest("name exactly one of module and item")
         return f"module:{module}" if module is not None else str(item)
 
-    def _start_worker(self, job: backlog.StartJob) -> None:
-        server = self.server
+    def _start_worker(self, job: backlog.StartJob, ctx: RepoContext) -> None:
+        """The slow part of a start, on its own thread, in the repository `ctx` the request named (the handler's
+        `_ctx` belongs to the next request on a kept-alive connection by then)."""
         try:
-            backlog.run_start(server.cfg, server.repo, job, spawn=server.spawn_run, config=server.config)
+            backlog.run_start(ctx.cfg, ctx.repo, job, spawn=self.server.spawn_run, config=ctx.config)
         except Exception:  # run_start has recorded the failure; the page shows it on the card
-            sys.stderr.write("dashboard: " + traceback.format_exc().replace(server.token, "<token>"))
+            sys.stderr.write("dashboard: " + traceback.format_exc().replace(self.server.token, "<token>"))
 
     def _body(self, max_body: int = MAX_BODY) -> dict | None:
         """The request's JSON object, or None after answering the error."""
@@ -891,12 +1243,21 @@ class _Handler(BaseHTTPRequestHandler):
         return body
 
     # -- server-sent events
-    def _events(self, quiet: bool = False) -> None:
+    def _events(self, quiet: bool = False, merged: bool = False) -> None:
+        """Stream new events: the legacy path's are the default repository's alone, untagged; a prefixed path's are
+        that repository's, and `merged`'s every live and missing repository's, each message tagged with `repo`.
+        Each pass reads `server.snap` once; a repository that joins starts at its logs' current end, and one whose
+        runs can't be read is skipped for that pass."""
+        tagged = self._scoped or merged
+        # per repository id: the resolved runs directory its offsets were taken in, and the offsets
+        streams: dict[str, tuple[Path, dict[str, int]]] = {}
         # The starting point is fixed before the 200 goes out: a client that acts as soon as it sees the
         # response must get the events it causes, so nothing written after this line counts as old.
-        root = runs_root(self.server.repo)
-        offsets = {path.parent.name: self._size(path) for path in self._logs(root)}
-        offsets[BACKLOG_LOG] = self._size(root / "backlog.jsonl")
+        for ctx in self._streamed(self._snap, merged):
+            try:
+                streams[ctx.id] = self._seed(ctx)
+            except Exception:  # tried again on the next pass
+                pass
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self._security_headers(API_CSP)
@@ -905,21 +1266,21 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(b": connected\n\n")
         self.wfile.flush()
         pinged = time.monotonic()
-        last_sent: dict[tuple[str, str], float] = {}  # quiet only: when each session's activity last went out
-        pending: dict[tuple[str, str], bytes] = {}  # quiet only: the newest activity message still waiting
+        last_sent: dict[tuple[str, str, str], float] = {}  # quiet only: when each session's activity last went out
+        pending: dict[tuple[str, str, str], bytes] = {}  # quiet only: the newest activity message still waiting
         while not self.server.stopping.is_set():
             sent = False
-            for path in self._logs(root):
-                name = path.parent.name
-                for event in self._new_events(path, offsets, name):
-                    if quiet and event.get("type") == "agent_turn":
-                        sent |= self._coalesce(name, event, last_sent, pending)
+            contexts = self._streamed(self.server.snap, merged)
+            for gone in streams.keys() - {ctx.id for ctx in contexts}:
+                del streams[gone]  # if it comes back, it starts again at its logs' end
+            for ctx in contexts:
+                repo = ctx.id if tagged else None
+                for name, event in self._read(ctx, streams):  # reads only: a write error still ends the stream
+                    if quiet and name != BACKLOG_LOG and event.get("type") == "agent_turn":
+                        sent |= self._coalesce(ctx.id, repo, name, event, last_sent, pending)
                         continue
-                    self.wfile.write(b"data: " + _json_bytes({"run_id": name, "event": event}) + b"\n\n")
+                    self.wfile.write(self._message(repo, name, event))
                     sent = True
-            for event in self._new_events(root / "backlog.jsonl", offsets, BACKLOG_LOG):
-                self.wfile.write(b"data: " + _json_bytes({"run_id": BACKLOG_LOG, "event": event}) + b"\n\n")
-                sent = True
             if pending:
                 now = time.monotonic()
                 for key in [k for k in pending if now - last_sent[k] >= QUIET_EVERY_S]:
@@ -938,15 +1299,67 @@ class _Handler(BaseHTTPRequestHandler):
                 pinged = time.monotonic()
             self.server.stopping.wait(SSE_POLL_S)
 
-    def _coalesce(self, run_id: str, event: dict, last_sent: dict, pending: dict) -> bool:
-        """Turn one `agent_turn` into an `agent_activity` message: send it now when its session has been quiet
-        for `QUIET_EVERY_S`, or keep it (replacing an older waiting one) for the stream loop to send. Returns
-        whether it wrote anything."""
-        key = (run_id, str(event.get("session_id")))
-        message = b"data: " + _json_bytes({"run_id": run_id, "event": {
+    def _streamed(self, snap: Snapshot, merged: bool) -> list[RepoContext]:
+        """The contexts a pass over `snap` streams, in map order: `merged`, every usable and every `missing` one;
+        else this request's context, while it is either (the legacy default is sticky, so its id never moves)."""
+        if merged:
+            candidates = list(snap.repos.values())
+        else:
+            ctx = snap.repos.get(self._ctx.id)
+            candidates = [ctx] if ctx is not None else []
+        return [ctx for ctx in candidates if ctx.state == "missing" or usable(ctx)]
+
+    @staticmethod
+    def _root(ctx: RepoContext) -> Path:
+        """The runs directory to stream for `ctx`: a missing one's is the directory it was built with; a usable
+        one's is what its pack names, which `usable` has just checked is that same directory. May raise."""
+        if ctx.state == "missing" and ctx.runs is not None:
+            return ctx.runs
+        return runs_root(ctx.repo)
+
+    def _seed(self, ctx: RepoContext) -> tuple[Path, dict[str, int]]:
+        """The runs directory to stream for `ctx`, resolved, and its offsets at its logs' current end. May raise."""
+        root = self._root(ctx).resolve()
+        offsets = {path.parent.name: self._size(path) for path in self._logs(root)}
+        offsets[BACKLOG_LOG] = self._size(root / "backlog.jsonl")
+        return root, offsets
+
+    def _read(self, ctx: RepoContext, streams: dict[str, tuple[Path, dict[str, int]]]) -> list[tuple[str, dict]]:
+        """`ctx`'s events since the last pass, as `(run id or BACKLOG_LOG, event)`. A repository not seen before
+        in this stream, or whose runs directory is now another one, is first seeded at its logs' current end, so
+        nothing older is replayed. Its files are untrusted input: anything raised costs it this pass only."""
+        try:
+            root = self._root(ctx).resolve()
+            known = streams.get(ctx.id)
+            if known is None or known[0] != root:
+                streams.pop(ctx.id, None)
+                known = streams[ctx.id] = self._seed(ctx)
+                root = known[0]
+            offsets = known[1]
+            out = [(path.parent.name, event) for path in self._logs(root)
+                   for event in self._new_events(path, offsets, path.parent.name)]
+            out += [(BACKLOG_LOG, event) for event in self._new_events(root / "backlog.jsonl", offsets, BACKLOG_LOG)]
+            return out
+        except Exception:
+            return []
+
+    @staticmethod
+    def _message(repo: str | None, run_id: str, event: dict) -> bytes:
+        """One SSE message; tagged with `repo` unless it is None (the legacy stream's, byte for byte as before)."""
+        body = {"run_id": run_id, "event": event} if repo is None else {"repo": repo, "run_id": run_id, "event": event}
+        return b"data: " + _json_bytes(body) + b"\n\n"
+
+    def _coalesce(self, ctx_id: str, repo: str | None, run_id: str, event: dict, last_sent: dict,
+                  pending: dict) -> bool:
+        """Turn one `agent_turn` into an `agent_activity` message (tagged with `repo` unless it is None): send it
+        now when its session has been quiet for `QUIET_EVERY_S`, or keep it (replacing an older waiting one) for
+        the stream loop to send. A session is keyed by its repository too, so one run id in two repositories never
+        shares a slot. Returns whether it wrote anything."""
+        key = (ctx_id, run_id, str(event.get("session_id")))
+        message = self._message(repo, run_id, {
             "type": "agent_activity", "session_id": event.get("session_id"), "key": event.get("key"),
             "last_tool": event.get("last_tool"), "context_pct": event.get("context_pct"),
-            "ts": event.get("ts")}}) + b"\n\n"
+            "ts": event.get("ts")})
         now = time.monotonic()
         if key not in pending and (key not in last_sent or now - last_sent[key] >= QUIET_EVERY_S):
             self.wfile.write(message)

@@ -734,6 +734,19 @@ def test_a_file_over_the_byte_cap_is_refused_before_it_is_parsed(tmp_path):
         layers._read(path)
 
 
+def test_a_file_that_is_not_utf8_is_a_layer_error_naming_it(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b"\xff")
+    with pytest.raises(LayerError, match="not valid UTF-8 text") as err:
+        layers._read(path)
+    assert str(path) in str(err.value)
+    target = write_user_file("")
+    target.write_bytes(b"\xff")
+    with pytest.raises(LayerError, match="not valid UTF-8 text") as err:
+        load_user_settings()
+    assert str(target) in str(err.value)
+
+
 def merge_chain(budget: int = layers.MAX_CONFIG_BYTES) -> str:
     """A chain of anchored mappings, each merging (`<<`) the one before and adding a key, as long as fits in `budget`
     bytes: building mapping n copies n entries, so the whole file costs the square of its length to construct."""
@@ -769,5 +782,3 @@ def test_ordinary_merge_keys_still_load(tmp_path):
     assert loaded["gates"]["lint"] == {"run": "ruff", "timeout": 5}
     assert layers.parse_config("") is None
     assert layers.parse_config("k: v\n") == {"k": "v"}
-
-

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import ast
+import dataclasses
 import getpass
+import hashlib
 import http.client
 import json
 import os
@@ -16,14 +19,28 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import yaml
 
-from agentflow import claims, hitl, pack
+from agentflow import (
+    backlog,
+    claims,
+    config_edit,
+    dashboard,
+    hitl,
+    layers,
+    module_queue,
+    pack,
+    preflight,
+    repo_context,
+    repo_set,
+)
 from agentflow.config import RETRO_PIPELINE
+from agentflow.events import LOCK_NAME
 from agentflow.dashboard import PAGE_CSP, UI_DIR, UI_SCRIPTS, make_server
 from agentflow.run_control import RUN_ACTIONS, available_actions, cancel, pause
 from agentflow.state import Run, runs_root
-from agentflow.views import _badge, _strip, lane_phases, step_title
-from conftest import PYTHON_CONFIG, L, add_vuln_lane, awaiting, land_on_origin, run_git, session_with_transcript
+from agentflow.views import _badge, _strip, lane_phases, step_title, workflow_view
+from conftest import PYTHON_CONFIG, SPARSE_PACK, L, add_vuln_lane, awaiting, land_on_origin, run_git, session_with_transcript
 from test_vuln import _alert
 
 TOKEN = "k3y-" + "x" * 40
@@ -2670,3 +2687,1474 @@ def test_a_reopening_edit_returns_the_claim_lines_as_notes(kdash, tmp_path):
     assert "released" in answer["notes"][0] and "Test" in answer["notes"][0]
     assert claims.read(flow.cfg, root, "r") is None
     assert "status: ready" in (root / "backlog.yml").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- a map of repository contexts (W2)
+
+
+def _live_context(repo: Path, cfg) -> repo_context.RepoContext:
+    """`repo` as a live workspace context: `cfg`, and the runs directory it has now, frozen."""
+    ctx = repo_context.single_context(repo.resolve(), cfg)
+    return dataclasses.replace(ctx, repo=repo.resolve(), runs=repo_context.runs_dir(ctx))
+
+
+def load_config_of(repo: Path):
+    from agentflow.config import load_config
+
+    return load_config(pack.pack_config(repo))
+
+
+@dataclass
+class Two:
+    dash: Dash
+    a: object  # the flow repository's context
+    b: object  # the sparse repository's context, the default
+    a_run: Run
+    b_run: Run
+
+
+def _serve(server) -> threading.Thread:
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return thread
+
+
+class RecordedStarts:
+    """Stands in for `spawn_run` over several repositories: records each call and creates the run in the repository
+    it names, with that repository's current config."""
+
+    def __init__(self, contexts: list) -> None:
+        self.contexts = contexts
+        self.calls: list[dict] = []
+
+    def __call__(self, repo, lane, params, **kw):
+        self.calls.append({"repo": Path(repo), "lane": lane, "params": dict(params), **kw})
+        ctx = next(c for c in self.contexts if c.repo == Path(repo))
+        return Run.create(ctx.cfg, Path(repo), lane, params).id
+
+
+def _forbid_legacy(data: dict) -> None:
+    data["guardrails"]["forbidden_paths"].append("legacy/**")
+
+
+@pytest.fixture
+def two(flow_repo, sparse_repo, monkeypatch):
+    """A workspace server over the flow repository (A: the `python` pack, which also forbids `legacy/**`) and a sparse
+    one (B), B preferred; each has one run, and A's waits on its plan approval. `dash.spawned` records each runner a
+    resume starts (`Popen`), `dash.fake` each card start (`spawn_run`)."""
+    spawned: list[dict] = []
+    real_popen = subprocess.Popen
+
+    def popen(command, *args, **kwargs):
+        if isinstance(command, list) and "resume" in command:
+            spawned.append({"command": command, **kwargs})
+            return None
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    flow_repo.configure(edit=_forbid_legacy)
+    b_cfg = load_config_of(sparse_repo)
+    a, b = _live_context(flow_repo.root, flow_repo.cfg), _live_context(sparse_repo, b_cfg)
+    a_run = awaiting(flow_repo, "alpha")
+    b_run = Run.create(b_cfg, sparse_repo, "feature", {"module": "beta"})
+    starts = RecordedStarts([a, b])
+    server = dashboard.make_workspace_server([a, b], repo_context.engine_user_settings(), "127.0.0.1", 0, TOKEN,
+                                             prefer=b.id, spawn_run=starts)
+    thread = _serve(server)
+    dash = Dash(server, server.server_address[1], flow_repo, spawned)
+    dash.fake = starts
+    yield Two(dash, a, b, a_run, b_run)
+    server.close()
+    thread.join(timeout=5)
+
+
+@pytest.fixture
+def empty_dash(flow_repo):
+    server = dashboard.make_workspace_server([], repo_context.engine_user_settings(), "127.0.0.1", 0, TOKEN)
+    thread = _serve(server)
+    yield Dash(server, server.server_address[1], flow_repo)
+    server.close()
+    thread.join(timeout=5)
+
+
+def test_a_workspace_server_over_two_repositories_answers_the_legacy_routes_for_the_default(two):
+    assert two.dash.server.workspace is True and two.dash.server.default == two.b.id
+    assert list(two.dash.server.repos) == [two.a.id, two.b.id]
+    status, _, body = two.dash.get("/api/board")
+    ids = [c["run_id"] for c in payload(body)["cards"]]
+    assert status == 200 and two.b_run.id in ids and two.a_run.id not in ids
+    assert two.dash.get(f"/api/runs/{two.a_run.id}")[0] == 404
+    status, _, body = two.dash.get(f"/api/runs/{two.b_run.id}")
+    assert status == 200 and payload(body)["run_id"] == two.b_run.id
+
+
+def test_the_default_is_the_first_live_context_when_nothing_is_preferred(flow_repo, sparse_repo):
+    bare = dataclasses.replace(_live_context(flow_repo.root, flow_repo.cfg), cfg=None, runs=None, state="not_set_up")
+    live = _live_context(sparse_repo, load_config_of(sparse_repo))
+    server = dashboard.make_workspace_server([bare, live], repo_context.engine_user_settings(), "127.0.0.1", 0, TOKEN)
+    try:
+        assert server.default == live.id and server.default_context() is server.repos[live.id]
+        assert server.live_contexts() == [server.repos[live.id]]
+    finally:
+        server.server_close()
+
+
+def test_with_no_default_a_legacy_route_is_404_and_info_still_answers(empty_dash):
+    assert empty_dash.server.default is None and empty_dash.server.default_context() is None
+    assert empty_dash.server.repo is None and empty_dash.server.cfg is None and empty_dash.server.config is None
+    status, _, body = empty_dash.get("/api/board")
+    assert status == 404 and payload(body)["error"] == "no repository"
+    status, _, body = empty_dash.get("/api/info")
+    assert status == 200 and payload(body) == {"name": "agentflow-harness", "version": pack.ENGINE_VERSION,
+                                                "board_refresh_s": 2.0, "inbox_legacy": False, "done_shown": 10}
+    assert empty_dash.get("/api/workflow")[0] == 404
+    assert empty_dash.post("/api/backlog", {"lane": "feature"})[0] == 404
+    assert empty_dash.get("/api/board", token=None)[0] == 403  # the token is still checked first
+
+
+def test_server_repo_cfg_and_config_follow_the_default_and_cfg_can_be_replaced(two, flow_repo):
+    server, b = two.dash.server, two.dash.server.default_context()
+    assert b.id == two.b.id
+    assert server.repo == b.repo and server.cfg is b.cfg and server.config is b.config
+    server.cfg = flow_repo.cfg
+    assert server.default_context().cfg is flow_repo.cfg and server.cfg is flow_repo.cfg
+    assert server.repos[two.a.id].cfg is flow_repo.cfg and server.repos[two.a.id] is not server.default_context()
+
+
+def _is_self_server(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr == "server" and isinstance(node.value, ast.Name)
+            and node.value.id == "self")
+
+
+def _server_misuses(tree: ast.AST) -> tuple[list[str], list[str]]:
+    """Every use of `self.server` in `tree` that could reach the default repository, and the functions that call
+    `self.server.default_context()`. A `self.server` is allowed only as the object of an attribute other than
+    `repo`, `cfg` and `config`; any other place it appears in (an alias in any form, an argument of
+    `getattr`/`setattr`/`delattr` or of anything else) is a misuse, so no syntax needs listing."""
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    misuses, calls = [], []
+    for func in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+        for node in ast.walk(func):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in ("getattr", "setattr", "delattr")
+                    and node.args and _is_self_server(node.args[0])):
+                misuses.append(f"{func.name}:{node.lineno}: {node.func.id}(self.server, ...)")
+            if not _is_self_server(node):
+                continue
+            parent = parents.get(node)
+            if not (isinstance(parent, ast.Attribute) and parent.value is node
+                    and parent.attr not in ("repo", "cfg", "config")):
+                misuses.append(f"{func.name}:{node.lineno}: {type(parent).__name__}")
+            elif parent.attr == "default_context" and isinstance(parents.get(parent), ast.Call):
+                calls.append(func.name)
+    return misuses, calls
+
+
+SERVER_MISUSES = {  # each form `_server_misuses` must catch
+    "plain alias": "server = self.server\nserver.cfg",
+    "tuple": "ctx, server = self._ctx, self.server\nserver.cfg",
+    "annotated": "s: object = self.server\ns.repo",
+    "walrus": "(s := self.server).cfg",
+    "getattr": "getattr(self.server, 'cfg')",
+    "setattr": "setattr(self.server, 'cfg', None)",
+    "direct": "self.server.config",
+    "argument": "use(self.server)",
+}
+
+
+def test_the_handler_never_reads_the_default_through_the_server():
+    import inspect
+
+    tree = ast.parse(inspect.getsource(dashboard))
+    handler = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_Handler")
+    misuses, calls = _server_misuses(handler)
+    assert misuses == []
+    assert set(calls) == {"_handle"}  # only the dispatcher picks the context
+    assert all(isinstance(getattr(dashboard.DashboardServer, name), property) for name in ("repo", "cfg", "config"))
+    # the walk catches what it is meant to catch, and only that
+    for form, body in SERVER_MISUSES.items():
+        sample = ast.parse("def f(self):\n" + "".join(f"    {line}\n" for line in body.splitlines()))
+        assert _server_misuses(sample)[0], form
+    fine = ast.parse("def f(self):\n    self.server.repos\n    self._ctx.cfg\n    self.server.token.encode()\n"
+                     "    self.server.starts.append(1)\n    ctx = self.server.default_context(self._snap)\n")
+    assert _server_misuses(fine) == ([], ["f"])
+
+
+def test_info_numbers():
+    assert dashboard.info_numbers({"board_refresh_s": 5, "done_shown": 20}) == (5.0, 20)
+    assert isinstance(dashboard.info_numbers({"board_refresh_s": 5})[0], float)
+    assert dashboard.info_numbers({}) == (2.0, 10)
+    assert dashboard.info_numbers({"board_refresh_s": 0.1, "done_shown": 0}) == (2.0, 10)
+    assert dashboard.info_numbers({"board_refresh_s": float("nan"), "done_shown": True}) == (2.0, 10)
+    assert dashboard.info_numbers({"board_refresh_s": "x", "done_shown": 1001}) == (2.0, 10)
+    assert dashboard.info_numbers({"board_refresh_s": 60, "done_shown": 1000}) == (60.0, 1000)
+
+
+def test_port_of():
+    assert dashboard.port_of({"port": 7788}) == 7788 and dashboard.port_of({"port": 0}) == 0
+    assert dashboard.port_of({"port": 65535}) == 65535
+    for block in ({}, {"port": -1}, {"port": 65536}, {"port": True}, {"port": "80"}, {"port": 1.5}, {"port": None}):
+        with pytest.raises(ValueError, match="dashboard.port"):
+            dashboard.port_of(block)
+
+
+def test_info_for_a_server_with_no_default_uses_the_user_settings(flow_repo):
+    for port in (7788, 99999):
+        user = layers.UserSettings(layers.WorkspaceSettings((), (), ()),
+                                   {"port": port, "board_refresh_s": 5, "done_shown": 20}, None)
+        server = dashboard.make_workspace_server([], user, "127.0.0.1", 0, TOKEN)
+        thread = _serve(server)
+        try:
+            status, _, body = Dash(server, server.server_address[1], flow_repo).get("/api/info")
+            info = payload(body)
+            assert status == 200 and server.default is None
+            assert info["board_refresh_s"] == 5.0 and info["done_shown"] == 20 and info["inbox_legacy"] is False
+        finally:
+            server.close()
+            thread.join(timeout=5)
+
+
+def test_a_workspace_server_binds_127_0_0_1_with_a_long_token_only():
+    user = repo_context.engine_user_settings()
+    with pytest.raises(ValueError):
+        dashboard.make_workspace_server([], user, "0.0.0.0", 0, TOKEN)
+    with pytest.raises(ValueError):
+        dashboard.make_workspace_server([], user, "127.0.0.1", 0, "x" * 10)
+
+
+def test_a_default_whose_state_dir_changed_after_load_is_refused(two, sparse_repo, tmp_path):
+    server = two.dash.server
+    assert two.b in server.live_contexts()
+    data = {**SPARSE_PACK, "paths": {"state_dir": str(tmp_path / "moved")}}
+    (sparse_repo / ".agentflow" / "config.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    status, _, body = two.dash.get("/api/board")
+    assert status == 409 and "state directory changed" in payload(body)["error"]
+    assert two.dash.get(f"/api/runs/{two.b_run.id}")[0] == 409
+    assert two.dash.get("/api/info")[0] == 200
+    assert server.default == two.b.id  # the default stays; it does not fall over to A
+    assert server.live_contexts() == [server.repos[two.a.id]]
+
+
+def test_the_default_is_sticky(two):
+    a, b = two.a, two.b
+    repos = {a.id: a, b.id: b}
+    assert dashboard.choose_default(repos, a.id, None) == a.id
+    assert dashboard.choose_default(repos, "elsewhere", None) == a.id
+    unset_a = {a.id: dataclasses.replace(a, state="not_set_up", cfg=None), b.id: b}
+    assert dashboard.choose_default(unset_a, a.id, None) == b.id
+    for state in ("not_set_up", "error", "missing"):
+        changed = {a.id: a, b.id: dataclasses.replace(b, state=state, cfg=None)}
+        assert dashboard.choose_default(changed, a.id, b.id) == b.id
+    assert dashboard.choose_default({a.id: a}, a.id, b.id) == b.id  # B left the map; it stays the default
+    dead = {key: dataclasses.replace(ctx, state="error", cfg=None) for key, ctx in repos.items()}
+    assert dashboard.choose_default(dead, a.id, None) is None
+    assert dashboard.choose_default({}, None, None) is None
+
+    server = two.dash.server
+    server.snap = dataclasses.replace(server.snap, repos={a.id: a, b.id: dataclasses.replace(b, state="not_set_up")})
+    status, _, body = two.dash.get("/api/board")
+    assert status == 409 and payload(body)["error"].startswith(f"{b.name} is not live: ")
+    server.snap = dataclasses.replace(server.snap, repos={a.id: a})
+    status, _, body = two.dash.get("/api/board")
+    assert status == 404 and payload(body)["error"] == "no repository"
+    assert two.dash.get(f"/api/runs/{two.a_run.id}")[0] == 404  # never A's run on the legacy route
+    assert server.default == b.id
+
+
+def test_make_server_wraps_one_repository_exactly_as_before(dash):
+    server = dash.server
+    (ctx,) = server.repos.values()
+    assert ctx.state == "live" and ctx.runs is None and ctx.cfg is dash.flow.cfg
+    assert server.default == ctx.id and server.workspace is False and server.skipped == ()
+    assert server.repo == dash.flow.root.resolve() and server.live_contexts() == [ctx]
+    assert server.user_error is None and server.prefer is None
+
+
+# --------------------------------------------------------------------------- /api/repos and the /api/repos/<id>/ prefix (W2)
+
+
+def at(ctx, rest: str) -> str:
+    """`rest` under `ctx`'s prefix."""
+    return f"/api/repos/{ctx.id}/{rest}"
+
+
+def _bytes(path: Path) -> bytes | None:
+    return path.read_bytes() if path.exists() else None
+
+
+def _b_pack(two, **extra) -> None:
+    """Rewrite B's pack as `SPARSE_PACK` plus `extra` and serve it; its runs directory stays the same."""
+    data = {**SPARSE_PACK, **extra}
+    (two.b.repo / ".agentflow" / "config.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    two.b.cfg = load_config_of(two.b.repo)
+
+
+def test_api_repos_lists_every_repository_with_counts(two):
+    server = two.dash.server
+    status, _, raw = two.dash.get("/api/repos")
+    data = payload(raw)
+    assert status == 200
+    rows = {row["id"]: row for row in data["repos"]}
+    assert list(rows) == [two.a.id, two.b.id]
+    assert [row["state"] for row in rows.values()] == ["live", "live"]
+    assert rows[two.a.id]["waiting"] == 1 and rows[two.b.id]["waiting"] == 0
+    assert data["default"] == server.default == two.b.id and data["skipped"] == []
+    text = raw.decode("utf-8")
+    assert "/" not in text and "\\" not in text  # no filesystem path anywhere
+    assert two.dash.get("/api/repos", token=None)[0] == 403
+
+
+def _freeze_clock(monkeypatch) -> None:
+    """Stop the clock the views read, so two answers a moment apart agree on every age and duration."""
+    from agentflow import views
+
+    frozen = datetime.now(dashboard.UTC)
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen if tz is not None else frozen.replace(tzinfo=None)
+
+    monkeypatch.setattr(views, "datetime", Frozen)
+    monkeypatch.setattr(dashboard, "datetime", Frozen)
+
+
+def _get_scoped(two, route: str, monkeypatch) -> None:
+    """Each repository's answer under its prefix, asked while the other is the default, is the one the legacy route
+    gives while it is the default; the two answers differ; and a run of one repository is no run under the other."""
+    server = two.dash.server
+    _freeze_clock(monkeypatch)
+    # what makes the two repositories' answers differ beyond their runs: a lesson of B's pack, a second run in A
+    (two.b.repo / ".agentflow" / "lessons.md").write_text(
+        "## L-0001 Run lint\n- source: 20261101-0800-feature-r0#3\n- target: gate_first_pass:lint\nRun it.\n",
+        encoding="utf-8")
+    Run.create(two.a.cfg, two.a.repo, "bug", {"task": "second"})
+    answers = {}
+    for this, other, run in ((two.a, two.b, two.a_run), (two.b, two.a, two.b_run)):
+        rest = route.format(run=run.id)
+        server.snap = dataclasses.replace(server.snap, default=this.id)  # the legacy route reads `this` now
+        legacy = two.dash.get(f"/api/{rest}")
+        server.snap = dataclasses.replace(server.snap, default=other.id)  # and the prefix must not follow it
+        scoped = two.dash.get(at(this, rest))
+        answers[this.id] = payload(scoped[2])
+        assert scoped[0] < 500 and (scoped[0], answers[this.id]) == (legacy[0], payload(legacy[2])), rest
+        if "{run}" in route:
+            status, _, body = two.dash.get(at(other, rest))
+            assert status == 404 and payload(body)["error"] == "no such run", rest
+    if route in ("board", "workflow", "inbox", "lessons", "metrics"):
+        assert answers[two.a.id] != answers[two.b.id]
+
+
+def _backlog_log(ctx) -> bytes | None:
+    return _bytes(ctx.runs / "backlog.jsonl")
+
+
+def _b_cards(two) -> None:
+    """Let B's Backlog take a bug card, as A's (the `python` pack) does."""
+    _b_pack(two, dashboard={"backlog": {"new_task": {"bug": ["issue", "task", "after"]}}})
+
+
+def _add_card(two, ctx, task: str) -> str:
+    status, _, body = two.dash.post(at(ctx, "backlog"), {"lane": "bug", "fields": {"task": task}})
+    assert status == 200, body
+    return payload(body)["key"]
+
+
+def _post_backlog(two) -> None:
+    _b_cards(two)
+    for this, other in ((two.a, two.b), (two.b, two.a)):
+        before = _backlog_log(other)
+        _add_card(two, this, f"Traceback in {this.name}")
+        assert f"Traceback in {this.name}" in _backlog_log(this).decode("utf-8")
+        assert _backlog_log(other) == before
+
+
+def _post_backlog_remove(two) -> None:
+    _b_cards(two)
+    for this, other in ((two.a, two.b), (two.b, two.a)):
+        key = _add_card(two, this, f"Traceback in {this.name}")
+        mine, theirs = _backlog_log(this), _backlog_log(other)
+        assert two.dash.post(at(other, "backlog/remove"), {"item": key})[0] in (400, 404, 409)
+        assert (_backlog_log(this), _backlog_log(other)) == (mine, theirs)
+        assert two.dash.post(at(this, "backlog/remove"), {"item": key})[0] == 200
+        assert _backlog_log(this) != mine and _backlog_log(other) == theirs
+
+
+def _post_backlog_start(two) -> None:
+    _b_cards(two)
+    for this, other in ((two.a, two.b), (two.b, two.a)):
+        key = _add_card(two, this, f"Traceback in {this.name}")
+        calls = len(two.dash.fake.calls)
+        assert two.dash.post(at(other, "backlog/start"), {"item": key})[0] in (400, 404, 409)
+        settle(two.dash)
+        assert len(two.dash.fake.calls) == calls
+        assert two.dash.post(at(this, "backlog/start"), {"item": key})[0] == 202
+        settle(two.dash)
+        assert [c["repo"] for c in two.dash.fake.calls[calls:]] == [this.repo]
+
+
+def _post_backlog_file(two) -> None:
+    text = "version: 1\nitems:\n  - id: r\n    title: Ready one\n    status: ready\n"
+    for ctx in (two.a, two.b):  # only B's pack reads its backlog.yml; A's is a capability-map pack
+        (ctx.repo / "backlog.yml").write_text(text, encoding="utf-8")
+    _b_pack(two, work_source={"kind": "backlog"})
+    a_file, b_file = two.a.repo / "backlog.yml", two.b.repo / "backlog.yml"
+    edit = {"op": "edit", "id": "r", "fields": {"title": "Renamed"}, "sha256": hashlib.sha256(text.encode()).hexdigest()}
+    status, _, body = two.dash.post(at(two.a, "backlog/file"), edit)
+    assert status in (400, 409) and payload(body)["error"]
+    assert a_file.read_text(encoding="utf-8") == text and b_file.read_text(encoding="utf-8") == text
+    status, _, body = two.dash.post(at(two.b, "backlog/file"), edit)
+    assert status == 200, body
+    assert "Renamed" in b_file.read_text(encoding="utf-8") and a_file.read_text(encoding="utf-8") == text
+
+
+def _config_text(two, ctx) -> dict:
+    status, _, body = two.dash.get(at(ctx, "config"))
+    assert status == 200
+    return payload(body)
+
+
+def _post_config_preview(two) -> None:
+    for this, other in ((two.a, two.b), (two.b, two.a)):
+        files = {c.id: Path(c.cfg.path).read_bytes() for c in (this, other)}
+        data = _config_text(two, this)
+        assert ("legacy/**" in data["text"]) == (this is two.a)
+        change = {"base_sha256": data["sha256"], "text": data["text"] + "# previewed\n"}
+        status, _, body = two.dash.post(at(this, "config/preview"), change)
+        assert status == 200 and "+# previewed" in payload(body)["diff"]
+        status, _, body = two.dash.post(at(other, "config/preview"), change)  # not the other's file's hash
+        assert status == 409
+        assert {c.id: Path(c.cfg.path).read_bytes() for c in (this, other)} == files
+
+
+def _post_config_save(two) -> None:
+    for this, other in ((two.a, two.b), (two.b, two.a)):
+        theirs = Path(other.cfg.path).read_bytes()
+        data = _config_text(two, this)
+        change = {"base_sha256": data["sha256"], "text": data["text"] + f"# saved in {this.name}\n"}
+        status, _, body = two.dash.post(at(this, "config/save"), change)
+        assert status == 200 and payload(body)["saved"] is True
+        assert f"# saved in {this.name}" in Path(this.cfg.path).read_text(encoding="utf-8")
+        assert Path(other.cfg.path).read_bytes() == theirs
+
+
+def _post_run_action(two) -> None:
+    for this, other, run, other_run in ((two.a, two.b, two.a_run, two.b_run), (two.b, two.a, two.b_run, two.a_run)):
+        mine, theirs = _bytes(run.dir / "events.jsonl"), _bytes(other_run.dir / "events.jsonl")
+        status, _, body = two.dash.post(at(other, f"runs/{run.id}/pause"))
+        assert status == 404 and _bytes(run.dir / "events.jsonl") == mine
+        assert two.dash.post(at(this, f"runs/{run.id}/pause"))[0] == 200
+        assert [e["by"] for e in two.dash.flow.events(Run.load(this.repo, run.id), "run_paused")] == ["dashboard"]
+        assert _bytes(other_run.dir / "events.jsonl") == theirs
+
+
+REPO_GETS = ["board", "workflow", "agents", "inbox", "lessons", "metrics", "scorecard", "runs/{run}",
+             *(f"runs/{{run}}/{what}" for what in ("artifacts", "plan", "files", "changes", "sessions", "events",
+                                                   "findings"))]
+REPO_POSTS = {"backlog": _post_backlog, "backlog/file": _post_backlog_file, "backlog/start": _post_backlog_start,
+              "backlog/remove": _post_backlog_remove, "config/preview": _post_config_preview,
+              "config/save": _post_config_save, "runs/<id>/<action>": _post_run_action}
+
+
+@pytest.mark.parametrize("method, route", [*(("GET", r) for r in REPO_GETS), *(("POST", r) for r in REPO_POSTS)])
+def test_every_repository_route_is_scoped_to_its_context(two, monkeypatch, method, route):
+    if method == "GET":
+        _get_scoped(two, route, monkeypatch)
+    else:
+        REPO_POSTS[route](two)
+
+
+def test_the_same_run_id_in_two_repositories_is_each_repositorys_own(two):
+    run_id = "20261126-1200-same"
+    a_run = Run.create(two.a.cfg, two.a.repo, "feature", {"module": "same"}, run_id=run_id)
+    b_run = Run.create(two.b.cfg, two.b.repo, "bug", {"task": "same"}, run_id=run_id)
+    assert payload(two.dash.get(at(two.a, f"runs/{run_id}"))[2])["lane"] == "feature"
+    assert payload(two.dash.get(at(two.b, f"runs/{run_id}"))[2])["lane"] == "bug"
+    a_run.emit("hitl_raised", kind="blocked", key="build/impl", summary="stuck")
+    questions = [hitl.Question("q1", "Which one?", [hitl.Option("A", "this one", True)], [], "spec_gap")]
+    hitl.raise_hitl(two.b.cfg, b_run, "needs_human", "define/draft", "Decide", questions)
+
+    theirs = _bytes(b_run.dir / "events.jsonl")
+    status, _, body = two.dash.post(at(two.a, f"runs/{run_id}/approve"))
+    assert status == 200 and payload(body)["resumed"] is True
+    assert _bytes(b_run.dir / "events.jsonl") == theirs and b_run.refresh()["waiting"] is not None
+    assert [s["cwd"] for s in two.dash.spawned] == [two.a.repo]
+
+    mine = _bytes(a_run.dir / "events.jsonl")
+    status, _, body = two.dash.post(at(two.b, f"runs/{run_id}/answer"), {"answers": {"q1": "A"}})
+    assert status == 200 and payload(body)["complete"] is True
+    assert _bytes(a_run.dir / "events.jsonl") == mine and b_run.refresh()["waiting"] is None
+
+    theirs = _bytes(b_run.dir / "events.jsonl")
+    assert two.dash.post(at(two.a, f"runs/{run_id}/cancel"))[0] == 200
+    assert a_run.refresh()["status"] == "cancelled" and b_run.refresh()["status"] != "cancelled"
+    assert _bytes(b_run.dir / "events.jsonl") == theirs
+
+
+def test_json_bytes_survives_a_lone_surrogate():
+    out = dashboard._json_bytes({"name": "a\udcffb"})
+    assert isinstance(out, bytes) and out.startswith(b'{"name": "a') and out.endswith(b'b"}')
+    assert dashboard._json_bytes({"x": "é<&>"}) == '{"x": "é\\u003c\\u0026\\u003e"}'.encode("utf-8")
+
+
+def test_a_repository_whose_state_dir_changed_after_load_is_refused_under_its_prefix(two, tmp_path):
+    _b_pack(two, paths={"state_dir": str(tmp_path / "moved")})
+    for rest in ("board", "workflow", "inbox", "config", f"runs/{two.b_run.id}", f"runs/{two.b_run.id}/plan"):
+        status, _, body = two.dash.get(at(two.b, rest))
+        assert status == 409 and "state directory changed" in payload(body)["error"], rest
+    status, _, body = two.dash.post(at(two.b, "backlog"), {"lane": "bug", "fields": {"task": "t"}})
+    assert status == 409 and "state directory changed" in payload(body)["error"]
+    assert two.dash.get(at(two.a, "board"))[0] == 200 and two.dash.get("/api/info")[0] == 200
+    assert two.b.id in [row["id"] for row in payload(two.dash.get("/api/repos")[2])["repos"]]
+
+
+def test_a_settings_save_lands_on_the_current_context(two, monkeypatch):
+    server, real_save = two.dash.server, config_edit.save
+
+    def save(path, proposal):  # a rescan replaces B's context while the save is being written
+        digest = real_save(path, proposal)
+        snap = server.snap
+        server.snap = dataclasses.replace(snap, repos={**snap.repos, two.b.id: dataclasses.replace(snap.repos[two.b.id])})
+        return digest
+
+    monkeypatch.setattr(config_edit, "save", save)
+    data = _config_text(two, two.b)
+    status, _, body = two.dash.post(at(two.b, "config/save"), {"base_sha256": data["sha256"],
+                                                               "text": data["text"] + "dashboard:\n  show_done_days: 3\n"})
+    assert status == 200 and payload(body)["saved"] is True
+    current = server.snap.repos[two.b.id]
+    assert current is not two.b and current.cfg.dashboard["show_done_days"] == 3
+
+
+def test_a_symlinked_agentflow_directory_cannot_be_saved_through(two, tmp_path):
+    from agentflow.repo_set import RepoRef
+
+    root = tmp_path / "linked"
+    root.mkdir()
+    run_git(root, "init", "-q", "-b", "main")
+    elsewhere = tmp_path / "elsewhere" / ".agentflow"
+    elsewhere.mkdir(parents=True)
+    target = elsewhere / "config.yaml"
+    target.write_text(yaml.safe_dump(SPARSE_PACK, sort_keys=False), encoding="utf-8")
+    (root / ".agentflow").symlink_to(elsewhere, target_is_directory=True)
+    root = root.resolve()
+    ctx = repo_context.load_context(RepoRef(pack.repo_id(root), "linked", root, "live"))
+    assert ctx.state == "error"
+    server = two.dash.server
+    server.snap = dataclasses.replace(server.snap, repos={**server.snap.repos, ctx.id: ctx})
+    before, listing = target.read_bytes(), sorted(p.name for p in elsewhere.iterdir())
+    text = before.decode("utf-8")
+    status, _, body = two.dash.post(at(ctx, "config/save"), {"base_sha256": config_edit.sha256(text),
+                                                             "text": text + "# through the link\n"})
+    assert status == 409 and "symlink" in payload(body)["error"]
+    assert target.read_bytes() == before and sorted(p.name for p in elsewhere.iterdir()) == listing
+    assert two.dash.get(at(ctx, "config"))[0] == 409
+
+
+def test_a_prefixed_route_serves_that_repository(two):
+    a_ids = [c["run_id"] for c in payload(two.dash.get(at(two.a, "board"))[2])["cards"]]
+    b_ids = [c["run_id"] for c in payload(two.dash.get(at(two.b, "board"))[2])["cards"]]
+    assert a_ids == [two.a_run.id] and b_ids == [two.b_run.id]
+    assert two.dash.get(at(two.b, "info"))[0] == 200
+    a_flow = payload(two.dash.get(at(two.a, "workflow"))[2])
+    assert a_flow == json.loads(dashboard._json_bytes(workflow_view(two.a.cfg)))
+    assert a_flow != payload(two.dash.get(at(two.b, "workflow"))[2])
+
+
+def test_a_run_id_of_one_repository_under_another_is_404(two):
+    waiting = Run.load(two.a.repo, two.a_run.id).state["waiting"]
+    assert waiting is not None
+    for rest in (f"runs/{two.a_run.id}", f"runs/{two.a_run.id}/plan"):
+        assert two.dash.get(at(two.b, rest))[0] == 404
+    assert two.dash.post(at(two.b, f"runs/{two.a_run.id}/approve"))[0] == 404
+    assert Run.load(two.a.repo, two.a_run.id).state["waiting"] == waiting
+
+
+def test_an_action_changes_only_the_repository_it_names(two):
+    logs = {path: path.read_bytes() for path in two.b.runs.glob("*/events.jsonl")}
+    assert logs
+    assert two.dash.post(at(two.a, f"runs/{two.a_run.id}/approve"))[0] == 200  # a phase approval: it rests
+    stuck = Run.create(two.a.cfg, two.a.repo, "feature", {"module": "stuck"})
+    stuck.emit("hitl_raised", kind="blocked", key="build/impl", summary="stuck")
+    status, _, body = two.dash.post(at(two.a, f"runs/{stuck.id}/approve"))
+    assert status == 200 and payload(body)["resumed"] is True
+    (spawn,) = two.dash.spawned
+    assert spawn["cwd"] == two.a.repo and spawn["command"][-2:] == ["resume", stuck.id]
+    assert {path: path.read_bytes() for path in two.b.runs.glob("*/events.jsonl")} == logs
+
+
+def _record_file_access(monkeypatch) -> list[str]:
+    """Wrap the calls every `Path` method and `glob` reach the filesystem through, recording the first argument of
+    each one a request-handler thread makes."""
+    import builtins
+    import io
+
+    seen: list[str] = []
+
+    def wrap(real):
+        def wrapper(*args, **kwargs):
+            if "process_request_thread" in threading.current_thread().name:
+                try:
+                    seen.append(os.fspath(args[0]) if args else ".")
+                except TypeError:
+                    seen.append(repr(args[0]))
+            return real(*args, **kwargs)
+        return wrapper
+
+    for module, name in ((os, "stat"), (os, "lstat"), (os, "scandir"), (os, "listdir"), (io, "open"),
+                         (builtins, "open")):
+        monkeypatch.setattr(module, name, wrap(getattr(module, name)))
+    return seen
+
+
+UNKNOWN_IDS = ["..%2f..%2fetc", "%00", "a%0ab", "%2e%2e", "", "{A_UPPER}", "x" * 5000, "{A}%2F..%2F{B}", "%7Eroot"]
+
+
+@pytest.mark.parametrize("raw", UNKNOWN_IDS, ids=["dots", "nul", "newline", "dotdot", "empty", "upper", "long",
+                                                  "slash", "tilde"])
+def test_an_id_the_map_does_not_hold_is_404_and_reads_nothing(two, monkeypatch, raw):
+    raw = raw.replace("{A_UPPER}", two.a.id.upper()).replace("{A}", two.a.id).replace("{B}", two.b.id)
+    seen = _record_file_access(monkeypatch)
+    assert two.dash.get(at(two.a, "board"))[0] == 200 and seen  # the wrappers see what a known id reads
+    for method, rest in (("GET", "board"), ("GET", f"runs/{two.a_run.id}"), ("GET", "info"),
+                         ("POST", f"runs/{two.a_run.id}/approve"), ("POST", "backlog")):
+        seen.clear()
+        status, _, body = two.dash.request(method, f"/api/repos/{raw}/{rest}", body={} if method == "POST" else None)
+        assert status == 404 and payload(body)["error"], rest
+        assert seen == [], rest
+
+
+def test_a_repository_that_cannot_serve_answers_409_with_the_reason(two, tmp_path):
+    server = two.dash.server
+    bare = repo_context.RepoContext("bare-00000001", "bare", tmp_path / "bare", state="not_set_up")
+    broken = repo_context.RepoContext("broken-00000002", "broken", tmp_path / "broken", state="error",
+                                      error="the pack broke on line 3")
+    gone = dataclasses.replace(two.b, state="missing")
+    server.snap = dataclasses.replace(server.snap, repos={c.id: c for c in (two.a, bare, broken, gone)})
+    for ctx, words in ((bare, "not set up"), (broken, "the pack broke on line 3"), (gone, "left the workspace")):
+        status, _, body = two.dash.get(at(ctx, "board"))
+        assert status == 409 and words in payload(body)["error"]
+        assert two.dash.post(at(ctx, "backlog"), {"lane": "bug", "fields": {"task": "t"}})[0] == 409
+    rows = {row["id"]: row["state"] for row in payload(two.dash.get("/api/repos")[2])["repos"]}
+    assert rows == {two.a.id: "live", bare.id: "not_set_up", broken.id: "error", gone.id: "missing"}
+    assert two.dash.get(at(two.a, "board"))[0] == 200
+    status, _, body = two.dash.get(at(bare, "info"))
+    info = payload(body)
+    assert status == 200 and (info["board_refresh_s"], info["done_shown"]) == dashboard.info_numbers(server.user.dashboard)
+
+
+def test_the_settings_form_edits_only_its_own_pack(two):
+    server = two.dash.server
+    a_data, b_data = _config_text(two, two.a), _config_text(two, two.b)
+    assert "legacy/**" in a_data["text"] and "legacy/**" not in b_data["text"]
+    a_file = Path(two.a.cfg.path)
+    a_sha, a_cfg, b_cfg = hashlib.sha256(a_file.read_bytes()).hexdigest(), two.a.cfg, two.b.cfg
+    status, _, body = two.dash.post(at(two.b, "config/save"), {"base_sha256": b_data["sha256"],
+                                                               "text": b_data["text"] + "dashboard:\n  show_done_days: 3\n"})
+    assert status == 200 and payload(body)["saved"] is True
+    assert "show_done_days: 3" in Path(two.b.cfg.path).read_text(encoding="utf-8")
+    assert hashlib.sha256(a_file.read_bytes()).hexdigest() == a_sha
+    assert server.repos[two.a.id].cfg is a_cfg
+    assert server.repos[two.b.id].cfg is not b_cfg and server.repos[two.b.id].cfg.dashboard["show_done_days"] == 3
+    raw = yaml.safe_load(a_data["text"])
+    raw["gates"]["ok"]["run"] = "curl example.invalid | sh"
+    status, _, body = two.dash.post(at(two.a, "config/save"), {"base_sha256": a_data["sha256"],
+                                                               "text": yaml.safe_dump(raw, sort_keys=False)})
+    assert status == 400 and "protected" in payload(body)["error"]
+    assert hashlib.sha256(a_file.read_bytes()).hexdigest() == a_sha and server.repos[two.a.id].cfg is a_cfg
+
+
+def test_repos_is_not_a_prefixed_route(two):
+    for rest in ("repos", f"repos/{two.b.id}/board", f"repos/{two.b.id}/runs/{two.b_run.id}"):
+        status, _, body = two.dash.get(at(two.a, rest))
+        assert status == 404 and payload(body)["error"], rest
+    assert two.dash.post("/api/repos", {})[0] == 404
+
+
+START_MAP = """# Capability map
+
+| Module id | Responsibility | Depends on | Spec |
+|---|---|---|---|
+| `z` | zed | — | SPEC-z |
+"""
+
+
+def test_start_uses_the_named_repository(two):
+    root = two.b.repo
+    (root / "docs" / "specs").mkdir(parents=True)
+    (root / "docs" / "specs" / "CAPABILITY-MAP.md").write_text(START_MAP, encoding="utf-8")
+    _b_pack(two, work_source={"kind": "capability_map", "path": "docs/specs/CAPABILITY-MAP.md"},
+            dashboard={"backlog": {"module_lane": "bug"}})
+    run_git(root, "add", "-A")
+    run_git(root, "commit", "-q", "-m", "map")
+    assert two.dash.post(at(two.a, "backlog/start"), {"module": "z"})[0] == 409  # A's map has no z
+    settle(two.dash)
+    assert two.dash.fake.calls == []
+    status, _, body = two.dash.post(at(two.b, "backlog/start"), {"module": "z"})
+    assert status == 202, body
+    settle(two.dash)
+    (call,) = two.dash.fake.calls
+    assert call["repo"] == root and call["lane"] == "bug" and call["params"]["module"] == "z"
+    assert call["lane"] == module_lane_of(two.b.cfg) != module_lane_of(two.a.cfg)
+
+
+def module_lane_of(cfg) -> str | None:
+    from agentflow.module_queue import module_lane
+
+    return module_lane(cfg)
+
+
+# --------------------------------------------------------------------------- one stream over every repository (W2)
+
+
+class Stream:
+    """An open event stream on `path` whose messages a thread collects, so a quiet stream never stalls a test."""
+
+    def __init__(self, port: int, path: str) -> None:
+        self.conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        self.conn.request("GET", path, headers={"X-Agentflow-Token": TOKEN})
+        self.response = self.conn.getresponse()
+        assert self.response.status == 200
+        assert self.response.fp.readline() == b": connected\n"  # the starting point is fixed once this arrives
+        self.messages: list[dict] = []
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        try:
+            while line := self.response.fp.readline().decode("utf-8"):
+                if line.startswith("data: "):
+                    self.messages.append(json.loads(line[len("data: "):]))
+        except (OSError, ValueError):
+            pass
+
+    def wait(self, test, seconds: float = 3.0) -> list[dict]:
+        """The messages that pass `test` once there is one, or [] after `seconds`."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            found = [m for m in list(self.messages) if test(m)]
+            if found:
+                return found
+            time.sleep(0.05)
+        return []
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def by(who: str):
+    return lambda message: message["event"].get("by") == who
+
+
+def _open(two, path: str) -> Stream:
+    return Stream(two.dash.port, path)
+
+
+def _a_then_b(two, stream: Stream) -> dict:
+    """Emit an event in A, then one in B, and return B's message once it arrives: A's, were it streamed, comes first."""
+    two.a_run.emit("run_paused", by="in-a")
+    two.b_run.emit("run_paused", by="in-b")
+    (message,) = stream.wait(by("in-b"))
+    return message
+
+
+def test_the_legacy_stream_is_the_default_repositorys_alone_and_untagged(two):
+    assert two.dash.server.default == two.b.id
+    stream = _open(two, "/api/events")
+    try:
+        message = _a_then_b(two, stream)
+        assert set(message) == {"run_id", "event"} and message["run_id"] == two.b_run.id
+        assert not [m for m in stream.messages if by("in-a")(m) or m["run_id"] == two.a_run.id]
+    finally:
+        stream.close()
+
+
+def test_the_all_stream_tags_each_message_with_its_repository(two):
+    stream = _open(two, "/api/events?all=1")
+    try:
+        message = _a_then_b(two, stream)
+        assert message == {"repo": two.b.id, "run_id": two.b_run.id, "event": message["event"]}
+        assert list(message) == ["repo", "run_id", "event"]
+        (from_a,) = stream.wait(by("in-a"))
+        assert from_a["repo"] == two.a.id and from_a["run_id"] == two.a_run.id
+    finally:
+        stream.close()
+    for query in ("all=2", "all=1&all=1", "all=yes"):
+        stream = _open(two, f"/api/events?{query}")
+        try:
+            message = _a_then_b(two, stream)
+            assert set(message) == {"run_id", "event"}, query
+            assert not stream.wait(by("in-a"), seconds=0.1), query
+        finally:
+            stream.close()
+
+
+def test_a_repository_prefixed_stream_carries_only_that_repository(two):
+    stream = _open(two, at(two.b, "events"))
+    try:
+        message = _a_then_b(two, stream)
+        assert message["repo"] == two.b.id and message["run_id"] == two.b_run.id
+        assert not [m for m in stream.messages if by("in-a")(m) or m["repo"] != two.b.id]
+    finally:
+        stream.close()
+
+
+def test_a_prefixed_stream_ignores_all(two):
+    stream = _open(two, at(two.b, "events?all=1"))
+    try:
+        message = _a_then_b(two, stream)
+        assert message["repo"] == two.b.id
+        assert not [m for m in stream.messages if by("in-a")(m) or m["repo"] != two.b.id]
+    finally:
+        stream.close()
+
+
+TWIN = "20261126-0000-twin"
+
+
+def _append(ctx, run_id: str, event: dict) -> None:
+    """Append `event` as one line to `run_id`'s log in `ctx`'s runs directory, creating the run's folder."""
+    folder = runs_root(ctx.repo) / run_id
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event) + "\n")
+
+
+def test_a_run_of_the_same_id_in_two_repositories_does_not_collide_under_quiet(two):
+    for ctx in (two.a, two.b):
+        _append(ctx, TWIN, {"type": "run_started", "ts": "x"})
+    stream = _open(two, "/api/events?all=1&quiet=1")
+    try:
+        for ctx in (two.a, two.b):
+            _append(ctx, TWIN, {"type": "agent_turn", "session_id": "s-1", "key": "plan/plan",
+                                "last_tool": f"Edit-{ctx.name}", "context_pct": 5, "ts": "y"})
+        # a shared key would hold the second one back for QUIET_EVERY_S
+        found = stream.wait(lambda m: len([x for x in stream.messages if x["event"]["type"] == "agent_activity"]) >= 2,
+                            seconds=dashboard.QUIET_EVERY_S * 0.75)
+        assert found
+        activity = [m for m in stream.messages if m["event"]["type"] == "agent_activity"]
+        assert {(m["repo"], m["run_id"], m["event"]["last_tool"]) for m in activity} == {
+            (two.a.id, TWIN, f"Edit-{two.a.name}"), (two.b.id, TWIN, f"Edit-{two.b.name}")}
+        assert not [m for m in stream.messages if m["event"]["type"] == "agent_turn"]
+    finally:
+        stream.close()
+
+
+def publish(server, repos) -> None:
+    """Swap in a snapshot holding `repos`, in order, the way `rescan` does: one assignment."""
+    server.snap = dataclasses.replace(server.snap, repos={ctx.id: ctx for ctx in repos})
+
+
+def _third_repo(tmp_path: Path):
+    root = tmp_path / "third"
+    root.mkdir()
+    run_git(root, "init", "-q", "-b", "main")
+    run_git(root, "config", "user.name", "Test")
+    run_git(root, "config", "user.email", "test@example.com")
+    run_git(root, "config", "commit.gpgsign", "false")
+    (root / ".agentflow").mkdir()
+    (root / ".agentflow" / "config.yaml").write_text(yaml.safe_dump(SPARSE_PACK, sort_keys=False), encoding="utf-8")
+    run_git(root, "add", "-A")
+    run_git(root, "commit", "-q", "-m", "init")
+    return _live_context(root, load_config_of(root))
+
+
+def test_a_repository_that_joins_mid_stream_is_not_replayed(two, tmp_path):
+    server = two.dash.server
+    c = _third_repo(tmp_path)
+    for i in (1, 2, 3):
+        _append(c, TWIN, {"type": "run_paused", "by": f"c-{i}"})
+    stream = _open(two, "/api/events?all=1")
+    try:
+        publish(server, [c, *server.repos.values()])  # first in the map, so a pass reads it before B
+        for marker in ("in-b-1", "in-b-2"):  # the second one's pass began after the swap, so it has seen C
+            two.b_run.emit("run_paused", by=marker)
+            assert stream.wait(by(marker))
+        _append(c, TWIN, {"type": "run_paused", "by": "c-4"})
+        (fourth,) = stream.wait(by("c-4"))
+        assert fourth["repo"] == c.id and fourth["run_id"] == TWIN
+        assert not [m for m in stream.messages if m["event"].get("by") in ("c-1", "c-2", "c-3")]
+    finally:
+        stream.close()
+
+
+def test_a_missing_repository_still_streams_its_runs(two):
+    server = two.dash.server
+    gone = dataclasses.replace(two.a, state="missing")
+    publish(server, [gone, server.repos[two.b.id]])
+    stream = _open(two, "/api/events?all=1")
+    try:
+        two.a_run.emit("run_paused", by="in-a")
+        (message,) = stream.wait(by("in-a"))
+        assert message["repo"] == two.a.id and message["run_id"] == two.a_run.id
+    finally:
+        stream.close()
+
+
+def test_a_repository_that_raises_does_not_end_the_stream(two, monkeypatch):
+    import shutil
+
+    real = dashboard.runs_root
+    stream = _open(two, "/api/events?all=1")
+    try:
+        two.b_run.emit("run_paused", by="b-0")
+        assert stream.wait(by("b-0"))
+        shutil.rmtree(real(two.a.repo))
+        assert repo_context.usable(two.dash.server.repos[two.a.id])  # still live: the stream must cope itself
+        for i, error in enumerate((RuntimeError, ValueError), start=1):
+            def raising(repo, error=error):
+                if Path(repo).resolve() == two.a.repo:
+                    raise error("paths.state_dir cannot be resolved")
+                return real(repo)
+
+            monkeypatch.setattr(dashboard, "runs_root", raising)
+            two.b_run.emit("run_paused", by=f"b-{i}")
+            assert stream.wait(by(f"b-{i}")), error
+    finally:
+        stream.close()
+
+
+# --------------------------------------------------------------------------- every repository stays live (W2)
+
+
+def ws_repo(parent: Path, name: str, with_pack: bool = True) -> Path:
+    """A git repository `parent/name` (no commit), with the sparse pack unless `with_pack` is False."""
+    path = parent / name
+    path.mkdir(parents=True)
+    run_git(path, "init", "-q", "-b", "main")
+    if with_pack:
+        write_sparse_pack(path)
+    return path
+
+
+def write_sparse_pack(repo: Path, **extra) -> None:
+    (repo / ".agentflow").mkdir(exist_ok=True)
+    data = {**SPARSE_PACK, **extra}
+    (repo / ".agentflow" / "config.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+def write_workspace(**workspace) -> Path:
+    """The user file holding `workspace` (each value a list of paths or names)."""
+    path = layers.user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    block = {key: [str(v) for v in values] for key, values in workspace.items()}
+    path.write_text(yaml.safe_dump({"workspace": block}), encoding="utf-8")
+    return path
+
+
+def scanned() -> tuple[list, layers.UserSettings, tuple]:
+    """The workspace the user file names now: its contexts in order, the settings and the skipped entries."""
+    settings = layers.load_user_settings()
+    found = repo_set.resolve(settings.workspace)
+    return list(repo_context.reconcile({}, found).values()), settings, found.skipped
+
+
+def workspace_server(prefer: str | None = None):
+    contexts, settings, skipped = scanned()
+    return dashboard.make_workspace_server(contexts, settings, "127.0.0.1", 0, TOKEN, prefer=prefer, skipped=skipped)
+
+
+def id_of(path: Path) -> str:
+    return pack.repo_id(path.resolve())
+
+
+@dataclass
+class Ws:
+    dash: Dash
+    root: Path
+
+    @property
+    def server(self):
+        return self.dash.server
+
+    def id(self, name: str) -> str:
+        return id_of(self.root / name)
+
+    def listed(self) -> dict:
+        status, _, body = self.dash.get("/api/repos")
+        assert status == 200
+        return payload(body)
+
+    def rows(self) -> dict:
+        return {row["id"]: row for row in self.listed()["repos"]}
+
+
+@pytest.fixture
+def ws_root(tmp_path):
+    """A workspace root holding `a` (with the sparse pack), named by the user file."""
+    root = tmp_path / "ws"
+    root.mkdir()
+    ws_repo(root, "a")
+    write_workspace(roots=[root])
+    return root
+
+
+@pytest.fixture
+def wsd(ws_root):
+    """A serving workspace server over `ws_root`."""
+    server = workspace_server()
+    thread = _serve(server)
+    yield Ws(Dash(server, server.server_address[1], None), ws_root)
+    server.close()
+    thread.join(timeout=5)
+
+
+def live_lock(run: Run) -> Path:
+    """Hold `run`'s runner lock as this (live) process, as a working runner would."""
+    lock = run.dir / LOCK_NAME
+    lock.write_text(str(os.getpid()), encoding="utf-8")
+    return lock
+
+
+def interrupted(repo: Path, item_id: str) -> None:
+    """A card start a dead dashboard left half-done: `item_starting` with no outcome."""
+    log = backlog._log(repo)
+    log.path.parent.mkdir(parents=True, exist_ok=True)
+    log.append("item_added", by="dashboard", id=item_id, lane="feature", label=item_id)
+    log.append("item_starting", by="dashboard", id=item_id)
+
+
+def item_status(repo: Path, item_id: str) -> str:
+    """`starting` while the start is half-done; `interrupted` once a dashboard has marked it failed."""
+    item = backlog.Backlog.load(repo).items[item_id]
+    return "interrupted" if item.failure and "interrupted" in item.failure else item.status
+
+
+def quiet_loops(monkeypatch) -> list[str]:
+    """Replace the background loops `serve` starts by recorders, so a test serves nothing in the background; the
+    list names each loop started."""
+    started: list[str] = []
+    for name in ("_remind_loop", "_refresh_loop", "_rescan_loop"):
+        monkeypatch.setattr(dashboard, name, lambda server, name=name: started.append(name))
+    return started
+
+
+def stop_at_once(monkeypatch, before=None) -> None:
+    """`serve_forever` runs `before(server)` (when given) and stops as Ctrl-C would."""
+    def serve_forever(self, *args, **kwargs):
+        if before is not None:
+            before(self)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dashboard.DashboardServer, "serve_forever", serve_forever)
+
+
+def test_rescan_adds_a_repository_and_keeps_the_others_by_identity(wsd):
+    server = wsd.server
+    a = server.repos[wsd.id("a")]
+    ws_repo(wsd.root, "b")
+    server.rescan()
+    assert [row["id"] for row in wsd.listed()["repos"]] == [wsd.id("a"), wsd.id("b")]
+    assert server.repos[wsd.id("a")] is a
+    assert [ctx.state for ctx in server.repos.values()] == ["live", "live"]
+
+
+def test_rescan_keeps_a_vanished_repository_while_its_run_is_live_and_drops_it_after(wsd):
+    server = wsd.server
+    b = ws_repo(wsd.root, "b")
+    server.rescan()
+    lock = live_lock(Run.create(load_config_of(b), b, "feature", {"module": "x"}))
+    write_workspace(roots=[wsd.root], exclude=["b"])
+    server.rescan()
+    assert server.repos[wsd.id("b")].state == "missing"
+    assert wsd.rows()[wsd.id("b")]["state"] == "missing"
+    lock.unlink()
+    server.rescan()
+    assert wsd.id("b") not in server.repos and list(wsd.rows()) == [wsd.id("a")]
+
+
+def test_rescan_never_raises_and_the_thread_survives_a_hostile_pack(wsd, monkeypatch, capsys):
+    server = wsd.server
+    hostile = ws_repo(wsd.root, "hostile")
+    (hostile / ".agentflow" / "config.yaml").write_bytes(b"version: 2\nname: \xff\n")
+    corrupt = ws_repo(wsd.root, "corrupt")
+    log = runs_root(corrupt) / "20261126-0000-corrupt" / "events.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_bytes(b'\xff\xfe not json\n{"seq": 1\n')
+    server.rescan()
+    rows = wsd.rows()
+    assert rows[wsd.id("hostile")]["state"] == "error" and rows[wsd.id("hostile")]["error"]
+    kept = rows[wsd.id("corrupt")]
+    # its log is read leniently, so the run still counts (as stalled), and nothing waits or is active
+    assert kept["state"] == "live" and (kept["waiting"], kept["active"]) == (0, 0)
+    assert rows[wsd.id("a")]["state"] == "live"
+
+    calls: list[int] = []
+    real = server.rescan
+
+    def spy() -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        real()
+
+    monkeypatch.setattr(server, "rescan", spy)
+    monkeypatch.setattr(dashboard, "RESCAN_EVERY_S", 0.01)
+    capsys.readouterr()
+    thread = threading.Thread(target=dashboard._rescan_loop, args=(server,), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while len(calls) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    server.stopping.set()
+    thread.join(timeout=5)
+    assert len(calls) >= 3 and not thread.is_alive()
+    assert "dashboard: rescan failed: boom\n" in capsys.readouterr().err
+
+
+def test_rescan_with_an_unusable_user_file_keeps_the_map_and_reports_it(wsd):
+    server = wsd.server
+    before = server.repos
+    path = layers.user_config_path()
+    good = path.read_text(encoding="utf-8")
+    path.write_text("workspace: {roots: 5}\n", encoding="utf-8")
+    server.rescan()
+    assert server.repos is before
+    error = wsd.listed()["user_config_error"]
+    assert error and str(path) in error and "\n" not in error
+    path.write_text(good, encoding="utf-8")
+    server.rescan()
+    assert wsd.listed()["user_config_error"] is None and list(server.repos) == list(before)
+
+
+def test_a_default_stays_put_when_it_leaves_or_breaks_and_is_adopted_once_when_there_is_none(wsd, tmp_path):
+    server, a = wsd.server, wsd.id("a")
+    ws_repo(wsd.root, "b")
+    server.rescan()
+    assert server.default == a
+
+    def board() -> tuple[int, str]:
+        status, _, body = wsd.dash.get("/api/board")
+        return status, payload(body).get("error", "")
+
+    pack_file = wsd.root / "a" / ".agentflow" / "config.yaml"
+    good = pack_file.read_bytes()
+    pack_file.unlink()  # a checkout that removes the pack
+    server.rescan()
+    assert server.repos[a].state == "not_set_up" and server.default == a
+    status, error = board()
+    assert status == 409 and "is not live" in error
+    pack_file.write_bytes(b"version: 2\nname: \xff\n")  # back, broken
+    server.rescan()
+    assert server.repos[a].state == "error" and server.default == a and board()[0] == 409
+    pack_file.write_bytes(good)
+    server.rescan()
+    assert server.repos[a].state == "live" and server.default == a and board()[0] == 200
+
+    lock = live_lock(Run.create(server.repos[a].cfg, wsd.root / "a", "feature", {"module": "x"}))
+    write_workspace(roots=[wsd.root], exclude=["a"])
+    server.rescan()
+    assert server.repos[a].state == "missing" and server.default == a
+    status, error = board()
+    assert status == 409 and "is not live" in error
+    lock.unlink()
+    server.rescan()
+    assert a not in server.repos and server.default == a and board() == (404, "no repository")
+
+    # a server with no default adopts the first usable repository once, and keeps it
+    other = tmp_path / "ws2"
+    other.mkdir()
+    m = ws_repo(other, "m", with_pack=False)
+    write_workspace(roots=[other])
+    fresh = workspace_server()
+    try:
+        assert fresh.default is None
+        fresh.rescan()
+        assert fresh.default is None
+        write_sparse_pack(m)
+        fresh.rescan()
+        assert fresh.default == id_of(m)
+        ws_repo(other, "b")  # sorts before `m`
+        fresh.rescan()
+        assert list(fresh.repos) == [id_of(other / "b"), id_of(m)] and fresh.default == id_of(m)
+    finally:
+        fresh.server_close()
+
+
+def test_a_request_sees_one_snapshot(wsd, monkeypatch):
+    server = wsd.server
+    with pytest.raises(AttributeError):
+        server.repos = {}
+    with pytest.raises(AttributeError):
+        server.default = "x"
+    ws_repo(wsd.root, "b")
+    assigned: list = []
+
+    def put(self, value) -> None:
+        assigned.append(value)
+        self.__dict__["snap"] = value
+
+    monkeypatch.setattr(dashboard.DashboardServer, "snap", property(lambda self: self.__dict__["snap"], put),
+                        raising=False)
+    server.rescan()
+    assert len(assigned) == 1
+    a, b = wsd.id("a"), wsd.id("b")
+    both = (tuple(sorted([a, b])), None, ())
+    one = ((a,), None, ("b",))
+    texts = []
+    for exclude in ([], ["b"]):
+        write_workspace(roots=[wsd.root], exclude=exclude)
+        texts.append(layers.user_config_path().read_text(encoding="utf-8"))
+    stop, mixed, seen = threading.Event(), [], set()
+
+    def read() -> None:
+        while not stop.is_set():
+            snap = server.snap
+            pair = (tuple(sorted(snap.repos)), snap.user_error, snap.user.workspace.exclude)
+            seen.add(pair)
+            if pair not in (both, one):
+                mixed.append(pair)
+            time.sleep(0)  # let the rescans have the interpreter too
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        for i in range(200):
+            layers.user_config_path().write_text(texts[(i + 1) % 2], encoding="utf-8")
+            server.rescan()
+    finally:
+        stop.set()
+        reader.join(timeout=5)
+    assert mixed == [] and seen == {both, one}
+    assert len(assigned) == 201
+
+
+def test_a_single_repository_server_never_rescans(dash, tmp_path):
+    before = dash.server.snap
+    write_workspace(roots=[tmp_path])  # a workspace exists, but this server serves the one repository
+    dash.server.rescan()
+    assert dash.server.snap is before and dash.server.workspace is False
+
+
+def test_a_settings_save_and_a_rescan_never_lose_the_save(wsd, monkeypatch):
+    server, a = wsd.server, wsd.id("a")
+    data = payload(wsd.dash.get(f"/api/repos/{a}/config")[2])
+    change = {"base_sha256": data["sha256"], "text": data["text"] + "dashboard:\n  done_shown: 7\n"}
+    saved, answers = threading.Event(), []
+    real_save, real_reconcile = config_edit.save, repo_context.reconcile
+
+    def save(*args, **kwargs):
+        out = real_save(*args, **kwargs)
+        saved.set()
+        return out
+
+    def reconcile(current, found, **kwargs):
+        # the next snapshot is built from the contexts as they are now, as new objects (a rename makes copies) ...
+        built = {key: dataclasses.replace(ctx) for key, ctx in real_reconcile(current, found, **kwargs).items()}
+        # ... then a save lands before it is published
+        poster = threading.Thread(target=lambda: answers.append(wsd.dash.post(f"/api/repos/{a}/config/save", change)),
+                                  daemon=True)
+        poster.start()
+        saved.wait(5)
+        poster.join(timeout=0.5)  # a save that does not wait for the scan stores its config here
+        return built
+
+    monkeypatch.setattr(config_edit, "save", save)
+    monkeypatch.setattr(repo_context, "reconcile", reconcile)
+    server.rescan()
+    deadline = time.monotonic() + 5
+    while not answers and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert answers and answers[0][0] == 200
+    assert server.repos[a].cfg.dashboard["done_shown"] == 7
+    assert payload(wsd.dash.get(f"/api/repos/{a}/info")[2])["done_shown"] == 7
+
+
+def test_a_save_never_gives_a_config_to_a_context_that_is_not_live(wsd, monkeypatch):
+    server, a = wsd.server, wsd.id("a")
+    data = payload(wsd.dash.get(f"/api/repos/{a}/config")[2])
+    real_save = config_edit.save
+
+    def save(*args, **kwargs):  # the repository breaks while the save is in flight
+        out = real_save(*args, **kwargs)
+        publish(server, [dataclasses.replace(server.repos[a], state="error", cfg=None, error="broken")])
+        return out
+
+    monkeypatch.setattr(config_edit, "save", save)
+    status, _, _ = wsd.dash.post(f"/api/repos/{a}/config/save",
+                                 {"base_sha256": data["sha256"], "text": data["text"] + "# saved\n"})
+    assert status == 200
+    assert server.repos[a].state == "error" and server.repos[a].cfg is None
+
+
+def test_reminders_and_rechecks_run_in_every_live_repository(two, monkeypatch):
+    server = two.dash.server
+    bare = dataclasses.replace(two.a, id="bare", state="not_set_up", cfg=None, runs=None)
+    broken = dataclasses.replace(two.a, id="broken", state="error", cfg=None, error="x")
+    publish(server, [two.a, bare, broken, two.b])
+    reminded, rechecked = [], []
+    monkeypatch.setattr(hitl, "remind_due", lambda cfg, repo, *args, **kw: reminded.append((repo, cfg)))
+    monkeypatch.setattr(preflight, "recheck_waiting", lambda cfg, repo, **kw: rechecked.append((repo, cfg)))
+    dashboard.remind_once(server)
+    expected = [(two.a.repo, two.a.cfg), (two.b.repo, two.b.cfg)]
+    assert reminded == expected and rechecked == expected
+
+
+def test_one_repository_failing_does_not_stop_the_others_and_is_named(two, monkeypatch, capsys):
+    server = two.dash.server
+    monkeypatch.setattr(module_queue, "backlog_settings", lambda cfg: {"module_lane": "feature"})
+    refreshed: list[Path] = []
+
+    def refresh(cfg, repo) -> None:
+        refreshed.append(Path(repo))
+        if Path(repo) == two.a.repo:
+            raise OSError("disk full")
+
+    monkeypatch.setattr(backlog, "refresh", refresh)
+    capsys.readouterr()
+    dashboard.refresh_round(server)
+    assert refreshed == [two.a.repo, two.b.repo]
+    assert f"dashboard: {two.a.name}: backlog refresh failed: disk full\n" in capsys.readouterr().err
+
+    rechecked: list[Path] = []
+
+    def remind(cfg, repo, *args, **kw) -> None:
+        if Path(repo) == two.a.repo:
+            raise RuntimeError("no notifier")
+
+    monkeypatch.setattr(hitl, "remind_due", remind)
+    monkeypatch.setattr(preflight, "recheck_waiting", lambda cfg, repo, **kw: rechecked.append(Path(repo)))
+    dashboard.remind_once(server)
+    assert rechecked == [two.a.repo, two.b.repo]
+    assert f"dashboard: {two.a.name}: reminders failed: no notifier\n" in capsys.readouterr().err
+
+    single = make_server(two.b.repo, two.b.cfg, "127.0.0.1", 0, TOKEN)
+    try:
+        monkeypatch.setattr(backlog, "refresh", lambda cfg, repo: (_ for _ in ()).throw(OSError("disk full")))
+        dashboard.refresh_once(single)
+        assert capsys.readouterr().err == "dashboard: backlog refresh failed: disk full\n"
+        dashboard.refresh_round(single)
+        assert capsys.readouterr().err == "dashboard: backlog refresh failed: disk full\n"
+    finally:
+        single.server_close()
+
+
+def test_refreshes_run_one_repository_at_a_time(two, monkeypatch):
+    marks: list[tuple[str, Path]] = []
+
+    def refresh(cfg, repo) -> None:
+        marks.append(("in", Path(repo)))
+        time.sleep(0.05)
+        marks.append(("out", Path(repo)))
+
+    monkeypatch.setattr(module_queue, "backlog_settings", lambda cfg: {"module_lane": "feature"})
+    monkeypatch.setattr(backlog, "refresh", refresh)
+    dashboard.refresh_round(two.dash.server)
+    a, b = two.a.repo, two.b.repo
+    assert marks == [("in", a), ("out", a), ("in", b), ("out", b)]
+
+
+def test_prepare_settles_every_repository_that_is_live_at_start(ws_root, monkeypatch, capsys):
+    a, b = ws_root / "a", ws_repo(ws_root, "b")
+    for repo in (a, b):
+        interrupted(repo, "card:x")
+    contexts, settings, skipped = scanned()
+    broken = {"on": True}
+    real_load = backlog.Backlog.load.__func__
+
+    def load(cls, repo):
+        if broken["on"] and Path(repo).resolve() == a.resolve():
+            raise OSError("unreadable")
+        return real_load(cls, repo)
+
+    monkeypatch.setattr(backlog.Backlog, "load", classmethod(load))
+    started = quiet_loops(monkeypatch)
+    late: dict[str, Path] = {}
+
+    def join_later(server) -> None:  # a repository that joins after start-up
+        late["c"] = ws_repo(ws_root, "c")
+        interrupted(late["c"], "card:y")
+        server.rescan()
+        assert id_of(late["c"]) in server.repos
+
+    stop_at_once(monkeypatch, join_later)
+    capsys.readouterr()
+    dashboard.serve_workspace(contexts, settings, "127.0.0.1", 0, TOKEN, skipped=skipped, announce=lambda text: None)
+    broken["on"] = False
+    err = capsys.readouterr().err
+    assert "dashboard: a: prepare failed: unreadable\n" in err
+    assert item_status(a, "card:x") == "starting"  # A's prepare failed; it is left as it was
+    assert item_status(b, "card:x") == "interrupted"
+    failures = [e for e in backlog._log(b).read() if e["type"] == "item_failed"]
+    assert len(failures) == 1
+    assert "dashboard: b: card card:x was starting when the last dashboard stopped" in err
+    assert item_status(late["c"], "card:y") == "starting"
+    assert started == ["_remind_loop", "_refresh_loop", "_rescan_loop"]
+
+
+def test_a_context_that_stops_being_usable_leaves_every_background_pass(two, monkeypatch, tmp_path):
+    server = two.dash.server
+    data = {**SPARSE_PACK, "paths": {"state_dir": str(tmp_path / "moved")}}
+    (two.b.repo / ".agentflow" / "config.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    reminded, rechecked, refreshed = [], [], []
+    monkeypatch.setattr(hitl, "remind_due", lambda cfg, repo, *args, **kw: reminded.append(Path(repo)))
+    monkeypatch.setattr(preflight, "recheck_waiting", lambda cfg, repo, **kw: rechecked.append(Path(repo)))
+    monkeypatch.setattr(module_queue, "backlog_settings", lambda cfg: {"module_lane": "feature"})
+    monkeypatch.setattr(backlog, "refresh", lambda cfg, repo: refreshed.append(Path(repo)))
+    dashboard.remind_once(server)
+    dashboard.refresh_round(server)
+    assert reminded == rechecked == refreshed == [two.a.repo]
+    server.snap = dataclasses.replace(server.snap, default=two.a.id)  # the merged stream needs a usable default
+    stream = _open(two, "/api/events?all=1")
+    try:
+        moved = Run.create(load_config_of(two.b.repo), two.b.repo, "feature", {"module": "moved"})
+        moved.emit("run_paused", by="in-moved-b")
+        for marker in ("in-a-1", "in-a-2"):  # the second one's pass began after B's event was written
+            two.a_run.emit("run_paused", by=marker)
+            assert stream.wait(by(marker))
+        assert not [m for m in stream.messages if m.get("repo") == two.b.id]
+    finally:
+        stream.close()
+
+
+def test_log_and_announce_lines_escape_a_hostile_name(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "ws"
+    root.mkdir()
+    name = "a\x1b[31mb"
+    try:
+        hostile = ws_repo(root, name)
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("this filesystem refuses an escape byte in a folder name")
+    ws_repo(root, "z")
+    write_workspace(roots=[root])
+    contexts, settings, skipped = scanned()
+    assert [ctx.state for ctx in contexts] == ["live", "live"]
+    escaped = "a\\x1b[31mb"
+    monkeypatch.setattr(module_queue, "backlog_settings", lambda cfg: {"module_lane": "feature"})
+    monkeypatch.setattr(backlog, "refresh", lambda cfg, repo: (_ for _ in ()).throw(OSError("disk full\x1b[0m")))
+    server = dashboard.make_workspace_server(contexts, settings, "127.0.0.1", 0, TOKEN, prefer=id_of(hostile))
+    try:
+        capsys.readouterr()
+        dashboard.refresh_round(server)
+    finally:
+        server.server_close()
+    err = capsys.readouterr().err
+    assert f"dashboard: {escaped}: backlog refresh failed: disk full\\x1b[0m\n" in err and "\x1b" not in err
+    quiet_loops(monkeypatch)
+    stop_at_once(monkeypatch)
+    texts: list[str] = []
+    dashboard.serve_workspace(contexts, settings, "127.0.0.1", 0, TOKEN, prefer=id_of(hostile), skipped=skipped,
+                              announce=texts.append)
+    assert escaped in texts[0] and "\x1b" not in "".join(texts)
+
+
+def test_serve_workspace_announces_how_many_repositories_it_covers(ws_root, monkeypatch):
+    ws_repo(ws_root, "b")
+    contexts, settings, skipped = scanned()
+    started = quiet_loops(monkeypatch)
+    stop_at_once(monkeypatch)
+    texts: list[str] = []
+    dashboard.serve_workspace(contexts, settings, "127.0.0.1", 0, TOKEN, skipped=skipped, announce=texts.append)
+    first, last = texts
+    assert f"/#token={TOKEN}" in first and "2 repositories" in first and last == "dashboard stopped"
+    assert started == ["_remind_loop", "_refresh_loop", "_rescan_loop"]
+
+    started.clear()
+    texts.clear()
+    a = ws_root / "a"
+    dashboard.serve(a, load_config_of(a), "127.0.0.1", 0, TOKEN, announce=texts.append)
+    first, last = texts
+    assert re.fullmatch(r"agentflow dashboard: http://127\.0\.0\.1:[0-9]+/#token=" + re.escape(TOKEN) + "\n"
+                        r"Keep this URL private: the token lets anyone with it approve checkpoints\. "
+                        r"Ctrl-C stops the server\.", first)
+    assert last == "dashboard stopped"
+    assert started == ["_remind_loop", "_refresh_loop"]  # one repository: no rescan

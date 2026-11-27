@@ -7,6 +7,24 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.15] - 2026-11-26
+
+### Added
+- `agentflow dashboard` serves every repository of your workspace from one process, one port and one token, and runs from any directory when your user file names a workspace. Each repository stays live in the background (reminders, environment rechecks and the Backlog refresh, one repository at a time), and the dashboard rescans the workspace every minute, so a repository that joins or leaves needs no restart. The page and the legacy routes still show one repository, the default (the one you started in, else the first live one), until the switcher ships. With no workspace, or with `--config`, it serves the one repository you start in, as before.
+- `GET /api/repos` lists the workspace's repositories with their state (`live`, `not_set_up`, `missing` or `error`, with the reason), pack version and `waiting`, `active` and `failed` counts, plus the skipped entries, and `/api/repos/<id>/…` serves every API route for that one repository. An unknown id is a 404 that reads no file.
+- `/api/events?all=1` streams every served repository's events on one connection (a repository that left the workspace while a run of it is live included), each message tagged with its `repo` id, and `/api/repos/<id>/events` streams one repository's, tagged. The legacy `/api/events` stays the default repository's, untagged.
+- A dashboard whose port is in use says `another dashboard may be running; use --port 0`.
+- The playbook's section 17 covers the multi-repository dashboard and its known limits.
+
+### Changed
+- `workspace list` and `--all` now report a root's child that git refuses, whose main checkout is outside the root, or whose path is not valid UTF-8, instead of dropping it silently.
+- A single-repository `agentflow dashboard` prints a `warning:` line when your user file's `workspace` block can't be read, and still serves the repository.
+- A workspace dashboard shows a repository whose `paths.state_dir` is inside the repository's own checkout, another workspace repository's checkout or a workspace root, or points at another repository's state, as `error` and does not serve it; the CLI and a single-repository dashboard are unaffected.
+
+### Fixed
+- A user config file or a pack that is not valid UTF-8 is now a load error naming the file, for the CLI and the dashboard alike.
+- `agentflow dashboard` with a port outside 0 to 65535 (from `--port`, the user file or the pack) prints `error: dashboard.port …` and exits 1 instead of a traceback.
+
 ## [3.14] - 2026-11-26
 
 ### Fixed

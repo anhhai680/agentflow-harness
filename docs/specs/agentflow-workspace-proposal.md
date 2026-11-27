@@ -206,14 +206,19 @@ logged with its name and never stops the others. A rescan (1) adds or retires co
 |---|---|
 | `/api/repos` | the workspace: `id`, `name`, `state`, pack version and counts `waiting`, `active`, `failed`; plus the skipped entries |
 | `/api/repos/<id>/…` | every route the legacy API serves, with that repository's context |
-| `/api/inbox`, `/api/agents` (legacy paths) | one repository: unchanged. Several: every repository's items, each with a `repo` field |
+| `/api/inbox`, `/api/agents` (legacy paths) | one repository: unchanged. Several: every repository's items, each with a `repo` field (from W3; in W2 they are the default repository's, untagged, and `/api/repos/<id>/inbox` and `/api/repos/<id>/agents` serve each repository's) |
 | every other legacy `/api/...` path | resolves to `default`; with no `default`, 404 |
 | `/api/user-config` (GET, POST) | the user-level settings form and its save (section 5) |
-| `/api/events` | one SSE stream; each message gains `repo` |
+| `/api/events` | one SSE stream; each message gains `repo`. In W2 the legacy `/api/events` is the default repository's stream, untagged, `/api/repos/<id>/events` is one repository's, tagged, and the merged, tagged stream is `/api/events?all=1`; W3 moves the page to it |
 
 `<id>` is looked up in the server's own map, **never** turned into a path. A request can reach only a repository the
 last rescan named. A run id is resolved under that repository's `runs/` root by the existing `_run` check (regex, no
 symlink, parent equals the root), so a run id of A sent to B is a 404.
+
+Until W3 moves the page, `/api/inbox`, `/api/agents` and `/api/events` (the legacy paths) stay the default
+repository's, byte for byte: the W2 page would show another repository's inbox rows that its actions cannot reach,
+and would refresh the wrong card for a run id that two repositories share. The merged, tagged stream is
+`/api/events?all=1` from W2.
 
 #### 4.4 The page
 
@@ -366,12 +371,13 @@ No test calls a real model or GitHub (the fake agent and fake `gh` stay). New te
   with `-C` is refused; the existing single-repository output is byte-identical (the golden `explain` files and the
   current `status` tests do not change).
 - **Dashboard**: a server over the two toy repositories. `/api/repos` lists both with counts; a run id of A under
-  `/api/repos/<B>/runs/<id>` is 404; an unknown repository id is 404 and no request value reaches a path; the legacy
-  `/api/inbox` and `/api/agents` return each item with `repo` when several are live; an approve for an item of A
-  changes A's run and not B's; the SSE stream tags events with `repo`; one repository's refresh failing is logged and
-  the others refresh; a rescan adds a new repository and retires a missing one only after its runs end; the server
-  starts outside a repository, and with no workspace opens with the empty state; a one-repository server serves the
-  legacy routes exactly as before.
+  `/api/repos/<B>/runs/<id>` is 404; an unknown repository id is 404 and no request value reaches a path; an approve
+  for an item of A changes A's run and not B's; the SSE stream tags events with `repo`; one repository's refresh
+  failing is logged and the others refresh; a rescan adds a new repository and retires a missing one only after its
+  runs end; the server starts outside a repository, and with no workspace opens with the empty state; a
+  one-repository server serves the legacy routes exactly as before.
+- **Dashboard, W3**: the legacy `/api/inbox` and `/api/agents` return each item with `repo` when several are live, and
+  the page's stream is `/api/events?all=1`.
 - **Settings** (`test_config_edit.py`): a `workspace.*` save lands in the user file and not in any pack; a project field
   lands in the pack; `hitl.notify`, `agents.*.user_settings`, `dashboard.host` and any `_PROTECTED_KEYS` key sent to
   `/api/user-config` are 400 and change nothing; a stale sha256 is a conflict; comments survive; a symlinked user file
@@ -402,7 +408,7 @@ No test calls a real model or GitHub (the fake agent and fake `gh` stay). New te
 |---|---|---|
 | **W1 — workspace settings, CLI** | the `workspace.*` and dashboard user keys, `load_user_settings`, `repo_set.py`, `-C`, `--all`, `workspace list`, the `validate` checks, playbook §10, §14, §17. The workspace is edited by hand in the user file until W4. *(security overlay: `layers.py`)* | none |
 | **W2 — one server, many repositories** | `RepoContext`, the map and rescan, `/api/repos`, the `/api/repos/<id>/…` prefix, tagged SSE, staggered refresh, `dashboard` startable anywhere. The page still shows the default repository, so the legacy API and UI stay compatible. | W1 |
-| **W3 — the page** | `repos.js` (switcher, badges, not-set-up group), cross-repository Inbox and Agents, the `core.js` prefix, the repository name in notification titles and the tab title. | W2 |
+| **W3 — the page** | `repos.js` (switcher, badges, not-set-up group), cross-repository Inbox and Agents, the merged `/api/inbox` and `/api/agents` (each item with `repo`) and the page's switch to `/api/events?all=1`, the `core.js` prefix, the repository name in notification titles and the tab title. | W2 |
 | **W4 — two-level Settings** | the User section, field routing with save-target badges, `/api/user-config` and its guarded write, the empty-state onboarding. *(security overlay: `config_edit.py` write path)* | W2 |
 | **W5 — cap and digest (conditional)** | `workspace.max_active_runs` held with a lock under `user_state_root()`, and a merged digest; built only if real use shows the need. | W2 |
 
@@ -429,7 +435,8 @@ single-repository behaviour is already pinned by the existing tests. W3 and W4 a
 7. A field that belongs to the user level saves to the user file and a project field saves to the selected repository's
    pack, each marked on the page. A request to write `hitl.notify`, `agents.*.user_settings` or `dashboard.host`
    through `/api/user-config` is refused and changes nothing.
-8. One repository's failing refresh, pack or `gh` never delays or stops another repository's refresh, reminders or runs.
+8. One repository's failing refresh, pack or `gh` never stops another repository's refresh, reminders or runs; a slow
+   one may delay the next within a round.
 9. `ruff`, `validate` (0 warnings) and `test_portability.py` pass.
 
 ## Alternatives considered
@@ -494,7 +501,11 @@ the resolved map.
   main checkout, which can be anywhere on the machine, and then joins the workspace. That is harmless for read-only
   views. Before the dashboard starts runs from the map, decide whether a root's child may resolve to a checkout outside
   its root (recommendation: no, drop it with a `Skipped` line that says so).
+  Settled in the W2 plan: such a child is dropped with a `Skipped` line that names its main checkout.
 - **`UserSettings.dashboard` is unvalidated** beyond what `check_user` and `validate` already do. W2 reads `port`,
   `board_refresh_s` and `done_shown` from it and must range-check them as `validate` does.
+  Settled in the W2 plan: the dashboard range-checks them (`info_numbers`, `port_of`); a bad port is an error that
+  names `dashboard.port`, and a bad refresh or count becomes its default.
 - **A git-refused root child is dropped silently** (a submodule, a `--separate-git-dir` repository). `workspace list`
   cannot say why a repository is missing; W2 or W3 should give it a `Skipped` line.
+  Settled in the W2 plan: it is a `Skipped` line with its folder name, which `workspace list` and `--all` print.
