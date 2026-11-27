@@ -82,6 +82,7 @@ async function afterUserSave() {
   ui.workflow = null;
   await loadUserSettings();
   await loadRepos();
+  $("user-prompt").hidden = !emptyStart(ui.repos);  // drawn above from the list before the save: the folder may be in now
   if (before === 0 && repoCount(ui.repos) > 0) {
     loadInfo();
     boardRefresh();

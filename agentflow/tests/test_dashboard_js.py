@@ -1383,3 +1383,21 @@ def test_an_empty_start_asks_for_a_folder_and_hides_the_repository_form():
       [empty, [nodes['user-prompt'].hidden, nodes['settings-repo'].hidden, nodes['settings-repo-title'].textContent, asked]]""", data)
     assert got[0] == [False, True, False, True, 0]  # no repository: the prompt, the cursor in the roots, no /api/config
     assert got[1] == [True, False, "Repository: billing", ["/api/config"]]
+
+
+def test_the_folder_prompt_goes_once_a_save_lists_a_repository():
+    got = js_async(USER_FORM, REC_EL + """var ok = null;
+      ui = {repos: {repos: []}, multi: false, repo: null, workflow: null, view: 'board'};
+      toast = () => {}; diffNode = () => null; dialog = (title, body, onOk) => { ok = onOk; };
+      loadRepos = async () => { ui.repos = {repos: [{id: 'a', name: 'a', state: 'live'}]}; };
+      loadInfo = () => {}; boardRefresh = () => {};
+      api = async (path) => path.endsWith('/preview') ? {changed: true, ok: true, diff: '', issues: []}
+        : path.endsWith('/save') ? {ok: true, sha256: 'b', restart: [], rescanned: true}
+        : {sha256: 'b', exists: true, editable: true, error: null, rescans: true, sections: []};
+      (async () => {
+        userSettings.data = {sha256: 'a', exists: false, editable: true, error: null, rescans: true, sections: []};
+        renderUserSettings(); const before = nodes['user-prompt'].hidden;
+        userSettings.edits.set('k', {key: ['workspace', 'roots'], value: ['~/code']});
+        await reviewUserSettings(); await ok();
+        return [before, nodes['user-prompt'].hidden]; })()""", None)
+    assert got == [False, True]  # asked for a folder; gone once the save listed its repository
