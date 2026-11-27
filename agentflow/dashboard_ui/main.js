@@ -159,7 +159,13 @@ function route() {
     history.replaceState(null, "", routeHash(fixed));
     where = parseRoute(location.hash);
   }
-  if (want !== ui.repo) applyRepo(want);
+  if (want !== ui.repo) {
+    if (!settingsMayLeave()) {  // kept: the address goes back to what the page shows
+      history.replaceState(null, "", routeHash(shownRoute()));
+      return;
+    }
+    applyRepo(want);
+  }
   closePeek();
   if (where.view === "run") {
     openRun(where.run, where.tab, where.sub);
@@ -171,6 +177,12 @@ function route() {
     if (ui.board) renderBoard(ui.board);
   }
   show(where.view);
+}
+
+// The route of what the page shows now, in the selected repository.
+function shownRoute() {
+  if (ui.view === "run" && ui.run) return { view: "run", run: ui.run.id, tab: ui.run.tab, sub: ui.run.sub };
+  return { view: ui.view, query: ui.boardQuery };
 }
 
 restoreMetricsChoice();

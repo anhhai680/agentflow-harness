@@ -5,7 +5,7 @@
 // The form sends only the fields that changed ({key, value}); the YAML tab sends the whole text. Either way the
 // server checks the result as `agentflow validate` does and refuses protected settings, and the dialog shows the diff.
 
-const settings = { data: null, mode: "form", edits: new Map(), rows: new Map(), yamlDirty: false };
+const settings = { data: null, mode: "form", edits: new Map(), rows: new Map(), yamlDirty: false, request: 0 };  // `request`: the newest load
 const keyId = (key) => JSON.stringify(key);
 const same = (a, b) => JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
 
@@ -168,12 +168,16 @@ function settingsMode(mode) {
 }
 
 async function loadSettings() {
+  const request = ++settings.request;  // an older answer (another repository's, after a switch) is dropped
   try {
-    settings.data = await api("/api/config");
+    const data = await api("/api/config");
+    if (request !== settings.request) return;
+    settings.data = data;
     settings.edits.clear();
     settings.yamlDirty = false;
     renderSettings();
   } catch (err) {
+    if (request !== settings.request) return;
     $("settings-status").textContent = "Could not load the config: " + err.message;
   }
 }

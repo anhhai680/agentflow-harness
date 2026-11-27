@@ -1010,3 +1010,35 @@ def test_waiting_total_sums_every_row():
 def test_a_repository_name_comes_from_the_list_else_the_id():
     assert js(["repos.js"], "ui = {repos: args}; [repoName('lib-0a1b2c3d'), repoName('nope')]", REPOS) == ["lib", "nope"]
     assert js(["repos.js"], "ui = {repos: null}; repoName('x')", None) == "x"
+
+
+def test_only_an_empty_list_or_no_selection_shows_no_repository():
+    broken = {**REPOS["repos"][3]}
+    cases = [({"repos": []}, False, None), ({"repos": [broken]}, False, None), ({"repos": REPOS["repos"][:1]}, False, None),
+             (REPOS, True, None), (REPOS, True, "lib-0a1b2c3d"), (REPOS, True, "api-1a2b3c4d"), (None, False, None)]
+    got = js(["repos.js"], "args.map(([view, multi, repo]) => nothingToShow(view, multi, repo))", cases)
+    # a page of one whose repository is broken asks the legacy route and shows its reason, as before
+    assert got == [True, False, False, True, False, False, False]
+
+
+def test_leaving_a_repository_asks_before_dropping_unsaved_settings():
+    stubs = ("ui = {repos: null, repo: 'a'}; var asked = []; settings = {edits: new Map([['k', 1]]), yamlDirty: false};"
+             "confirm = (text) => { asked.push(text); return answer; };")
+    no = js(["repos.js"], stubs + "var answer = false; [settingsMayLeave(), settings.edits.size, asked]", None)
+    assert no == [False, 1, ["Discard the unsaved Settings changes in a?"]]
+    yes = js(["repos.js"], stubs + "var answer = true; [settingsMayLeave(), settings.edits.size, settingsMayLeave(), asked.length]", None)
+    assert yes == [True, 0, True, 1]  # once let go, the route that follows does not ask again
+    clean = js(["repos.js"], stubs + "settings.edits.clear(); var answer = false; [settingsMayLeave(), asked.length]", None)
+    assert clean == [True, 0]
+
+
+def test_a_late_config_answer_of_another_load_is_dropped():
+    got = js_async([DOM_STUB, "settings.js"], """var rendered = [], answers = {};
+      api = (path) => new Promise((resolve) => { answers[Object.keys(answers).length] = resolve; });
+      renderSettings = () => rendered.push(settings.data.name);
+      (async () => {
+        const first = loadSettings(); const second = loadSettings();
+        answers[1]({name: 'new'}); await second; answers[0]({name: 'old'}); await first;
+        const third = loadSettings(); settings.request++; answers[2]({name: 'switched away'}); await third;
+        return [rendered, settings.data.name]; })()""", None)
+    assert got == [["new"], "new"]

@@ -51,8 +51,10 @@ const waitingTotal = (view) => ((view && view.repos) || []).reduce((sum, r) => s
 // A stream message is the page's own when the page shows one repository, or when it is the selected repository's.
 const streamOwn = (msg, multi, repo) => !multi || (!!msg && msg.repo === repo);
 
-// Nothing to fetch: a page of several with no repository selected, or a page whose list holds no live repository.
-const nothingToShow = (view, multi, repo) => !!view && (multi ? repo === null : !((view.repos || []).some(selectable)));
+// Nothing to fetch: a page of several with no repository selected, or a page with no repository at all. A page of one
+// whose repository is not live still asks the legacy routes, so it shows their reason, as it always has; so does a
+// page of several whose selected repository stopped being live.
+const nothingToShow = (view, multi, repo) => !!view && (multi ? repo === null : !(Array.isArray(view.repos) && view.repos.length));
 
 const repoName = (id) => { const row = repoRow(ui.repos, id); return row && row.name ? row.name : String(id === null || id === undefined ? "" : id); };
 
@@ -117,10 +119,20 @@ function renderRepos() {
   nav.replaceChildren(...(ui.multi ? chipModel(ui.repos, ui.repo).map(repoChipNode) : []));
 }
 
+// Whether the page may leave the selected repository: Settings holds no unsaved edit, or the reader lets them go (then
+// they are dropped here, so the route that follows does not ask again). A chip click and a route both ask.
+function settingsMayLeave() {
+  if (!settings.edits.size && !settings.yamlDirty) return true;
+  if (!confirm("Discard the unsaved Settings changes in " + repoName(ui.repo) + "?")) return false;
+  settings.edits.clear();
+  settings.yamlDirty = false;
+  return true;
+}
+
 // A chip click: the same view under the new prefix (a Run page goes to the Board). Nothing on the server changes.
 function selectRepo(id) {
   if (id === ui.repo || !selectable(repoRow(ui.repos, id))) return;
-  if ((settings.edits.size || settings.yamlDirty) && !confirm("Discard the unsaved Settings changes in " + repoName(ui.repo) + "?")) return;
+  if (!settingsMayLeave()) return;
   storeRepo(id);
   const where = parseRoute(location.hash);
   location.hash = routeHash(where.view === "run" ? { view: "board", query: ui.boardQuery, repo: id } : Object.assign(where, { repo: id }));
@@ -140,10 +152,15 @@ function applyRepo(id) {
   ui.files = null;
   ui.sessions = null;
   ui.plan = null;
+  ui.activity = null;
+  ui.comments.clear();  // keyed by run id, path and sha: another repository's run of the same id is another run
+  lastActivity.clear();
   ui.inbox.view = null;
   ui.inbox.gone.clear();
   ui.inbox.armed = null;
+  disarmBacklog();  // an idea armed in the old repository never starts the new one's idea of the same key
   closePeek();
+  settings.request++;  // a /api/config answer still out is the old repository's: it is dropped
   settings.data = null;
   settings.edits.clear();
   settings.yamlDirty = false;
