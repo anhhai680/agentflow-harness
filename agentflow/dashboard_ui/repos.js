@@ -58,6 +58,13 @@ const nothingToShow = (view, multi, repo) => !!view && (multi ? repo === null : 
 
 const repoName = (id) => { const row = repoRow(ui.repos, id); return row && row.name ? row.name : String(id === null || id === undefined ? "" : id); };
 
+// A merged view's `errors` (`[{repo, error}]`: a repository whose read failed) as lines of text, `<repo name>: <error>`.
+const viewErrorLines = (errors) => (Array.isArray(errors) ? errors : []).map((e) => repoName(e && e.repo) + ": " + String((e && e.error) || ""));
+
+// Which repository the Inbox and Agents ask for: on a page of several with the All chip on, every one (a workspace
+// route, null); otherwise the selected one (undefined), which is tagged when the server holds several.
+const viewRepo = () => (ui.multi && ui.allRepos ? null : undefined);
+
 // ---- the selection, kept for the tab
 
 function storedRepo() {
@@ -100,9 +107,36 @@ async function loadRepos() {
   document.title = tabTitle(view);
   if (ui.multi) setInboxBadge(waitingTotal(view));
   renderRepos();
+  renderAllChips();
   if (first || ui.repo === before) return;
   if (reset) route();
   else history.replaceState(null, "", routeHash(Object.assign(parseRoute(location.hash), { repo: ui.repo })));  // the prefix alone
+}
+
+// The "All repositories" chips of the Inbox and Agents: shown on a page of several, one choice for both.
+function renderAllChips() {
+  for (const id of ["inbox-all", "agents-all"]) {
+    const chip = $(id);
+    if (!chip) continue;
+    chip.hidden = !ui.multi;
+    chip.setAttribute("aria-pressed", String(ui.allRepos));
+  }
+}
+
+// A click on either chip: the other views of the same rows change with it, so what was drawn from the old choice is
+// dropped (an item missing from the new view is not "decided elsewhere") and the next round fetches the new one.
+function setAllRepos(on) {
+  if (!!on === ui.allRepos) return;
+  ui.allRepos = !!on;
+  disarmInbox();
+  ui.inbox.view = null;
+  ui.inbox.gone.clear();
+  ui.inbox.sent.clear();
+  ui.agents = null;
+  dirty.inbox = true;
+  dirty.agents = true;
+  renderAllChips();
+  boardRefresh();
 }
 
 function repoChipNode(chip) {

@@ -347,6 +347,7 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
       <span class="muted">Group by</span>
       <button id="inbox-group-run" type="button" aria-pressed="true">Run</button>
       <button id="inbox-group-kind" type="button" aria-pressed="false">Kind</button>
+      <button id="inbox-all" type="button" aria-pressed="true" hidden>All repositories</button>
     </div>
     <p id="inbox-hint" class="muted">j/k move · o open · a approve (press twice) · r request changes</p>
     <div id="inbox-list"></div>
@@ -376,6 +377,7 @@ button.src { font-size: 11px; padding: 1px 6px; margin: 2px 4px 2px 0; }
     <div id="workflow-human"></div>
   </section>
   <section id="agents-view" hidden>
+    <div class="moves"><button id="agents-all" type="button" aria-pressed="true" hidden>All repositories</button></div>
     <p id="agents-summary"></p>
     <div id="agents-live"></div>
     <h2 class="lane" id="exited-title"></h2>

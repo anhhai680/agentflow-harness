@@ -10,6 +10,7 @@ let boardRefreshMs = 2000;  // `/api/info`'s board_refresh_s, once it answers
 async function refreshBoardNow() {
   if (nothingToShow(ui.repos, ui.multi, ui.repo)) { $("summary").textContent = NO_REPO_TEXT; return; }  // the flags stay for when one comes
   const repo = ui.repo;  // a switch while the fetches run makes what they bring another repository's
+  const which = viewRepo();  // the Inbox and Agents: every repository (null) or the selected one, as of this round
   const wantBoard = dirty.board;
   const wantAgents = ui.view === "agents" || dirty.agents;
   const wantWorkflow = !ui.workflow;  // fetched once, and again after Settings saves the config
@@ -20,8 +21,8 @@ async function refreshBoardNow() {
   if (!wantBoard && !wantAgents && !wantWorkflow && !wantInbox) return;
   try {
     const [boardData, agentsData, workflow, inboxData] = await Promise.all([wantBoard ? api("/api/board") : null,
-      wantAgents ? api("/api/agents") : null, wantWorkflow ? api("/api/workflow") : null, wantInbox ? api("/api/inbox") : null]);
-    if (ui.repo !== repo) return;  // applyRepo marked everything for the new repository's round
+      wantAgents ? api("/api/agents", undefined, which) : null, wantWorkflow ? api("/api/workflow") : null, wantInbox ? api("/api/inbox", undefined, which) : null]);
+    if (ui.repo !== repo || viewRepo() !== which) return;  // applyRepo and setAllRepos marked everything for the new round
     if (boardData) { renderBoard(boardData); if (!ui.multi) setInboxBadge(boardData.needs_human.length); }  // several: loadRepos counts every one
     if (inboxData) renderInbox(inboxData);
     if (agentsData) renderAgents(agentsData);

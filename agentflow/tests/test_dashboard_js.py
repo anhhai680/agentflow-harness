@@ -1042,3 +1042,121 @@ def test_a_late_config_answer_of_another_load_is_dropped():
         const third = loadSettings(); settings.request++; answers[2]({name: 'switched away'}); await third;
         return [rendered, settings.data.name]; })()""", None)
     assert got == [["new"], "new"]
+
+
+# ---- the All-repositories Inbox and Agents: each item acts on its own repository (Review Focus 1 and 5)
+def test_items_of_two_repositories_with_one_run_id_have_two_keys():
+    pair = {"a": {"repo": "a", "run_id": "r", "key": "k"}, "b": {"repo": "b", "run_id": "r", "key": "k"},
+            "none": {"run_id": "r", "key": "k"}}
+    got = js([PAGE_STUB, "core.js", "inbox.js"], "[inboxItemKey(args.a), inboxItemKey(args.b), inboxItemKey(args.none)]", pair)
+    assert got[0] != got[1] and got[2] == "r\u0000k"
+    assert js(["inbox.js"], "[inboxItemKey(args.a), inboxItemKey(args.none)]", pair) == [got[0], "r\u0000k"]  # no core.js: same keys
+
+
+def test_items_group_by_repository_and_run():
+    items = [{"repo": "a", "run_id": "r", "run_label": "x", "group": "stop", "key": "1"},
+             {"repo": "b", "run_id": "r", "run_label": "x", "group": "stop", "key": "1"},
+             {"repo": "a", "run_id": "r", "run_label": "x", "group": "question", "key": "2"}]
+    got = js([PAGE_STUB, "core.js", "inbox.js"], "groupItems(args, 'run').map(g => [g.repo, g.items.map(i => i.key)])", items)
+    assert got == [["a", ["1", "2"]], ["b", ["1"]]]
+    keys = js([PAGE_STUB, "core.js", "inbox.js"], "groupItems(args, 'run').map(g => g.key)", items)
+    assert keys[0] != keys[1]
+
+
+def test_gone_text_reads_only_its_own_repositorys_recent():
+    item = {"repo": "a", "run_id": "r", "kind": "blocked", "key": "build/x"}
+    other = {"repo": "b", "run_id": "r", "key": "build/x", "phase": "build", "action": "approved", "by": "dashboard",
+             "ts": "2026-11-16T14:00:00+00:00"}
+    mine = {**other, "repo": "a"}
+    pick = "goneText(args.item, args.recent)"
+    assert js(["inbox.js"], pick, {"item": item, "recent": [other]}) == "No longer waiting on you"
+    assert js(["inbox.js"], pick, {"item": item, "recent": [other, mine]}).startswith("Approved from the dashboard at ")
+    untagged = {"run_id": "r", "kind": "blocked", "key": "build/x"}
+    assert js(["inbox.js"], pick, {"item": untagged, "recent": [{**other, "repo": None}]}).startswith("Approved from the dashboard")
+
+
+SEND_STUBS = """var recorded = []; toast = () => {}; refreshAfter = () => {};
+  fetch = async (path) => { recorded.push(path); return {ok: true, status: 200, text: async () => '{"ok": true}'}; };"""
+
+
+def test_an_inbox_action_posts_to_the_items_repository_not_the_selected_one():  # spec Testing strategy; Review Focus 1
+    item = {"run_id": "20261127-1200-same", "key": "plan_approved", "kind": "phase_approval", "phase": "plan"}
+    got = js_async([PAGE_STUB, "core.js", "inbox.js"], SEND_STUBS + """(async () => {
+      ui.repo = "b"; ui.multi = true;
+      await inboxSend({repo: "a", ...args}, "approve", {target: "plan"});
+      return recorded; })()""", item)
+    assert got == ["/api/repos/a/runs/20261127-1200-same/approve"]
+    one = js_async([PAGE_STUB, "core.js", "inbox.js"], SEND_STUBS + """(async () => {
+      ui.repo = null; ui.multi = false;
+      await inboxSend(args, "approve", {target: "plan"});
+      return recorded; })()""", item)
+    assert one == ["/api/runs/20261127-1200-same/approve"]
+    refused = js_async([PAGE_STUB, "core.js", "inbox.js"], SEND_STUBS + """(async () => {
+      ui.repo = "b"; ui.multi = true;
+      const sent = await inboxSend(args, "approve", {target: "plan"});
+      return [sent, recorded, inboxDraft(args).error]; })()""", item)
+    assert refused == [False, [], "This card names no repository; reload the page."]
+
+
+def test_typing_and_arming_one_card_never_touch_the_other_with_the_same_run_and_key():
+    item = {"run_id": "r", "key": "k", "kind": "blocked", "approve_note": "optional", "actions": ["approve"]}
+    got = js([PAGE_STUB, "core.js", "inbox.js"], """(() => {
+      const a = {repo: "a", ...args}, b = {repo: "b", ...args};
+      inboxDraft(a).note = "only for a"; ui.inbox.armed = inboxItemKey(a);
+      return [inboxDraft(b).note, ui.inbox.armed === inboxItemKey(b), inboxDraft(a).note, ui.inbox.drafts.size]; })()""", item)
+    assert got == ["", False, "only for a", 2]
+
+
+def test_approve_all_posts_each_approval_to_its_own_repository():
+    got = js_async(["inbox.js"], """(async () => {
+      var sent = [];
+      setTimeout = () => 0; clearTimeout = () => {};
+      renderInbox = () => {};
+      act = async (run, action, body, repo) => { sent.push(run + ":" + repo); return true; };
+      viewedList = () => [];
+      ui = {multi: true, repo: "c", inbox: {view: {items: args}, armed: null, armedAt: 0, drafts: new Map(), busy: new Set(),
+                    sent: new Set()}};
+      approveAllItems(); approveAllItems();
+      for (let i = 0; i < 50; i++) await null;
+      return sent;
+    })()""", [approval("r1", repo="a"), approval("r2", phase="plan", repo="b")])
+    assert got == ["r1:a", "r2:b"]
+
+
+def test_a_phase_approval_carries_what_its_own_repository_showed():
+    item = {"repo": "a", "run_id": "r", "kind": "phase_approval", "phase": "plan", "key": "plan_approved", "approve_note": "none"}
+    got = js(["inbox.js"], "(viewedList = (id, repo) => [{path: id, sha: 'abcdef1', repo: repo}], approvePayload(args, {note: ''}))", item)
+    assert got["body"]["viewed"] == [{"path": "r", "sha": "abcdef1", "repo": "a"}]
+
+
+def test_agents_of_two_repositories_with_one_run_id_are_two_groups():
+    rows = [{"repo": "a", "run_id": "r", "module": "x", "idle": False, "age_s": 5},
+            {"repo": "b", "run_id": "r", "module": "x", "idle": False, "age_s": 9},
+            {"repo": "a", "run_id": "r", "module": "x", "idle": True, "age_s": 1}]
+    got = js([PAGE_STUB, "core.js", "agents.js"], "agentsByRun(args).map(g => [g.repo, g.rows.map(r => r.age_s)])", rows)
+    assert got == [["a", [1, 5]], ["b", [9]]]
+
+
+def test_the_header_inbox_count_is_only_set_from_a_view_on_a_page_of_one():
+    assert js(["inbox.js"], "[inboxBadgeCount({items: [1, 2]}, false), inboxBadgeCount({items: [1, 2]}, true)]", None) == [2, None]
+
+
+def test_a_repositorys_failed_read_is_a_line_of_text_naming_it():
+    errors = [{"repo": "a", "error": "events.jsonl: bad line 3"}, {"repo": "gone", "error": "<b>x</b>"}]
+    got = js([PAGE_STUB, "core.js", "repos.js"], """(() => {
+      ui.repos = {repos: [{id: "a", name: "api", state: "live"}]};
+      return [viewErrorLines(args), viewErrorLines(undefined), viewErrorLines([])]; })()""", errors)
+    assert got == [["api: events.jsonl: bad line 3", "gone: <b>x</b>"], [], []]
+
+
+def test_the_agents_table_leads_with_the_repository_only_when_asked():
+    rows = [{"repo": "a", "run_id": "r", "module": "m", "idle": False, "age_s": 5, "place": "build", "subagents": []}]
+    got = js([PAGE_STUB, "core.js", "repos.js", "agents.js"], """(() => {
+      routeHash = () => "#"; goRun = () => {}; SESSIONS_TAB = "sessions";
+      el = (tag, attrs, ...kids) => ({tag: tag, attrs: attrs || {}, kids: kids.flat(Infinity)});
+      ui.repos = {repos: [{id: "a", name: "api", state: "live"}]};
+      const text = (n) => (n && typeof n === "object" ? (n.attrs && n.attrs.text) || "" : "") + (n && n.kids ? n.kids.map(text).join("|") : "");
+      const heads = (t) => t.kids[0].kids[0].kids.map(text);
+      return [heads(agentTable(args, false, true)), heads(agentTable(args, false, false)), heads(agentTable(args, false))]; })()""", rows)
+    assert got[0][0] == "Repository" and got[0][1] == "Session" and len(got[0]) == len(got[1]) + 1
+    assert got[1] == got[2] and got[1][0] == "Session"

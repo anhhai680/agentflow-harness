@@ -491,6 +491,14 @@ def test_the_page_loads_repos_js_after_core_js(dash):
     assert shell.index("<h1>agentflow</h1>") < shell.index('id="repos"') < shell.index('id="version"')
 
 
+def test_the_inbox_and_agents_views_have_an_all_repositories_chip(dash):
+    shell = dash.get("/", token=None)[2].decode("utf-8")
+    assert '<button id="inbox-all" type="button" aria-pressed="true" hidden>All repositories</button>' in shell
+    assert re.search(r'<[a-z]+ id="agents-all"[^>]* hidden', shell)
+    assert shell.index('id="inbox-group-kind"') < shell.index('id="inbox-all"') < shell.index('id="inbox-hint"')
+    assert shell.index('id="agents-view"') < shell.index('id="agents-all"') < shell.index('id="agents-summary"')
+
+
 def test_the_page_streams_every_repository():
     main = (UI_DIR / "main.js").read_text(encoding="utf-8")
     assert "/api/events?all=1&quiet=1&token=" in main and "/api/events?quiet=1&token=" not in main

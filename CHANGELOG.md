@@ -10,6 +10,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 ### Added
 - With several repositories, `/api/inbox` and `/api/agents` merge every usable repository's decisions and agents into one view, each row tagged with its `repo` id, oldest decision first; a repository whose runs can't be read is a line of `errors` and the others still answer.
 - With several repositories, the dashboard's header has a repository switcher: one chip per repository with its waiting count, the ones not set up greyed and last. The selection rides in the URL (`#/repo/<id>/…`) and survives a reload, the page reads one stream of every repository, and the tab title names the repository (`agentflow · <name>`) or counts them (`agentflow · <n> repositories`). With one repository the page looks as before.
+- With several repositories, the Inbox and Agents tabs have an "All repositories" chip (on by default) that lists every repository's decisions and agents, each card and row naming its repository, with the header Inbox count summing every repository. Approve, Answer and Request changes on a card always go to that card's own repository, whichever one is selected, and a repository whose read failed shows as one line while the others still list. Two repositories with the same run id are two cards.
 
 ### Changed
 - The default notification title and the digest title name the repository (`agentflow · <folder>`) when your user file names a workspace; a `title` you set in `hitl.notify` is kept as written, and with no workspace the titles are unchanged.
