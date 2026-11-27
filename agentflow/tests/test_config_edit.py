@@ -1573,3 +1573,212 @@ def test_the_settings_page_refuses_a_merge_key_chain_quickly(shipped):
     with pytest.raises(EditError, match="merge keys"):
         config_edit.form_fields(shipped)
     assert time.monotonic() - started < 3
+
+
+# --------------------------------------------------------------------------- the user file: Your settings
+
+
+def _user_fields(path: Path | None = None) -> dict:
+    return {tuple(f["key"]): f for s in config_edit.user_form_fields(path)["sections"] for f in s["fields"]}
+
+
+def _user_propose(*changes, packs=(), path: Path | None = None) -> config_edit.Proposal:
+    from agentflow import layers
+
+    _, sha, _ = config_edit.read_user(path or layers.user_config_path())
+    return config_edit.propose_user(sha, [{"key": k, "value": v} for k, v in changes], packs, path)
+
+
+def _user_save(*changes, packs=(), path: Path | None = None) -> str:
+    proposal = _user_propose(*changes, packs=packs, path=path)
+    assert not proposal.errors, proposal.errors
+    return config_edit.save_user(proposal, path)
+
+
+def test_the_user_form_holds_the_allow_list_and_nothing_else():
+    from agentflow import layers
+
+    fields = _user_fields()
+    assert set(fields) == set(config_edit.USER_FIELD_KEYS)
+    for key, item in fields.items():
+        assert any(len(p.split(".")) == len(key) and all(s in ("*", k) for s, k in zip(p.split("."), key))
+                   for p in layers.USER_KEYS), key
+        assert ".".join(key) not in ("hitl.notify", "agents.claude.user_settings", "dashboard.host")
+        protected = [p for p in config_edit._PROTECTED_KEYS if key[:len(p.split("."))] == tuple(p.split("."))]
+        assert protected in ([], ["workspace"]), (key, protected)
+        assert item["target"] == "user" and item["optional"] is True
+        if key[0] == "workspace":
+            assert item["lines"] is True
+    assert {key for key in fields if key[0] == "agents"} == {("agents", "claude", "models"), ("agents", "codex", "models")}
+
+
+def test_a_missing_user_file_is_an_empty_form_and_the_first_save_creates_it_private(tmp_path):
+    import hashlib
+    import stat
+
+    from agentflow import layers
+
+    p = layers.user_config_path()
+    assert not p.parent.exists()
+    assert config_edit.read_user(p) == ("", hashlib.sha256(b"").hexdigest(), False)
+    data = config_edit.user_form_fields()
+    assert data["exists"] is False and data["editable"] is True and data["error"] is None
+    root = tmp_path / "code"
+    root.mkdir()
+    _user_save((["workspace", "roots"], [str(root)]))
+    assert p.is_file() and stat.S_IMODE(p.stat().st_mode) == 0o600
+    assert yaml.safe_load(p.read_text(encoding="utf-8")) == {"workspace": {"roots": [str(root)]}}
+    assert config_edit.user_form_fields()["exists"] is True
+    assert _user_fields()[("workspace", "roots")]["source"] == "user"
+
+
+def test_a_commented_out_workspace_block_takes_a_new_root(tmp_path):
+    from agentflow import layers
+
+    root = tmp_path / "code"
+    root.mkdir()
+    p = layers.user_config_path()
+    p.parent.mkdir(parents=True)
+    p.write_text("hitl:\n  notify: [desktop]  # mine\nworkspace:\n  # roots:\n  #   - ~/old\n", encoding="utf-8")
+    _user_save((["workspace", "roots"], [str(root)]))
+    text = p.read_text(encoding="utf-8")
+    assert yaml.safe_load(text) == {"hitl": {"notify": ["desktop"]}, "workspace": {"roots": [str(root)]}}
+    assert "# mine" in text and "# roots:" in text
+    p.write_text("", encoding="utf-8")
+    _user_save((["workspace", "roots"], [str(root)]))
+    assert yaml.safe_load(p.read_text(encoding="utf-8")) == {"workspace": {"roots": [str(root)]}}
+
+
+@pytest.mark.parametrize("key", [["hitl", "notify"], ["agents", "claude", "user_settings"], ["dashboard", "host"],
+                                 ["gates", "unit"], ["workspace"], ["agents", "mine", "models"]])
+def test_keys_outside_the_allow_list_are_refused_and_change_nothing(key):
+    p = _user_file({"dashboard": {"done_shown": 20}})
+    before = p.read_bytes()
+    with pytest.raises(Refused):
+        _user_propose((key, ["x"] if key[-1] == "notify" else True))
+    assert p.read_bytes() == before
+
+
+def test_a_new_root_must_be_an_existing_folder_and_an_old_one_may_be_gone(tmp_path):
+    existing = tmp_path / "code"
+    existing.mkdir()
+    p = _user_file({"workspace": {"roots": ["/gone"]}})
+    _user_save((["dashboard", "done_shown"], 20))
+    _user_save((["workspace", "roots"], ["/gone", str(existing)]))
+    assert yaml.safe_load(p.read_text(encoding="utf-8"))["workspace"]["roots"] == ["/gone", str(existing)]
+    before = p.read_bytes()
+    with pytest.raises(EditError, match="not a folder"):
+        _user_propose((["workspace", "roots"], ["/gone", "/nope"]))
+    for bad in ("code", "~bob/x"):
+        with pytest.raises(EditError, match="absolute path"):
+            _user_propose((["workspace", "roots"], [bad]))
+    assert p.read_bytes() == before
+
+
+def test_a_stale_base_is_a_conflict_for_the_user_file():
+    p = _user_file({"dashboard": {"done_shown": 20}})
+    with pytest.raises(Conflict):
+        config_edit.propose_user("0" * 64, [{"key": ["dashboard", "done_shown"], "value": 30}])
+    proposal = _user_propose((["dashboard", "done_shown"], 30))
+    p.write_text(p.read_text(encoding="utf-8") + "# edited by hand\n", encoding="utf-8")
+    with pytest.raises(Conflict):
+        config_edit.save_user(proposal)
+    assert yaml.safe_load(p.read_text(encoding="utf-8")) == {"dashboard": {"done_shown": 20}}
+
+
+def test_a_symlinked_or_hardlinked_user_file_is_shown_read_only_and_never_written(tmp_path):
+    from agentflow import layers
+
+    p = layers.user_config_path()
+    p.parent.mkdir(parents=True)
+    real = tmp_path / "real.yaml"
+    real.write_text("dashboard: {done_shown: 20}\n", encoding="utf-8")
+    p.symlink_to(real)
+    data = config_edit.user_form_fields()
+    assert data["editable"] is False and "symlink" in data["error"]
+    with pytest.raises(EditError, match="symlink"):
+        config_edit.propose_user(config_edit.sha256(real.read_text(encoding="utf-8")),
+                                 [{"key": ["dashboard", "done_shown"], "value": 30}])
+    p.unlink()
+    os.link(real, p)
+    data = config_edit.user_form_fields()
+    assert data["editable"] is False and "hardlink" in data["error"]
+    with pytest.raises(EditError, match="hardlink"):
+        config_edit.propose_user(config_edit.sha256(real.read_text(encoding="utf-8")),
+                                 [{"key": ["dashboard", "done_shown"], "value": 30}])
+    assert real.read_text(encoding="utf-8") == "dashboard: {done_shown: 20}\n"
+    # a symlinked `agentflow` folder: the save refuses it and the link's target is untouched
+    p.unlink()
+    p.parent.rmdir()
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    p.parent.symlink_to(target, target_is_directory=True)
+    proposal = config_edit.Proposal(config_edit.sha256(""), "dashboard: {done_shown: 30}\n", "diff")
+    with pytest.raises(EditError):
+        config_edit.save_user(proposal)
+    assert list(target.iterdir()) == []
+    assert config_edit.user_form_fields()["editable"] is False
+
+
+def test_an_unparseable_user_file_is_read_only_and_a_loadable_fix_is_accepted(tmp_path):
+    from agentflow import layers
+
+    p = layers.user_config_path()
+    p.parent.mkdir(parents=True)
+    p.write_text("::: [\n", encoding="utf-8")
+    data = config_edit.user_form_fields()
+    assert data["editable"] is False and data["error"]
+    existing = tmp_path / "code"
+    existing.mkdir()
+    p.write_text("workspace: {roots: [code]}\n", encoding="utf-8")
+    data = config_edit.user_form_fields()
+    assert data["editable"] is True and "workspace.roots" in data["error"]
+    _user_save((["workspace", "roots"], [str(existing)]))
+    assert layers.load_user_settings().workspace.roots == (str(existing),)
+    assert config_edit.user_form_fields()["error"] is None
+
+
+def test_a_user_edit_that_breaks_a_live_pack_is_an_error_naming_it(tmp_path):
+    from conftest import SPARSE_PACK
+
+    a = tmp_path / "a" / ".agentflow" / "config.yaml"
+    a.parent.mkdir(parents=True)
+    a.write_text(yaml.safe_dump({**SPARSE_PACK, "agents": {**SPARSE_PACK["agents"], "codex": None}}), encoding="utf-8")
+    assert "codex" not in load_config(a).agents  # pack A loads on its own, with no codex agent
+    b = tmp_path / "b" / ".agentflow" / "config.yaml"
+    b.parent.mkdir(parents=True)
+    b.write_text(yaml.safe_dump({**SPARSE_PACK, "version": 99}), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(b)  # pack B is already broken: it blocks nothing
+    p = _user_file({"dashboard": {"done_shown": 20}})
+    before = p.read_bytes()
+    proposal = _user_propose((["agents", "codex", "models"], {"build": "x"}), packs=[("A", a), ("B", b)])
+    assert len(proposal.errors) == 1, proposal.errors
+    said = f"{proposal.errors[0].path}: {proposal.errors[0].message}"
+    assert "A:" in said and ".config-check-" not in said and str(p) in said
+    with pytest.raises(EditError):
+        config_edit.save_user(proposal)
+    assert p.read_bytes() == before
+    assert not [f for f in p.parent.iterdir() if f.name.startswith(".config-")]
+    assert not _user_propose((["agents", "claude", "models"], {"build": "opus"}), packs=[("A", a), ("B", b)]).errors
+
+
+def test_the_pack_form_says_each_field_saves_to_the_pack(sparse_repo):
+    path = _sparse(sparse_repo)
+    assert all(f["target"] == "project" for f in _fields(path).values())
+    _user_file({"dashboard": {"done_shown": 20}})
+    shown = _fields(path)[("dashboard", "done_shown")]
+    assert "user config" in shown["readonly"] and "Your settings" in shown["hint"]
+    assert "hint" not in _fields(path)[("dashboard", "port")]
+
+
+def test_clearing_a_user_field_removes_the_key_and_the_engine_decides_again():
+    p = _user_file({"agents": {"claude": {"models": {"build": "opus"}}}, "dashboard": {"done_shown": 20}})
+    assert _user_fields()[("agents", "claude", "models")]["value"]["build"] == "opus"
+    _user_save((["agents", "claude", "models"], None), (["dashboard", "done_shown"], None))
+    assert (yaml.safe_load(p.read_text(encoding="utf-8")) or {}) == {}  # no empty block is left behind
+    models = _user_fields()[("agents", "claude", "models")]
+    assert models["source"] == "engine" and models["value"]["build"] == "sonnet"
+    big = {f"role{i}": "m" * 400 for i in range(400)}  # a text past the byte cap would never be read again
+    with pytest.raises(EditError, match="bytes"):
+        _user_propose((["agents", "codex", "models"], big))

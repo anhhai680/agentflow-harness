@@ -7,6 +7,9 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Added
+- `config_edit` can write your user file (`user_form_fields`, `propose_user`, `save_user`), for the Settings page's coming Your settings. It takes form changes only, and only to an allow-list of personal keys: `workspace.roots`, `repos` and `exclude`, `dashboard.port`, `board_refresh_s` and `done_shown`, the three `defaults` budgets, `hitl.remind_after_h`, the five `usage.*` keys and `agents.claude.models` / `agents.codex.models`. Any other key is refused, `hitl.notify`, `agents.*.user_settings` and `dashboard.host` included. A new root must be a folder that exists, the text must load as your user file and with every live repository's pack that loads today (an error names the repository), a symlinked or hardlinked file is shown read only and never written, and a new file is created `0o600`. The pack form's fields say they save to the pack (`target: "project"`), and one your user file sets says to change it under Your settings. `load_user_settings` and `load_config` can read a given user file.
+
 ## [3.16] - 2026-11-27
 
 ### Added
