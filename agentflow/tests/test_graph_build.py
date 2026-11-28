@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -317,6 +318,7 @@ def test_an_ignore_file_inside_an_ignored_folder_is_never_read(tmp_path, cfg, mo
     real = graph_git.read_blobs
     monkeypatch.setattr(graph_git, "read_blobs", lambda r, blobs, limit: asked.extend(blobs) or real(r, blobs, limit))
     build(repo, cfg, download=False)
+    assert git_ignores(repo, "generated/keep.py")
     assert inner not in asked and read(repo, graph_store.ignore_files) == {"": "generated/\n"}
     assert rows(repo)["generated/keep.py"].state == "ignored"
     commit(repo, {".gitignore": b"*.log\n"})  # the folder is no longer ignored: its own file is loaded now
@@ -325,6 +327,31 @@ def test_an_ignore_file_inside_an_ignored_folder_is_never_read(tmp_path, cfg, mo
     assert rows(repo)["generated/keep.py"].state == "indexed"
     delta = graph_of(repo)
     assert full_graph_of(repo, cfg, monkeypatch, tmp_path / "elsewhere") == delta
+
+
+def git_ignores(repo: Path, path: str) -> bool:
+    """`git check-ignore --no-index` on `path`, with no excludes file of this machine."""
+    out = subprocess.run(["git", "-c", "core.excludesFile=/dev/null", "check-ignore", "--no-index", "-q", path],
+                         cwd=repo, capture_output=True)
+    assert out.returncode in (0, 1), out.stderr
+    return out.returncode == 0
+
+
+@pytest.mark.parametrize("root", [b".*\n", b"*.gitignore\n", b".gitignore\n"])
+def test_an_ignore_file_that_a_pattern_matches_still_applies(tmp_path, cfg, monkeypatch, root):
+    repo = make_repo(tmp_path, {".gitignore": root, "pkg/.gitignore": b"secret.txt\n", "pkg/secret.txt": b"s\n",
+                                "pkg/a.py": b"A = 1\n"}, force=True)
+    assert git_ignores(repo, "pkg/.gitignore") and git_ignores(repo, "pkg/secret.txt")
+    assert not git_ignores(repo, "pkg/a.py")
+    secret = run_git(repo, "rev-parse", "HEAD:pkg/secret.txt").strip()
+    asked: list[str] = []
+    real = graph_git.read_blobs
+    monkeypatch.setattr(graph_git, "read_blobs", lambda r, blobs, limit: asked.extend(blobs) or real(r, blobs, limit))
+    build(repo, cfg, download=False)
+    found = rows(repo)
+    assert secret not in asked and found["pkg/secret.txt"].state == "ignored"
+    assert found["pkg/.gitignore"].state == "ignored" and found["pkg/a.py"].state == "indexed"
+    assert read(repo, graph_store.ignore_files)["pkg"] == "secret.txt\n"
 
 
 def test_a_failed_ignore_read_is_a_build_error_and_keeps_the_snapshot(tmp_path, cfg, monkeypatch):

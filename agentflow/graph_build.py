@@ -14,8 +14,8 @@ The steps, in order:
    `graph.max_file_kb`, the doc roots, the repository id, the engine version, whose selection and resolution rules
    may differ) differ from the last build's take every listed path.
 2. **`.gitignore`.** When a commit changes any ignore file, the tree's ignore files are taken shallowest first, and
-   one that the shallower files ignore (`generated/.gitignore` under a `generated/` pattern) is never read, as git
-   never loads it; the others are read from their blobs (or kept from the store when unchanged). When the set of
+   one in a folder the shallower files ignore (`generated/.gitignore` under a `generated/` pattern) is never read, as
+   git never loads it (a pattern that matches the ignore file itself, such as `.*`, does not stop git loading it); the others are read from their blobs (or kept from the store when unchanged). When the set of
    texts moved, every listed path is judged again and those whose state moved join the change list; otherwise only
    the changed paths are judged. A path that is not `indexed` (ignored, secret, vendored, excluded, a symlink or a
    submodule) is never read.
@@ -307,8 +307,8 @@ class _Build:
                        key=lambda path: (path.count("/"), path))
         texts: dict[str, str] = {}
         for _, level in itertools.groupby(found, key=lambda path: path.count("/")):
-            above = Ignore(texts)  # the shallower files: git never loads an ignore file they ignore
-            loaded = [path for path in level if not above.ignored(path)]
+            above = Ignore(texts)  # the shallower files: git loads no ignore file in a folder they ignore
+            loaded = [path for path in level if not above.folder_ignored(posixpath.dirname(path))]
             unread = [path for path in loaded if path in self.changed or posixpath.dirname(path) not in stored]
             blobs = [listed[path].blob for path in unread]
             got = dict(graph_git.read_blobs(self.repo, blobs, IGNORE_MAX_BYTES)) if blobs else {}

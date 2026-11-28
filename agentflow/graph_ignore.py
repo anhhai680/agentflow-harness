@@ -446,3 +446,17 @@ class Ignore:
     def ignored(self, path: str) -> bool:
         """Whether the file `path` is ignored."""
         return self.judge(path)[0]
+
+    def folder_ignored(self, directory: str) -> bool:
+        """Whether the folder `directory`, or one above it, is ignored: git loads no ignore file inside such a folder.
+        A folder that needs `MAX_STEPS` is judged ignored, as `judge` does for a path."""
+        directory = directory.strip("/")
+        if not directory:
+            return False
+        try:
+            return self._dir(directory)[0]
+        except _Exhausted:
+            note = f"a path that took {MAX_STEPS} steps to judge is judged ignored"
+            if note not in self.notes:
+                self.notes.append(note)
+            return True

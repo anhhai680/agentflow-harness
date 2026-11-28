@@ -266,3 +266,11 @@ def test_exclude_patterns_are_passed_as_a_root_file():
     assert exclude.ignored("a/generated/x.py") is True
     assert exclude.ignored("t/x.snap") is True
     assert exclude.ignored("t/x.py") is False
+
+
+def test_folder_ignored_judges_the_folder_and_those_above_it_only():
+    ignore = gi.Ignore({"": "generated/\n.*\n*.gitignore\n", "pkg": "cache/\n"})
+    assert ignore.folder_ignored("generated") and ignore.folder_ignored("generated/deep/er")
+    assert ignore.folder_ignored(".hidden") and ignore.folder_ignored("pkg/cache")
+    assert not ignore.folder_ignored("pkg") and not ignore.folder_ignored("") and not ignore.folder_ignored("cache")
+    assert ignore.ignored("pkg/.gitignore") and not ignore.folder_ignored("pkg")  # the file matches, its folder does not
