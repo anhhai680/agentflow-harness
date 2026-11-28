@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tree-sitter==0.27.0", "tree-sitter-javascript==0.25.0", "tree-sitter-typescript==0.23.2"]
+# ///
 """The parser process: it reads one file's bytes at a time on stdin and answers with that file's facts as JSON.
 
 `graph_parse.Parser` starts this script as a child, limits it and distrusts every word it says. The protocol is lines
@@ -15,7 +19,10 @@ every other import waits for `_import_root`. It sets `RLIMIT_AS` to 1 GiB where 
 allows (macOS refuses), writes no bytecode, opens no file and no socket, and keeps file descriptor 1 for protocol lines
 only: anything else written to stdout goes to stderr, which the parent sends to /dev/null.
 
-It imports `graph_model` and the extractors and nothing else from the engine, and never `yaml`.
+It imports `graph_model` and the extractors and nothing else from the engine, and never `yaml`. The script header above
+names the exact tree-sitter packages, and `graph_worker.py.lock` beside it holds their hashes: under `uv run --locked
+--script` the worker also offers `graph_syntax.available()` (TypeScript, TSX and JavaScript, each versioned
+`<extractor>+<grammar>`); under `python -I -S` that is `{}` and it offers the stdlib extractors only.
 """
 
 from __future__ import annotations
@@ -120,12 +127,17 @@ def main() -> int:
     except OSError:
         pass
     sys.stdout = sys.stderr
-    from agentflow import graph_manifest, graph_markdown, graph_model, graph_python
+    import functools
+
+    from agentflow import graph_manifest, graph_markdown, graph_model, graph_python, graph_syntax
 
     if os.path.dirname(os.path.abspath(graph_model.__file__)) != here:
         return 2  # some other `agentflow` came first: answer nothing rather than run code that is not ours
     extractors = {"python": graph_python.extract, "markdown": graph_markdown.extract, "manifest": graph_manifest.extract}
     languages = {lang: graph_model.EXTRACTOR_VERSIONS[lang] for lang in extractors}
+    for lang, version in graph_syntax.available().items():  # `{}` in the stdlib mode, which has no tree-sitter
+        extractors[lang] = functools.partial(graph_syntax.extract, lang=lang)
+        languages[lang] = version
     proto.write(_line({"ready": 1, "pid": os.getpid(), "languages": languages}))
     proto.flush()
     return serve(sys.stdin.buffer, proto, extractors)
