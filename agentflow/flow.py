@@ -1193,6 +1193,21 @@ def _continue_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", help="path to a config.yaml (default: the one the run started with)")
 
 
+def _graph_number(low: int, high: int):
+    """An argparse `type=` for a whole number from `low` to `high`."""
+
+    def parse(text: str) -> int:
+        try:
+            number = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+        if not low <= number <= high:
+            raise argparse.ArgumentTypeError(f"{number} is not from {low} to {high}")
+        return number
+
+    return parse
+
+
 def _since_date(text: str):
     """`--since YYYY-MM-DD` as midnight UTC of that day."""
     from datetime import UTC, datetime
@@ -1466,6 +1481,33 @@ def build_parser() -> argparse.ArgumentParser:
     wks_list = wks_sub.add_parser("list", help="the roots, each repository found there and what was skipped")
     wks_list.add_argument("--json", action="store_true", help="print the repositories and the skipped entries as JSON")
     wks_list.set_defaults(func=cmd_workspace_list)
+
+    from agentflow.graph_model import NODE_KINDS
+
+    gph = sub.add_parser("graph", help="the knowledge graph of the base branch's code and docs: build, status, query, show")
+    gph_sub = gph.add_subparsers(dest="graph_command", required=True)
+
+    def _graph_arg(parser: argparse.ArgumentParser, with_json: bool = True) -> None:
+        if with_json:
+            parser.add_argument("--json", action="store_true", help="print the data as JSON")
+        parser.add_argument("--config", help="path to a config.yaml (default: the repository's .agentflow/config.yaml)")
+        parser.set_defaults(func=cmd_graph)
+
+    gph_build = gph_sub.add_parser("build", help="index the base branch's commit; later builds parse only what changed")
+    gph_build.add_argument("--full", action="store_true", help="index every file again, keeping nothing of the last build")
+    _graph_arg(gph_build, with_json=False)
+    _graph_arg(gph_sub.add_parser("status", help="the indexed commit, its counts and its languages"))
+    gph_query = gph_sub.add_parser("query", help="search the index for nodes by name, path and text")
+    gph_query.add_argument("text", metavar="TEXT", help="the words to look for")
+    gph_query.add_argument("--kind", choices=NODE_KINDS, help="only nodes of this kind")
+    gph_query.add_argument("--limit", type=_graph_number(1, 50), default=10, metavar="N",
+                           help="most hits to show, 1 to 50 (default 10)")
+    _graph_arg(gph_query)
+    gph_show = gph_sub.add_parser("show", help="one node (by id or file path) and the nodes linked to it")
+    gph_show.add_argument("target", metavar="TARGET", help="a node id, or a file path")
+    gph_show.add_argument("--depth", type=_graph_number(1, 3), default=1, metavar="N",
+                          help="how many links away to follow, 1 to 3 (default 1)")
+    _graph_arg(gph_show)
     return parser
 
 
@@ -1519,6 +1561,83 @@ def _run_all(args: argparse.Namespace) -> int:
     for skip in found.skipped:
         print(f"skipped {printable(skip.entry)}: {printable(skip.reason)}")
     return 1 if failed else 0
+
+
+def _graph_read(repo: Path, args: argparse.Namespace) -> tuple[list[str], int] | None:
+    """What `graph status`, `query` or `show` print and exit with, read from the repository's index in one pass;
+    None when there is no index to read. The store is untrusted: a file that opens but fails at a query (a damaged
+    middle page, a table with other columns) raises `sqlite3.Error`, which also means "no index"."""
+    import sqlite3
+    import time
+
+    from agentflow import graph_report as report
+    from agentflow import graph_store, pack
+
+    try:
+        conn = graph_store.open_read(graph_store.path_for(pack.state_dir(repo)))
+        try:
+            meta = graph_store.meta(conn)
+            if not meta.get("commit"):
+                return None
+            commit, now = meta["commit"], time.time()
+            if args.graph_command == "status":
+                counts = graph_store.counts(conn)
+                langs = report.language_states(graph_store.files(conn).values(), report.offered(meta))
+                if args.json:
+                    return [json.dumps(report.status_json(meta, counts, now, langs))], 0
+                return report.status_lines(meta, counts, now, langs), 0
+            if args.graph_command == "query":
+                hits = graph_store.search(conn, args.text, args.kind, args.limit)
+                if args.json:
+                    return [json.dumps(report.query_json(hits, commit))], 0
+                return report.query_lines(hits, commit), 0
+            target = graph_store.node(conn, args.target) if ":" in args.target else None  # an id: `<repo>:<kind>:<path>#<name>`
+            if target is None:
+                here = graph_store.nodes_at(conn, args.target)
+                target = next((n for n in here if n.kind in ("file", "doc")), here[0] if here else None)
+            if target is None:
+                row = graph_store.files(conn).get(args.target)
+                return [report.no_node_line(args.target, row.state if row else None)], 1
+            around = graph_store.neighbours(conn, target.id, args.depth)
+            if args.json:
+                return [json.dumps(report.show_json(target, around, commit))], 0
+            return report.show_lines(target, around, commit), 0
+        finally:
+            conn.close()
+    except (graph_store.Unusable, sqlite3.Error):
+        return None
+
+
+def cmd_graph(args: argparse.Namespace) -> int:
+    """`graph build` indexes the base branch; `status`, `query` and `show` read what it built, even when
+    `graph.enabled` has since been turned off. Every store byte and every message is printed through `printable`;
+    the `--json` views go through `json.dumps`, which writes every control and non-ASCII character as an escape."""
+    from agentflow import graph_build, graph_report
+    from agentflow.doctor import printable
+
+    try:
+        repo, cfg = _find_repo(), _load_cfg(args)
+    except _human_errors() as exc:
+        print(f"error: {printable(exc)}")
+        return 1
+    if args.graph_command == "build":
+        if not cfg.graph.enabled:  # before `build`, which would otherwise be the first to touch the state dir
+            print(graph_report.OFF)
+            return 1
+        try:
+            result = graph_build.build(repo, cfg, full=args.full)
+        except graph_build.BuildError as exc:
+            print(f"error: {printable(exc)}")
+            return 1
+        print("\n".join(graph_report.build_lines(result)))
+        return 0
+    found = _graph_read(repo, args)
+    if found is None:
+        print(graph_report.NO_INDEX)
+        return 1
+    lines, code = found
+    print("\n".join(lines))
+    return code
 
 
 def cmd_workspace_list(args: argparse.Namespace) -> int:
