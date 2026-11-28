@@ -128,3 +128,23 @@ def test_long_specs_and_hostile_lines():
     assert _roundtrip("requirements.txt", b"a" * 500 + b"==1\n").deps == ()  # a name past 200 characters
     for line in (b"a" + b" " * 300_000 + b"x", b"a[" * 100_000, b" --" * 100_000 + b"a", b"\\\n" * 100_000):
         _roundtrip("requirements.txt", line + b"\n")
+
+
+def test_url_credentials_never_reach_the_facts():
+    py = _roundtrip(
+        "pyproject.toml",
+        b'[project]\ndependencies = ["a @ git+https://user:SECRETTOKEN@host.example/org/a.git@v1.0#egg=a", "b @ https://SECRETTOKEN@host.example/b.whl", "c @ https://host.example/c@v2"]\n',
+    )
+    assert [(d.name, d.spec) for d in py.deps] == [
+        ("a", "@ git+https://host.example/org/a.git@v1.0#egg=a"), ("b", "@ https://host.example/b.whl"), ("c", "@ https://host.example/c@v2"),
+    ]  # fmt: skip
+    req = _roundtrip("requirements.txt", b"a @ git+https://user:SECRETTOKEN@host.example/a.git\nb @ https://SECRETTOKEN@host.example/b.whl\n")
+    assert [d.spec for d in req.deps] == ["@ git+https://host.example/a.git", "@ https://host.example/b.whl"]
+    js = _roundtrip(
+        "package.json",
+        b'{"name": "@acme/web", "dependencies": {"a": "git+https://user:SECRETTOKEN@host.example/a.git#v1.0", "b": "https://SECRETTOKEN@host.example/b.tgz", "@acme/c": "^1"}}',
+    )
+    assert [(d.name, d.spec) for d in js.deps] == [("a", "git+https://host.example/a.git#v1.0"), ("b", "https://host.example/b.tgz"), ("@acme/c", "^1")]
+    assert js.package == "@acme/web"
+    for facts in (py, req, js):
+        assert "SECRETTOKEN" not in json.dumps(gm.to_json(facts))

@@ -8,6 +8,9 @@ note, and the list is cut to `MAX_DEPS` with a note, so the facts are always acc
 A Python name is normalised as PEP 503 does (lower case, each run of `-`, `_` and `.` as one `-`). Its `spec` is the version
 part of the requirement: the extras and the environment marker are left out.
 
+A URL in a `spec` loses its userinfo (`https://user:token@host/x` is kept as `https://host/x`), so a credential
+written in a manifest never reaches the store.
+
 The worker process imports this module, so it uses the standard library and `graph_model` only.
 """
 
@@ -20,6 +23,7 @@ import tomllib
 from agentflow.graph_model import MAX_DEPS, NAME_MAX, Dep, Facts, empty, module, text
 
 _REQUIREMENT = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(.*)", re.DOTALL)
+_USERINFO = re.compile(r"://[^/?#\s@]*@")  # the credentials of a URL: after `://`, up to the first `@` before any path
 _SEPARATORS = re.compile(r"[-_.]+")
 _SPEC_STARTS = ("<", ">", "=", "!", "~", "(", "@")
 _NPM_GROUPS = (("dependencies", "runtime"), ("devDependencies", "dev"), ("optionalDependencies", "optional"), ("peerDependencies", "optional"))
@@ -58,7 +62,7 @@ class _Deps:
         elif len(self.rows) >= MAX_DEPS:
             self.cut = True
         else:
-            self.rows.append(Dep(clean, text(spec, NAME_MAX), group))
+            self.rows.append(Dep(clean, text(_USERINFO.sub("://", spec), NAME_MAX), group))
 
     def add_requirement(self, line: str, group: str) -> None:
         parsed = _requirement(line)
