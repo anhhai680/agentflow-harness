@@ -206,6 +206,11 @@ _SECTIONS: list[tuple[str, str, list[tuple[tuple[str, ...], str, dict]]]] = [
         (("memory", "digest_tokens"), "Retro digest size (tokens)", {"kind": "int", "min": 1000, "max": 50000}),
         (("memory", "retro_every_days"), "Days between retros (0 = manual only)", {"kind": "int", "min": 0, "max": 90}),
     ]),
+    ("Knowledge graph", "The index of this repository's code and docs (`agentflow graph`).", [
+        (("graph", "enabled"), "Index this repository", {"kind": "bool"}),
+        (("graph", "exclude"), "Patterns left out (`.gitignore` syntax)", {"kind": "list"}),
+        (("graph", "max_file_kb"), "Largest file parsed (KB)", {"kind": "int", "min": 1, "max": 4096}),
+    ]),
     ("Issues", "What a run started from an issue does on GitHub.", [
         (("issues", "in_progress_label"), "In-progress label (empty = off)", {"kind": "text", "allow_empty": True}),
         (("issues", "comment"), "Comment when a run starts", {"kind": "bool"}),
