@@ -1,0 +1,32 @@
+# The retrieval questions for test_graph_retrieval.py: frozen once written. Each paraphrases ARCHITECTURES.md section 5.1.
+# Never change a question or a file to raise the score; only general ranking may change.
+- {q: "append-only event log and the run lock", file: "agentflow/events.py"}
+- {q: "reduce the event log into the run's state", file: "agentflow/state.py"}
+- {q: "merge the config layers: engine defaults, starter, pack, user file", file: "agentflow/layers.py"}
+- {q: "find the pack in the main checkout and check the engine version range", file: "agentflow/pack.py"}
+- {q: "refuse a step that touches forbidden paths or moves HEAD", file: "agentflow/guards.py"}
+- {q: "write files without following symlinks", file: "agentflow/safeio.py"}
+- {q: "build the command line for the agent CLI and parse its stream", file: "agentflow/agents.py"}
+- {q: "the phase loop that starts a run and advances it", file: "agentflow/pipeline.py"}
+- {q: "decide which step of a phase runs next", file: "agentflow/flow_control.py"}
+- {q: "the result file schema, the inbox and notifications", file: "agentflow/hitl.py"}
+- {q: "pause, resume, cancel, retry and archive a run", file: "agentflow/run_control.py"}
+- {q: "lease each live run a slot number for ports", file: "agentflow/slots.py"}
+- {q: "hold a session past the machine-wide cap on active runs", file: "agentflow/run_cap.py"}
+- {q: "hold runs on the five hour and seven day usage windows", file: "agentflow/governor.py"}
+- {q: "keep the machine awake while a run advances", file: "agentflow/keepawake.py"}
+- {q: "resolve the workspace roots into repositories", file: "agentflow/repo_set.py"}
+- {q: "read a repository from its base branch to propose gates and a starter", file: "agentflow/detect.py"}
+- {q: "check agent logins, the remote and docker on this machine", file: "agentflow/doctor.py"}
+- {q: "the backlog claim protocol with leased pushes", file: "agentflow/claims.py"}
+- {q: "parse and render the backlog file", file: "agentflow/backlog_file.py"}
+- {q: "parse the lessons files and select lessons for a prompt", file: "agentflow/lessons.py"}
+- {q: "turn a run's events into signals", file: "agentflow/signals.py"}
+- {q: "audit the obligations at finish before the push", file: "agentflow/conformance.py"}
+- {q: "render the run brief, the appended system prompt", file: "agentflow/brief.py"}
+- {q: "named condition checks such as file exists and section items", file: "agentflow/conditions.py"}
+- {q: "parse plan tasks and the capability map", file: "agentflow/sources.py"}
+- {q: "number the doubt review's findings and apply its stop rules", file: "agentflow/doubt.py"}
+- {q: "dependabot alert intake and the probe", file: "agentflow/vuln.py"}
+- {q: "edit the config file from the settings page keeping comments", file: "agentflow/config_edit.py"}
+- {q: "wait for CI, fix failures and mark the pull request ready", file: "agentflow/ci_lane.py"}
