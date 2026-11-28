@@ -30,6 +30,12 @@ CASES = [
     ({"": "**\n"}, "any/thing", True), ({"": "a**b\n"}, "aXXb", True), ({"": "a**b\n"}, "a/b", False),
     ({"": "*\n!*/\n!*.py\n"}, "pkg/m.py", False), ({"": "*\n!*/\n!*.py\n"}, "pkg/m.txt", True),
     ({"": "/a/b\n"}, "a/b", True), ({"": "a/b\n"}, "x/a/b", False), ({"": "foo\n!foo/bar\n"}, "foo/bar", True),
+    # CRLF line endings and a leading byte order mark, as git reads them
+    ({"": "secrets/\r\n*.log\r\n"}, "secrets/a.py", True), ({"": "secrets/\r\n*.log\r\n"}, "a.log", True),
+    ({"": "*.log\r\n!keep.log\r\n"}, "keep.log", False), ({"": "a \r\n"}, "a", True), ({"": "\ufeff*.log\n"}, "a.log", True),
+    ({"": "\ufeff*.log\r\n#c\r\n"}, "x/b.log", True), ({"": "\ufeff#*.log\n"}, "a.log", False),
+    ({"": "a\\*b\n"}, "a*b", True), ({"": "a\\*b\n"}, "aXb", False), ({"": "**/**/x\n"}, "x", True),
+    ({"": "a/**/**/b\n"}, "a/p/q/b", True), ({"": "a/**/**\n"}, "a/p", True), ({"": "a/**/**\n"}, "a", False),
     ({"": "*.py[co]\n"}, "m.pyc", True), ({"": "[[:digit:]]x\n"}, "5x", True), ({"": "\\!bang\n"}, "!bang", True),
 ]
 
@@ -76,7 +82,7 @@ def test_a_file_over_the_line_cap_contributes_nothing_and_one_note():
 def test_a_long_pattern_is_skipped_with_a_note_and_the_others_still_apply():
     ignore = gi.Ignore({"": "a" * 600 + "\n*.log\n"})
     assert ignore.ignored("x.log") is True
-    assert ignore.ignored("a" * 600) is False
+    assert ignore.ignored("a" * 200) is False
     assert len(ignore.notes) == 1
 
 
@@ -87,15 +93,81 @@ def test_a_clean_file_leaves_no_note():
 def test_many_stars_do_not_backtrack_badly():
     ignore = gi.Ignore({"": "a*a*a*a*a*a*a*a*b\n"})
     start = time.monotonic()
-    assert ignore.ignored("a" * 5000) is False
+    ignore.ignored("a" * 5000)  # a name this long is judged ignored, without a walk
+    assert ignore.ignored("a" * gi.MAX_NAME) is False
     assert time.monotonic() - start < 1.0
+
+
+def test_a_path_too_deep_or_with_a_name_too_long_is_judged_ignored_with_one_note():
+    ignore = gi.Ignore({})
+    assert ignore.ignored("/".join(["d"] * (gi.MAX_DEPTH + 1))) is True
+    assert ignore.ignored("a" * (gi.MAX_NAME + 1)) is True
+    assert ignore.ignored("/".join(["d"] * gi.MAX_DEPTH)) is False
+    assert len(ignore.notes) == 1
+
+
+def test_a_backtracking_segment_is_cheap_to_ask_and_correct():
+    ignore = gi.Ignore({"": "*a*[bc]*d\n"})
+    assert ignore.ignored("xaybzd") is True
+    assert ignore.ignored("xaydzd") is False
+    heavy = gi.Ignore({"": "".join(f"*a*[bc]*d{n}\n" for n in range(100))})
+    assert len(heavy.notes) == 1  # past the budget for segments that can backtrack
 
 
 def test_many_double_stars_and_a_deep_path_stay_fast():
     ignore = gi.Ignore({"": "/".join(["**"] * 40) + "/z\n"})
     start = time.monotonic()
-    assert ignore.ignored("/".join(["d"] * 400) + "/y") is False
+    assert ignore.ignored("/".join(["d"] * 60) + "/y") is False
     assert time.monotonic() - start < 1.0
+
+
+def _timed(files, paths):
+    ignore = gi.Ignore(files)
+    start = time.monotonic()
+    for path in paths:
+        ignore.ignored(path)
+    return time.monotonic() - start, ignore
+
+
+def test_many_hostile_rules_within_the_caps_judge_a_thousand_paths_quickly():
+    paths = [f"pkg{n % 7}/mod{n}/sub/file{n}.py" for n in range(1000)]
+    wide = ["/".join(["a" * 200] * 12) + f"/{'a' * 40}{n:010d}" for n in range(1000)]
+    deep = ["/".join(["x"] * 60) + f"/f{n}" for n in range(1000)]
+    hostile = {
+        "doublestars": "\n".join("**/" * 40 + f"lit{n}" for n in range(1900)) + "\n",
+        "stars": "\n".join("**/" * 20 + "a*" * 8 + f"b{n}" for n in range(3000)) + "\n",
+        "stars_and_marks": "\n".join("**/" * 20 + "*a?" * 8 + f"b{n}" for n in range(2700)) + "\n",
+        "classes": "\n".join("*[ab]" * 8 + f"[x{n % 9}]" for n in range(3000)) + "\n",
+        "middle": "\n".join("x/" + "**/x/" * 7 + f"*b{n}" for n in range(3000)) + "\n",
+        "spread": "\n".join("**/x/" * 7 + "**/*" for _ in range(3000)) + "\n",
+    }
+    for name, text in hostile.items():
+        assert len(text.encode()) <= gi.MAX_FILE_BYTES, name
+        for sample in (paths, wide, deep):
+            took, _ = _timed({"": text}, sample)
+            assert took < 2.0, (name, took)
+
+
+def test_an_honest_file_keeps_every_pattern_and_stays_fast():
+    text = "".join(f"/dir{n}/\n*.ext{n}\n" for n in range(300)) + "build/\n"
+    took, ignore = _timed({"": text}, [f"pkg/mod{n}/file{n}.py" for n in range(1000)])
+    assert ignore.notes == [] and took < 1.0
+    assert ignore.ignored("x/build/a") and ignore.ignored("dir299/a.py") and ignore.ignored("q/z.ext7")
+
+
+def test_a_pattern_past_the_limits_is_left_out_with_one_note():
+    text = "/".join(["a"] * (gi.MAX_SEGMENTS + 1)) + "\n" + "*" * 3 + "a*" * (gi.MAX_STARS + 1) + "\n*.log\n"
+    ignore = gi.Ignore({"": text})
+    assert ignore.ignored("x.log") is True
+    assert ignore.ignored("/".join(["a"] * (gi.MAX_SEGMENTS + 1))) is False
+    assert len(ignore.notes) == 1
+
+
+def test_the_token_budget_leaves_out_the_rest_with_one_note():
+    ignore = gi.Ignore({"": "".join(f"*a*b*c{n}\n" for n in range(2000))})
+    assert len(ignore.notes) == 1
+    assert ignore.ignored("xaybzc0") is True
+    assert ignore.ignored("xaybzc1999") is False
 
 
 def test_an_unclosed_class_is_a_literal_bracket():
