@@ -875,6 +875,19 @@ Facts found while writing the K1 plan, each corrected in place above:
 8. **In K1 a TypeScript or JavaScript file without its grammar gets a file node and a note only.** The coarse
    fallback is K1b's.
 
+## As built in K1 (2026-11-28)
+
+Where slice K1, as built, differs from or adds to the text above. The design is unchanged; these are details that planning and review settled.
+
+1. **The `.gitignore` matcher uses no regular expression.** A pattern is split into segments and matched by equality, `str.find` over the chunks between stars, or a two-pointer wildcard walk, so no input can cause backtracking. Each path's matching work is counted and capped. A path that spends the cap is judged ignored, which is the safe side, and is never cached. A hostile ignore file can slow a build, but cannot make it index a path git ignores.
+2. **A nested `.gitignore` in an ignored folder is skipped.** git never loads an ignore file from a folder it ignores, so the graph does not either (`generated/.gitignore` under a `generated/` pattern). A pattern that matches the ignore file itself, such as `.*`, does not stop git loading it, and does not stop the graph.
+3. **A blob git cannot give is a build error.** A partial clone with lazy fetch off, or a pruned object, stops the build with `git could not read a blob of <sha>`. The proposal did not say what a missing blob does. Storing it as "not read" would be a verdict no later build revisits, because the blob id does not change.
+4. **A constant's signature is empty.** A TypeScript or JavaScript `const NAME` is a `constant` symbol with no signature, so a literal's value (a token in a source file, say) never reaches the store.
+5. **URL credentials are stripped from dependency specs.** `https://user:token@host/x` in a manifest is kept as `https://host/x`.
+6. **The JSON output escapes through `json.dumps`.** Its default `ensure_ascii` writes every control and non-ASCII character as a `\uXXXX` escape. The text views go through `doctor.printable` instead, which would double the escapes in JSON.
+
+The retrieval measurement (success criterion 1) scored 25 of 30 on the first run, with no ranking change, and is `agentflow/tests/test_graph_retrieval.py`. The build timings are in the pull request.
+
 ## Next step
 
 Slice K1 is planned in `docs/plans/2026-11-28-knowledge-graph-k1.md` (named `<date>-<module>-<slice>.md`, which is how
