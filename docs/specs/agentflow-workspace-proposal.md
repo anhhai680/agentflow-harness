@@ -450,7 +450,9 @@ agentflow/dashboard.py            RepoContext, the repository map, rescan, /api/
 agentflow/config_edit.py          the user-level form and its guarded write
 agentflow/dashboard_ui/           repos.js (switcher, badges; new), core.js (path prefix), inbox.js, agents.js, settings.js
 agentflow/hitl.py                 the notification title carries the repository name
+agentflow/run_cap.py              the machine-wide run cap: slot locks, the per-turn context, the hold (new)
 agentflow/tests/test_repo_set.py, test_workspace_cli.py   resolution, rescan, -C, --all (new)
+agentflow/tests/test_run_cap.py   slots, holds, pause and cancel while held (new)
 agentflow/tests/{test_dashboard,test_dashboard_js,test_config_edit,test_layers}.py   extended
 agentflow/tests/fixtures/packs/{python,node}       the two toy packs double as a two-repository workspace
 docs/agentflow-playbook.md        §10 cheat sheet, §14 one line per new key, a new section "Several repositories" (§17)

@@ -7,7 +7,7 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
-## [3.18] - 2026-11-27
+## [3.18] - 2026-11-28
 
 ### Added
 - Two personal keys for the user file, `workspace.max_active_runs` (a whole number from 1 to 64, or absent for no cap) and `workspace.digest` (true or false, default false). Only the user file is read for them: a pack that sets one gets a `validate` warning and the value is ignored. Your settings has a new Across repositories section with both.

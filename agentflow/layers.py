@@ -454,7 +454,7 @@ def workspace_settings(block: object) -> WorkspaceSettings:
     if block is None:
         return WorkspaceSettings((), (), ())
     if not isinstance(block, dict):
-        raise LayerError("workspace", "must be a mapping of roots, repos and exclude")
+        raise LayerError("workspace", f"must be a mapping of {', '.join(WORKSPACE_KEYS[:-1])} and {WORKSPACE_KEYS[-1]}")
     for key in block:
         if key not in WORKSPACE_KEYS:
             raise LayerError(f"workspace.{key}", f"unknown key; known: {', '.join(WORKSPACE_KEYS)}")

@@ -259,6 +259,27 @@ def test_a_pause_while_a_session_waits_stops_the_step(flow_repo):
     slot.release()
 
 
+def test_a_run_already_paused_at_a_full_cap_is_not_held(flow_repo, monkeypatch, tmp_path):
+    from agentflow import hitl
+
+    told: list = []
+    monkeypatch.setattr(hitl, "notify_run", lambda *a, **k: told.append(a))
+    cap_of(1)
+    run = flow_repo.new_run()
+    run.emit("run_paused", by="me")
+    mine = run_cap.take(1)
+    try:
+        out = finished(in_turn(flow_repo, lambda: run_step(flow_repo)))["out"]
+        gate_out = finished(in_turn(flow_repo, lambda: gates.run_gates(
+            flow_repo.cfg, [a_fixture_gate(flow_repo)], flow_repo.root, tmp_path / "logs")))["out"]
+    finally:
+        mine.release()
+    assert out == "stopped" and flow_repo.calls() == []
+    assert [(r.name, r.passed) for r in gate_out] == [("floor", True)]
+    assert flow_repo.events(run, "run_held") == [] and flow_repo.events(run, "run_hold_ended") == []
+    assert told == []
+
+
 def test_an_empty_gate_set_never_waits(flow_repo, tmp_path):
     cap_of(1)
     flow_repo.new_run()

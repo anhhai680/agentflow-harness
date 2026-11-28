@@ -256,6 +256,8 @@ def _hold(t: Turn, key: str, stop_on_halt: bool) -> bool:
         if slot is not None:
             t.slot = slot
             return True
+        if _halted(run.refresh()["status"]):
+            return not stop_on_halt  # already paused or cancelled: hold nothing, say nothing
         run.emit("run_held", key=key, reason=HOLD_REASON, until=_iso_now(), cap=cap)
         held = True
         _notify(t, key, cap)
