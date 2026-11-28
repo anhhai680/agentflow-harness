@@ -31,6 +31,9 @@ With `slots.count` above 1 a run holds a slot for as long as it is live (`slots.
 at every `advance` and every reload, so a run that started with slots off takes one at its next phase), and the
 runner's config is a copy with `{slot}` filled in (`slots.render`, also after a reload; a reload that finds no free
 slot is skipped).
+With `workspace.max_active_runs` in the user file, `advance` runs its loop in a `run_cap.turn`: each agent session
+and gate set of the turn takes one of that many machine-wide slots, and past the cap the run is held (`run cap`) until
+one frees. A wait on a person, an approval or CI holds none.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ from functools import partial
 from pathlib import Path
 from typing import TextIO
 
-from agentflow import keepawake
+from agentflow import keepawake, run_cap
 from agentflow.agents import make_agents
 from agentflow.autonomy import (
     AUTO_BY,
@@ -317,7 +320,9 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
     `resume` goes on from) before the lock is released and the exception goes on to the caller. Taking the run's
     slot comes first: `slots.SlotsFull` (or any failure of that step) releases the lock and is raised with no
     `runner_error`, so the run's status is left as it was. The run's claim on its backlog item follows the status it
-    ends this turn with (`claim_sync.sync_quietly`), before the slot and the issue label are released."""
+    ends this turn with (`claim_sync.sync_quietly`), before the slot and the issue label are released. The loop runs
+    inside a `run_cap.turn`, so each agent session and gate set of the turn takes a machine-wide slot, and the turn
+    gives back whatever it holds however it ends."""
     if run.refresh().get("pipeline") == RETRO_PIPELINE:  # it walks no phase: resuming one would run the whole workflow
         raise ValueError(f"{run.id} is a retro run, which cannot be resumed; cancel it and run `agentflow retro` again")
     lock = run.lock()
@@ -329,7 +334,7 @@ def advance(run: Run, cfg: Config, opts: RunOptions | None = None) -> str:
         lock.release()  # no issue label for `release` to take off (the run is not terminal); the lock must not outlive this
         raise
     try:
-        with keepawake.holding():  # until a human is needed or the run ends
+        with keepawake.holding(), run_cap.turn(run, cfg):  # until a human is needed or the run ends
             return _Loop(run, cfg, _effective(run, opts), slot).go()
     except Exception as exc:
         run.emit("runner_error", error=str(exc) or repr(exc), exception=type(exc).__name__)

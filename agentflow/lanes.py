@@ -3,7 +3,8 @@
 `Executor.run_agent_step` goes round one loop per agent call, in this order: budget check (the soft
 budget notifies once, the hard one stops), then model and effort (from state; for a new step, the level a
 read-only sizer session gave it (`sizing_lane.py`), else `effort.default`), prompt, tree snapshot, the call
-(`agent_started` ... `agent_exited`, spend, one `permission_denied` per denial), guards, the
+(`agent_started` ... `agent_exited`, spend, one `permission_denied` per denial; inside an `advance` turn it holds a
+machine-wide `run_cap` slot, and a pause or cancel while the cap holds it stops the step), guards, the
 `result.json`, gates and doc checks (`checks:`, which always have the fix loop) with the fix loop,
 rollover; and once the result is `done` and the gates pass: the progress check, the commit
 (`commit: true`) and `step_finished`. Anything the runner cannot settle stops the run for a human
@@ -34,7 +35,7 @@ from typing import Literal, TextIO
 from agentflow import backlog_file, backlog_writes
 from agentflow import brief as brief_mod
 from agentflow import lessons as lessons_mod
-from agentflow import (doubt, gitops, overlays, pack, run_env, safeio, sizing, sources, speculation, verification, vuln,
+from agentflow import (doubt, gitops, overlays, pack, run_cap, run_env, safeio, sizing, sources, speculation, verification, vuln,
                        waves, workspace)
 from agentflow.agents import (CLAUDE_MIN_VERSION, LEAN_ARGS, NO_USER_SETTINGS, Agent, AgentCall, AgentOutcome, Interruption,
                               ignored_settings, read_only_allow)
@@ -989,7 +990,10 @@ class Executor(BugEvalLane, StepControl, FeatureLane, WaveLane, SyncLane, CILane
                 if not self.govern(sr.key, "hard", sr.phase.name):
                     return "stopped"
 
-            called = self._call(sr, turn)
+            with run_cap.working(f"{sr.phase.name}/{run_cap.CAP_STEP}", stop_on_halt=True) as go_on:
+                if not go_on:  # paused or cancelled while the run cap held it
+                    return "stopped"
+                called = self._call(sr, turn)
             if called.brief_error is not None:  # no agent ran: the session can't have its brief, so a fresh one starts
                 replaced = self._replace_brief(sr, turn, called.brief_error)
                 if replaced is None:

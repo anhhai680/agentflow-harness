@@ -25,10 +25,13 @@ PHASE_FREE_KEYS = ("needs_approval", "resolve", "model", "agent")  # the rest of
 USER_KEYS = (  # dotted patterns of the settings that are personal; `*` matches exactly one segment
     "agents.*.models", "agents.claude.user_settings", "defaults.run_budget_usd", "defaults.run_budget_hard_usd",
     "defaults.task_budget_usd", "hitl.notify", "hitl.remind_after_h", "dashboard.port", "usage.*",
-    "workspace.roots", "workspace.repos", "workspace.exclude", "dashboard.board_refresh_s", "dashboard.done_shown",
+    "workspace.roots", "workspace.repos", "workspace.exclude", "workspace.max_active_runs", "workspace.digest",
+    "dashboard.board_refresh_s", "dashboard.done_shown",
 )
 MAX_WORKSPACE_ENTRIES = 256  # per list of `workspace`: a hand-written file never nears it, a hostile one is cut off
-WORKSPACE_KEYS = ("roots", "repos", "exclude")
+WORKSPACE_LISTS = ("roots", "repos", "exclude")  # the lists that say which repositories the workspace holds
+WORKSPACE_KEYS = (*WORKSPACE_LISTS, "max_active_runs", "digest")
+MAX_ACTIVE_RUNS = 64  # the largest `workspace.max_active_runs`: one lock file per slot, so it is bounded
 _WHOLE_ENTRIES = (("record_step",), ("resolve_step",))  # replaced whole, like each entry of `conditions`/`gates`
 _WHOLE_PARENTS = ("conditions", "gates", "policy.obligations")  # dotted: each entry below one is replaced whole
 _WHOLE_PARENT_KEYS = tuple(tuple(dotted.split(".")) for dotted in _WHOLE_PARENTS)
@@ -424,6 +427,8 @@ class WorkspaceSettings(NamedTuple):
     roots: tuple[str, ...]  # folders whose child repositories belong to the workspace
     repos: tuple[str, ...]  # single repositories
     exclude: tuple[str, ...]  # a path, or a bare folder name, to leave out
+    max_active_runs: int | None = None  # most runs working at once on this machine; None: no cap
+    digest: bool = False  # one merged notification digest over every repository of the workspace
 
 
 class UserSettings(NamedTuple):
@@ -438,21 +443,23 @@ def _path_shaped(entry: str) -> bool:
 
 
 def workspace_settings(block: object) -> WorkspaceSettings:
-    """The `workspace` block as three tuples of entries; None (no block) is all empty.
+    """The `workspace` block as three tuples of entries, the run cap and the digest switch; None (no block) is all
+    empty, no cap, no merged digest.
 
     Every entry is checked here once, so a reader can take the shape as given: text that is not empty, at most
     `MAX_WORKSPACE_ENTRIES` per list. A `roots` or `repos` entry, and an `exclude` entry that holds a `/` or starts
     with `~`, is an absolute path or one under the home directory (`~`, `~/...`); an `exclude` entry with neither is
-    a bare folder name. A `LayerError` names `workspace.<key>`."""
+    a bare folder name. `max_active_runs` is a whole number from 1 to `MAX_ACTIVE_RUNS` (a bool is not one) or
+    absent, and `digest` is true or false (absent: false). A `LayerError` names `workspace.<key>`."""
     if block is None:
         return WorkspaceSettings((), (), ())
     if not isinstance(block, dict):
-        raise LayerError("workspace", "must be a mapping of roots, repos and exclude")
+        raise LayerError("workspace", f"must be a mapping of {', '.join(WORKSPACE_KEYS[:-1])} and {WORKSPACE_KEYS[-1]}")
     for key in block:
         if key not in WORKSPACE_KEYS:
             raise LayerError(f"workspace.{key}", f"unknown key; known: {', '.join(WORKSPACE_KEYS)}")
     lists: dict[str, tuple[str, ...]] = {}
-    for key in WORKSPACE_KEYS:
+    for key in WORKSPACE_LISTS:
         where = f"workspace.{key}"
         value = block.get(key)
         if value is None:
@@ -470,7 +477,13 @@ def workspace_settings(block: object) -> WorkspaceSettings:
             if (key != "exclude" or "/" in entry or entry.startswith("~")) and not _path_shaped(entry):
                 raise LayerError(where, f"{entry!r} must be an absolute path or start with ~/ (never `~user` or relative)")
         lists[key] = tuple(value)
-    return WorkspaceSettings(lists["roots"], lists["repos"], lists["exclude"])
+    cap = block.get("max_active_runs")
+    if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= MAX_ACTIVE_RUNS):
+        raise LayerError("workspace.max_active_runs", f"must be a whole number from 1 to {MAX_ACTIVE_RUNS}")
+    digest = block.get("digest")
+    if digest is not None and not isinstance(digest, bool):
+        raise LayerError("workspace.digest", "must be true or false")
+    return WorkspaceSettings(lists["roots"], lists["repos"], lists["exclude"], cap, bool(digest))
 
 
 def load_user_settings(path: Path | None = None) -> UserSettings:

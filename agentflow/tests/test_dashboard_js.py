@@ -1346,6 +1346,22 @@ def test_a_user_config_that_cannot_be_edited_renders_every_field_disabled():
     assert got[2] is True and got[3] == "/u/config.yaml"
 
 
+def test_only_the_workspace_folders_section_carries_the_restart_note():
+    data = {"path": "/u/config.yaml", "sha256": "0" * 64, "exists": True, "editable": True, "error": None,
+            "rescans": False, "sections": [
+                {"title": "Workspace", "note": "n1", "fields": [
+                    {"key": ["workspace", "roots"], "label": "Roots", "kind": "list", "lines": True, "value": [], "present": False,
+                     "source": "engine", "optional": True, "target": "user"}]},
+                {"title": "Across repositories", "note": "n2", "fields": [
+                    {"key": ["workspace", "max_active_runs"], "label": "Cap", "kind": "int", "min": 1, "max": 64, "value": None,
+                     "present": False, "source": "engine", "optional": True, "target": "user"}]}]}
+    got = js(USER_FORM, REC_EL + """ui = {repos: {repos: [{id: 'a'}]}, repo: null};
+      userSettings.data = args; renderUserSettings();
+      nodes['user-form'].kids.map((section) => section.c[1].p.text)""", data)
+    assert "only after a restart" in got[0]
+    assert "only after a restart" not in got[1] and got[1] == "n2"
+
+
 def test_a_user_save_reloads_the_form_and_the_repositories_and_wakes_an_empty_page():
     got = js_async(USER_FORM, """var asked = [], toasts = [], calls = [], ok = null;
       ui = {repos: {repos: []}, multi: false, repo: null, workflow: {x: 1}, view: 'board'};

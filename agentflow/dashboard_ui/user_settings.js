@@ -45,7 +45,7 @@ function renderUserSettings() {
   $("user-path").textContent = d.path || "your user config";
   const locked = d.editable ? null : (d.error || "your user config can't be edited here; fix it by hand");
   $("user-form").replaceChildren(...(d.sections || []).map((section) => {
-    const workspace = section.fields.some((f) => f.key[0] === "workspace");
+    const workspace = section.fields.some((f) => f.key[0] === "workspace" && f.kind === "list");
     const note = workspace && d.rescans === false
       ? section.note + " This dashboard serves one repository, so it takes a workspace change only after a restart." : section.note;
     return el("div", { class: "set-section" }, el("h3", { text: section.title }), el("p", { class: "muted", text: note }),

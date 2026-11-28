@@ -285,7 +285,7 @@ def _table(rows: list[list[str]]) -> list[str]:
 
 
 def _print_run_detail(run) -> None:
-    from agentflow.state import display_status
+    from agentflow.state import OPEN_HOLDS, display_status
 
     st = run.state
     print(f"run:      {run.id}")
@@ -300,7 +300,9 @@ def _print_run_detail(run) -> None:
         if value:
             print(f"{label}:".ljust(10) + str(value))
     if st.get("hold"):
-        print(f"held:     {st['hold']['reason']} until {st['hold']['until']}, step {st['hold']['key']}")
+        hold = st["hold"]
+        until = "" if hold["reason"] in OPEN_HOLDS else f" until {hold['until']}"
+        print(f"held:     {hold['reason']}{until}, step {hold['key']}")
     if st["waiting"]:
         w = st["waiting"]
         print(f"waiting:  {w['kind']} {w['key']} since {w['since']}")

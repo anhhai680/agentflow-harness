@@ -68,9 +68,11 @@ Routes:
   (`config_edit.propose_user`: it must load there, and pass `validate` wherever it passed), so an edit that breaks
   one is a 400 naming it; 409 when the file changed since the page read it. A save answers
   `{ok, sha256, restart, rescanned}`: every live repository's config is loaded again
-  (`DashboardServer.user_saved`), a workspace dashboard rescans at once on a `workspace.*` change, or when the user
-  file did not load or a repository was in `error` before the save (the save may have mended either), and `restart`
-  lists what needs a restart (`dashboard.port`, and `workspace.*` on a server that does not rescan).
+  (`DashboardServer.user_saved`), a workspace dashboard rescans at once on a `workspace.roots`, `repos` or `exclude`
+  change, or when the user file did not load or a repository was in `error` before the save (the save may have
+  mended either), and `restart`
+  lists what needs a restart (`dashboard.port`, and those three `workspace` lists on a server that does not rescan;
+  `workspace.max_active_runs` and `workspace.digest` are read per use and need neither).
 - `GET /api/repos`: every repository the server holds (`repo_context.repos_view`, from one snapshot: its id, name,
   state, counts and load error, the skipped settings entries, the default's id), with no checkout path in it.
   The counts are cached for `repo_context.COUNTS_TTL_S` seconds per context object (`DashboardServer.counts`).
@@ -198,6 +200,8 @@ CONFIG_ROUTES = ("/api/config/preview", "/api/config/save")
 CONFIG_MAX_BODY = config_edit.MAX_TEXT + 64 * 1024  # the YAML tab sends the whole file
 USER_ROUTES = ("/api/user-config", "/api/user-config/preview", "/api/user-config/save")  # Your settings: no repository
 RESTART_KEYS = ("dashboard.port",)  # a user-file key the running server reads only at start-up
+# the user-file keys that change which repositories the workspace holds: a save of one rescans, or needs a restart
+WORKSPACE_LIST_KEYS = frozenset(f"workspace.{k}" for k in layers.WORKSPACE_LISTS)
 BACKLOG_LOG = "backlog"  # the `run_id` the live stream gives backlog events
 REFRESH_EVERY_S = 60.0
 SSE_POLL_S = 0.25
@@ -592,10 +596,10 @@ class DashboardServer(ThreadingHTTPServer):
         """After Your settings saved the user file: load every live context's config again (stored on the context
         the current snapshot holds, as a pack save stores it) and the snapshot's `user`, under `_scan_lock`, so a
         rescan publishes either before (and this lands on what it published) or after (and it read the new file).
-        Then a workspace server rescans at once when `keys` holds a `workspace.*` key, or when the snapshot before
-        the save had a user file that did not load (`user_error`) or a repository in `error`: the save may have
-        mended either, and the page lists the repositories again right after it. True when it rescanned. A
-        context whose reload fails is logged with its name and keeps its config. Never raises."""
+        Then a workspace server rescans at once when `keys` holds a `workspace.roots`, `repos` or `exclude` key, or
+        when the snapshot before the save had a user file that did not load (`user_error`) or a repository in
+        `error`: the save may have mended either, and the page lists the repositories again right after it. True when
+        it rescanned. A context whose reload fails is logged with its name and keeps its config. Never raises."""
         mend = False
         with self._scan_lock:
             try:
@@ -615,7 +619,7 @@ class DashboardServer(ThreadingHTTPServer):
                     self.snap = replace(snap, user=settings, user_error=None)
             except Exception as exc:
                 sys.stderr.write(f"dashboard: reload after a user config save failed: {doctor.printable(exc)}\n")
-        if not (self.workspace and (mend or any(key.startswith("workspace.") for key in keys))):
+        if not (self.workspace and (mend or any(key in WORKSPACE_LIST_KEYS for key in keys))):
             return False
         self.rescan()
         return True
@@ -1329,7 +1333,7 @@ class _Handler(BaseHTTPRequestHandler):
         rescanned = False
         if proposal.changed:
             for key in keys:
-                if key not in restart and (key in RESTART_KEYS or (key.startswith("workspace.")
+                if key not in restart and (key in RESTART_KEYS or (key in WORKSPACE_LIST_KEYS
                                                                    and not self.server.workspace)):
                     restart.append(key)
             rescanned = self.server.user_saved(keys)

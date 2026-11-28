@@ -7,6 +7,16 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+## [3.18] - 2026-11-28
+
+### Added
+- Two personal keys for the user file, `workspace.max_active_runs` (a whole number from 1 to 64, or absent for no cap) and `workspace.digest` (true or false, default false). Only the user file is read for them: a pack that sets one gets a `validate` warning and the value is ignored. Your settings has a new Across repositories section with both.
+- The run cap: with `workspace.max_active_runs` in your user file, at most that many runs work at once on this machine. Each agent session (fresh, resumed, sizer or triage) and each gate set of a run takes a slot while it runs and gives it back after; past the cap the run is held (`held (run cap)` on the Board, `run cap` in `agentflow status` and the Inbox, with no "until"), notifies once and checks again every 10 seconds. A pause or cancel during the wait stops an agent session, while a gate set runs once without a slot. Waits on a person, an approval or CI hold no slot, and a lock folder or file that can't be used lets the work go on uncapped, said once on stderr.
+- The merged digest: with `workspace.digest: true` in your user file, every notification is one line over your whole workspace, titled `agentflow`, whatever each pack's `hitl.digest` says, such as `3 items need you (2 hold a run): billing 2, web 1; 1 run progressing in 3 repositories; 1 not counted`. Another repository is read only from its default state dir, through its runs' `state.json` files, and is never locked or written; one whose pack sets `paths.state_dir`, or that can't be read safely, is `not counted`. The line is sent only when it changed, and is kept in `workspace_digest.txt` under the state root only when a notifier delivered it.
+
+### Changed
+- A `workspace.*` save from Your settings rescans the workspace, or asks for a restart on a single-repository dashboard, only for `roots`, `repos` and `exclude`. The restart note on the page goes only on the Workspace section.
+
 ## [3.17] - 2026-11-27
 
 ### Added

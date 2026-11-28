@@ -41,6 +41,12 @@ def test_a_pack_that_sets_workspace_gets_a_warning_and_a_user_value_does_not(tmp
     assert [i for i in issues_for(tmp_cfg, {}) if i.path.startswith("workspace")] == []
 
 
+def test_a_pack_that_sets_the_cap_or_the_digest_gets_a_warning(tmp_cfg):
+    found = issues_for(tmp_cfg, {"workspace": {"max_active_runs": 2, "digest": True}})
+    assert sorted((i.level, i.path) for i in found if i.path.startswith("workspace")) == [
+        ("warning", "workspace.digest"), ("warning", "workspace.max_active_runs")]
+
+
 def test_the_workspace_warning_survives_a_missing_home_directory(tmp_cfg, monkeypatch):
     path = tmp_cfg({"workspace": {"roots": ["/x"]}})
     cfg = load_config(path)

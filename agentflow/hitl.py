@@ -13,16 +13,20 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import unicodedata
 import urllib.request
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
-from . import layers, pack, safeio
+import yaml
+
+from . import layers, pack, repo_set, safeio
 from .config import CONFORMANCE_FAILED, QUESTION_KINDS, RECONCILE_CHANGED, RETRO_PIPELINE, Config, for_lane
 from .events import nfc, parse_iso
 from .park import radius_line
@@ -370,9 +374,11 @@ def _send(entry: dict, title: str, message: str) -> None:
         raise NotifyError(f"unknown notifier type {kind!r}")
 
 
-def notify(cfg: Config, title: str, message: str, run: Run | None = None) -> None:
-    """Tell the human through every enabled `hitl.notify` entry. A failing notifier is logged, never raised."""
+def notify(cfg: Config, title: str, message: str, run: Run | None = None) -> int:
+    """Tell the human through every enabled `hitl.notify` entry. A failing notifier is logged, never raised.
+    Returns how many entries delivered (sent without an error): the merged digest keeps a line only when one did."""
     message = _one_line(message)[:MESSAGE_MAX]
+    delivered = 0
     for entry in cfg.hitl.get("notify", []):
         if not isinstance(entry, dict) or not entry.get("enabled", True):
             continue
@@ -380,26 +386,174 @@ def notify(cfg: Config, title: str, message: str, run: Run | None = None) -> Non
             _send(entry, title, message)
         except (OSError, subprocess.SubprocessError, ValueError, NotifyError) as exc:
             _log_failure(run, str(entry.get("type")), str(exc) or type(exc).__name__)
+        else:
+            delivered += 1
+    return delivered
 
 
 DIGEST_TITLE = "agentflow"
 DIGEST_FILE = "notify_digest.txt"  # in the state dir: the digest line last sent
 DIGEST_MAX_BYTES = 1024
 PROGRESSING = ("running", "refining")  # a run no one waits on and that is neither done, paused nor ready
+WORKSPACE_DIGEST_FILE = "workspace_digest.txt"  # under `pack.user_state_root()`: the merged line last delivered
+STATE_MAX_BYTES = 8 * 1024 * 1024  # another repository's `state.json` longer than this is not read
+DIGEST_LABELS = 3  # repositories named in the merged line; the rest are `+<n> more`
+
+
+class DigestCounts(NamedTuple):
+    items: int  # what needs a person: each run's wait and each parked stop
+    holding: int  # the items that are a run's wait (a parked item holds nothing)
+    going: int  # the runs in `PROGRESSING`
+
+
+def _item_kind(item: dict) -> str:
+    """An inbox item's kind, raising as `inbox_items` would for an item with no `key` or `kind`."""
+    if "key" not in item:
+        raise KeyError("key")
+    return item["kind"]
+
+
+def counts_of_states(states: Iterable[dict]) -> DigestCounts:
+    """What `inbox_items` and `PROGRESSING` count over runs' states: an unfinished run's wait (which holds the run),
+    each of its parked stops (which holds nothing, so its run still counts as progressing), and the runs going on.
+    A state of an unexpected shape raises."""
+    items = holding = going = 0
+    for state in states:
+        status, waiting = state["status"], state["waiting"]
+        if status in PROGRESSING:
+            going += 1
+        if status in TERMINAL:
+            continue
+        if waiting is not None:
+            items += 1
+            holding += _item_kind(waiting) != "parked"
+        for item in (state.get("parked") or {}).values():
+            _item_kind(item)
+            items += 1
+    return DigestCounts(items, holding, going)
+
+
+def digest_counts(repo: Path) -> DigestCounts:
+    """The digest's counts over every run of the repository holding `repo` (its `pack.state_dir`)."""
+    return counts_of_states(run.state for run in list_runs(repo))
+
+
+def _digest_parts(c: DigestCounts) -> tuple[str, str]:
+    """The line's two halves: what needs you (and what it holds), and the runs progressing."""
+    need = "Nothing needs you" if not c.items else f"{c.items} item{'s' if c.items != 1 else ''} need{'' if c.items != 1 else 's'} you"
+    held = f" ({c.holding} hold{'s' if c.holding == 1 else ''} a run)" if c.holding else ""
+    return f"{need}{held}", f"{c.going} run{'' if c.going == 1 else 's'} progressing"
+
+
+def digest_line(c: DigestCounts) -> str:
+    """The digest's one line for `c`, such as `2 items need you (1 holds a run); 3 runs progressing`."""
+    return "; ".join(_digest_parts(c))
 
 
 def digest_text(repo: Path) -> str:
     """The one machine-wide line of `hitl.digest`: the items that need a person, and the runs going on.
     An item "holds a run" when it is a run's wait; a parked item needs a person but holds nothing, and its run still
     counts as progressing."""
-    runs = list_runs(repo)
-    items = inbox_items(repo, runs)
-    holding = sum(1 for item in items if item["kind"] != "parked")
-    going = sum(1 for run in runs if run.state["status"] in PROGRESSING)
-    count = len(items)
-    need = "Nothing needs you" if not count else f"{count} item{'s' if count != 1 else ''} need{'' if count != 1 else 's'} you"
-    held = f" ({holding} hold{'s' if holding == 1 else ''} a run)" if holding else ""
-    return f"{need}{held}; {going} run{'' if going == 1 else 's'} progressing"
+    return digest_line(digest_counts(repo))
+
+
+def _uses_default_state(path: Path) -> bool:
+    """Whether the repository at `path` keeps its runs in its default state dir. It reads that repository's
+    `.agentflow/config.yaml` and nothing else of its checkout: through `safeio` (no symlink, FIFO or device, never
+    blocking), capped at `layers.MAX_CONFIG_BYTES`, and only below a `.agentflow` that is a real folder. True only for a
+    mapping whose `paths.state_dir` is absent or empty; its value is never followed (a clone can ship one)."""
+    if not stat.S_ISDIR(os.lstat(path / pack.PACK_DIR).st_mode):  # a symlinked folder is not one
+        return False
+    data = safeio.read_bytes(path / pack.PACK_DIR / "config.yaml", layers.MAX_CONFIG_BYTES)
+    if data is None:
+        return False
+    raw = yaml.safe_load(data.decode("utf-8"))
+    if not isinstance(raw, dict):
+        return False
+    paths = raw.get("paths")
+    if paths is None:
+        return True
+    if not isinstance(paths, dict):
+        return False
+    value = paths.get("state_dir")
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _other_counts(repo_id: str) -> DigestCounts:
+    """The digest's counts of another repository, read from its default state dir only: each `runs/<id>` that is a
+    real folder (a symlink is skipped) holding `events.jsonl`, through its `state.json`, read with `safeio` and capped
+    at `STATE_MAX_BYTES`. Never through `Run.load`, which would lock and rewrite another repository's runs. Raises
+    when anything can't be read or has an unexpected shape."""
+    root = pack.user_state_root() / repo_id / "runs"
+    try:
+        names = sorted(os.listdir(root))
+    except FileNotFoundError:
+        return DigestCounts(0, 0, 0)
+    states = []
+    for name in names:
+        folder = root / name
+        if not stat.S_ISDIR(os.lstat(folder).st_mode) or not (folder / "events.jsonl").is_file():
+            continue
+        data = safeio.read_bytes(folder / "state.json", STATE_MAX_BYTES)
+        if data is None:
+            raise ValueError(f"{folder} has no state.json")
+        state = json.loads(data)
+        if not isinstance(state, dict):
+            raise ValueError(f"{folder}/state.json is not a mapping")
+        states.append(state)
+    return counts_of_states(states)
+
+
+def workspace_digest_text(repo: Path) -> str:
+    """The merged digest of `workspace.digest`: `digest_text`'s counts summed over the run's own repository and every
+    other live repository of the workspace, such as
+    `3 items need you (2 hold a run): billing 2, web 1; 1 run progressing in 3 repositories; 1 not counted`, cut to
+    `MESSAGE_MAX`. The run's own repository is read as `digest_text` reads it, and raises when its runs can't be read.
+    Another repository is counted only from its default state dir (`_uses_default_state`, `_other_counts`): one that
+    sets `paths.state_dir`, or that fails in any way, is *not counted*, and nothing of it is locked, written or
+    followed. A user file that names no workspace, or can't be read, counts the run's own repository only."""
+    root = pack.checkout_root(repo)
+    own_id = pack.repo_id(root)
+    own = digest_counts(repo)
+    try:
+        refs = repo_set.from_user_config().repos
+    except Exception:  # no workspace, or a user file that can't be read: the run's own repository only
+        refs = ()
+    own_name = _one_line(next((r.name for r in refs if r.id == own_id), None) or root.name)
+    counted: list[tuple[str, DigestCounts]] = [(own_name, own)]
+    seen = {own_id}
+    not_counted = 0
+    for ref in refs:
+        if ref.state != "live" or ref.id in seen:
+            continue
+        seen.add(ref.id)
+        try:  # the whole count of a repository: any failure makes it not counted
+            if not _uses_default_state(ref.path):
+                raise ValueError("it does not keep its runs in its default state dir")
+            counted.append((_one_line(ref.name), _other_counts(ref.id)))
+        except Exception:
+            not_counted += 1
+    total = DigestCounts(*(sum(c[i] for _, c in counted) for i in range(3)))
+    need, going = _digest_parts(total)
+    if total.items:
+        named = sorted(((name, c.items) for name, c in counted if c.items), key=lambda pair: (-pair[1], pair[0]))
+        labels = [f"{name} {items}" for name, items in named[:DIGEST_LABELS]]
+        if len(named) > DIGEST_LABELS:
+            labels.append(f"+{len(named) - DIGEST_LABELS} more")
+        need += ": " + ", ".join(labels)
+    k = len(counted)
+    line = f"{need}; {going} in {k} repositor{'y' if k == 1 else 'ies'}"
+    if not_counted:
+        line += f"; {not_counted} not counted"
+    return _one_line(_one_line(line)[:MESSAGE_MAX])
+
+
+def _workspace_digest_on() -> bool:
+    """`workspace.digest` from the user file; anything that goes wrong reading it is off."""
+    try:
+        return layers.load_user_settings().workspace.digest is True
+    except Exception:
+        return False
 
 
 def _digest_unchanged(path: Path, text: str) -> bool:
@@ -411,10 +565,34 @@ def _digest_unchanged(path: Path, text: str) -> bool:
 
 
 def notify_run(cfg: Config, run: Run, message: str) -> None:
-    """`notify` with the run's configured title. With `hitl.digest` on it sends `digest_text` instead of `message`,
-    and only when that differs from the line last sent (kept in the state dir): a note that changes no count is
-    never sent. A digest that cannot be built (another run's state unreadable, say) is logged as `notify_failed` and
-    `message` is sent instead: telling a person never raises."""
+    """`notify` with the run's configured title.
+
+    With `workspace.digest` on in the user file, it sends `workspace_digest_text` instead of `message`, titled plainly
+    `agentflow`, whatever the pack's `hitl.digest` says, and only when that line differs from the last one delivered
+    (kept in `WORKSPACE_DIGEST_FILE` under `pack.user_state_root()`). The line is kept only when at least one notifier
+    delivered it, so a pack with no working notifier never marks it as sent for the other repositories.
+
+    Else, with `hitl.digest` on, it sends `digest_text` instead of `message`, and only when that differs from the line
+    last sent (kept in the state dir): a note that changes no count is never sent.
+
+    A digest that cannot be built (a run's state unreadable, say) is logged as `notify_failed` and `message` is sent
+    instead: telling a person never raises."""
+    if _workspace_digest_on():
+        try:
+            text = workspace_digest_text(run.repo)
+            path = safeio.ensure_dir(pack.user_state_root()) / WORKSPACE_DIGEST_FILE
+        except Exception as exc:  # the run's own runs can't be read, or the state root can't be used
+            _log_failure(run, "digest", f"could not build the digest: {exc}")
+            notify(cfg, _title_for(cfg, run), message, run=run)
+            return
+        if _digest_unchanged(path, text):
+            return
+        if notify(cfg, DIGEST_TITLE, text, run=run):  # a patched `notify` that returns None delivered nothing
+            try:
+                safeio.write_text(path, text)
+            except (OSError, ValueError) as exc:
+                _log_failure(run, "digest", f"could not keep the digest sent: {exc}")
+        return
     if cfg.hitl.get("digest") is not True:
         notify(cfg, _title_for(cfg, run), message, run=run)
         return

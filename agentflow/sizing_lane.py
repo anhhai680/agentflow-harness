@@ -36,7 +36,7 @@ import os
 import stat
 from typing import TYPE_CHECKING, Literal
 
-from agentflow import overlays, route, run_env, safeio, sizing, sources
+from agentflow import overlays, route, run_cap, run_env, safeio, sizing, sources
 from agentflow.agents import Agent, AgentCall, AgentOutcome, EventCallback
 from agentflow.conditions import fmt
 from agentflow.config import Phase, Step, resolve_model
@@ -462,54 +462,57 @@ class SizingLane:
         """One fresh read-only session: its parsed answer (None when it gave none) and what it changed. Never waits
         on a usage limit, reminds or stops: an interruption, a timeout or an exception gives no answer. `add_dirs` are the directories
         outside the worktree it may read (the run's workspace, for a triage that names the run's inputs). A Claude
-        sizer waits first while the usage window is above its hard mark; paused or cancelled there, it gives no answer
-        and changed nothing."""
+        sizer waits first while the usage window is above its hard mark, and every sizer holds a `run_cap` slot for the
+        call; paused or cancelled in either wait, it gives no answer and changed nothing."""
         if agent.name == "claude" and not self.govern(key, "hard", phase):
             return None, []
-        before = self._repo_state()
-        self.run.emit("sizer_started", key=key, **before)
-        call = AgentCall(
-            prompt=prompt, model=model, effort=effort, cwd=self.worktree, run_id=self.run.id, step_key=key,
-            result_path=self.run.agent_result_path(key), transcript_path=self.run.transcript_path(key, 1),
-            add_dirs=list(add_dirs or []), runs_root=self.run.dir.parent, timeout_s=timeout_s,
-            resume_session=None,  # always fresh: a resumed Codex session keeps its own sandbox
-            agent_profile=None, context_window=self.context_window_for(key, model), env=self.cfg.defaults.env,
-            env_base=run_env.base(self.cfg), forbidden_paths=list(self.cfg.guardrails.forbidden_paths),
-            max_turns=turns, read_only=True, self_contained=True,
-            usage_windows=dict(self.run.state.get("usage_window") or {}), on_reading=self._on_reading,
-        )
-        seen: dict[str, object] = {"pid": None}
+        with run_cap.working(f"{phase}/{run_cap.CAP_STEP}", stop_on_halt=True) as go_on:
+            if not go_on:  # paused or cancelled while the run cap held it: no answer, and nothing changed
+                return None, []
+            before = self._repo_state()
+            self.run.emit("sizer_started", key=key, **before)
+            call = AgentCall(
+                prompt=prompt, model=model, effort=effort, cwd=self.worktree, run_id=self.run.id, step_key=key,
+                result_path=self.run.agent_result_path(key), transcript_path=self.run.transcript_path(key, 1),
+                add_dirs=list(add_dirs or []), runs_root=self.run.dir.parent, timeout_s=timeout_s,
+                resume_session=None,  # always fresh: a resumed Codex session keeps its own sandbox
+                agent_profile=None, context_window=self.context_window_for(key, model), env=self.cfg.defaults.env,
+                env_base=run_env.base(self.cfg), forbidden_paths=list(self.cfg.guardrails.forbidden_paths),
+                max_turns=turns, read_only=True, self_contained=True,
+                usage_windows=dict(self.run.state.get("usage_window") or {}), on_reading=self._on_reading,
+            )
+            seen: dict[str, object] = {"pid": None}
 
-        def on_event(name: str, payload: dict) -> None:
-            data = {**payload, "sizer": True}  # never a step of its own (`state._on_agent_started`)
-            if name == "agent_started":
-                seen["pid"] = data.get("pid")
-                data.update(sizing=True, phase=phase, role=role)
-            elif name == "agent_session":
-                data.update(key=key, pid=seen["pid"])
-            elif name == "agent_exited":
-                data["key"] = key
-            self.run.emit(name, **data)
+            def on_event(name: str, payload: dict) -> None:
+                data = {**payload, "sizer": True}  # never a step of its own (`state._on_agent_started`)
+                if name == "agent_started":
+                    seen["pid"] = data.get("pid")
+                    data.update(sizing=True, phase=phase, role=role)
+                elif name == "agent_session":
+                    data.update(key=key, pid=seen["pid"])
+                elif name == "agent_exited":
+                    data["key"] = key
+                self.run.emit(name, **data)
 
-        outcome: AgentOutcome | None = None
-        changed = ["unknown"]
-        try:
-            outcome = self._metered(lambda: self._run_sizer(agent, call, on_event))
-        except Exception:  # noqa: BLE001 - no answer; what it changed is still checked below
-            outcome = None
-        finally:
+            outcome: AgentOutcome | None = None
+            changed = ["unknown"]
             try:
-                changed = self._changes_since(before)
-            except Exception:  # noqa: BLE001 - what cannot be compared cannot be vouched for
-                changed = ["unknown"]
-        if not changed:  # accounted for now: a pause or a crash before its decision never leaves it open
-            self._settle(key)
-        if outcome is None or outcome.timed_out or outcome.interruption is not None:
-            return None, changed
-        try:
-            return sizing.parse_result(outcome.final_text or ""), changed
-        except Exception:  # noqa: BLE001 - e.g. JSON nested too deep
-            return None, changed
+                outcome = self._metered(lambda: self._run_sizer(agent, call, on_event))
+            except Exception:  # noqa: BLE001 - no answer; what it changed is still checked below
+                outcome = None
+            finally:
+                try:
+                    changed = self._changes_since(before)
+                except Exception:  # noqa: BLE001 - what cannot be compared cannot be vouched for
+                    changed = ["unknown"]
+            if not changed:  # accounted for now: a pause or a crash before its decision never leaves it open
+                self._settle(key)
+            if outcome is None or outcome.timed_out or outcome.interruption is not None:
+                return None, changed
+            try:
+                return sizing.parse_result(outcome.final_text or ""), changed
+            except Exception:  # noqa: BLE001 - e.g. JSON nested too deep
+                return None, changed
 
     def _run_sizer(self, agent: Agent, call: AgentCall, on_event: EventCallback) -> AgentOutcome:
         """The sizer's agent call: a seam for tests (`StepControl._run_agent` is another method)."""
