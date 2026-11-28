@@ -7,6 +7,9 @@ The version is `pack.ENGINE_VERSION`; `pyproject.toml` must carry the same numbe
 
 ## [Unreleased]
 
+### Fixed
+- The bug lane's regression test command (`signals.test_command`, for `expect: red` and `expect: green`) now runs in the same environment as the gates, the inherited one with `defaults.env` on top. Before, it ran without `defaults.env`, so a test that needs a pack variable (a database port, say) failed on the missing setting: the red check accepted that failure as a reproduction, and the fix's green check could never pass.
+
 ## [3.18] - 2026-11-28
 
 ### Added
