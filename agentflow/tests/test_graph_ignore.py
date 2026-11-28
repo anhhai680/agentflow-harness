@@ -95,59 +95,46 @@ def test_a_clean_file_leaves_no_note():
 def test_many_stars_do_not_backtrack_badly():
     ignore = gi.Ignore({"": "a*a*a*a*a*a*a*a*b\n"})
     start = time.monotonic()
-    ignore.ignored("a" * 5000)  # a name this long is judged ignored, without a walk
-    assert ignore.ignored("a" * gi.MAX_NAME) is False
+    assert ignore.ignored("a" * 5000) is False
     assert time.monotonic() - start < 1.0
 
 
-def test_a_path_too_deep_or_with_a_name_too_long_is_judged_ignored_with_one_note():
-    ignore = gi.Ignore({})
-    assert ignore.ignored("/".join(["d"] * (gi.MAX_DEPTH + 1))) is True
-    assert ignore.ignored("a" * (gi.MAX_NAME + 1)) is True
-    assert ignore.ignored("/".join(["d"] * gi.MAX_DEPTH)) is False
-    assert len(ignore.notes) == 1
-
-
-def test_a_backtracking_segment_is_cheap_to_ask_and_correct():
+def test_a_backtracking_segment_is_correct():
     ignore = gi.Ignore({"": "*a*[bc]*d\n"})
     assert ignore.ignored("xaybzd") is True
     assert ignore.ignored("xaydzd") is False
-    heavy = gi.Ignore({"": "".join(f"*a*[bc]*d{n}\n" for n in range(100))})
-    assert len(heavy.notes) == 1  # past the budget for segments that can backtrack
 
 
-def test_many_double_stars_and_a_deep_path_stay_fast():
-    ignore = gi.Ignore({"": "/".join(["**"] * 40) + "/z\n"})
-    start = time.monotonic()
-    assert ignore.ignored("/".join(["d"] * 60) + "/y") is False
-    assert time.monotonic() - start < 1.0
-
-
-def _timed(files, paths):
+def _steps(files, paths):
     ignore = gi.Ignore(files)
-    start = time.monotonic()
-    for path in paths:
-        ignore.ignored(path)
-    return time.monotonic() - start, ignore
+    return ignore, [ignore.judge(path)[1] for path in paths]
 
 
-def test_many_hostile_rules_within_the_caps_judge_a_thousand_paths_quickly():
-    paths = [f"pkg{n % 7}/mod{n}/sub/file{n}.py" for n in range(1000)]
-    wide = ["/".join(["a" * 200] * 12) + f"/{'a' * 40}{n:010d}" for n in range(1000)]
-    deep = ["/".join(["x"] * 60) + f"/f{n}" for n in range(1000)]
-    hostile = {
-        "doublestars": "\n".join("**/" * 40 + f"lit{n}" for n in range(1900)) + "\n",
-        "stars": "\n".join("**/" * 20 + "a*" * 8 + f"b{n}" for n in range(3000)) + "\n",
-        "stars_and_marks": "\n".join("**/" * 20 + "*a?" * 8 + f"b{n}" for n in range(2700)) + "\n",
-        "classes": "\n".join("*[ab]" * 8 + f"[x{n % 9}]" for n in range(3000)) + "\n",
-        "middle": "\n".join("x/" + "**/x/" * 7 + f"*b{n}" for n in range(3000)) + "\n",
-        "spread": "\n".join("**/x/" * 7 + "**/*" for _ in range(3000)) + "\n",
-    }
-    for name, text in hostile.items():
-        assert len(text.encode()) <= gi.MAX_FILE_BYTES, name
-        for sample in (paths, wide, deep):
-            took, _ = _timed({"": text}, sample)
-            assert took < 2.0, (name, took)
+def _deep(depth, n=40):
+    return [f"top{i % 3}/mid{i}/" + "/".join(f"d{k}" for k in range(depth - 2)) + f"/file{i}.py" for i in range(n)]
+
+
+def _mixed(lines):
+    out = []
+    for n in range(lines // 10):
+        out += [f"*.ext{n}", f"/dir{n}/", f"build{n}/", f"**/cache{n}", "*.py[cod]", f"[Tt]emp{n}*", f"logs/**/*.log{n}",
+                f"!keep{n}.log", f"pkg{n}/*/gen", f"# comment {n}"]
+    return "\n".join(out)
+
+
+HONEST = {
+    "1000 wild rules at depth 20": ({"": "".join(f"*.ext{n}\n" for n in range(1000))}, _deep(20)),
+    "5000 mixed lines at depth 20": ({"": _mixed(4990)}, _deep(20)),
+    "this repository's own file": ({"": (Path(__file__).parents[2] / ".gitignore").read_text(encoding="utf-8")}, _deep(20)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(HONEST))
+def test_honest_files_stay_under_a_quarter_of_the_step_budget(name):
+    files, paths = HONEST[name]
+    ignore, steps = _steps(files, paths)
+    assert ignore.notes == []
+    assert max(steps) * 4 <= gi.MAX_STEPS, (name, max(steps))
 
 
 REVIEWED_SHAPES = {
@@ -156,66 +143,63 @@ REVIEWED_SHAPES = {
     "star": "**/x*/" * 7 + "**/*.py",
     "mark": "**/?/" * 7 + "**/*.py",
 }
+_K = 8
+WALK = "\n".join("**/" + "[a]*" * (_K - 1) + "[b]/**/" + "[a]*" * _K for _ in range(400)) + "\n"
+HOSTILE = {
+    **{f"{shape}-{depth}": ("\n".join(REVIEWED_SHAPES[shape] for _ in range(3000)) + "\n", depth)
+       for shape in REVIEWED_SHAPES for depth in (62, 10)},
+    "walk": (WALK, 62),
+}
 
 
-@pytest.mark.parametrize("shape", sorted(REVIEWED_SHAPES))
-@pytest.mark.parametrize("depth", [62, 10])
-def test_the_reviewed_shapes_judge_a_thousand_paths_in_two_seconds(shape, depth):
-    text = "\n".join(REVIEWED_SHAPES[shape] for _ in range(3000)) + "\n"
+def _hostile_paths(name, depth, n):
+    if name == "walk":  # fresh directories, then segments the walk can spend its steps on
+        return [f"q{i}/" + "/".join(["a" * _K] * (depth - 1)) + "/f" for i in range(n)]
+    return ["/".join(["x"] * depth) + f"/f{i}.py" for i in range(n)]
+
+
+@pytest.mark.parametrize("name", sorted(HOSTILE))
+def test_a_hostile_file_costs_at_most_the_step_budget_per_path(name):
+    text, depth = HOSTILE[name]
     assert len(text.encode()) <= gi.MAX_FILE_BYTES
-    paths = ["/".join(["x"] * depth) + f"/f{n}.py" for n in range(1000)]
-    took, ignore = _timed({"": text}, paths)
-    assert took < 2.0, (shape, depth, took)
-    assert all(ignore.ignored(path) for path in paths[:5])  # matched by the file, or judged ignored
+    ignore, steps = _steps({"": text}, _hostile_paths(name, depth, 8))
+    assert max(steps) <= gi.MAX_STEPS
 
 
-def test_the_same_rules_in_sixty_nested_directories_judge_a_thousand_paths_in_two_seconds():
+def test_a_hostile_file_cannot_hang_a_build():
+    start = time.monotonic()
+    ignore, steps = _steps({"": WALK}, _hostile_paths("walk", 62, 100))
+    assert time.monotonic() - start < 30.0
+    assert ignore.notes and max(steps) == gi.MAX_STEPS
+
+
+def test_the_same_rules_in_sixty_nested_directories_stay_bounded():
     text = "\n".join(REVIEWED_SHAPES["plain"] for _ in range(3000)) + "\n"
-    files = {"/".join(["x"] * depth): text for depth in range(gi.MAX_DEPTH - 3)}
-    paths = ["/".join(["x"] * 60) + f"/f{n}.py" for n in range(1000)]
-    took, ignore = _timed(files, paths)
-    assert took < 2.0, took
-    assert ignore.ignored(paths[0]) is True
+    files = {"/".join(["x"] * depth): text for depth in range(60)}
+    ignore, steps = _steps(files, ["/".join(["x"] * 60) + f"/f{n}.py" for n in range(20)])
+    assert max(steps) <= gi.MAX_STEPS
 
 
-def test_a_path_that_runs_out_of_steps_is_judged_ignored_and_its_directory_with_it():
-    text = "\n".join(f"**/x/**/x/**/x*/**/f{n}*" for n in range(400)) + "\n"
-    ignore = gi.Ignore({"": text})
-    deep = "/".join(["x"] * 40)
-    assert ignore.ignored(deep + "/zzz") is True
-    assert any("steps" in note for note in ignore.notes)
-    assert ignore.ignored(deep + "/other") is True
+def test_a_call_that_runs_out_is_ignored_with_one_note_and_the_answer_does_not_depend_on_the_order(monkeypatch):
+    files = {"": "".join(f"*.ext{n}\n" for n in range(1000))}
+    paths = _deep(20, 6)
+    fresh = gi.Ignore(files).judge(paths[0])
+    assert fresh[1] < gi.MAX_STEPS  # sanity: the file alone fits
+    monkeypatch.setattr(gi, "MAX_STEPS", 15_000)  # a path 20 deep in fresh directories no longer fits
+    a, b = gi.Ignore(files), gi.Ignore(files)
+    forward = [a.judge(path) for path in paths]
+    backward = [b.judge(path) for path in reversed(paths)][::-1]
+    assert forward == backward
+    assert forward[0] == (True, 15_000) and a.notes == b.notes and len(a.notes) == 1
+    assert [a.ignored(path) for path in paths] == [b.ignored(path) for path in paths] == [True] * len(paths)
 
 
-def test_an_honest_file_never_runs_out_of_steps():
-    text = "".join(f"*.ext{n}\n/dir{n}/\nbuild{n}/\n**/cache{n}\n*.py[cod]\n[Tt]emp{n}*\nlogs/**/*.log{n}\n" for n in range(60))
-    ignore = gi.Ignore({"": text, "pkg/a": "*.o\nbuild/\n", "pkg": "!keep\n"})
-    for n in range(300):
-        ignore.ignored(f"pkg/a/b{n % 5}/c{n % 7}/d{n % 11}/e{n % 13}/f{n % 17}/g{n}/file{n}.py")
-    assert ignore.notes == []
-    assert ignore.ignored("pkg/a/x.o") and ignore.ignored("m/mod.pyc") and not ignore.ignored("pkg/a/x.py")
-
-
-def test_an_honest_file_keeps_every_pattern_and_stays_fast():
+def test_an_honest_file_keeps_every_pattern_and_stays_correct():
     text = "".join(f"/dir{n}/\n*.ext{n}\n" for n in range(300)) + "build/\n"
-    took, ignore = _timed({"": text}, [f"pkg/mod{n}/file{n}.py" for n in range(1000)])
-    assert ignore.notes == [] and took < 1.0
-    assert ignore.ignored("x/build/a") and ignore.ignored("dir299/a.py") and ignore.ignored("q/z.ext7")
-
-
-def test_a_pattern_past_the_limits_is_left_out_with_one_note():
-    text = "/".join(["a"] * (gi.MAX_SEGMENTS + 1)) + "\n" + "*" * 3 + "a*" * (gi.MAX_STARS + 1) + "\n*.log\n"
     ignore = gi.Ignore({"": text})
-    assert ignore.ignored("x.log") is True
-    assert ignore.ignored("/".join(["a"] * (gi.MAX_SEGMENTS + 1))) is False
-    assert len(ignore.notes) == 1
-
-
-def test_the_token_budget_leaves_out_the_rest_with_one_note():
-    ignore = gi.Ignore({"": "".join(f"*a*b*c{n}\n" for n in range(2000))})
-    assert len(ignore.notes) == 1
-    assert ignore.ignored("xaybzc0") is True
-    assert ignore.ignored("xaybzc1999") is False
+    assert ignore.notes == []
+    assert ignore.ignored("x/build/a") and ignore.ignored("dir299/a.py") and ignore.ignored("q/z.ext7")
+    assert not ignore.ignored("pkg/mod/file.py")
 
 
 def test_an_unclosed_class_is_a_literal_bracket():

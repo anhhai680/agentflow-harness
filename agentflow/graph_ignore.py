@@ -5,19 +5,22 @@ file) and answers `ignored(path)` the way `git check-ignore` does. The same clas
 patterns, passed as one root file.
 
 The patterns are untrusted repository text, so nothing here uses a regular expression. A pattern is split on `/` into
-segments and each segment is compiled to a short token list. A segment is matched with the two-pointer wildcard walk,
-which is `O(len(text) * len(pattern))` however many `*` it holds (a backtracking regular expression is not: `a*a*a*b`
-on a long run of `a` goes polynomial). `**` segments are matched by a set walk over the path's segments, so repetition
-is never nested. Caps bound the rest: a file over `MAX_FILE_BYTES` or `MAX_LINES` contributes nothing, and a pattern
-over `MAX_PATTERN` characters, `MAX_SEGMENTS` segments or `MAX_STARS` stars in a segment is skipped, as is every
-pattern past the file's `MAX_TOKENS` budget (and past `MAX_HEAVY` tokens of the one kind of segment that can still
-backtrack: two or more `*` beside a `?` or a class), each with one note. A path of more than `MAX_DEPTH` segments, or
-with a segment over `MAX_NAME` characters, is judged ignored (and noted once), which is the safe side for a graph.
-Per path, a rule is dismissed cheaply first (its last segment must match before the earlier ones are walked, and a
-rule whose last segment is a plain name is looked up by that name). Whatever the shape of the files, one `ignored`
-call spends at most `MAX_STEPS` steps (a step is a rule looked at, a segment compared in a `**` walk, or a step of the
-wildcard walk), counted over every rule of every file it consults; a call that runs out judges the path ignored (and
-the directory it was inside, which keeps the answer the same for what lies below), with one note.
+segments and each segment is compiled to a short token list. A segment is matched by equality, by `str.find` over the
+chunks between its stars, by comparing the tokens either side of its one star, or, when it has several stars beside a
+`?` or a class, by the two-pointer wildcard walk, which is `O(len(text) * len(pattern))` however many `*` it holds (a
+backtracking regular expression is not). `**` segments are matched by a set walk over the path's segments, so
+repetition is never nested.
+
+The work of one `ignored(path)` call is counted and bounded. A step is a rule looked at, a token compared or a
+character walked, counted over every rule of every file the call consults and including the directories above the
+path (a directory already judged by an earlier call is charged what it cost then, so the count is the same whatever
+order the paths are asked in). A call that spends `MAX_STEPS` stops, judges the path ignored, which is the safe side
+for the graph, adds one note and caches nothing. Honest files stay far below it (the tests assert a quarter at most:
+1,000 `*.ext` rules at depth 20 take 21,000 steps, a 5,000-line mixed file at depth 20 takes 73,000, this
+repository's own file about 300). An exhausted call measured at most 70 ms on a laptop (hostile shapes, fresh
+directories), so a hostile file can slow a build by that much per path but cannot make it judge a path not ignored
+that git ignores. The exceptions are the three caps below, which leave a file or a pattern out with a note:
+`MAX_FILE_BYTES`, `MAX_LINES` and `MAX_PATTERN`.
 """
 
 from __future__ import annotations
@@ -26,8 +29,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 MAX_FILE_BYTES, MAX_LINES, MAX_PATTERN = 256 * 1024, 5000, 512
-MAX_SEGMENTS, MAX_STARS, MAX_TOKENS, MAX_HEAVY = 16, 8, 10000, 100
-MAX_DEPTH, MAX_NAME, MAX_STEPS = 64, 255, 4000
+MAX_STEPS = 400_000
 
 _STAR = ("*",)
 _ANY = ("?",)
@@ -107,49 +109,67 @@ def _one(token: tuple, char: str) -> bool:
     return hit != token[1]
 
 
+
+
 class _Exhausted(Exception):
     """One `ignored` call spent its steps."""
 
 
-def _walk(tokens: tuple, text: str, budget: list[int]) -> bool:
+class _Meter:
+    """The steps one call has left."""
+
+    __slots__ = ("left",)
+
+    def __init__(self, left: int) -> None:
+        self.left = left
+
+    def spend(self, steps: int = 1) -> None:
+        self.left -= steps
+        if self.left < 0:
+            raise _Exhausted
+
+
+def _weight(token: tuple) -> int:
+    """What comparing one character against the token costs: a class costs by its members."""
+    return 1 + len(token[2]) + len(token[3]) if token[0] == "[" else 1
+
+
+def _walk(tokens: tuple, weights: tuple, text: str, meter: _Meter) -> bool:
     """Whether `text` (no `/`) matches the tokens: the wildcard walk that backtracks to the last `*` only."""
     ti = si = 0
     star = mark = -1
-    left = budget[0]
-    while si < len(text):
-        left -= 1
-        if left < 0:
-            raise _Exhausted
-
-        if ti < len(tokens) and tokens[ti] == _STAR:
-            star, mark = ti, si
+    left = meter.left
+    try:
+        while si < len(text):
+            left -= weights[ti] if ti < len(tokens) else 1
+            if left < 0:
+                raise _Exhausted
+            if ti < len(tokens) and tokens[ti] == _STAR:
+                star, mark = ti, si
+                ti += 1
+            elif ti < len(tokens) and _one(tokens[ti], text[si]):
+                ti += 1
+                si += 1
+            elif star >= 0:
+                mark += 1
+                ti, si = star + 1, mark
+            else:
+                return False
+        while ti < len(tokens) and tokens[ti] == _STAR:
             ti += 1
-        elif ti < len(tokens) and _one(tokens[ti], text[si]):
-            ti += 1
-            si += 1
-        elif star >= 0:
-            mark += 1
-            ti, si = star + 1, mark
-        else:
-            return False
-    budget[0] = left
-    while ti < len(tokens) and tokens[ti] == _STAR:
-        ti += 1
-    return ti == len(tokens)
+        return ti == len(tokens)
+    finally:
+        meter.left = left
 
 
 class _Glob:
-    """One path segment's glob, with the cheap tests that dismiss most texts before any walk.
+    """One path segment's glob. `match` charges the meter for the work beyond the one step its caller paid."""
 
-    A glob is matched one of four ways, none of which backtracks more than the wildcard walk of the last kind:
-    equality (no wildcard), `str.find` over the chunks between stars (literals and stars only), a comparison of
-    the tokens before the one star with the text's start and of those after it with the text's end, and the walk.
-    """
-
-    __slots__ = ("tokens", "literal", "head", "mid", "tail", "stars", "need", "first", "last", "before", "after", "heavy")
+    __slots__ = ("tokens", "weights", "literal", "head", "mid", "tail", "stars", "need", "first", "last", "before", "after", "span")
 
     def __init__(self, tokens: tuple) -> None:
         self.tokens = tokens
+        self.weights = tuple(_weight(t) for t in tokens)
         plain = all(t[0] == "c" or t == _STAR for t in tokens)
         self.stars = sum(1 for t in tokens if t == _STAR)
         self.need = len(tokens) - self.stars
@@ -168,11 +188,11 @@ class _Glob:
         elif not plain and self.stars <= 1:
             at = tokens.index(_STAR) if self.stars else len(tokens)
             self.before, self.after = tokens[:at], tokens[at + 1 :]
-        self.heavy = len(tokens) if not plain and self.stars > 1 else 0
+        self.span = sum(self.weights) - (1 if self.stars else 0)
         self.first = tokens[0][1] if tokens and tokens[0][0] == "c" else None
         self.last = tokens[-1][1] if tokens and tokens[-1][0] == "c" else None
 
-    def match(self, text: str, budget: list[int]) -> bool:
+    def match(self, text: str, meter: _Meter) -> bool:
         if self.literal is not None:
             return text == self.literal
         if len(text) < self.need or (not self.stars and len(text) != self.need):
@@ -183,7 +203,7 @@ class _Glob:
             pos, end = len(self.head), len(text) - len(self.tail)
             if pos > end:
                 return False
-            budget[0] -= len(self.mid)
+            meter.spend(len(self.mid))
             for chunk in self.mid:
                 at = text.find(chunk, pos, end)
                 if at < 0:
@@ -192,10 +212,11 @@ class _Glob:
             return True
         if (self.first is not None and text[0] != self.first) or (self.last is not None and text[-1] != self.last):
             return False
-        if not self.heavy:
+        if self.stars <= 1:
+            meter.spend(self.span)
             tail = text[len(text) - len(self.after) :] if self.after else ""
             return all(map(_one, self.before, text)) and all(map(_one, self.after, tail))
-        return _walk(self.tokens, text, budget)
+        return _walk(self.tokens, self.weights, text, meter)
 
 
 @dataclass(frozen=True)
@@ -214,31 +235,28 @@ class _Rule:
         return None if last == "**" else last.literal
 
 
-def _match(rule: _Rule, parts: list[str], budget: list[int]) -> bool:
+def _match(rule: _Rule, parts: list[str], meter: _Meter) -> bool:
     """Whether the rule matches the path made of `parts` (relative to the rule's directory)."""
     segments = rule.segments
     if not rule.anchored:
-        return segments[0].match(parts[-1], budget)
+        return segments[0].match(parts[-1], meter)
     count = len(parts)
-    last = segments[-1]
-    first = segments[0]
-    if (
-        count < rule.need
-        or (rule.fixed and count != len(segments))
-        or (last != "**" and not last.match(parts[-1], budget))
-        or (first != "**" and not first.match(parts[0], budget))
-    ):
+    if count < rule.need or (rule.fixed and count != len(segments)):
+        return False
+    first, last = segments[0], segments[-1]
+    meter.spend(2)
+    if (last != "**" and not last.match(parts[-1], meter)) or (first != "**" and not first.match(parts[0], meter)):
         return False
     here = {0}
     final = len(segments) - 1
     for n, segment in enumerate(segments):
-        budget[0] -= len(here)
-        if budget[0] < 0:
-            raise _Exhausted
         if segment == "**":
-            here = set(range(min(here) + (1 if n == final else 0), count + 1))
+            lowest = min(here) + (1 if n == final else 0)
+            meter.spend(count - lowest + 1)
+            here = set(range(lowest, count + 1))
         else:
-            here = {j + 1 for j in here if j < count and segment.match(parts[j], budget)}
+            meter.spend(len(here))
+            here = {j + 1 for j in here if j < count and segment.match(parts[j], meter)}
         if not here:
             return False
     return count in here
@@ -284,16 +302,6 @@ def _rule(line: str) -> _Rule | None:
     return _Rule(tuple(segments), True, dir_only, negate, need, not stars)
 
 
-def _cost(rule: _Rule) -> int:
-    """What the rule adds to a file's budget: its tokens, and more when `**` makes it walk the path's segments."""
-    tokens = sum(1 if seg == "**" else 1 + len(seg.tokens) for seg in rule.segments)
-    return tokens if rule.fixed else tokens + 4 * len(rule.segments)
-
-
-def _heavy(rule: _Rule) -> int:
-    return sum(seg.heavy for seg in rule.segments if seg != "**")
-
-
 def _parse(directory: str, text: str, notes: list[str]) -> list[_Rule]:
     name = f"{directory}/.gitignore" if directory else ".gitignore"
     if len(text.encode("utf-8", "replace")) > MAX_FILE_BYTES:
@@ -304,32 +312,15 @@ def _parse(directory: str, text: str, notes: list[str]) -> list[_Rule]:
         notes.append(f"{name}: over {MAX_LINES} lines, left out")
         return []
     rules: list[_Rule] = []
-    skipped = budget = heavy = 0
+    skipped = 0
     for line in lines:
         line = _clean(line.removesuffix("\r"))
         if len(line) > MAX_PATTERN:
             skipped += 1
-            continue
-        rule = _rule(line)
-        if rule is None:
-            continue
-        cost = _cost(rule)
-        if (
-            len(rule.segments) > MAX_SEGMENTS
-            or any(seg != "**" and seg.stars > MAX_STARS for seg in rule.segments)
-            or budget + cost > MAX_TOKENS
-            or heavy + _heavy(rule) > MAX_HEAVY
-        ):
-            skipped += 1
-            continue
-        budget += cost
-        heavy += _heavy(rule)
-        rules.append(rule)
+        elif (rule := _rule(line)) is not None:
+            rules.append(rule)
     if skipped:
-        notes.append(
-            f"{name}: {skipped} pattern(s) left out (over {MAX_PATTERN} characters, {MAX_SEGMENTS} segments,"
-            f" {MAX_STARS} stars in a segment or the file's budget of {MAX_TOKENS} tokens)"
-        )
+        notes.append(f"{name}: {skipped} pattern(s) over {MAX_PATTERN} characters left out")
     return rules
 
 
@@ -348,14 +339,12 @@ class _Index:
             else:
                 self.named.setdefault(name, []).append((n, rule))
 
-    def verdict(self, below: list[str], is_dir: bool, budget: list[int]) -> bool | None:
+    def verdict(self, below: list[str], is_dir: bool, meter: _Meter) -> bool | None:
         """True or False by the last rule that matches `below`, or None when none does."""
         best, answer = -1, None
         for n, rule in (*self.wild, *self.named.get(below[-1], ())):
-            budget[0] -= 1
-            if budget[0] < 0:
-                raise _Exhausted
-            if n > best and (is_dir or not rule.dir_only) and _match(rule, below, budget):
+            meter.spend()
+            if n > best and (is_dir or not rule.dir_only) and _match(rule, below, meter):
                 best, answer = n, not rule.negate
         return answer
 
@@ -371,50 +360,57 @@ class Ignore:
             if parsed := _parse(directory, text, self.notes):
                 rules.setdefault(directory, []).extend(parsed)
         self._index = {directory: _Index(found) for directory, found in rules.items()}
-        self._dirs: dict[str, bool] = {}
+        self._dirs: dict[str, tuple[bool, int]] = {}  # directory -> (ignored, steps it cost with its ancestors)
 
-    def _verdict(self, path: str, is_dir: bool, budget: list[int]) -> bool:
+    def _verdict(self, path: str, is_dir: bool, meter: _Meter) -> bool:
         """The last matching rule's answer for `path`, over the files above it, shallowest first."""
         parts = path.split("/")
+        meter.spend(len(parts))
         verdict = False
         for depth in range(len(parts)):
             index = self._index.get("/".join(parts[:depth]))
-            if index is not None and (found := index.verdict(parts[depth:], is_dir, budget)) is not None:
+            if index is not None and (found := index.verdict(parts[depth:], is_dir, meter)) is not None:
                 verdict = found
         return verdict
 
-    def _dir_ignored(self, directory: str, budget: list[int]) -> bool:
-        """Whether `directory` or one above it is ignored, remembered per directory."""
+    def _dir(self, directory: str) -> tuple[bool, int]:
+        """Whether `directory` or one above it is ignored, and the steps that took, remembered per directory."""
         parts = directory.split("/") if directory else []
-        above = False
+        above, spent = False, 0
         for depth in range(1, len(parts) + 1):
             current = "/".join(parts[:depth])
-            if current not in self._dirs:
-                try:
-                    self._dirs[current] = above or self._verdict(current, True, budget)
-                except _Exhausted:
-                    self._dirs[current] = True
-                    self._note(f"a path that took over {MAX_STEPS} steps to judge is judged ignored")
-            above = self._dirs[current]
-        return above
+            known = self._dirs.get(current)
+            if known is None:
+                if above:
+                    known = (True, spent)
+                else:
+                    meter = _Meter(MAX_STEPS - spent)
+                    known = (self._verdict(current, True, meter), MAX_STEPS - meter.left)
+                self._dirs[current] = known
+            above, spent = known
+        return above, spent
 
-    def _note(self, text: str) -> None:
-        if text not in self.notes:
-            self.notes.append(text)
+    def judge(self, path: str) -> tuple[bool, int]:
+        """Whether the file `path` is ignored, itself or through an ignored directory above it, and the steps it took.
 
-    def ignored(self, path: str) -> bool:
-        """Whether the file `path` is ignored, itself or through an ignored directory above it."""
+        The steps are the same whatever was asked before. A path that needs `MAX_STEPS` is judged ignored.
+        """
         path = path.strip("/")
         if not path:
-            return False
-        parts = path.split("/")
-        if len(parts) > MAX_DEPTH or any(len(part) > MAX_NAME for part in parts):
-            self._note(f"a path over {MAX_DEPTH} segments or with a name over {MAX_NAME} characters is judged ignored")
-            return True
-        budget = [MAX_STEPS]
-        parent, _, _ = path.rpartition("/")
+            return False, 0
         try:
-            return self._dir_ignored(parent, budget) or self._verdict(path, False, budget)
+            above, spent = self._dir(path.rpartition("/")[0])
+            if above:
+                return True, spent
+            meter = _Meter(MAX_STEPS - spent)
+            verdict = self._verdict(path, False, meter)
+            return verdict, MAX_STEPS - meter.left
         except _Exhausted:
-            self._note(f"a path that took over {MAX_STEPS} steps to judge is judged ignored")
-            return True
+            note = f"a path that took {MAX_STEPS} steps to judge is judged ignored"
+            if note not in self.notes:
+                self.notes.append(note)
+            return True, MAX_STEPS
+
+    def ignored(self, path: str) -> bool:
+        """Whether the file `path` is ignored."""
+        return self.judge(path)[0]
