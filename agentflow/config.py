@@ -439,6 +439,18 @@ class MemoryPolicy:
     retro_every_days: int  # days between retros the runner proposes; 0 means manual only
 
 
+GRAPH_EXCLUDE_MAX = 64  # `graph.exclude` entries
+GRAPH_PATTERN_MAX = 200  # characters in one `graph.exclude` pattern
+GRAPH_FILE_KB = (1, 4096)  # the range of `graph.max_file_kb`
+
+
+@dataclass
+class GraphPolicy:
+    enabled: bool = False  # index this repository's code and docs for `agentflow graph`
+    exclude: tuple[str, ...] = ()  # `.gitignore`-style patterns left out, on top of `.gitignore` and the fixed list
+    max_file_kb: int = 512  # a larger file gets a file node and is not parsed
+
+
 @dataclass
 class IssuePolicy:
     in_progress_label: str = "agentflow:in-progress"  # "" turns off the label and the start comment, never the PR link
@@ -765,6 +777,7 @@ class Config:
     policy: Policy = field(default_factory=Policy)  # the obligations a finished run must show evidence for
     route: Route = field(default_factory=Route)  # how much ceremony a run's route gets (`route.py` reads it)
     backlog: BacklogPolicy = field(default_factory=BacklogPolicy)  # the backlog file's work source (`work_source: {kind: backlog}`)
+    graph: GraphPolicy = field(default_factory=GraphPolicy)  # the knowledge graph of the repository's code and docs
 
 
 def _holds_finish(steps: list[Step]) -> bool:
@@ -1681,6 +1694,7 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
     effort = _require(raw, "effort", "", dict)
     context = _require(raw, "context", "", dict)
     memory = _optional(raw, "memory", "", dict, {})
+    graph = _optional(raw, "graph", "", dict, {})
     issues = _optional(raw, "issues", "", dict, {})
     vuln = _optional(raw, "vuln", "", dict, {})
     policy = _optional(raw, "policy", "", dict, {})
@@ -1744,6 +1758,11 @@ def _build(merged: dict, layer_origins: dict, path: Path, disabled: tuple[str, .
             lessons_max_tokens=_optional(memory, "lessons_max_tokens", "memory", int, 1500),
             digest_tokens=_optional(memory, "digest_tokens", "memory", int, 15000),
             retro_every_days=_optional(memory, "retro_every_days", "memory", int, 7),
+        ),
+        graph=GraphPolicy(
+            enabled=_optional(graph, "enabled", "graph", bool, False),
+            exclude=tuple(_string_list(graph.get("exclude") or [], "graph.exclude")),
+            max_file_kb=_optional(graph, "max_file_kb", "graph", int, 512),
         ),
         issues=IssuePolicy(
             in_progress_label=_optional(issues, "in_progress_label", "issues", str, "agentflow:in-progress"),
@@ -1844,6 +1863,22 @@ def resolve_model(cfg: Config, phase: Phase, step: Step, role: str, overrides: d
 
 
 # --------------------------------------------------------------------------- validation
+
+
+def _graph_pattern_problem(pattern: str) -> str:
+    """Why a `graph.exclude` pattern is refused, or "". A pattern is relative to the repository: it is never absolute and
+    never names a parent directory, so it can only ever narrow the index of the checkout."""
+    if not pattern.strip():
+        return "must not be empty"
+    if len(pattern) > GRAPH_PATTERN_MAX:
+        return f"must be at most {GRAPH_PATTERN_MAX} characters"
+    if "\n" in pattern or "\0" in pattern:
+        return "must be one line"
+    if pattern.startswith("/"):
+        return "must be relative to the repository, not an absolute path"
+    if ".." in pattern.split("/"):
+        return "must not contain a `..` segment"
+    return ""
 
 
 def _label_problem(label: str) -> bool:
@@ -2907,6 +2942,18 @@ class _Validator:
                 self.error(f"memory.{key}", f"must be from {low} to {high}{note}")
         self.lessons()
 
+    def graph(self) -> None:
+        pol = self.cfg.graph
+        low, high = GRAPH_FILE_KB
+        if isinstance(pol.max_file_kb, bool) or not low <= pol.max_file_kb <= high:
+            self.error("graph.max_file_kb", f"must be a whole number of KB from {low} to {high}")
+        if len(pol.exclude) > GRAPH_EXCLUDE_MAX:
+            self.error("graph.exclude", f"must hold at most {GRAPH_EXCLUDE_MAX} patterns")
+        for i, pattern in enumerate(pol.exclude):
+            problem = _graph_pattern_problem(pattern)
+            if problem:
+                self.error(f"graph.exclude[{i}]", problem)
+
     def issue_policy(self) -> None:
         pol = self.cfg.issues
         if _label_problem(pol.in_progress_label):
@@ -3688,6 +3735,7 @@ def validate(cfg: Config, repo: Path) -> list[Issue]:
     v.effort()
     v.context()
     v.memory()
+    v.graph()
     v.issue_policy()
     v.vuln()
     v.preflight()

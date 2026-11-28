@@ -99,6 +99,14 @@ def test_the_memory_section_saves_a_zero_and_keeps_the_comments(shipped):
     assert all(line in text for line in SHIPPED.splitlines() if "#" in line)  # every comment survives
 
 
+def test_the_graph_section_saves_into_the_pack(shipped):
+    proposal = form(shipped, (["graph", "enabled"], True), (["graph", "exclude"], ["generated/", "*.snap"]))
+    assert not proposal.errors, proposal.errors
+    config_edit.save(shipped, proposal)
+    graph = load_config(shipped).graph
+    assert graph.enabled is True and graph.exclude == ("generated/", "*.snap")
+
+
 def test_the_form_switches_preflight_on(shipped):
     proposal = form(shipped, (["preflight", "enabled"], True))
     assert not proposal.errors, proposal.errors
@@ -206,6 +214,7 @@ def test_values_that_need_quoting_are_quoted(shipped):
     (["context", "max_compactions"], 0, EditError),                    # at least one
     (["context", "context_window_tokens"], 50000, EditError),          # below Claude Code's smallest auto-compact window
     (["memory", "lessons_max_tokens"], 5000, EditError),               # above the range
+    (["graph", "max_file_kb"], 0, EditError),
     (["effort", "allowed"], ["low", "turbo"], EditError),
     (["effort", "sizing"], "yes", EditError),
     (["defaults", "agent"], "nobody", EditError),

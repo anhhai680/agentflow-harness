@@ -1470,6 +1470,49 @@ def test_memory_bounds_are_inclusive(tmp_cfg, key, value):
     assert not [i for i in issues_for(tmp_cfg, {"memory": {key: value}}) if i.path.startswith("memory")]
 
 
+# --------------------------------------------------------------------------- the graph section
+
+
+def test_graph_defaults(cfg):
+    assert (cfg.graph.enabled, cfg.graph.exclude, cfg.graph.max_file_kb) == (False, (), 512)
+
+
+@pytest.mark.parametrize("patch, path", [
+    ({"max_file_kb": 0}, "graph.max_file_kb"),
+    ({"max_file_kb": 4097}, "graph.max_file_kb"),
+    ({"max_file_kb": True}, "graph.max_file_kb"),
+    ({"exclude": ["/abs"]}, "graph.exclude[0]"),
+    ({"exclude": ["a/../b"]}, "graph.exclude[0]"),
+    ({"exclude": [".."]}, "graph.exclude[0]"),
+    ({"exclude": [""]}, "graph.exclude[0]"),
+    ({"exclude": ["x" * 201]}, "graph.exclude[0]"),
+    ({"exclude": ["p"] * 65}, "graph.exclude"),
+])
+def test_graph_keys_are_validated(tmp_cfg, patch, path):
+    assert ("error", path) in errors(issues_for(tmp_cfg, {"graph": patch}))
+
+
+@pytest.mark.parametrize("patch, path", [
+    ({"enabled": "yes"}, "graph.enabled"),
+    ({"exclude": "generated/"}, "graph.exclude"),
+    ({"exclude": [1]}, "graph.exclude"),
+    ({"max_file_kb": "big"}, "graph.max_file_kb"),
+])
+def test_graph_keys_of_the_wrong_type_are_refused_on_load(tmp_cfg, patch, path):
+    with pytest.raises(ConfigError) as err:
+        load_config(tmp_cfg({"graph": patch}))
+    assert err.value.path == path
+
+
+@pytest.mark.parametrize("patch", [
+    {"enabled": True}, {"max_file_kb": 1}, {"max_file_kb": 4096},
+    {"exclude": ["generated/", "*.snap", "docs/**/old", "x" * 200]}, {"exclude": ["p"] * 64},
+    {"exclude": ["\\#notes", "\\!keep", "C:notes", "a\\..\\b"]},  # gitignore escapes and odd names are patterns too
+])
+def test_graph_bounds_are_inclusive(tmp_cfg, patch):
+    assert not [i for i in issues_for(tmp_cfg, {"graph": patch}) if i.path.startswith("graph")]
+
+
 # --------------------------------------------------------------------------- the retro step
 
 

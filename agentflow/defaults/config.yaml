@@ -117,6 +117,11 @@ memory:
   digest_tokens: 15000       # the size a retro's digest of recent runs is cut to
   retro_every_days: 7        # days between the retros the runner proposes (0 means manual only)
 
+graph:
+  enabled: false       # index this repository's code and docs for `agentflow graph` (the knowledge graph)
+  exclude: []          # `.gitignore`-style patterns left out of the index, on top of `.gitignore` and the fixed list
+  max_file_kb: 512     # a larger file is listed and not parsed
+
 issues:
   in_progress_label: "agentflow:in-progress"   # "" turns off the label and the start comment (never the PR link)
   comment: true                                # also post one comment when a run starts from an issue

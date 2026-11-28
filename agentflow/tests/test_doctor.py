@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 from pathlib import Path
@@ -11,8 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agentflow import keepawake
-from agentflow import doctor, flow, layers
+from agentflow import doctor, flow, graph_build, graph_store, keepawake, layers, pack
 from agentflow.config import load_config
 from agentflow.doctor import Check, gate_programs, render, run_checks
 
@@ -659,3 +659,113 @@ def test_doctor_workspace_check_warns_when_the_user_file_does_not_load(tmp_cfg, 
     assert check.status == "warn"
     assert "workspace" in check.detail
     assert str(path) in check.detail
+
+
+def _graph_patch():
+    return _patch(graph={"enabled": True})
+
+
+@pytest.fixture
+def state_outside(tmp_path_factory, monkeypatch) -> Path:
+    """The state dir away from `repo`, which is the tmp dir itself: a graph store inside the checkout is refused."""
+    home = tmp_path_factory.mktemp("state")
+    monkeypatch.setenv("XDG_STATE_HOME", str(home))
+    return home
+
+
+def _index(tmp_cfg, repo: Path) -> None:
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "mod.py").write_text("def one():\n    return 1\n", encoding="utf-8")
+    _git(repo, "add", "pkg")
+    _git(repo, "-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false",
+         "commit", "-q", "-m", "c")
+    graph_build.build(repo, load_config(tmp_cfg(_graph_patch())), download=False)
+
+
+@pytest.mark.usefixtures("state_outside")
+def test_doctor_has_no_graph_check_when_the_graph_is_off(tmp_cfg, repo, monkeypatch):
+    seen = _recording(monkeypatch)
+    checks = _checks(tmp_cfg, repo)
+    assert not [name for name in checks if name.startswith("graph")]
+    without_graph = list(seen)
+    seen.clear()
+    _checks(tmp_cfg, repo, _graph_patch())
+    assert seen == without_graph  # the graph's checks add no command
+
+
+@pytest.mark.usefixtures("state_outside")
+def test_doctor_warns_when_there_is_no_index_yet(tmp_cfg, repo, monkeypatch):
+    seen = _recording(monkeypatch)
+    checks = _checks(tmp_cfg, repo, _graph_patch())
+    assert checks["graph search"].status == "ok"
+    assert checks["graph index"].status == "warn" and checks["graph index"].fix == "agentflow graph build"
+    assert list(checks).index("graph index") > list(checks).index("inherited environment")
+    assert list(checks).index("graph index") < list(checks).index("gate:build")
+    assert not (pack.state_dir(repo) / "graph").exists()  # looking creates nothing
+    assert not [argv for argv in seen if "graph" in " ".join(argv)]
+
+
+@pytest.mark.usefixtures("state_outside")
+def test_doctor_graph_index_is_ok_after_a_build_and_runs_no_command(tmp_cfg, repo, monkeypatch):
+    _index(tmp_cfg, repo)
+    seen = _recording(monkeypatch)
+    checks = _checks(tmp_cfg, repo, _graph_patch())
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()[:12]
+    assert checks["graph index"].status == "ok", checks["graph index"]
+    assert checks["graph index"].detail.startswith(f"{sha}, python exact")
+    with_graph = list(seen)
+    seen.clear()
+    _checks(tmp_cfg, repo)
+    assert with_graph == seen  # the same commands with the graph on as with it off: it ran none
+
+
+@pytest.mark.usefixtures("state_outside")
+def test_doctor_warns_for_a_language_the_parser_does_not_offer(tmp_cfg, repo):
+    _index(tmp_cfg, repo)
+    conn = sqlite3.connect(graph_store.path_for(pack.state_dir(repo)))
+    conn.execute("UPDATE meta SET value = '{}' WHERE key = 'languages'")
+    conn.commit()
+    conn.close()
+    check = _checks(tmp_cfg, repo, _graph_patch())["graph index"]
+    assert check.status == "warn" and "python not parsed (no grammar)" in check.detail
+    assert check.fix == "agentflow graph build"
+
+
+@pytest.mark.usefixtures("state_outside")
+def test_doctor_warns_for_an_unreadable_index(tmp_cfg, repo):
+    store = graph_store.path_for(pack.state_dir(repo))
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"not a database" * 100)
+    assert _checks(tmp_cfg, repo, _graph_patch())["graph index"].status == "warn"
+
+
+@pytest.mark.usefixtures("state_outside")
+def test_doctor_fails_the_graph_search_check_without_fts5(tmp_cfg, repo, monkeypatch):
+    monkeypatch.setattr(graph_store, "fts5_available", lambda: False)
+    checks = _checks(tmp_cfg, repo, _graph_patch())
+    assert checks["graph search"].status == "fail"
+    assert checks["graph search"].fix == "use a Python whose SQLite has FTS5"
+    assert "graph index" not in checks
+
+
+def test_doctor_reads_no_store_inside_the_checkout(tmp_cfg, repo, state_outside, monkeypatch):
+    _index(tmp_cfg, repo)
+    built = graph_store.path_for(pack.state_dir(repo))
+    assert _checks(tmp_cfg, repo, _graph_patch())["graph index"].status == "ok"
+    monkeypatch.setenv("XDG_STATE_HOME", str(repo / "xdg"))  # the conftest default: inside this checkout
+    inside = graph_store.path_for(pack.state_dir(repo))
+    inside.parent.mkdir(parents=True)
+    inside.write_bytes(built.read_bytes())
+    check = _checks(tmp_cfg, repo, _graph_patch())["graph index"]
+    assert (check.status, check.detail) == ("warn", "no index yet")
+
+
+@pytest.mark.usefixtures("state_outside")
+def test_doctor_survives_a_blob_where_a_language_belongs(tmp_cfg, repo):
+    _index(tmp_cfg, repo)
+    conn = sqlite3.connect(graph_store.path_for(pack.state_dir(repo)))
+    conn.execute("UPDATE files SET lang = x'4142'")
+    conn.commit()
+    conn.close()
+    check = _checks(tmp_cfg, repo, _graph_patch())["graph index"]
+    assert check.status == "ok" and check.detail.endswith("none")

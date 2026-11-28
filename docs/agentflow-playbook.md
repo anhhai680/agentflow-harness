@@ -494,6 +494,11 @@ agentflow lessons [--json]                          # each lesson's verdict: its
                                                     #   carried it
 agentflow scorecard [--freeze]                      # the finished runs' signals against the baseline frozen on this machine,
                                                     #   conformance first; also the dashboard's Metrics tab
+agentflow graph build [--full]                      # index the base branch's commit (needs `graph.enabled: true`); later builds parse only
+                                                    #   what changed (section 18). Only this command may download the parser's packages
+agentflow graph status [--json]                     # the indexed commit, its counts, its languages and what was left out
+agentflow graph query TEXT [--kind K] [--limit N] [--json]   # nodes whose name, path or text match the words, best first
+agentflow graph show TARGET [--depth N] [--json]    # one node (by id or file path) and the nodes linked to it, 1 to 3 links away
 ```
 
 **A `claim_lost` stop** (a backlog pack with `backlog.claims`): the run's next phase or status change found that its claim on `origin` was released or is now another run's, and the runner never pushes over it. The stop names the new claimant, or says the claim is gone, and the autonomy resolver never settles it. You decide: `agentflow approve <run> <phase>/claim` makes the next change claim the item again, which works when the item is free and stops again, naming the new claimant, when it isn't; `agentflow backlog release <id>` frees the other claim first; `agentflow cancel <run>` ends the run. A failed push to an unreachable `origin` is not a lost claim: the run goes on, records `claim_sync_failed`, and the next change catches the claim up.
@@ -649,6 +654,9 @@ A live run sees a change to any layer file between its phases: the runner takes 
 - `memory.lessons_max_tokens`: the most tokens of lessons a step's prompt carries, 1500 by default; `validate` wants a number from 0 to 4000, and 0 turns lessons off. Not protected.
 - `memory.digest_tokens`: the size a retro's digest of recent runs is cut to, 15000 by default; `validate` wants a number from 1000 to 50000. Not protected.
 - `memory.retro_every_days`: the days between the retros the runner proposes, 7 by default; `validate` wants a number from 0 to 90, and 0 means manual only. Not protected.
+- `graph.enabled`: whether the repository's code and docs are indexed for `agentflow graph` (the knowledge graph), `false` by default; `validate` wants `true` or `false`. Not protected.
+- `graph.exclude`: `.gitignore`-style patterns left out of the index, on top of `.gitignore` and the fixed list, none by default; `validate` wants at most 64 patterns, each non-empty, at most 200 characters, relative (no leading `/`) and with no `..` segment. Not protected.
+- `graph.max_file_kb`: the largest file the index parses, 512 by default (a larger file is listed and not parsed); `validate` wants a number from 1 to 4096. Not protected.
 - `issues.in_progress_label`: the label a run started from an issue puts on it, `agentflow:in-progress` by default; `validate` wants a string of at most 50 characters with no newline and no comma (`gh` splits `--add-label` on commas), not starting with `-`. `""` turns off the label and the start comment, but never the PR link. Not protected.
 - `issues.comment`: whether a run started from an issue also posts one comment on it when the run starts, `true` by default; `validate` wants a bool. Not protected.
 - `issues.epic_labels`: the labels that mark an issue as an epic, `["epic"]` by default; an issue with one of them gets `Refs #N` and never `Closes #N`. `validate` wants a list of non-empty one-line strings of at most 50 characters each, and `[]` means no issue is an epic. Not protected.
@@ -1043,3 +1051,66 @@ Known limits, until later slices:
 - **What it counts.** The counts are the per-repository digest's (a run's wait, which holds the run, each parked stop, and the runs running or refining), summed over the run's own repository and every other live repository of the workspace. When anything needs you, up to three repositories are named with their items, most first and then by name, and `+<n> more` stands for the rest. `in <k> repositories` says how many were counted. The run's own repository always counts, even when it is outside the workspace (its folder name labels it then), and with no workspace it is the only one.
 - **Not counted.** Another repository is read only from its default state dir (`<state root>/<repo-id>/runs`), from each run's `state.json` (capped at 8 MiB). Nothing of it is locked, written or followed. A repository whose pack sets `paths.state_dir`, or whose pack can't be read safely (a symlinked `.agentflow`, a pack file that is a symlink, a FIFO or a device), counts as `not counted`, and so does one where anything else goes wrong, such as a `state.json` that is missing, not JSON or of an unexpected shape. A `runs/<id>` that is a symlink is skipped. A `state.json` can trail a runner that died mid-write by one event. When the run's own runs can't be read, its plain message is sent instead and `notify_failed` is logged.
 - **Delivery.** The line is cut to 240 characters and is sent, titled `agentflow`, only when it differs from the last one delivered, which is kept in `<state root>/workspace_digest.txt`. It is kept only when at least one of the run's notifiers delivered it, so a pack with no working notifier never marks a line as sent for the others.
+
+## 18. The knowledge graph
+
+`agentflow graph` indexes a repository's code and docs into one SQLite file, so you can search it by name, path and text and follow the links between files, symbols, docs and dependencies. It is slice K1 of `docs/specs/agentflow-knowledge-graph-proposal.md`. It reads git only, runs no model and executes nothing from the repository. No lane, prompt or run uses it yet: it is a command you run.
+
+**Turn it on.** It is off by default. Set `graph.enabled: true` in `.agentflow/config.yaml`, run `agentflow validate`, then `agentflow doctor` (it adds a `graph search` check, that this Python's SQLite has FTS5, and a `graph index` check, that an index exists and parses what it should). The three keys are in section 14: `graph.enabled`, `graph.exclude` and `graph.max_file_kb`.
+
+```bash
+agentflow graph build                      # index the base branch's commit; the first build parses every file
+agentflow graph status                     # the indexed commit, node and edge counts, languages, what was left out
+agentflow graph query "lease a slot"       # nodes matching any word, best first (BM25), with the file and line
+agentflow graph query lease --kind symbol --limit 5
+agentflow graph show agentflow/slots.py    # a file, then the nodes linked to it (--depth 2 follows two links)
+```
+
+Every command takes `--json` (except `build`) and `--config PATH`. `build --full` indexes every file again and keeps nothing of the last build, to repair a store you distrust.
+
+**What a build reads.** It indexes the commit `origin/<project.base_branch>` names, else the local `<project.base_branch>`, never your working tree or `HEAD`. It reads only committed files, as git objects. It never fetches and makes no call to a remote: a git call that would ask a remote for a missing object fails instead. The first build parses every indexed file. A later build compares the new commit with the stored one and parses only the blobs that changed, so a build with no new commit parses nothing (`parsed 0`), and a one-file commit parses one file.
+
+**What is indexed.**
+- Python, through `ast`. Definitions (functions, classes, methods, constants), imports and references. A class's first docstring line is kept with its node. A signature never holds a value: each default, class keyword value and TypeScript or JavaScript parameter initialiser is written `...`, since one can hold a secret as a constant's value can.
+- Markdown at the top of the repository and under the docs folders `project.docs` names. Sections, and the decisions, questions and requirements listed under them, with links. A document's `Status:` line is its doc node's signature (`graph show` prints it under the node).
+- Dependencies from `pyproject.toml`, `requirements*.txt` and `package.json`. A credential in a dependency's URL is stripped before it is stored.
+- TypeScript, TSX and JavaScript, through tree-sitter in the parser worker (below).
+- Any other tracked file is listed as a file node and not parsed. A file over `graph.max_file_kb` is listed and not parsed.
+
+**What is left out.** Each path gets one verdict, and the first that holds wins. `agentflow graph status` counts them in its `left out:` line.
+1. A symlink or a submodule is never read.
+2. A secret-looking name is never read, even when force-added: `.env` and `.env.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keystore`, `id_rsa*`, `id_ed25519*` and any name with `credentials` in it.
+3. A path the repository's own `.gitignore` files name, even a file that was force-added. Only the tracked `.gitignore` files of the commit count: `.git/info/exclude` and `core.excludesFile` are not honoured, since they are not in the commit. An ignore file over a cap (256 KiB, 5,000 lines, or a pattern over 512 characters) fails closed: every path below its folder is judged ignored, with a note, so a root `.gitignore` over a cap leaves the whole repository out. That is the safe side, since its dropped patterns could have ignored any of them. A negated pattern over 512 characters is only skipped, which can only leave more ignored.
+4. The fixed list of vendored and generated paths: `node_modules`, `vendor`, `third_party`, `bower_components`, `site-packages`, `.venv`, `venv` and `__pycache__` folders, and `*.min.js`, `*.min.css`, `*.map`, `*_pb2.py`, `*_pb2_grpc.py`, `*.lock`, `package-lock.json` and `pnpm-lock.yaml`.
+5. Your `graph.exclude` patterns, written like `.gitignore` lines.
+
+A path that is left out is never opened and never reaches the parser.
+
+**The parser worker.** Repository bytes are untrusted, so the engine never parses them itself. Python, Markdown and manifests are read in a child process, `agentflow/graph_worker.py`, and TypeScript, TSX and JavaScript run in the same worker with three pinned tree-sitter packages. The worker gets one file's bytes at a time, runs in an empty directory with a scrubbed environment, and is limited: 10 seconds per file, a memory limit (`RLIMIT_AS` on Linux, a resident-size check elsewhere), a reply size cap and a bounded number of restarts. Its replies are checked field by field before anything is stored.
+- The packages are pinned to exact versions with a hash lock beside the worker. `uv` always runs with `--locked`, so a changed pin is refused.
+- Only `agentflow graph build` may download them, once: on the first `graph build` that parses a TypeScript or JavaScript file. A build with no such file to parse starts the stdlib worker directly and never starts `uv`. `doctor`, `status`, `query` and `show` never download.
+- `uv` runs with `--no-build`, so no source distribution is ever built (its build dependencies would not be hash-locked), and with `--no-config`, so no `uv.toml` or `[tool.uv]` above the worker changes what it resolves. A platform with no matching wheel falls back to the stdlib worker.
+- Offline, or with no `uv`, the build falls back to a stdlib-only worker. A TypeScript or JavaScript file then gets a file node and the note `no grammar`, and the next online build parses it.
+
+**Exact and heuristic.** Every edge says which it is. `exact` means a parser proved it: a definition, an import that resolves to one file, a manifest dependency, a heading, a Markdown link. `heuristic` means a name match: a test file that imports a module `tests` it, and a call or member chain that names a symbol `references` it. An import that matches several files goes to the one that shares the longest leading folder with the importer, and a tie gives no edge, so an absent edge is not proof of no relationship.
+
+**What a re-index does.** A change to `graph.exclude`, `graph.max_file_kb` or the docs folders, or an upgrade of the engine, makes the next build judge every path again, because the rules may have changed. It does not parse them again: a blob's facts are cached by blob id, language and extractor version, so only a path whose verdict or extractor changed is read. A change to a `.gitignore` judges the paths again too.
+
+**The residual risk.** The worker is a child process with limits, not an OS sandbox. A bug in a parser, or in a grammar package, could run code with your permissions, as section 11's residual risk says for gates. The controls are the ones above: nothing is run or imported from the repository, the packages are pinned and locked, the worker runs in an empty directory with a scrubbed environment, and the worker never opens a path; it receives the repository-relative path as data, beside the bytes. Index a repository you do not trust only in a disposable environment.
+
+The index is private to your machine: the directory is `0700` and the file `0600`, in the state dir (`<state dir>/graph/graph.sqlite`). It holds names, signatures, one doc line per symbol and the text of doc sections, so treat it as you treat the repository. A path that becomes left out keeps none of its text: its cached facts are dropped, its words leave the search index and the freed pages are overwritten. A `paths.state_dir` inside the repository's checkout is refused, since a repository could commit a crafted store there: `status`, `query`, `show` and `doctor` treat it as no index, and `build` stops with an error that names `paths.state_dir`.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `graph: no index yet: run `agentflow graph build`` (from `status`, `query` or `show`, or `graph index` in `doctor`) | nothing has been built for this repository. Set `graph.enabled: true` and run `agentflow graph build` |
+| `graph.enabled is false` (from `build`) | the key is off. Set it to `true` in `.agentflow/config.yaml`. `status`, `query` and `show` still read an index you built before you turned it off |
+| `another build is running` | a build holds `<state dir>/graph/build.lock`. Wait for it, or end the process that holds it. The lock is dropped when its process dies, so a crash leaves nothing to clear |
+| `no grammar` on TypeScript or JavaScript files, and `languages:` shows `typescript not parsed (no grammar)` (or `tsx`, `javascript`) | the worker's three packages are not installed. Run `agentflow graph build` once while online, with `uv` on `PATH`; it downloads them and parses those files on that build. Until then those files are file nodes only |
+| `git could not read a blob of <sha>` | the object is missing from this clone, typically a partial clone made with `git clone --filter=blob:none` (a build never fetches: lazy fetch is off and every git call runs with `protocol.allow=never`). Fetch the missing objects yourself (`git fetch`, or clone again without the filter), then build again. The build stops rather than store a verdict for a blob it could not read |
+| A path you expect is not in the results | `agentflow graph status` shows the `left out:` counts. Check, in order, secret names, `.gitignore`, the fixed vendored list and `graph.exclude`. A `.gitignore` inside an ignored folder is never read, as git never reads one, so its patterns don't apply. A folder that git ignores is left out whatever its own files say. A `note:` that names a `.gitignore` over a cap means every path below its folder is left out: shorten that file |
+| A build is slow on a repository with a very large or odd `.gitignore` | each path's matching work is capped. A hostile or pathological ignore file can slow a build, but when the cap is hit the path is judged ignored, so it never makes the build index a path that git ignores. Shorten the file |
+| The next build judges every path again after you edited `graph.*` or upgraded agentflow | expected: the rules may have changed. It re-judges, and parses again only what the new verdicts or extractors need |
+| `this Python's SQLite has no FTS5` | search needs SQLite's FTS5. Use a Python build whose `sqlite3` has it |
+| `status`, `query` or `show` say `no index yet` though you built one | the store file can't be used: it is not a graph store, has another schema version (after an upgrade), was changed by hand, or lies inside the checkout (`paths.state_dir`). They never show a traceback. Run `agentflow graph build`, which starts a new store when the old one fails SQLite's `quick_check` (`--full` always does); for a store inside the checkout, set `paths.state_dir` to a folder outside the repository |

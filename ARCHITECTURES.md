@@ -208,7 +208,18 @@ flowchart TB
         work["work_source.py · module_queue.py · backlog.py · finished.py"]
     end
 
+    subgraph Graph["Knowledge graph (not part of a run)"]
+        gbuild["graph_build.py<br/>delta build of the base branch"]
+        gparse["graph_parse.py → graph_worker.py<br/>child process: extractors"]
+        gstore["graph_store.py<br/>one SQLite file"]
+        greport["graph_report.py<br/>text and JSON views"]
+    end
+
     flow --> pipeline
+    flow --> gbuild
+    gbuild --> gparse
+    gbuild --> gstore
+    flow --> greport
     dashboard --> views
     dashboard --> hitl
     dashboard --> runctl
@@ -234,7 +245,7 @@ flowchart TB
 
 | Area | Module | Responsibility |
 |---|---|---|
-| **CLI** | `flow.py` | `init`, `doctor`, `validate`, `config`, `run`, `resume`, `explain`, `next`, `status`, `inbox`, `answer`, `approve`, `reject`, `pause`, `cancel`, `retry`, `archive`, `attach`, `queue`, `backlog`, `metrics`, `scorecard`, `lessons`, `retro`, `dashboard` |
+| **CLI** | `flow.py` | `init`, `doctor`, `validate`, `config`, `run`, `resume`, `explain`, `next`, `status`, `inbox`, `answer`, `approve`, `reject`, `pause`, `cancel`, `retry`, `archive`, `attach`, `queue`, `backlog`, `metrics`, `scorecard`, `lessons`, `retro`, `graph`, `dashboard` |
 | **Phase loop** | `pipeline.py` | `start` creates the run and its worktree. `advance` holds the run lock and walks phases, then settles each one (approval, refine and reconcile rounds), writes `handoff.md` and reloads the pack before each phase. |
 | | `flow_control.py` | `StepControl`: walks a phase's steps and handles `when`/`unless`, groups with `repeat`, checkpoints, gate steps, `foreach`, `finish` and `ci`. Also produces the dry-run output. |
 | | `keepawake.py` | Holds a sleep inhibitor (`caffeinate` or `systemd-inhibit`) while a run advances. |
@@ -270,6 +281,18 @@ flowchart TB
 | **Learning** | `signals.py`, `lessons.py`, `scorecard.py`, `retro.py`, `metrics.py` | Signals per run, lessons injected into prompts, before/after effects, baseline scorecard, retro PRs. |
 | **Views** | `views.py`, `activity.py`, `sessions.py`, `transcripts.py`, `artifacts.py`, `plan_view.py`, `inbox_view.py`, `run_files.py`, `verification.py` | Pure or read-only passes over events and git for the CLI and dashboard. |
 | **Setup** | `detect.py`, `init.py`, `doctor.py` | Read a repo from its base branch, write a sparse pack, check the machine. |
+| **Knowledge graph** | `graph_model.py` | The vocabulary: node and edge kinds, the `Facts` an extractor returns and `check_facts`, which distrusts them. The worker imports it, so it is stdlib only. |
+| | `graph_ignore.py` | A pure `.gitignore` matcher with no regular expression and a per-path work budget; also holds `graph.exclude`. |
+| | `graph_select.py` | One verdict per tracked path (`indexed`, `ignored`, `secret`, `vendored`, `excluded`, `symlink`, `submodule`, `unparsed`) and the language to parse it as. |
+| | `graph_python.py`, `graph_markdown.py`, `graph_manifest.py` | Extractors that return facts from `ast`, Markdown and `pyproject.toml` / `requirements*.txt` / `package.json`. They run in the worker and import nothing but `graph_model`. |
+| | `graph_syntax.py` | The tree-sitter extractor for TypeScript, TSX and JavaScript. Only the worker imports it, and only under the locked `uv` mode. |
+| | `graph_worker.py` | The parser process: a `uv` script with three pinned packages and a hash lock (`graph_worker.py.lock`). It reads one file's bytes at a time and answers with JSON. |
+| | `graph_parse.py` | The engine's side of the worker: starts and limits the child, falls back to the stdlib mode, and checks every reply with `check_facts`. |
+| | `graph_resolve.py` | Pure: turns one file's facts into nodes and edges and names the keys (`path:`, `py:`, `pkg:`) that tie files together. |
+| | `graph_store.py` | The SQLite store (`<state dir>/graph/graph.sqlite`), built as a copy and swapped in by rename: tables, FTS5 search, `neighbours`. Every value is a bound parameter. |
+| | `graph_git.py` | The reads from git: a commit's tree, the difference of two commits and blobs by id, hardened and never touching a remote or a working tree. |
+| | `graph_build.py` | `build`: the delta over the last snapshot (change list, `.gitignore`, facts, resolution), parsing only changed blobs, under `build.lock`. |
+| | `graph_report.py` | Pure: the text and JSON views of `agentflow graph build`, `status`, `query` and `show`. |
 
 `Executor` combines the step lifecycle with every lane behaviour through mixins:
 

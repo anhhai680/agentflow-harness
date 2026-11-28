@@ -439,7 +439,7 @@ def _gate_checks(cfg: Config) -> tuple[list[Check], bool]:
 
 def run_checks(cfg: Config, repo: Path) -> list[Check]:
     """Every check, in order: the agents, the user's Claude settings a run skips, `gh`, its issue fields (with `issues.sync_label`), Dependabot alerts (when the pack can run the vuln lane), the dependency review API (with `vuln.dependency_review`), the remote, the claims on it (a `backlog` pack with `backlog.claims`), Docker (when a gate runs it), the state dir, the workspace (when the user's settings name one), keeping the
-    machine awake, the inherited environment, the gates and the vuln probe."""
+    machine awake, the inherited environment, the knowledge graph (with `graph.enabled`), the gates and the vuln probe."""
     gate_checks, uses_docker = _gate_checks(cfg)
     checks = [*_agent_checks(cfg, repo)]
     if (settings := _user_settings_check(cfg)) is not None:
@@ -461,7 +461,39 @@ def run_checks(cfg: Config, repo: Path) -> list[Check]:
         checks.append(workspace)
     checks.append(_keepawake_check())
     checks.append(_environment_check(cfg))
+    if cfg.graph.enabled:
+        checks.extend(_graph_checks(repo))
     return [*checks, *gate_checks]
+
+
+def _graph_checks(repo: Path) -> list[Check]:
+    """The knowledge graph's checks (`graph.enabled`): this SQLite has FTS5, and the index exists and parses what it
+    holds. It runs no command: FTS5 is probed in this process and the index is opened read-only (nothing is created)."""
+    import sqlite3
+
+    from agentflow import graph_report, graph_store
+
+    if not graph_store.fts5_available():
+        return [Check("graph search", "fail", "this Python's SQLite has no FTS5",
+                      "use a Python whose SQLite has FTS5")]
+    checks = [Check("graph search", "ok", "FTS5 is available")]
+    no_index = Check("graph index", "warn", "no index yet", "agentflow graph build")
+    try:
+        conn = graph_store.open_read(graph_store.path_for(pack.state_dir(repo)), checkout=pack.checkout_root(repo))
+        try:
+            meta = graph_store.meta(conn)
+            languages = graph_report.language_states(graph_store.files(conn).values(), graph_report.offered(meta))
+        finally:
+            conn.close()
+    except (graph_store.Unusable, sqlite3.Error, TypeError, ValueError, OverflowError):  # an untrusted store
+        return [*checks, no_index]
+    if not meta.get("commit"):
+        return [*checks, no_index]
+    shown = graph_report.languages_line(languages).removeprefix("languages: ")
+    detail = f"{graph_report.sha12(meta['commit'])}, {shown.replace(' · ', ', ')}"
+    if all(how == "exact" for how in languages.values()):
+        return [*checks, Check("graph index", "ok", detail)]
+    return [*checks, Check("graph index", "warn", detail, "agentflow graph build")]
 
 
 def printable(text: object) -> str:
