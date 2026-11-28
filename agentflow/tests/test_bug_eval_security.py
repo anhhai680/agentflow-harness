@@ -391,6 +391,20 @@ def test_test_command_runs_without_a_shell_and_is_killed_at_the_timeout(tmp_path
     assert ran.timed_out and "killed after 1s" in ran.log_path.read_text(encoding="utf-8")
 
 
+def test_test_command_gets_defaults_env_as_the_gates_do(flow_repo, monkeypatch):
+    # A test that needs a pack's env (a database port) must see it, or a red check passes for a connection error
+    # and the green check can never pass.
+    monkeypatch.delenv("AF_TEST_DB_PORT", raising=False)
+    flow_repo.configure({"defaults": {"env": {"AF_TEST_DB_PORT": "55432"}}})
+    ignore_local_settings(flow_repo)
+    allow = json.dumps({"permissions": {"allow": ["Bash(printenv *)"]}})
+    (flow_repo.root / ".claude" / "settings.local.json").write_text(allow, encoding="utf-8")
+    run = red_with(flow_repo, "printenv AF_TEST_DB_PORT")
+    assert raised(flow_repo, run)["kind"] == "red_test_passes"  # it saw the variable: `printenv` exits 0
+    log = flow_repo.events(run, "expectation_checked")[-1]["log"]
+    assert "55432" in Path(log).read_text(encoding="utf-8")
+
+
 # --------------------------------------------------------------------------- review fix round 1: lanes end clean
 
 

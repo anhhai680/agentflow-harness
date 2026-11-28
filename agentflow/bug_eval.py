@@ -53,11 +53,12 @@ import re
 import shlex
 import signal
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from agentflow import safeio, vuln
+from agentflow import run_env, safeio, vuln
 from agentflow.config import ADVISORY_CLEARED, ADVISORY_PRESENT
 from agentflow.gates import GateResult, gates_ok, record_results, run_gates, summarize
 from agentflow.guards import Violation, changed_paths, command_allowed, path_matches, snapshot
@@ -118,14 +119,15 @@ def _kill_group(proc: subprocess.Popen) -> None:
         os.killpg(proc.pid, signal.SIGKILL)
 
 
-def run_test_command(argv: list[str], cwd: Path, log_path: Path, timeout_s: int, tail_lines: int) -> CommandRun:
+def run_test_command(argv: list[str], cwd: Path, log_path: Path, timeout_s: int, tail_lines: int,
+                     env: Mapping[str, str] | None = None) -> CommandRun:
     """Run `argv` with no shell in `cwd`, stdin closed, its process group killed after `timeout_s` (and
-    whenever this function is left with it still running). Raises `OSError` when it cannot start, or when
+    whenever this function is left with it still running), in `env` (default: this process's environment). Raises `OSError` when it cannot start, or when
     `log_path` is a symlink (checked before anything runs; the log is never written through one)."""
     shown = shlex.join(argv)
     safeio.write_text(log_path, f"$ {shown}\n")
     proc = subprocess.Popen(
-        argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        argv, cwd=cwd, env=None if env is None else dict(env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", start_new_session=True,
     )
     code: int | None = None
@@ -181,8 +183,9 @@ class BugEvalLane:
         timeout = max(1, round(self.cfg.defaults.step_timeout_min * 60))
         before = snapshot(self.worktree)
         try:
+            env = {**run_env.base(self.cfg), **self.cfg.defaults.env}  # what a gate runs in (`gates.run_gates`)
             ran = run_test_command(argv, self.worktree, self.run.gate_log_dir(sr.key) / f"{TEST_GATE}.log",
-                                   timeout, self.cfg.context.gate_output_lines)
+                                   timeout, self.cfg.context.gate_output_lines, env)
         except OSError as exc:
             return self._stop(sr, "blocked", f"The test command `{command}` could not start: {exc}. "
                               "Approve to resume the step.")
