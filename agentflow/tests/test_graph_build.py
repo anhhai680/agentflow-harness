@@ -17,6 +17,8 @@ from conftest import PYTHON_CONFIG, run_git
 from agentflow import graph_git, graph_parse, graph_store, pack
 from agentflow.config import GraphPolicy, load_config
 from agentflow.graph_build import BuildError, build, doc_roots
+from agentflow.graph_ignore import MAX_FILE_BYTES as IGNORE_MAX_BYTES
+from agentflow.graph_ignore import MAX_LINES
 
 REPO_A = {
     "pkg/slots.py": b"def lease():\n    return 1\n",
@@ -352,6 +354,51 @@ def test_an_ignore_file_that_a_pattern_matches_still_applies(tmp_path, cfg, monk
     assert secret not in asked and found["pkg/secret.txt"].state == "ignored"
     assert found["pkg/.gitignore"].state == "ignored" and found["pkg/a.py"].state == "indexed"
     assert read(repo, graph_store.ignore_files)["pkg"] == "secret.txt\n"
+
+
+def _spy_reads(monkeypatch) -> list[str]:
+    asked: list[str] = []
+    real = graph_git.read_blobs
+    monkeypatch.setattr(graph_git, "read_blobs", lambda r, blobs, limit: asked.extend(blobs) or real(r, blobs, limit))
+    return asked
+
+
+OVER_BYTES = b"*.log\n" + b"#" * (IGNORE_MAX_BYTES + 10) + b"\n"
+OVER_LINES = b"*.log\n" * (MAX_LINES + 1)
+
+
+@pytest.mark.parametrize("big", [OVER_BYTES, OVER_LINES], ids=["over the byte cap", "over the line cap"])
+def test_a_nested_ignore_file_over_a_cap_leaves_its_folder_ignored_and_unread(tmp_path, cfg, monkeypatch, big):
+    repo = make_repo(tmp_path, {"pkg/.gitignore": big, "pkg/canary.py": b"CANARY = 1\n", "pkg/sub/b.py": b"B = 1\n",
+                                "a.py": b"A = 1\n"}, force=True)
+    canary = run_git(repo, "rev-parse", "HEAD:pkg/canary.py").strip()
+    asked = _spy_reads(monkeypatch)
+    result = build(repo, cfg, download=False)
+    found = rows(repo)
+    assert canary not in asked
+    assert (found["pkg/canary.py"].state, found["pkg/sub/b.py"].state, found["a.py"].state) == ("ignored", "ignored",
+                                                                                                "indexed")
+    assert any(note.startswith("pkg/.gitignore: over ") and "pkg/ is judged ignored (the safe side)" in note
+               for note in result.notes)
+    assert "CANARY" not in repr(read(repo, graph_store.dump))
+    again = build(repo, cfg, download=False)  # unchanged: the stored verdict holds, and nothing is read
+    assert rows(repo)["pkg/canary.py"].state == "ignored" and canary not in asked and again.parsed == 0
+    delta = graph_of(repo)
+    assert full_graph_of(repo, cfg, monkeypatch, tmp_path / "elsewhere") == delta
+
+
+def test_a_root_ignore_file_over_the_byte_cap_leaves_the_whole_repository_ignored(tmp_path, cfg, monkeypatch):
+    repo = make_repo(tmp_path, {".gitignore": OVER_BYTES, "a.py": b"A = 1\n", "pkg/.gitignore": b"!*.py\n",
+                                "pkg/b.py": b"B = 1\n"}, force=True)
+    asked = _spy_reads(monkeypatch)
+    result = build(repo, cfg, download=False)
+    assert asked == [run_git(repo, "rev-parse", "HEAD:.gitignore").strip()]  # sized only: no blob is read
+    assert {row.state for row in rows(repo).values()} == {"ignored"} and result.parsed == 0
+    assert f".gitignore: over {IGNORE_MAX_BYTES} bytes, so the whole repository is judged ignored (the safe side)" \
+        in result.notes
+    commit(repo, {".gitignore": b"*.log\n"})  # back under the cap: every path is judged again
+    build(repo, cfg, download=False)
+    assert rows(repo)["a.py"].state == "indexed" and rows(repo)["pkg/b.py"].state == "indexed"
 
 
 def test_a_failed_ignore_read_is_a_build_error_and_keeps_the_snapshot(tmp_path, cfg, monkeypatch):

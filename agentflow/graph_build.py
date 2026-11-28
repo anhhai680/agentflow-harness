@@ -15,8 +15,9 @@ The steps, in order:
    may differ) differ from the last build's take every listed path.
 2. **`.gitignore`.** When a commit changes any ignore file, the tree's ignore files are taken shallowest first, and
    one in a folder the shallower files ignore (`generated/.gitignore` under a `generated/` pattern) is never read, as
-   git never loads it (a pattern that matches the ignore file itself, such as `.*`, does not stop git loading it); the others are read from their blobs (or kept from the store when unchanged). When the set of
-   texts moved, every listed path is judged again and those whose state moved join the change list; otherwise only
+   git never loads it (a pattern that matches the ignore file itself, such as `.*`, does not stop git loading it); the others are read from their blobs (or kept from the store when unchanged). One over
+   `graph_ignore.MAX_FILE_BYTES` is never read: it is stored as `OVER_CAP`, and every path below its folder is judged
+   ignored, as for the other caps (`graph_ignore` fails closed). When the set of texts moved, every listed path is judged again and those whose state moved join the change list; otherwise only
    the changed paths are judged. A path that is not `indexed` (ignored, secret, vendored, excluded, a symlink or a
    submodule) is never read.
 3. **Facts.** A changed blob's facts come from the cache by blob id, language and extractor version, else from the
@@ -65,7 +66,7 @@ from typing import TYPE_CHECKING
 from agentflow import graph_git, graph_parse, graph_store, pack, safeio
 from agentflow.graph_git import Entry
 from agentflow.graph_ignore import MAX_FILE_BYTES as IGNORE_MAX_BYTES
-from agentflow.graph_ignore import Ignore
+from agentflow.graph_ignore import OVER_CAP, Ignore
 from agentflow.graph_model import EXTRACTOR_VERSIONS, JS_LANGS, NOTE_MAX, Facts, empty
 from agentflow.graph_report import DISABLED
 from agentflow.graph_resolve import file_node, provided, resolve, wanted
@@ -331,7 +332,7 @@ class _Build:
                 if path not in unread:
                     texts[directory] = stored[directory]
                 elif (data := got.get(listed[path].blob)) is None:
-                    self.notes.append(f"{path}: over {IGNORE_MAX_BYTES} bytes, its patterns left out")
+                    texts[directory] = OVER_CAP  # never read: every path below its folder is judged ignored, with a note
                 else:
                     texts[directory] = data.decode("utf-8", "replace")
         moved = False

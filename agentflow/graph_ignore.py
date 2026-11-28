@@ -19,10 +19,13 @@ for the graph, adds one note and caches nothing. Honest files stay far below it 
 1,000 `*.ext` rules at depth 20 take 21,000 steps, a 5,000-line mixed file at depth 20 takes 73,000, this
 repository's own file about 300). An exhausted call measured about 15 to 100 ms on a 2026 laptop (hostile shapes,
 fresh directories; the figure moves with the shape, the Python version and the load), so a hostile file can slow a
-build by that much per path but cannot make it judge a path not ignored that git ignores. The exceptions are the
-three caps below, which leave a file or a pattern out with a note: `MAX_FILE_BYTES`, `MAX_LINES` and `MAX_PATTERN`.
-Parsing is linear in each pattern's length, so a file within the caps parses in well under a second however its
-brackets are placed.
+build by that much per path but cannot make it judge a path not ignored that git ignores. The three caps fail closed
+too, each with a note: a file over `MAX_FILE_BYTES` or `MAX_LINES`, or one with a pattern over `MAX_PATTERN`
+characters, leaves every path below its folder ignored (the whole repository for the root file), since the patterns
+dropped could have ignored any of them. Only a negated pattern over the cap is just left out, which can only leave
+more ignored; a comment is never a pattern. `OVER_CAP` is the text a caller passes for a file it would not read.
+A line ends at its first NUL, as git reads it. Parsing is linear in each pattern's length, so a file within the
+caps parses in well under a second however its brackets are placed.
 """
 
 from __future__ import annotations
@@ -32,6 +35,8 @@ from dataclasses import dataclass
 
 MAX_FILE_BYTES, MAX_LINES, MAX_PATTERN = 256 * 1024, 5000, 512
 MAX_STEPS = 400_000
+OVER_CAP = "\0an ignore file over the byte cap\0"  # the text of one the caller could not read: its folder is ignored
+EXHAUSTED = f"a path that took {MAX_STEPS} steps to judge is judged ignored"
 
 _STAR = ("*",)
 _ANY = ("?",)
@@ -334,25 +339,39 @@ def _rule(line: str) -> _Rule | None:
     return _Rule(tuple(segments), True, dir_only, negate, need, not stars)
 
 
-def _parse(directory: str, text: str, notes: list[str]) -> list[_Rule]:
+def _parse(directory: str, text: str, notes: list[str]) -> list[_Rule] | None:
+    """The rules of one ignore file, or None when a cap drops what could ignore a path: the caller then judges every
+    path below `directory` ignored, the safe side (a file that ignores less than git would lets its text in)."""
     name = f"{directory}/.gitignore" if directory else ".gitignore"
-    if len(text.encode("utf-8", "replace")) > MAX_FILE_BYTES:
-        notes.append(f"{name}: over {MAX_FILE_BYTES} bytes, left out")
-        return []
+    where = f"{directory}/" if directory else "the whole repository"
+    closed = f"so {where} is judged ignored (the safe side)"
+    if text == OVER_CAP or len(text.encode("utf-8", "replace")) > MAX_FILE_BYTES:
+        notes.append(f"{name}: over {MAX_FILE_BYTES} bytes, {closed}")
+        return None
     lines = text.removeprefix("\ufeff").split("\n")
+    if lines[-1:] == [""]:  # the empty piece after a final newline is no line
+        lines.pop()
     if len(lines) > MAX_LINES:
-        notes.append(f"{name}: over {MAX_LINES} lines, left out")
-        return []
+        notes.append(f"{name}: over {MAX_LINES} lines, {closed}")
+        return None
     rules: list[_Rule] = []
-    skipped = 0
+    long = negated = 0
     for line in lines:
-        line = _clean(line.removesuffix("\r"))
+        line = _clean(line.partition("\0")[0].removesuffix("\r"))  # git reads a line only up to its first NUL
+        if line.startswith("#"):
+            continue  # a comment, however long
         if len(line) > MAX_PATTERN:
-            skipped += 1
+            if line.startswith("!"):
+                negated += 1  # left out, it can only leave more ignored
+            else:
+                long += 1
         elif (rule := _rule(line)) is not None:
             rules.append(rule)
-    if skipped:
-        notes.append(f"{name}: {skipped} pattern(s) over {MAX_PATTERN} characters left out")
+    if negated:
+        notes.append(f"{name}: {negated} negated pattern(s) over {MAX_PATTERN} characters left out (the safe side)")
+    if long:
+        notes.append(f"{name}: {long} pattern(s) over {MAX_PATTERN} characters, {closed}")
+        return None
     return rules
 
 
@@ -387,23 +406,35 @@ class Ignore:
     def __init__(self, files: Mapping[str, str]) -> None:
         self.notes: list[str] = []
         rules: dict[str, list[_Rule]] = {}
+        self._closed: set[str] = set()  # directories whose file a cap dropped: everything below them is ignored
         for directory, text in files.items():
             directory = directory.strip("/")
-            if parsed := _parse(directory, text, self.notes):
+            parsed = _parse(directory, text, self.notes)
+            if parsed is None:
+                self._closed.add(directory)
+            elif parsed:
                 rules.setdefault(directory, []).extend(parsed)
         self._index = {directory: _Index(found) for directory, found in rules.items()}
         self._dirs: dict[str, tuple[bool, int]] = {}  # directory -> (ignored, steps it cost with its ancestors)
 
     def _verdict(self, path: str, is_dir: bool, meter: _Meter) -> bool:
-        """The last matching rule's answer for `path`, over the files above it, shallowest first."""
+        """The last matching rule's answer for `path`, over the files above it, shallowest first; ignored at once
+        below a directory whose file a cap dropped."""
         parts = path.split("/")
         meter.spend(len(parts))
         verdict = False
         for depth in range(len(parts)):
-            index = self._index.get("/".join(parts[:depth]))
+            here = "/".join(parts[:depth])
+            if here in self._closed:
+                return True
+            index = self._index.get(here)
             if index is not None and (found := index.verdict(parts[depth:], is_dir, meter)) is not None:
                 verdict = found
         return verdict
+
+    def _exhausted(self) -> None:
+        if EXHAUSTED not in self.notes:
+            self.notes.append(EXHAUSTED)
 
     def _dir(self, directory: str) -> tuple[bool, int]:
         """Whether `directory` or one above it is ignored, and the steps that took, remembered per directory."""
@@ -438,9 +469,7 @@ class Ignore:
             verdict = self._verdict(path, False, meter)
             return verdict, MAX_STEPS - meter.left
         except _Exhausted:
-            note = f"a path that took {MAX_STEPS} steps to judge is judged ignored"
-            if note not in self.notes:
-                self.notes.append(note)
+            self._exhausted()
             return True, MAX_STEPS
 
     def ignored(self, path: str) -> bool:
@@ -456,7 +485,5 @@ class Ignore:
         try:
             return self._dir(directory)[0]
         except _Exhausted:
-            note = f"a path that took {MAX_STEPS} steps to judge is judged ignored"
-            if note not in self.notes:
-                self.notes.append(note)
+            self._exhausted()
             return True

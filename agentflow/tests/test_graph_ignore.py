@@ -73,24 +73,71 @@ def test_the_matcher_follows_git(files, path, expected, tmp_path):
     assert _git_says(tmp_path, files, path) is expected
 
 
-def test_a_file_over_the_size_cap_contributes_nothing_and_one_note():
+# --- the caps fail closed: what a dropped file or pattern could have ignored is judged ignored ---
+
+
+def test_a_file_over_the_size_cap_leaves_its_folder_ignored_with_one_note():
     big = "*.log\n" + "#" * (gi.MAX_FILE_BYTES + 10)
-    ignore = gi.Ignore({"": big})
-    assert ignore.ignored("a.log") is False
-    assert len(ignore.notes) == 1
+    ignore = gi.Ignore({"pkg": big})
+    assert ignore.ignored("pkg/a.py") and ignore.ignored("pkg/x/y.py") and ignore.folder_ignored("pkg/x")
+    assert not ignore.ignored("a.py") and not ignore.ignored("pkgs/a.py") and not ignore.folder_ignored("pkg")
+    assert ignore.notes == [f"pkg/.gitignore: over {gi.MAX_FILE_BYTES} bytes, so pkg/ is judged ignored (the safe side)"]
 
 
-def test_a_file_over_the_line_cap_contributes_nothing_and_one_note():
-    ignore = gi.Ignore({"": "*.log\n" * (gi.MAX_LINES + 1)})
-    assert ignore.ignored("a.log") is False
-    assert len(ignore.notes) == 1
+def test_a_root_file_over_a_cap_leaves_the_whole_repository_ignored():
+    for text in ("*.log\n" * (gi.MAX_LINES + 1), gi.OVER_CAP):
+        ignore = gi.Ignore({"": text})
+        assert ignore.ignored("a.py") and ignore.ignored("deep/er/b.md") and ignore.folder_ignored("deep")
+        assert len(ignore.notes) == 1 and "the whole repository is judged ignored (the safe side)" in ignore.notes[0]
 
 
-def test_a_long_pattern_is_skipped_with_a_note_and_the_others_still_apply():
-    ignore = gi.Ignore({"": "a" * 600 + "\n*.log\n"})
-    assert ignore.ignored("x.log") is True
-    assert ignore.ignored("a" * 200) is False
-    assert len(ignore.notes) == 1
+def test_the_over_cap_marker_names_the_byte_cap():
+    assert gi.Ignore({"a/b": gi.OVER_CAP}).notes == [
+        f"a/b/.gitignore: over {gi.MAX_FILE_BYTES} bytes, so a/b/ is judged ignored (the safe side)"]
+
+
+def test_a_file_over_the_line_cap_leaves_its_folder_ignored_with_one_note():
+    ignore = gi.Ignore({"pkg": "*.log\n" * (gi.MAX_LINES + 1)})
+    assert ignore.ignored("pkg/a.py") and not ignore.ignored("a.py")
+    assert ignore.notes == [f"pkg/.gitignore: over {gi.MAX_LINES} lines, so pkg/ is judged ignored (the safe side)"]
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n"])
+def test_a_file_of_exactly_the_line_cap_is_accepted(ending):
+    text = "*.log" + ending + "".join(f"*.e{n}{ending}" for n in range(gi.MAX_LINES - 1))
+    assert text.count("\n") == gi.MAX_LINES and text.endswith("\n")
+    ignore = gi.Ignore({"": text})
+    assert ignore.notes == [] and ignore.ignored("a.log") and not ignore.ignored("a.py")
+    assert gi.Ignore({"": text.rstrip("\r\n")}).notes == []  # the same lines with no final newline
+    over = gi.Ignore({"": text + "x\n"})
+    assert len(over.notes) == 1 and over.ignored("a.py")
+
+
+def test_a_long_pattern_leaves_its_folder_ignored_and_no_other():
+    ignore = gi.Ignore({"pkg": "a" * 600 + "\n*.log\n", "": "*.tmp\n"})
+    assert ignore.ignored("pkg/b.py") is True and ignore.ignored("pkg/x/c.md") is True
+    assert ignore.ignored("b.py") is False and ignore.ignored("x.log") is False and ignore.ignored("x.tmp") is True
+    assert ignore.notes == [f"pkg/.gitignore: 1 pattern(s) over {gi.MAX_PATTERN} characters, so pkg/ is judged "
+                            "ignored (the safe side)"]
+
+
+def test_a_long_negated_pattern_is_skipped_and_its_folder_stays_judged_by_the_rest():
+    ignore = gi.Ignore({"": "*.log\n!" + "a" * 600 + "\n"})
+    assert ignore.ignored("x.log") is True and ignore.ignored("b.py") is False
+    assert ignore.notes == [f".gitignore: 1 negated pattern(s) over {gi.MAX_PATTERN} characters left out (the safe side)"]
+
+
+def test_a_long_comment_is_no_pattern():
+    ignore = gi.Ignore({"": "#" + "c" * 600 + "\n*.log\n"})
+    assert ignore.notes == [] and not ignore.ignored("b.py") and ignore.ignored("a.log")
+
+
+NUL_FILES = {"": "foo\0bar\nb\0\nqux\0\0\n\0zzz\n"}
+
+
+@pytest.mark.parametrize("path", ["foo", "foo_bar", "b", "qux", "zzz", "bar", "foobar"])
+def test_a_line_is_cut_at_its_first_nul_as_git_cuts_it(path, tmp_path):
+    assert gi.Ignore(NUL_FILES).ignored(path) is _git_says(tmp_path, NUL_FILES, path)
 
 
 def test_a_clean_file_leaves_no_note():
