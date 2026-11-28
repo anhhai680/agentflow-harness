@@ -1563,6 +1563,11 @@ def _run_all(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _graph_json(data: dict) -> str:
+    """One JSON line; `allow_nan=False` makes a stray `nan` an error (`ValueError`) instead of invalid JSON."""
+    return json.dumps(data, allow_nan=False)
+
+
 def _graph_read(repo: Path, args: argparse.Namespace) -> tuple[list[str], int] | None:
     """What `graph status`, `query` or `show` print and exit with, read from the repository's index in one pass;
     None when there is no index to read. The store is untrusted: a file that opens but fails at a query (a damaged
@@ -1584,12 +1589,12 @@ def _graph_read(repo: Path, args: argparse.Namespace) -> tuple[list[str], int] |
                 counts = graph_store.counts(conn)
                 langs = report.language_states(graph_store.files(conn).values(), report.offered(meta))
                 if args.json:
-                    return [json.dumps(report.status_json(meta, counts, now, langs))], 0
+                    return [_graph_json(report.status_json(meta, counts, now, langs))], 0
                 return report.status_lines(meta, counts, now, langs), 0
             if args.graph_command == "query":
                 hits = graph_store.search(conn, args.text, args.kind, args.limit)
                 if args.json:
-                    return [json.dumps(report.query_json(hits, commit))], 0
+                    return [_graph_json(report.query_json(hits, commit))], 0
                 return report.query_lines(hits, commit), 0
             target = graph_store.node(conn, args.target) if ":" in args.target else None  # an id: `<repo>:<kind>:<path>#<name>`
             if target is None:
@@ -1600,12 +1605,12 @@ def _graph_read(repo: Path, args: argparse.Namespace) -> tuple[list[str], int] |
                 return [report.no_node_line(args.target, row.state if row else None)], 1
             around = graph_store.neighbours(conn, target.id, args.depth)
             if args.json:
-                return [json.dumps(report.show_json(target, around, commit))], 0
+                return [_graph_json(report.show_json(target, around, commit))], 0
             return report.show_lines(target, around, commit), 0
         finally:
             conn.close()
-    except (graph_store.Unusable, sqlite3.Error):
-        return None
+    except (graph_store.Unusable, sqlite3.Error, TypeError, ValueError, OverflowError):
+        return None  # a store that opens but holds a value of another type is no index either; never a traceback
 
 
 def cmd_graph(args: argparse.Namespace) -> int:

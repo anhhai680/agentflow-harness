@@ -354,6 +354,55 @@ def test_a_store_that_opens_but_fails_at_a_query_is_no_index_and_no_traceback(bu
     assert capsys.readouterr().err == ""
 
 
+def _planted(built: Path, tmp_path: Path, *statements: str) -> Path:
+    copy = tmp_path / "copy"
+    shutil.copytree(built, copy)
+    conn = sqlite3.connect(store_of(copy))
+    for statement in statements:
+        conn.execute(statement)
+    conn.commit()
+    conn.close()
+    return copy
+
+
+def test_a_blob_where_a_language_belongs_never_crashes_status(built, tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(_planted(built, tmp_path, "UPDATE files SET lang = x'4142'"))
+    code, out = graph(capsys, "graph", "status")
+    assert code == 0 and out.startswith("graph: ") and "Traceback" not in out and "unexpected" not in out
+    code, out = graph(capsys, "graph", "status", "--json")
+    assert code == 0 and json.loads(out)["languages"] == {}
+    assert capsys.readouterr().err == ""
+
+
+def test_wrong_types_in_the_node_columns_never_crash_query_or_show(built, tmp_path, monkeypatch, capsys):
+    copy = _planted(built, tmp_path, "UPDATE nodes SET name = x'4142', line = 'abc', end_line = x'00', trust = x'41', "
+                    "signature = x'42', text = x'43'")
+    monkeypatch.chdir(copy)
+    for argv in (["graph", "query", "cap"], ["graph", "query", "cap", "--json"], ["graph", "show", "pkg/cap.py"],
+                 ["graph", "show", "pkg/cap.py", "--json"]):
+        code, out = graph(capsys, *argv)
+        assert code in (0, 1) and "unexpected" not in out and "Traceback" not in out, argv
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e999"])
+def test_a_planted_built_at_never_makes_invalid_json(built, tmp_path, monkeypatch, capsys, value):
+    monkeypatch.chdir(_planted(built, tmp_path, f"UPDATE meta SET value = '{value}' WHERE key = 'built_at'"))
+    code, out = graph(capsys, "graph", "status", "--json")
+    data = json.loads(out, parse_constant=lambda name: pytest.fail(f"bare {name} in the JSON"))
+    assert code == 0 and data["built_at"] is None and data["age_s"] is None
+    code, out = graph(capsys, "graph", "status")
+    assert code == 0 and ", built " not in out.splitlines()[0]
+
+
+def test_no_json_view_can_hold_a_bare_nan(built, tmp_path, monkeypatch, capsys):
+    """`allow_nan=False` turns any stray non-finite number into the no-index line, never invalid JSON."""
+    monkeypatch.chdir(built)
+    monkeypatch.setattr(graph_report, "_score", lambda value: float("nan"))
+    code, out = graph(capsys, "graph", "query", "cap", "--json")
+    assert (code, out.strip()) == (1, graph_report.NO_INDEX)
+
+
 def test_the_damaged_store_does_open(built, tmp_path):
     """Pins the case the test above is about: `open_read` accepts both stores, so the failure is at a query."""
     for damage in (_zero_the_nodes_pages, _recreate_nodes_with_other_columns):

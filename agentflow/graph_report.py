@@ -11,6 +11,7 @@ double the escapes).
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
@@ -51,7 +52,7 @@ def _text(value: object, limit: int | None = None) -> str:
 
 def language_states(rows: Iterable[FileRow], offered: Mapping[str, str]) -> dict[str, str]:
     """Each language a file with nodes has, `exact` when the last build's parser offered it, else `not parsed`."""
-    langs = {row.lang for row in rows if row.state in _HAS_NODES and row.lang}
+    langs = {row.lang for row in rows if row.state in _HAS_NODES and isinstance(row.lang, str) and row.lang}
     return {lang: _EXACT if lang in offered else _NOT_PARSED for lang in sorted(langs)}
 
 
@@ -64,7 +65,7 @@ def languages_line(languages: Mapping[str, str]) -> str:
 
 def left_out_counts(states: Mapping[str, int]) -> dict[str, int]:
     """The `files` rows by state, for every state that has no nodes."""
-    return {state: n for state, n in sorted(states.items()) if state not in _HAS_NODES and n > 0}
+    return {state: _int(n) for state, n in sorted(states.items()) if state not in _HAS_NODES and _int(n) > 0}
 
 
 def left_out_line(left_out: Mapping[str, int]) -> str | None:
@@ -121,9 +122,10 @@ def build_json(result: Result) -> dict:
 
 def _built_at(meta: Mapping[str, str]) -> float | None:
     try:
-        return float(meta["built_at"])
+        built = float(meta["built_at"])
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
+    return built if math.isfinite(built) else None  # a `nan` or `inf` would make `json.dumps` write invalid JSON
 
 
 def offered(meta: Mapping[str, str]) -> dict[str, str]:
@@ -175,8 +177,16 @@ def query_lines(hits: Sequence[Hit], commit: str) -> list[str]:
     return lines
 
 
+def _score(value: object) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return score if math.isfinite(score) else 0.0
+
+
 def query_json(hits: Sequence[Hit], commit: str) -> dict:
-    return {"commit": str(commit), "hits": [{**node_json(hit.node), "score": float(hit.score)} for hit in hits]}
+    return {"commit": str(commit), "hits": [{**node_json(hit.node), "score": _score(hit.score)} for hit in hits]}
 
 
 # --- show ---

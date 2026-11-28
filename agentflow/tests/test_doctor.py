@@ -732,3 +732,13 @@ def test_doctor_fails_the_graph_search_check_without_fts5(tmp_cfg, repo, monkeyp
     assert checks["graph search"].status == "fail"
     assert checks["graph search"].fix == "use a Python whose SQLite has FTS5"
     assert "graph index" not in checks
+
+
+def test_doctor_survives_a_blob_where_a_language_belongs(tmp_cfg, repo):
+    _index(tmp_cfg, repo)
+    conn = sqlite3.connect(graph_store.path_for(pack.state_dir(repo)))
+    conn.execute("UPDATE files SET lang = x'4142'")
+    conn.commit()
+    conn.close()
+    check = _checks(tmp_cfg, repo, _graph_patch())["graph index"]
+    assert check.status == "ok" and check.detail.endswith("none")

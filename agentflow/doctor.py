@@ -485,7 +485,7 @@ def _graph_checks(repo: Path) -> list[Check]:
             languages = graph_report.language_states(graph_store.files(conn).values(), graph_report.offered(meta))
         finally:
             conn.close()
-    except (graph_store.Unusable, sqlite3.Error):
+    except (graph_store.Unusable, sqlite3.Error, TypeError, ValueError, OverflowError):  # an untrusted store
         return [*checks, no_index]
     if not meta.get("commit"):
         return [*checks, no_index]
