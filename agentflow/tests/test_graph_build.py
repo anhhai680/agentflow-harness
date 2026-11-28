@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import fcntl
 import json
 import os
@@ -80,10 +81,11 @@ def read(repo: Path, fn, *args):
 
 
 def graph_of(repo: Path) -> dict:
-    """The store's dump without the history-dependent `facts` cache and `meta.built_at` (ruling R3)."""
+    """The store's dump without what depends on history: the `facts` cache, `meta.built_at` and `meta.languages`
+    (ruling R3, amended)."""
     dumped = read(repo, graph_store.dump)
     dumped.pop("facts")
-    dumped["meta"] = [row for row in dumped["meta"] if row[0] != "built_at"]
+    dumped["meta"] = [row for row in dumped["meta"] if row[0] not in ("built_at", "languages")]
     return dumped
 
 
@@ -296,6 +298,83 @@ def test_uncommitted_edits_and_local_excludes_change_nothing(tmp_path, cfg, monk
     assert graph_of(repo) == before
 
 
+def full_graph_of(repo: Path, cfg, monkeypatch, where: Path) -> dict:
+    """The graph a full build in another state dir gives at the same commit; the state dir is put back after."""
+    home = os.environ["XDG_STATE_HOME"]
+    monkeypatch.setenv("XDG_STATE_HOME", str(where))
+    try:
+        build(repo, cfg, download=False, full=True)
+        return graph_of(repo)
+    finally:
+        monkeypatch.setenv("XDG_STATE_HOME", home)
+
+
+def test_an_ignore_file_inside_an_ignored_folder_is_never_read(tmp_path, cfg, monkeypatch):
+    repo = make_repo(tmp_path, {".gitignore": b"generated/\n", "generated/.gitignore": b"!keep.py\n# inner\n",
+                                "generated/keep.py": b"K = 1\n", "a.py": b"A = 1\n"}, force=True)
+    inner = run_git(repo, "rev-parse", "HEAD:generated/.gitignore").strip()
+    asked: list[str] = []
+    real = graph_git.read_blobs
+    monkeypatch.setattr(graph_git, "read_blobs", lambda r, blobs, limit: asked.extend(blobs) or real(r, blobs, limit))
+    build(repo, cfg, download=False)
+    assert inner not in asked and read(repo, graph_store.ignore_files) == {"": "generated/\n"}
+    assert rows(repo)["generated/keep.py"].state == "ignored"
+    commit(repo, {".gitignore": b"*.log\n"})  # the folder is no longer ignored: its own file is loaded now
+    build(repo, cfg, download=False)
+    assert inner in asked and read(repo, graph_store.ignore_files)["generated"] == "!keep.py\n# inner\n"
+    assert rows(repo)["generated/keep.py"].state == "indexed"
+    delta = graph_of(repo)
+    assert full_graph_of(repo, cfg, monkeypatch, tmp_path / "elsewhere") == delta
+
+
+def test_a_failed_ignore_read_is_a_build_error_and_keeps_the_snapshot(tmp_path, cfg, monkeypatch):
+    repo = make_repo(tmp_path, IGNORED, force=True)
+    first = build(repo, cfg, download=False)
+    commit(repo, {".gitignore": b"generated/\n*.snap\n"})
+
+    def failed(*args):
+        raise graph_git.ReadFailed("git cat-file --batch-check failed")
+
+    with pytest.MonkeyPatch.context() as patch, pytest.raises(BuildError, match="batch-check failed"):
+        patch.setattr(graph_git, "_sizes", failed)
+        build(repo, cfg, download=False)
+    assert read(repo, graph_store.meta)["commit"] == first.commit
+    assert read(repo, graph_store.ignore_files) == {"": "generated/\n"}
+    assert sorted(p.name for p in store_of(repo).parent.iterdir()) == ["build.lock", "graph.sqlite"]
+    build(repo, cfg, download=False)
+    assert rows(repo)["a.snap"].state == "ignored" and rows(repo)["generated/api.py"].state == "ignored"
+    delta = graph_of(repo)
+    assert full_graph_of(repo, cfg, monkeypatch, tmp_path / "elsewhere") == delta
+
+
+def test_a_failed_blob_read_is_a_build_error_never_a_verdict(repo_a, cfg, tmp_path, monkeypatch):
+    first = build(repo_a, cfg, download=False)
+    commit(repo_a, {"pkg/slots.py": b"def lend(): ...\n"})
+
+    def failed(*args):
+        raise graph_git.ReadFailed("git cat-file --batch failed")
+
+    with pytest.MonkeyPatch.context() as patch, pytest.raises(BuildError, match="batch failed"):
+        patch.setattr(graph_git, "_batch", failed)
+        build(repo_a, cfg, download=False)
+    assert read(repo_a, graph_store.meta)["commit"] == first.commit and rows(repo_a)["pkg/slots.py"].state == "indexed"
+    seen = spy_on_parser(monkeypatch)
+    again = build(repo_a, cfg, download=False)
+    assert seen == [("pkg/slots.py", "python")] and again.previous == first.commit
+    assert rows(repo_a)["pkg/slots.py"].state == "indexed"
+    delta = graph_of(repo_a)
+    assert full_graph_of(repo_a, cfg, monkeypatch, tmp_path / "elsewhere") == delta
+
+
+def test_a_new_engine_judges_every_path_again(repo_a, cfg, monkeypatch):
+    first = build(repo_a, cfg, download=False)
+    monkeypatch.setattr(pack, "ENGINE_VERSION", "99.0")
+    seen = spy_on_parser(monkeypatch)
+    upgraded = build(repo_a, cfg, download=False)
+    assert upgraded.full and upgraded.previous == first.commit and seen == [] and upgraded.cached == 6
+    assert json.loads(read(repo_a, graph_store.meta)["settings"])["engine"] == "99.0"
+
+
 def test_a_nested_gitignore_applies_below_its_folder_only(tmp_path, cfg):
     repo = make_repo(tmp_path, {"pkg/.gitignore": b"gen_*.py\n", "pkg/gen_a.py": b"A = 1\n", "gen_b.py": b"B = 1\n",
                                 "pkg/sub/gen_c.py": b"C = 1\n"}, force=True)
@@ -336,7 +415,7 @@ def test_large_and_binary_files_are_unparsed_with_a_file_node(tmp_path, cfg, mon
     build(repo, small, download=False)
     assert seen == [("ok.py", "python")]
     found = rows(repo)
-    assert (found["big.py"].state, found["big.py"].note) == ("unparsed", "not_read")
+    assert (found["big.py"].state, found["big.py"].note) == ("unparsed", "over_max_file_kb")
     assert (found["nul.py"].state, found["nul.py"].note) == ("unparsed", "binary")
     for path in ("big.py", "nul.py"):
         assert [n.kind for n in read(repo, graph_store.nodes_at, path)] == ["file"]
@@ -402,6 +481,33 @@ def test_an_interrupted_publish_keeps_the_old_snapshot(repo_a, cfg, monkeypatch)
     again = build(repo_a, cfg, download=False)
     assert again.previous == first.commit and again.parsed == 1
     assert sorted(p.name for p in store_of(repo_a).parent.iterdir()) == ["build.lock", "graph.sqlite"]
+
+
+def test_a_full_disk_is_a_build_error_and_keeps_the_snapshot(repo_a, cfg):
+    first = build(repo_a, cfg, download=False)
+    commit(repo_a, {"pkg/slots.py": b"def lend(): ...\n"})
+
+    def full_disk(*args):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    for target in ("prune_facts", "publish"):  # during the build, and at the `COMMIT` of the publish
+        with pytest.MonkeyPatch.context() as patch, pytest.raises(BuildError, match="disk is full"):
+            patch.setattr(graph_store, target, full_disk)
+            build(repo_a, cfg, download=False)
+        assert read(repo_a, graph_store.meta)["commit"] == first.commit
+        assert sorted(p.name for p in store_of(repo_a).parent.iterdir()) == ["build.lock", "graph.sqlite"]
+    assert build(repo_a, cfg, download=False).previous == first.commit  # the lock was released
+
+
+def test_a_filesystem_that_cannot_lock_is_a_build_error(repo_a, cfg):
+    def no_locks(fd, operation):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    with pytest.MonkeyPatch.context() as patch, pytest.raises(BuildError, match="No locks available"):
+        patch.setattr(fcntl, "flock", no_locks)
+        build(repo_a, cfg, download=False)
+    assert not store_of(repo_a).exists()
+    assert build(repo_a, cfg, download=False).full
 
 
 def test_a_directory_at_the_store_path_is_a_build_error(repo_a, cfg):

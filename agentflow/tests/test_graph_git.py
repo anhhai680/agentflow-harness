@@ -125,24 +125,52 @@ def test_changes_lists_add_change_delete_and_mode(repo):
     assert graph_git.changes(repo, old, "1" * 40) is None
 
 
-def test_read_blobs_skips_what_is_over_the_limit_or_missing(repo, monkeypatch):
+def test_read_blobs_skips_what_is_over_the_limit_or_not_a_blob(repo, monkeypatch):
     small, big = _blob(repo, b"tiny\n"), _blob(repo, b"x" * 5000)
     read: list[list[str]] = []
     real = graph_git._batch
     monkeypatch.setattr(graph_git, "_batch", lambda r, ids, limit: read.append(list(ids)) or real(r, ids, limit))
-    missing = "e" * 40
-    got = list(graph_git.read_blobs(repo, [big, small, missing, small], 1000))
-    assert got == [(big, None), (small, b"tiny\n"), (missing, None)]
+    got = list(graph_git.read_blobs(repo, [big, small, "not-an-id", small], 1000))
+    assert got == [(big, None), (small, b"tiny\n"), ("not-an-id", None)]
     assert read == [[small]]
     tree = run_git(repo, "rev-parse", "HEAD^{tree}").strip()
     assert list(graph_git.read_blobs(repo, [tree], 10**6)) == [(tree, None)]
     assert list(graph_git.read_blobs(repo, [], 10)) == []
 
 
+def test_a_failed_read_raises_and_is_never_a_none(repo, tmp_path, monkeypatch):
+    small = _blob(repo, b"tiny\n")
+    with pytest.raises(graph_git.ReadFailed, match="not in the object store"):
+        list(graph_git.read_blobs(repo, [small, "e" * 40], 1000))
+    with pytest.raises(graph_git.ReadFailed):
+        list(graph_git.read_blobs(tmp_path / "not-a-repo", [small], 1000))
+    monkeypatch.setattr(graph_git, "_git", lambda *a, **k: None)  # git failed or timed out
+    with pytest.raises(graph_git.ReadFailed):
+        list(graph_git.read_blobs(repo, [small], 1000))
+    sizes_ok = {small: ("blob", 5)}
+    monkeypatch.setattr(graph_git, "_sizes", lambda r, ids: sizes_ok)
+    with pytest.raises(graph_git.ReadFailed, match="--batch failed"):
+        list(graph_git.read_blobs(repo, [small], 1000))
+
+
 def test_read_blobs_reads_in_runs(repo, monkeypatch):
     monkeypatch.setattr(graph_git, "BATCH_MAX_BYTES", 10)
     ids = [_blob(repo, f"blob {n}\n".encode()) for n in range(4)]
     assert [data for _, data in graph_git.read_blobs(repo, ids, 100)] == [f"blob {n}\n".encode() for n in range(4)]
+
+
+def test_a_gitlink_change_is_listed_whatever_gitmodules_says(repo):
+    first = run_git(repo, "rev-parse", "HEAD").strip()
+    (repo / ".gitmodules").write_text('[submodule "sub"]\n\tpath = sub\n\turl = ./x\n\tignore = all\n')
+    run_git(repo, "add", "-A")
+    run_git(repo, "update-index", "--add", "--cacheinfo", f"160000,{first},sub")
+    run_git(repo, "commit", "-q", "-m", "sub")
+    old = run_git(repo, "rev-parse", "HEAD").strip()
+    run_git(repo, "config", "diff.ignoreSubmodules", "all")
+    run_git(repo, "update-index", "--cacheinfo", f"160000,{old},sub")
+    run_git(repo, "commit", "-q", "-m", "move sub")
+    new = run_git(repo, "rev-parse", "HEAD").strip()
+    assert graph_git.changes(repo, old, new) == ([Change("sub", "160000", first, old)], [])
 
 
 def test_hooks_and_fsmonitor_never_run(repo, tmp_path):

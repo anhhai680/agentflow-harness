@@ -11,14 +11,22 @@ The steps, in order:
 1. **The change list.** `git diff-tree` between the stored commit and the new one. When git cannot diff them (the old
    commit was rewritten and pruned), the new tree is compared with the stored rows by blob id and mode. A first
    build, a `full` one (a repair from a new schema, keeping nothing) and one whose settings (`graph.exclude`,
-   `graph.max_file_kb`, the doc roots, the repository id) differ from the last build's take every listed path.
-2. **`.gitignore`.** A changed ignore file is read from its blob and kept in the store. When one changed, every listed
-   path is judged again and those whose state moved join the change list; otherwise only the changed paths are
-   judged. A path that is not `indexed` (ignored, secret, vendored, excluded, a symlink or a submodule) is never read.
+   `graph.max_file_kb`, the doc roots, the repository id, the engine version, whose selection and resolution rules
+   may differ) differ from the last build's take every listed path.
+2. **`.gitignore`.** When a commit changes any ignore file, the tree's ignore files are taken shallowest first, and
+   one that the shallower files ignore (`generated/.gitignore` under a `generated/` pattern) is never read, as git
+   never loads it; the others are read from their blobs (or kept from the store when unchanged). When the set of
+   texts moved, every listed path is judged again and those whose state moved join the change list; otherwise only
+   the changed paths are judged. A path that is not `indexed` (ignored, secret, vendored, excluded, a symlink or a
+   submodule) is never read.
 3. **Facts.** A changed blob's facts come from the cache by blob id, language and extractor version, else from the
    parser worker, which runs in a child process; nothing in the repository is ever executed.
 4. **Resolution.** Every changed path, and every path that wants a key a changed path provided before or provides now,
    is resolved again from stored facts. An affected path is never re-read, whatever its key set did.
+
+A blob git fails to give (`graph_git.ReadFailed`: git failed or timed out, or the object is not in the store) is a
+`BuildError`, never data: storing it as "not read" would be a verdict no later build revisits, since the blob id
+does not change. A full disk or a failed `COMMIT` (`sqlite3.OperationalError`, `OSError`) is a `BuildError` too.
 
 **When the parser starts, and what is extracted again.** Each `files` row records the extractor version its facts
 came from (`""` when no extractor gave a verdict: `no_grammar`, `parser_unavailable`), and `meta.languages` records
@@ -37,7 +45,9 @@ import contextlib
 import fcntl
 import json
 import os
+import itertools
 import posixpath
+import sqlite3
 import stat
 import time
 from collections import Counter
@@ -61,7 +71,7 @@ if TYPE_CHECKING:
 LOCK = "build.lock"
 NOTES_MAX = 50
 SNIFF_BYTES = 8000  # a NUL among a file's first bytes makes it binary: a file node, never parsed
-NOT_READ, BINARY = "not_read", "binary"  # the notes of a file over `graph.max_file_kb` (or not in git) and a binary one
+TOO_BIG, BINARY = "over_max_file_kb", "binary"  # the notes of a file over `graph.max_file_kb` and of a binary one
 _HAS_NODES = ("indexed", "unparsed")
 _REGULAR = ("100644", "100755")
 _NO_VERDICT = frozenset({"no_grammar", "parser_unavailable"})  # stored with version "": tried again by a later parser
@@ -135,6 +145,8 @@ def _locked(directory: Path) -> Iterator[None]:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise BuildError("another build is running") from None
+        except OSError as exc:  # a filesystem that cannot lock (`ENOLCK`, `EOPNOTSUPP`)
+            raise BuildError(f"cannot lock {directory / LOCK}: {exc}") from exc
         yield
     finally:
         os.close(fd)
@@ -156,11 +168,13 @@ def build(repo: Path, cfg: Config, *, full: bool = False, download: bool = True,
         except (graph_store.Unusable, OSError) as exc:
             raise BuildError(f"cannot start a build of {store}: {exc}") from exc
         try:
-            result = _Build(repo, cfg, conn, target, fresh=full, download=download).run(started)
             try:
+                result = _Build(repo, cfg, conn, target, fresh=full, download=download).run(started)
                 graph_store.publish(conn, temp, store)
-            except OSError as exc:  # a directory at the store path, a full disk
-                raise BuildError(f"cannot replace {store}: {exc}") from exc
+            except graph_git.ReadFailed as exc:
+                raise BuildError(f"git could not read a blob of {target[:12]}: {exc}") from exc
+            except (OSError, sqlite3.OperationalError) as exc:  # a directory at the store path, a full disk
+                raise BuildError(f"cannot write the index at {store}: {exc}") from exc
         except BaseException:
             graph_store.discard(conn, temp)
             raise
@@ -205,7 +219,8 @@ class _Build:
         self.limit = cfg.graph.max_file_kb * 1024
         self.exclude = Ignore({"": "\n".join(cfg.graph.exclude)})
         self.settings = json.dumps({"exclude": list(cfg.graph.exclude), "max_file_kb": cfg.graph.max_file_kb,
-                                    "doc_roots": list(self.doc_roots), "repo_id": self.repo_id}, sort_keys=True)
+                                    "doc_roots": list(self.doc_roots), "repo_id": self.repo_id,
+                                    "engine": pack.ENGINE_VERSION}, sort_keys=True)
         self.meta = graph_store.meta(conn)
         self.rows = graph_store.files(conn)  # as the last snapshot left them
         self.changed: dict[str, Entry | None] = {}  # None: deleted
@@ -282,29 +297,37 @@ class _Build:
     # --- 2. the ignore files, and judging the paths again ---
 
     def _ignore_files(self, everything: bool) -> Ignore:
-        texts = graph_store.ignore_files(self.conn)
-        paths = sorted(path for path in self.changed if posixpath.basename(path) == ".gitignore")
-        regular = {p: e for p in paths if (e := self.changed[p]) is not None and e.mode in _REGULAR}
-        got = dict(graph_git.read_blobs(self.repo, [e.blob for e in regular.values()], IGNORE_MAX_BYTES)) if regular else {}
+        """The ignore files of the commit, kept in the store; every path judged again when their texts moved."""
+        stored = graph_store.ignore_files(self.conn)
+        if not everything and not any(posixpath.basename(path) == ".gitignore" for path in self.changed):
+            return Ignore(stored)
+        listed = self._listing()
+        found = sorted((path for path, entry in listed.items()
+                        if posixpath.basename(path) == ".gitignore" and entry.mode in _REGULAR),
+                       key=lambda path: (path.count("/"), path))
+        texts: dict[str, str] = {}
+        for _, level in itertools.groupby(found, key=lambda path: path.count("/")):
+            above = Ignore(texts)  # the shallower files: git never loads an ignore file they ignore
+            loaded = [path for path in level if not above.ignored(path)]
+            unread = [path for path in loaded if path in self.changed or posixpath.dirname(path) not in stored]
+            blobs = [listed[path].blob for path in unread]
+            got = dict(graph_git.read_blobs(self.repo, blobs, IGNORE_MAX_BYTES)) if blobs else {}
+            for path in loaded:
+                directory = posixpath.dirname(path)
+                if path not in unread:
+                    texts[directory] = stored[directory]
+                elif (data := got.get(listed[path].blob)) is None:
+                    self.notes.append(f"{path}: over {IGNORE_MAX_BYTES} bytes, its patterns left out")
+                else:
+                    texts[directory] = data.decode("utf-8", "replace")
         moved = False
-        for path in paths:
-            directory, text = posixpath.dirname(path), None
-            if path in regular:
-                data = got.get(regular[path].blob)
-                if data is None:
-                    self.notes.append(f"{path}: over {IGNORE_MAX_BYTES} bytes or not in git, its patterns left out")
-                else:
-                    text = data.decode("utf-8", "replace")
-            if texts.get(directory) != text:
-                graph_store.set_ignore_file(self.conn, directory, text)
-                if text is None:
-                    texts.pop(directory, None)
-                else:
-                    texts[directory] = text
+        for directory in sorted({*stored, *texts}):
+            if stored.get(directory) != texts.get(directory):
+                graph_store.set_ignore_file(self.conn, directory, texts.get(directory))
                 moved = True
         ignore = Ignore(texts)
         if moved and not everything:
-            for path, entry in self._listing().items():
+            for path, entry in listed.items():
                 row = self.rows.get(path)
                 if path not in self.changed and (row is None or _judged(row.state) != self._state(path, entry, ignore)):
                     self._mark(path, entry)
@@ -385,7 +408,7 @@ class _Build:
             reuse = {lang for lang, version in offered.items() if known.get(lang) == version}
             for (path, entry, lang), data in self._read(self.queue):
                 if data is None:
-                    self._unparsed(path, entry, lang, "", NOT_READ)
+                    self._unparsed(path, entry, lang, "", TOO_BIG)
                 elif b"\0" in data[:SNIFF_BYTES]:
                     self._unparsed(path, entry, lang, "", BINARY)
                 else:
@@ -393,7 +416,7 @@ class _Build:
         return offered
 
     def _read(self, queue: Sequence[tuple[str, Entry, str]]) -> Iterator[tuple[tuple[str, Entry, str], bytes | None]]:
-        """Each queued item with its blob's bytes (None: over `max_file_kb` or not in git), from one `read_blobs`."""
+        """Each queued item with its blob's bytes (None: over `max_file_kb`), from one `read_blobs`."""
         by_blob: dict[str, list[tuple[str, Entry, str]]] = {}
         for item in queue:
             by_blob.setdefault(item[1].blob, []).append(item)
@@ -402,9 +425,8 @@ class _Build:
         for blob, data in graph_git.read_blobs(self.repo, list(by_blob), self.limit):
             for item in by_blob.pop(blob, ()):
                 yield item, data
-        for items in by_blob.values():  # an id `read_blobs` did not answer for
-            for item in items:
-                yield item, None
+        if by_blob:  # `read_blobs` answers for every id it is given; an id it skipped is a failed read, not data
+            raise graph_git.ReadFailed(f"no answer for blob {next(iter(by_blob))}")
 
     def _facts(self, parser, path: str, entry: Entry, lang: str, data: bytes, offered: Mapping[str, str],
                hits: Mapping[str, Facts]) -> None:

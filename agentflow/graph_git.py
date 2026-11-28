@@ -9,8 +9,11 @@ and refused past a cap, so a hostile tree cannot make the engine hold gigabytes.
 
 An object id is used only when it is a full hex id; a branch name only when it cannot be read as an option. A path is
 left out, and counted in one note per kind, when it is not UTF-8, holds a control character or is longer than
-`PATH_MAX_BYTES`, so what reaches the store and the terminal is always a plain string. Nothing here raises: a git that
-fails, times out or writes something unexpected is `None`.
+`PATH_MAX_BYTES`, so what reaches the store and the terminal is always a plain string. Nothing here raises but
+`read_blobs`: elsewhere a git that fails, times out or writes something unexpected is `None`. `read_blobs` must tell a
+blob it may not read (over the limit, not a blob) from a read that failed, because a caller that took a failure for
+the first would store it as a lasting verdict; so a failed git, or an id the object store does not hold, raises
+`ReadFailed`.
 """
 
 from __future__ import annotations
@@ -48,6 +51,10 @@ class Entry:
     path: str
     mode: str
     blob: str  # the object id: a blob, or a commit for a submodule
+
+
+class ReadFailed(Exception):
+    """`read_blobs` could not answer: git failed, timed out or wrote nonsense, or an object is not in the store."""
 
 
 @dataclass(frozen=True)
@@ -200,7 +207,9 @@ def changes(repo: Path, old: str, new: str) -> tuple[list[Change], list[str]] | 
     the names left out; None when git cannot diff them (an unknown id among them)."""
     if not _is_id(old) or not _is_id(new):
         return None
-    out = _git(repo, ["diff-tree", "-r", "-z", "--raw", "--no-renames", "--no-ext-diff", "--no-textconv", old, new])
+    # `--ignore-submodules=none`: the repository's own `.gitmodules` (`ignore = all`) must not hide a gitlink change
+    out = _git(repo, ["diff-tree", "-r", "-z", "--raw", "--no-renames", "--no-ext-diff", "--no-textconv",
+                      "--ignore-submodules=none", old, new])
     if out is None:
         return None
     parts = out.split(b"\0")
@@ -227,62 +236,69 @@ def changes(repo: Path, old: str, new: str) -> tuple[list[Change], list[str]] | 
     return found, _notes(left)
 
 
-def _sizes(repo: Path, ids: Sequence[str]) -> dict[str, int]:
-    """The size of each id in `ids` that names a blob (`cat-file --batch-check`); {} when git fails."""
+def _sizes(repo: Path, ids: Sequence[str]) -> dict[str, tuple[str, int]]:
+    """The type and size of each id in `ids` (`cat-file --batch-check`); `ReadFailed` when git fails or an id is
+    missing."""
     if not ids:
         return {}
     out = _git(repo, ["cat-file", "--batch-check"], feed="".join(f"{i}\n" for i in ids).encode("ascii"),
                limit=len(ids) * _HEADER_BYTES)
-    sizes: dict[str, int] = {}
-    for line in (out or b"").split(b"\n"):
+    if out is None:
+        raise ReadFailed("git cat-file --batch-check failed")
+    lines = out.split(b"\n")
+    if lines[-1:] == [b""]:
+        lines.pop()
+    if len(lines) != len(ids):
+        raise ReadFailed("git cat-file --batch-check answered for another number of objects")
+    found: dict[str, tuple[str, int]] = {}
+    for oid, line in zip(ids, lines):
         fields = line.decode("ascii", "replace").split(" ")
-        if len(fields) == 3 and fields[1] == "blob" and _ID.fullmatch(fields[0]) and fields[2].isdigit():
-            sizes[fields[0]] = int(fields[2])
-    return sizes
+        if fields == [oid, "missing"]:
+            raise ReadFailed(f"object {oid} is not in the object store")
+        if len(fields) != 3 or fields[0] != oid or not fields[2].isdigit():
+            raise ReadFailed("git cat-file --batch-check wrote an unexpected line")
+        found[oid] = (fields[1], int(fields[2]))
+    return found
 
 
 def _batch(repo: Path, ids: Sequence[str], limit: int) -> dict[str, bytes]:
-    """The bytes of each blob in `ids` at or under `limit` (`cat-file --batch`); {} when git fails or writes nonsense."""
+    """The bytes of each blob in `ids`, each at or under `limit` (`cat-file --batch`); `ReadFailed` when git fails,
+    an object went missing, or the output is not what was asked for."""
     out = _git(repo, ["cat-file", "--batch"], feed="".join(f"{i}\n" for i in ids).encode("ascii"),
                limit=len(ids) * (_HEADER_BYTES + 1) + BATCH_MAX_BYTES + limit)
     if out is None:
-        return {}
+        raise ReadFailed("git cat-file --batch failed")
     found: dict[str, bytes] = {}
     at = 0
     for oid in ids:
         end = out.find(b"\n", at)
-        if end < 0:
-            return {}
-        fields = out[at:end].decode("ascii", "replace").split(" ")
+        fields = out[at:end].decode("ascii", "replace").split(" ") if end >= 0 else []
         at = end + 1
-        if fields[0] != oid:
-            return {}
-        if len(fields) == 2 and fields[1] == "missing":
-            continue
-        if len(fields) != 3 or not fields[2].isdigit():
-            return {}
+        if len(fields) != 3 or fields[0] != oid or fields[1] != "blob" or not fields[2].isdigit():
+            raise ReadFailed(f"git cat-file --batch did not return blob {oid}")
         size = int(fields[2])
         data, at = out[at : at + size], at + size + 1
-        if len(data) != size or out[at - 1 : at] != b"\n":
-            return {}
-        if fields[1] == "blob" and size <= limit:
-            found[oid] = data
+        if len(data) != size or size > limit or out[at - 1 : at] != b"\n":
+            raise ReadFailed(f"git cat-file --batch returned blob {oid} cut short or over the limit")
+        found[oid] = data
     return found
 
 
 def _flush(repo: Path, run: Sequence[str], sizes: dict[str, int], limit: int) -> Iterator[tuple[str, bytes | None]]:
-    readable = [oid for oid in run if 0 <= sizes.get(oid, -1) <= limit]
+    readable = [oid for oid in run if sizes.get(oid, limit + 1) <= limit]
     got = _batch(repo, readable, limit) if readable else {}
     for oid in run:
         yield oid, got.get(oid)
 
 
 def read_blobs(repo: Path, blobs: Sequence[str], limit: int) -> Iterator[tuple[str, bytes | None]]:
-    """Each distinct id of `blobs`, in order, with its bytes; None for an id that is not a full hex id, names no blob,
-    or is over `limit` bytes. Sizes come first from `cat-file --batch-check`, so a blob over `limit` is never read;
-    the rest are read by `cat-file --batch` in runs of at most `BATCH_MAX_BYTES`."""
+    """Each distinct id of `blobs`, in order, with its bytes; None for an id that is not a full hex id, names an
+    object that is not a blob, or a blob over `limit` bytes. `ReadFailed` (raised while iterating) when git fails or
+    an id names no object in the store. Sizes come first from `cat-file --batch-check`, so a blob over `limit` is
+    never read; the rest are read by `cat-file --batch` in runs of at most `BATCH_MAX_BYTES`."""
     ids = list(dict.fromkeys(blobs))
-    sizes = _sizes(repo, [oid for oid in ids if _is_id(oid)]) if limit >= 0 else {}
+    found = _sizes(repo, [oid for oid in ids if _is_id(oid)]) if limit >= 0 else {}
+    sizes = {oid: size for oid, (kind, size) in found.items() if kind == "blob"}
     run: list[str] = []
     budget = 0
     for oid in ids:
