@@ -49,6 +49,7 @@ _SCHEMA = (
     " state TEXT NOT NULL, version TEXT NOT NULL, note TEXT NOT NULL)",
     "CREATE TABLE facts (blob TEXT NOT NULL, lang TEXT NOT NULL, version TEXT NOT NULL, json TEXT NOT NULL,"
     " lines INTEGER NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY (blob, lang, version))",
+    "CREATE INDEX facts_seen ON facts (seen)",  # MAX(seen) on every put and hit, and prune's ORDER BY
     "CREATE TABLE provides (key TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (key, path))",
     "CREATE INDEX provides_path ON provides (path)",
     "CREATE TABLE wants (key TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (key, path))",
@@ -223,9 +224,10 @@ def begin(path: Path, fresh: bool = False) -> tuple[sqlite3.Connection, Path]:
             source = open_read(path)
         except Unusable:
             source = None
-    temp = _create_temp(path)
     conn: sqlite3.Connection | None = None
+    temp: Path | None = None
     try:
+        temp = _create_temp(path)
         conn = sqlite3.connect(str(temp), isolation_level=None)
         _harden(conn)
         conn.execute("PRAGMA journal_mode = DELETE")
@@ -240,8 +242,9 @@ def begin(path: Path, fresh: bool = False) -> tuple[sqlite3.Connection, Path]:
     except BaseException:
         if conn is not None:
             conn.close()
-        _unlink(temp)
-        _unlink(temp.with_name(temp.name + "-journal"))
+        if temp is not None:
+            _unlink(temp)
+            _unlink(temp.with_name(temp.name + "-journal"))
         raise
     finally:
         if source is not None:

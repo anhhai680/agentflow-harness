@@ -587,3 +587,69 @@ def test_dump_holds_facts_under_their_own_key_without_a_counter(conn):
     rows = gs.dump(conn)["facts"]
     assert [r[0] for r in rows] == ["b1", "b2"]
     assert all(len(r) == 5 for r in rows)
+
+
+# --- scale: nothing a build does per file may scan a whole table ---
+
+
+def test_the_statements_a_build_runs_per_file_use_an_index(conn):
+    plans = {
+        "max_seen": "SELECT MAX(seen) FROM facts",
+        "facts_hit": "UPDATE facts SET seen = 1 WHERE blob = 'b' AND lang = 'l' AND version = 'v'",
+        "facts_row": "SELECT json, lines FROM facts WHERE blob = 'b' AND lang = 'l' AND version = 'v'",
+        "node_blob": "UPDATE nodes SET blob = 'b' WHERE path = 'p'",
+        "keys_provides": "DELETE FROM provides WHERE path = 'p'",
+        "keys_wants": "DELETE FROM wants WHERE path = 'p'",
+        "drop_search": "DELETE FROM search WHERE rowid IN (SELECT rowid FROM nodes WHERE path = 'p')",
+        "drop_nodes": "DELETE FROM nodes WHERE path = 'p'",
+        "drop_edges": "DELETE FROM edges WHERE origin = 'p'",
+        "drop_file": "DELETE FROM files WHERE path = 'p'",
+        "node_by_id": "SELECT rowid FROM nodes WHERE id = 'i'",
+        "file_blob": "SELECT blob FROM files WHERE path = 'p'",
+        "providers": "SELECT path FROM provides WHERE key = 'k' ORDER BY path",
+        "wanting": "SELECT path FROM wants WHERE key IN ('a', 'b')",
+        "edges_src": "SELECT src FROM edges WHERE src = 'n' ORDER BY src, dst, kind, origin",
+        "edges_dst": "SELECT src FROM edges WHERE dst = 'n' ORDER BY src, dst, kind, origin",
+        "nodes_at": "SELECT id FROM nodes WHERE path = 'p' ORDER BY line, id",
+    }
+    for name, sql in plans.items():
+        detail = " ".join(r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql))
+        detail = detail.replace("SCAN search VIRTUAL TABLE INDEX 0:=", "FTS5 rowid lookup")  # `0:=` is a rowid match
+        assert "SCAN" not in detail, (name, detail)
+        if name == "max_seen":  # a bare `SEARCH facts` is also what an unindexed MAX reports
+            assert "facts_seen" in detail, detail
+
+
+def test_a_build_with_many_cached_facts_is_not_quadratic(conn):
+    import time
+
+    count = 10000
+    started = time.monotonic()
+    for i in range(count):
+        gs.put_facts(conn, f"blob{i}", "python", "1", FACTS)
+    for i in range(count):
+        assert gs.facts(conn, f"blob{i}", "python", "1") is not None
+    gs.prune_facts(conn)
+    # Linear this takes about a second; a scan of the facts table per call took 8 s here and minutes with real facts.
+    assert time.monotonic() - started < 5
+
+
+def test_begin_closes_the_source_when_it_cannot_make_the_temp_file(store, monkeypatch):
+    build(store)
+    opened = []
+    real_open = gs.open_read
+
+    def spy(path):
+        opened.append(real_open(path))
+        return opened[-1]
+
+    def refuse(path):
+        raise OSError("no room")
+
+    monkeypatch.setattr(gs, "open_read", spy)
+    monkeypatch.setattr(gs, "_create_temp", refuse)
+    with pytest.raises(OSError):
+        gs.begin(store)
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")
