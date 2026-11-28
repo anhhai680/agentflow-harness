@@ -6,9 +6,11 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
+from agentflow import graph_model as gm
 from agentflow import graph_parse, graph_syntax
 from agentflow.graph_parse import Parser
 
@@ -125,6 +127,67 @@ def test_the_script_lock_is_used_inside_a_project_of_its_own(exact, tmp_path):
                          env=graph_parse.worker_env(), timeout=120)
     assert json.loads(out.stdout.splitlines()[0])["languages"]["typescript"] == "1+0.23.2"
     assert sorted(p.name for p in project.iterdir()) == ["pyproject.toml"]
+
+
+# --- hostile files: every node is read a constant number of times, and nothing raises ---
+
+N = 10_000
+LINEAR_S = 2.0  # a quadratic walk takes minutes at N; a linear one, a few hundredths of a second
+
+
+def _timed(parser, lang: str, data: bytes) -> tuple[gm.Facts, float]:
+    t0 = time.monotonic()
+    facts = parser.parse("web/hostile.js", lang, data)
+    return facts, time.monotonic() - t0
+
+
+def test_a_long_member_chain_on_a_call_is_linear(exact):
+    f, took = _timed(exact, "javascript", b'import g from "g";\ng()' + b".a" * N + b";\nimport api from \"api\";\napi" + b".b" * N + b";\n")
+    assert took < LINEAR_S, took
+    assert ("g", "") in {(r.name, r.scope) for r in f.refs}
+    assert "dropped 1 references with names outside [A-Za-z0-9_$.]" in f.notes  # `api.b.b...` is past NAME_MAX
+
+
+def test_a_long_member_chain_on_this_is_linear(exact):
+    f, took = _timed(exact, "typescript", b'import api from "api";\nclass K { m() { this' + b".a" * N + b"; api.go(); } }\n")
+    assert took < LINEAR_S, took
+    assert {(r.name, r.scope) for r in f.refs} == {("api.go", "K.m")}
+
+
+def test_require_in_deeply_nested_parentheses_is_linear(exact):
+    data = b"(require('x'), " * N + b"0" + b")" * N + b";\nconst y = require('y');\n"
+    f, took = _timed(exact, "javascript", data)
+    assert took < LINEAR_S, took
+    assert f.imports[0] == gm.Import("x", "", "", 0, 1) and "cut imports from 10001 to 2000" in f.notes
+    assert [d.name for d in f.defs] == []  # `y` binds an import, not a constant
+
+
+@pytest.mark.parametrize("data", [b"[" * (10 * N), b"x = " + b"[" * (5 * N) + b"]" * (5 * N) + b";\n",
+                                  b"function f() {" * (2 * N) + b"}" * (2 * N), b"const f = " + b"() => " * (2 * N) + b"g();\n"])
+def test_a_deeply_nested_file_is_facts_or_a_note(exact, data):
+    f, took = _timed(exact, "javascript", data)
+    assert took < LINEAR_S, took
+    assert not any(note.startswith("parser_") for note in f.notes)
+    assert set(f.notes) <= {"syntax_error"}
+
+
+def test_each_list_is_cut_to_its_cap_with_a_note(exact):
+    imports = b"".join(b'import a%d from "m";\n' % i for i in range(gm.MAX_IMPORTS + 1))
+    consts = b"".join(b"const c%d = 1;\n" % i for i in range(gm.MAX_DEFS + 1))
+    calls = b"function f() {" + b"".join(b"a0.p%d();" % i for i in range(gm.MAX_REFS + 1)) + b"}\n"
+    f, took = _timed(exact, "javascript", imports + consts + calls)
+    assert took < 5 * LINEAR_S, took
+    assert (len(f.imports), len(f.defs), len(f.refs)) == (gm.MAX_IMPORTS, gm.MAX_DEFS, gm.MAX_REFS)
+    assert f.notes == (f"cut definitions from {gm.MAX_DEFS + 2} to {gm.MAX_DEFS}",
+                       f"cut imports from {gm.MAX_IMPORTS + 1} to {gm.MAX_IMPORTS}",
+                       f"cut references from {gm.MAX_REFS + 1} to {gm.MAX_REFS}")
+
+
+def test_bytes_that_are_not_utf8_are_a_note_and_a_bom_is_allowed(exact):
+    assert exact.parse("web/a.ts", "typescript", b"export const a = '\xff';\n").notes == ("UnicodeDecodeError",)
+    f = exact.parse("web/b.ts", "typescript", b"\xef\xbb\xbfexport function f() {}\n")
+    assert [(d.name, d.line, d.signature, d.exported) for d in f.defs] == [("f", 1, "export function f()", True)]
+    assert f.notes == ()
 
 
 # --- the engine never loads tree-sitter ---

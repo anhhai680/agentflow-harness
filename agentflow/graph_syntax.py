@@ -9,7 +9,8 @@ pinned version and its language loads.
 `extract` decodes the bytes as strict UTF-8 (a byte order mark is allowed) and hands them to tree-sitter. It never
 compiles, executes or evaluates anything, and it never raises: a file that does not decode gives
 `empty(lang, <the error's class name>)`, and a tree with errors still gives what was found, with the note
-`syntax_error`. Every walk keeps an explicit stack, so a deep tree costs time and not a crash.
+`syntax_error`. Every walk keeps an explicit stack and reads each node a constant number of times (it never asks
+the tree for a parent, which costs the node's depth), so a deep or long tree costs linear time and not a crash.
 
 The rules. Top-level `function`, `class`, `interface`, `type` and `enum` declarations are definitions (`function`, or
 `class` for the other four), as is a `const` or `let` bound to an arrow function or function expression (`function`)
@@ -414,17 +415,17 @@ class _Walk:
         if not found:  # `export * from "m"`
             self.bind(mod, "*", "", stmt)
 
-    def require(self, call, kind: str) -> None:
-        """`require("m")` or `import("m")` with one string argument, bound by the declarator around it if any."""
+    def require(self, call, target) -> None:
+        """`require("m")` or `import("m")` with one string argument; `target` is the declarator name it binds, if any.
+
+        The caller names the declarator: asking the tree for a node's parent costs its depth, which a file of nested
+        parentheses makes quadratic.
+        """
         args = _field(call, "arguments")
         strings = [] if args is None else list(args.named_children)
         if len(strings) != 1 or strings[0].type != "string":
             return
         mod = self.string(strings[0])
-        parent = call.parent
-        target = _field(parent, "name") if kind == "require" and parent is not None and parent.type == "variable_declarator" else None
-        if target is not None and _field(parent, "value") != call:
-            target = None
         if target is None:
             self.bind(mod, "", "", call)
         elif target.type == "identifier":
@@ -440,21 +441,26 @@ class _Walk:
 
     # --- references ---
 
-    def chain(self, node) -> list[str] | None:
-        """The parts of `a.b.c` when `node` is a member chain of plain names, else None."""
-        parts: list[str] = []
+    def chain(self, node) -> tuple[list[str] | None, object]:
+        """The parts of `a.b.c` when `node` is a member chain of plain names (else None), and the chain's base.
+
+        The base is the first node under the chain that is not a `member_expression`, so a walk that cannot use the
+        chain goes on from there and never looks at the chain's inner links again: each link is read once.
+        """
+        parts: list[str] | None = []
         cur = node
         while cur is not None and cur.type == "member_expression":
             prop = _field(cur, "property")
-            if prop is None or prop.type != "property_identifier":
-                return None
-            parts.append(self.text(prop))
+            if parts is not None and prop is not None and prop.type == "property_identifier":
+                parts.append(self.text(prop))
+            else:
+                parts = None
             cur = _field(cur, "object")
-        if cur is None or cur.type != "identifier":
-            return None
+        if parts is None or cur is None or cur.type != "identifier":
+            return None, cur
         parts.append(self.text(cur))
         parts.reverse()
-        return parts
+        return parts, cur
 
     def note(self, parts: list[str], node, scope: str) -> None:
         name = ".".join(parts)
@@ -473,21 +479,28 @@ class _Walk:
             node, scope = stack.pop()
             kind = node.type
             skip = None
-            if kind == "member_expression":
-                parts = self.chain(node)
+            if kind == "member_expression":  # its links hold only names: the chain, or else its base, is all there is
+                parts, base = self.chain(node)
                 if parts is not None:
                     self.note(parts, node, scope)
-                    continue
+                elif base is not None:
+                    stack.append((base, scope))
+                continue
+            if kind == "variable_declarator":
+                value = _field(node, "value")
+                if self.required(value):
+                    self.require(value, _field(node, "name"))
+                    skip = value
             elif kind == "call_expression":
                 fn = _field(node, "function")
                 if fn is not None and fn.type == "identifier":
                     if self.text(fn) == "require":
-                        self.require(node, "require")
+                        self.require(node, None)
                     else:
                         self.note([self.text(fn)], fn, scope)
                     skip = fn
                 elif fn is not None and fn.type == "import":
-                    self.require(node, "import")
+                    self.require(node, None)
                     skip = fn
             elif kind == "new_expression":
                 ctor = _field(node, "constructor")
