@@ -46,11 +46,34 @@ def test_definitions():
         ("main", "function", True),
     ]
     hold = f.defs[2]
-    assert hold.signature == "def hold(self, run: 'Run', *, wait: float=1.0) -> bool"
+    assert hold.signature == "def hold(self, run: 'Run', *, wait: float=...) -> bool"  # R22: no default's value
     assert (hold.line, hold.end) == (13, 14) and f.defs[1].doc == "Holds one slot."
     assert f.defs[1].signature == "class Cap(Base)"
-    assert f.defs[4].signature == "async def main(argv: list[str] | None=None) -> int"
+    assert f.defs[4].signature == "async def main(argv: list[str] | None=...) -> int"
     assert f.defs[4].doc == ""
+
+
+CANARY = "zqxcanary7731"
+
+
+def test_no_default_or_class_keyword_value_reaches_a_signature():
+    """A default can hold a secret, as a constant's value can (R13): every one is written `...`."""
+    src = f'''class Conf(Base, metaclass=Meta, token="{CANARY}", **extra):
+    def connect(self, url="https://u:{CANARY}@h", /, port=5432, *args, key=b"{CANARY}", retries, **kw) -> None:
+        ...
+def call(fn=lambda: "{CANARY}", data={{"k": "{CANARY}"}}): ...
+async def later(*, wait: float = len("{CANARY}")): ...
+class Inline(**{{"token": "{CANARY}"}}): ...
+'''.encode()
+    defs = {d.name: d.signature for d in _roundtrip(src).defs}
+    assert CANARY not in repr(defs)
+    assert defs == {
+        "Conf": "class Conf(Base, metaclass=..., token=..., **extra)",
+        "Conf.connect": "def connect(self, url=..., /, port=..., *args, key=..., retries, **kw) -> None",
+        "call": "def call(fn=..., data=...)",
+        "later": "async def later(*, wait: float=...)",
+        "Inline": "class Inline(**...)",
+    }
 
 
 def test_imports():

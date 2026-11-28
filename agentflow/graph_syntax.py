@@ -18,7 +18,7 @@ and any other top-level `const NAME` but a `require` (`constant`, with no signat
 class's methods are `Class.method`. `exported` means declared under `export` (`export default` included, named
 `default` when anonymous), named in a local `export { ... }`, or named by `module.exports` / `exports.x`; a method is
 exported with its class unless it is `private` or `#private`. `signature` is the first line of the declaration up to
-its body; `doc` is the first line of a `/** ... */` comment directly above. Imports are one `Import` per binding of
+its body, with each parameter's `= initialiser` written `= ...` (a default can hold a secret); `doc` is the first line of a `/** ... */` comment directly above. Imports are one `Import` per binding of
 `import`, `export ... from`, `import x = require(...)`, `require(...)` and `import(...)`, with `module` the specifier
 as written and `level` 0; a binding-less import has name and alias "". A `Ref` is a call or member chain whose first
 part is an import binding or a top-level definition, once per `(name, scope)`, scoped to the enclosing definition.
@@ -65,6 +65,10 @@ _CLASSES = frozenset(("class_declaration", "abstract_class_declaration"))
 _TYPES = frozenset(("interface_declaration", "type_alias_declaration", "enum_declaration"))
 _ASSIGNMENTS = frozenset(("assignment_expression", "augmented_assignment_expression"))
 _SIGNATURE_TAILS = ("=>", "=", "{")
+# the parameter forms that carry a default, and the field holding it: TypeScript's, then JavaScript's (and both's
+# destructuring defaults)
+_INITIALISERS = {"required_parameter": "value", "optional_parameter": "value", "assignment_pattern": "right",
+                 "object_assignment_pattern": "right"}
 
 _parsers: dict[str, object] | None = None
 
@@ -284,13 +288,34 @@ class _Walk:
         return fn is not None and fn.type == "identifier" and self.text(fn) == "require"
 
     def signature(self, outer, body) -> str:
-        """The first line of `outer` up to `body`, without the `=>`, `=` or `{` before it."""
+        """The first line of `outer` up to `body`, without the `=>`, `=` or `{` before it, and with each parameter's
+        `= initialiser` written `= ...`: a default can hold a secret, as a constant's value can."""
         stop = body.start_byte if body is not None and body.start_byte > outer.start_byte else outer.end_byte
-        head = self.body[outer.start_byte : stop].decode("utf-8", "replace").split("\n", 1)[0].rstrip()
+        raw, at = b"", outer.start_byte
+        for start, end in self.initialisers(outer, stop):
+            raw += self.body[at:start] + b"..."
+            at = end
+        raw += self.body[at:stop]
+        head = raw.decode("utf-8", "replace").split("\n", 1)[0].rstrip()
         for tail in _SIGNATURE_TAILS:
             if head.endswith(tail):
                 head = head[: -len(tail)].rstrip()
         return text(head, SIGNATURE_MAX)
+
+    def initialisers(self, outer, stop: int) -> list[tuple[int, int]]:
+        """The byte spans of the parameter initialisers in `outer` before `stop`, outermost only, in order. The walk
+        keeps an explicit stack, never enters a node that starts at `stop` or later (the body) nor an initialiser."""
+        spans: list[tuple[int, int]] = []
+        stack = [outer]
+        while stack:
+            node = stack.pop()
+            field = _INITIALISERS.get(node.type)
+            value = _field(node, field) if field is not None else None
+            if value is not None and value.end_byte <= stop:
+                spans.append((value.start_byte, value.end_byte))
+            stack.extend(child for child in reversed(node.children)
+                         if child.start_byte < stop and (value is None or child != value))
+        return sorted(spans)
 
     def doc(self, outer) -> str:
         """The first line of a `/** ... */` comment that ends on the line above `outer` (or on its own line)."""

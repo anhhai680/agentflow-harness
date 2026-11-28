@@ -105,6 +105,36 @@ def test_export_forms_private_methods_and_dropped_records(exact):
                        "dropped 2 imports with names outside [A-Za-z0-9_$.]")
 
 
+CANARY = "zqxcanary7731"
+DEFAULTS = f'''export function connect(url: string = "https://u:{CANARY}@h", port = 5432, {{ key = "{CANARY}" }} = {{}}, ...rest: string[]): void {{ }}
+export const call = (fn = () => "{CANARY}", n?: number) => fn();
+export class Conf {{ open(token: string = `{CANARY}`): void {{ }} }}
+'''.encode()
+
+
+@pytest.mark.parametrize("lang", ["typescript", "tsx"])
+def test_no_parameter_initialiser_reaches_a_signature(exact, lang):
+    """A default can hold a secret, as a constant's value can (R13): each `= initialiser` is written `= ...`."""
+    defs = {d.name: d.signature for d in exact.parse("web/conf.ts", lang, DEFAULTS).defs}
+    assert CANARY not in repr(defs)
+    assert defs == {
+        "connect": "export function connect(url: string = ..., port = ..., { key = ... } = ..., ...rest: string[]): void",
+        "call": "export const call = (fn = ..., n?: number)",
+        "Conf": "export class Conf",
+        "Conf.open": "open(token: string = ...): void",
+    }
+
+
+def test_no_parameter_initialiser_reaches_a_javascript_signature(exact):
+    src = f'''function connect(url = "{CANARY}", {{ key = "{CANARY}" }} = {{}}, [a = 1] = []) {{ }}
+const call = function (fn = () => "{CANARY}") {{ return fn(); }};
+'''.encode()
+    defs = {d.name: d.signature for d in exact.parse("web/conf.js", "javascript", src).defs}
+    assert CANARY not in repr(defs)
+    assert defs == {"connect": "function connect(url = ..., { key = ... } = ..., [a = ...] = ...)",
+                    "call": "const call = function (fn = ...)"}
+
+
 def test_a_broken_file_keeps_what_was_found(exact):
     f = exact.parse("web/broken.ts", "typescript", b'import { a } from "./a";\nexport const a = 1,\n')
     assert "syntax_error" in f.notes
@@ -113,8 +143,8 @@ def test_a_broken_file_keeps_what_was_found(exact):
 
 def test_the_locked_worker_offers_the_pinned_grammars(exact):
     assert exact.mode in ("offline", "locked")
-    assert exact.languages["typescript"] == "1+0.23.2"
-    assert exact.languages["tsx"] == "1+0.23.2" and exact.languages["javascript"] == "1+0.25.0"
+    assert exact.languages["typescript"] == "2+0.23.2"
+    assert exact.languages["tsx"] == "2+0.23.2" and exact.languages["javascript"] == "2+0.25.0"
     assert {"python", "markdown", "manifest"} <= set(exact.languages)
 
 
@@ -125,7 +155,7 @@ def test_the_script_lock_is_used_inside_a_project_of_its_own(exact, tmp_path):
     (project / "pyproject.toml").write_text('[project]\nname = "other"\nversion = "0"\ndependencies = ["requests"]\n')
     out = subprocess.run(graph_parse.worker_argv(exact.mode), input=b"", capture_output=True, cwd=project,
                          env=graph_parse.worker_env(), timeout=120)
-    assert json.loads(out.stdout.splitlines()[0])["languages"]["typescript"] == "1+0.23.2"
+    assert json.loads(out.stdout.splitlines()[0])["languages"]["typescript"] == "2+0.23.2"
     assert sorted(p.name for p in project.iterdir()) == ["pyproject.toml"]
 
 

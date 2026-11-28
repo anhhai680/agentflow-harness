@@ -698,7 +698,7 @@ def test_a_stored_version_that_differs_is_extracted_again(repo_a, cfg, monkeypat
     seen = spy_on_parser(monkeypatch)
     result = build(repo_a, cfg, download=False)
     assert sorted(seen) == [("pkg/cap.py", "python"), ("pkg/slots.py", "python"), ("tests/test_cap.py", "python")]
-    assert result.parsed == 3 and {row.version for row in rows(repo_a).values() if row.lang == "python"} == {"1"}
+    assert result.parsed == 3 and {row.version for row in rows(repo_a).values() if row.lang == "python"} == {"2"}
 
 
 TS = {"web/a.ts": b'import { b } from "./b";\nexport const a = b;\n', "web/b.ts": b"export const b = 1;\n",

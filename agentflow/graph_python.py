@@ -165,12 +165,29 @@ def _def(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef, name: str,
     )
 
 
+def _elided() -> ast.Constant:
+    return ast.Constant(value=...)
+
+
+def _without_defaults(args: ast.arguments) -> ast.arguments:
+    """`args` with every default and keyword-only default written `...`: a default can hold a secret, as a constant's
+    value can, so none reaches the store. The tree itself is not changed."""
+    return ast.arguments(
+        posonlyargs=args.posonlyargs, args=args.args, vararg=args.vararg, kwonlyargs=args.kwonlyargs,
+        kw_defaults=[None if d is None else _elided() for d in args.kw_defaults], kwarg=args.kwarg,
+        defaults=[_elided() for _ in args.defaults],
+    )
+
+
 def _signature(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> str:
     if isinstance(node, ast.ClassDef):
-        parts = [_unparse(base) or "..." for base in node.bases] + [_unparse(kw) or "..." for kw in node.keywords]
+        keywords = [f"{kw.arg}=..." if kw.arg is not None  # a keyword's value can hold a secret too
+                    else f"**{_unparse(kw.value)}" if isinstance(kw.value, (ast.Name, ast.Attribute)) else "**..."
+                    for kw in node.keywords]
+        parts = [_unparse(base) or "..." for base in node.bases] + keywords
         return f"class {node.name}({', '.join(parts)})" if parts else f"class {node.name}"
     head = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-    args = _unparse(node.args)
+    args = _unparse(_without_defaults(node.args))
     returns = _unparse(node.returns)
     sig = f"{head} {node.name}({'...' if args is None else args})"
     return f"{sig} -> {returns}" if returns is not None else sig

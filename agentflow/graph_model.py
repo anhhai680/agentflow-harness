@@ -19,11 +19,11 @@ SCHEMA_VERSION = 1
 NODE_KINDS = ("file", "symbol", "doc", "section", "decision", "question", "requirement", "package", "provides", "needs")
 EDGE_KINDS = ("contains", "imports", "references", "tests", "depends_on", "mentions")
 LANGUAGES = ("python", "typescript", "tsx", "javascript", "markdown", "manifest")
-EXTRACTOR_VERSIONS = {
-    "python": "1",
-    "typescript": "1",
-    "tsx": "1",
-    "javascript": "1",
+EXTRACTOR_VERSIONS = {  # bumped with any change to an extractor's output, so cached facts are extracted again
+    "python": "2",  # 2: no default's or class keyword's value in a signature
+    "typescript": "2",  # 2: no parameter initialiser in a signature
+    "tsx": "2",
+    "javascript": "2",
     "markdown": "1",
     "manifest": "1",
 }
