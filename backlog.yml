@@ -73,7 +73,13 @@ items:
     spec: docs/specs/agentflow-vuln-fix-proposal.md
     plan: docs/plans/2026-11-24-agentflow-harness-vuln-v3.md
   - id: workspace
-    plan: docs/plans/2026-11-26-agentflow-harness-workspace-w1.md
+    plan: docs/plans/2026-11-27-agentflow-harness-workspace-w5.md
     title: "Proposal: a user-level dashboard and CLI that work on several repositories of a workspace at once"
-    status: ready
+    status: done
     spec: docs/specs/agentflow-workspace-proposal.md
+  - id: knowledge-graph
+    plan: docs/plans/2026-11-28-knowledge-graph-k1.md
+    title: "Proposal: a knowledge graph of the workspace's code and a context graph of its decisions"
+    status: ready
+    spec: docs/specs/agentflow-knowledge-graph-proposal.md
+    depends_on: [workspace]
