@@ -148,3 +148,31 @@ def test_url_credentials_never_reach_the_facts():
     assert js.package == "@acme/web"
     for facts in (py, req, js):
         assert "SECRETTOKEN" not in json.dumps(gm.to_json(facts))
+
+
+def test_a_password_with_an_at_sign_leaves_no_part_in_the_facts():
+    py = _roundtrip("pyproject.toml", b'[project]\ndependencies = ["a @ https://user:pw1@pw2@host.example/x.git@v1", "b @ https://pw3@pw4@host.example/b.whl"]\n')
+    req = _roundtrip("requirements.txt", b"a @ https://user:pw1@pw2@host.example/x.git@v1\n")
+    js = _roundtrip("package.json", b'{"dependencies": {"a": "git+https://user:pw1@pw2@host.example/x.git#v1", "b": "https://pw3@pw4@host.example/b.tgz"}}')
+    assert [d.spec for d in py.deps] == ["@ https://host.example/x.git@v1", "@ https://host.example/b.whl"]
+    assert [d.spec for d in req.deps] == ["@ https://host.example/x.git@v1"]
+    assert [d.spec for d in js.deps] == ["git+https://host.example/x.git#v1", "https://host.example/b.tgz"]
+    for facts in (py, req, js):
+        dump = json.dumps(gm.to_json(facts))
+        assert not any(part in dump for part in ("pw1", "pw2", "pw3", "pw4", "user"))
+
+
+def test_requirement_continuations_are_linear_and_flushed_at_the_end():
+    import time
+
+    big = b"flask==1 \\\n" + b"\\\n" * 1_000_000
+    start = time.monotonic()
+    f = _roundtrip("requirements.txt", big)
+    assert time.monotonic() - start < 1.0
+    assert [(d.name, d.spec) for d in f.deps] == [("flask", "==1")]
+    many = b"".join(b"pkg%d==1 \\\n    --hash=sha256:abc\n" % i for i in range(100_000)) + b"last==2\n"
+    start = time.monotonic()
+    g = _roundtrip("requirements.txt", many)
+    assert time.monotonic() - start < 2.0 and len(g.deps) == gm.MAX_DEPS
+    assert [(d.name, d.spec) for d in _roundtrip("requirements.txt", b"a==1\nflask==1 \\").deps] == [("a", "==1"), ("flask", "==1")]
+    assert [d.name for d in _roundtrip("requirements.txt", b"a \\\n  ==1\nb\n").deps] == ["a", "b"]

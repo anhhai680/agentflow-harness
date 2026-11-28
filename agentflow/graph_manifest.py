@@ -23,7 +23,8 @@ import tomllib
 from agentflow.graph_model import MAX_DEPS, NAME_MAX, Dep, Facts, empty, module, text
 
 _REQUIREMENT = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(.*)", re.DOTALL)
-_USERINFO = re.compile(r"://[^/?#\s@]*@")  # the credentials of a URL: after `://`, up to the first `@` before any path
+_USERINFO = re.compile(r"://[^/?#\s]*@")  # a URL's credentials: after `://`, up to the LAST `@` before any path, query or fragment
+_LINE_CAP = 20_000  # characters kept of one continued requirements line; the rest is read and ignored
 _SEPARATORS = re.compile(r"[-_.]+")
 _SPEC_STARTS = ("<", ">", "=", "!", "~", "(", "@")
 _NPM_GROUPS = (("dependencies", "runtime"), ("devDependencies", "dev"), ("optionalDependencies", "optional"), ("peerDependencies", "optional"))
@@ -145,19 +146,36 @@ def _requirement(line: str) -> tuple[str, str] | None:
 def _requirements(file_name: str, data: bytes) -> Facts:
     group = "dev" if "dev" in file_name or "test" in file_name else "runtime"
     deps = _Deps()
-    joined = ""
-    for raw in data.decode("utf-8-sig").splitlines():
-        line = joined + raw.replace("\t", " ")
-        if line.endswith("\\"):  # a continued line, as pip reads it
-            joined = line[:-1] + " "
-            continue
-        joined = ""
-        line = line.split(" #", 1)[0].strip()
+    for logical in _logical_lines(data.decode("utf-8-sig")):
+        line = logical.split(" #", 1)[0].strip()
         if line and not line.startswith(("#", "-")):
             deps.add_requirement(line, group)
         if deps.cut:
             break
     return Facts(lang="manifest", deps=tuple(deps.rows), ecosystem="pypi", notes=tuple(deps.notes()))
+
+
+def _logical_lines(content: str):
+    """The lines of a requirements file with each `\\` continuation joined, as pip reads them.
+
+    The pieces of one line are gathered in a list and kept only up to `_LINE_CAP` characters, so a file of
+    continuation lines costs linear time. A continuation still open at the end of the file ends the line.
+    """
+    pieces: list[str] = []
+    size = 0
+    for raw in content.splitlines():
+        piece = raw.replace("\t", " ")
+        continued = piece.endswith("\\")
+        if continued:
+            piece = piece[:-1] + " "
+        if size < _LINE_CAP:
+            pieces.append(piece)
+            size += len(piece)
+        if not continued:
+            yield "".join(pieces)
+            pieces, size = [], 0
+    if pieces:
+        yield "".join(pieces)
 
 
 # --- package.json ---
