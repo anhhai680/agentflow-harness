@@ -242,11 +242,13 @@ def test_a_handshake_that_is_not_as_it_must_be_is_refused(hello):
     assert graph_parse._ready(json.dumps(hello).encode() + b"\n") is None
 
 
-@pytest.mark.parametrize("languages", [
-    ["python"], {"python": 1}, {"cobol": "1"}, {"python": "1" * 41}, {"python": "1\n"}, {"python": "1", "rust": "1"},
+@pytest.mark.parametrize(("languages", "kept"), [
+    (["python"], {}), ("python", {}), ({"python": 1}, {}), ({"cobol": "1"}, {}), ({"python": "1" * 41}, {}),
+    ({"python": "1\n"}, {}), ({"python": "1", "rust": "1"}, {"python": "1"}),
+    ({"python": "1", "markdown": None, "manifest": "1 2", "tsx": "1+0.23.2"}, {"python": "1", "tsx": "1+0.23.2"}),
 ])
-def test_handshake_languages_that_are_odd_are_no_languages(languages):
-    assert graph_parse._ready(json.dumps({"ready": 1, "pid": 4242, "languages": languages}).encode()) == (4242, {})
+def test_odd_handshake_languages_are_dropped_one_at_a_time(languages, kept):
+    assert graph_parse._ready(json.dumps({"ready": 1, "pid": 4242, "languages": languages}).encode()) == (4242, kept)
 
 
 def test_handshake_languages_that_are_known_are_kept():
@@ -331,3 +333,141 @@ def test_a_uv_mode_runs_the_worker_as_a_grandchild_and_kills_its_whole_group(mon
     assert _group_gone(pgid)
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+# --- fix round 1: a flooding worker, stray lines, interrupts, and a uv worker with no language ---
+
+
+def _until(check, within: float = 3.0) -> None:
+    deadline = time.monotonic() + within
+    while not check():
+        assert time.monotonic() < deadline, "the condition never held"
+        time.sleep(0.02)
+
+
+def test_a_worker_that_floods_its_stdout_fills_a_bounded_queue_and_is_restarted(tmp_path):
+    log = tmp_path / "starts"
+    p = _bad("flood", log)
+    try:
+        worker = p._worker
+        _until(worker.lines.full)
+        time.sleep(0.3)  # it keeps writing: the reader is blocked, nothing more is held
+        assert worker.lines.qsize() == graph_parse.QUEUE_LINES and worker.reader.is_alive()
+        # the unasked lines restart it before the request; the fresh worker's flood is then no reply
+        assert p.parse("a.py", "python", b"x = 1\n").notes == ("parser_reply",)
+        assert _group_gone(worker.proc.pid) and not worker.reader.is_alive() and _starts(log) == 2
+    finally:
+        p.close()
+
+
+@pytest.mark.parametrize("behaviour", ["extra", "die_idle"])
+def test_a_stray_line_or_an_idle_death_restarts_the_worker_without_blaming_the_next_file(behaviour, tmp_path):
+    log = tmp_path / "starts"
+    p = _bad(behaviour, log)
+    try:
+        assert p.parse("a.py", "python", b"x = 1\n").notes == ()
+        worker = p._worker
+        _until(lambda: not worker.idle())
+        assert p.parse("b.py", "python", b"y = 2\n").notes == ()
+        assert _group_gone(worker.proc.pid) and _starts(log) == 2
+    finally:
+        p.close()
+
+
+def test_a_restart_for_a_stray_line_counts_against_max_restarts(tmp_path, monkeypatch):
+    monkeypatch.setattr(graph_parse, "MAX_RESTARTS", 1)
+    log = tmp_path / "starts"
+    p = _bad("extra", log)
+    try:
+        for _ in range(2):
+            assert p.parse("a.py", "python", b"x = 1\n").notes == ()
+            worker = p._worker
+            _until(lambda: not worker.idle())
+        assert p.parse("a.py", "python", b"x = 1\n").notes == ("parser_unavailable",)
+        assert _starts(log) == 2
+    finally:
+        p.close()
+
+
+def _record_starts(monkeypatch) -> tuple[list, list[Path]]:
+    procs: list = []
+    dirs: list[Path] = []
+    real_popen, real_mkdtemp = graph_parse.subprocess.Popen, graph_parse.tempfile.mkdtemp
+
+    def popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        procs.append(proc)
+        return proc
+
+    def mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        dirs.append(Path(path))
+        return path
+
+    monkeypatch.setattr(graph_parse.subprocess, "Popen", popen)
+    monkeypatch.setattr(graph_parse.tempfile, "mkdtemp", mkdtemp)
+    return procs, dirs
+
+
+def _nothing_left(procs: list, dirs: list[Path]) -> bool:
+    started = [proc for proc in procs if proc.args and proc.args[0] != "ps"]
+    assert started and dirs
+    return all(proc.returncode is not None and _group_gone(proc.pid) for proc in started) and not any(
+        d.exists() for d in dirs)
+
+
+def _interrupt(self, *args, **kwargs):
+    raise KeyboardInterrupt
+
+
+def test_an_interrupt_during_the_handshake_leaves_no_process_and_no_directory(monkeypatch):
+    procs, dirs = _record_starts(monkeypatch)
+    monkeypatch.setattr(graph_parse.queue.Queue, "get", _interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        Parser(download=False, argv=worker_argv("stdlib"))
+    assert _nothing_left(procs, dirs)
+
+
+def test_an_interrupt_during_a_restart_leaves_no_process_and_no_directory(monkeypatch, tmp_path):
+    p = _bad("exit", tmp_path / "starts")
+    try:
+        assert p.parse("a.py", "python", b"x = 1\n").notes == ("parser_crashed",)
+        procs, dirs = _record_starts(monkeypatch)
+        monkeypatch.setattr(graph_parse.queue.Queue, "get", _interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            p.parse("a.py", "python", b"x = 1\n")
+        assert _nothing_left(procs, dirs)
+    finally:
+        p.close()
+
+
+def test_a_reader_that_cannot_start_leaves_no_process_and_no_directory(monkeypatch):
+    procs, dirs = _record_starts(monkeypatch)
+
+    def no_thread(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(graph_parse.threading.Thread, "start", no_thread)
+    p = Parser(download=False, argv=worker_argv("stdlib"))
+    monkeypatch.undo()
+    try:
+        assert p.mode == "" and p.languages == {}
+        assert _nothing_left(procs, dirs)
+    finally:
+        p.close()
+
+
+def test_a_uv_worker_with_no_language_counts_as_no_handshake(monkeypatch, tmp_path):
+    log = tmp_path / "starts"
+    fake = tmp_path / "uv"
+    fake.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{BAD}" no_languages "{log}"\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    with Parser(download=False) as p:
+        assert p.mode == "stdlib" and "python" in p.languages and _starts(log) == 1
+
+
+def test_an_override_with_no_language_is_kept_and_parses_nothing(tmp_path):
+    with _bad("no_languages", tmp_path / "starts") as p:
+        assert p.mode == "custom" and p.languages == {}
+        assert p.parse("a.py", "python", b"x = 1\n").notes == ("no_grammar",)

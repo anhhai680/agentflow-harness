@@ -2,7 +2,9 @@
 
 `hang` (handshake, then sleep), `half` (half a reply, then sleep), `huge` (one 5 MB line), `wrong_id`, `other_path`
 (valid facts whose `lang` is another language), `past_end` (a definition below the file's last line), `not_json`,
-`exit` (handshake, then exit) and `no_handshake` (exit before a word). A second argument names a file that gets one
+`exit` (handshake, then exit), `no_handshake` (exit before a word), `flood` (handshake, then lines just under the
+reply cap, unasked and without end), `extra` (a valid reply, then one more line), `die_idle` (a valid reply, then exit)
+and `no_languages` (a handshake that offers only an unknown language, then valid replies). A second argument names a file that gets one
 line per start, so a test can count the processes the parser started.
 """
 
@@ -36,7 +38,12 @@ def main() -> int:
     if behaviour == "no_handshake":
         return 0
     out, inp = sys.stdout.buffer, sys.stdin.buffer
-    write(out, json.dumps({"ready": 1, "pid": os.getpid(), "languages": {"python": "1"}}).encode() + b"\n")
+    languages = {"cobol": "1"} if behaviour == "no_languages" else {"python": "1"}
+    write(out, json.dumps({"ready": 1, "pid": os.getpid(), "languages": languages}).encode() + b"\n")
+    if behaviour == "flood":
+        line = b"x" * (4 * 1024 * 1024 - 1) + b"\n"
+        while True:
+            write(out, line)
     if behaviour == "exit":
         return 0
     if behaviour == "hang":
@@ -56,6 +63,12 @@ def main() -> int:
             write(out, b"x" * (5 * 1024 * 1024) + b"\n")
         elif behaviour == "not_json":
             write(out, b"this is not json\n")
+        elif behaviour in ("extra", "die_idle", "no_languages"):
+            write(out, json.dumps({"id": rid, "facts": facts(lang)}).encode() + b"\n")
+            if behaviour == "extra":
+                write(out, json.dumps({"id": rid + 1, "facts": facts(lang)}).encode() + b"\n")
+            if behaviour == "die_idle":
+                return 0
         else:
             reply = {
                 "wrong_id": {"id": rid + 1, "facts": facts(lang)},
