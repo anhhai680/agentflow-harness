@@ -17,10 +17,12 @@ path (a directory already judged by an earlier call is charged what it cost then
 order the paths are asked in). A call that spends `MAX_STEPS` stops, judges the path ignored, which is the safe side
 for the graph, adds one note and caches nothing. Honest files stay far below it (the tests assert a quarter at most:
 1,000 `*.ext` rules at depth 20 take 21,000 steps, a 5,000-line mixed file at depth 20 takes 73,000, this
-repository's own file about 300). An exhausted call measured at most 70 ms on a laptop (hostile shapes, fresh
-directories), so a hostile file can slow a build by that much per path but cannot make it judge a path not ignored
-that git ignores. The exceptions are the three caps below, which leave a file or a pattern out with a note:
-`MAX_FILE_BYTES`, `MAX_LINES` and `MAX_PATTERN`.
+repository's own file about 300). An exhausted call measured about 15 to 100 ms on a 2026 laptop (hostile shapes,
+fresh directories; the figure moves with the shape, the Python version and the load), so a hostile file can slow a
+build by that much per path but cannot make it judge a path not ignored that git ignores. The exceptions are the
+three caps below, which leave a file or a pattern out with a note: `MAX_FILE_BYTES`, `MAX_LINES` and `MAX_PATTERN`.
+Parsing is linear in each pattern's length, so a file within the caps parses in well under a second however its
+brackets are placed.
 """
 
 from __future__ import annotations
@@ -38,46 +40,76 @@ _POSIX = {
     "space": str.isspace, "blank": lambda c: c in " \t", "xdigit": lambda c: c in "0123456789abcdefABCDEF",
     "punct": lambda c: c.isascii() and c.isprintable() and not c.isalnum() and c != " ",
 }
+_LONGEST = max(map(len, _POSIX))
 
 
-def _class(text: str, at: int):
-    """The class opening at `text[at] == "["`: (token, index after it), or None when it never closes."""
-    i = at + 1
-    negate = i < len(text) and text[i] in "!^"
-    i += negate
-    ranges: list[tuple[str, str]] = []
-    named: list[str] = []
-    first = True
-    while i < len(text):
-        c = text[i]
-        if c == "]" and not first:
-            return ("[", negate, tuple(ranges), tuple(named)), i + 1
-        first = False
-        if c == "[" and text.startswith(":", i + 1) and (end := text.find(":]", i + 2)) > 0:
-            name = text[i + 2 : end]
-            if name in _POSIX:
-                named.append(name)
-                i = end + 2
-                continue
-        if c == "\\" and i + 1 < len(text):
-            i += 1
+class _Classes:
+    """Reads the bracket classes of one segment so that parsing it is linear in its length, however many `[` it holds.
+
+    Once past its first member, a class scan's path depends only on where it stands, so every position a scan that
+    never closed walked through is remembered as dead and a later scan that reaches one stops there. A scan that closes
+    is not walked again, because the tokens resume after it. The `:]` that ends a `[:name:]` is looked up once per
+    stretch of the segment, not once per `[`.
+    """
+
+    __slots__ = ("text", "dead", "seek", "found")
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.dead: set[int] = set()
+        self.seek, self.found = len(text) + 1, -1  # the first `:]` at or after `seek` is at `found` (-1: none)
+
+    def _colon(self, start: int) -> int:
+        """Where the first `:]` at or after `start` begins, or -1."""
+        if not (self.seek <= start and (self.found < 0 or self.found >= start)):
+            self.seek, self.found = start, self.text.find(":]", start)
+        return self.found
+
+    def read(self, at: int):
+        """The class opening at `text[at] == "["`: (token, index after it), or None when it never closes."""
+        text, dead = self.text, self.dead
+        i = at + 1
+        negate = i < len(text) and text[i] in "!^"
+        i += negate
+        ranges: list[tuple[str, str]] = []
+        named: list[str] = []
+        first = True
+        walked: list[int] = []
+        while i < len(text):
+            if not first:
+                if i in dead:
+                    break
+                walked.append(i)
             c = text[i]
-        if i + 2 < len(text) and text[i + 1] == "-" and text[i + 2] != "]":
-            hi = text[i + 2]
-            if hi == "\\" and i + 3 < len(text):
-                hi = text[i + 3]
+            if c == "]" and not first:
+                return ("[", negate, tuple(ranges), tuple(named)), i + 1
+            first = False
+            if c == "[" and text.startswith(":", i + 1) and (end := self._colon(i + 2)) > 0:
+                if end - i - 2 <= _LONGEST and (name := text[i + 2 : end]) in _POSIX:
+                    named.append(name)
+                    i = end + 2
+                    continue
+            if c == "\\" and i + 1 < len(text):
                 i += 1
-            ranges.append((c, hi))
-            i += 3
-        else:
-            ranges.append((c, c))
-            i += 1
-    return None
+                c = text[i]
+            if i + 2 < len(text) and text[i + 1] == "-" and text[i + 2] != "]":
+                hi = text[i + 2]
+                if hi == "\\" and i + 3 < len(text):
+                    hi = text[i + 3]
+                    i += 1
+                ranges.append((c, hi))
+                i += 3
+            else:
+                ranges.append((c, c))
+                i += 1
+        dead.update(walked)
+        return None
 
 
 def _tokens(segment: str) -> tuple:
     """One path segment's glob as tokens: ("c", char), `?`, `*` (runs of `*` collapse) and classes."""
     out: list[tuple] = []
+    classes = _Classes(segment)
     i = 0
     while i < len(segment):
         c = segment[i]
@@ -86,7 +118,7 @@ def _tokens(segment: str) -> tuple:
                 out.append(_STAR)
         elif c == "?":
             out.append(_ANY)
-        elif c == "[" and (made := _class(segment, i)) is not None:
+        elif c == "[" and (made := classes.read(i)) is not None:
             out.append(made[0])
             i = made[1]
             continue

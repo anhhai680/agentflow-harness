@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -39,6 +40,10 @@ CASES = [
     # an empty segment names nothing in git
     ({"": "a//b\n"}, "a/b", False), ({"": "c//\n"}, "c/x", False), ({"": "c//\n"}, "c", False), ({"": "//d\n"}, "d", False),
     ({"": "e/\n"}, "e/x", True), ({"": "*.py[co]\n"}, "m.pyc", True), ({"": "[[:digit:]]x\n"}, "5x", True), ({"": "\\!bang\n"}, "!bang", True),
+    # an unclosed `[` is never a class, and the rules after it still apply
+    ({"": "[\n*.log\n"}, "a.log", True), ({"": "a[b\n"}, "ab", False), ({"": "x[[:\n"}, "x", False),
+    ({"": "[[:\n*.log\n"}, "b.log", True), ({"": "[a-\n"}, "a", False), ({"": "x[a-\n*.log\n"}, "x.log", True),
+    ({"": "[!x\n"}, "y", False), ({"": "[\\]x\n"}, "]x", False),
 ]
 
 
@@ -200,6 +205,48 @@ def test_an_honest_file_keeps_every_pattern_and_stays_correct():
     assert ignore.notes == []
     assert ignore.ignored("x/build/a") and ignore.ignored("dir299/a.py") and ignore.ignored("q/z.ext7")
     assert not ignore.ignored("pkg/mod/file.py")
+
+
+UNCLOSED = {"open": "[", "posix": "[[:", "range": "[a-", "escaped": "[\\]", "negated": "[!"}  # units of a line
+
+
+@pytest.mark.parametrize("name", sorted(UNCLOSED))
+def test_a_file_of_unclosed_classes_parses_in_linear_time(name):
+    line = UNCLOSED[name] * (511 // len(UNCLOSED[name]))
+    text = "\n".join([line] * (gi.MAX_FILE_BYTES // (len(line) + 1)))
+    assert len(text.encode()) <= gi.MAX_FILE_BYTES and len(line) <= gi.MAX_PATTERN
+    start = time.monotonic()
+    ignore = gi.Ignore({"": text})
+    assert time.monotonic() - start < 5.0  # a hang detector: it takes about 0.1 s, and took up to 13 s when quadratic
+    assert ignore.notes == []
+
+
+def _lines_run(text: str) -> int:
+    """How many lines of graph_ignore building an Ignore from `text` runs: a count that does not depend on the machine."""
+    count = 0
+
+    def local(frame, event, arg):
+        nonlocal count
+        count += event == "line"
+        return local
+
+    def calls(frame, event, arg):
+        return local(frame, event, arg) if frame.f_code.co_filename == gi.__file__ else None
+
+    previous = sys.gettrace()
+    sys.settrace(calls)
+    try:
+        gi.Ignore({"": text})
+    finally:
+        sys.settrace(previous)
+    return count
+
+
+@pytest.mark.parametrize("name", sorted(UNCLOSED))
+def test_parsing_unclosed_classes_grows_linearly_with_the_line(name):
+    unit = UNCLOSED[name]
+    short, long = _lines_run(unit * (120 // len(unit))), _lines_run(unit * (480 // len(unit)))
+    assert long < 6 * short  # four times the line costs about four times the work (it was about 15 times)
 
 
 def test_an_unclosed_class_is_a_literal_bracket():
