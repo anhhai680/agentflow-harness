@@ -1874,9 +1874,9 @@ def _graph_pattern_problem(pattern: str) -> str:
         return f"must be at most {GRAPH_PATTERN_MAX} characters"
     if "\n" in pattern or "\0" in pattern:
         return "must be one line"
-    if pattern.startswith(("/", "\\")) or re.match(r"[A-Za-z]:", pattern):
+    if pattern.startswith("/"):
         return "must be relative to the repository, not an absolute path"
-    if ".." in re.split(r"[/\\]", pattern):
+    if ".." in pattern.split("/"):
         return "must not contain a `..` segment"
     return ""
 

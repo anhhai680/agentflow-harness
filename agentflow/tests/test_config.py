@@ -1507,6 +1507,7 @@ def test_graph_keys_of_the_wrong_type_are_refused_on_load(tmp_cfg, patch, path):
 @pytest.mark.parametrize("patch", [
     {"enabled": True}, {"max_file_kb": 1}, {"max_file_kb": 4096},
     {"exclude": ["generated/", "*.snap", "docs/**/old", "x" * 200]}, {"exclude": ["p"] * 64},
+    {"exclude": ["\\#notes", "\\!keep", "C:notes", "a\\..\\b"]},  # gitignore escapes and odd names are patterns too
 ])
 def test_graph_bounds_are_inclusive(tmp_cfg, patch):
     assert not [i for i in issues_for(tmp_cfg, {"graph": patch}) if i.path.startswith("graph")]
