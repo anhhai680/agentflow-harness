@@ -476,6 +476,21 @@ def test_refusals(tmp_path, repo_a, base_cfg, cfg):
     assert not store_of(repo_a).parent.exists()
 
 
+def test_a_blobless_partial_clone_is_a_build_error_and_fetches_nothing(repo_a, cfg, tmp_path):
+    """R17: a blob the object store does not hold is a `BuildError`; git never asks the promisor remote for it."""
+    run_git(repo_a, "config", "uploadpack.allowFilter", "true")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", "--no-checkout", "--filter=blob:none", f"file://{repo_a}", str(clone)],
+                   check=True, capture_output=True)
+    blob = run_git(repo_a, "rev-parse", "HEAD:pkg/slots.py").strip()
+    with pytest.raises(BuildError, match="not in the object store"):
+        build(clone, cfg, download=False)
+    missing = subprocess.run(["git", "-C", str(clone), "cat-file", "-e", blob], capture_output=True,
+                             env={**os.environ, "GIT_NO_LAZY_FETCH": "1"})
+    assert missing.returncode != 0  # the blob was never fetched
+    assert not store_of(clone).exists()
+
+
 def test_a_second_build_is_refused_while_one_holds_the_lock(repo_a, cfg):
     build(repo_a, cfg, download=False)
     stale = store_of(repo_a).with_name("graph.sqlite.tmp-1-live")

@@ -1,10 +1,11 @@
 """The knowledge graph's reads from git: one commit's tree, the difference of two commits, and blobs by id.
 
 Every byte the graph indexes comes from a git object at a named commit, never from a working tree. The repository is
-untrusted, so every call is `git --no-pager <HARDENED> -C <repo> ...` (no hook, no fsmonitor, no replace object),
-with the caller's `GIT_*` variables removed and `GIT_TERMINAL_PROMPT=0`, `GIT_NO_LAZY_FETCH=1` and
-`GIT_OPTIONAL_LOCKS=0` set, so git never prompts, never asks a promisor remote for a missing object and never writes
-the index. Stdin is closed or fed only object ids, each call has `TIMEOUT_S`, and its output is counted as it streams
+untrusted, so every call is `git --no-pager <HARDENED> -c protocol.allow=never -C <repo> ...` (no hook, no
+fsmonitor, no replace object, no transport), with the caller's `GIT_*` variables removed and `GIT_TERMINAL_PROMPT=0`,
+`GIT_NO_LAZY_FETCH=1` and `GIT_OPTIONAL_LOCKS=0` set, so git never prompts, never asks a promisor remote for a missing
+object (a git before 2.44 ignores `GIT_NO_LAZY_FETCH`, and `protocol.allow=never` still refuses the fetch) and never
+writes the index. Stdin is closed or fed only object ids, each call has `TIMEOUT_S`, and its output is counted as it streams
 and refused past a cap, so a hostile tree cannot make the engine hold gigabytes.
 
 An object id is used only when it is a full hex id; a branch name only when it cannot be read as an option. A path is
@@ -38,6 +39,7 @@ _HEADER_BYTES = 200  # room for one `cat-file` header line, per object
 _ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _ZERO = re.compile(r"0{40}|0{64}")
 _MODE = re.compile(r"[0-7]{6}")
+_NO_TRANSPORT = ("-c", "protocol.allow=never")  # a git before 2.44 ignores GIT_NO_LAZY_FETCH: it still cannot fetch
 _BRANCH = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/+@-]{0,254}")  # a name that can't be read as an option
 _LEFT_OUT = {
     "long": f"longer than {PATH_MAX_BYTES} bytes",
@@ -84,9 +86,9 @@ def _feed(stream, data: bytes) -> None:
 
 
 def _git(repo: Path, args: Sequence[str], *, feed: bytes | None = None, limit: int = LIST_MAX_BYTES) -> bytes | None:
-    """stdout of `git --no-pager <HARDENED> -C <repo> <args>`, or None when git fails, times out or writes more than
+    """stdout of `git --no-pager <HARDENED> -c protocol.allow=never -C <repo> <args>`, or None when git fails, times out or writes more than
     `limit` bytes. `feed` (object ids) is written from a thread, so a git that stops reading cannot block us."""
-    argv = ["git", "--no-pager", *HARDENED, "-C", str(repo), *args]
+    argv = ["git", "--no-pager", *HARDENED, *_NO_TRANSPORT, "-C", str(repo), *args]
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE if feed is not None else subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_env())

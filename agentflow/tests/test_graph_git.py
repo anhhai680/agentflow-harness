@@ -189,3 +189,25 @@ def test_hooks_and_fsmonitor_never_run(repo, tmp_path):
     assert graph_git.changes(repo, head, head) == ([], [])
     assert all(data is not None for _, data in graph_git.read_blobs(repo, [e.blob for e in entries], 10**6))
     assert not marker.exists()
+
+
+def test_every_git_call_refuses_every_transport(repo, monkeypatch):
+    """`protocol.allow=never`: a git older than 2.44 ignores `GIT_NO_LAZY_FETCH`, and still cannot fetch."""
+    argvs: list[list[str]] = []
+    real = subprocess.Popen
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **k: argvs.append(list(argv)) or real(argv, **k))
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    argvs.clear()
+    entries, _ = graph_git.listing(repo, head)
+    graph_git.changes(repo, head, head)
+    list(graph_git.read_blobs(repo, [e.blob for e in entries], 10**6))
+    assert graph_git.base_commit(repo, "main") == head
+    assert len(argvs) >= 5
+    for argv in argvs:
+        at = argv.index("-C")
+        assert argv[:2] == ["git", "--no-pager"] and ["-c", "protocol.allow=never"] in _pairs(argv[:at])
+
+
+def _pairs(argv: list[str]) -> list[list[str]]:
+    return [argv[n : n + 2] for n in range(len(argv) - 1)]
+

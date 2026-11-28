@@ -69,7 +69,10 @@ def worker_argv(mode: str) -> list[str] | None:
     if uv is None:
         return None
     offline = ["--offline"] if mode == "offline" else []
-    return [uv, "run", "--quiet", "--locked", *offline, "--python", sys.executable, "--script", str(WORKER)]
+    # `--no-build`: an sdist's build dependencies are not hash-locked, so a platform with no matching wheel fails the
+    # handshake and falls back to `stdlib`; `--no-config`: no `uv.toml` or `[tool.uv]` above the script is read
+    return [uv, "run", "--quiet", "--locked", "--no-build", "--no-config", *offline, "--python", sys.executable,
+            "--script", str(WORKER)]
 
 
 def worker_env() -> dict[str, str]:

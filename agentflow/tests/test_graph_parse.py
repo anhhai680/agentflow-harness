@@ -282,8 +282,11 @@ def test_worker_argv_for_each_mode(monkeypatch, tmp_path):
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path))
     tail = ["--python", sys.executable, "--script", str(graph_parse.WORKER)]
-    assert worker_argv("locked") == [str(fake), "run", "--quiet", "--locked", *tail]
-    assert worker_argv("offline") == [str(fake), "run", "--quiet", "--locked", "--offline", *tail]
+    # `--no-build`: no sdist is built, since its build dependencies are not hash-locked; `--no-config`: no
+    # `uv.toml` or `[tool.uv]` above the worker script changes what uv resolves
+    head = [str(fake), "run", "--quiet", "--locked", "--no-build", "--no-config"]
+    assert worker_argv("locked") == [*head, *tail]
+    assert worker_argv("offline") == [*head, "--offline", *tail]
     monkeypatch.setenv("PATH", str(tmp_path / "none"))
     assert worker_argv("locked") is None and worker_argv("offline") is None
 
