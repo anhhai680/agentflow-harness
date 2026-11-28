@@ -36,7 +36,9 @@ CASES = [
     ({"": "\ufeff*.log\r\n#c\r\n"}, "x/b.log", True), ({"": "\ufeff#*.log\n"}, "a.log", False),
     ({"": "a\\*b\n"}, "a*b", True), ({"": "a\\*b\n"}, "aXb", False), ({"": "**/**/x\n"}, "x", True),
     ({"": "a/**/**/b\n"}, "a/p/q/b", True), ({"": "a/**/**\n"}, "a/p", True), ({"": "a/**/**\n"}, "a", False),
-    ({"": "*.py[co]\n"}, "m.pyc", True), ({"": "[[:digit:]]x\n"}, "5x", True), ({"": "\\!bang\n"}, "!bang", True),
+    # an empty segment names nothing in git
+    ({"": "a//b\n"}, "a/b", False), ({"": "c//\n"}, "c/x", False), ({"": "c//\n"}, "c", False), ({"": "//d\n"}, "d", False),
+    ({"": "e/\n"}, "e/x", True), ({"": "*.py[co]\n"}, "m.pyc", True), ({"": "[[:digit:]]x\n"}, "5x", True), ({"": "\\!bang\n"}, "!bang", True),
 ]
 
 
@@ -146,6 +148,52 @@ def test_many_hostile_rules_within_the_caps_judge_a_thousand_paths_quickly():
         for sample in (paths, wide, deep):
             took, _ = _timed({"": text}, sample)
             assert took < 2.0, (name, took)
+
+
+REVIEWED_SHAPES = {
+    "plain": "**/x/" * 7 + "**/*.py",
+    "class": "**/[x]/" * 7 + "**/*.py",
+    "star": "**/x*/" * 7 + "**/*.py",
+    "mark": "**/?/" * 7 + "**/*.py",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(REVIEWED_SHAPES))
+@pytest.mark.parametrize("depth", [62, 10])
+def test_the_reviewed_shapes_judge_a_thousand_paths_in_two_seconds(shape, depth):
+    text = "\n".join(REVIEWED_SHAPES[shape] for _ in range(3000)) + "\n"
+    assert len(text.encode()) <= gi.MAX_FILE_BYTES
+    paths = ["/".join(["x"] * depth) + f"/f{n}.py" for n in range(1000)]
+    took, ignore = _timed({"": text}, paths)
+    assert took < 2.0, (shape, depth, took)
+    assert all(ignore.ignored(path) for path in paths[:5])  # matched by the file, or judged ignored
+
+
+def test_the_same_rules_in_sixty_nested_directories_judge_a_thousand_paths_in_two_seconds():
+    text = "\n".join(REVIEWED_SHAPES["plain"] for _ in range(3000)) + "\n"
+    files = {"/".join(["x"] * depth): text for depth in range(gi.MAX_DEPTH - 3)}
+    paths = ["/".join(["x"] * 60) + f"/f{n}.py" for n in range(1000)]
+    took, ignore = _timed(files, paths)
+    assert took < 2.0, took
+    assert ignore.ignored(paths[0]) is True
+
+
+def test_a_path_that_runs_out_of_steps_is_judged_ignored_and_its_directory_with_it():
+    text = "\n".join(f"**/x/**/x/**/x*/**/f{n}*" for n in range(400)) + "\n"
+    ignore = gi.Ignore({"": text})
+    deep = "/".join(["x"] * 40)
+    assert ignore.ignored(deep + "/zzz") is True
+    assert any("steps" in note for note in ignore.notes)
+    assert ignore.ignored(deep + "/other") is True
+
+
+def test_an_honest_file_never_runs_out_of_steps():
+    text = "".join(f"*.ext{n}\n/dir{n}/\nbuild{n}/\n**/cache{n}\n*.py[cod]\n[Tt]emp{n}*\nlogs/**/*.log{n}\n" for n in range(60))
+    ignore = gi.Ignore({"": text, "pkg/a": "*.o\nbuild/\n", "pkg": "!keep\n"})
+    for n in range(300):
+        ignore.ignored(f"pkg/a/b{n % 5}/c{n % 7}/d{n % 11}/e{n % 13}/f{n % 17}/g{n}/file{n}.py")
+    assert ignore.notes == []
+    assert ignore.ignored("pkg/a/x.o") and ignore.ignored("m/mod.pyc") and not ignore.ignored("pkg/a/x.py")
 
 
 def test_an_honest_file_keeps_every_pattern_and_stays_fast():
