@@ -16,6 +16,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from agentflow.doctor import printable
+from agentflow.graph_store import HAS_NODES
 
 if TYPE_CHECKING:
     from agentflow.graph_build import Result
@@ -23,11 +24,11 @@ if TYPE_CHECKING:
     from agentflow.graph_store import FileRow, Hit
 
 NO_INDEX = "graph: no index yet: run `agentflow graph build`"
-OFF = "error: graph.enabled is false: set it to true in .agentflow/config.yaml to build the index"
+DISABLED = "graph.enabled is false: set it to true in .agentflow/config.yaml to build the index"
+OFF = f"error: {DISABLED}"
 SHA_CHARS = 12
 NOTES_SHOWN = 20
 TEXT_CHARS = 80  # a hit's text, and a node's in `show`
-_HAS_NODES = ("indexed", "unparsed")
 _LEFT_OUT_NAMES = (("ignored", ".gitignore"), ("secret", "secret"), ("vendored", "vendored"), ("excluded", "excluded"))
 _OTHER_STATES = ("symlink", "submodule")
 _EXACT, _NOT_PARSED = "exact", "not parsed"
@@ -52,7 +53,7 @@ def _text(value: object, limit: int | None = None) -> str:
 
 def language_states(rows: Iterable[FileRow], offered: Mapping[str, str]) -> dict[str, str]:
     """Each language a file with nodes has, `exact` when the last build's parser offered it, else `not parsed`."""
-    langs = {row.lang for row in rows if row.state in _HAS_NODES and isinstance(row.lang, str) and row.lang}
+    langs = {row.lang for row in rows if row.state in HAS_NODES and isinstance(row.lang, str) and row.lang}
     return {lang: _EXACT if lang in offered else _NOT_PARSED for lang in sorted(langs)}
 
 
@@ -65,7 +66,7 @@ def languages_line(languages: Mapping[str, str]) -> str:
 
 def left_out_counts(states: Mapping[str, int]) -> dict[str, int]:
     """The `files` rows by state, for every state that has no nodes."""
-    return {state: _int(n) for state, n in sorted(states.items()) if state not in _HAS_NODES and _int(n) > 0}
+    return {state: _int(n) for state, n in sorted(states.items()) if state not in HAS_NODES and _int(n) > 0}
 
 
 def left_out_line(left_out: Mapping[str, int]) -> str | None:
@@ -108,13 +109,6 @@ def build_lines(result: Result) -> list[str]:
         lines.append(left)
     lines += [f"note: {printable(note)}" for note in result.notes[:NOTES_SHOWN]]
     return lines
-
-
-def build_json(result: Result) -> dict:
-    return {"commit": result.commit, "previous": result.previous, "full": result.full, "parsed": result.parsed,
-            "cached": result.cached, "resolved": result.resolved, "removed": result.removed,
-            "left_out": dict(result.left_out), "languages": dict(result.languages), "notes": list(result.notes),
-            "ms": result.ms}
 
 
 # --- status ---
@@ -216,6 +210,6 @@ def show_json(target: Node, around: Sequence[tuple[Edge, Node]], commit: str) ->
 
 def no_node_line(target: str, state: str | None = None) -> str:
     """`no node: <path> is left out (<state>)` for a path the index holds without nodes, else `no node: <target>`."""
-    if state is not None and state not in _HAS_NODES:
+    if state is not None and state not in HAS_NODES:
         return f"no node: {printable(target)} is left out ({printable(state)})"
     return f"no node: {printable(target)}"

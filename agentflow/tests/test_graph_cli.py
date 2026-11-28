@@ -31,7 +31,7 @@ FILES = {
     ESC_NAME: b"def escaped():\n    return 1\n",
     BIDI_NAME: b"def flipped():\n    return 1\n",
 }
-STATE = ".graph-state"  # inside the repository, so a copy of the repository carries its index
+STATE = "../graph-state"  # beside the repository: a store inside its checkout is refused (`copy_of` copies both)
 
 
 def make_repo(root: Path, *, enabled: bool = True, base_branch: str = "main") -> Path:
@@ -89,6 +89,15 @@ def store_of(root: Path) -> Path:
     return graph_store.path_for(pack.state_dir(root))
 
 
+def copy_of(built: Path, where: Path) -> Path:
+    """`built` and its state dir copied to `where/copy` and `where/graph-state`, so the copy carries the index."""
+    copy = where / "copy"
+    shutil.copytree(built, copy)
+    shutil.copytree(built.parent / "graph-state", where / "graph-state")
+    assert store_of(copy) == (where / "graph-state" / "graph" / "graph.sqlite").resolve()
+    return copy
+
+
 # --- build ---
 
 
@@ -110,7 +119,7 @@ def test_build_refuses_when_graph_is_off_and_creates_nothing(tmp_path, monkeypat
     code, out = graph(capsys, "graph", "build")
     assert code == 1
     assert out.strip() == ("error: graph.enabled is false: set it to true in .agentflow/config.yaml to build the index")
-    assert not (root / STATE / "graph").exists()
+    assert not (root.parent / "graph-state" / "graph").exists()
 
 
 def test_build_error_text_is_printable(tmp_path, monkeypatch, capsys):
@@ -137,7 +146,7 @@ def test_build_rebuilds_over_a_store_of_random_bytes(repo, capsys):
 def test_status_before_a_build_says_there_is_no_index(repo, capsys):
     code, out = graph(capsys, "graph", "status")
     assert (code, out.strip()) == (1, "graph: no index yet: run `agentflow graph build`")
-    assert not (repo / STATE / "graph").exists()  # reading creates nothing
+    assert not (repo.parent / "graph-state" / "graph").exists()  # reading creates nothing
 
 
 def test_status_after_a_build_has_the_commit_counts_and_languages(indexed, capsys):
@@ -156,8 +165,7 @@ def test_status_after_a_build_has_the_commit_counts_and_languages(indexed, capsy
 
 
 def test_status_works_after_graph_is_turned_off(built, tmp_path, monkeypatch, capsys):
-    copy = tmp_path / "copy"
-    shutil.copytree(built, copy)
+    copy = copy_of(built, tmp_path)
     path = copy / ".agentflow" / "config.yaml"
     path.write_text(path.read_text().replace("enabled: true", "enabled: false"), encoding="utf-8")
     monkeypatch.chdir(copy)
@@ -290,8 +298,7 @@ def test_a_path_with_an_escape_byte_is_left_out_and_never_printed_raw(repo, caps
 
 def test_a_planted_store_with_escapes_in_it_prints_them_escaped(built, tmp_path, monkeypatch, capsys):
     """A name and a text that carry an escape sequence and a bidi override, as a store from elsewhere could."""
-    copy = tmp_path / "copy"
-    shutil.copytree(built, copy)
+    copy = copy_of(built, tmp_path)
     conn = sqlite3.connect(store_of(copy))
     conn.execute("UPDATE nodes SET name = name || char(27) || '[31m' || char(8238), text = 'x' || char(27) || '[2J' || char(8238)")
     conn.execute("UPDATE meta SET value = value || char(27) WHERE key = 'commit'")
@@ -313,8 +320,7 @@ def test_build_notes_are_printable(repo, capsys, monkeypatch):
 
 
 def _damaged_copy(built: Path, tmp_path: Path, damage) -> Path:
-    copy = tmp_path / "copy"
-    shutil.copytree(built, copy)
+    copy = copy_of(built, tmp_path)
     damage(store_of(copy))
     return copy
 
@@ -354,9 +360,41 @@ def test_a_store_that_opens_but_fails_at_a_query_is_no_index_and_no_traceback(bu
     assert capsys.readouterr().err == ""
 
 
+def test_build_rebuilds_a_store_damaged_in_the_middle_with_no_traceback(built, tmp_path, monkeypatch, capsys):
+    copy = _damaged_copy(built, tmp_path, _zero_the_nodes_pages)
+    monkeypatch.chdir(copy)
+    code, out = graph(capsys, "graph", "build")
+    assert code == 0 and out.startswith("graph: ") and "parsed 0," not in out.splitlines()[0]
+    assert capsys.readouterr().err == ""
+    assert graph(capsys, "graph", "status")[0] == 0
+    code, out = graph(capsys, "graph", "build")
+    assert code == 0 and "parsed 0, from cache 0, re-resolved 0, removed 0" in out.splitlines()[0]
+
+
+def test_a_state_dir_inside_the_checkout_is_refused(built, tmp_path, monkeypatch, capsys):
+    """A repository could commit a crafted store under a `paths.state_dir` of its own: it is never read or built."""
+    copy = copy_of(built, tmp_path)
+    inside = copy / ".graph-state" / "graph"
+    inside.mkdir(parents=True)
+    shutil.copy(store_of(copy), inside / "graph.sqlite")  # a sound store, as the repository could have committed it
+    path = copy / ".agentflow" / "config.yaml"
+    path.write_text(path.read_text().replace("state_dir: ../graph-state", "state_dir: .graph-state"), encoding="utf-8")
+    monkeypatch.chdir(copy)
+    assert store_of(copy) == (inside / "graph.sqlite").resolve()
+    for argv in (["graph", "status"], ["graph", "status", "--json"], ["graph", "query", "cap"],
+                 ["graph", "show", "pkg/cap.py"]):
+        code, out = graph(capsys, *argv)
+        assert (code, out.strip()) == (1, graph_report.NO_INDEX), argv
+    before = sorted(p.name for p in inside.iterdir())
+    code, out = graph(capsys, "graph", "build")
+    assert code == 1 and out.startswith("error: ") and "paths.state_dir" in out
+    assert sorted(p.name for p in inside.iterdir()) == before  # no lock, no temp file
+    with pytest.raises(graph_build.BuildError, match=r"paths\.state_dir"):
+        graph_build.build(copy, load_config(path), download=False)
+
+
 def _planted(built: Path, tmp_path: Path, *statements: str) -> Path:
-    copy = tmp_path / "copy"
-    shutil.copytree(built, copy)
+    copy = copy_of(built, tmp_path)
     conn = sqlite3.connect(store_of(copy))
     for statement in statements:
         conn.execute(statement)

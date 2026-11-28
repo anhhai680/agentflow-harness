@@ -665,6 +665,14 @@ def _graph_patch():
     return _patch(graph={"enabled": True})
 
 
+@pytest.fixture
+def state_outside(tmp_path_factory, monkeypatch) -> Path:
+    """The state dir away from `repo`, which is the tmp dir itself: a graph store inside the checkout is refused."""
+    home = tmp_path_factory.mktemp("state")
+    monkeypatch.setenv("XDG_STATE_HOME", str(home))
+    return home
+
+
 def _index(tmp_cfg, repo: Path) -> None:
     (repo / "pkg").mkdir()
     (repo / "pkg" / "mod.py").write_text("def one():\n    return 1\n", encoding="utf-8")
@@ -674,6 +682,7 @@ def _index(tmp_cfg, repo: Path) -> None:
     graph_build.build(repo, load_config(tmp_cfg(_graph_patch())), download=False)
 
 
+@pytest.mark.usefixtures("state_outside")
 def test_doctor_has_no_graph_check_when_the_graph_is_off(tmp_cfg, repo, monkeypatch):
     seen = _recording(monkeypatch)
     checks = _checks(tmp_cfg, repo)
@@ -684,6 +693,7 @@ def test_doctor_has_no_graph_check_when_the_graph_is_off(tmp_cfg, repo, monkeypa
     assert seen == without_graph  # the graph's checks add no command
 
 
+@pytest.mark.usefixtures("state_outside")
 def test_doctor_warns_when_there_is_no_index_yet(tmp_cfg, repo, monkeypatch):
     seen = _recording(monkeypatch)
     checks = _checks(tmp_cfg, repo, _graph_patch())
@@ -695,6 +705,7 @@ def test_doctor_warns_when_there_is_no_index_yet(tmp_cfg, repo, monkeypatch):
     assert not [argv for argv in seen if "graph" in " ".join(argv)]
 
 
+@pytest.mark.usefixtures("state_outside")
 def test_doctor_graph_index_is_ok_after_a_build_and_runs_no_command(tmp_cfg, repo, monkeypatch):
     _index(tmp_cfg, repo)
     seen = _recording(monkeypatch)
@@ -708,6 +719,7 @@ def test_doctor_graph_index_is_ok_after_a_build_and_runs_no_command(tmp_cfg, rep
     assert with_graph == seen  # the same commands with the graph on as with it off: it ran none
 
 
+@pytest.mark.usefixtures("state_outside")
 def test_doctor_warns_for_a_language_the_parser_does_not_offer(tmp_cfg, repo):
     _index(tmp_cfg, repo)
     conn = sqlite3.connect(graph_store.path_for(pack.state_dir(repo)))
@@ -719,6 +731,7 @@ def test_doctor_warns_for_a_language_the_parser_does_not_offer(tmp_cfg, repo):
     assert check.fix == "agentflow graph build"
 
 
+@pytest.mark.usefixtures("state_outside")
 def test_doctor_warns_for_an_unreadable_index(tmp_cfg, repo):
     store = graph_store.path_for(pack.state_dir(repo))
     store.parent.mkdir(parents=True)
@@ -726,6 +739,7 @@ def test_doctor_warns_for_an_unreadable_index(tmp_cfg, repo):
     assert _checks(tmp_cfg, repo, _graph_patch())["graph index"].status == "warn"
 
 
+@pytest.mark.usefixtures("state_outside")
 def test_doctor_fails_the_graph_search_check_without_fts5(tmp_cfg, repo, monkeypatch):
     monkeypatch.setattr(graph_store, "fts5_available", lambda: False)
     checks = _checks(tmp_cfg, repo, _graph_patch())
@@ -734,6 +748,19 @@ def test_doctor_fails_the_graph_search_check_without_fts5(tmp_cfg, repo, monkeyp
     assert "graph index" not in checks
 
 
+def test_doctor_reads_no_store_inside_the_checkout(tmp_cfg, repo, state_outside, monkeypatch):
+    _index(tmp_cfg, repo)
+    built = graph_store.path_for(pack.state_dir(repo))
+    assert _checks(tmp_cfg, repo, _graph_patch())["graph index"].status == "ok"
+    monkeypatch.setenv("XDG_STATE_HOME", str(repo / "xdg"))  # the conftest default: inside this checkout
+    inside = graph_store.path_for(pack.state_dir(repo))
+    inside.parent.mkdir(parents=True)
+    inside.write_bytes(built.read_bytes())
+    check = _checks(tmp_cfg, repo, _graph_patch())["graph index"]
+    assert (check.status, check.detail) == ("warn", "no index yet")
+
+
+@pytest.mark.usefixtures("state_outside")
 def test_doctor_survives_a_blob_where_a_language_belongs(tmp_cfg, repo):
     _index(tmp_cfg, repo)
     conn = sqlite3.connect(graph_store.path_for(pack.state_dir(repo)))

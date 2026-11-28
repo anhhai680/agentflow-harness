@@ -7,14 +7,17 @@ file over the published one, so a reader sees the old snapshot or the new one an
 The journal is SQLite's default rollback journal, so a snapshot is one self-contained file with no `-wal` or `-shm`.
 
 The tables are `meta`, `files`, `facts` (a cache of what an extractor returned for one blob, kept past the blob's
-last use so a revert is not parsed again), `provides` and `wants` (the keys a file offers and looks up), `nodes`,
+last use so a revert is not parsed again, but dropped once only left-out rows name the blob), `provides` and `wants` (the keys a file offers and looks up), `nodes`,
 `edges`, `ignore_files` and `search`, an FTS5 table whose rows share their rowid with `nodes`. An edge is stored
 with the `origin` path whose facts made it, so dropping a file drops what it said, never what others said of it;
 an edge whose other end is gone dangles until its origin is resolved again, and `neighbours` skips it.
 
 Everything read from the repository ends up here as bound parameters, never as SQL text. A query is reduced to
 `[a-z0-9]` tokens before it reaches FTS5. The directory is `0700` and the file `0600`, since it holds names,
-signatures and doc text of the indexed repository.
+signatures and doc text of the indexed repository. The file itself is untrusted too: every connection is opened with
+`trusted_schema` off and, where this `sqlite3` offers it, `SQLITE_DBCONFIG_DEFENSIVE`; `begin` copies a store only
+when its `quick_check` passes; and a caller that names the repository's checkout gets `Unusable` for a store inside
+it, which the repository itself could have committed.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from urllib.parse import quote
 from agentflow import safeio
 from agentflow.graph_model import SCHEMA_VERSION, Edge, Facts, Node, check_facts, to_json
 
+HAS_NODES = ("indexed", "unparsed")  # the `files` states whose paths have nodes; every other state is left out
 FACTS_KEEP = 2000  # cached facts kept for blobs no longer in the tree (a revert is then not parsed again)
 QUERY_TOKENS = 16
 TOKEN_MAX = 64  # a query token is cut to this many characters
@@ -68,7 +72,7 @@ _SCHEMA = (
 
 
 class Unusable(Exception):
-    """The store is missing, not SQLite, of another schema version, or this SQLite has no FTS5."""
+    """The store is missing, not SQLite, of another schema version, inside the checkout, or this SQLite has no FTS5."""
 
 
 @functools.cache
@@ -112,13 +116,28 @@ class Hit:
 
 def _harden(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA trusted_schema = OFF")  # a planted file's views and triggers may not call functions
+    if hasattr(conn, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE"):  # Python 3.12+
+        conn.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)  # no writable schema, no shadow-table writes
 
 
-def open_read(path: Path) -> sqlite3.Connection:
-    """`path` opened read-only; `Unusable` when it is not a regular file, not a store of this schema, or has no FTS5."""
+def outside(path: Path, checkout: Path | None) -> None:
+    """`Unusable` when `path`, resolved, lies inside `checkout`: a repository that sets `paths.state_dir` to a folder
+    of its own could commit a crafted store there. Nothing is checked when `checkout` is None."""
+    if checkout is None:
+        return
+    here, root = Path(os.path.realpath(path)), Path(os.path.realpath(checkout))
+    if here == root or root in here.parents:
+        raise Unusable(f"{path} lies inside the repository's checkout, where a store could be committed: "
+                       "set paths.state_dir to a folder outside the repository")
+
+
+def open_read(path: Path, *, checkout: Path | None = None) -> sqlite3.Connection:
+    """`path` opened read-only; `Unusable` when it is not a regular file, not a store of this schema, has no FTS5,
+    or lies inside `checkout` (the repository's main checkout, when the caller names one)."""
     path = Path(path)
     if not fts5_available():
         raise Unusable("this SQLite has no FTS5")
+    outside(path, checkout)
     try:
         info = os.lstat(path)
         absolute = os.path.abspath(path)
@@ -207,15 +226,25 @@ def _unlink(path: Path) -> None:
         pass
 
 
-def begin(path: Path, fresh: bool = False) -> tuple[sqlite3.Connection, Path]:
+def _intact(conn: sqlite3.Connection) -> bool:
+    """Whether `PRAGMA quick_check` finds every page sound; a damaged page would otherwise be copied forward."""
+    try:
+        return conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+    except sqlite3.Error:
+        return False
+
+
+def begin(path: Path, fresh: bool = False, *, checkout: Path | None = None) -> tuple[sqlite3.Connection, Path]:
     """A writable copy of the store at `path`, as a temp file beside it, with a transaction open.
 
-    A new schema when `fresh` or when `path` is `Unusable`. Temp files of killed builds are removed first: one builder
-    runs at a time. Hand the result to `publish` or `discard`. `Unusable` when this SQLite has no FTS5.
+    A new schema when `fresh`, when `path` is `Unusable`, or when its `quick_check` finds a damaged page. Temp files
+    of killed builds are removed first: one builder runs at a time. Hand the result to `publish` or `discard`.
+    `Unusable` when this SQLite has no FTS5 or `path` lies inside `checkout` (nothing is created then).
     """
     path = Path(path)
     if not fts5_available():
         raise Unusable("this SQLite has no FTS5")
+    outside(path, checkout)
     _private_dir(path.parent)
     _remove_stale(path)
     source: sqlite3.Connection | None = None
@@ -224,6 +253,9 @@ def begin(path: Path, fresh: bool = False) -> tuple[sqlite3.Connection, Path]:
             source = open_read(path)
         except Unusable:
             source = None
+        if source is not None and not _intact(source):
+            source.close()
+            source = None
     conn: sqlite3.Connection | None = None
     temp: Path | None = None
     try:
@@ -231,6 +263,7 @@ def begin(path: Path, fresh: bool = False) -> tuple[sqlite3.Connection, Path]:
         conn = sqlite3.connect(str(temp), isolation_level=None)
         _harden(conn)
         conn.execute("PRAGMA journal_mode = DELETE")
+        conn.execute("PRAGMA secure_delete = ON")  # a dropped row's text is overwritten, not left on a free page
         if source is not None:
             source.backup(conn)
         else:
@@ -375,14 +408,22 @@ def put_facts(conn: sqlite3.Connection, blob: str, lang: str, version: str, fact
 
 
 def prune_facts(conn: sqlite3.Connection) -> int:
-    """Drop cached facts past `FACTS_KEEP` for blobs no `files` row names (least recently seen first); the count dropped."""
+    """Drop the cached facts of every blob that only left-out rows name (`ignored`, `secret` and the rest: a path now
+    left out keeps none of its text), then those past `FACTS_KEEP` for blobs no `files` row names, least recently seen
+    first; the count dropped. The facts of a blob an `indexed` or `unparsed` row names are always kept."""
+    marks = ", ".join("?" * len(HAS_NODES))
+    left_out = conn.execute(
+        f"DELETE FROM facts WHERE blob IN (SELECT blob FROM files) AND blob NOT IN "
+        f"(SELECT blob FROM files WHERE state IN ({marks}))",
+        HAS_NODES,
+    )
     orphan = "blob NOT IN (SELECT blob FROM files)"
     cursor = conn.execute(
         f"DELETE FROM facts WHERE {orphan} AND rowid NOT IN "
         f"(SELECT rowid FROM facts WHERE {orphan} ORDER BY seen DESC, blob, lang, version LIMIT ?)",
         (FACTS_KEEP,),
     )
-    return max(cursor.rowcount, 0)
+    return max(left_out.rowcount, 0) + max(cursor.rowcount, 0)
 
 
 # --- keys ---
@@ -470,6 +511,13 @@ def replace_graph(conn: sqlite3.Connection, path: str, nodes: Sequence[Node], ed
         "INSERT OR REPLACE INTO edges (src, dst, kind, confidence, origin) VALUES (?, ?, ?, ?, ?)",
         [(e.src, e.dst, e.kind, e.confidence, e.origin) for e in edges],
     )
+
+
+def purge_search(conn: sqlite3.Connection) -> None:
+    """Rewrite the search index as one segment. A deleted FTS5 row leaves its words in the old segments until they
+    are merged; this drops them, so the words of a path now left out are in no table (`secure_delete` zeroes the
+    freed pages)."""
+    conn.execute("INSERT INTO search (search) VALUES ('optimize')")
 
 
 # --- reading the graph ---

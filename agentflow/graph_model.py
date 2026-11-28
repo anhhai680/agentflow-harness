@@ -229,7 +229,7 @@ _REF_KEYS = frozenset(("name", "line", "scope"))
 _SECTION_KEYS = frozenset(("title", "level", "line", "end", "kind", "text"))
 _LINK_KEYS = frozenset(("target", "line"))
 _DEP_KEYS = frozenset(("name", "spec", "group"))
-_JS_LANGS = ("typescript", "tsx", "javascript")
+JS_LANGS = ("typescript", "tsx", "javascript")
 
 
 def _int(value: object) -> bool:
@@ -255,7 +255,7 @@ def _span(line: object, end: object, lines: int) -> bool:
 def _import_module_ok(lang: str, mod: object, level: int) -> bool:
     if lang == "python":
         return module(mod) is not None or (mod == "" and level > 0)
-    if lang in _JS_LANGS:
+    if lang in JS_LANGS:
         return specifier(mod) is not None
     return module(mod) is not None
 

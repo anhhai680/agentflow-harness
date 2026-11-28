@@ -479,7 +479,7 @@ def _graph_checks(repo: Path) -> list[Check]:
     checks = [Check("graph search", "ok", "FTS5 is available")]
     no_index = Check("graph index", "warn", "no index yet", "agentflow graph build")
     try:
-        conn = graph_store.open_read(graph_store.path_for(pack.state_dir(repo)))
+        conn = graph_store.open_read(graph_store.path_for(pack.state_dir(repo)), checkout=pack.checkout_root(repo))
         try:
             meta = graph_store.meta(conn)
             languages = graph_report.language_states(graph_store.files(conn).values(), graph_report.offered(meta))

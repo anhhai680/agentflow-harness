@@ -3,8 +3,8 @@
 Repository bytes are hostile, so the engine never parses them itself. `Parser` starts the worker in its own session,
 in a fresh empty temp directory, with `worker_env()` and stderr to /dev/null, and sends it one file at a time over
 the protocol `graph_worker` describes. It tries a `uv` mode first (`locked` when `download`, else `offline`) and
-falls back to `stdlib` when the handshake does not arrive in time or the child exits before it; an `argv` override is
-tried once and never falls back.
+falls back to `stdlib` when the handshake does not arrive in time or the child exits before it; with `uv=False` it
+starts `stdlib` at once, and an `argv` override is tried once and never falls back.
 
 Everything the worker says is untrusted. The handshake must be exactly `ready`, a `pid` above 1 and a `languages` map
 of known language names to short version strings; an odd entry is dropped, and a `uv` worker left with no language
@@ -226,7 +226,7 @@ class _Worker:
 class Parser:
     """A kept worker process: `parse` sends it one file and returns facts that `check_facts` accepted, or a note."""
 
-    def __init__(self, *, download: bool, argv: list[str] | None = None) -> None:
+    def __init__(self, *, download: bool, argv: list[str] | None = None, uv: bool = True) -> None:
         self.mode = ""
         self.languages: dict[str, str] = {}
         self._worker: _Worker | None = None
@@ -239,8 +239,10 @@ class Parser:
         if argv is not None:
             mode = next((m for m in MODES if worker_argv(m) == list(argv)), "custom")
             tries = [(mode, list(argv))]
-        else:
+        elif uv:
             tries = [("locked" if download else "offline", None), ("stdlib", None)]
+        else:
+            tries = [("stdlib", None)]
         try:
             for mode, cmd in tries:
                 cmd = cmd if cmd is not None else worker_argv(mode)

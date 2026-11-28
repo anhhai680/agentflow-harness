@@ -160,6 +160,65 @@ def test_begin_refuses_a_symlinked_graph_directory(tmp_path):
         gs.begin(tmp_path / "graph" / "graph.sqlite")
 
 
+def _zero_middle_pages(path) -> None:
+    """Zero the pages of the `nodes` table: the header and the schema stay intact, so `open_read` accepts it."""
+    conn = sqlite3.connect(path)
+    root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = 'nodes'").fetchone()[0]
+    size = conn.execute("PRAGMA page_size").fetchone()[0]
+    conn.close()
+    data = bytearray(path.read_bytes())
+    assert root > 2 and len(data) >= root * size
+    data[(root - 1) * size : root * size] = bytes(size)
+    path.write_bytes(bytes(data))
+
+
+def test_begin_starts_fresh_over_a_store_that_fails_its_quick_check(store):
+    def fill(c):
+        gs.set_meta(c, commit="c" * 40)
+        for i in range(50):
+            gs.replace_graph(c, f"p{i}.py", [node(f"p{i}.py", text="t" * 200)], [])
+
+    build(store, fill)
+    _zero_middle_pages(store)
+    gs.open_read(store).close()  # it still opens: only a check of every page finds the damage
+    conn, temp = gs.begin(store)
+    try:
+        assert gs.meta(conn) == {"schema": str(SCHEMA_VERSION)} and gs.counts(conn)["nodes"] == 0
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    finally:
+        gs.discard(conn, temp)
+
+
+def test_a_store_inside_the_checkout_is_unusable(tmp_path):
+    checkout = tmp_path / "repo"
+    store = gs.path_for(checkout / "state")
+    build(store, lambda c: gs.set_meta(c, commit="c" * 40))
+    gs.open_read(store).close()  # without a checkout to compare with, it is an ordinary store
+    for inside in (checkout, tmp_path / "link"):
+        if inside.name == "link":
+            inside.symlink_to(checkout)  # the checkout named through a symlink is the same checkout
+        with pytest.raises(gs.Unusable, match=r"paths\.state_dir"):
+            gs.open_read(store, checkout=inside)
+        with pytest.raises(gs.Unusable, match=r"paths\.state_dir"):
+            gs.begin(store, checkout=inside)
+    assert sorted(p.name for p in store.parent.iterdir()) == ["graph.sqlite"]  # begin left no temp file
+    gs.open_read(store, checkout=tmp_path / "elsewhere").close()
+    conn, temp = gs.begin(store, checkout=tmp_path / "elsewhere")
+    gs.discard(conn, temp)
+
+
+@pytest.mark.skipif(not hasattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE"), reason="this sqlite3 has no setconfig")
+def test_every_connection_the_store_opens_is_defensive(store):
+    conn, temp = gs.begin(store)
+    assert conn.getconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE)
+    gs.publish(conn, temp, store)
+    reader = gs.open_read(store)
+    try:
+        assert reader.getconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE)
+    finally:
+        reader.close()
+
+
 # --- open_read refuses what is not a usable store ---
 
 
@@ -392,8 +451,8 @@ def test_facts_can_be_read_on_a_read_only_connection(store):
 
 def test_prune_keeps_tree_blobs_and_the_most_recently_seen_others(conn, monkeypatch):
     monkeypatch.setattr(gs, "FACTS_KEEP", 3)
-    gs.put_file(conn, row("a.py", blob="tree1"))
-    gs.put_file(conn, row("b.py", blob="tree2"))
+    gs.put_file(conn, row("a.py", blob="tree1", state="indexed"))
+    gs.put_file(conn, row("b.py", blob="tree2", state="unparsed"))
     for blob in ("tree1", "tree2", "o1", "o2", "o3", "o4", "o5"):
         gs.put_facts(conn, blob, "python", "1", FACTS)
     gs.facts(conn, "o1", "python", "1")  # o1 is used again: it is now the most recently seen
@@ -406,11 +465,24 @@ def test_prune_keeps_tree_blobs_and_the_most_recently_seen_others(conn, monkeypa
 def test_prune_keeps_every_tree_blob_even_past_the_limit(conn, monkeypatch):
     monkeypatch.setattr(gs, "FACTS_KEEP", 0)
     for i in range(5):
-        gs.put_file(conn, row(f"{i}.py", blob=f"t{i}"))
+        gs.put_file(conn, row(f"{i}.py", blob=f"t{i}", state="indexed"))
         gs.put_facts(conn, f"t{i}", "python", "1", FACTS)
     gs.put_facts(conn, "gone", "python", "1", FACTS)
     assert gs.prune_facts(conn) == 1
     assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 5
+
+
+@pytest.mark.parametrize("state", ["ignored", "secret", "vendored", "excluded", "symlink", "submodule"])
+def test_prune_drops_the_facts_of_a_blob_only_left_out_rows_name(conn, monkeypatch, state):
+    """A path now left out keeps none of its extracted text, whatever `FACTS_KEEP` allows for orphans."""
+    monkeypatch.setattr(gs, "FACTS_KEEP", 100)
+    gs.put_file(conn, row("gone.py", blob="left", state=state))
+    gs.put_file(conn, row("both.py", blob="shared", state=state))
+    gs.put_file(conn, row("kept.py", blob="shared", state="indexed"))  # the same bytes, indexed at another path
+    for blob in ("left", "shared", "orphan"):
+        gs.put_facts(conn, blob, "python", "1", FACTS)
+    assert gs.prune_facts(conn) == 1
+    assert {r[0] for r in conn.execute("SELECT blob FROM facts")} == {"shared", "orphan"}
 
 
 # --- search ---
@@ -639,8 +711,8 @@ def test_begin_closes_the_source_when_it_cannot_make_the_temp_file(store, monkey
     opened = []
     real_open = gs.open_read
 
-    def spy(path):
-        opened.append(real_open(path))
+    def spy(path, **kw):
+        opened.append(real_open(path, **kw))
         return opened[-1]
 
     def refuse(path):

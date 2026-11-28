@@ -1579,7 +1579,7 @@ def _graph_read(repo: Path, args: argparse.Namespace) -> tuple[list[str], int] |
     from agentflow import graph_store, pack
 
     try:
-        conn = graph_store.open_read(graph_store.path_for(pack.state_dir(repo)))
+        conn = graph_store.open_read(graph_store.path_for(pack.state_dir(repo)), checkout=pack.checkout_root(repo))
         try:
             meta = graph_store.meta(conn)
             if not meta.get("commit"):

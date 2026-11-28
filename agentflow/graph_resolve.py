@@ -29,10 +29,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from agentflow.graph_model import Def, Edge, Facts, Import, Node, node_id
+from agentflow.graph_model import JS_LANGS, Def, Edge, Facts, Import, Node, node_id
 from agentflow.graph_select import is_test, language
 
-_JS_LANGS = ("typescript", "tsx", "javascript")
 _JS_SUFFIXES = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", "/index.ts", "/index.tsx", "/index.js")
 
 
@@ -189,7 +188,7 @@ def _script_plan(path: str, imp: Import) -> _Plan | None:
 def _plan(path: str, lang: str, imp: Import) -> _Plan | None:
     if lang == "python":
         return _python_plan(path, imp)
-    if lang in _JS_LANGS:
+    if lang in JS_LANGS:
         return _script_plan(path, imp)
     return None
 

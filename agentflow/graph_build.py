@@ -36,7 +36,13 @@ a *parse candidate* (an indexed row, or an unparsed one the parser failed on) re
 for its language: a language the last parser did not offer, a grammar that came later, may be offered now. Once it
 runs, every candidate whose language it offers at another version is extracted again; a language it does not offer
 keeps its stored facts. On a machine that lacks a grammar, a repository with files in that language so starts the
-parser once per build to look again, and parses nothing when the grammar is still missing.
+parser once per build to look again, and parses nothing when the grammar is still missing. The parser tries the `uv`
+worker only when a queued blob or a candidate is TypeScript, TSX or JavaScript; otherwise it starts the stdlib worker,
+which offers the same versions for every other language, so such a repository never waits on uv or the network.
+
+**The store.** A store the repository could have written (`paths.state_dir` inside its checkout) is refused before
+anything is made; one whose `quick_check` fails is not copied, and the build starts from a new schema. A damaged
+page the build meets anyway is a `BuildError` (`sqlite3.DatabaseError`), never a traceback.
 """
 
 from __future__ import annotations
@@ -60,10 +66,11 @@ from agentflow import graph_git, graph_parse, graph_store, pack, safeio
 from agentflow.graph_git import Entry
 from agentflow.graph_ignore import MAX_FILE_BYTES as IGNORE_MAX_BYTES
 from agentflow.graph_ignore import Ignore
-from agentflow.graph_model import EXTRACTOR_VERSIONS, NOTE_MAX, Facts, empty
+from agentflow.graph_model import EXTRACTOR_VERSIONS, JS_LANGS, NOTE_MAX, Facts, empty
+from agentflow.graph_report import DISABLED
 from agentflow.graph_resolve import file_node, provided, resolve, wanted
 from agentflow.graph_select import parses, state
-from agentflow.graph_store import FileRow
+from agentflow.graph_store import HAS_NODES, FileRow
 
 if TYPE_CHECKING:
     from agentflow.config import Config
@@ -72,7 +79,6 @@ LOCK = "build.lock"
 NOTES_MAX = 50
 SNIFF_BYTES = 8000  # a NUL among a file's first bytes makes it binary: a file node, never parsed
 TOO_BIG, BINARY = "over_max_file_kb", "binary"  # the notes of a file over `graph.max_file_kb` and of a binary one
-_HAS_NODES = ("indexed", "unparsed")
 _REGULAR = ("100644", "100755")
 _NO_VERDICT = frozenset({"no_grammar", "parser_unavailable"})  # stored with version "": tried again by a later parser
 _PARSE_FAILED = _NO_VERDICT | {"too_large", "parser_timeout", "parser_memory", "parser_crashed", "parser_reply"}
@@ -156,16 +162,21 @@ def build(repo: Path, cfg: Config, *, full: bool = False, download: bool = True,
     """Index `commit` (default: the base branch's) into the repository's store; see the module docstring."""
     started = time.monotonic()
     if not cfg.graph.enabled:
-        raise BuildError("graph.enabled is false: set it to true in .agentflow/config.yaml to build the index")
+        raise BuildError(DISABLED)
     if not graph_store.fts5_available():
         raise BuildError("this Python's SQLite has no FTS5: use a Python whose SQLite has FTS5")
     repo = Path(repo)
     target = _target(repo, cfg.project.base_branch, commit)
     store = graph_store.path_for(pack.state_dir(repo))
+    checkout = pack.checkout_root(repo)
+    try:  # before the lock: nothing is made inside the checkout
+        graph_store.outside(store, checkout)
+    except graph_store.Unusable as exc:
+        raise BuildError(f"cannot build: {exc}") from exc
     with _locked(store.parent):
         try:
-            conn, temp = graph_store.begin(store, fresh=full)
-        except (graph_store.Unusable, OSError) as exc:
+            conn, temp = graph_store.begin(store, fresh=full, checkout=checkout)
+        except (graph_store.Unusable, OSError, sqlite3.DatabaseError) as exc:
             raise BuildError(f"cannot start a build of {store}: {exc}") from exc
         try:
             try:
@@ -173,7 +184,7 @@ def build(repo: Path, cfg: Config, *, full: bool = False, download: bool = True,
                 graph_store.publish(conn, temp, store)
             except graph_git.ReadFailed as exc:
                 raise BuildError(f"git could not read a blob of {target[:12]}: {exc}") from exc
-            except (OSError, sqlite3.OperationalError) as exc:  # a directory at the store path, a full disk
+            except (OSError, sqlite3.DatabaseError) as exc:  # a directory at the store path, a full disk, a bad page
                 raise BuildError(f"cannot write the index at {store}: {exc}") from exc
         except BaseException:
             graph_store.discard(conn, temp)
@@ -230,6 +241,7 @@ class _Build:
         self.notes: list[str] = []
         self.file_notes: list[str] = []
         self.parsed = self.cached = self.removed = 0
+        self.left_out_now = False  # a path that had nodes is left out now: its words leave the search index too
         self._listed: dict[str, Entry] | None = None
 
     def run(self, started: float) -> Result:
@@ -244,9 +256,11 @@ class _Build:
         graph_store.set_meta(self.conn, commit=self.commit, built_at=f"{time.time():.0f}", engine=pack.ENGINE_VERSION,
                              languages=json.dumps(offered, sort_keys=True), settings=self.settings)
         graph_store.prune_facts(self.conn)
+        if self.left_out_now:
+            graph_store.purge_search(self.conn)
         final = graph_store.files(self.conn)
-        left_out = Counter(row.state for row in final.values() if row.state not in _HAS_NODES)
-        langs = {row.lang for row in final.values() if row.state in _HAS_NODES and row.lang}
+        left_out = Counter(row.state for row in final.values() if row.state not in HAS_NODES)
+        langs = {row.lang for row in final.values() if row.state in HAS_NODES and row.lang}
         notes = [*self.notes, *sorted(self.file_notes), *ignore.notes, *self.exclude.notes]
         if len(notes) > NOTES_MAX:
             notes = [*notes[: NOTES_MAX - 1], f"{len(notes) - NOTES_MAX + 1} more note(s)"]
@@ -340,7 +354,7 @@ class _Build:
 
     def _place(self, path: str, ignore: Ignore) -> None:
         entry, row = self.changed[path], self.rows.get(path)
-        had_nodes = row is not None and row.state in _HAS_NODES
+        had_nodes = row is not None and row.state in HAS_NODES
         if entry is None:
             graph_store.drop_file(self.conn, path)
             self.removed += had_nodes
@@ -350,6 +364,7 @@ class _Build:
             graph_store.drop_file(self.conn, path)
             graph_store.put_file(self.conn, FileRow(path, entry.blob, entry.mode, "", verdict, "", ""))
             self.removed += had_nodes
+            self.left_out_now |= had_nodes
             return
         lang = parses(path, self.doc_roots)
         if lang is None:
@@ -398,7 +413,11 @@ class _Build:
                 hits[path] = found
         candidates = self._candidates()
         start = len(hits) < len(self.queue) or any(row.version != known.get(row.lang) for row in candidates)
-        with (graph_parse.Parser(download=self.download) if start else contextlib.nullcontext()) as parser:
+        # Only TypeScript and JavaScript need the uv worker's grammars: without them the stdlib worker offers the same
+        # versions, and a build never waits on uv (or the network) for a repository it gains nothing from.
+        uv = any(lang in JS_LANGS for _, _, lang in self.queue) or any(row.lang in JS_LANGS for row in candidates)
+        parsing = graph_parse.Parser(download=self.download, uv=uv) if start else contextlib.nullcontext()
+        with parsing as parser:
             offered = dict(parser.languages) if parser is not None else known
             for row in candidates:
                 if row.lang in offered and row.version != offered[row.lang]:

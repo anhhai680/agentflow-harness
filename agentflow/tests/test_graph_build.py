@@ -559,6 +559,85 @@ def test_a_directory_at_the_store_path_is_a_build_error(repo_a, cfg):
     assert sorted(p.name for p in store_of(repo_a).parent.iterdir()) == ["build.lock", "graph.sqlite"]
 
 
+def _zero_the_nodes_pages(store: Path) -> None:
+    """Zero the pages from the `nodes` table's root on, as a disk fault might; the header and schema stay intact."""
+    conn = sqlite3.connect(store)
+    root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = 'nodes'").fetchone()[0]
+    size = conn.execute("PRAGMA page_size").fetchone()[0]
+    conn.close()
+    data = bytearray(store.read_bytes())
+    assert root > 2 and len(data) >= root * size
+    data[(root - 1) * size : root * size] = bytes(size)
+    store.write_bytes(bytes(data))
+
+
+def test_a_store_damaged_in_the_middle_is_rebuilt_fresh(repo_a, cfg):
+    first = build(repo_a, cfg, download=False)
+    _zero_the_nodes_pages(store_of(repo_a))
+    commit(repo_a, {"pkg/slots.py": b"def lend(): ...\n"})
+    again = build(repo_a, cfg, download=False)
+    assert again.full and again.previous is None and again.commit != first.commit
+    conn = sqlite3.connect(store_of(repo_a))
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        conn.close()
+    assert read(repo_a, graph_store.nodes_at, "pkg/slots.py")
+    assert build(repo_a, cfg, download=False).parsed == 0  # the next build is a delta over the sound store
+
+
+def test_a_damaged_page_met_during_a_build_is_a_build_error(repo_a, cfg, monkeypatch):
+    first = build(repo_a, cfg, download=False)
+    commit(repo_a, {"pkg/slots.py": b"def lend(): ...\n"})
+
+    def damaged(*args):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    with pytest.MonkeyPatch.context() as patch, pytest.raises(BuildError, match="malformed"):
+        patch.setattr(graph_store, "prune_facts", damaged)
+        build(repo_a, cfg, download=False)
+    assert read(repo_a, graph_store.meta)["commit"] == first.commit
+
+
+CANARY = b"zqxcanary7731"
+
+
+def test_a_path_that_becomes_ignored_keeps_none_of_its_text(tmp_path, cfg):
+    repo = make_repo(tmp_path, {"keep.py": b"K = 1\n",
+                                "notes.py": b'def tell():\n    """' + CANARY + b' is said here."""\n'})
+    build(repo, cfg, download=False)
+    assert CANARY.decode() in repr(read(repo, graph_store.dump))
+    commit(repo, {".gitignore": b"notes.py\n"})
+    build(repo, cfg, download=False)
+    assert rows(repo)["notes.py"].state == "ignored"
+    assert CANARY.decode() not in repr(read(repo, graph_store.dump))
+    assert CANARY not in store_of(repo).read_bytes()  # `secure_delete`: no free page keeps the dropped text either
+
+
+def test_a_python_only_repository_never_starts_uv(repo_a, cfg, monkeypatch):
+    modes: list[str] = []
+    real = graph_parse.worker_argv
+    monkeypatch.setattr(graph_parse, "worker_argv", lambda mode: modes.append(mode) or real(mode))
+    started: list[str] = []
+    real_init = graph_parse.Parser.__init__
+
+    def init(self, **kw):
+        real_init(self, **kw)
+        started.append(self.mode)
+
+    monkeypatch.setattr(graph_parse.Parser, "__init__", init)
+    build(repo_a, cfg, download=True)
+    commit(repo_a, {"pkg/slots.py": b"def lend(): ...\n"})
+    build(repo_a, cfg, download=True)
+    assert started == ["stdlib", "stdlib"] and set(modes) == {"stdlib"}
+    commit(repo_a, {"web/a.ts": b"export const a = 1;\n"})  # a TypeScript blob to parse: the uv modes are tried
+    modes.clear()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(graph_parse, "HANDSHAKE_S", {**graph_parse.HANDSHAKE_S, "locked": 0.01})
+        build(repo_a, cfg, download=True)
+    assert modes[0] == "locked"
+
+
 # --- versions and grammars ---
 
 
