@@ -283,7 +283,8 @@ def _section_names(facts: Facts) -> list[str]:
 def _own_nodes(repo_id: str, path: str, facts: Facts, defs: dict[str, Def]) -> list[Node]:
     kind = _kind_of(path, facts.lang)
     trust = "human" if kind == "doc" else "code"
-    nodes = [Node(node_id(repo_id, kind, path), kind, _basename(path), path, 1, 1, trust, "", facts.doc)]
+    status = f"Status: {facts.status}" if kind == "doc" and facts.status else ""  # a document's `Status:` line
+    nodes = [Node(node_id(repo_id, kind, path), kind, _basename(path), path, 1, 1, trust, status, facts.doc)]
     for d in defs.values():
         nodes.append(Node(node_id(repo_id, "symbol", path, d.name), "symbol", d.name, path, d.line, d.end, "code", d.signature, d.doc))
     for section, name in zip(facts.sections, _section_names(facts)):

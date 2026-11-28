@@ -537,8 +537,8 @@ lets a harness rule answer a question in a human's place. The rules, each tested
 - **Parsers run in a child process.** The tree-sitter grammars are compiled C reading hostile bytes, and `ast` has
   crashed interpreters on crafted input before. The worker has a time limit and a memory limit (section 2 says how
   each holds per system), gets the bytes on its standard input, and returns facts as JSON that the engine validates
-  against the schema. It is given no path, runs in an empty directory with a scrubbed environment, and its own code
-  opens no file and no socket. **That is not an operating-system sandbox.** A parser bug that gives hostile bytes
+  against the schema. It never opens a path (it receives the repository-relative path as data), runs in an empty
+  directory with a scrubbed environment, and its own code opens no file and no socket. **That is not an operating-system sandbox.** A parser bug that gives hostile bytes
   code execution would run with the user's permissions, as a hostile file opened in an editor's syntax highlighter
   would. The limits and the validation contain crashes, hangs and malformed output, not that. A user who indexes
   repositories they do not trust at all should do it in a disposable environment (playbook §11).
@@ -551,8 +551,10 @@ lets a harness rule answer a question in a human's place. The rules, each tested
   files at the base commit are seen, never the working tree or a run's worktree; and a path the repository's
   `.gitignore` names is never opened, even when it was committed by mistake.
 - **`.gitignore` is hostile input like any other file.** Its size, its line count and each pattern's length are
-  capped, and a pattern is matched by a translation that cannot backtrack without bound. A file over a cap is
-  ignored with a note, and the build goes on with the patterns of the other `.gitignore` files. The store sits in
+  capped, and a pattern is matched by a translation that cannot backtrack without bound. A file over a cap, or one
+  with a pattern over the cap, fails closed: every path below its folder is judged ignored, with a note (the whole
+  repository for a root file), since its dropped patterns could have ignored any of them. A negated pattern over
+  the cap is only skipped, which can only leave more ignored. The store sits in
   the state dir with its permissions and is denied to agents (`Edit(<state>/graph/**)` in the runner's `--settings`).
 - **The graph cannot be written by an agent.** It is built only by the runner from git commits and run logs. Model
   text is stored as `trust: model`, never becomes a precedent, and is marked wherever it is shown.
@@ -861,7 +863,7 @@ Facts found while writing the K1 plan, each corrected in place above:
 2. **The memory limit cannot be a resource limit on macOS.** `RLIMIT_AS` is refused there, so the parent watches
    the worker's resident size instead. Linux keeps the hard limit.
 3. **The worker is not sandboxed.** The first text said it "has no access to the repository, the state dir or the
-   network". Nothing enforces that. The Security section now states what holds (no path given, an empty directory,
+   network". Nothing enforces that. The Security section now states what holds (no path opened, an empty directory,
    a scrubbed environment, limits, validation) and the residual risk.
 4. **A symbol node also holds the first line of its docstring** (at most 200 characters). Names and signatures
    alone are unlikely to meet success criterion 1.
@@ -885,6 +887,11 @@ Where slice K1, as built, differs from or adds to the text above. The design is 
 4. **A constant's signature is empty.** A TypeScript or JavaScript `const NAME` is a `constant` symbol with no signature, so a literal's value (a token in a source file, say) never reaches the store.
 5. **URL credentials are stripped from dependency specs.** `https://user:token@host/x` in a manifest is kept as `https://host/x`.
 6. **The JSON output escapes through `json.dumps`.** Its default `ensure_ascii` writes every control and non-ASCII character as a `\uXXXX` escape. The text views go through `doctor.printable` instead, which would double the escapes in JSON.
+7. **An ignore file over a cap leaves its folder out.** The Security text first left such a file's patterns out, which indexed paths git ignores. Now a file over the byte or line cap, or with a pattern over the length cap, makes every path below its folder ignored, with a note, and a root file over a cap leaves the whole repository out. A negated pattern over the cap is only skipped.
+8. **A signature holds no value.** Every Python default, keyword-only default and class keyword value, and every TypeScript or JavaScript parameter initialiser, is written `...` (`wait: float=...`), for the reason item 4 gives. The extractor versions moved to 2, so cached facts are extracted again.
+9. **The store is distrusted too.** A store inside the repository's checkout (`paths.state_dir` set to a folder of the repository) is refused, a store that fails SQLite's `quick_check` is rebuilt from a new schema, and every connection runs with `trusted_schema` off and `SQLITE_DBCONFIG_DEFENSIVE` on. A path that becomes left out keeps none of its text: its cached facts are dropped and the search index is rewritten.
+10. **The worker's `uv` runs with `--no-build` and `--no-config`, and only for TypeScript or JavaScript.** No source distribution is built, since its build dependencies are not hash-locked, and no uv configuration around the worker is read. A build with no TypeScript or JavaScript file to parse starts the stdlib worker directly.
+11. **A document's `Status:` line is its doc node's signature.**
 
 The retrieval measurement (success criterion 1) scored 25 of 30 on the first run, with no ranking change, and is `agentflow/tests/test_graph_retrieval.py`. The build timings are in the pull request.
 

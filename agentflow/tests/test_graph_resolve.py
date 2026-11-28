@@ -344,6 +344,14 @@ def test_file_node():
     assert (doc.id, doc.kind, doc.trust) == ("r:doc:a.md#", "doc", "human")
 
 
+def test_a_documents_status_line_is_its_doc_nodes_signature():
+    facts = graph_markdown.extract("docs/p.md", b"# Proposal\n\nStatus: approved\n\nThe text.\n")
+    doc = next(n for n in resolve("r", "docs/p.md", facts, IDX)[0] if n.kind == "doc")
+    assert (doc.signature, doc.text) == ("Status: approved", facts.doc)
+    plain = graph_markdown.extract("docs/q.md", b"# Notes\n\nNo status here.\n")
+    assert next(n for n in resolve("r", "docs/q.md", plain, IDX)[0] if n.kind == "doc").signature == ""
+
+
 def test_a_parsed_file_node_matches_file_node_but_for_its_text():
     nodes, _ = resolve("r", "pkg/slots.py", F["pkg/slots.py"], IDX)
     assert next(n for n in nodes if n.kind == "file") == file_node("r", "pkg/slots.py", "python")
